@@ -1,6 +1,6 @@
 /** Round 3: switch/restart transitions and the server-stamped opening (contract v3 OpeningProgressV3). */
 import { describe, expect, it } from 'vitest';
-import { OPENING_MILESTONES_V3 } from '@/server/billing/v3/contract';
+import { OPENING_MILESTONES_V3, SWITCH_HEAL_REASONS_V3 } from '@/server/billing/v3/contract';
 import { SWITCH_DEMAND_WINDOW_MS } from './ready-pool';
 import type { Placement } from './placement';
 import {
@@ -174,3 +174,104 @@ describe('describeProgress: OpeningProgressV3 fields, capacity wait, expected se
     });
 });
 function nonceIn(s: number) { return new Date(T0.getTime() + s * 1000); }
+
+describe('round 5 D2: a failed pool release being healed keeps the switch in flight (stop_healing)', () => {
+    const JOB = '33333333-3333-4333-8333-333333333333';
+    const REPLAY_JOB = '44444444-4444-4444-8444-444444444444';
+    /** aws-receipts.ts:340-345: a FAILED release execution → UNCONFIRMED `failed:*`, job and digest kept, enrollment cleared. */
+    const failedRelease = (over: Partial<Placement> = {}) => placement({ state: 'UNCONFIRMED', lastError: 'failed:LifecycleUnconfirmed',
+        lifecycleJobId: JOB, lifecycleDigest: 'd'.repeat(64), ...over });
+    /** aws-pool-release-recovery.ts reservation: RECOVERING with the replay intent under the recovery prefix. */
+    const replaying = (over: Partial<Placement> = {}) => failedRelease({ state: 'RECOVERING', lifecycleJobId: REPLAY_JOB,
+        lastError: `pool_release_recovery:${JSON.stringify({ intent: { operation: 'release', jobId: REPLAY_JOB }, sourceJobId: JOB, stoppedAt: null, error: null })}`, ...over });
+    const recoveryError = (error: string) => `pool_release_recovery:${JSON.stringify({ error })}`;
+    const limit = (TRANSITION_STOP_TIMEOUT_MS + TRANSITION_STOP_GRACE_MS) / 1000;
+
+    it('the reasons are the pinned contract codes (SWITCH_HEAL_REASONS_V3)', () => {
+        expect([...SWITCH_HEAL_REASONS_V3]).toEqual(['stop_healing', 'release_heal_failed', 'release_heal_timeout']);
+    });
+    it('pending: the phase stays (stopping, or requested) with reason stop_healing up to the existing 230 s stop bound', () => {
+        expect(resolveTransition(transition(), failedRelease(), at(25))).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        expect(resolveTransition(transition(), replaying(), at(52))).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        expect(resolveTransition(transition({ phase: 'requested', stoppingAt: null }), failedRelease(), at(25))).toEqual({ phase: 'requested', reason: 'stop_healing' });
+        expect(resolveTransition(transition(), failedRelease({ lastError: recoveryError('execution_unavailable') }), at(60)))
+            .toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        expect(resolveTransition(transition(), failedRelease(), at(limit))).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        expect(resolveTransition(transition(), failedRelease(), at(limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
+        expect(resolveTransition(transition(), replaying(), at(limit + 1))).toEqual({ phase: 'failed', reason: 'release_heal_timeout' });
+    });
+    it('a heal that fails is release_heal_failed at once (non-retryable)', () => {
+        for (const error of ['recovery_retry_awaits_new_deployment', 'termination_not_proven', 'instance_identity', 'execution_not_failed']) {
+            expect(resolveTransition(transition(), failedRelease({ lastError: recoveryError(error) }), at(40))).toEqual({ phase: 'failed', reason: 'release_heal_failed' });
+        }
+    });
+    it('not this switch\'s release: the existing UNCONFIRMED/RECOVERING failures are unchanged', () => {
+        expect(resolveTransition(transition(), failedRelease({ leaseEpoch: 8 }), at(40))).toEqual({ phase: 'failed', reason: 'unconfirmed' });
+        expect(resolveTransition(transition(), failedRelease({ lifecycleJobId: null }), at(40))).toEqual({ phase: 'failed', reason: 'unconfirmed' });
+        expect(resolveTransition(transition(), failedRelease({ lastError: 'capacity:region' }), at(40))).toEqual({ phase: 'failed', reason: 'capacity_unavailable' });
+        expect(resolveTransition(transition({ phase: 'waking', wakingAt: at(30).toISOString() }), failedRelease(), at(40))).toEqual({ phase: 'failed', reason: 'unconfirmed' });
+        expect(resolveTransition(transition(), placement({ state: 'RECOVERING', lastError: recoveryError('x') }), at(40)).phase).toBe('failed');
+    });
+    it('the heal settles STOPPED/pool_released → waking (reason null); the adopt on the target is done', () => {
+        const settled = placement({ state: 'STOPPED', lastError: 'pool_released' });
+        expect(resolveTransition(transition(), settled, at(55))).toEqual({ phase: 'waking', reason: null });
+        expect(resolveTransition(transition({ phase: 'waking', wakingAt: at(55).toISOString() }), placement({ leaseEpoch: 8, generation: 4, instanceType: 'm6i.2xlarge' }), at(95)))
+            .toEqual({ phase: 'done', reason: null });
+    });
+    it('describeProgress: stop_healing keeps the switching (or restarting) stage, active, with no operator hold', () => {
+        for (const p of [failedRelease(), replaying()]) {
+            const resolved = resolveTransition(transition(), p, at(30));
+            const view = transitionView(transition(), resolved);
+            const opening = describeOpening({ placement: p, stored: null, transition: { t: transition(), phase: resolved.phase }, pool: null, migrating: false, now: at(30) });
+            expect(describeProgress(C, p, null, env, at(30), null, { transition: view, opening, warmMedianSeconds: 30 })).toMatchObject({
+                stage: 'switching', operation: 'opening', needsOperator: false, active: true, path: 'switch', typicalSeconds: 300, expectedSeconds: 300,
+                lifecycleState: p.state, transition: { phase: 'stopping', reason: 'stop_healing' },
+            });
+            const restart = transition({ kind: 'restart', target: 'std-2' });
+            expect(describeProgress(C, p, null, env, at(30), null, { transition: transitionView(restart, resolveTransition(restart, p, at(30))) }))
+                .toMatchObject({ stage: 'restarting', needsOperator: false, active: true });
+        }
+    });
+    it('describeProgress: a heal that failed or timed out holds for the operator as before', () => {
+        const failed = failedRelease({ lastError: recoveryError('termination_not_proven') });
+        expect(describeProgress(C, failed, null, env, at(30), null, { transition: transitionView(transition(), resolveTransition(transition(), failed, at(30))) }))
+            .toMatchObject({ stage: 'needs_operator', needsOperator: true, active: false, transition: { phase: 'failed', reason: 'release_heal_failed' } });
+        expect(describeProgress(C, failedRelease(), null, env, at(limit + 1), null,
+            { transition: transitionView(transition(), resolveTransition(transition(), failedRelease(), at(limit + 1))) }))
+            .toMatchObject({ stage: 'needs_operator', needsOperator: true, transition: { phase: 'failed', reason: 'release_heal_timeout' } });
+        // No transition: an UNCONFIRMED failed:* row alone is ambiguous (any failed job writes it) and still holds.
+        expect(describeProgress(C, failedRelease(), null, env, at(30))).toMatchObject({ stage: 'needs_operator', needsOperator: true });
+    });
+    it('describeProgress: a plain Stop whose release is being replayed (RECOVERING with its intent) reads as stopping', () => {
+        expect(describeProgress(C, replaying(), null, env, at(30))).toMatchObject({ stage: 'stopping', operation: 'stopping', needsOperator: false,
+            active: true, lifecycleState: 'RECOVERING' });
+        // Other RECOVERING rows (deleted/image recovery) are unchanged.
+        expect(describeProgress(C, placement({ state: 'RECOVERING', lastError: recoveryError('x') }), null, env, at(30)))
+            .toMatchObject({ stage: 'recovering', operation: 'none', active: false });
+    });
+
+    it('the 10-29 09:36Z incident replay (4e8347ca std-2 → cmp-4): heal, adopt, done; never failed', () => {
+        const T = (iso: string) => new Date(`2026-10-29T${iso}Z`);
+        const t = transition({ current: 'std-2', target: 'cmp-4', fromGeneration: 4, fromLeaseEpoch: 11,
+            requestedAt: T('09:36:08.000').toISOString(), stoppingAt: T('09:36:08.050').toISOString() });
+        const base = { generation: 4, leaseEpoch: 11, instanceType: 'm6i.large', updatedAt: T('09:36:33.000') };
+        const steps: [string, Placement, { phase: string; reason: string | null }, string][] = [
+            ['09:36:20.000', placement({ ...base, state: 'DRAINING', lifecycleJobId: JOB, lifecycleDigest: 'd'.repeat(64) }), { phase: 'stopping', reason: null }, 'switching'],
+            // 09:36:33 compute-transition failed stop_placement_unconfirmed on live: the release FAILED (lifecycle_instance_invalid).
+            ['09:36:33.500', failedRelease(base), { phase: 'stopping', reason: 'stop_healing' }, 'switching'],
+            // 09:37:00 the replay release (here: the driver's next status look) reserves RECOVERING.
+            ['09:37:00.400', replaying(base), { phase: 'stopping', reason: 'stop_healing' }, 'switching'],
+            ['09:37:05.900', placement({ ...base, state: 'STOPPED', lastError: 'pool_released' }), { phase: 'waking', reason: null }, 'switching'],
+            // 09:37:06 adopt of an m6i.xlarge on the next epoch, then RUNNING.
+            ['09:37:06.200', placement({ ...base, state: 'LEASED', generation: 5, leaseEpoch: 12, instanceType: 'm6i.xlarge', instanceId: null }), { phase: 'waking', reason: null }, 'leased'],
+            ['09:37:40.000', placement({ ...base, state: 'RUNNING', generation: 5, leaseEpoch: 12, instanceType: 'm6i.xlarge' }), { phase: 'done', reason: null }, 'running'],
+        ];
+        for (const [time, p, expected, stage] of steps) {
+            const resolved = resolveTransition(t, p, T(time));
+            expect(resolved, time).toEqual(expected);
+            const view = TRANSITION_IN_FLIGHT_PHASES.includes(resolved.phase) ? transitionView(t, resolved) : null;
+            expect(describeProgress(C, p, null, env, T(time), null, { transition: view }), time).toMatchObject({ stage, needsOperator: false });
+        }
+    });
+});
+const TRANSITION_IN_FLIGHT_PHASES: readonly string[] = ['requested', 'stopping', 'waking'];

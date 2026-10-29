@@ -28,7 +28,7 @@ import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/
 import type { BillingDeps } from '@/server/billing/ports';
 import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 import { planFromSubscriptions } from '@/server/billing/v3/catalog';
-import type { SwitchConfigurationOutputV3, SwitchPhaseV3 } from '@/server/billing/v3/contract';
+import type { SwitchConfigurationOutputV3, SwitchHealReasonV3, SwitchPhaseV3 } from '@/server/billing/v3/contract';
 import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
 import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
 import { recordComputeTiming } from '@/server/lib/compute/aws-pool-timing';
@@ -49,6 +49,7 @@ import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
+import type { ReleaseHeal } from '@/server/lib/compute/release-heal';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
 import { migrationStartingAnswer } from '@/server/lib/compute/provider-migrate-placement';
@@ -208,6 +209,16 @@ export const AWS_SHELL_STOP_BUDGET_MS = 200_000;
 /** Interval between status looks (each applies the stop's lifecycle receipt). */
 export const AWS_SHELL_STOP_POLL_MS = 5_000;
 
+const STOP_HEALING = 'stop_healing' satisfies SwitchHealReasonV3;
+const RELEASE_HEAL_FAILED = 'release_heal_failed' satisfies SwitchHealReasonV3;
+/** The stored reason of a transition stop that did not confirm; the D2 heal reasons are the pinned codes, exactly. */
+function stopFailureReason(outcome: string | undefined): string {
+    if (outcome === 'still_running') return 'stop_timeout';
+    if (outcome === STOP_HEALING) return 'release_heal_timeout' satisfies SwitchHealReasonV3;
+    if (outcome === RELEASE_HEAL_FAILED) return RELEASE_HEAL_FAILED;
+    return `stop_${outcome ?? 'refused'}`.slice(0, 64);
+}
+
 /**
  * The shell's stop contract (`POST /api/shell/stop`, e2e/hosted-continuity.mjs) for an
  * AWS computer: a CONFIRMED answer, never "requested". An AWS stop is asynchronous (a
@@ -217,6 +228,10 @@ export const AWS_SHELL_STOP_POLL_MS = 5_000;
  * - reaches STOPPED within the budget → `{ ok: true, terminated: true, outcome: 'destroyed' }`;
  * - still draining/stopping at the deadline → `{ ok: false, terminated: false, outcome:
  *   'still_running' }`, the shell's "not yet" (the client asks again; never a false success);
+ * - round 5 D2: a failed pool release the platform is healing (status `releaseHeal: 'pending'`;
+ *   each status look applies the receipt, which runs `reconcilePoolReleaseRecovery`, aws-receipts.ts:249)
+ *   is still this stop: polling continues through UNCONFIRMED/RECOVERING to STOPPED/pool_released.
+ *   A heal that fails → `release_heal_failed`; still healing at the deadline → `stop_healing` (not yet);
  * - any other answer (refused, moved to another state) is returned as a failure unchanged.
  */
 export async function confirmAwsStop(
@@ -231,16 +246,20 @@ export async function confirmAwsStop(
     const first = await provider.stop(ctx, computer, 'user');
     if (first.ok) return { ok: true, terminated: false, outcome: 'not_running' };
     if (!['stopping', 'placement_draining', 'placement_stopping'].includes(first.outcome ?? '')) return first;
+    let healing = false;
     while (now() < deadline) {
         await sleep(Math.max(0, Math.min(opts.pollMs ?? AWS_SHELL_STOP_POLL_MS, deadline - now())));
-        const placementState = ((await provider.status(ctx, computer)) as AwsComputeStatus).placementState;
+        const status = (await provider.status(ctx, computer)) as AwsComputeStatus & { releaseHeal?: ReleaseHeal };
+        const placementState = status.placementState;
         if (placementState === 'STOPPED') return { ok: true, terminated: true, outcome: 'destroyed' };
-        if (placementState !== 'DRAINING' && placementState !== 'STOPPING') {
+        healing = placementState !== 'DRAINING' && placementState !== 'STOPPING' && status.releaseHeal === 'pending';
+        if (status.releaseHeal === 'failed') return { ok: false, terminated: false, outcome: RELEASE_HEAL_FAILED, error: RELEASE_HEAL_FAILED };
+        if (placementState !== 'DRAINING' && placementState !== 'STOPPING' && !healing) {
             const outcome = placementState ? `placement_${placementState.toLowerCase()}` : 'aws_status_unavailable';
             return { ok: false, terminated: false, outcome, error: outcome };
         }
     }
-    return { ok: false, terminated: false, outcome: 'still_running' };
+    return { ok: false, terminated: false, outcome: healing ? STOP_HEALING : 'still_running' };
 }
 
 /**
@@ -360,6 +379,8 @@ async function settleStored(db: PlacementExecutor, billing: BillingDeps, compute
  * cold) because the stored preference now names the target. `ensure` is only ever called on a
  * non-RUNNING placement (it never renews a lease as owner presence). Completion is RUNNING on
  * a later lease epoch; UNCONFIRMED, `capacity:*`, a refused open or a budget overrun fails.
+ * Round 5 D2: a failed release being healed is waited through inside `confirmAwsStop` (reads see
+ * `stopping` / `stop_healing`, so `settleStored` neither ends the transition nor reverts the preference).
  */
 export async function driveTransition(db: PlacementDb, computer: ComputerRef, t: ComputerTransition, deps: TransitionDeps = {}): Promise<ComputerTransition> {
     const env = deps.env ?? process.env, clock = deps.now ?? (() => new Date());
@@ -382,7 +403,7 @@ export async function driveTransition(db: PlacementDb, computer: ComputerRef, t:
         if (current.phase === 'stopping') {
             const stopped = await confirmAwsStop(routed.provider, ctx, computer, { budgetMs: deps.stop?.budgetMs ?? TRANSITION_STOP_TIMEOUT_MS,
                 pollMs: deps.stop?.pollMs, sleep, now: () => clock().getTime() });
-            if (!stopped.ok) return fail(stopped.outcome === 'still_running' ? 'stop_timeout' : `stop_${stopped.outcome ?? 'refused'}`.slice(0, 64));
+            if (!stopped.ok) return fail(stopFailureReason(stopped.outcome));
             if (!await advance('waking', { wakingAt: clock().toISOString() })) return current;
         }
         const gate = await gateComputerStart({ deps: billing, ...computer, kind: 'aws-ec2', instanceType: routed.instanceType, now: billing.now() });

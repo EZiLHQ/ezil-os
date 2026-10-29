@@ -50,7 +50,9 @@ vi.mock('@/server/lib/compute/progress', async original => {
 });
 
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
-import { readComputerMeta, resolveTransition, transitionView, type ComputerTransition } from '@/server/lib/compute/progress';
+import { parseTransition, readComputerMeta, resolveTransition, transitionView, type ComputerTransition } from '@/server/lib/compute/progress';
+import { readPlacement } from '@/server/lib/compute/placement';
+import { POOL_RELEASE_RECOVERY_PREFIX, releaseHealOf } from '@/server/lib/compute/release-heal';
 import type { ComputeProvider } from '@/server/lib/compute/provider';
 import type { BillingDeps } from '@/server/billing/ports';
 import { restartWholeComputer, switchComputerConfiguration, type TransitionDeps, type RouteOptions } from './compute-dispatch';
@@ -61,7 +63,31 @@ const computer = { userId: U, computerId: C };
 const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_COMPUTE_PLACEMENT_READS: '1' };
 const TYPE: Record<string, string> = { 'std-2': 'm6i.large', 'cmp-4': 'm6i.xlarge', 'cmp-8': 'm6i.2xlarge' };
 
-function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed' | 'warm'; stop?: 'ok' | 'never' } = {}) {
+const JOB = '33333333-3333-4333-8333-333333333333';
+const REPLAY_JOB = '44444444-4444-4444-8444-444444444444';
+/** Round 5 D2: what each status look (its receipt + reconcilePoolReleaseRecovery pass) does to a release that failed once. */
+type ReleaseScript = 'release_flake' | 'release_heal_fail' | 'release_stuck';
+const RELEASE_SCRIPTS: Record<ReleaseScript, Record<string, Record<string, unknown>>> = {
+    release_flake: {
+        // aws-receipts.ts:340-345: the FAILED release execution → UNCONFIRMED failed:*, job and digest kept, enrollment cleared.
+        DRAINING: { state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed', lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64),
+            enroll_nonce_hash: null, enroll_consumed_hash: null, enroll_expires_at: null },
+        // The recovery reserves RECOVERING with the replay intent, then settles STOPPED/pool_released.
+        UNCONFIRMED: { state: 'RECOVERING', lifecycle_job_id: REPLAY_JOB, last_error: POOL_RELEASE_RECOVERY_PREFIX
+            + JSON.stringify({ intent: { operation: 'release', jobId: REPLAY_JOB }, sourceJobId: JOB, stoppedAt: null, error: null }) },
+        RECOVERING: { state: 'STOPPED', last_error: 'pool_released', lifecycle_job_id: null, lifecycle_digest: null, lease_until: null },
+    },
+    release_heal_fail: {
+        DRAINING: { state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed', lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64) },
+        UNCONFIRMED: { last_error: POOL_RELEASE_RECOVERY_PREFIX + JSON.stringify({ error: 'termination_not_proven' }) },
+    },
+    // The recovery never advances past UNCONFIRMED (e.g. the terminated host is still shutting-down).
+    release_stuck: {
+        DRAINING: { state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed', lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64) },
+    },
+};
+
+function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'capacity' | 'stuck' | 'unconfirmed' | 'warm'; stop?: 'ok' | 'never' | ReleaseScript } = {}) {
     const prepared = new Set<number>();
     const fake = createFakePlacementDb({ placements: [placementRow({
         computer_id: C, owner_user_id: U, state: 'RUNNING', generation: 3, lease_epoch: 7, region: 'ap-south-1', zone_id: 'aps1-az1',
@@ -70,6 +96,8 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
     const p = () => fake.placements[0]!;
     let clock = Date.parse('2026-10-28T10:00:00.000Z');
     const calls = { stop: 0, ensure: 0, leases: 0, status: 0, leasedSizes: [] as string[] };
+    /** Per status look: the resolved transition reason and the stored size preference at that moment. */
+    const observed = { reasons: [] as (string | null)[], preferences: [] as (string | null)[] };
     const provider = (options: RouteOptions): ComputeProvider => ({
         kind: 'aws-ec2',
         async stop() {
@@ -81,10 +109,18 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
         },
         async status() {
             calls.status++;
-            const next: Record<string, string> = script.stop === 'never' ? {} : { DRAINING: 'STOPPING', STOPPING: 'STOPPED' };
+            const released = script.stop && script.stop in RELEASE_SCRIPTS ? RELEASE_SCRIPTS[script.stop as ReleaseScript] : null;
+            const next: Record<string, string> = script.stop === 'never' || released ? {} : { DRAINING: 'STOPPING', STOPPING: 'STOPPED' };
             Object.assign(next, { LEASED: 'STARTING', STARTING: 'MOUNTING', MOUNTING: 'RUNNING' });
-            if (next[p().state as string]) p().state = next[p().state as string];
-            return { ok: true, placementState: p().state } as never;
+            if (released?.[p().state as string]) Object.assign(p(), released[p().state as string]);
+            else if (next[p().state as string]) p().state = next[p().state as string];
+            // Like aws-ec2 `status`: the placement-only heal state, present only when there is one.
+            const record = (await readPlacement(fake.db, C, U)).record;
+            const heal = releaseHealOf(record);
+            const t = parseTransition(h.metadata.transition, computer);
+            if (t) observed.reasons.push(resolveTransition(t, record, new Date(clock)).reason);
+            observed.preferences.push(h.preference);
+            return { ok: !['UNCONFIRMED', 'RECOVERING'].includes(String(p().state)), placementState: p().state, ...(heal ? { releaseHeal: heal } : {}) } as never;
         },
         async ensure() {
             calls.ensure++;
@@ -130,7 +166,7 @@ function harness(row: Record<string, unknown> = {}, script: { ensure?: 'ok' | 'c
     };
     const run = async () => { while (scheduled.length) await scheduled.shift()!(); };
     const stored = () => h.metadata.transition as ComputerTransition | undefined;
-    return { fake, p, calls, deps, run, store, preflight, preparePool, migration, stored, tick: (ms: number) => { clock += ms; }, now: () => new Date(clock) };
+    return { fake, p, calls, observed, deps, run, store, preflight, preparePool, migration, stored, tick: (ms: number) => { clock += ms; }, now: () => new Date(clock) };
 }
 
 beforeEach(() => {
@@ -269,6 +305,65 @@ describe('switchConfiguration: RUNNING applies now (stop, then wake on the targe
         const next = await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000002' }, s.deps);
         expect(next).toMatchObject({ ok: true, effective: 'switching', target: 'cmp-4' });
         expect(h.preference).toBe('cmp-4');
+    });
+});
+
+describe('round 5 D2: a release that fails and heals during a switch (release_flake)', () => {
+    it('release FAILED → RECOVERING → STOPPED/pool_released → adopt → done; reasons stop_healing then null; preference intact', async () => {
+        const s = harness({}, { stop: 'release_flake' });
+        const out = await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        expect(out).toMatchObject({ ok: true, effective: 'switching', current: 'std-2', target: 'cmp-4' });
+        await s.run();
+        expect(s.observed.reasons).toEqual(['stop_healing', 'stop_healing', null]);
+        expect(s.observed.preferences).toEqual(['cmp-4', 'cmp-4', 'cmp-4']);
+        expect(s.calls).toMatchObject({ stop: 1, leases: 1, leasedSizes: ['cmp-4'] });
+        expect(s.p()).toMatchObject({ state: 'RUNNING', instance_type: 'm6i.xlarge', generation: 4, lease_epoch: 8 });
+        expect(s.stored()).toMatchObject({ phase: 'done', reason: null });
+        expect(h.preference).toBe('cmp-4');
+        expect(s.store.setSizePreference).toHaveBeenCalledTimes(1); // the switch's own write; never a revert
+    });
+    it('a restart inherits it: heal, then the same size again', async () => {
+        const s = harness({}, { stop: 'release_flake' });
+        await restartWholeComputer(s.fake.db, computer, { requestId: 'restart-0001' }, s.deps);
+        await s.run();
+        expect(s.observed.reasons).toEqual(['stop_healing', 'stop_healing', null]);
+        expect(s.stored()).toMatchObject({ kind: 'restart', phase: 'done', reason: null });
+        expect(s.calls.leasedSizes).toEqual(['std-2']);
+    });
+    it('while healing, the same request answers switching, the transition is not ended and the preference is not reverted (settleStored)', async () => {
+        const s = harness({}, { stop: 'release_flake' });
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        // The driver died after the stop began; the release then failed (the 09:36:33Z row).
+        Object.assign(h.metadata.transition as object, { phase: 'stopping', stoppingAt: s.now().toISOString() });
+        Object.assign(s.p(), RELEASE_SCRIPTS.release_flake.DRAINING);
+        s.tick(25_000);
+        const again = await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        expect(again).toMatchObject({ ok: true, effective: 'switching', target: 'cmp-4' });
+        expect(await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-8', requestId: 'click-000002' }, s.deps)).toEqual({ ok: false, reason: 'switch_in_progress' });
+        expect(s.stored()).toMatchObject({ phase: 'stopping', reason: null, endedAt: null });
+        expect(h.preference).toBe('cmp-4');
+        expect(resolveTransition(s.stored()!, (await readPlacement(s.fake.db, C, U)).record, s.now())).toEqual({ phase: 'stopping', reason: 'stop_healing' });
+        // Past the existing 230 s stop bound with no heal: release_heal_timeout (non-retryable; the failed switch reverts as before).
+        s.tick(210_000);
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        expect(s.stored()).toMatchObject({ phase: 'failed', reason: 'release_heal_timeout' });
+    });
+    it('a heal that fails ends the switch as release_heal_failed (not stop_placement_unconfirmed); no wake', async () => {
+        const s = harness({}, { stop: 'release_heal_fail' });
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        await s.run();
+        expect(s.observed.reasons).toEqual(['stop_healing', 'release_heal_failed']);
+        expect(s.observed.preferences).toEqual(['cmp-4', 'cmp-4']);
+        expect(s.stored()).toMatchObject({ phase: 'failed', reason: 'release_heal_failed' });
+        expect(s.calls.leases).toBe(0);
+    });
+    it('a heal still pending when the driver\'s stop budget ends fails as release_heal_timeout, not stop_timeout', async () => {
+        const s = harness({}, { stop: 'release_stuck' });
+        await switchComputerConfiguration(s.fake.db, computer, { size: 'cmp-4', requestId: 'click-000001' }, s.deps);
+        await s.run();
+        expect(new Set(s.observed.reasons)).toEqual(new Set(['stop_healing']));
+        expect(s.stored()).toMatchObject({ phase: 'failed', reason: 'release_heal_timeout' });
+        expect(s.calls.leases).toBe(0);
     });
 });
 

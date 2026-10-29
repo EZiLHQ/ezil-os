@@ -800,6 +800,32 @@ describe('Codex #3: computer.delete retires an AWS computer before it is soft-de
     });
 });
 
+describe('round 5 D2: status reports a failed pool release being healed (releaseHeal)', () => {
+    const me = { userId: U1, computerId: C1 };
+    const JOB = '33333333-3333-4333-8333-333333333333';
+    const failed = (over: Record<string, unknown> = {}) => stopped({ state: 'UNCONFIRMED', lease_epoch: 4, last_error: 'failed:LifecycleUnconfirmed',
+        lifecycle_job_id: JOB, lifecycle_digest: 'd'.repeat(64), ...over });
+    it('UNCONFIRMED failed:* with its job: releaseHeal pending, the placement state unchanged', async () => {
+        const { provider } = setup({ placements: [failed()] });
+        expect(await provider.status(ctx, me)).toMatchObject({ ok: false, error: 'placement_unconfirmed', placementState: 'UNCONFIRMED', releaseHeal: 'pending' });
+    });
+    it('a recovery that recorded a non-retryable error: releaseHeal failed', async () => {
+        const { provider } = setup({ placements: [failed({ last_error: 'pool_release_recovery:{"error":"termination_not_proven"}' })] });
+        expect(await provider.status(ctx, me)).toMatchObject({ placementState: 'UNCONFIRMED', releaseHeal: 'failed' });
+    });
+    it('a RECOVERING release replay: releaseHeal pending (state starting, as before)', async () => {
+        const { provider } = setup({ placements: [failed({ state: 'RECOVERING',
+            last_error: 'pool_release_recovery:' + JSON.stringify({ intent: { operation: 'release' }, sourceJobId: JOB, stoppedAt: null, error: null }) })] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'starting', placementState: 'RECOVERING', releaseHeal: 'pending' });
+    });
+    it('no heal: the field is absent (existing answers unchanged)', async () => {
+        const { provider } = setup({ placements: [stopped({ state: 'STOPPED', lease_epoch: 4 })] });
+        expect(await provider.status(ctx, me)).not.toHaveProperty('releaseHeal');
+        const other = setup({ placements: [failed({ lifecycle_job_id: null, lifecycle_digest: null })] });
+        expect(await other.provider.status(ctx, me)).not.toHaveProperty('releaseHeal');
+    });
+});
+
 describe('Codex #6: a guest-initiated idle stop is reconciled into the placement', () => {
     const me = { userId: U1, computerId: C1 };
     const describerSaying = (state: string | 'throw' | null) => {
