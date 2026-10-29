@@ -307,10 +307,19 @@ function paint () {
         if (restoreFocus) host.querySelector('#ezil-preview-port')?.focus();
         return;
     }
+    // D6: the plain answer (where it runs, on which configuration) stays in view; identifiers, the
+    // slot, the image, the measurements and how each value was obtained sit behind a closed Details.
+    const detailsOpen = host.querySelector('details[data-role="sys-details"]')?.open === true;
     host.innerHTML = `
         <h3>System</h3>
-        <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
-           Each value says whether it is recorded, configured or measured; anything not known right now is labelled or shows as ${UNKNOWN}.</p>
+        <p class="ezil-sys-lead">What this window is connected to.</p>
+
+        <h4>Machine</h4>
+        ${(() => { const p = describeRunningOn(systemInfo, systemInfoReason); return row('Running on', esc(p.value), esc(p.hint), 'sys-running-on'); })()}
+        ${(() => { const p = describePlan(systemInfo); return row('Configuration', esc(p.value), esc(p.hint), 'sys-configuration'); })()}
+
+        <details class="ezil-sys-details" data-role="sys-details"${detailsOpen ? ' open' : ''}><summary>Details</summary>
+        <p class="ezil-sys-note">Each value says whether it is recorded, configured or measured; anything not known right now is labelled or shows as ${UNKNOWN}.</p>
 
         <h4>Linked computer</h4>
         ${row('Name', computer ? esc(computer.name) : UNKNOWN)}
@@ -318,9 +327,7 @@ function paint () {
         ${row('Identifier', computer ? `<code>${esc(String(computer.id).slice(0, 8))}…</code>` : UNKNOWN,
               'The sandbox this session is bound to.')}
 
-        <h4>Machine</h4>
-        ${(() => { const p = describeRunningOn(systemInfo, systemInfoReason); return row('Running on', esc(p.value), esc(p.hint), 'sys-running-on'); })()}
-        ${(() => { const p = describePlan(systemInfo); return row('Configuration', esc(p.value), esc(p.hint), 'sys-configuration'); })()}
+        <h4>Machine details</h4>
         ${(() => { const i = describeImage(systemInfo); return row('Image', i.title ? `<code title="${esc(i.title)}">${esc(i.value)}</code>` : esc(i.value)); })()}
         ${(() => { const m = describeMachine(systemInfo); return row('Size', esc(m.value), esc(m.hint)); })()}
         ${(() => { const u = describeUsage(); return row('CPU and memory use', esc(u.value), esc(u.hint)); })()}
@@ -347,6 +354,7 @@ function paint () {
         ${row('Round trip', num(v.rttMs, ' ms'), 'Measured on the selected connection route.')}
         ${row('Jitter', num(v.jitterMs, ' ms'))}
         ${row('Packets lost', num(v.packetsLost))}`)}
+        </details>
     `;
 }
 

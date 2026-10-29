@@ -257,6 +257,9 @@ export function reasonCopy (errorCode) {
     }
 }
 
+/** Round 5 (D6): one Restart duration, quoted identically in the description and while it runs. */
+const RESTART_DESKTOP_TIME = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
+
 function render ($win) {
     const $body = $win.find('[data-role="troubleshoot-body"]');
     if ( $body.length === 0 ) return; // pane not mounted (wrong tab active) — nothing to draw yet
@@ -270,7 +273,8 @@ function render ($win) {
         // confirm it is gone (`RESTART_STOP_DEADLINE_MS`) BEFORE it starts the
         // ~22s boot. Quoting only the boot half would make a normal restart
         // look overdue while it is still going fine.
-        statusHtml = '<p class="ezil-settings-muted">Restarting… this usually takes about 45 seconds and can take up to 3 minutes.</p>';
+        // D6: the same sentence as the section description, so the two never disagree.
+        statusHtml = `<p class="ezil-settings-muted">${RESTART_DESKTOP_TIME}</p>`;
     } else if ( status === 'restarted' ) {
         statusHtml = '<p class="ezil-settings-muted">Restart requested. Give it a few seconds, then reopen the '
             + 'desktop from the taskbar or Start menu if it does not reconnect on its own.</p>';
@@ -320,7 +324,7 @@ function render ($win) {
             ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If the desktop is frozen or not responding, restart it. Your files are not touched
             by either restart, and the computer itself is not deleted.`}
         </p>
-        ${isNative() ? '' : '<h3>Restart desktop</h3><p class="ezil-settings-muted">Restarts the desktop and its apps on this machine. Files stay. About 20 seconds.</p>'}
+        ${isNative() ? '' : `<h3>Restart desktop</h3><p class="ezil-settings-muted">Restarts the desktop and its apps on this machine. Files stay. ${RESTART_DESKTOP_TIME}</p>`}
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
             ${isNative() ? 'hidden' : ''} ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
         ${statusHtml}

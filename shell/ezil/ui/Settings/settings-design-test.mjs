@@ -452,7 +452,14 @@ await check('Confirm: the sheet styles use tokens only (accent primary, dark sur
 const RESTART = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
 await check('Troubleshoot: the Restart copy is one sentence, identical in both places', () => {
     const src = read('tabs/troubleshoot.js');
-    assert.equal(src.split(RESTART).length - 1, 2, 'the sentence appears in the description and in the restarting status');
+    // Either the sentence is written twice, or it is one constant interpolated into both places.
+    const named = src.match(/const (\w+) = '([^']+)';/g)?.map(line => line.match(/const (\w+) = '([^']+)';/)).find(m => m[2] === RESTART)?.[1];
+    const uses = named ? src.split('${' + named + '}').length - 1 : src.split(RESTART).length - 1;
+    assert.equal(uses, 2, 'the sentence appears in the description and in the restarting status');
+    if ( named ) {
+        assert.match(src, new RegExp(`Restart desktop</h3><p class="ezil-settings-muted">[^<]*\\$\\{${named}\\}</p>`), 'description');
+        assert.match(src, new RegExp(`statusHtml = \`<p class="ezil-settings-muted">\\$\\{${named}\\}</p>\``), 'restarting status');
+    }
     assert.doesNotMatch(src, /About 20 seconds/);
     assert.deepEqual(scanCopy(RESTART), []);
 });

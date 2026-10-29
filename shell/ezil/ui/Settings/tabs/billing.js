@@ -5,6 +5,7 @@ import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
+import { openConfirmSheet } from '../sheet-frame.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -755,6 +756,8 @@ async function act ($win, state, action, value) {
 
 export default {
     id: 'billing', label: 'Billing', icon: BILLING_ICON,
+    /** The shared sheet-frame confirmation; Settings → Computer reaches it through this module (D6). */
+    confirmSheet: openConfirmSheet,
     available (ctx) {
         return ! isNative(ctx) && TabAccount.available(ctx)
             && (ctx?.payload?.features ?? bootPayload()?.features)?.billing === true;
