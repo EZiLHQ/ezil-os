@@ -160,7 +160,10 @@ async function openingOptions(db: PlacementExecutor, computer: { computerId: str
     const quiet = async <T>(read: () => Promise<T>, fallback: T): Promise<T> => { try { return await read(); } catch { return fallback; } };
     const meta = await quiet(() => readComputerMeta(db, computer), null);
     const resolved = meta?.transition ? resolveTransition(meta.transition, p, now) : null;
-    if (meta?.transition && resolved) options.transition = transitionView(meta.transition, resolved);
+    // The DTO shows the reconciled transition (a recovered or superseded failure is not "didn't finish");
+    // the opening below keeps the unreconciled phase, so a recovered `done` never relabels its path.
+    const reconciled = meta?.transition ? reconcileTransition(meta.transition, p, now) : null;
+    options.transition = meta?.transition && reconciled?.current ? transitionView(meta.transition, reconciled) : null;
     const aws = p?.provider === 'aws-ec2' ? p : null;
     if (aws?.state === 'STOPPED') options.capacityWaiting = await quiet(() => pool.hasActiveCapacityDemand(db, aws.computerId, now), false);
     const poolTimes = aws ? await quiet(() => pool.readPoolOpening(db, aws, now), null) : null;
@@ -321,6 +324,31 @@ export function resolveTransition(t: ComputerTransition, p: Placement | null, no
     const wakeFrom = ms(t.wakingAt) || (ms(t.stoppingAt) || ms(t.requestedAt)) + TRANSITION_STOP_TIMEOUT_MS;
     if (elapsed(wakeFrom) > TRANSITION_WAKE_TIMEOUT_MS) return { phase: 'failed', reason: 'wake_timeout' };
     return { phase: 'waking', reason: null };
+}
+
+export interface ReconciledTransition { phase: SwitchPhaseV3; reason: string | null; current: boolean }
+/**
+ * What a stored transition means NOW against the placement (pure). A stored failure is
+ * advisory history: a later lease epoch may have run the target anyway (a heal released the
+ * host and the user's own open booted the switch's size), or the user's own later opening
+ * may have replaced it. In flight → `resolveTransition`, current; stored `done` → as stored.
+ * A stored failure is obsolete once the AWS placement is past the switch's own epoch (> from + 1).
+ * At exactly from + 1: RUNNING on the target is `done` (recovered); with no wake recorded the
+ * epoch is the user's later opening (superseded, not current); its own wake RUNNING elsewhere
+ * is `size_not_applied`; its own wake not running keeps the stored failure. At or before the
+ * switch's epoch (or no AWS placement) nothing has happened since: a real failure stays.
+ */
+export function reconcileTransition(t: ComputerTransition, p: Placement | null, now: Date): ReconciledTransition {
+    const resolved = resolveTransition(t, p, now);
+    // In flight (even one that resolves failed) and stored `done`: the resolved phase, current.
+    if (t.phase !== 'failed') return { ...resolved, current: true };
+    const aws = p?.provider === 'aws-ec2' ? p : null;
+    if (!aws || aws.leaseEpoch <= t.fromLeaseEpoch) return { ...resolved, current: true };
+    if (aws.leaseEpoch > t.fromLeaseEpoch + 1) return { ...resolved, current: false };
+    if (aws.state === 'RUNNING' && aws.instanceType === SIZES[t.target].machine) return { phase: 'done', reason: null, current: true };
+    if (t.wakingAt === null) return { ...resolved, current: false };
+    if (aws.state === 'RUNNING') return { phase: 'failed', reason: 'size_not_applied', current: true };
+    return { ...resolved, current: true };
 }
 
 export interface TransitionView {

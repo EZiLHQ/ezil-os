@@ -69,6 +69,17 @@ const EASE_CAP = 0.9;
 const formatBytes = bytes => bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(1)} GB` : `${Math.round(bytes / 1_000_000)} MB`;
 const vcpuOf = size => { const m = typeof size === 'string' && /^(?:std|cmp)-(\d+)$/.exec(size); return m ? Number(m[1]) : null; };
 const time = value => { const at = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(at) ? at : null; };
+/**
+ * The loading-stage sentence for a reached server milestone (HF3). "Almost there" only at
+ * desktop_ready (reached 4, the server's ready): never earlier, never for a hold or failure.
+ */
+function stageBody (reached, path, appName) {
+    if (reached >= 4) return `Almost there — waiting for ${appName || 'your desktop'} to connect.`;
+    if (reached >= 3) return `The desktop is starting. ${appName ? `${appName} opens` : 'Your apps open'} next.`;
+    if (reached >= 2) return 'Your files are attached. The desktop is starting.';
+    if (reached >= 1) return 'A machine is ready and starting up.';
+    return path === 'cold' ? 'Preparing a new machine — this can take a few minutes.' : 'Finding a machine for your computer.';
+}
 
 /** "0:42", "12:05". */
 export function formatElapsed (seconds) {
@@ -149,32 +160,39 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
     const waking = transition?.phase === 'waking';
     const starting = !appName || path === 'switch' ? 'Starting your desktop' : `Starting ${appName}`;
     const preOpening = openRequested === true && ['stopped', 'purge_eligible'].includes(stage) && !opening && !migration;
-    let title = stages[stage][0];
+    const hold = HOLD.includes(stage);
+    // HF3: while an AWS opening or switch is underway the body is ONE loading-stage sentence, keyed by
+    // the server's `reached` (never the client clock), set together with the title so the two agree.
+    let title = stages[stage][0], body = preOpening || moving >= 0 || (opening && !hold) ? '' : stages[stage][1];
     if (preOpening) title = 'Starting your computer';
     else if (moving >= 0) title = migrationSteps[moving];
     else if (opening) {
-        if (stage === 'switching') title = waking ? machine : stages.switching[0];
-        else if (stage === 'restarting') title = waking ? 'Starting your computer' : stages.restarting[0];
-        else if (stage === 'waiting_capacity') title = stages.waiting_capacity[0];
-        else if (reached >= 3) title = starting;
-        else if (reached >= 2) title = 'Attaching your files';
-        else if (path === 'switch') title = machine;
-        else title = 'Starting your computer';
+        const healing = IN_FLIGHT.includes(transition?.phase) && transition.reason === 'stop_healing';
+        if (healing) {
+            title = `Recovering your computer before the ${transition.kind === 'restart' ? 'restart' : 'switch'}`;
+            body = 'A release did not confirm; the computer is being checked. Your files are safe.';
+        } else if (stage === 'switching') {
+            title = waking ? machine : stages.switching[0];
+            body = waking ? 'Starting your computer on the new configuration.' : 'Your files stay with your computer.';
+        } else if (stage === 'restarting') {
+            title = waking ? 'Starting your computer' : stages.restarting[0];
+            body = waking ? 'Starting your computer again.' : 'Your files stay with your computer.';
+        } else if (stage === 'waiting_capacity') {
+            title = stages.waiting_capacity[0]; body = stageBody(0, path, appName);
+        } else if (reached >= 3) { title = starting; body = stageBody(reached, path, appName); }
+        else if (reached >= 2) { title = 'Attaching your files'; body = stageBody(2, path, appName); }
+        else if (path === 'switch') { title = machine; body = 'Starting your computer on the new configuration.'; }
+        else { title = 'Starting your computer'; body = stageBody(reached, path, appName); }
     }
-    const hold = HOLD.includes(stage);
     const bar = hold || (!opening && moving < 0) ? null : {
         startedAtMs: openingStartedAt, expected, reached: opening ? reached : moving,
         floors: opening ? MILESTONE_FLOOR : MIGRATION_FLOOR,
         migrationFraction: moving === 2 && percent !== null ? MIGRATION_FLOOR[2] + (MIGRATION_FLOOR[3] - MIGRATION_FLOOR[2]) * percent / 100 : null,
     };
-    const hardware = data.selectedNextOpenHardware;
-    const next = features?.devDetails === true && hardware?.effective === 'next_open' && Number.isSafeInteger(hardware.vcpu) && hardware.vcpu > 0
-        && Number.isFinite(hardware.memoryGiB) && hardware.memoryGiB > 0
-        ? `Next session: ${hardware.vcpu} vCPU · ${hardware.memoryGiB} GiB memory. Applies after you stop this session and start again.` : '';
     return {
         stage, path, title,
-        // One status line while opening or moving; other states keep one explanatory sentence.
-        body: preOpening || ((opening || moving >= 0) && !hold) ? '' : stages[stage][1],
+        // One loading-stage sentence while opening; none while moving; other states keep one explanatory sentence.
+        body,
         bytes: moving === 2 && measured ? `${formatBytes(data.bytes.transferred)} of ${formatBytes(data.bytes.total)}` : '',
         manualAttention: data.recordedStage === 'failed_needs_operator' || data.stage === 'failed_needs_operator',
         active: data.active === true && !['operations_paused', 'needs_operator', 'queued', 'unavailable', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
@@ -183,10 +201,10 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
         elapsed, expected, reached, serverReady, bar,
         // No server opening to measure yet: the surface shows an indeterminate bar, never a guessed position.
         indeterminate: preOpening,
-        transition: transition ? { transitionId: transition.transitionId, kind: transition.kind, phase: transition.phase, target: transition.target } : null,
+        transition: transition ? { transitionId: transition.transitionId, kind: transition.kind, phase: transition.phase, target: transition.target,
+            reason: typeof transition.reason === 'string' ? transition.reason : null } : null,
         // The opening, not its path: `cold` becomes `warm` when a pool host is adopted mid-opening.
         openingKey: String(openingStartedAt),
-        next,
         updated: features?.devDetails === true && typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
             ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,
     };
@@ -248,7 +266,7 @@ const ICON_URL = /^(?:data:image\/(?:svg\+xml|png|gif|webp|jpeg)[;,]|https:\/\/|
  * The one opening surface. Builds its DOM once; `paint(model)` only updates it.
  *
  *   model.status   the one status line (or a failure title)
- *   model.body     one sentence, only for failures and hold states
+ *   model.body     one sentence: the loading stage while opening, or a failure / hold explanation
  *   model.percent  0..100 for a determinate bar, 'indeterminate', or null (no bar)
  *   model.key      the opening the percent belongs to; the bar never regresses within one
  *   model.meta     muted line: the elapsed time, or the long-wait note

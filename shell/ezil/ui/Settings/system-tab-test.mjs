@@ -238,3 +238,20 @@ test('Round 4: a Free user with files on the AWS computer sees truthful Running 
     assert.equal(rowText('sys-configuration'), 'Plan: Free · files kept on this computer');
     assert.doesNotMatch(host.innerHTML, /Not reported<|Plan entitlement is not available|ap-south-1|Mumbai/);
 });
+
+test('HF3: a real failed switch names the size the computer is on; a recovered one is ready on the running size', async () => {
+    const machine = { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' };
+    const t = { transitionId: 't-f', kind: 'switch', current: 'std-2', target: 'cmp-4', phase: 'failed', reason: 'wake_timeout', revertAvailable: true };
+    let plan = { standing: 'paid', vcpu: 4, memoryGB: 16, status: 'failed', reason: 'wake_timeout', current: 'std-2', selected: 'std-2', transition: t };
+    answer = () => ({ ok: true, info: { provider: 'aws-ec2', providerSource: 'placement', lifecycleState: 'RUNNING', usage: null, machine, image: { id: 'running-image', source: 'running' }, plan } });
+    await activate();
+    const row = role => host.innerHTML.match(new RegExp(`data-role="${role}">\\s*<div class="ezil-sys-k">[^<]*</div>\\s*<div class="ezil-sys-v">([^<]*)</div>\\s*(?:<div class="ezil-sys-h">([^<]*)</div>)?`));
+    assert.equal(row('sys-configuration')?.[1], 'Switch to 4 vCPU / 16 GB didn&#39;t finish');
+    assert.equal(row('sys-configuration')?.[2], 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.');
+    assert.doesNotMatch(host.innerHTML, /back on/);
+    system.onDeactivate();
+    plan = { standing: 'paid', vcpu: 4, memoryGB: 16, status: 'ready', reason: null, current: 'cmp-4', selected: 'cmp-4', transition: null };
+    await activate();
+    assert.equal(row('sys-configuration')?.[1], '4 vCPU / 16 GB on AWS (India)');
+    assert.doesNotMatch(host.innerHTML, /didn&#39;t finish|back on/);
+});

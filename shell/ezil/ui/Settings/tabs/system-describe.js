@@ -222,7 +222,13 @@ export function describePlan (info) {
         return { value: current ? `${current} on AWS (India)` : planned,
             hint: selected && current && selected !== current ? `Next start: ${selected}.` : '' };
     case 'failed':
-        if ( t && SIZE_LABEL[t.current] ) return { value: `Switch didn't finish — back on ${SIZE_LABEL[t.current]}`, hint: 'Your files are safe. Try again from Settings → Computer.' };
+        // HF3: name the size the computer is actually on (the placement's), never the pre-switch size by default.
+        if ( t ) {
+            const actual = current ?? SIZE_LABEL[t.current] ?? null;
+            const target = t.kind !== 'restart' ? SIZE_LABEL[t.target] ?? null : null;
+            return { value: t.kind === 'restart' ? "Restart didn't finish" : target ? `Switch to ${target} didn't finish` : "Switch didn't finish",
+                hint: `${actual ? `Your computer is on ${actual}. ` : ''}Your files are safe. Try again from Settings → Computer.` };
+        }
         return { value: `${planned} — preparation failed`, hint: p.reason || '' };
     case 'blocked':
         return { value: `${planned} — paused`, hint: p.reason || '' };

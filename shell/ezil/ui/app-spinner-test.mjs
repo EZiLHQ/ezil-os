@@ -186,9 +186,9 @@ const migration = { version: 2, computerId: 'qa-computer', operation: 'migration
     percent: 26, etaSeconds: 121, typicalSeconds: 390, transferStartedAt: '2026-10-26T10:00:00Z', transferUpdatedAt: '2026-10-26T10:01:00Z' };
 let payload = migration;
 globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
-async function observe(data, check) {
+async function observe(data, check, options = {}) {
     payload = data;
-    const spinner = AppSpinner({ computerId: 'qa-computer' });
+    const spinner = AppSpinner({ computerId: 'qa-computer', ...options });
     document.body.appendChild(spinner.el);
     try { spinner.render({ kind: 'progress' }); await tick(); await check(spinner); }
     finally { spinner.dispose(); spinner.el.remove(); }
@@ -349,11 +349,42 @@ try {
         globalThis.window = dom.window;
         window.__EZIL_BOOT__ = { user: { id: 'qa-user' }, features: { devDetails } };
         await observe({ ...opening, updatedAt: '2026-10-27T00:00:00Z', selectedNextOpenHardware: { effective: 'next_open', vcpu: 2, memoryGiB: 8 } }, spinner => {
-            push(`boot devDetails ${devDetails}: diagnostics require boolean true`,
-                spinner.el.textContent.includes('Next session: 2 vCPU · 8 GiB memory.') === (devDetails === true)
-                && spinner.el.textContent.includes('Last recorded update:') === (devDetails === true));
+            const sub = spinner.el.querySelector('.ezil-app-spinner-sub').textContent;
+            push(`boot devDetails ${devDetails}: only the update line is a diagnostic, and it requires boolean true`,
+                spinner.el.textContent.includes('Last recorded update:') === (devDetails === true), sub);
+            // HF3: the opening surface never shows the next-start hardware; the body is the loading stage.
+            push(`boot devDetails ${devDetails}: the body is the loading stage, never "Next session"`,
+                !/Next session|GiB memory|Applies after/.test(spinner.el.textContent)
+                && sub.startsWith('A machine is ready and starting up.'), sub);
         });
         delete globalThis.window;
+    }
+    // HF3: one loading-stage sentence per server milestone; "Almost there" only at desktop_ready.
+    {
+        const T = '1970-01-01T00:00:00.000Z';
+        const keys = ['requested', 'host_claimed', 'files_attached', 'desktop_starting', 'desktop_ready'];
+        const sentences = ['Finding a machine for your computer.', 'A machine is ready and starting up.', 'Your files are attached. The desktop is starting.',
+            'The desktop is starting. Browser opens next.', 'Almost there — waiting for Browser to connect.'];
+        for ( let n = 1; n <= 5; n++ ) {
+            await observe({ ...opening, stage: 'provisioning', path: 'warm', openingStartedAt: T, expectedSeconds: 240,
+                milestones: keys.slice(0, n).map(key => ({ key, at: T })) }, spinner => {
+                const sub = spinner.el.querySelector('.ezil-app-spinner-sub');
+                push(`milestone ${keys[n - 1]}: the body is "${sentences[n - 1]}"`, !sub.hidden && sub.textContent === sentences[n - 1], sub.textContent);
+                push(`milestone ${keys[n - 1]}: "Almost there" only at desktop_ready`, /Almost there/.test(spinner.el.textContent) === (n === 5));
+                push(`milestone ${keys[n - 1]}: no percentages, countdowns or ticks`, !/\d+%|min left|Estimated|✓/.test(spinner.el.textContent));
+            }, { label: 'Opening Browser…' });
+        }
+        await observe({ ...opening, stage: 'provisioning', path: 'cold', openingStartedAt: T, expectedSeconds: 400, milestones: [{ key: 'requested', at: T }] }, spinner => {
+            push('cold path at requested: "Preparing a new machine"', spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'Preparing a new machine — this can take a few minutes.');
+        });
+        // Ten minutes in, runningLong still replaces the body; the long meta line is unchanged.
+        await observe({ ...opening, stage: 'leased', startedAt: T, openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }, { key: 'host_claimed', at: T }] }, async spinner => {
+            now = 600000; await poll();
+            push('running long: the long copy replaces the stage sentence', spinner.el.querySelector('.ezil-app-spinner-sub').textContent
+                === "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
+            push('running long: the meta line is the elapsed time', spinner.el.querySelector('.ezil-opening-meta').textContent === '10:00');
+        });
+        now = 0;
     }
     // F1b: while this window's open is in flight and the server still says stopped (no opening yet), the surface
     // reads "Starting your computer" with an indeterminate bar, never "Computer stopped — Use the normal computer controls…".
