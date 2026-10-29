@@ -16,6 +16,7 @@
  * decides, nothing has recorded where it runs.
  */
 import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
+import { CATALOG_V3, type ComputeStandingV3 } from '@/server/billing/v3/contract';
 import { deriveGuacamoleSandboxId, getGuacamoleSandboxSystem, resolveCloudflareGuacamoleConfig } from '../cloudflare-guacamole-provider';
 import { isAwsComputersEnabled, isPlacementReadEnabled, meteredSizeForInstanceType, type Env } from './aws-config';
 import { PlacementOwnerError, readPlacement, type Placement, type PlacementExecutor, type ResolvedPlacement } from './placement';
@@ -69,7 +70,14 @@ export interface SystemInfo {
     /** No live resource metrics exist yet. */
     usage: null;
     plan?: {
-        vcpu: number; memoryGB: number; region: 'ap-south-1';
+        /**
+         * Round 4 (additive; docs/billing/STANDING-CONTRACT.md §System): `Free` with `provider` 'cloudflare'
+         * (2 vCPU / 6 GB on Cloudflare) or 'aws' (`standing` files_on_aws: the recorded AWS computer, held at
+         * std-2 under Free limits). Paid plans carry their name and provider 'aws'. A client must branch on
+         * `provider` before saying "on AWS (India)".
+         */
+        name?: 'Free' | 'Standard' | 'Premium'; provider?: 'aws' | 'cloudflare'; standing?: ComputeStandingV3;
+        vcpu: number; memoryGB: number; region: 'ap-south-1' | null;
         /**
          * Round 3: `being_prepared` ONLY while a configuration switch/restart is in flight; `ready` once
          * the computer is on AWS (`current` = what it runs, `selected` = the next start's choice, which
@@ -99,11 +107,31 @@ export function describePlanPlacement(info: SystemInfo, entitlement: import('./t
     const switchFailed = transition?.phase === 'failed' ? transition : null;
     const failed = migration?.state.startsWith('failed_');
     const status = blocked ? 'blocked' : switching ? 'being_prepared' : switchFailed ? 'failed' : onAws ? 'ready' : failed ? 'failed' : 'preparing';
-    return { vcpu: size.vcpu, memoryGB: size.memoryGiB, region: 'ap-south-1', status,
+    return { name: entitlement.planId === 'premium_monthly_v3' ? 'Premium' : 'Standard', provider: 'aws',
+        vcpu: size.vcpu, memoryGB: size.memoryGiB, region: 'ap-south-1', status,
         reason: blocked ? 'AWS paused by operations' : status === 'failed' ? switchFailed ? switchFailed.reason ?? 'switch_failed'
             : 'AWS preparation failed; your existing workspace is retained' : null,
         outcome: migration?.outcome === 'fresh_provision' ? 'fresh_provision' : null,
         current, selected, transition };
+}
+
+/**
+ * Round 4 (D16): a Free plan is reported, never "not available". On Cloudflare (or with no placement yet) it is
+ * Free's own configuration; with an aws-ec2 placement it is that computer's configuration (files_on_aws).
+ * Nothing here says the files moved.
+ */
+export function describeFreePlan(info: SystemInfo, entitlement: import('./tier').EntitlementRecord | null): SystemInfo['plan'] | undefined {
+    if (entitlement?.source !== 'billing_v2' || entitlement.planId !== 'free_v3' || entitlement.provider === 'aws') return;
+    const free = CATALOG_V3.free_v3;
+    if (info.provider !== 'aws-ec2') return { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: free.vcpu, memoryGB: free.memoryGiB,
+        region: null, status: 'ready', reason: null, outcome: null, current: free.size, selected: null, transition: null };
+    const current = meteredSizeForInstanceType(info.machine.instanceType);
+    // An unrecorded type falls back to the only configuration the hold opens (std-2); `current` stays null.
+    const size = SIZES[current ?? 'std-2'];
+    return { name: 'Free', provider: 'aws', standing: 'files_on_aws',
+        vcpu: info.machine.vcpu ?? size.vcpu, memoryGB: info.machine.memoryMiB !== null ? info.machine.memoryMiB / 1024 : size.memoryGiB,
+        region: info.machine.region === 'ap-south-1' ? 'ap-south-1' : null, status: 'ready', reason: null, outcome: null,
+        current, selected: null, transition: null };
 }
 
 /** The computer's switch/restart transition with its resolved phase, while it is current: a failed one stays shown until a later opening. */
@@ -122,7 +150,12 @@ async function withPlanInfo(info: SystemInfo, db: PlacementExecutor, computer: {
     try {
         const { billingV2EntitlementReader } = await import('@/server/billing/v2/compute-access');
         const entitlement = await billingV2EntitlementReader().read(computer.userId);
-        if (!entitlement || entitlement.provider !== 'aws') return info;
+        if (!entitlement) return info;
+        if (entitlement.provider !== 'aws') {
+            const free = describeFreePlan(info, entitlement);
+            if (free) info.plan = free;
+            return info;
+        }
         let migration = null;
         if (isPlacementReadEnabled(env)) {
             const { migrationStatusFor } = await import('./provider-migrate-orchestrator');
