@@ -548,17 +548,24 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('HF2 refund over operato
                 expiresAt: String(root.payload.expiresAt) }, 'grant', invoiceId);
             Object.assign(correction.payload, { accountPublicId: 'canary-payer', ...note });
             for (const item of order === 'root first' ? [root, revoke, correction] : [correction, revoke, root]) await store.enqueueOutbox(item);
-            // The receipt read has no ORDER BY; each case pins the order the planner actually receives.
-            expect((await store.aiCreditGrantsByInvoice!(owner.userId, invoiceId)).map(r => r.payload.entitlementId))
-                .toEqual(order === 'root first' ? [ROOT, CORR] : [CORR, ROOT]);
+            // The receipt read has no ORDER BY, so heap order is not insertion order: hand the planner each order explicitly.
+            const want = order === 'root first' ? [ROOT, CORR] : [CORR, ROOT];
+            let reads = 0;
+            const ordered: BillingStore = { ...store, aiCreditGrantsByInvoice: async (userId, invoice) => {
+                const rows = await store.aiCreditGrantsByInvoice!(userId, invoice);
+                expect(rows.map(r => String(r.payload.entitlementId)).sort()).toEqual([ROOT, CORR].sort());
+                reads++;
+                return want.map(id => rows.find(r => r.payload.entitlementId === id)!);
+            } };
             const charge: StripeCharge = { id: `ch_${randomUUID()}`, customer: owner.customerId, invoiceId, paymentIntentId: null,
                 amount: 2000, amountRefunded: 2000, refunded: true };
             stripe.charges.set(charge.id, charge);
             const refundId = `re_${randomUUID()}`;
-            const deps = { store, stripe: stripe.api, now: () => NOW };
+            const deps = { store: ordered, stripe: stripe.api, now: () => NOW };
             const outbox = () => db.select().from(schema.billingOutbox).where(eq(schema.billingOutbox.userId, owner.userId));
             const before = await outbox();
             expect(await processStripeEvent(event('refund.created', { id: refundId, charge: charge.id }), deps)).toBe('applied');
+            expect(reads).toBe(1);
             expect(await store.grantsBySource('refund', refundId)).toEqual([expect.objectContaining({ userId: owner.userId,
                 meter: 'compute_std_seconds', kind: 'revoke', amount: BigInt(-144000), subscriptionId: owner.subscriptionId })]);
             const after = await outbox();
