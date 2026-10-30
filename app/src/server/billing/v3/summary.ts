@@ -81,7 +81,7 @@ const credits = (micro: bigint) => creditNumber(micro.toString());
  */
 export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
     gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null }): Pick<BillingSummaryV3['ai'],
-    'state' | 'included' | 'purchased' | 'starter' | 'pendingFromRenewal'> {
+    'state' | 'included' | 'purchased' | 'starter' | 'previous' | 'pendingFromRenewal'> {
     const { plan } = input;
     const paid = plan.sku === 'standard_monthly_v3' || plan.sku === 'premium_monthly_v3';
     const receipts = (input.receipts ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
@@ -110,6 +110,10 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     const purchased = known && live('purchased').length ? { remaining: credits(sum(live('purchased'), 'remainingMicro')) ?? 0,
         expiresAt: live('purchased').map(g => g.expiresAt).sort()[0]! } : null;
     const starter = known && live('starter').length ? { remaining: credits(sum(live('starter'), 'remainingMicro')) ?? 0 } : null;
+    // Round 6 (R1-10/R4-05): an earlier period's or plan's grants (kept after a cancel until they expire), named
+    // so "763 left" on Free can say where 663 of them came from and when they go. Earliest expiry, like purchased.
+    const earlier = live('previous').sort((a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt));
+    const previous = known && earlier.length ? { remaining: credits(sum(earlier, 'remainingMicro')) ?? 0, expiresAt: earlier[0]!.expiresAt } : null;
     const pendingFromRenewal = paid && input.receipts !== null && plan.renewsAt !== null
         && !current.some(r => r.planPeriodSku === plan.sku) ? { credits: plan.offer.aiCredits.amount, at: plan.renewsAt } : null;
     // Paid plans judge THIS period's credits; Free judges its starter grant. Unknown → v1 total-vs-catalog rule.
@@ -121,7 +125,7 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     else if (known && basisGranted > BigInt(0)) state = sum(basis, 'remainingMicro') * BigInt(10) <= basisGranted ? 'low' : 'ok';
     else state = aiMicroBalanceState(input.balanceMicro, includedGrantedMicro > BigInt(0) ? Number(includedGrantedMicro / MICRO)
         : plan.sku === 'legacy' ? 0 : plan.offer.aiCredits.amount);
-    return { state, included, purchased, starter, pendingFromRenewal };
+    return { state, included, purchased, starter, previous, pendingFromRenewal };
 }
 
 const GIB = BigInt(1024) ** BigInt(3);
@@ -274,7 +278,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
-        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers(),
+        // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
+        catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),
             customTopup: { ...CUSTOM_TOPUP } },
