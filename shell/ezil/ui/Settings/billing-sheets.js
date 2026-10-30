@@ -172,11 +172,31 @@ export function openDowngradeSheet (options) {
     return sheet.handle;
 }
 
+const VCPU = { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8 };
+
+/**
+ * Round 6 (R4-13, plan A6): the cancel sheet says what happens to the COMPUTER. Under the D16 hold an AWS
+ * computer opens on Free only at 2 vCPU, for Free's session length, and is never resized: a 4 or 8 vCPU
+ * computer can't open on Free (R4-02). Files on Cloudflare (or an older server) keep the plain line.
+ */
+function cancelCopyV3 (summary) {
+    const at = summary.plan.renewal?.at;
+    const lead = `Your plan stays active ${at ? `until ${dateLabel(at)}` : 'until the end of your billing period'}, then moves to Free.`;
+    if ( summary.computer?.filesOn !== 'aws' ) return `${lead} Your files and installed tools stay.`;
+    const after = at ? `After ${dateLabel(at)}` : 'After that';
+    const size = summary.computer.size;
+    const vcpu = summary.computer.machineChoice?.find(m => m.size === size)?.vcpu ?? VCPU[size];
+    if ( size && size !== 'std-2' && vcpu ) return `${lead} ${after} your ${vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer.`;
+    const cap = summary.catalog?.offers?.find(offer => offer.sku === 'free_v3')?.sessionMaxSeconds;
+    const hours = Number.isSafeInteger(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
+    return `${lead} ${after} your computer opens under Free limits${hours ? ` (sessions up to ${hours} hour${hours === 1 ? '' : 's'})` : ''}; your files stay on your AWS computer.`;
+}
+
 export function openCancelSheet (options) {
     const sheet = billingSheet(options, 'cancel', `Cancel ${options.summary.version === 3 ? options.summary.plan.name : planName(options.summary.plan.family)}`);
     if ( sheet.existing ) return sheet.existing;
     sheet.node('p', options.summary.version === 3
-        ? `Your plan stays active ${options.summary.plan.renewal ? `until ${dateLabel(options.summary.plan.renewal.at)}` : 'until the end of your billing period'}, then moves to Free. Your files and installed tools stay.`
+        ? cancelCopyV3(options.summary)
         : `Your plan stays active until ${dateLabel(options.summary.plan.periodEnd)}, then moves to Free. You can resume any time before then.`);
     const actions = sheet.node('div', null);
     actions.className = 'ezil-billing-sheet-actions';
@@ -333,6 +353,9 @@ function openV3DowngradeSheet (options) {
     offerDetails(sheet, standard, sheet.body, { existingDisk: options.summary.computer?.disk ?? {} });
     const date = options.summary.plan.renewal?.at;
     sheet.node('p', `You keep Premium ${date ? `until ${dateLabel(date)}` : 'until the end of your billing period'}. Standard starts then.`);
+    // Round 6 (R4-13, plan A6): the computer outcome — Standard opens 2 vCPU · 8 GB from that date.
+    const size = Number.isSafeInteger(standard.vcpu) && Number.isSafeInteger(standard.memoryGiB) ? `${standard.vcpu} vCPU · ${standard.memoryGiB} GB` : null;
+    if ( size ) sheet.node('p', `From ${date ? dateLabel(date) : 'then'} your computer starts on ${size}. Your files and installed tools stay.`);
     sheet.button('Change to Standard', 'confirm', () => {
         void sheet.request('billing.scheduleDowngrade', { toSku: standard.sku }, data => {
             sheet.result([`Scheduled. You switch to Standard on ${dateLabel(data.effectiveAt)}.`]);
