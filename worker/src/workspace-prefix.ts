@@ -1,13 +1,14 @@
 /**
- * The workspace's key prefix: ONE derivation for the Cloudflare open's hydrate
- * (`ensureWorkspaceMount`, index.ts) and the reverse import (AWS → Cloudflare,
- * docs/compute/REVERSE-MOVE-CONTRACT.md §4.1, "P").
+ * The workspace's key prefix: the Cloudflare open's derivation (`ensureWorkspaceMount`
+ * and `/sandbox/preview`, index.ts) as functions, for the reverse import (AWS →
+ * Cloudflare, docs/compute/REVERSE-MOVE-CONTRACT.md §4.1, "P").
  *
  * 🔴 The import writes the head the NEXT Cloudflare open of the computer reads.
  * If the two derivations ever drift, the import commits a head nothing hydrates
- * and the open seeds an empty workspace over the user's files. Keep both call
- * sites on these functions; `workspace-prefix.test.ts` drives the real open
- * route and compares.
+ * and the open seeds an empty workspace over the user's files.
+ * `workspace-prefix.test.ts` drives the real `/sandbox/preview` route and fails on
+ * any drift. index.ts keeps its expressions inline for now: `index.test.ts` pins
+ * their source text (`config.prefix ?? …`, `|| 'main'`).
  */
 import { realR2KeyPrefix } from './workspace-seed';
 
