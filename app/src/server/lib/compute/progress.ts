@@ -10,6 +10,11 @@ import { ENROLL_NONCE_TTL_SECONDS } from './aws-rebase-lease';
 import { MIGRATION_STATES, pendingRecovery, TERMINAL_MIGRATION_STATES, type MigrationState } from './provider-migrate';
 import { createProviderMigrationStore, snapshotChunkSizes, type ComputeMigration } from './provider-migrate-store';
 import { releaseHeal, releaseHealOf } from './release-heal';
+import {
+    REVERSE_MOVE_BUDGET_SECONDS, reverseHoldOpenable, reverseIso, reverseMoveReason, reverseMoveRetry, reverseMoveVisible, reverseOpenBlocked,
+    reversePlacementView,
+} from './provider-reverse';
+import { createProviderReverseStore, REVERSE_MOVE_IN_FLIGHT, reverseMovesTablePresent, type ComputeReverseMove, type ReverseMoveState } from './provider-reverse-store';
 import type { SwitchHealReasonV3 } from '@/server/billing/v3/contract';
 
 function transferProgress(migration: ComputeMigration | null, stage: string, stopped: boolean) {
@@ -147,10 +152,94 @@ export function describeProgress(computerId: string, placement: Placement | null
     };
 }
 
+// ── Phase B: an AWS → Cloudflare move (docs/compute/REVERSE-MOVE-CONTRACT.md §5.10) ─────────
+
+/** The move's phases and their §6.1 steps (the same as `REVERSE_MOVE_DTO_STAGE`'s, so the overlay and the Computer tab agree). */
+const REVERSE_PHASE: Readonly<Partial<Record<ReverseMoveState, { phase: 'export_boot' | 'exporting' | 'importing' | 'checking' | 'committing'; step: 0 | 1 | 2 | 3 }>>> = {
+    requested: { phase: 'export_boot', step: 0 }, booting: { phase: 'export_boot', step: 0 }, exporting: { phase: 'exporting', step: 0 },
+    copying: { phase: 'importing', step: 1 }, checking: { phase: 'checking', step: 2 }, flipping: { phase: 'committing', step: 3 },
+};
+/** Seconds of the export boot, the capture, and the check + host retire + commit; the import is 1 MiB/s (§5.10, provisional). */
+const REVERSE_EXPECTED = { boot: OPENING_TYPICAL_SECONDS, capture: 120, importUnknown: 120, finish: 150, min: 600, max: 3600 } as const;
+/** The bar's time ease only, never shown as a number (no duration claims): `clamp(240 + 120 + import + 150, 600, 3600)`. */
+export function reverseMoveExpectedSeconds(bytesTotal: number | null): number {
+    const importSeconds = bytesTotal === null ? REVERSE_EXPECTED.importUnknown : Math.ceil(bytesTotal / 1_048_576);
+    return Math.max(REVERSE_EXPECTED.min, Math.min(REVERSE_EXPECTED.max,
+        REVERSE_EXPECTED.boot + REVERSE_EXPECTED.capture + importSeconds + REVERSE_EXPECTED.finish));
+}
+/** `computer.progress`'s additive `move` (§5.10): absent with no visible reverse row; old shells ignore it. */
+export function reverseMoveProgress(m: ComputeReverseMove, placement: Placement | null) {
+    const view = reversePlacementView(placement);
+    const phase = REVERSE_PHASE[m.state] ?? null;
+    const terminal = !REVERSE_MOVE_IN_FLIGHT.includes(m.state);
+    return {
+        moveId: m.id, direction: 'to_cloudflare' as const,
+        phase: phase?.phase ?? null, step: phase?.step ?? null,
+        startedAt: reverseIso(m.createdAt), phaseStartedAt: reverseIso(m.stateEnteredAt),
+        expectedSeconds: reverseMoveExpectedSeconds(m.bytesTotal), budgetSeconds: REVERSE_MOVE_BUDGET_SECONDS,
+        bytesDone: m.bytesTotal === null ? null : m.importProgress?.bytes ?? 0, bytesTotal: m.bytesTotal,
+        outcome: terminal ? m.state as 'committed' | 'failed_reopened' | 'failed_needs_operator' : null,
+        reason: reverseMoveReason(m), retry: reverseMoveRetry(m, view), openBlocked: reverseOpenBlocked(m),
+        holdOpenable: m.state === 'committed' ? null : reverseHoldOpenable(view),
+        // Diagnostics only: the export boot's real placement state (no shell reads it; `lifecycleState` is null).
+        placementState: view?.provider === 'aws-ec2' ? view.state : null,
+    };
+}
+/**
+ * 🔴 The moving view (§5.10, pinned; `version` stays 2): an in-flight row, or an open-blocked `failed_needs_operator` one.
+ * Nothing placement-derived drives it: never `opening` or `stopping`, no lifecycle stage, no `needsOperator` from the export
+ * boot's UNCONFIRMED or enrollment expiry, no capacity wait, no transition, no 6a connect expectation, and no opening record
+ * read or written (`openingOptions` is not called). `stage: 'moving'` is unknown to an old shell, whose `progressView`
+ * returns null: no opening bar, no `needs_operator`, no wrong copy. An in-flight move continues under the kill switch.
+ */
+export function describeReverseMoving(computerId: string, m: ComputeReverseMove, placement: Placement | null, now = new Date()) {
+    const move = reverseMoveProgress(m, placement);
+    const blocked = reverseOpenBlocked(m);
+    const transferred = move.bytesDone, total = move.bytesTotal;
+    const progress = m.importProgress;
+    return {
+        version: 2 as const, computerId, observedAt: now.toISOString(), operation: 'moving' as const,
+        stage: blocked ? 'needs_operator' as const : 'moving' as const, recordedStage: m.state,
+        lifecycleState: null, paused: false, operationsPaused: false, needsOperator: blocked,
+        active: REVERSE_MOVE_IN_FLIGHT.includes(m.state),
+        startedAt: move.startedAt, updatedAt: reverseIso(m.updatedAt),
+        durable: true as const, resumePolicy: 'unavailable' as const,
+        bytes: { transferred, total },
+        percent: move.phase === 'importing' && transferred !== null && total !== null && total > 0
+            ? Math.max(0, Math.min(100, Math.floor(100 * transferred / total))) : null,
+        etaSeconds: null,
+        transferStartedAt: reverseIso(progress?.first), transferUpdatedAt: reverseIso(progress?.last),
+        typicalSeconds: move.expectedSeconds,
+        openingStartedAt: null, path: null, expectedSeconds: null, milestones: [],
+        transition: null, selectedNextOpenHardware: null,
+        hardware: { instanceType: placement?.instanceType ?? null, source: placement ? 'placement' as const : 'unavailable' as const },
+        move,
+    };
+}
+/** The computer's newest reverse row (§3.4 probe first: no 0012 is no row), or `'foreign'` for another owner's. */
+async function readReverseMove(db: PlacementExecutor, computer: { computerId: string; userId: string }): Promise<ComputeReverseMove | 'foreign' | null> {
+    if (!(await reverseMovesTablePresent(db))) return null;
+    const m = await createProviderReverseStore(db).readByComputer(computer.computerId);
+    if (!m) return null;
+    return m.userId !== computer.userId.toLowerCase() || m.computerId !== computer.computerId.toLowerCase() ? 'foreign' : m;
+}
+
 /** Caller first checks live computer ownership; this repeats ownership for both stored records. */
 export async function readComputerProgress(db: PlacementExecutor, computer: { computerId: string; userId: string }, env: Env = process.env, now = new Date()) {
     if (!isPlacementReadEnabled(env)) return describeProgress(computer.computerId, null, null, env);
     try {
+        // Phase B (§5.10): the newest reverse row decides BEFORE anything placement-derived. With no 0012 or no row, today's
+        // output byte for byte. Owner-checked exactly as the forward row below.
+        const reverse = await readReverseMove(db, computer);
+        if (reverse === 'foreign') return null;
+        if (reverse && (REVERSE_MOVE_IN_FLIGHT.includes(reverse.state) || reverseOpenBlocked(reverse))) {
+            let record: Placement | null = null;
+            // The export boot's placement is diagnostics only here: an unreadable one (an image reservation racing `requested`)
+            // still shows the move. Another owner's placement is NOT_FOUND, as below.
+            try { record = (await readPlacement(db, computer.computerId, computer.userId)).record; }
+            catch (error) { if (error instanceof PlacementOwnerError) throw error; }
+            return describeReverseMoving(computer.computerId, reverse, record, now);
+        }
         const placement = await readPlacement(db, computer.computerId, computer.userId);
         const migration = await createProviderMigrationStore(db).readByComputer(computer.computerId);
         if (migration && (migration.userId !== computer.userId.toLowerCase() || migration.computerId !== computer.computerId.toLowerCase())) return null;
@@ -160,8 +249,11 @@ export async function readComputerProgress(db: PlacementExecutor, computer: { co
             const { billingV2EntitlementReader } = await import('@/server/billing/v2/compute-access');
             entitlement = await billingV2EntitlementReader().read(computer.userId);
         } catch { /* An unavailable preference must not hide actual progress. */ }
-        return describeProgress(computer.computerId, placement.record, migration, env, now, entitlement,
+        const described = describeProgress(computer.computerId, placement.record, migration, env, now, entitlement,
             await openingOptions(db, computer, placement.record, migration, now));
+        // A terminal row (24 h, DB clock) adds its outcome; it never takes over `stage` (a reverse `failed_reopened` is not
+        // the forward "original computer was reopened"). The shell keys the outcome on `move` alone (§6.4).
+        return reverse && reverseMoveVisible(reverse) ? { ...described, move: reverseMoveProgress(reverse, placement.record) } : described;
     } catch (error) {
         if (error instanceof PlacementOwnerError) return null;
         // No raw database/provider errors in the user contract; never infer a running operation.
