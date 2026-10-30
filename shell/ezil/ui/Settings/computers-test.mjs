@@ -484,7 +484,7 @@ if ( haveBundle ) {
     window.addEventListener('error', e => uncaught.push(e.message));
     if ( ! window.crypto?.getRandomValues ) window.crypto = { getRandomValues: a => { for ( let i = 0; i < a.length; i++ ) a[i] = (Math.random() * 256) | 0; return a; } };
     const calls = [];
-    let data = premium(), progress = running(), switchReply = null, held = null;
+    let data = premium(), progress = running(), switchReply = null, held = null, usageData = null;
     window.fetch = async (url, opts = {}) => {
         const u = String(url);
         const call = { url: u, method: opts.method ?? 'GET', body: opts.body ? JSON.parse(opts.body) : null, at: window.performance.now() };
@@ -494,6 +494,7 @@ if ( haveBundle ) {
         if ( u.includes('/api/trpc/billing.summary') ) return json({ result: { data: { json: data } } });
         if ( u.includes('/api/trpc/billing.history') ) return json({ result: { data: { json: [] } } });
         if ( u.includes('/api/trpc/computer.progress') ) return json({ result: { data: { json: progress } } });
+        if ( u.includes('/api/trpc/billing.usage') && usageData ) return json({ result: { data: { json: usageData } } });
         if ( u.endsWith('/api/shell/switch') ) {
             if ( switchReply ) return json(switchReply);
             return new Promise(resolve => { held = body => resolve(json(body)); });
@@ -684,6 +685,50 @@ if ( haveBundle ) {
         assert.equal(card('cmp-4')?.dataset.state, 'locked');
         assert.match(card('cmp-8')?.textContent ?? '', /Included in Premium\s*Upgrade/);
         assert.ok(card('cmp-8')?.querySelector('[data-action="config-upgrade"].ezil-computer-upgrade'));
+    });
+    const usageReads = () => calls.filter(c => c.url.includes('/api/trpc/billing.usage'));
+    const summaryReads = () => calls.filter(c => c.url.includes('/api/trpc/billing.summary'));
+    check('bundle: Round 6: a paid computer never reads billing.usage from the Computer tab', () => assert.equal(usageReads().length, 0));
+
+    // Round 6 (R1-08/CR-2): the founder's held std-2, on the real click path. A session that starts while the pane is
+    // open (STARTING → RUNNING) re-reads the summary (its deadline) and usage (the hours left) once.
+    data = heldData(); data.computer.activeDeadline = new Date(Date.now() + 40 * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    usageData = { ...heldUsage, asOf: new Date().toISOString() };
+    progress = running('m6i.large', { lifecycleState: 'STARTING', operation: 'opening' });
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+    await settle(3);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+    await settle();
+    check('bundle: Round 6 held std-2: current with Free limits, 4/8 vCPU locked, AWS (India), the hold line from billing.usage', () => {
+        assert.equal(card('std-2')?.dataset.state, 'current');
+        assert.ok(card('std-2')?.querySelector('[data-role="config-free-limits"]'));
+        assert.equal(card('cmp-4')?.dataset.state, 'locked');
+        assert.equal(pane()?.querySelector('[data-role="computer-provider"]')?.textContent, 'AWS (India)');
+        assert.equal(pane()?.querySelector('[data-role="hold-time"]')?.textContent, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+        const read = usageReads().at(-1);
+        assert.ok(read, 'billing.usage was read');
+        assert.match(decodeURIComponent(read.url), /"computerId":"c-1"/);
+        assert.equal(pane()?.querySelector('[data-role="session-ends"]'), null, 'not running yet');
+    });
+    const before = { summaries: summaryReads().length, usage: usageReads().length };
+    progress = running();
+    await settle(25, 200); // the opening poll is 3 s
+    check('bundle: Round 6 held: the session starting re-reads the deadline and the hours once, and shows when it ends', () => {
+        assert.equal(summaryReads().length, before.summaries + 1);
+        assert.equal(usageReads().length, before.usage + 1);
+        assert.match(pane()?.querySelector('[data-role="session-ends"]')?.textContent ?? '', /^This session ends at .+\.$/);
+        assert.ok(pane()?.querySelector('[data-action="open"]'));
+    });
+    progress = stoppedAws('m6i.xlarge');
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+    await settle(3);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+    await settle();
+    check('bundle: Round 6 (R4-02) held 4 vCPU: no Open desktop; it says so with Upgrade', () => {
+        assert.equal(pane()?.querySelector('[data-action="open"]'), null);
+        assert.match(pane()?.querySelector('[data-role="files-held"]')?.textContent ?? '', /The Free plan can't open it at that size/);
+        assert.ok(pane()?.querySelector('[data-role="files-held"] [data-action="held-upgrade"]'));
+        assert.doesNotMatch(pane()?.textContent ?? '', /mumbai/i);
     });
     check('bundle: no uncaught page errors', () => assert.deepEqual(uncaught, []));
     dom.window.close();
