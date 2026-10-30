@@ -1109,7 +1109,19 @@ try {
         window.history.replaceState(null, '', `/os${search}`); await open();
         assert.equal(creditsScrolled, 1, 'only the Billing AI credits deep link focuses the card');
     }
-    pass('AI credits deep-link heading focus survives URL cleanup and a failed summary without refocusing');
+    // The path form (docs/APP-ROUTES.md §1): `/app/settings?tab=billing` is the
+    // same link as `/os?settings=billing`, so it opens the card too (positive
+    // first). `tab` names Billing only on `/app/settings`, and never against a
+    // conflicting `settings`.
+    window.history.replaceState(null, '', '/app/settings?tab=billing&section=ai-credits&view=files'); await open();
+    assert.equal(creditsScrolled, 2, '/app/settings?tab=billing&section=ai-credits focuses the card');
+    assert.equal(window.document.activeElement, q('#ai-credits h4'));
+    for ( const url of ['/app/settings?tab=account&section=ai-credits', '/app/settings?tab=billing&section=unknown', '/app/code?tab=billing&section=ai-credits',
+        '/os?tab=billing&section=ai-credits', '/app/settings?tab=billing&settings=account&section=ai-credits'] ) {
+        window.history.replaceState(null, '', url); await open();
+        assert.equal(creditsScrolled, 2, `${url} does not focus the card`);
+    }
+    pass('AI credits deep-link heading focus survives URL cleanup and a failed summary without refocusing; /app/settings?tab=billing is the same link');
     // Round 5 (D6): no operator internals on the user surface, in any AI state.
     summary = summaryV3(); await refresh();
     for ( const role of ['ai-usage', 'ai-limits', 'ai-recent', 'ai-spending'] ) has(`[data-role="${role}"]`, false);
