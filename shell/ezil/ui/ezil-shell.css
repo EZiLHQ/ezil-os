@@ -499,11 +499,19 @@ body.device-phone {
  * that are already there, and it spends the tongue's discoverability on a
  * moment nobody needs it.
  *
- * `.ezil-fullbleed` is written by `go_fullbleed` / `minimise_to_taskbar` in
- * shell/ezil/apps/desktop-window.js — NOT `data-is_fullpage`, which upstream's
- * `exit_fullpage_mode` removes. Specificity (0,3,0) and source order both beat
- * `dashboard.css`'s `.dashboard-app-drawer`. */
-.ezil-desktop-window:not(.ezil-fullbleed) .ezil-app-drawer {
+ * `.ezil-fullbleed` is written by `../ui/full-view.js` (for the Browser via
+ * `go_fullbleed` / `minimise_to_taskbar` in shell/ezil/apps/desktop-window.js)
+ * — NOT `data-is_fullpage`, which upstream's `exit_fullpage_mode` removes.
+ * Specificity (0,3,0) and source order both beat `dashboard.css`'s
+ * `.dashboard-app-drawer`.
+ *
+ * MODIFIED 2026-10-30 (app-code lane A2): every full-view rule from here to the
+ * resize-handle rule below was keyed on `.ezil-desktop-window`. The Code window
+ * now has a full view too, so they key on `.ezil-full-view-host`, which
+ * `createFullView()` puts on every window that can go full view (Browser and
+ * Code). Same specificity, same source position: the Browser's cascade is
+ * unchanged. */
+.ezil-full-view-host:not(.ezil-fullbleed) .ezil-app-drawer {
     display: none;
 }
 
@@ -511,21 +519,21 @@ body.device-phone {
  * expanded drawer and the collapsed tongue's hit pad stay above the stream,
  * so Chrome's address bar remains tappable and the exit stays reachable.
  * The stream fitting code already observes the window body when it resizes. */
-.ezil-desktop-window.ezil-fullbleed {
+.ezil-full-view-host.ezil-fullbleed {
     /* The drawer's content height plus its 1px visible border. */
     --ezil-control-strip-height: 43px;
     background-color: #11151f;
 }
 @media (pointer: coarse) {
-    .ezil-desktop-window.ezil-fullbleed {
+    .ezil-full-view-host.ezil-fullbleed {
         --ezil-control-strip-height: 59px;
     }
 }
-.ezil-desktop-window.ezil-fullbleed > .window-body.window-body-app {
+.ezil-full-view-host.ezil-fullbleed > .window-body.window-body-app {
     top: var(--ezil-control-strip-height);
     height: calc(100% - var(--ezil-control-strip-height)) !important;
 }
-.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer {
+.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer {
     --safe-top: 0px;
     top: 0;
     bottom: auto;
@@ -535,14 +543,14 @@ body.device-phone {
     transition: top 0.3s ease, width 0.45s cubic-bezier(0.34, 1.2, 0.4, 1),
         height 0.45s cubic-bezier(0.34, 1.2, 0.4, 1), border-radius 0.45s ease, opacity 0.2s ease;
 }
-.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer.collapsed {
+.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer.collapsed {
     top: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2);
     border-radius: 12px;
     border: 1px solid rgba(255, 255, 255, 0.22);
     transition: top 0.3s ease, width 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
         height 0.3s cubic-bezier(0.5, 0.05, 0.25, 1), border-radius 0.3s ease, opacity 0.2s ease 0.08s;
 }
-.ezil-desktop-window.ezil-fullbleed .dashboard-app-drawer-toggle::after {
+.ezil-full-view-host.ezil-fullbleed .dashboard-app-drawer-toggle::after {
     /* Keep the drawer's invisible hit pad inside the top control strip. */
     bottom: 0;
 }
@@ -560,7 +568,7 @@ body.device-phone {
  * `pointer-events: none` and reduced opacity — which would dim the desktop and
  * swallow every click into it. Hiding the handle elements removes the only
  * thing resizable binds to and touches nothing else. */
-.ezil-desktop-window.ezil-fullbleed > .ui-resizable-handle {
+.ezil-full-view-host.ezil-fullbleed > .ui-resizable-handle {
     display: none;
 }
 
