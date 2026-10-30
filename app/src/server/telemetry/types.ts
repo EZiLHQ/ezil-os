@@ -45,7 +45,9 @@ export const ATTRS_ALLOW_LIST: Record<EventClass, readonly string[]> = {
     api_failure: ['status', 'retryable'],
     // `reason`/`status`: the frame probe's reason and the ORIGIN's HTTP status, so a
     // `frame_not_answering` names the hop that answered (follow-up r5, ACCEPT-9a755827 A3).
-    display_failure: ['seen', 'reason', 'status'],
+    // `asks`/`running`/`elapsed_ms`: the desktop frame check's ask count, its last
+    // `desktopRunning` read and the time since handover (G12, PROD-COMPUTERS-PLAN §6.3).
+    display_failure: ['seen', 'reason', 'status', 'asks', 'running', 'elapsed_ms'],
     boot_summary: ['phases', 'total_ms'],
     boot_phase: [],
     boot_stall: [],

@@ -78,6 +78,11 @@ describe('sanitizeAttrs: per-class allow-list, strip not reject', () => {
         expect(out).toEqual({ seen: 'false', reason: 'http_error', status: 530 });
     });
 
+    it('keeps asks/running/elapsed_ms for display_failure (G12: how long the desktop frame check asked)', () => {
+        const out = sanitizeAttrs('display_failure', { seen: 'undefined', asks: 14, running: 'true', elapsed_ms: 61_250, url: 'https://x/' });
+        expect(out).toEqual({ seen: 'undefined', asks: 14, running: 'true', elapsed_ms: 61_250 });
+    });
+
     it('keeps only status/retryable for api_failure, not an arbitrary key', () => {
         const out = sanitizeAttrs('api_failure', { status: 500, retryable: true, extra: 'nope' });
         expect(out).toEqual({ status: 500, retryable: true });

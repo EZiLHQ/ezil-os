@@ -176,7 +176,7 @@ const MOBILE_BRIDGE_SOURCE = 'ezil-mobile';
  *
  * `attrs` is omitted for `display_failure` on purpose: its server-side
  * allow-list (`ATTRS_ALLOW_LIST` in `app/src/server/telemetry/types.ts`) is
- * `['seen', 'reason', 'status']`, so an `app_id` sent under that class would be
+ * `['seen', 'reason', 'status', 'asks', 'running', 'elapsed_ms']`, so an `app_id` sent under that class would be
  * stripped on ingest. Sending a key guaranteed to be discarded is how a field comes to be
  * believed in a dashboard that never receives it.
  */
