@@ -108,15 +108,18 @@ The router calls `registry.launch(id, { ...registry.launchContext(ctx), initialT
   including a canonicalised `/os?app=code`, and Back/Forward):
   1. nothing if a Code window is already open: Back/Forward only focuses it
      and never resizes it. Its relaunch hook (`_ezil_relaunch`) still runs,
-     with no `view`. An entry's recorded view can be older than the user's
-     latest choice, which was recorded on whichever entry was current then;
-     else
+     with no `view`. The entry it lands on takes the view Code shows now
+     instead (§5 "State"), so a reload of it reopens Code as it is on
+     screen; else
   2. the view this history entry recorded (`history.state.ezilView`, when
      `history.state.ezilApp === 'code'`), else
   3. `'full'`.
-  Rule 2 also applies to a reload, since `history.state` survives one: a
-  Code entry the user switched to windowed reloads windowed. This is this
-  lane's reading of contract item 3 + 5.
+  Rule 2 also applies to a reload, since `history.state` survives one. An
+  entry written while Code was open records the view Code showed then, so a
+  Code the user switched to windowed reloads windowed, whichever entry the
+  switch happened on. This is this lane's reading of contract item 3 + 5.
+  (Until 2026-10-30 an entry kept its recorded view while Back landed on it
+  with Code open in another view; a reload then reopened the older view.)
 - Dock, Start menu, App Store and Settings-drawer launches pass no `view`,
   `project` or `initialTab` (A2 decides Code's view). A click inside a
   window that a route opened does not inherit that route's keys
@@ -145,7 +148,7 @@ nothing sets.)
 | Focus moves to another app's window | **replace** with that app's URL |
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
-| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
+| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). If the window is open, the entry first takes the view it shows, in place, at the popstate itself ("State" below). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
 | Boot with a link | **replace** (canonicalise) before launching; the billing link after its launch, its `upgrade` key already gone before it. Either launch is numbered ("Order" below). |
 
 Why the push happens first: in Chromium a frame navigation is filed under
@@ -296,6 +299,27 @@ entry each race leaves hands Settings no `openUpgrade`, and a fresh link
 hands it exactly once; a plain Settings link with `tab=billing&upgrade=pro`
 loses the key before its launch and reloads with no `openUpgrade`).
 
+Tests for "State" (the entry follows the screen): `app-history-test.mjs`
+covers stand-in windows with and without `_ezil_view`: Back/Forward to an
+open window, one that reports no view, a value that is not a view, an
+accessor that throws, each write path listed above, and adopt as the
+control. `app-link-test.mjs` runs the real bundle, with code.js's own full
+view, top bar, relaunch hook and view event, nothing stubbed:
+- E1 full from `/app/code`; Settings pushes E2; a focus of Code renames E2;
+  Restore window on E2. Back to E1 leaves Code windowed and E1 says
+  `'window'`. A reload booted from E1's URL and state opens Code windowed.
+- The same for Forward, and both with no Restore (full) as the control.
+- A click right after Back that makes the Back launch stand down.
+- Back to a closed Code (its recorded view, `'full'` and `'window'`).
+- Code minimised from full view.
+- A failed click on Settings while Code changes view.
+- Focus, close and click on Code's icon, each with a reload.
+
+`code-test.mjs` pins `_ezil_view()`: `'window'` at open, `'full'` in full
+view and while minimised from it, `'window'` when restored.
+`app-link-browser-test.mjs` (Chromium) covers Back, Back, reload with Code
+windowed, and full as the control.
+
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
 page-level `computer` (captured once at boot; the server picks the computer
@@ -307,11 +331,48 @@ reloads the page on a non-null state without `__NA`; a later lane may add
 e.g. `ezilProjectLaunchIntent`). Known keys: `ezilApp` (the entry's app) and
 `ezilView` (that app's view; removed when the entry's app changes).
 
+**The entry follows the screen.** Whenever this module writes an entry
+naming an app whose window is open, `ezilView` is the view that window
+shows at that moment. It is read from the window itself
+(`el._ezil_view()`, Code's full-view state; see `docs/APP-CODE-FULL-VIEW.md`
+§1). It is never a copy kept here, because a copy drifts: an open is not
+announced, and a minimise is not a change of view. A window that reports no
+view (every app but Code, a value that is not a view, an accessor that
+throws) leaves the entry with no `ezilView` rather than a stale one.
+
+- **Where.** Back/Forward landing on an open app writes in place, at the
+  popstate itself, before its launch. A launch that then stands down (a
+  click before its `commit`) leaves the entry right too. The same rule
+  covers a route's `commit`, a focus, a close that names the front app,
+  `sync`, a click on an app already open (its push), the in-place rewrite
+  of a click at new parameters, and a failed click's give-back. (While that
+  click was pending, the address bar named the clicked app, so a change of
+  view then was recorded nowhere.)
+- **Order.** None of these is a new intent, and none changes "Order" below.
+  The popstate write is Back/Forward's own, made when it takes the entry.
+  Every other write is one that "Order" already allows.
+- **What keeps its recorded view.** An entry whose app has no window keeps
+  it: the boot's `adopt` (a reload), and Back/Forward to a closed app, which
+  launches with it (§3 rule 2). Code's `'full'` while minimised from full
+  view is its desire (it re-enters full view when shown), not the
+  `ezil-fullbleed` class, which is off while it is hidden.
+- **Known limits.**
+  - A click on a Code that is not open pushes its entry before the window
+    exists, with no view. Nothing writes that entry again until the next
+    focus, close, view change or traversal. So a reload of a dock-opened,
+    windowed Code, before any of those, still opens full (§3 rule 3).
+  - Entries behind the current one are refreshed when Back/Forward lands on
+    them in the same document. After a reload, Back to such an entry is a
+    full document load (see "Next.js" below), which opens its app with the
+    view the entry recorded when it was last written.
+
 **Events this relies on**, emitted by `shell/src/UI/UIWindow.js`:
 `ezil:window-focus` (`{window}`, from `$.fn.focusWindow`) and
 `ezil:window-closed` (`{window, app}`, from `delete_window_element`, the
 funnel every close goes through). A2 dispatches `ezil:app-view-changed` and
-never calls history APIs.
+never calls history APIs. The Code window also exposes `el._ezil_view()`
+(`shell/ezil/apps/code.js`), which this module reads whenever it writes
+that window's entry ("State" above).
 
 **Next.js.** `/os` and `/app/<id>` are App Router pages. After hydration
 Next patches `pushState`/`replaceState`, but a state that already carries
@@ -482,6 +543,9 @@ Still open:
   was opened at.
 - A page load at a compute app's URL starts a stopped computer with no
   click (§6, "After sign-in"). Owner decision.
+- A click on a Code that is not open pushes its entry with no view, and a
+  reload before any later write of that entry opens Code full, though Code
+  opened windowed (§5 "State", known limits).
 - Launch order (§5, "Order"): a superseded launch's window that is built
   more than about 120ms after the newer launch opened still takes the front
   (UIWindow's own focus) without the address bar, and a reopen that
