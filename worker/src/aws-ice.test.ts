@@ -7,20 +7,29 @@
 import { describe, expect, it } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
 import {
+  AWS_DESKTOP_CONFIG_APPLY_MS,
+  AWS_DESKTOP_CONFIG_CLAIM_MS,
+  AWS_DESKTOP_PUSH_TIMEOUT_MS,
+  AWS_DESKTOP_STATUS_TIMEOUT_MS,
+  RELAY_MIN_AHEAD_MS,
+  awsCodeServerAnswers,
   awsRelayContainer,
   awsRelayRefresh,
   buildAwsDesktopConfig,
   desktopConfigBody,
   ensureAwsDesktop,
+  ensureAwsDesktopConfig,
   pushAwsDesktopConfig,
   readAwsDesktopStatus,
   sha256Hex,
   type AwsDesktopConfig,
+  type AwsDesktopParams,
   type RelayMint,
 } from './aws-ice';
-import { decodeControlKey, handleAwsPreview, verifyGatewayHeader, type AwsTunnelRecord, type FetchLike } from './aws-origin';
+import { awsPreviewSurface, decodeControlKey, handleAwsPreview, verifyGatewayHeader, type AwsPreviewSurface, type AwsTunnelRecord, type FetchLike } from './aws-origin';
+import { createAwsTunnelService, type TunnelStorage } from './aws-tunnels';
 import type { IceServerEntry } from './desktop-mode';
-import { RelayFailure } from './relay-refresh';
+import { RELAY_CLOCK_MARGIN_MS, RelayFailure, relayExpiryFor } from './relay-refresh';
 import type { PreviewTokenV2Claims } from './hmac';
 
 const KEY = decodeControlKey(vectors.controlKeyBase64)!;
@@ -72,6 +81,13 @@ interface HostState {
   /** The desktop unit's state the host reports; undefined = an older host that does not. */
   unit?: string;
   restartsExhausted?: boolean;
+  /** The host kernel's boot id and whether the running desktop has Chat's AI env (reported together). */
+  bootId?: string;
+  aiConfigured?: boolean;
+  /** code-server answers on 8443; otherwise the edge's 502 desktop_unreachable. */
+  codeUp?: boolean;
+  /** The host's clock for gw1 freshness (ms); NOW unless a test moves it. */
+  clock?: number;
 }
 
 function fakeHost(over: Partial<HostState> = {}) {
@@ -88,12 +104,16 @@ function fakeHost(over: Partial<HostState> = {}) {
     const body = typeof init.body === 'string' ? init.body : undefined;
     calls.push({ method, path: u.pathname, body });
     if (u.hostname !== `c-${SID}-g1-e2.${ZONE}`) bad.push(`host ${u.hostname}`);
-    const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, record(), method, u.pathname, Math.floor(NOW / 1000));
+    const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, record(), method, u.pathname, Math.floor((st.clock ?? NOW) / 1000));
     if (!v.ok) return new Response(JSON.stringify({ ok: false, error: v.error }), { status: 401 });
     const j = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s });
     if (method === 'GET' && u.pathname === '/__ezil/control/desktop') {
       return j({ ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice,
-        ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }) });
+        ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }),
+        ...(st.bootId === undefined ? {} : { bootId: st.bootId, aiConfigured: st.aiConfigured === true }) });
+    }
+    if (method === 'GET' && u.pathname === '/__p/8443/healthz') {
+      return st.codeUp ? j({ status: 'alive', lastHeartbeat: NOW }) : j({ ok: false, error: 'desktop_unreachable' }, 502);
     }
     if (method === 'POST' && u.pathname.startsWith('/__ezil/control/ice/')) {
       if (u.pathname.slice('/__ezil/control/ice/'.length) !== (await sha256Hex(body ?? ''))) return j({ ok: false, error: 'ice_digest_mismatch' }, 400);
@@ -211,6 +231,23 @@ describe('push and status (GW-5): signed, digest in the signed path', () => {
     const err = await readAwsDesktopStatus(record(), ZONE, broken, NOW / 1000).catch((e) => e);
     expect(err).toBeInstanceOf(RelayFailure);
     expect([(err as RelayFailure).code, (err as RelayFailure).status]).toEqual(['aws_desktop_unreachable', 503]);
+  });
+  it('status: a host that never answers is aws_desktop_unreachable (503) after the explicit timeout', async () => {
+    let signal: AbortSignal | null | undefined;
+    const hung: FetchLike = (_url, init) => new Promise((_resolve, reject) => {
+      signal = init.signal;
+      init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+    const err = await readAwsDesktopStatus(record(), ZONE, hung, NOW / 1000, 25).catch((e) => e);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect([(err as RelayFailure).code, (err as RelayFailure).status]).toEqual(['aws_desktop_unreachable', 503]);
+    // The default bound is explicit too: every status read carries a signal.
+    const h = fakeHost({ configured: true, expiresAt: NOW + 5, desktop: 'running', ice: 'applied' });
+    let seen: AbortSignal | null | undefined;
+    await readAwsDesktopStatus(record(), ZONE, (u, i) => { seen = i.signal; return h.fetch(u, i); }, NOW / 1000);
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(AWS_DESKTOP_STATUS_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(AWS_DESKTOP_STATUS_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
   });
   it('an unroutable record or a bad control key never reaches fetch', async () => {
     const h = fakeHost();
@@ -339,6 +376,257 @@ describe('ensureAwsDesktop: the open flow', () => {
   });
 });
 
+/**
+ * The tunnel registry an open reads its record from and claims its push through (the real
+ * service: its compare-and-set), seeded with this epoch's record. `rec()` is what a lookup
+ * returns now; `writes` counts every `restartPush` call; `failWrite` makes the registry fail.
+ */
+function registry(start: Partial<AwsTunnelRecord>, nowMs: () => number) {
+  const map = new Map<string, unknown>([['tunnel', record(start)]]);
+  const storage: TunnelStorage = {
+    async get<T>(k: string) { return map.get(k) as T | undefined; },
+    async put<T>(k: string, v: T) { map.set(k, structuredClone(v)); },
+    async delete(k: string) { return map.delete(k); },
+  };
+  const svc = createAwsTunnelService({ api: null, storage, zone: ZONE, nowMs });
+  const reg = {
+    writes: 0, failWrite: false,
+    rec: () => map.get('tunnel') as AwsTunnelRecord,
+    restartPush: (async (bootId, expectAt, next) => {
+      reg.writes += 1;
+      if (reg.failWrite) throw new Error('registry down');
+      return svc.restartPush(1, 2, bootId, expectAt, next);
+    }) as NonNullable<AwsDesktopParams['restartPush']>,
+  };
+  return reg;
+}
+
+describe('ensureAwsDesktop: one config push per host boot while the host applies it', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  const ai = async () => ({ baseUrl: `https://aws-8443-${SID}-aws.preview.example.org/ai/v1`, proxyToken: 'f'.repeat(64) });
+  const pending = { state: 'starting', reason: 'config_pending' };
+  /**
+   * Opens against one host through the registry; each ask gets the record a lookup returns at
+   * that moment unless it passes the (stale) one it read. `mint.hold` holds every mint until it
+   * resolves; `mint.fail` mints nothing; `mint.expiresAt` gives the minted expiry from the clock.
+   */
+  function opener(h: ReturnType<typeof fakeHost>, start: Partial<AwsTunnelRecord> = {}) {
+    const m = mintOk(NOW + 1_600_000);
+    let now = NOW;
+    const reg = registry(start, () => now);
+    const mint = { hold: null as Promise<void> | null, fail: false, expiresAt: null as ((now: number) => number) | null };
+    const minting: RelayMint = async (signal, purpose) => {
+      if (mint.hold) await mint.hold;
+      if (mint.fail) return null;
+      const out = await m.mint(signal, purpose);
+      return out && mint.expiresAt ? { ...out, expiresAt: mint.expiresAt(now) } : out;
+    };
+    const ask = (at = now, rec?: AwsTunnelRecord) => {
+      now = at;
+      return ensureAwsDesktop({ record: rec ?? reg.rec(), zone: ZONE, fetch: h.fetch, nowMs: () => now, neko: NEKO, mint: minting, aiConfig: ai,
+        restartPush: reg.restartPush });
+    };
+    const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
+    return { ask, reg, mint, mints: m.count, pushes };
+  }
+
+  it('10-30 live: a running desktop without Chat\'s AI env is pushed ONCE; every later ask waits (config_pending), no mint, no push', async () => {
+    // The host keeps aiConfigured=false until its next tick restarts the desktop; each push re-arms that restart.
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT });
+    // Asks every ~2 s for ~110 s (inside the fake host's gw1 skew window around NOW).
+    const start = NOW - 110_000;
+    expect(await o.ask(start)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(h.st.config!.ai).toBeDefined();
+    for (let i = 1; i <= 55; i++) expect(await o.ask(start + i * 2_000)).toEqual(pending);
+    // One claim, then the pushed config recorded against it; nothing after.
+    expect([o.pushes(), o.mints(), o.reg.writes]).toEqual([1, 1, 2]);
+    expect(o.reg.rec()).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: h.st.expiresAt!, restartPushAt: start });
+    // The restart applied it: ready, with no further push.
+    h.st.aiConfigured = true;
+    expect((await o.ask(NOW + 2_000)).state).toBe('ready');
+    expect(o.pushes()).toBe(1);
+  });
+  it('overlapping asks that both read "no push" (Code, the desktop window, a retry) push ONCE between them', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT });
+    // Both read the record before either claims: the snapshot alone cannot tell them apart.
+    const read = o.reg.rec();
+    let release = () => {};
+    o.mint.hold = new Promise<void>((r) => { release = r; });
+    const a = o.ask(NOW, read);
+    const b = o.ask(NOW, read);
+    // One claims and mints (held); the other is refused the claim and answers without a mint.
+    const first = await Promise.race([a, b]);
+    expect(first).toEqual(pending);
+    expect(o.pushes()).toBe(0);
+    release();
+    expect([...(await Promise.all([a, b]))].map((r) => (r as { reason: string }).reason).sort()).toEqual(['config_pending', 'restart_scheduled']);
+    expect([o.pushes(), o.mints()]).toEqual([1, 1]);
+    expect(o.reg.rec()).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: h.st.expiresAt!, restartPushAt: NOW });
+    expect(await o.ask(NOW + 2_000, read)).toEqual(pending);
+    expect(o.pushes()).toBe(1);
+  });
+  it('a claim still pushing holds the others back (before the held config is compared); one older than its window lost its asker', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushAt: NOW - AWS_DESKTOP_CONFIG_CLAIM_MS + 1 });
+    expect(await o.ask()).toEqual(pending);
+    expect([o.pushes(), o.mints(), o.reg.writes]).toEqual([0, 0, 0]);
+    expect(await o.ask(NOW + 1)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect([o.pushes(), o.mints()]).toEqual([1, 1]);
+    expect(o.reg.rec()).toMatchObject({ restartPushAt: NOW + 1, restartPushExpiresAt: h.st.expiresAt! });
+    // The claim's window covers its mint and push.
+    expect(AWS_DESKTOP_CONFIG_CLAIM_MS).toBeGreaterThan(20_000 + AWS_DESKTOP_PUSH_TIMEOUT_MS);
+    expect(AWS_DESKTOP_CONFIG_CLAIM_MS).toBeLessThan(AWS_DESKTOP_CONFIG_APPLY_MS);
+  });
+  it('a claim whose mint or push fails is released: the next ask pushes again, never waits on it or ends in the terminal code', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled', pushError: 'ice_store_failed' });
+    const o = opener(h, { aiBootId: BOOT });
+    await expect(o.ask()).rejects.toMatchObject({ code: 'ice_store_failed', status: 502 });
+    expect(o.reg.rec().restartPushBootId).toBeUndefined();
+    o.mint.fail = true;
+    h.st.pushError = undefined;
+    await expect(o.ask(NOW + 2_000)).rejects.toMatchObject({ code: 'turn_unavailable' });
+    expect(o.reg.rec().restartPushBootId).toBeUndefined();
+    o.mint.fail = false;
+    expect(await o.ask(NOW + 4_000)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    h.st.clock = NOW + 4_000 + AWS_DESKTOP_CONFIG_APPLY_MS - 1;
+    expect(await o.ask(h.st.clock)).toEqual(pending);
+    expect(o.pushes()).toBe(2);
+  });
+  it('a desktop that started without a relay (ice missing) gets one push per boot too', async () => {
+    for (const aiConfigured of [false, true]) {
+      const h = fakeHost({ configured: false, desktop: 'running', ice: 'missing', bootId: BOOT, aiConfigured, pushState: 'restart_scheduled' });
+      const o = opener(h);
+      expect(await o.ask()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+      expect(await o.ask(NOW + 2_000)).toEqual(pending);
+      expect(o.pushes()).toBe(1);
+    }
+  });
+  it('a push the host never applies within the bound is a coded failure, never an endless starting', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false });
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushExpiresAt: NOW + 1_700_000,
+      restartPushAt: NOW - AWS_DESKTOP_CONFIG_APPLY_MS + 1 });
+    expect(await o.ask()).toEqual(pending);
+    await expect(o.ask(NOW + 1)).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied', status: 502 });
+    expect([o.pushes(), o.mints()]).toEqual([0, 0]);
+    // The bound sits inside the shell's 215 s wake deadline, so the waiting open receives the code.
+    expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeGreaterThanOrEqual(120_000);
+    expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeLessThan(215_000);
+  });
+  it('on staging\'s 300 s TURN TTL: pending, the coded failure from the bound until the config goes stale, then exactly one new push', async () => {
+    // relayExpiryFor: a config minted at t expires at t + 300 s - 60 s; it stops being fresh 60 s before.
+    const ttlSeconds = 300;
+    expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeLessThan(ttlSeconds * 1000 - RELAY_CLOCK_MARGIN_MS - RELAY_MIN_AHEAD_MS);
+    const h = fakeHost({ configured: false, desktop: 'running', ice: 'missing', bootId: BOOT, aiConfigured: false, pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT });
+    o.mint.expiresAt = (now) => relayExpiryFor(now, ttlSeconds);
+    const at = (t: number) => { h.st.clock = t; return o.ask(t); };
+    expect(await at(NOW)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(h.st.expiresAt).toBe(NOW + 240_000);
+    expect(await at(NOW + AWS_DESKTOP_CONFIG_APPLY_MS - 1)).toEqual(pending);
+    await expect(at(NOW + AWS_DESKTOP_CONFIG_APPLY_MS)).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied' });
+    const stale = NOW + 240_000 - RELAY_MIN_AHEAD_MS;
+    await expect(at(stale - 1)).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied' });
+    expect(o.pushes()).toBe(1);
+    expect(await at(stale)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(await at(stale + 2_000)).toEqual(pending);
+    expect([o.pushes(), o.mints()]).toEqual([2, 2]);
+    expect(h.bad).toEqual([]);
+  });
+  it('another fresh config held instead of the recorded one (the Restart route staged it) gets its own bound, with no push', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_650_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false });
+    // Our recorded push is long past its bound, but the host now holds another config.
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushExpiresAt: NOW + 1_000_000,
+      restartPushAt: NOW - 2 * AWS_DESKTOP_CONFIG_APPLY_MS });
+    expect(await o.ask()).toEqual(pending);
+    expect([o.pushes(), o.mints(), o.reg.writes]).toEqual([0, 0, 1]);
+    expect(o.reg.rec()).toMatchObject({ restartPushExpiresAt: NOW + 1_650_000, restartPushAt: NOW });
+    expect(await o.ask(NOW + 2_000)).toEqual(pending);
+    expect(o.reg.writes).toBe(1);
+    // Its own bound: the adopted record ends in the coded failure once that config sits unapplied as long.
+    const later = opener(h, { ...o.reg.rec(), restartPushAt: NOW - AWS_DESKTOP_CONFIG_APPLY_MS });
+    await expect(later.ask()).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied' });
+    expect(o.pushes()).toBe(0);
+  });
+  it('a recorded push whose config the host no longer holds (expired) is a past episode: push again, never the terminal code', async () => {
+    // e.g. the desktop crashed long after the first push and restarted without a relay once its config expired.
+    const h = fakeHost({ configured: false, desktop: 'running', ice: 'missing', bootId: BOOT, aiConfigured: false, pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushExpiresAt: NOW - 39 * 60_000, restartPushAt: NOW - 40 * 60_000 });
+    expect(await o.ask()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect([o.pushes(), o.reg.writes]).toEqual([1, 2]);
+    expect(o.reg.rec().restartPushAt).toBe(NOW);
+    expect(await o.ask(NOW + 2_000)).toEqual(pending);
+  });
+  it('a new host boot (another bootId) is pushed again; so is an older host that reports no boot id', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: '22222222-2222-4222-8222-222222222222', restartPushBootId: '22222222-2222-4222-8222-222222222222',
+      restartPushAt: NOW - 1_000 });
+    expect(await o.ask()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(o.pushes()).toBe(1);
+    expect(o.reg.rec()).toMatchObject({ restartPushBootId: BOOT, restartPushAt: NOW });
+    const old = fakeHost({ configured: false, desktop: 'running', ice: 'missing', pushState: 'restart_scheduled' });
+    const p = opener(old);
+    await p.ask();
+    await p.ask(NOW + 2_000);
+    expect([p.pushes(), p.reg.writes]).toEqual([2, 0]);
+  });
+  it('a registry that does not answer never fails the open: it pushes as before', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT });
+    o.reg.failWrite = true;
+    expect(await o.ask()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect([o.pushes(), o.reg.writes]).toEqual([1, 2]);
+  });
+  it('a desktop still starting with this boot\'s AI config already held: config_pending, no re-push', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'absent', unit: 'activating', bootId: BOOT, aiConfigured: false });
+    const o = opener(h, { aiBootId: BOOT });
+    expect(await o.ask()).toEqual(pending);
+    expect([o.pushes(), o.mints()]).toEqual([0, 0]);
+    // No AI config minted for this boot yet: pushed once with it, as before.
+    const fresh = opener(fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'absent', bootId: BOOT, aiConfigured: false }));
+    expect(await fresh.ask()).toEqual({ state: 'starting', reason: 'config_pushed' });
+    expect(fresh.pushes()).toBe(1);
+  });
+  it('a push whose answer never comes (its own timeout) may have landed: its claim holds the others back for its window, then one push again', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    let now = NOW;
+    let hang = true;
+    let signal: AbortSignal | null | undefined;
+    const fetch: FetchLike = (url, init) => {
+      if (!hang || !new URL(url).pathname.startsWith('/__ezil/control/ice/')) return h.fetch(url, init);
+      signal = init.signal;
+      return Promise.reject(new DOMException('The operation timed out.', 'TimeoutError'));
+    };
+    const reg = registry({ aiBootId: BOOT }, () => now);
+    const ask = (at: number) => {
+      now = at;
+      h.st.clock = at;
+      return ensureAwsDesktopConfig({ record: reg.rec(), zone: ZONE, fetch, nowMs: () => now, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
+        restartPush: reg.restartPush });
+    };
+    const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
+    await expect(ask(NOW)).rejects.toMatchObject({ code: 'aws_desktop_unreachable', status: 503 });
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(reg.rec()).toMatchObject({ restartPushBootId: BOOT, restartPushAt: NOW });
+    expect(reg.rec().restartPushExpiresAt).toBeUndefined();
+    hang = false;
+    expect(await ask(NOW + 2_000)).toEqual(pending);
+    expect(await ask(NOW + AWS_DESKTOP_CONFIG_CLAIM_MS - 1)).toEqual(pending);
+    expect(pushes()).toBe(0);
+    expect(await ask(NOW + AWS_DESKTOP_CONFIG_CLAIM_MS)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(pushes()).toBe(1);
+    expect(AWS_DESKTOP_PUSH_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+  });
+});
+
 describe('handleAwsPreview with the desktop relay', () => {
   const claims = (): PreviewTokenV2Claims => ({
     ts: NOW, sandboxId: SID, computerId: CID, userId: 'u1', provider: 'aws-ec2', store: '', generation: 1, leaseEpoch: 2,
@@ -367,5 +655,121 @@ describe('handleAwsPreview with the desktop relay', () => {
     expect(await res.json()).toEqual({ ok: false, error: 'turn_unavailable' });
     const odd = await handleAwsPreview(claims(), deps(async () => { throw new Error(`boom ${TURN_PASS}`); }));
     expect(await odd.json()).toEqual({ ok: false, error: 'relay_refresh_failed' });
+  });
+});
+
+describe('handleAwsPreview: the Code and app surfaces never wait on neko or its relay', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  const claims = (): PreviewTokenV2Claims => ({
+    ts: NOW, sandboxId: SID, computerId: CID, userId: 'u1', provider: 'aws-ec2', store: '', generation: 1, leaseEpoch: 2,
+  });
+  const ai = async () => ({ baseUrl: `https://aws-8443-${SID}-aws.preview.example.org/ai/v1`, proxyToken: 'f'.repeat(64) });
+  /**
+   * The index.ts wiring against one fake host and one registry: `ask(surface)` opens that
+   * window (the desktop when absent); the desktop's relay path and Code's probe are counted.
+   */
+  function wired(h: ReturnType<typeof fakeHost>, start: Partial<AwsTunnelRecord> = {}) {
+    const reg = registry(start, () => NOW);
+    const seen = { desktop: 0, probes: 0 };
+    const params = (r: AwsTunnelRecord) => ({ record: r, zone: ZONE, fetch: h.fetch, nowMs: () => NOW, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
+      restartPush: reg.restartPush });
+    const deps = {
+      zone: ZONE, secrets: ['s3cr3t'], zoneRoot: 'preview.example.org', lookup: async () => reg.rec(),
+      verifyOrigin: async () => 'verified' as const, nowMs: () => NOW,
+      ensureDesktop: (r: AwsTunnelRecord) => { seen.desktop += 1; return ensureAwsDesktop(params(r)); },
+      ensureConfig: (r: AwsTunnelRecord) => ensureAwsDesktopConfig(params(r)),
+      codeAnswers: (r: AwsTunnelRecord) => { seen.probes += 1; return awsCodeServerAnswers(r, ZONE, h.fetch, () => NOW); },
+    };
+    const ask = async (surface?: AwsPreviewSurface) => {
+      const res = await handleAwsPreview(claims(), { ...deps, surface });
+      return [res.status, (await res.json()) as Record<string, unknown>] as const;
+    };
+    const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
+    return { deps, ask, seen, pushes, reg };
+  }
+  const starting = (reason: string) => ({ ok: false, error: 'aws_desktop_starting', reason });
+
+  it('Code answers once code-server does while the desktop still says starting (neko not up yet); the desktop surface is unchanged', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: true,
+      nekoUp: false, codeUp: true });
+    const w = wired(h, { aiBootId: BOOT });
+    expect(await w.ask()).toEqual([503, starting('desktop_starting')]);
+    expect(await w.ask('desktop')).toEqual([503, starting('desktop_starting')]);
+    expect([w.seen.desktop, w.seen.probes]).toEqual([2, 0]);
+    const [status, body] = await w.ask('code');
+    expect(status).toBe(200);
+    expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.preview.example.org/preview-bootstrap?token=`);
+    expect(body.relay).toBeUndefined();
+    expect(body.turnRelay).toBeUndefined();
+    expect([w.seen.desktop, w.seen.probes, w.pushes()]).toEqual([2, 1, 0]);
+    h.st.nekoUp = true;
+    const [deskStatus, desk] = await w.ask();
+    expect([deskStatus, desk.turnRelay]).toEqual([200, true]);
+  });
+  it('10-30 live: a running desktop without Chat\'s AI env -> Code waits for the ONE restart that applies it (never 200 before), then answers', async () => {
+    // That restart also restarts code-server (it runs in the desktop's container): a 200 before
+    // it would hand out a Code window the host's next tick tears down.
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      nekoUp: false, codeUp: true, pushState: 'restart_scheduled' });
+    const w = wired(h, { aiBootId: BOOT });
+    expect(await w.ask('code')).toEqual([503, starting('restart_scheduled')]);
+    expect(w.pushes()).toBe(1);
+    expect(h.st.config!.ai).toBeDefined();
+    // Code, the desktop window and the app all wait for it now; nothing is pushed again.
+    for (const surface of ['code', undefined, 'app', 'code'] as const) expect(await w.ask(surface)).toEqual([503, starting('config_pending')]);
+    expect([w.pushes(), w.seen.probes]).toEqual([1, 0]);
+    // The restart applied it (neko still booting): Code answers, the desktop still waits on neko.
+    h.st.aiConfigured = true;
+    expect((await w.ask('code'))[0]).toBe(200);
+    expect(await w.ask()).toEqual([503, starting('desktop_starting')]);
+    expect(w.pushes()).toBe(1);
+  });
+  it('a cold host (no config, Code not up): the Code ask pushes the config and answers starting', async () => {
+    const h = fakeHost({ bootId: BOOT, aiConfigured: false });
+    const w = wired(h);
+    expect(await w.ask('code')).toEqual([503, starting('config_pushed')]);
+    expect([w.pushes(), w.seen.desktop, w.seen.probes]).toEqual([1, 0, 0]);
+    expect(h.st.config!.ai).toBeDefined();
+  });
+  it('the desktop runs with its config but code-server is not up yet: 503 code_starting, no push', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: true });
+    const w = wired(h);
+    expect(await w.ask('code')).toEqual([503, starting('code_starting')]);
+    expect([w.pushes(), w.seen.probes]).toEqual([0, 1]);
+  });
+  it('a config failure answers its code to Code, whether or not code-server answers', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit: 'failed', restartsExhausted: true, codeUp: true });
+    expect(await wired(h).ask('code')).toEqual([502, { ok: false, error: 'aws_desktop_failed' }]);
+    const up = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', codeUp: true });
+    const v = wired(up);
+    v.deps.ensureConfig = async () => { throw new RelayFailure('turn_unavailable'); };
+    expect(await v.ask('code')).toEqual([502, { ok: false, error: 'turn_unavailable' }]);
+    expect(v.seen.probes).toBe(0);
+  });
+  it('the hosted app surface is served once the desktop runs with its config, without waiting on neko', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: true, nekoUp: false });
+    const w = wired(h, { aiBootId: BOOT });
+    const [status, body] = await w.ask('app');
+    expect(status).toBe(200);
+    expect(String(body.appPreviewUrl)).toContain('https://aws-3002-');
+    expect([w.seen.desktop, w.seen.probes, w.pushes()]).toEqual([0, 0, 0]);
+    const down = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'absent', unit: 'activating' });
+    expect(await wired(down).ask('app')).toEqual([503, starting('desktop_starting')]);
+  });
+  it('awsCodeServerAnswers: a gw1-signed GET of code-server\'s /healthz; an edge 502, a throw or a hang is not up', async () => {
+    const h = fakeHost({ codeUp: true });
+    expect(await awsCodeServerAnswers(record(), ZONE, h.fetch, () => NOW)).toBe(true);
+    expect(h.calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /__p/8443/healthz']);
+    expect(h.bad).toEqual([]);
+    h.st.codeUp = false;
+    expect(await awsCodeServerAnswers(record(), ZONE, h.fetch, () => NOW)).toBe(false);
+    expect(await awsCodeServerAnswers(record(), ZONE, async () => { throw new Error('reset'); }, () => NOW)).toBe(false);
+    const hung: FetchLike = (_u, init) => new Promise((_r, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
+    expect(await awsCodeServerAnswers(record(), ZONE, hung, () => NOW, 25)).toBe(false);
+    expect(await awsCodeServerAnswers(record({ controlKey: 'nope' }), ZONE, h.fetch, () => NOW)).toBe(false);
+  });
+  it('the surface comes only from the exact signed body values; anything else is the desktop', () => {
+    expect(['code', 'app', 'desktop', undefined, 'CODE', 'neko', 1, {}].map(awsPreviewSurface))
+      .toEqual(['code', 'app', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop']);
   });
 });
