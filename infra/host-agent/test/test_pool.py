@@ -255,6 +255,30 @@ class Requests(PoolTest):
                     self.assertEqual(client.mock_calls[-1], mock.call.claim())
                     self.assertEqual(self.clock.sleeps, [1] * 300)
 
+    def test_an_app_outage_while_waiting_keeps_the_host_but_a_refusal_ends_it(self):
+        # R2-4: the guard's exit 2 is never restarted, so an outage (the claim request's own
+        # retry budget spent) must not end the spare's pool agent. A refusal still does.
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        for code in ("pool_retry_exhausted", "pool_unavailable"):
+            with self.subTest(code=code):
+                self.clock.now, self.clock.sleeps = 0, []
+                client = mock.Mock()
+                client.claim.side_effect = [Refused(code), None, Refused(code), CLAIM]
+                self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+                self.assertEqual((client.claim.call_count, self.clock.sleeps), (4, [1] * 3))
+        client = mock.Mock()
+        client.claim.side_effect = [None, Refused("pool_request_refused"), CLAIM]
+        with self.assertRaisesRegex(Refused, "pool_request_refused"):
+            pool.wait_claim(client, self.cfg)
+
+    def test_an_outage_on_the_claim_check_after_a_failed_refresh_keeps_waiting(self):
+        self.patch(pool, "wait_ready", return_value=HEALTH)
+        client = mock.Mock()
+        client.claim.side_effect = [None] * 301 + [Refused("pool_retry_exhausted"), None, CLAIM]
+        client.enroll.side_effect = Refused("pool_retry_exhausted")
+        self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+        self.assertEqual(client.claim.call_count, 304)
+
     def test_retryable_refresh_refusal_without_claim_keeps_polling(self):
         self.patch(pool, "wait_ready", return_value=HEALTH)
         for operation in ("enroll", "ready"):
@@ -419,6 +443,10 @@ class Readiness(PoolTest):
         service, unit = sections["Service"], sections["Unit"]
         self.assertEqual((service["Type"], service["Restart"]), ("oneshot", "on-failure"),
                          "oneshot allows on-failure only (systemd refuses always/on-success)")
+        # normal mode passes through failed: every Requires= dependent's start job fails with it
+        # and nothing starts them again (the ezil-enroll.service rule). Unit-file only: that the
+        # dependents still start after one failed run is a live check on a systemd 255 host.
+        self.assertEqual(service.get("RestartMode"), "direct", "a restart must not fail the dependents")
         self.assertGreater(int(service["RestartSec"]), 0)
         self.assertGreater(int(unit["StartLimitIntervalSec"]), 0)
         self.assertGreater(int(unit["StartLimitBurst"]), 0)

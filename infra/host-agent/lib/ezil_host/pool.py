@@ -359,10 +359,25 @@ def first_ready(client, warm):
     return False
 
 
+def poll_claim(client):
+    """One claim poll while the warm host waits. An app outage (the request's own retry budget
+    spent) is not fatal: the guard would exit 2, which its unit never restarts, and the spare's
+    pool agent would end for good (R2-4). The host keeps waiting instead; while the app stays
+    unreachable no refresh succeeds, so the host ages out of the claimable set and the planner
+    retires it. A refusal still raises."""
+    try:
+        return client.claim()
+    except Refused as e:
+        if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+            raise
+        print("[pool] claim poll: app unreachable; still waiting", flush=True)
+        return None
+
+
 def wait_claim(client, warm):
     refresh_at = time.monotonic() + REFRESH_SECONDS
     while True:
-        claim = client.claim()
+        claim = poll_claim(client)
         if claim is not None:
             return claim
         if time.monotonic() >= refresh_at:
@@ -375,7 +390,7 @@ def wait_claim(client, warm):
                 client.ready(health, retry_seconds=REFRESH_RETRY_SECONDS)
             except Refused as e:
                 # Leasing can refuse a refresh before the claim response is published.
-                claim = client.claim()
+                claim = poll_claim(client)
                 if claim is not None:
                     return claim
                 if e.code == "pool_desktop_not_ready":
