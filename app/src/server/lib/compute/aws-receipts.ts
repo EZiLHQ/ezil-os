@@ -17,7 +17,6 @@ import { createProviderMigrationStore } from './provider-migrate-store';
 
 import { createHash, randomUUID } from 'node:crypto';
 
-import { sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
@@ -714,30 +713,6 @@ export async function enforceSessionLimits(
     const limit = sessionLimitFor(p, policy, usage);
     if (!limit) return null;
     return (await startStopAsReconciler(deps, p, deployment, limit)) ? limit : null;
-}
-
-/**
- * Round 6 R1-01: RUNNING aws-ec2 placements with no lifecycle job, migration or image job in flight, oldest write
- * first, for the billing sweep's held bound (cron/billing-session-sweep). Read-only: never the fleet pass's rotating
- * claim. `since` is the row's last write, never before it went RUNNING. No placement table (a billing-only
- * database) reads as none.
- */
-export async function readRunningAwsPlacements(db: PlacementExecutor, limit: number): Promise<{ userId: string; computerId: string; since: Date }[]> {
-    const rowsOf = (result: unknown) => (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
-    const [table] = rowsOf(await db.execute(sql`/* placement:running-aws-table */ SELECT to_regclass('public.ezil_computer_placements') IS NOT NULL AS present`));
-    if (table?.present !== true) return [];
-    const rows = rowsOf(await db.execute(sql`/* placement:running-aws */ SELECT computer_id::text AS computer_id,
-            owner_user_id::text AS owner_user_id, updated_at
-        FROM public.ezil_computer_placements
-        WHERE provider = 'aws-ec2' AND state = 'RUNNING' AND lifecycle_job_id IS NULL AND image_upgrade_job_id IS NULL
-            AND (last_error IS NULL OR NOT starts_with(last_error, 'migration_pending:'))
-        ORDER BY updated_at, computer_id
-        LIMIT ${Math.max(0, Math.floor(limit))}`));
-    return rows.flatMap(row => {
-        const since = row.updated_at instanceof Date ? row.updated_at : new Date(String(row.updated_at));
-        return typeof row.computer_id === 'string' && typeof row.owner_user_id === 'string' && Number.isFinite(since.getTime())
-            ? [{ userId: row.owner_user_id, computerId: row.computer_id, since }] : [];
-    });
 }
 
 /** Most placements one fleet pass looks at (each RUNNING one costs a DescribeInstances). */

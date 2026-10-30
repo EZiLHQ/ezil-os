@@ -15,8 +15,10 @@ const RETRY_WINDOW_MS = 2 * 60 * 60 * 1000;
  * epoch, has none being opened: only then may a stop act on it (the held bound, and the retry: CR-4).
  */
 export const RUNNING_GRACE_MS = 2 * 60 * 1000;
-/** Most RUNNING aws-ec2 placements one held pass reads (the AWS fleet is bounded by its region caps). */
+/** Most computers one held pass reads (the AWS fleet is bounded by its region caps). */
 const HELD_SCAN_LIMIT = 200;
+/** Round 6 R1-01: how far back the held pass looks for a computer's last AWS session (store.ts `runningAwsComputersAfterEpochs`). */
+export const HELD_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface BillingSessionSweepCounts {
     examined: number;
@@ -39,7 +41,7 @@ export interface BillingSessionSweepCounts {
 /** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
 export type AwsStopProof = (computer: ComputerRef) => Promise<{ running: boolean; stoppedAt: Date | null }>;
 
-/** Round 6 R1-01: RUNNING aws-ec2 placements with nothing in flight; `since` is the row's last write (≥ RUNNING entry). */
+/** Round 6 R1-01: RUNNING aws-ec2 computers with nothing in flight; `since` is the placement row's last write (≥ RUNNING entry). */
 export type RunningAwsPlacements = (limit: number) => Promise<readonly (ComputerRef & { since: Date })[]>;
 
 export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, limit = 50 }: {

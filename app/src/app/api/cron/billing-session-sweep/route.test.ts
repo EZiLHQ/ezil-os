@@ -4,7 +4,7 @@ import { getBillingDeps } from '@/server/billing/deps';
 import { readBillingConfig } from '@/server/billing/config';
 import type { BillingDeps, BillingStore } from '@/server/billing/ports';
 import { db } from '@/server/db';
-import { readRunningAwsPlacements } from '@/server/lib/compute/aws-receipts';
+import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { handleBillingSessionSweep } from './handler';
@@ -17,9 +17,9 @@ vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ routeComputer: vi.fn() }));
 vi.mock('@/server/lib/compute/placement', () => ({ readPlacement: vi.fn() }));
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: vi.fn() }));
-vi.mock('@/server/lib/compute/aws-receipts', () => ({ readRunningAwsPlacements: vi.fn() }));
+vi.mock('@/server/billing/store', () => ({ runningAwsComputersAfterEpochs: vi.fn() }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation' }));
-vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000 }));
+vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000, HELD_LOOKBACK_MS: 7 * 86_400_000 }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
@@ -129,11 +129,11 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(await (await wiring()).isStillRunning(computer)).toBe(expected);
     });
 
-    it('lists running AWS placements for the held bound through the read-only placement read', async () => {
+    it('lists running AWS computers for the held bound from the last 7 days of AWS sessions', async () => {
         const rows = [{ ...computer, since: now }];
-        vi.mocked(readRunningAwsPlacements).mockResolvedValue(rows);
+        vi.mocked(runningAwsComputersAfterEpochs).mockResolvedValue(rows);
         expect(await (await wiring()).runningAwsPlacements!(7)).toBe(rows);
-        expect(readRunningAwsPlacements).toHaveBeenCalledExactlyOnceWith(db, 7);
+        expect(runningAwsComputersAfterEpochs).toHaveBeenCalledExactlyOnceWith(db, new Date(now.getTime() - 7 * 86_400_000), 7);
     });
 
     it('does not retry if the placement owner no longer matches the epoch', async () => {

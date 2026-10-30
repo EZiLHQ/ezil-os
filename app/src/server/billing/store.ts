@@ -18,7 +18,7 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
-import { readPlacementProvider } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementIntegrityError, readPlacement, readPlacementProvider, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
@@ -633,4 +633,44 @@ export function createBillingStore(db: Database): BillingStore {
         },
     };
     return store;
+}
+
+/**
+ * Round 6 R1-01: the billing sweep's held-bound input. The computers whose newest compute epoch (open, or closed
+ * since `since`) is an AWS size and closed, newest close first, read through the placement module (the one reader
+ * of the placement tables, C-2): those RUNNING with no lifecycle, migration or image job in flight, with the row's
+ * last write (never before it went RUNNING). An open epoch is the policy pass's; a re-open whose epoch failed to
+ * open still has its last session's. No placement table (a billing-only database) reads as none.
+ */
+export async function runningAwsComputersAfterEpochs(db: Database, since: Date, limit: number):
+    Promise<{ userId: string; computerId: string; since: Date }[]> {
+    const bounded = Math.max(0, Math.min(200, Math.floor(limit)));
+    if (bounded === 0) return [];
+    const placements = db as unknown as PlacementExecutor;
+    const result = await db.execute(sql`/* billing:held-candidates */ SELECT computer_id::text AS computer_id, user_id::text AS user_id
+        FROM (SELECT DISTINCT ON (computer_id) computer_id, user_id, size, ended_at
+            FROM ${billingComputeEpochs}
+            WHERE ended_at IS NULL OR ended_at >= ${since.toISOString()}::timestamptz
+            ORDER BY computer_id, ready_at DESC, id DESC) newest
+        WHERE size <> 'free-cf' AND ended_at IS NOT NULL
+        ORDER BY ended_at DESC, computer_id
+        LIMIT ${bounded}`);
+    const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Record<string, unknown>[];
+    const running: { userId: string; computerId: string; since: Date }[] = [];
+    for (const row of rows) {
+        // A paid Cloudflare computer also rates std-2: only an aws-ec2 row (and only where the table exists) is read.
+        if (await readPlacementProvider(placements, String(row.computer_id)) !== 'aws-ec2') continue;
+        let record;
+        try {
+            ({ record } = await readPlacement(placements, String(row.computer_id)));
+        } catch (error) {
+            // A duplicate or corrupt row, or an image job holding it: never this pass's to stop.
+            if (error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError) continue;
+            throw error;
+        }
+        if (!record || record.provider !== 'aws-ec2' || record.state !== 'RUNNING' || record.lifecycleJobId !== null
+            || record.lastError?.startsWith('migration_pending:') || record.ownerUserId !== String(row.user_id).toLowerCase()) continue;
+        running.push({ userId: record.ownerUserId, computerId: record.computerId, since: record.updatedAt });
+    }
+    return running;
 }

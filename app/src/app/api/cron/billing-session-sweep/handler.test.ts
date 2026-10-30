@@ -5,7 +5,7 @@ import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { handleBillingSessionSweep, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, HELD_LOOKBACK_MS, RUNNING_GRACE_MS } from './handler';
 import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
@@ -487,8 +487,9 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
     const overrunLines = () => vi.mocked(console.info).mock.calls.map(call => String(call[0])).filter(line => line.startsWith('{"event":"held-overrun"'))
         .map(line => JSON.parse(line));
 
-    it('the grace is two minutes (route.test pins the same value for the retry check)', () => {
+    it('the grace is two minutes and the lookback seven days (route.test pins the same values)', () => {
         expect(RUNNING_GRACE_MS).toBe(120_000);
+        expect(HELD_LOOKBACK_MS).toBe(7 * 86_400_000);
     });
 
     it('stops a held RUNNING host whose session never opened, once the grace has passed', async () => {

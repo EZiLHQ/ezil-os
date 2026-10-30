@@ -1,13 +1,13 @@
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
+import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { db } from '@/server/db';
 import { newCorrelationId } from '@/server/lib/cloudflare-guacamole-provider';
-import { readRunningAwsPlacements } from '@/server/lib/compute/aws-receipts';
 import { readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
-import { handleBillingSessionSweep, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, HELD_LOOKBACK_MS, RUNNING_GRACE_MS } from './handler';
 
 export const maxDuration = 300;
 
@@ -58,7 +58,7 @@ export async function GET(req: Request): Promise<Response> {
         stop: (computer, reason) => stopComputerForPolicy(db, computer, reason),
         isStillRunning: isStillRunningAt(now),
         awsStopProof,
-        runningAwsPlacements: limit => readRunningAwsPlacements(db as unknown as PlacementExecutor, limit),
+        runningAwsPlacements: limit => runningAwsComputersAfterEpochs(db, new Date(now.getTime() - HELD_LOOKBACK_MS), limit),
     });
     return Response.json(counts);
 }
