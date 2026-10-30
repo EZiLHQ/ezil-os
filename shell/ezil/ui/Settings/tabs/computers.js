@@ -266,18 +266,25 @@ async function closeSandboxWindows (id, keepId) {
             && (keepId === undefined || windowStreams(el, keepId) !== true));
 
     const $wins = $(targets());
-    if ( $wins.length === 0 ) {
-        if ( openDesktopComputerId() === null ) activeComputerId = null;
-        return;
+    if ( $wins.length > 0 ) {
+        await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
+        const deadline = Date.now() + 3000;
+        while ( targets().length > 0 && Date.now() < deadline ) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+        if ( targets().length > 0 ) {
+            console.warn(`[${PHASE}] a sandbox window did not close within the wait budget`);
+        }
     }
-    await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
-    const deadline = Date.now() + 3000;
-    while ( targets().length > 0 && Date.now() < deadline ) {
-        await new Promise(r => setTimeout(r, 50));
-    }
-    if ( targets().length > 0 ) {
-        console.warn(`[${PHASE}] a sandbox window did not close within the wait budget`);
-    }
+    // 🔴 HOTFIX r5 (ACCEPT-11865d06 B6): a closed window is not a stopped loop.
+    // Every desktop/Preview/Code wake loop for this computer (including one whose
+    // window is already gone, and the paint-time warm) is cancelled and AWAITED,
+    // so no ask can reach the server's ensure() — which starts a STOPPED
+    // computer — after the Stop/Delete this precedes. Bounded like the close.
+    const cancelled = Promise.resolve(session.cancelComputerOpens?.(id, { keep: keepId }));
+    let budget;
+    await Promise.race([cancelled, new Promise(r => { budget = setTimeout(r, 3000); })]);
+    clearTimeout(budget);
     // The desktop specifically drives `activeComputerId` (see its own
     // comment): re-check it directly rather than assume it was among the
     // windows this call targeted.
@@ -443,7 +450,10 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
             plan: state === 'locked' ? planFor(size, data) : null };
     }) : [];
     const disk = data?.computer?.disk ?? null;
-    const done = ! switching && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
+    // Hotfix r5 (ACCEPT #5): "Now running on …" only while it is running — never beside Stopping…/Stopped.
+    // (Main's model has no `stopping` input: Settings' own Stop dismisses the transition on confirm.)
+    const done = ! switching && running && prog?.operation !== 'stopping'
+        && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
     const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
     return { computer, data, free, standing, held, move,
