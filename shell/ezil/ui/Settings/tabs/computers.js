@@ -320,7 +320,12 @@ const CAP_REASONS = new Set(['billing_user_hours_cap', 'billing_aws_monthly_cap'
 const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
 
 let summary = null;   // billing.summary (v3) or null when it cannot be read
-let progress = null;  // computer.progress of the main computer
+// computer.progress of the main computer, AS READ DURING THIS ACTIVATION. Follow-up r5
+// (ACCEPT-9a755827 FINDING 2): it is cleared whenever a window or the tab goes away and only
+// rendered when `progressGen` matches the current activation, so a reopen never paints the
+// lifecycle (Stopped without Stop over a running computer, or the reverse) of a previous life.
+let progress = null;
+let progressGen = -1; // `generation` when `progress` was read
 let pendingSwitch = null; // { computerId, current, target } from the click to the server's answer
 let notice = null;    // { text, tone } from the last switch/stop answer
 let unavailable = new Set();
@@ -718,10 +723,16 @@ function mainComputer () {
     return computers.find(c => c.id === id) ?? [...computers].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))[0] ?? null;
 }
 
+/** This activation's lifecycle read for `computer`, or null while it is unknown. */
+function currentProgress (computer) {
+    if ( ! progress || progressGen !== generation ) return null;
+    return progress.computerId === undefined || progress.computerId === computer.id ? progress : null;
+}
+
 function webModel () {
     const computer = mainComputer();
     if ( ! computer ) return null;
-    const prog = progress?.computerId === undefined || progress?.computerId === computer.id ? progress : null;
+    const prog = currentProgress(computer);
     const t = transitionOf(prog);
     if ( t && IN_FLIGHT.has(t.phase) ) seenInFlight.add(t.transitionId);
     return computerModel({ computer, data: summary, prog,
@@ -735,13 +746,16 @@ function renderWeb ($list) {
         $list.html('<div class="ezil-settings-muted" data-role="no-computer">Your computer is set up the first time you open the desktop.</div>');
         return;
     }
-    $list.html(computerHtml(model, progress, computers.filter(c => c.id !== model.computer.id)));
+    $list.html(computerHtml(model, currentProgress(model.computer), computers.filter(c => c.id !== model.computer.id)));
 }
 
 function schedulePoll ($win) {
+    // A CLOSED window's late caller (its Stop answering after Settings closed) must not
+    // cancel the poll of the window that is open now.
+    if ( ! $win.get(0)?.isConnected ) return;
     clearTimeout(pollTimer);
     pollTimer = null;
-    if ( ! paneActive || isNative() || ! $win.get(0)?.isConnected ) return;
+    if ( ! paneActive || isNative() ) return;
     const fast = pendingSwitch || inFlight(progress) || progress?.operation === 'opening' || progress?.operation === 'stopping' || stopBusy;
     pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : 20000);
 }
@@ -758,14 +772,18 @@ async function readSummary () {
 }
 
 async function refreshProgress ($win) {
+    // A closed window (a Stop that answered after Settings closed) neither reads into nor
+    // repaints the window open now; that window reads on its own activation and poll.
+    if ( ! $win.get(0)?.isConnected ) return;
     const computer = mainComputer();
     if ( ! computer || ! paneActive ) { schedulePoll($win); return; }
     const mine = generation;
-    const before = transitionOf(progress);
+    const before = transitionOf(currentProgress(computer));
     const res = await trpc.query('computer.progress', { computerId: computer.id }).catch(() => ({ ok: false }));
     if ( mine !== generation ) return;
     if ( res?.ok && res.data ) {
         progress = { ...res.data, computerId: res.data.computerId ?? computer.id };
+        progressGen = mine;
         const t = transitionOf(progress);
         // Hotfix r5 review: a stop (here or in another tab) ends the run "Now running on …" was about —
         // dismissed, not just hidden, so the next Start does not bring the same done transition back.
@@ -883,6 +901,7 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
                     transition: { transitionId: answer.transitionId, kind: 'switch', current: answer.current, target: answer.target,
                         phase: transitionOf(progress)?.transitionId === answer.transitionId ? transitionOf(progress).phase : 'requested',
                         reason: null, revertAvailable: false } };
+                progressGen = generation; // the server's own answer, in this activation
             }
         } else {
             if ( answer.reason !== 'switch_in_progress' ) clearSwitchRequestId(computer.id, target);
@@ -1053,11 +1072,13 @@ async function load ($win) {
     if ( isNative() || ! paneActive ) return;
     // The plan, the configurations it allows and the disk come from the billing
     // summary; the live state (running, stopped, switching) from progress.
+    // Follow-up r5 (ACCEPT-9a755827 FINDING 2): asked TOGETHER, so the lifecycle is
+    // unknown for one progress request, not for list + the slow summary + progress.
     const mine = ++generation;
-    await readSummary();
+    await Promise.all([readSummary(), refreshProgress($win)]);
     if ( mine !== generation ) return;
-    await refreshProgress($win);
-    if ( mine !== generation || ! queuedSwitch ) return;
+    if ( ! editingId ) render($win); // the summary may have answered after progress painted
+    if ( ! queuedSwitch ) return;
     const size = queuedSwitch;
     queuedSwitch = null;
     void requestSwitch($win, size, { confirm: true });
@@ -1311,6 +1332,7 @@ export default {
         pendingSwitch = null;
         notice = null;
         stopBusy = false;
+        progress = null; // never paint lifecycle from a previous window's life
         unavailable = new Set();
         // The fallback hint only — `openDesktopComputerId()` prefers the
         // stamp on the window itself. Read HERE rather than at module-eval
@@ -1325,7 +1347,7 @@ export default {
         const onSwitchRequest = event => { if ( AWS_SIZES.includes(event.detail?.size) ) queuedSwitch = event.detail.size; };
         window.addEventListener('ezil:computer-switch-request', onSwitchRequest);
         $win.on('remove.computers', () => {
-            paneActive = false; generation++; clearTimeout(pollTimer); pollTimer = null; queuedSwitch = null;
+            paneActive = false; generation++; clearTimeout(pollTimer); pollTimer = null; queuedSwitch = null; progress = null;
             window.removeEventListener('ezil:computer-switch-request', onSwitchRequest);
         });
         paneActive = false;
@@ -1343,6 +1365,7 @@ export default {
     onDeactivate () {
         paneActive = false;
         generation++;
+        progress = null; // the lifecycle may change while the tab is away; read it again on return
         clearTimeout(pollTimer);
         pollTimer = null;
     },
