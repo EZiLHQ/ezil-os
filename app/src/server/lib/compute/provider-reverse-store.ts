@@ -23,6 +23,7 @@
  * placement transaction (export-boot claim, flip), build the store over that transaction.
  */
 import { sql, type SQL } from 'drizzle-orm';
+import { AWS_REGION_PATTERN } from './aws-config';
 import { PLACEMENT_LOCK_NAMESPACE, type PlacementDb, type PlacementExecutor } from './placement';
 
 export const REVERSE_MOVE_STATES = ['requested', 'booting', 'exporting', 'copying', 'checking', 'flipping',
@@ -68,10 +69,12 @@ export const REVERSE_MOVE_MAX_ATTEMPTS = 5;
 export const REVERSE_MOVE_RETENTION_DAYS = 14;
 
 /** The export boot's claim on the published placement row (contract §5). Integers are the placement's
- * own counters (`placementGeneration`), never the move's uuid `generation`. */
+ * own counters (`placementGeneration`), never the move's uuid `generation`. `region` is the placement's region
+ * (r5): the flip deletes the placement row, so the D21 snapshot and the purge find the retained volume's region here. */
 export interface ReverseExportBoot {
     placementGeneration: number;
     leaseEpoch: number;
+    region: string;
     volumeId: string;
     jobId: string | null;
     instanceId: string | null;
@@ -242,7 +245,8 @@ async function forwardMoveBusy(tx: PlacementExecutor, computerId: string): Promi
 
 export function validExportBoot(boot: ReverseExportBoot): boolean {
     return !!boot && Number.isSafeInteger(boot.placementGeneration) && boot.placementGeneration >= 1
-        && Number.isSafeInteger(boot.leaseEpoch) && boot.leaseEpoch >= 1 && VOLUME.test(boot.volumeId)
+        && Number.isSafeInteger(boot.leaseEpoch) && boot.leaseEpoch >= 1
+        && typeof boot.region === 'string' && AWS_REGION_PATTERN.test(boot.region) && VOLUME.test(boot.volumeId)
         && (boot.jobId === null || UUID.test(boot.jobId)) && (boot.instanceId === null || INSTANCE.test(boot.instanceId))
         && (boot.fsUuid === null || UUID.test(boot.fsUuid)) && typeof boot.claimedAt === 'string' && Number.isFinite(Date.parse(boot.claimedAt));
 }
@@ -362,7 +366,7 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             const held = expected.exportBoot;
             const keeps = (key: 'jobId' | 'instanceId' | 'fsUuid') => held?.[key] == null || held[key] === boot[key];
             if (expected.state !== 'booting' || !held || held.placementGeneration !== boot.placementGeneration || held.leaseEpoch !== boot.leaseEpoch
-                || held.volumeId !== boot.volumeId || held.claimedAt !== boot.claimedAt || !keeps('jobId') || !keeps('instanceId') || !keeps('fsUuid')) {
+                || held.region !== boot.region || held.volumeId !== boot.volumeId || held.claimedAt !== boot.claimedAt || !keeps('jobId') || !keeps('instanceId') || !keeps('fsUuid')) {
                 refuse('illegal_transition');
             }
             return cas(expected, 'booting', sql`export_boot = ${json(boot)}`);
@@ -487,17 +491,21 @@ export function createProviderReverseStore(db: PlacementExecutor) {
          * long ago. Rows marked spent (`markSnapshotSpent`) are left out unless `includeSpent`: the sweep's snapshot step calls
          * `listUnsnapshotted(3)`, the `snapshot_missing` listing `listUnsnapshotted(10, 3600, {includeSpent: true})`. A plain
          * read: starting the snapshot is idempotent by its execution name (contract §7), so two sweeps never need a row lock.
+         * A purged row (`retain_until IS NULL` on a committed row: runbook `operator_purged`, contract §7, r5) is in neither
+         * listing: its volume is gone, so there is nothing left to snapshot or to alert on.
          */
         async listUnsnapshotted(limit: number, committedForSeconds = 0, options: { includeSpent?: boolean } = {}): Promise<ComputeReverseMove[]> {
             const age = Number.isFinite(committedForSeconds) ? Math.max(0, Math.trunc(committedForSeconds)) : 0;
             const spent = options.includeSpent === true ? sql`` : sql` AND (last_error IS NULL OR last_error NOT IN ${SPENT})`;
             return rows(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
-                WHERE state = 'committed' AND aws_snapshot_id IS NULL${spent}
+                WHERE state = 'committed' AND aws_snapshot_id IS NULL AND retain_until IS NOT NULL${spent}
                   AND state_entered_at <= clock_timestamp() - make_interval(secs => ${age}::int)
                 ORDER BY ezil_compute_reverse_moves.state_entered_at, id LIMIT ${clamp(limit, REVERSE_SNAPSHOT_LIST_MAX)}`)).map(parse);
         },
         /** Committed rows whose 14-day retention has ended (`retain_until < clock_timestamp()`), oldest first, at most
-         * `REVERSE_RETENTION_LIST_MAX`. Read-only: deletion is an operator step outside the app (rule R11, contract §7). */
+         * `REVERSE_RETENTION_LIST_MAX`. Read-only: deletion is an operator step outside the app (rule R11, contract §7).
+         * The purge marker is `retain_until = NULL` (runbook `operator_purged`, r5), so a purged row leaves this listing and
+         * more than 100 expired rows never hide the newer ones behind already-purged ones. */
         async listRetentionExpired(limit: number): Promise<ComputeReverseMove[]> {
             return rows(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
                 WHERE state = 'committed' AND retain_until < clock_timestamp()

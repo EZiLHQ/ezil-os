@@ -8,7 +8,7 @@ import { createProviderMigrationStore, MigrationConflictError } from './provider
 import {
     bitmapHas, bitmapSet, EXPORT_CHUNK_BYTES, EXPORT_MAX_BYTES, importComplete, MoveLockIsolationError,
     REVERSE_MOVE_DTO_STAGE, REVERSE_MOVE_HOLDING, REVERSE_MOVE_IN_FLIGHT, REVERSE_MOVE_STATES, REVERSE_MOVE_TRANSITIONS,
-    validExportHead, type ReverseExportHead,
+    validExportBoot, validExportHead, type ReverseExportBoot, type ReverseExportHead,
 } from './provider-reverse-store';
 
 const C = '11111111-1111-4111-8111-111111111111', G = '22222222-2222-4222-8222-222222222222';
@@ -60,6 +60,17 @@ describe('export head validation', () => {
             { ...head([5]), sha256: 'z'.repeat(64) }, { ...head([5, 5]), chunks: [{ i: 1, size: 5, sha256: 'b'.repeat(64) }] }]) {
             expect(validExportHead(bad, G)).toBe(false);
         }
+    });
+});
+
+describe('export boot validation (r5: the claim carries the placement region)', () => {
+    const boot: ReverseExportBoot = { placementGeneration: 2, leaseEpoch: 3, region: 'ap-south-1', volumeId: 'vol-0b1ffbc8f8cfa6384',
+        jobId: null, instanceId: null, fsUuid: null, claimedAt: '2026-10-30T09:00:00.000Z' };
+    it('accepts any configured-region shape and refuses a missing or malformed region', () => {
+        expect(validExportBoot(boot)).toBe(true);
+        expect(validExportBoot({ ...boot, region: 'eu-west-1' })).toBe(true);
+        for (const region of [undefined, null, '', 'ap-south', 'ap-south-0', 'AP-SOUTH-1', 'mumbai', ' ap-south-1'])
+            expect(validExportBoot({ ...boot, region } as never), String(region)).toBe(false);
     });
 });
 

@@ -23,7 +23,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `to_jsonb(timestamptz)`: ISO 8601 with an offset, which Date.parse reads. */
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}:\d{2}|Z)$/;
 const start = new Date('2026-10-30T09:00:00Z');
-const boot: ReverseExportBoot = { placementGeneration: 4, leaseEpoch: 7, volumeId: 'vol-0b1ffbc8f8cfa6384', jobId: null,
+const boot: ReverseExportBoot = { placementGeneration: 4, leaseEpoch: 7, region: 'ap-south-1', volumeId: 'vol-0b1ffbc8f8cfa6384', jobId: null,
     instanceId: null, fsUuid: null, claimedAt: start.toISOString() };
 const enrolled: ReverseExportBoot = { ...boot, jobId: JOB, instanceId: 'i-0123456789abcdef0', fsUuid: OTHER };
 const headFor = (generation: string, sizes = [EXPORT_CHUNK_BYTES, EXPORT_CHUNK_BYTES, 1234]): ReverseExportHead => ({
@@ -169,12 +169,16 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         const m = await create();
         await expect(reverse.recordExportBoot(m, { ...boot, placementGeneration: 0 })).rejects.toEqual(conflict('invalid_input'));
         await expect(reverse.recordExportBoot(m, { ...boot, volumeId: 'vol-XYZ' })).rejects.toEqual(conflict('invalid_input'));
+        // r5: the claim records the placement's region (the flip deletes the placement row; §7 snapshots in this region).
+        for (const region of [undefined, '', 'mumbai', 'ap-south-0', 'AP-SOUTH-1'])
+            await expect(reverse.recordExportBoot(m, { ...boot, region } as never)).rejects.toEqual(conflict('invalid_input'));
         const b1 = await reverse.recordExportBoot(m, boot);
         expect(b1).toMatchObject({ state: 'booting', exportBoot: boot });
+        expect(b1.exportBoot!.region).toBe('ap-south-1');
         await expect(reverse.advance(b1, 'exporting')).rejects.toEqual(conflict('illegal_transition'));
         const b2 = await reverse.recordExportBoot(b1, enrolled);
         expect(b2.exportBoot).toEqual(enrolled);
-        for (const changed of [{ placementGeneration: 5 }, { leaseEpoch: 8 }, { volumeId: 'vol-0123456789abcdef0' },
+        for (const changed of [{ placementGeneration: 5 }, { leaseEpoch: 8 }, { region: 'eu-west-1' }, { volumeId: 'vol-0123456789abcdef0' },
             { jobId: OTHER }, { instanceId: 'i-0fedcba9876543210' }, { claimedAt: new Date(start.getTime() + 1).toISOString() }]) {
             await expect(reverse.recordExportBoot(b2, { ...enrolled, ...changed })).rejects.toEqual(conflict('illegal_transition'));
         }
@@ -547,6 +551,36 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect((await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).map(m => m.id)).toEqual([c.id, d.id]);
     });
 
+    it('operator_purged (r5): the purge marker is retain_until = NULL; a purged row leaves the retention listing and both snapshot listings', async () => {
+        const [kept, purged] = [await commit(C), await commit(C2)];
+        // Guarded: never before the retention ends, never on a row that is not committed.
+        expect(await runbookSql('operator_purged', purged.id)).toHaveLength(0);
+        expect(await runbookSql('operator_purged', (await create(C3)).id)).toHaveLength(0);
+        for (const m of [kept, purged]) await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '1 day',
+            state_entered_at = state_entered_at - interval '15 days' WHERE id = '${m.id}'`);
+        const ids = (list: ComputeReverseMove[]) => list.map(m => m.id).sort();
+        expect(ids(await reverse.listRetentionExpired(10))).toEqual([kept.id, purged.id].sort());
+        expect(ids(await reverse.listUnsnapshotted(10))).toEqual([kept.id, purged.id].sort());
+        expect(ids(await reverse.listUnsnapshotted(10, 3600, { includeSpent: true }))).toEqual([kept.id, purged.id].sort());
+        const [row] = await runbookSql('operator_purged', purged.id);
+        expect(row).toMatchObject({ id: purged.id, state: 'committed', aws_volume_id: VOL, retain_until: null });
+        expect(await runbookSql('operator_purged', purged.id)).toHaveLength(0);
+        const after = (await reverse.readById(purged.id))!;
+        expect(after).toMatchObject({ state: 'committed', retainUntil: null, awsVolumeId: VOL, stateEnteredAt: (await q(
+            `SELECT state_entered_at::text AS t FROM $S.ezil_compute_reverse_moves WHERE id = '${purged.id}'`))[0]!.t });
+        expect(after.updatedAt).not.toBe(purged.updatedAt);
+        // Out of every listing; the unpurged row stays in each.
+        expect(ids(await reverse.listRetentionExpired(10))).toEqual([kept.id]);
+        expect(ids(await reverse.listUnsnapshotted(10))).toEqual([kept.id]);
+        expect(ids(await reverse.listUnsnapshotted(10, 3600, { includeSpent: true }))).toEqual([kept.id]);
+        // A spent row that is purged leaves the snapshot_missing listing too.
+        await reverse.markSnapshotSpent((await reverse.readById(kept.id))!, 'snapshot_failed');
+        expect(ids(await reverse.listUnsnapshotted(10, 3600, { includeSpent: true }))).toEqual([kept.id]);
+        expect(await runbookSql('operator_purged', kept.id)).toHaveLength(1);
+        expect(await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).toEqual([]);
+        expect(await reverse.listRetentionExpired(10)).toEqual([]);
+    });
+
     it('listRetentionExpired: committed rows whose retain_until passed on the DB clock, oldest first, bounded at 100', async () => {
         const live = await commit(C);
         const [old, older] = [await commit(C2), await commit(C3)];
@@ -594,7 +628,7 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         .replaceAll('<move-id>', id).replaceAll('<snapshot-id>', snapshotId));
 
     it('the contract\'s operator runbook SQL (§5.5.1, §7.1) runs on 0012: each statement is guarded and bumps updated_at', async () => {
-        expect(Object.keys(runbook).sort()).toEqual(['clear_commit_sent', 'operator_cleared', 'operator_released', 'operator_snapshot']);
+        expect(Object.keys(runbook).sort()).toEqual(['clear_commit_sent', 'operator_cleared', 'operator_purged', 'operator_released', 'operator_snapshot']);
         // operator_released: failed_needs_operator with no commit_sent_at → failed_reopened; a stale writer then loses.
         const a = await reverse.fail(await create(), 'failed_needs_operator', 'abort_unconfirmed');
         expect(await runbookSql('operator_released', a.id)).toEqual([expect.objectContaining({ state: 'failed_reopened', last_error: 'operator_released' })]);

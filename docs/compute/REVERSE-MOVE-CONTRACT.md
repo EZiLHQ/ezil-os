@@ -1374,6 +1374,19 @@ RETURNING id, state, aws_snapshot_id, updated_at::text AS updated_at;
 - **Purge listing.** `retention.ts` (dry run, `retention.ts:1-13,58-64`) lists `listRetentionExpired(100)` and the
   `snapshot_missing` rows (`listUnsnapshotted(10, 3600, {includeSpent: true})`, **[r4]** spent rows included). Both are read-only (§3.4).
 - **Purge.** Deletion is a separate founder-owned principal, never a workflow role. Both workflow roles deny `DeleteVolume` and `DeleteSnapshot` (rule R11).
+- **[r5] Purge marker.** After deleting a row's volume and snapshot, the operator runs `operator_purged`. It sets
+  `retain_until = NULL` on that committed row; the 0012 CHECK allows it (`retain_until IS NULL OR state = 'committed'`), so
+  0012 is unchanged. `listRetentionExpired` already skips NULL, so more than 100 expired rows never hide newer ones behind
+  rows already purged. `listUnsnapshotted` skips purged rows in both modes (store r5), so a purged row never re-enters the
+  snapshot queue or the `snapshot_missing` alert. The row keeps `aws_volume_id` and `aws_snapshot_id` as history.
+
+```sql
+-- runbook: operator_purged
+UPDATE public.ezil_compute_reverse_moves
+   SET retain_until = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+ WHERE id = '<move-id>'::uuid AND state = 'committed' AND retain_until IS NOT NULL AND retain_until < clock_timestamp()
+RETURNING id, state, aws_volume_id, aws_snapshot_id, retain_until, updated_at::text AS updated_at;
+```
 - **DLM.** `dlmRoleArn` pins `role/service-role/…` (`ops.ts:36`). Change it only after `iam get-role` confirms the path. T0 saw a DLM 12-hourly snapshot of the founder's volume (snap-053333a158f9cc895, 10-29 19:38Z), so DLM runs for at least that volume; DLM snapshots never replace the D21 snapshot.
 
 ---
