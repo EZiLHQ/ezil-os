@@ -126,8 +126,8 @@ describe('/app/<appId> (docs/APP-ROUTES.md)', () => {
         expect(mocks.context).toHaveBeenCalledTimes(1);
     });
 
-    it('the /os page refuses an app id it is handed that is not allowlisted', async () => {
-        await expect(Page({ params: Promise.resolve({ appId: 'unknown' }), searchParams: Promise.resolve({}) })).rejects.toThrow('NEXT_NOT_FOUND');
+    it('the /os page will not build a return URL from an app id that is not allowlisted', async () => {
+        await expect(Page({ params: Promise.resolve({ appId: 'unknown' }), searchParams: Promise.resolve({}) })).rejects.toThrow('Not a shell app id');
         expect(mocks.context).not.toHaveBeenCalled();
     });
 

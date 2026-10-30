@@ -1,13 +1,13 @@
 import Link from 'next/link';
 import { headers } from 'next/headers';
-import { notFound, redirect } from 'next/navigation';
+import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { shellFeaturesFor } from '@/server/shell/features';
-import { Routes, getReturnUrlQueryParam, isShellAppId, returnUrlFor, shellAppRoute } from '@/utils/constants';
+import { Routes, getReturnUrlQueryParam, returnUrlFor, shellAppRoute } from '@/utils/constants';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
@@ -105,8 +105,9 @@ export default async function Page({ params: routeParams, searchParams }: {
 }) {
     const params = await searchParams ?? {};
     const appId = (await routeParams)?.appId;
-    if (appId !== undefined && !isShellAppId(appId)) notFound();
     // Built from the allowlisted id, never echoed from the request path.
+    // `/app/[appId]` has already answered 404 for any other id;
+    // `shellAppRoute` throws rather than build a return URL from one.
     const returnUrl = returnUrlFor(appId === undefined ? Routes.OS : shellAppRoute(appId), params);
     // The tRPC context is built here rather than reusing `src/trpc/server.ts`'s
     // `api` for one reason: this page needs the resolved user for the payload

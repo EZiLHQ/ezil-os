@@ -92,12 +92,13 @@ export function getReturnUrlQueryParam(pathname: string): string {
  *   - it must carry no control characters or whitespace, which are the
  *     usual way a second URL is smuggled past a naive parse, and no
  *     backslash anywhere;
- *   - its PATH (not its query) must carry no dot segment and no encoded
- *     separator or dot (`%2f`, `%5c`, `%2e`) — a second spelling of a path
- *     the checks below would not recognise;
- *   - and the path must be one this app actually sends people back to:
+ *   - and its PATH must be, exactly, one this app sends people back to:
  *     `/os`, `/app/<shell app id>` (see `SHELL_APP_IDS`), `/computers`,
- *     `/computer/<uuid>`, `/billing/return`. The query is kept as it is.
+ *     `/computer/<uuid>`, `/billing/return`. Matching whole paths is also
+ *     what refuses dot segments (`/app/../admin`) and encoded separators or
+ *     dots (`/app/%2e%2e/x`, `/os%2fadmin`): none of those shapes can be on
+ *     the list. The query is data and is kept as it is (`%2F` there is
+ *     ordinary encoding).
  *
  * 🔴 THREE outcomes, on purpose — these are not the same decision:
  *   - No `returnUrl` was supplied at all (absent, or an empty string): there
@@ -126,9 +127,8 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     }
     const end = raw.search(/[?#]/);
     const path = end === -1 ? raw : raw.slice(0, end);
-    const rejected = path === Routes.APP || path.startsWith(`${Routes.APP}/`) ? Routes.OS : Routes.COMPUTERS;
-    if (/%(2f|5c|2e)/i.test(path) || path.split('/').some(segment => segment === '.' || segment === '..')) return rejected;
-    return isReturnPath(path) ? raw : rejected;
+    if (isReturnPath(path)) return raw;
+    return path === Routes.APP || path.startsWith(`${Routes.APP}/`) ? Routes.OS : Routes.COMPUTERS;
 }
 
 const UUID_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
