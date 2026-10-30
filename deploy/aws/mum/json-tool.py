@@ -1046,6 +1046,8 @@ def namespace_config(kind, path):
         need(value.get("poolLifecycle", False) is PROFILE["poolLifecycle"], "identity pool lifecycle mismatch")
         need(value.get("killSwitch", False) is False, "identity kill switch must be off for stack creation")
         need(PROFILE["rebase"] or "imageJobDeployment" not in value, "namespace has no rebase tuple: omit imageJobDeployment")
+        caller = (PROFILE["appCaller"] or {}).get("roleName")
+        need(value.get("appCallerRoleName") == caller, "identity appCallerRoleName must equal the namespace's reviewed app caller role name")
     elif kind == "foundation":
         need(value.get("stage") == NAMESPACE and value.get("region") == REGION, "foundation stage/region mismatch")
     elif kind == "ami":

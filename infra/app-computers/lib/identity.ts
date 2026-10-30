@@ -44,7 +44,13 @@ export const IdentityConfigSchema = z.object({
      * after the README staging proof): allowed for ec2:Attribute=userData on
      * compute-tagged instances, denied for any other or missing attribute. */
     userDataAttributeKeyVerified: z.boolean().default(false),
+    /** The lifecycle app caller's fixed RoleName (prd: ezil-prd-app-caller, which the app host pins).
+     * CloudFormation's pre-create existence check reads a named role by its path-less ARN; only that
+     * read is granted. Unset (mum: generated name) grants nothing. */
+    appCallerRoleName: z.string().regex(/^[A-Za-z0-9+=,.@_-]{1,64}$/).optional(),
 }).strict().superRefine((c, ctx) => {
+    if (c.appCallerRoleName !== undefined && !c.appCallerRoleName.startsWith(`ezil-${c.namespace}-`))
+        ctx.addIssue({ code: 'custom', path: ['appCallerRoleName'], message: 'app caller role must be named ezil-<namespace>-…' });
     if (c.imageJobDeployment && (['namespace', 'accountId', 'region'] as const).some(k => c.imageJobDeployment![k] !== c[k]))
         ctx.addIssue({ code: 'custom', message: 'image_job_boundary_scope_mismatch' });
     if (c.imageJobDeployment && c.imageJobDeployment.storage.dataMaxGiB > c.maxVolumeGiB)
@@ -326,6 +332,7 @@ export function execStatements(c: IdentityConfig): iam.PolicyStatement[] {
             resources: imageJobRoleArns(c.accountId, c.namespace),
             conditions: { StringEquals: { 'iam:PermissionsBoundary': imageJobBoundaryArn(c.accountId, c.namespace) } } }),
             new iam.PolicyStatement({ actions: ['iam:GetRole'], resources: imageJobRoleNameArns(c.accountId, c.namespace) })] : []),
+        ...(c.appCallerRoleName ? [new iam.PolicyStatement({ actions: ['iam:GetRole'], resources: [`arn:aws:iam::${a}:role/${c.appCallerRoleName}`] })] : []),
         new iam.PolicyStatement({ actions: ['iam:AttachRolePolicy', 'iam:DetachRolePolicy'], resources: [n.workloadRoles],
             conditions: { StringEquals: { 'iam:PermissionsBoundary': n.boundaryArn }, ArnEquals: { 'iam:PolicyARN': LAMBDA_BASIC_EXECUTION } } }),
         new iam.PolicyStatement({ actions: ['iam:GetRole', 'iam:GetRolePolicy', 'iam:ListRolePolicies', 'iam:ListAttachedRolePolicies',

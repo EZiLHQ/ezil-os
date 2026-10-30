@@ -116,6 +116,20 @@ test('exec role may only read the two path-less image-job role names (pre-create
     assert.deepEqual(imageJobRoleNameArns(cfg.accountId, cfg.namespace), [pathless('rebase-preparation'), pathless('recovery')]);
 });
 
+test('a fixed-name app caller adds only the path-less GetRole of that one role (pre-create existence check)', () => {
+    const pathless = (role: string) => `arn:aws:iam::${cfg.accountId}:role/ezil-${cfg.namespace}-${role}`;
+    const c = IdentityConfigSchema.parse({ ...cfg, appCallerRoleName: `ezil-${cfg.namespace}-app-caller` });
+    const all = [...json(execStatements(c)), ...json(identityGuardrailStatements(c))];
+    for (const role of ['app-caller', 'rebase-preparation', 'recovery', 'observer'])
+        assert.equal(evaluate(all, 'iam:GetRole', pathless(role), {}).allowed, role === 'app-caller', role);
+    for (const action of ['iam:CreateRole', 'iam:DeleteRole', 'iam:PutRolePolicy', 'iam:TagRole', 'iam:PassRole', 'iam:GetRolePolicy', 'iam:UpdateAssumeRolePolicy'])
+        assert.equal(evaluate(all, action, pathless('app-caller'), { 'iam:PassedToService': 'states.amazonaws.com' }).allowed, false, action);
+    const unset = IdentityConfigSchema.parse(cfg);
+    assert.deepEqual(json(execStatements(unset)), json(execStatements(c)).filter(x => JSON.stringify(x) !== JSON.stringify(
+        { Action: 'iam:GetRole', Effect: 'Allow', Resource: pathless('app-caller') })));
+    assert.equal(IdentityConfigSchema.safeParse({ ...cfg, appCallerRoleName: 'ezil-other-app-caller' }).success, false);
+});
+
 test('image boundary has a reviewed exact policy snapshot', () => {
     const expected = JSON.parse(readFileSync(join(__dirname, '__snapshots__/image-job-boundary.json'), 'utf8'));
     assert.deepEqual(json(imageJobBoundaryStatements(cfg, d)), expected);
