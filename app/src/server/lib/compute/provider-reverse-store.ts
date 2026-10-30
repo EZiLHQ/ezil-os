@@ -71,6 +71,10 @@ export const REVERSE_MOVE_RETENTION_DAYS = 14;
 export const REVERSE_MOVE_MAX_ACTIVE = 3;
 /** The states `REVERSE_MOVE_MAX_ACTIVE` counts: a claim moved the row there, and only a terminal state leaves them. */
 export const REVERSE_MOVE_HOST_BOUND: readonly ReverseMoveState[] = ['booting', 'exporting', 'copying', 'checking', 'flipping'];
+/** Pre-flip in-flight states: a failure here compensates first (contract §5.7). `flipping` never does. */
+export const REVERSE_MOVE_COMPENSABLE: readonly ReverseMoveState[] = ['requested', 'booting', 'exporting', 'copying', 'checking'];
+/** `compensate:<failure code>` with its sub-step (`recordCompensation`). */
+export const COMPENSATION_MARKER = /^compensate:[a-z_]{1,64}(:host|:unconfirmed)?$/;
 
 /** The export boot's claim on the published placement row (contract §5). Integers are the placement's
  * own counters (`placementGeneration`), never the move's uuid `generation`. `region` is the placement's region
@@ -440,6 +444,19 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             if (!flipping && expected.attempts >= REVERSE_MOVE_MAX_ATTEMPTS) return { move: expected, exhausted: true };
             const attempts = Math.min(expected.attempts + 1, REVERSE_MOVE_MAX_ATTEMPTS);
             return { move: await cas(expected, expected.state, sql`attempts = ${attempts}::int, last_error = ${reason}`), exhausted: false };
+        },
+        /**
+         * A pre-flip row whose machine decided a failure compensates (contract §5.7) while it KEEPS its state, across passes
+         * (the host retire takes minutes). r6, lane A: the contract pins no carrier for that decision, so it is this row's
+         * `last_error`, `compensate:<code>` (step 1, the Worker abort, pending), `…:host` (step 2: the abort is confirmed or
+         * not needed) or `…:unconfirmed` (the abort still failed after 5 tries). Attempts reset to 0: they count the abort
+         * tries (`recordRetry` with the same marker). `state_entered_at` never moves, so the compensation's bound (the
+         * state's deadline + 30 min) keeps its DB anchor. Never in `flipping`: that state is never compensated.
+         */
+        async recordCompensation(expected: ComputeReverseMove, marker: string): Promise<ComputeReverseMove> {
+            if (!REVERSE_MOVE_COMPENSABLE.includes(expected.state)) refuse('illegal_transition');
+            if (!COMPENSATION_MARKER.test(marker)) refuse('invalid_input');
+            return cas(expected, expected.state, sql`attempts = 0, last_error = ${marker}`);
         },
         /**
          * In-flight → `failed_reopened` | `failed_needs_operator`; an operator releases `failed_needs_operator` → `failed_reopened`.

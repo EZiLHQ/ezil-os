@@ -765,6 +765,40 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect((await reverse.claimStale(10)).map(m => m.state)).toEqual(Array(9).fill('requested'));
     });
 
+    it('countHostBound (r6, §5.1.1 step 5b): rows in booting … flipping, fleet-wide; requested and terminal rows never count', async () => {
+        expect(await reverse.countHostBound()).toBe(0);
+        await create(C);
+        await reverse.fail(await create(C2), 'failed_needs_operator', 'boot_unsettled');
+        await commit(C3);
+        expect(await reverse.countHostBound()).toBe(0);
+        await reverse.recordExportBoot(await create(C4), boot);
+        await q(`DELETE FROM $S.ezil_compute_reverse_moves WHERE computer_id = '${C}'`);
+        await toCopying();
+        expect(await reverse.countHostBound()).toBe(2);
+        await toFlippingFrom(await create(C5));
+        expect(await reverse.countHostBound()).toBe(3);
+    });
+
+    it('recordCompensation (r6): same state, the marker in last_error, attempts reset; never in flipping; a stale copy loses', async () => {
+        let m = await reverse.recordExportBoot(await create(), boot);
+        m = (await reverse.recordRetry(m, 'unavailable')).move;
+        expect(m.attempts).toBe(1);
+        const c = await reverse.recordCompensation(m, 'compensate:boot_timeout:host');
+        expect(c).toMatchObject({ state: 'booting', attempts: 0, lastError: 'compensate:boot_timeout:host', stateEnteredAt: m.stateEnteredAt });
+        await expect(reverse.recordCompensation(m, 'compensate:boot_timeout')).rejects.toEqual(conflict('lost_race'));
+        // The abort tries count on the same marker, and recordRetry's bound still applies.
+        let r = { move: await reverse.recordCompensation(c, 'compensate:boot_timeout'), exhausted: false };
+        for (let i = 0; i < 5; i++) r = await reverse.recordRetry(r.move, 'compensate:boot_timeout');
+        expect(r.move).toMatchObject({ attempts: 5, lastError: 'compensate:boot_timeout' });
+        expect((await reverse.recordRetry(r.move, 'compensate:boot_timeout')).exhausted).toBe(true);
+        for (const bad of ['boot_timeout', 'compensate:', 'compensate:Boot', 'compensate:x:later', 'compensate:x:host:host'])
+            await expect(reverse.recordCompensation(r.move, bad), bad).rejects.toEqual(conflict('invalid_input'));
+        const flipping = await toFlippingFrom(await create(C2));
+        await expect(reverse.recordCompensation(flipping, 'compensate:entitlement_paid')).rejects.toEqual(conflict('illegal_transition'));
+        const failed = await reverse.fail(r.move, 'failed_reopened', 'boot_timeout');
+        await expect(reverse.recordCompensation(failed, 'compensate:boot_timeout')).rejects.toEqual(conflict('illegal_transition'));
+    });
+
     it('the Drizzle model matches the applied table: columns, nullability, types, checks and indexes', async () => {
         const config = getTableConfig(computeReverseMoves);
         const columns = await q(`SELECT column_name, data_type, is_nullable FROM information_schema.columns
