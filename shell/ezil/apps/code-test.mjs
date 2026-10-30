@@ -844,6 +844,27 @@ await settle(4);
         push('7j 🔴 when the server settles it, the same Code window re-mints exactly once and the cover goes',
             mintedUrls.length === before + 1 && ! shown(state())
             && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+        // A watch that never settles (the server keeps reporting the transition
+        // in flight) gives up after its poll budget without calling back. The
+        // cover must not then stay up forever with nothing to press.
+        const realInterval = window.setInterval;
+        window.setInterval = (fn, ms, ...a) => realInterval.call(window, fn, ms === 5000 ? 20 : ms, ...a);
+        progressAnswer = { version: 2, computerId: COMPUTER.id, operation: 'opening', stage: 'switching', active: true,
+            transition: { transitionId: 't-2', kind: 'restart', phase: 'stopping', current: 'std-2', target: 'std-2' } };
+        const before2 = mintedUrls.length;
+        window.dispatchEvent(new window.CustomEvent('ezil:computer-transition', { detail: { computerId: COMPUTER.id, transitionId: 't-2' } }));
+        await settle(4);
+        push('setup: a second transition shows "Reconnecting…"', shown(state()) && state().dataset.state === 'reconnecting');
+        for ( let i = 0; i < 600 && state().dataset.state === 'reconnecting'; i++ ) await tick(25);
+        push('7j 🔴 a transition watch that gives up without settling turns the cover into "Computer stopped" with Start (never a dead end)',
+            shown(state()) && state().dataset.state === 'stopped' && shown(state().querySelector('.ezil-code-state-start')),
+            state()?.dataset.state);
+        push('7j …and nothing was started or re-minted on its own', mintedUrls.length === before2, `${mintedUrls.length - before2}`);
+        window.setInterval = realInterval;
+        click(state().querySelector('.ezil-code-state-start'));
+        for ( let i = 0; i < 40 && mintedUrls.length === before2; i++ ) await tick(25);
+        await settle(10);
+        push('setup: Start re-minted and the cover is gone before 7k', mintedUrls.length === before2 + 1 && ! shown(state()));
         progressAnswer = null;
         window.setTimeout = realTimeout;
     }

@@ -131,6 +131,8 @@ export const VIEW_STORAGE_KEY = 'ezil-os:view.code';
 export const VIEW_EVENT = 'ezil:app-view-changed';
 /** How often the "Computer stopped" state asks the cheap status probe whether the computer is back. */
 const STOPPED_POLL_MS = 10_000;
+/** How often "Reconnecting…" checks that its transition watch has not given up (the watch polls every 5s). */
+const TRANSITION_GUARD_MS = 5_000;
 
 function remembered_view () {
     try { return sessionStorage.getItem(VIEW_STORAGE_KEY) === 'full' ? 'full' : 'window'; } catch { return 'window'; }
@@ -820,14 +822,34 @@ export async function openCodeWindow (ctx = {}) {
     // A switch or a computer restart replaces the machine; re-mint once the server settles it (round 3).
     // While it is in flight the frame is covered by "Reconnecting…" (lane A2).
     let transition_watch = null;
+    /**
+     * 🔴 The watch can also end WITHOUT settling: `watchComputerTransition`
+     * gives up after its poll budget (~16 min) and never calls `onSettled`.
+     * Without this the opaque "Reconnecting…" cover would then stay up for
+     * good with nothing to press. So once the watch is no longer active and
+     * nothing re-minted, the cover becomes "Computer stopped": its Start, and
+     * its own probe that re-mints as soon as the computer is running.
+     */
+    let transition_guard = null;
     const on_transition = (e) => {
         if ( disposed || nativeSurface || e?.detail?.computerId !== computer.id || transition_watch?.active() ) return;
         transition_watch = watchComputerTransition({
             computerId: computer.id, element: el_window,
             transitionId: typeof e.detail.transitionId === 'string' ? e.detail.transitionId : null,
-            onSettled: () => { transition_watch = null; if ( ! disposed ) void start_boot(); },
+            onSettled: () => {
+                transition_watch = null;
+                clearInterval(transition_guard); transition_guard = null;
+                if ( ! disposed ) void start_boot();
+            },
         });
         show_state('reconnecting');
+        clearInterval(transition_guard);
+        transition_guard = setInterval(() => {
+            if ( disposed || transition_watch?.active() ) return;
+            clearInterval(transition_guard); transition_guard = null;
+            transition_watch = null;
+            if ( el_state.dataset.state === 'reconnecting' ) show_state('stopped');
+        }, TRANSITION_GUARD_MS);
     };
 
     // ── full view and its top bar (lane A2) ──────────────────────────────
@@ -986,6 +1008,7 @@ export async function openCodeWindow (ctx = {}) {
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
         window.removeEventListener(TRANSITION_EVENT, on_transition);
         transition_watch?.stop();
+        clearInterval(transition_guard);
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();

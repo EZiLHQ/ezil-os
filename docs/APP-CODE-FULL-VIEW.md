@@ -72,7 +72,7 @@ shell can neither see it nor replace it.
 
 | State | When | Copy | Action |
 |---|---|---|---|
-| `reconnecting` | An `ezil:computer-transition` (restart computer or switch) for this computer, from the event until the server settles it | "Reconnecting…" / "Your computer is restarting or switching configuration. Code reopens here when it is back. Your files are safe." | None. On `done` or `failed`, `start_boot()` re-mints, which is the existing behaviour. |
+| `reconnecting` | An `ezil:computer-transition` (restart computer or switch) for this computer, from the event until the server settles it | "Reconnecting…" / "Your computer is restarting or switching configuration. Code reopens here when it is back. Your files are safe." | None. On `done` or `failed`, `start_boot()` re-mints, which is the existing behaviour. If the watch gives up without settling (its ~16 min poll budget), the cover becomes `stopped`. It is never a dead end. |
 | `stopped` | The return-from-away check (`runtime-recheck.js`: back after at least 5 minutes away, a live frame, and `desktopRunning === false`) | "Computer stopped" / "Your computer isn't running, so Code can't reach it. Your files are safe." | **Start computer** calls `start_boot()` on an explicit click. While the state is shown, the cheap status probe (`session.desktopRunning`, which never wakes a computer) asks every 10s while the tab is visible. When it answers running, the window re-mints by itself. |
 
 The colours are charcoal `var(--color-charcoal, #161616)` with off-white text.
