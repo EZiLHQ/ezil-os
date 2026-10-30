@@ -596,55 +596,32 @@ await settle(4);
     push('a CLOSED Code window no longer listens for restarts', mintedUrls.length === closedMints, `${mintedUrls.length - closedMints}`);
 }
 
-// The real Settings -> session -> Code path with a deferred restart response.
-// The app tests supply the runtime transition; here the built shell must wait for
-// that HTTP completion before minting, and must ignore it if Code closed meanwhile.
+// App-code lane A2 (2026-10-30): Settings → Troubleshoot no longer offers
+// "Restart desktop", so the Settings -> session -> Code restart path this block
+// used to drive no longer exists. What stays is the Code window's
+// `ezil:desktop-restarted` listener (5b above proves it still re-mints on a
+// direct dispatch). Here: with Code open, Troubleshoot renders no Restart
+// desktop control (negative), still renders Restart computer (positive), and
+// merely opening the pane re-mints nothing.
 {
     ENDPOINTS.restart = '/api/shell/restart';
-    const originalFetch = window.fetch;
-    let finishRestart;
-    let restartRequests = 0;
-    window.fetch = async (url, opts) => {
-        if (String(url) !== ENDPOINTS.restart) return originalFetch(url, opts);
-        restartRequests++;
-        return new Promise(resolve => { finishRestart = resolve; });
-    };
-    await ezil.registry.launch('desktop', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
-    await settle(6);
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(20);
     await ezil.registry.launch('settings');
     await settle(6);
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="troubleshoot"]'));
     await settle(4);
-    const startRestart = async () => {
-        click(q('.window[data-app="settings"] [data-action="restart"]'));
-        await settle(2);
-        click(qa('button').find(b => b.textContent.trim() === 'Restart'));
-        await settle(4);
-    };
-    const completeRestart = () => finishRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }) });
-    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
-    await settle(20);
-    let before = mintedUrls.length;
-    const oldSrc = q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src');
-    await startRestart();
-    push('Settings dispatched one restart while Code is open', restartRequests === 1);
-    push('Code does not re-mint while the AWS restart response is pending', mintedUrls.length === before);
-    push('the pending restart has not assigned another Code frame URL',
-        q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src') === oldSrc);
-    completeRestart();
-    await settle(20);
-    push('HTTP restart completion re-mints Code exactly once through the real Settings handler', mintedUrls.length === before + 1);
-
-    await startRestart();
-    push('a second restart is pending before Code closes', restartRequests === 2);
-    await window.$(q('.window[data-app="code"]')).close();
-    await settle(4);
-    before = mintedUrls.length;
-    completeRestart();
-    await settle(10);
-    push('closing Code during the restart prevents any late re-mint', mintedUrls.length === before && !q('.window[data-app="code"]'));
+    const pane = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+    const before = mintedUrls.length;
+    push('🔴 with Code open, Troubleshoot offers no Restart desktop control',
+        !! pane && ! pane.querySelector('[data-action="restart"]') && ! /Restart desktop/i.test(pane.textContent ?? ''));
+    push('…positive control: the same pane offers Restart computer',
+        !! pane?.querySelector('[data-action="restart-computer"]') && /Restart computer/.test(pane?.textContent ?? ''));
+    await settle(6);
+    push('opening Troubleshoot re-mints nothing in the open Code window', mintedUrls.length === before, `${mintedUrls.length - before}`);
     await window.$(q('.window[data-app="settings"]')).close();
-    window.fetch = originalFetch;
+    await window.$(q('.window[data-app="code"]')).close();
+    await settle(6);
     delete ENDPOINTS.restart;
 }
 
