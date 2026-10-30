@@ -163,12 +163,28 @@ e.g. `ezilProjectLaunchIntent`). Known keys: `ezilApp` (the entry's app) and
 funnel every close goes through). A2 dispatches `ezil:app-view-changed` and
 never calls history APIs.
 
-**Next.js.** `/os` and `/app/<id>` are App Router pages. After hydration,
-Next patches `pushState`/`replaceState` to copy its keys and to point its
-router at the new URL (a `restore` action with the same route tree, which
-keeps custom state). Back/Forward across a reload of an entry made by the
-previous document is a full document load in the browser, which boots the
-shell at that entry's URL.
+**Next.js.** `/os` and `/app/<id>` are App Router pages. After hydration
+Next patches `pushState`/`replaceState`, but a state that already carries
+`__NA` takes the patch's pass-through branch
+(`next/dist/client/components/app-router.js`). Every write here merges
+`history.state`, so it does: Next's router is NOT told about these URL
+changes and keeps the boot URL as its `canonicalUrl` until a Back/Forward,
+when its own popstate handler traverses to `location.href` with the entry's
+route tree (the tree of the document that wrote it).
+
+- 🔴 Known risk: any Next router action on these pages (`router.refresh()`, a
+  server action, a client `<Link>` navigation) would make Next's history
+  updater write its stale `canonicalUrl` back into the address bar. Today
+  the shell pages trigger none; their only `<Link>`s are on the stall and
+  could-not-open screens, which leave the page.
+- Deliberately not done: handing Next a state without its keys, so its
+  patch re-adds them and dispatches a `restore`, would keep its router in
+  step but run that router on every focus change. Without a real Next run
+  proving the restore never refetches (a different route's tree would
+  remount the page and destroy the shell), this lane did not take that on.
+- Back/Forward to an entry written by a document that has since been
+  reloaded is a full document load, which boots the shell at that entry's
+  URL.
 
 ## 6. Sign-in return URLs
 
