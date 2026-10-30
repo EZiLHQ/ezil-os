@@ -13,14 +13,14 @@ const src = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'ut
     .replace("import UIAlert from '../../../../src/UI/UIAlert.js';", "const UIAlert = async () => 'confirm';")
     .replace("import { openConfirmSheet } from '../sheet-frame.js';", 'const openConfirmSheet = async () => false;')
     .replace("import log from '../../../log.js';", 'const log = { ringBuffer: () => [] };')
-    .replace("import session from '../../../session.js';", 'const session = { restartEndpoint: () => null, currentComputer: () => null };')
+    .replace("import session from '../../../session.js';", 'const session = { restartEndpoint: () => globalThis.__troubleshoot?.restart ?? null, currentComputer: () => globalThis.__troubleshoot?.computer ?? null };')
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }) };')
     .replace("import telemetry from '../../../telemetry.js';", 'const telemetry = { recentEvents: () => [], capture: () => undefined, redact: v => v };')
     .replace("import { ambientCorrelationId } from '../../../trace.js';", 'const ambientCorrelationId = () => null;')
     .replace("import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';", 'const feedback_enabled = () => false, open_feedback_dialog = () => undefined, list_my_reports = async () => [], delete_my_report = async () => true;')
     .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
 assert.ok(! /^import /m.test(src), 'every import is stubbed');
-const { reasonCopy } = await import(moduleUrl(src));
+const { reasonCopy, default: troubleshootTab } = await import(moduleUrl(src));
 
 let passed = 0;
 function check (name, fn) { fn(); passed++; console.log(`PASS ${name}`); }
@@ -59,4 +59,24 @@ check('the restart copy passes scanCopy', () => {
         assert.deepEqual(scanCopy(copy), []);
     }
 });
-console.log(`\n${passed}/4 Troubleshoot checks passed`);
+// Round 6a: the terminal desktop copy (boot-phases BOOT_FAILURE_COPY desktop_config_unapplied / desktop_failed) sends a
+// Code or app preview open to Restart computer. That is only honest if Restart computer is ENABLED with no desktop
+// window open, where Restart desktop is not.
+check('🔴 with no desktop window open, Restart computer is enabled and Restart desktop is not', () => {
+    let painted = '';
+    const body = { length: 1, html: h => { painted = h; }, on () { return body; } };
+    const $win = { find: sel => (sel === '[data-role="troubleshoot-body"]' ? Object.assign(body, { 0: { isConnected: true } }) : { length: 0 }) };
+    Object.assign(globalThis, {
+        __troubleshoot: { restart: '/api/shell/restart', computer: { id: 'c-1' } },
+        html_encode: v => String(v),
+        document: { querySelector: () => null },
+        window: { addEventListener () {}, removeEventListener () {} },
+    });
+    troubleshootTab.init($win);
+    const button = action => painted.match(new RegExp(`<button[^>]*data-action="${action}"[^>]*>`))?.[0] ?? '';
+    assert.ok(button('restart') && button('restart-computer'), painted);
+    assert.match(button('restart'), /\sdisabled\b/, 'Restart desktop needs an open desktop window');
+    assert.doesNotMatch(button('restart-computer'), /\sdisabled\b/, 'Restart computer needs only a computer');
+    assert.match(painted, /Open a desktop first/);
+});
+console.log(`\n${passed}/5 Troubleshoot checks passed`);

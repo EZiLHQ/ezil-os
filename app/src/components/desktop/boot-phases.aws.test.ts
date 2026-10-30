@@ -55,17 +55,26 @@ describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_
 // Round 6 (seam A): the Worker's terminal desktop answers (aws-preview.ts WORKER_TERMINAL). The Worker answers
 // both the same on every re-ask until the host's record changes, so neither is retried silently, and each
 // copy names the Troubleshoot action that changes it instead of promising that trying again helps.
+// Round 6a: both name Restart computer. Restart desktop is disabled unless a desktop window is open
+// (Settings/tabs/troubleshoot.js), so naming it sent a Code or app preview open to a disabled button.
 describe.each([['app', app], ['shell', shell]] as const)('%s terminal desktop copy', (_name, boot) => {
     it.each([
-        ['desktop_config_unapplied', 'Restart desktop'],
-        ['desktop_failed', 'Restart computer'],
-    ] as const)('%s is never retried automatically and names %s', (code, action) => {
+        ['desktop_config_unapplied', "Your computer's desktop didn't finish setting up",
+            "Your computer is running, but its desktop, which also runs Code and your app, didn't pick up its new settings in time. Use Restart computer in Settings → Troubleshoot to start it fresh, then open this again. Your files are kept."],
+        ['desktop_failed', "Your computer's desktop couldn't start",
+            "Your computer is running, but its desktop, which also runs Code and your app, stopped and couldn't restart. Use Restart computer in Settings → Troubleshoot. Your files are kept."],
+    ] as const)('%s is never retried automatically and names Restart computer', (code, title, body) => {
         expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: code }))
             .toEqual({ kind: 'failed', reason: code, errorCode: code });
         expect(boot.isRetryableBootErrorCode(code)).toBe(false);
         const copy = boot.BOOT_FAILURE_COPY[code];
-        expect(copy.body).toContain(`${action} in Settings → Troubleshoot`);
+        expect(copy).toEqual({ title, body });
+        expect(copy.body).toContain('Restart computer in Settings → Troubleshoot');
+        // Never the button a Code or app preview user cannot press.
+        expect(`${copy.title} ${copy.body}`).not.toContain('Restart desktop');
         expect(copy.body).toContain('Your files are kept.');
+        // Reads over every surface it shows on: the desktop, Code and an app preview.
+        expect(copy.title).not.toMatch(/\bapps?\b|\bcode\b|preview/i);
         expect(`${copy.title} ${copy.body}`).not.toMatch(/retrying usually fixes|try again|something went wrong|instant|faster|unlimited|mumbai|minute/i);
     });
     it('the generic AWS preview refusal still gets its one silent re-ask', () => {
