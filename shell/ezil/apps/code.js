@@ -1004,6 +1004,9 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     el_window.on_before_exit = async () => {
+        // Closing from full view while the Browser is still full-bleed must
+        // not put the taskbar over it (`full-view.js#prepare_close`).
+        full_view.prepare_close();
         dispose();
         return true;
     };

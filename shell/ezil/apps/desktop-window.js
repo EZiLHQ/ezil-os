@@ -2415,6 +2415,10 @@ export async function openDesktopWindow (ctx = {}) {
     // `$.fn.close` awaits this before it dismantles anything, so it is the one
     // place guaranteed to run exactly once per close.
     el_window.on_before_exit = async () => {
+        // Closing while ANOTHER window (Code, since 2026-10-30) is in full
+        // view must not give the taskbar back over it. A no-op whenever this
+        // is the only full window, i.e. in every state that existed before.
+        full_view.prepare_close();
         // Release BEFORE tearing down, so the request is issued while
         // everything it needs still exists — and NOT awaited, so a slow or
         // dead network cannot delay the close by one frame. See

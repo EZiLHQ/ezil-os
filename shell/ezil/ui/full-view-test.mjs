@@ -168,6 +168,27 @@ fa.minimise();
 await settle(4);
 push('…and minimising the last one gives it back', taskbar_shown());
 
+// ── 8. closing one of two full windows (`prepare_close`, from on_before_exit) ─
+window.$(A).showWindow();
+window.$(B).showWindow();
+await settle(14);
+fa.enter();
+fb2.enter();
+push('setup: both full again', fa.is_full() && fb2.is_full() && ! taskbar_shown());
+fa.prepare_close();
+push('prepare_close() with another full window open hands back only this head and drops data-is_fullpage',
+    ! fa.is_full() && A.getAttribute('data-is_fullpage') === null && head_shown(A) && ! taskbar_shown());
+await window.$(A).close();
+await settle(8);
+push('🔴 …so the real close of one of two full windows leaves the taskbar hidden for the other',
+    ! A.isConnected && ! taskbar_shown() && fb2.is_full(), `taskbar=${taskbar_shown()}`);
+fb2.prepare_close();
+push('…positive control: prepare_close() on the LAST full window does nothing (close then restores the taskbar as before)',
+    fb2.is_full() && B.getAttribute('data-is_fullpage') === '1');
+await window.$(B).close();
+await settle(8);
+push('…and that close gives the taskbar back', ! B.isConnected && taskbar_shown());
+
 push('no uncaught page errors', uncaught.length === 0, uncaught.slice(0, 2).join(' | '));
 
 let failed = 0;

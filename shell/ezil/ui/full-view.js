@@ -45,8 +45,9 @@
 // or minimise) gives the taskbar back only when no OTHER visible window is
 // still in full view; otherwise only this window's own head comes back. With
 // one full window — every state the Browser could reach before — this is
-// exactly `exit_fullpage_chrome`. NOT covered: `$.fn.close` on a full window
-// (UIWindow.js, not this lane's) always restores the taskbar.
+// exactly `exit_fullpage_chrome`. Closing is the same rule through
+// `prepare_close()`, which a window's `on_before_exit` calls: `$.fn.close`
+// (UIWindow.js, not this lane's) would otherwise always restore the taskbar.
 //
 // 🔴 This module never calls the browser Fullscreen API. "Full view" is a
 // layout mode inside the page, not `requestFullscreen()`.
@@ -82,7 +83,8 @@ function release_chrome (el) {
  * @param {HTMLElement} el_window
  * @returns {{
  *   enter: () => boolean, exit: () => boolean, minimise: () => void,
- *   settle: () => void, watch_restore: (fn: () => void) => MutationObserver,
+ *   settle: () => void, prepare_close: () => void,
+ *   watch_restore: (fn: () => void) => MutationObserver,
  *   is_full: () => boolean, forbid: () => void,
  *   readonly wants: boolean, readonly allowed: boolean,
  * }}
@@ -165,6 +167,23 @@ export function createFullView (el_window) {
     }
 
     /**
+     * For the window's `on_before_exit`, which `$.fn.close` awaits BEFORE its
+     * own full-page exit (UIWindow.js). That exit always gives the taskbar back
+     * — right for the last full window, wrong while another one is still in
+     * full view. So in exactly that case this window hands back only its own
+     * head and drops `data-is_fullpage`, and `$.fn.close` then has no taskbar
+     * to restore. Geometry is left alone (the window is closing). With no
+     * other full window — every state the Browser could reach before Code had
+     * a full view — it does nothing.
+     */
+    function prepare_close () {
+        if ( ! is_full() || ! other_full_view_visible(el_window) ) return;
+        el_window.classList.remove(FULL_VIEW_CLASS);
+        $(el_window).removeAttr('data-is_fullpage');
+        $(el_window).find('.window-head').show();
+    }
+
+    /**
      * Call `fn` each time the window comes back from the taskbar. `showWindow`
      * has no hook of its own, so this watches the attribute it writes — which
      * keeps the whole job inside EZiL code. The caller decides what a restore
@@ -186,6 +205,7 @@ export function createFullView (el_window) {
         exit,
         settle,
         minimise,
+        prepare_close,
         watch_restore,
         is_full,
         forbid () { may = false; },

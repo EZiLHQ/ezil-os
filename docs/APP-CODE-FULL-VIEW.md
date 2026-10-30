@@ -38,7 +38,8 @@ App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
 - **`settle()`** handles a window that was minimised from full view and is now restored without wanting full view. It goes back to its stashed bounds.
 - **`watch_restore(fn)`** calls `fn` on every restore from the taskbar.
 - **`forbid()`** means there is no exit, so there is no entry.
-- **Two windows in full view.** Leaving full view gives the taskbar back only when no other visible window is still in full view. Otherwise only that window's head comes back. Known gap: `$.fn.close` on a full window (UIWindow.js) always restores the taskbar.
+- **Two windows in full view.** Leaving full view gives the taskbar back only when no other visible window is still in full view. Otherwise only that window's head comes back.
+- **`prepare_close()`** is called from both windows' `on_before_exit`, which `$.fn.close` awaits before its own full-page exit. It applies the same rule to closing. When another window is still in full view, it drops this window's `data-is_fullpage`, so `$.fn.close` does not put the taskbar over that window. When there is no other full window it does nothing.
 
 `ezil-shell.css` keys the shared strip, drawer, body offset and resize-handle
 rules on `.ezil-full-view-host`, which `createFullView` adds. The Browser's rules
@@ -85,6 +86,5 @@ uses the accent style of the existing "Try again" button.
 ## 5. Not done here (deferred)
 
 - Pixel review of every value above.
-- `$.fn.close` on a full window with another full window open restores the taskbar early (UIWindow.js).
 - With `desktopState.ui.floatingControls === true`, the fenced Feedback sync hides the icon in every full-bleed window, so Code's full view would have no Feedback icon. Today that flag is always false.
 - A Settings button in Code's drawer (Browser "Guarantee #1") needs `wants_settings_in_drawer: true` on the `code` registry entry (registry.js, not this lane's). Today the top bar's Restore and Minimise bring the taskbar, and its Settings icon, back in one click.
