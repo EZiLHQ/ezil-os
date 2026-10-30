@@ -63,8 +63,9 @@ describe('staging Worker resources and routes', () => {
     });
   });
 
-  it('routes AWS computers on staging only, through its own zone', () => {
-    expect((config as { vars?: Record<string, string> }).vars?.AWS_ROUTING_ENABLED).toBeUndefined();
+  it('routes AWS computers in each environment through its own zone', () => {
+    expect(config.vars).toMatchObject({ AWS_ROUTING_ENABLED: 'on', AWS_ORIGIN_ZONE: 'ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.org' });
+    expect(staging.vars).toMatchObject({ AWS_ORIGIN_ZONE: 'ezil.work', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work' });
   });
 
   it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
