@@ -660,8 +660,13 @@ async function defaultIsOperator(email: string): Promise<boolean> {
     const [{ env }, { isTelemetryAdmin }] = await Promise.all([import('@/env'), import('@/server/telemetry/admin')]);
     return isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS);
 }
-/** The owner's standing for a computer whose placement is aws-ec2 (`files_on_aws` is the D16 hold: Free with the files on AWS). */
-async function heldStanding(billing: BillingDeps, userId: string): Promise<string> {
+/**
+ * The owner's standing for a computer whose placement is aws-ec2 (`files_on_aws` is the D16 hold: Free with the files on AWS).
+ * 🔴 Only where billing is on (`tabEnabled`, the summary's own gate): without it there is no plan and no standing, so no
+ * computer is "held" (otherwise every AWS computer of a deployment without billing would read as Free and be moved).
+ */
+async function heldStanding(billing: BillingDeps, userId: string): Promise<string | null> {
+    if (!billing.config.tabEnabled) return null;
     const [subscriptions, paymentIssues] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.openPaymentIssues(userId)]);
     return deriveStanding({ subscriptions, paymentIssues, placementProvider: 'aws-ec2', now: billing.now() }).standing;
 }
@@ -703,7 +708,7 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
     }
     const provider = reserved ? await readPlacementProvider(db, computerId) : record?.provider ?? null;
     if (provider !== 'aws-ec2') return moveRefusal('move_not_held');
-    let standing: string;
+    let standing: string | null;
     try { standing = await heldStanding(deps.billing ? deps.billing() : await defaultBilling(), userId); }
     // An unreadable standing is "not now", never "not held" (which would hide the card) and never a move.
     catch { console.warn('[reverse-move] start standing unavailable'); return moveRefusal('move_busy'); }

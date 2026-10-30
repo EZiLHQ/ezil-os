@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 type Row = Record<string, unknown>;
 const h = vi.hoisted(() => ({
     gate: vi.fn(), sync: vi.fn(), preview: vi.fn(), prepare: vi.fn(), schedule: vi.fn(),
-    subs: [] as unknown[], billingFails: false,
+    subs: [] as unknown[], billingFails: false, tabEnabled: true,
 }));
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string; email?: string } | null; db: unknown }>().create();
@@ -28,7 +28,7 @@ vi.mock('@/env', () => ({ env: { TELEMETRY_ADMIN_EMAILS: 'ops@example.com' } }))
 vi.mock('./computer-store', async original => ({ ...await original<Record<string, unknown>>(), stampOpened: vi.fn(async () => {}) }));
 vi.mock('@/server/lib/ai-credential', () => ({ syncAiCredential: h.sync }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({
-    config: { enforcementEnabled: true, tabEnabled: true, meteringEnabled: true }, now: () => new Date('2026-10-30T12:00:00Z'),
+    config: { enforcementEnabled: true, tabEnabled: h.tabEnabled, meteringEnabled: true }, now: () => new Date('2026-10-30T12:00:00Z'),
     store: {
         subscriptionsFor: async () => { if (h.billingFails) throw new Error('billing down'); return h.subs; },
         openPaymentIssues: async () => [],
@@ -158,6 +158,7 @@ beforeEach(() => {
     h.schedule.mockReset();
     h.subs = [];
     h.billingFails = false;
+    h.tabEnabled = true;
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -263,6 +264,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
         ['no email', { email: '' }],
         ['paid standing', { subs: [paidSub] }],
         ['standing unreadable', { billingFails: true }],
+        ['billing off (no plan, no standing)', { tabOff: true }],
         ['kill switch on', { env: { EZIL_AWS_KILL_SWITCH: '1' } }],
         ['AWS disabled', { env: { EZIL_AWS_COMPUTERS_ENABLED: '0' } }],
         ['RUNNING', { placement: { state: 'RUNNING' } }],
@@ -274,6 +276,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
     ] as const)('no row: %s (the open proceeds as the D16 hold)', async (_name, setup: Row) => {
         if (setup.subs) h.subs = setup.subs as unknown[];
         if (setup.billingFails) h.billingFails = true;
+        if (setup.tabOff) h.tabEnabled = false;
         for (const [k, v] of Object.entries((setup.env as Record<string, string>) ?? {})) vi.stubEnv(k, v);
         const w = world([held(setup.placement as Row)], { moves: setup.moves as Row[], forwardBusy: setup.forwardBusy as boolean, present: setup.present as boolean });
         const created = await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: setup.email ?? 'person@example.com' });
@@ -344,10 +347,13 @@ describe('computer.move.start / retry (§5.9): nested, pinned order, every refus
             const w = world([held()], { moves: [moveRow({ user_id: OTHER })] });
             expect(await ask(w.db, 'start')).toEqual({ ok: false, reason: 'move_not_held' });
         });
-        it('3. not held: a paid standing, or a Cloudflare placement → move_not_held', async () => {
+        it('3. not held: a paid standing, billing off, or a Cloudflare placement → move_not_held', async () => {
             h.subs = [paidSub];
             expect(await ask(world([held()]).db, 'start')).toEqual({ ok: false, reason: 'move_not_held' });
             h.subs = [];
+            h.tabEnabled = false;
+            expect(await ask(world([held()]).db, 'start')).toEqual({ ok: false, reason: 'move_not_held' });
+            h.tabEnabled = true;
             const cf = world([placementRow({ computer_id: C, owner_user_id: U, provider: 'cloudflare', workspace_store: 'r2' })]);
             expect(await ask(cf.db, 'start')).toEqual({ ok: false, reason: 'move_not_held' });
         });
