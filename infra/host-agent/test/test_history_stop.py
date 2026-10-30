@@ -21,7 +21,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
-from ezil_host import agent as agentmod, config, desktop  # noqa: E402
+from ezil_host import agent as agentmod, config, desktop, guard  # noqa: E402
 from ezil_host.fsops import Refused  # noqa: E402
 
 BASH = shutil.which("bash")
@@ -332,6 +332,10 @@ class StopOutcome(unittest.TestCase):
         self.assertFalse(any(c[0] == "ps" for c in st["calls"]), "a forced kill does not wait on shells")
 
 
+LEASE_DIGEST = "sha256:" + "a" * 64
+LEASE_IID = "i-0123456789abcdef0"
+
+
 class AgentStopRecord(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix="ezil-agent-unit-")
@@ -340,21 +344,88 @@ class AgentStopRecord(unittest.TestCase):
             os.makedirs(os.path.join(self.d, sub))
         with open(os.path.join(self.d, "state", "control.key"), "wb") as f:
             f.write(b"k" * 32)
-        self.lease = {"generation": 3, "leaseEpoch": 7}
-        with open(os.path.join(self.d, "run", "guard-ok"), "w") as f:
-            json.dump(self.lease, f)
+        self.lease = {"computerId": "11111111-2222-3333-8444-555555555555", "volumeId": "vol-0123456789abcdef0",
+                      "fsUuid": "6b1f0c9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f", "generation": 3, "leaseEpoch": 7}
         self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
         self.cfg.update({"stateDir": os.path.join(self.d, "state"), "runDir": os.path.join(self.d, "run"),
                          "dataMount": os.path.join(self.d, "data")})
         self.cfg["idle"]["flushTimeoutSeconds"] = 5
-        self.a = agentmod.Agent(self.cfg, self.lease, log=lambda m: None)
+        # The stamp exactly as guard.run_guard publishes it: the full committed marker.
+        self.write_stamp(guard.new_marker(self.lease, LEASE_DIGEST, LEASE_IID))
+        self.logs = []
+        self.a = agentmod.Agent(self.cfg, self.lease, log=self.logs.append)
 
-    def flush_with(self, outcome, sync_rc=0):
+    def write_stamp(self, stamp, raw=None):
+        with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
+            f.write(json.dumps(stamp) if raw is None else raw)
+
+    def flush_with(self, outcome, sync_rc=0, blockable=True):
         sync = lambda argv, **kw: subprocess.CompletedProcess(argv, sync_rc, "", "")  # noqa: E731 (host IO-independent)
-        with mock.patch.object(agentmod.desktop, "stop", return_value=outcome), \
+        with mock.patch.object(agentmod.desktop, "stop", return_value=outcome) as stop, \
                 mock.patch.object(agentmod, "dpkg_lock_held", return_value=False), \
                 mock.patch.object(agentmod.subprocess, "run", sync):
-            return self.a.flush(blockable=True)
+            res = self.a.flush(blockable=blockable)
+        self.desktop_stopped = stop.called
+        return res
+
+    def stop_tick(self, load1=0.01):
+        """One agent tick with the real flush: an idle-due computer, low load, no terminal
+        work, no dpkg lock; returns (tick result, shutdown reasons)."""
+        reasons = []
+        sync = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")  # noqa: E731
+        with mock.patch.object(self.a, "_terminal_hold", return_value=False), \
+                mock.patch.object(agentmod, "parse_load1", return_value=load1), \
+                mock.patch.object(agentmod, "dpkg_lock_held", return_value=False), \
+                mock.patch.object(agentmod.desktop, "stop", return_value="clean"), \
+                mock.patch.object(agentmod.subprocess, "run", sync), \
+                mock.patch.object(self.a, "shutdown", side_effect=reasons.append):
+            return self.a.tick(), reasons
+
+    def test_flush_accepts_the_full_marker_stamp_the_guard_writes(self):
+        # G9: since a19cfadc the guard stamps the full marker; an exact two-key compare
+        # made every flush "stale", so no idle computer ever stopped.
+        for iid in (LEASE_IID, None):
+            stamp = guard.new_marker(self.lease, LEASE_DIGEST, iid)
+            self.write_stamp(stamp)
+            self.assertEqual(self.flush_with("clean"), "ok", sorted(stamp))
+            self.assertTrue(self.desktop_stopped)
+
+    def test_flush_still_accepts_a_legacy_two_key_stamp(self):
+        self.write_stamp({"generation": 3, "leaseEpoch": 7})
+        self.assertEqual(self.flush_with("clean"), "ok")
+
+    def test_flush_refuses_another_lease_or_a_bad_stamp_without_stopping_the_desktop(self):
+        for key, value in (("generation", 2), ("generation", 4), ("leaseEpoch", 6), ("leaseEpoch", 8)):
+            stamp = guard.new_marker(self.lease, LEASE_DIGEST, LEASE_IID)
+            stamp[key] = value
+            self.write_stamp(stamp)
+            for blockable in (True, False):
+                self.assertEqual(self.flush_with("clean", blockable=blockable), "stale", (key, value, blockable))
+                self.assertFalse(self.desktop_stopped)
+        # Not a dict (must not raise: an agent crash restarts it and resets presence), or not JSON.
+        for raw in ("[]", '"guard-ok"', "7", "null", '{"generation": 3}', "{", ""):
+            self.write_stamp(None, raw=raw)
+            self.assertEqual(self.flush_with("clean"), "stale", raw)
+            self.assertFalse(self.desktop_stopped)
+        os.unlink(os.path.join(self.cfg.runDir, "guard-ok"))
+        self.assertEqual(self.flush_with("clean"), "stale")
+
+    def test_an_idle_computer_stops_with_the_guard_stamp(self):
+        self.a.last_presence = 0
+        self.assertEqual(self.stop_tick(), ("stopped", ["idle"]))
+        self.assertFalse([m for m in self.logs if m.startswith("idle stop blocked")], self.logs)
+
+    def test_a_requested_stop_flushes_with_the_guard_stamp(self):
+        self.a.stop_request = {"kind": "stop", "warn": 0, "reason": "cap"}
+        self.assertEqual(self.stop_tick(), ("stopped", ["stop:cap flush=ok"]))
+
+    def test_a_busy_or_unknown_load_holds_the_idle_stop_and_says_so(self):
+        self.a.last_presence = 0
+        for load1, shown in ((0.75, "0.75"), (None, "unknown")):
+            with mock.patch.object(self.a, "flush") as flush:
+                self.assertEqual(self.stop_tick(load1), ("busy_load", []))
+            flush.assert_not_called()
+            self.assertEqual(self.logs[-1], f"idle stop blocked: busy_load load1={shown}")
 
     def test_killed_stop_is_never_ok(self):
         self.assertEqual(self.flush_with("clean"), "ok")
