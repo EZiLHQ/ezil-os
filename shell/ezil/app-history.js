@@ -90,6 +90,20 @@ function decodedKey (pair) {
 }
 
 /**
+ * `location`'s path, query and hash without the query pairs whose (decoded)
+ * key is in `keys`. Every other pair is kept BYTE FOR BYTE, as in
+ * `canonicalUrl`.
+ * @param {{pathname: string, search?: string, hash?: string}} location
+ * @param {string[]} keys
+ */
+export function withoutKeys (location, keys) {
+    const drop = new Set(keys);
+    const kept = String(location.search ?? '').replace(/^\?/, '').split('&')
+        .filter(pair => pair !== '' && ! drop.has(decodedKey(pair)));
+    return `${location.pathname}${kept.length ? `?${kept.join('&')}` : ''}${location.hash ?? ''}`;
+}
+
+/**
  * The canonical `/app/<id>` spelling of the location `link` was parsed from.
  * Every query pair other than the alias selectors is kept BYTE FOR BYTE, so
  * canonicalising never turns a value the parser rejected (`path=a%2Fb`) into
@@ -340,6 +354,21 @@ export function createAppHistory () {
         route (ctx) {
             if ( deps && ctx && typeof ctx === 'object' ) routes.set(ctx, { gen: launchGeneration = issued += 1, held: owner });
             return ctx;
+        },
+
+        /**
+         * Drop one-shot query keys (the billing link's `upgrade`) from the
+         * address bar, in place, BEFORE the launch they are for: whatever
+         * happens to that launch, no entry keeps them for a reload to
+         * replay. Every other pair is kept byte for byte. Takes nothing: the
+         * entry names what it named. Also on an /os-only host (the path is
+         * never rewritten).
+         * @param {string[]} keys
+         */
+        consume (keys) {
+            if ( ! deps ) return;
+            const url = withoutKeys(win().location, keys);
+            if ( url !== here() ) write('replaceState', url, {});
         },
 
         /**

@@ -954,16 +954,23 @@ async function build (payload) {
     if ( billingLink ) {
         billingDeepLinkHandled = true;
         const { initialTab, openUpgrade, search } = billingLink;
-        // Numbered (`route`): a click made while Settings opens decides.
+        // `upgrade` (the checkout or upgrade sheet) leaves the address bar
+        // NOW, before the launch: `openUpgrade` travels in the ctx below, and
+        // however a click lands while Settings opens, no entry is left with
+        // it for a reload to open the sheet again. `section` stays until the
+        // adopt below (docs/APP-ROUTES.md §5 "Order").
+        appHistory.consume(['upgrade']);
+        // Numbered (`route`): a click made while Settings opens that takes
+        // the entry decides.
         const route = appHistory.route({ ...ctx, initialTab, historyMode: 'replace',
             openUpgrade: payload.features?.billing === true ? openUpgrade : false });
         try {
             await registry.launch('settings', route);
         } finally {
             // After the launch, not before: Billing reads `section` from the
-            // address bar while it opens. The one-shot `upgrade`/`section`
-            // keys go; `/os?settings=billing` becomes `/app/settings?tab=billing`.
-            // Not over that click's entry, though.
+            // address bar while it opens. The one-shot `section` key goes;
+            // `/os?settings=billing` becomes `/app/settings?tab=billing`.
+            // Not over the entry of a click that took it, though.
             appHistory.adopt(appLink, { search, route });
         }
     }
@@ -972,7 +979,8 @@ async function build (payload) {
     appLinkHandled = true;
     if (appLink && !billingLink && firstLink) {
         // Canonical first, so the window's own first focus finds `/app/<id>`.
-        // Numbered (`route`): a click made while it opens decides.
+        // Numbered (`route`): a click made while it opens that takes the
+        // entry decides.
         appHistory.adopt(appLink);
         await registry.launch(appLink.id, appHistory.route({
             ...registry.launchContext(ctx),

@@ -10,7 +10,7 @@ const dataUrl = text => `data:text/javascript;base64,${Buffer.from(text).toStrin
 // app-history.js imports './app-link.js'; a data: module cannot resolve that.
 const link = dataUrl(readFileSync(new URL('./app-link.js', import.meta.url), 'utf8'));
 const history = readFileSync(new URL('./app-history.js', import.meta.url), 'utf8').replace("from './app-link.js'", `from '${link}'`);
-const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
+const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
 let checks = 0;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const same = (actual, expected, message) => { assert.deepEqual(plain(actual), plain(expected), message); checks += 1; };
@@ -48,6 +48,13 @@ same(canonicalUrl(loc('?app=browser', '#h'), { id: 'desktop' }), '/app/desktop#h
 same(canonicalUrl(loc('?app=code&upgrade=pro'), { id: 'code' }, { search: '?keep=1' }), '/app/code?keep=1', 'a consumed query can be passed in');
 same(canonicalUrl(loc(''), { id: 'code' }), '/app/code');
 same(canonicalUrl(loc('?app%3D=1&%61pp=code'), { id: 'code' }), '/app/code?app%3D=1', 'keys compare decoded');
+// One-shot keys leave the address bar before their launch (`consume`).
+same(withoutKeys(loc('?settings=billing&upgrade=standard&section=ai-credits&x=%41', '#h'), ['upgrade']), '/os?settings=billing&section=ai-credits&x=%41#h',
+    'the key goes, every other pair byte for byte');
+same(withoutKeys(loc('?%75pgrade=pro&upgrade=x&keep=1'), ['upgrade']), '/os?keep=1', 'keys compare decoded, and every copy goes');
+same(withoutKeys(loc('?upgrade=pro'), ['upgrade']), '/os', 'nothing left: no `?`');
+same(withoutKeys({ pathname: '/app/settings', search: '?tab=billing&upgrade=pro' }, ['upgrade']), '/app/settings?tab=billing', 'the path form too');
+same(withoutKeys(loc('?upgrades=1&keep=1'), ['upgrade']), '/os?upgrades=1&keep=1', 'positive control: any other key stays');
 // The launch context a route gives an app (contract item 3).
 same(routeLaunchContext({ id: 'code' }), { view: 'full' });
 same(routeLaunchContext({ id: 'code' }, { hasWindow: true }), {}, 'Back to an open Code does not resize it');
@@ -231,9 +238,25 @@ for (const [recorded, later] of [['full', 'window'], ['window', 'full']]) for (c
     controller.adopt(null);
     same(url(), `/app/code?computer=${C}#top`);
 }
+{
+    // Consume: the billing link's `upgrade` leaves the address bar in place,
+    // before its launch. The state (Next's keys, the entry's app) is kept,
+    // and a key that is not there writes nothing.
+    const { w, controller, url } = harness('/os?settings=billing&upgrade=standard&section=ai-credits&x=1', { state: { __NA: true, ezilApp: 'settings' } });
+    const writes = [];
+    const replace = w.history.replaceState.bind(w.history);
+    w.history.replaceState = (...args) => { writes.push(args[2]); replace(...args); };
+    controller.consume(['upgrade']);
+    same([url(), w.history.length, w.history.state, writes.length], ['/os?settings=billing&section=ai-credits&x=1', 1, { __NA: true, ezilApp: 'settings' }, 1],
+        'upgrade goes, in place; section and unknown keys stay');
+    controller.consume(['upgrade']);
+    same(writes.length, 1, 'nothing left to drop: nothing written');
+}
 for (const provider of ['native-macos', 'local-vm']) {
     const { w, controller, open, focus, close, url, launches } = harness('/os?settings=billing&upgrade=pro&x=1', { provider });
     same(controller.enabled, false, provider);
+    controller.consume(['upgrade']);
+    same(url(), '/os?settings=billing&x=1', `${provider}: the one-shot key still goes before the launch, the path stays`);
     controller.adopt({ id: 'settings', initialTab: 'billing' }, { search: '?x=1' });
     same(url(), '/os?x=1', `${provider}: the consumed keys go, the path stays`);
     controller.adopt({ id: 'settings', initialTab: 'billing' });
@@ -773,4 +796,4 @@ for (const renames of [false, true]) {
     controller.begin('code');
     same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
 }
-console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);
+console.log(`PASS ${checks} checks: app-history helpers (consume included), push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);

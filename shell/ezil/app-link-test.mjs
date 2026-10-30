@@ -75,12 +75,13 @@ const COMPUTER = '11111111-1111-4111-8111-111111111111';
 // What Next.js's App Router keeps in `history.state` (`/os` is one of its
 // pages). Its popstate handler reloads the page if an entry lacks `__NA`.
 const NEXT_STATE = { __NA: true, __PRIVATE_NEXTJS_INTERNALS_TREE: { tree: ['', { children: ['os', {}] }], renderedSearch: '' } };
-async function boot(entry, { provider = 'cloudflare-guacamole', state = NEXT_STATE, ready = () => wait(250) } = {}) {
+async function boot(entry, { provider = 'cloudflare-guacamole', state = NEXT_STATE, ready = () => wait(250), features } = {}) {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', { url: `https://os.example${entry}`, runScripts: 'outside-only', pretendToBeVisual: true });
     const w = dom.window;
     w.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
     w.fetch = async () => ({ ok: true, json: async () => ({ result: { data: { json: [] } } }) });
-    w.__EZIL_BOOT__ = { user: { id: 'user', email: 'test@example.com' }, computer: { id: COMPUTER, name: 'Test', slot: 1 }, apps: [{ id: 'desktop' }], desktopState: { configured: false, provider } };
+    w.__EZIL_BOOT__ = { user: { id: 'user', email: 'test@example.com' }, computer: { id: COMPUTER, name: 'Test', slot: 1 }, apps: [{ id: 'desktop' }], desktopState: { configured: false, provider },
+        ...(features ? { features } : {}) };
     if (state) w.history.replaceState(state, '', w.location.href);
     const pops = [];
     w.addEventListener('popstate', () => pops.push(w.history.state));
@@ -392,6 +393,107 @@ for (const [entry, id, click, canonical] of [
     const alone = await bootOvertaken(entry, id, null);
     same([alone.url(), alone.w.history.length, alone.w.history.state.ezilApp, alone.front], [canonical, 1, id, id], `positive control: ${entry} with no click names ${id}`);
     done(alone.w);
+}
+
+// The billing link with Settings' `open` held, and no sleeps: the boot is
+// ready when its launch calls `open`; `finish` lets the real `open` run,
+// waits for it, then for one turn of the event loop (`turn`, no delay), after
+// which every microtask queued before it has run (the launch's commit, a
+// coalesced click's end, the boot's adopt). `focuses` runs the queued
+// 80/120ms focuses by hand. `opens`: what each `open` of Settings received,
+// and the address bar at that moment.
+const turn = () => new Promise(resolve => setImmediate(resolve));
+async function billingHeld(entry, { features } = {}) {
+    let release, started, opened;
+    const opening = new Promise(resolve => { started = resolve; });
+    const held = new Promise(resolve => { release = resolve; });
+    const resolved = new Promise(resolve => { opened = resolve; });
+    const delayed = [];
+    const opens = [];
+    const booted = await boot(entry, { features, ready: async w => {
+        // Before the boot's first await reaches the launch.
+        const app = w.ezil.registry.getApp('settings');
+        const open = app.open;
+        app.open = async launchCtx => {
+            opens.push({ initialTab: launchCtx.initialTab, openUpgrade: launchCtx.openUpgrade, at: `${w.location.pathname}${w.location.search}` });
+            if ( opens.length > 1 ) return open(launchCtx);
+            started();
+            await held;
+            const el = await open(launchCtx);
+            opened(el);
+            return el;
+        };
+        const setTimeout = w.setTimeout;
+        w.setTimeout = (fn, ms, ...args) => (ms === 80 || ms === 120 ? delayed.push({ ms, run: () => fn(...args) }) : setTimeout.call(w, fn, ms, ...args));
+        await opening;
+    } });
+    const finish = async () => { release(); await resolved; await turn(); };
+    const focuses = async () => {
+        for (const ms of [80, 120]) for (const timer of delayed.filter(t => t.ms === ms)) { delayed.splice(delayed.indexOf(timer), 1); timer.run(); }
+        await turn();
+    };
+    const front = () => [...booted.w.document.querySelectorAll('.window.window-active')].map(el => el.dataset.app).join();
+    return { ...booted, opens, finish, focuses, front };
+}
+const BILLING = '/os?settings=billing&upgrade=standard&section=ai-credits&x=1';
+const STRIPPED = '/os?settings=billing&section=ai-credits&x=1';
+const leftBehind = {};
+for (const click of [null, 'settings', 'code']) {
+    // The recheck of 118ebea9 (2026-10-30). A click on Settings ITSELF while
+    // the boot's billing link opens it writes nothing (the alias names
+    // Settings already), so the link still canonicalises its own entry. A
+    // click on Code pushes its entry and keeps it; the boot's entry is left
+    // behind it. No click: positive control. Whatever happens, `upgrade` left
+    // the address bar before the launch (Billing still finds `section`).
+    const b = await billingHeld(BILLING);
+    const { w, url, win, ctx } = b;
+    same(b.opens, [{ initialTab: 'billing', openUpgrade: false, at: STRIPPED }], `${click ?? 'no click'}: Settings opens with upgrade already gone from the address bar, section still on it`);
+    let clicked = null;
+    if ( click === 'settings' ) {
+        clicked = w.ezil.registry.launch('settings', ctx);
+        same([url(), w.history.length], [STRIPPED, 1], 'a click on Settings while it opens writes nothing');
+    } else if ( click === 'code' ) {
+        await w.ezil.registry.launch('code', ctx);
+        same([url(), w.history.length], ['/app/code', 2], 'a click on Code while it opens pushes its own entry');
+    }
+    await b.finish();
+    if ( clicked ) ok(await clicked === win('settings'), 'the click and the billing link resolve with one window');
+    const named = click === 'code' ? ['/app/code', 2, 'code'] : ['/app/settings?tab=billing&x=1', 1, 'settings'];
+    // With Code clicked, Settings' own focus while it is built names it
+    // until Code's ensureOnTop runs (a known limit, docs/APP-ROUTES.md §5):
+    // plain `/app/settings`, so neither the link's commit nor its adopt
+    // wrote over the click's entry.
+    same([url(), w.history.length, w.history.state.ezilApp], click === 'code' ? ['/app/settings', 2, 'settings'] : named, click === 'settings'
+        ? 'a click on Settings itself took nothing: the billing link canonicalises its entry, one-shot keys gone'
+        : click ? 'the click on Code took the entry: the billing link writes nothing over it' : 'positive control: the billing link is canonicalised');
+    await b.focuses();
+    same([url(), w.history.length, w.history.state.ezilApp, b.front()], [...named, named[2]], `${click ?? 'no click'}: the same after the delayed focuses, its window in front`);
+    same(w.document.querySelectorAll('.window[data-app="settings"]').length, 1);
+    if ( click === 'code' ) {
+        const back = new Promise(resolve => w.addEventListener('popstate', resolve, { once: true }));
+        w.history.back(); await back;
+        same(url(), STRIPPED, 'Back: the boot entry left behind the click has no upgrade key');
+        await turn();
+    }
+    leftBehind[click ?? 'none'] = url();
+    done(w);
+}
+for (const [label, entry] of [['the entry a click on Settings left', leftBehind.settings], ['the entry a click on Code left behind', leftBehind.code]]) {
+    // A reload of either, billing on, does not open the checkout or upgrade
+    // sheet again: Settings opens at Billing with no `openUpgrade`.
+    const b = await billingHeld(entry, { features: { billing: true } });
+    await b.finish();
+    same(b.opens.map(({ initialTab, openUpgrade }) => [initialTab, openUpgrade]), [['billing', false]], `a reload of ${label} (${entry}) opens no sheet`);
+    done(b.w);
+}
+{
+    // Positive control: the link itself, billing on, hands Settings its
+    // sheet exactly once, and leaves the address bar without the key.
+    const b = await billingHeld('/os?settings=billing&upgrade=standard', { features: { billing: true } });
+    await b.finish();
+    same([b.opens.map(({ initialTab, openUpgrade, at }) => [initialTab, openUpgrade, at]), b.url()],
+        [[['billing', 'standard_monthly_v3', '/os?settings=billing']], '/app/settings?tab=billing'], 'positive control: a fresh billing link opens the sheet once');
+    done(b.w);
 }
 
 // ── hosts that serve only /os: no rewriting ─────────────────────────────────
