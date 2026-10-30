@@ -47,7 +47,7 @@ import { sharedAwsSdkCollaborators } from '@/server/lib/compute/aws-clients';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import type { AwsPreviewResult } from '@/server/lib/compute/aws-preview';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
-import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { PlacementOwnerError, readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
@@ -171,21 +171,29 @@ export const STOP_COOLDOWN_MS = 60_000;
  * `appPreviewUrl`) asked while the AWS placement settled STOPPED less than `STOP_COOLDOWN_MS` ago
  * answers this refusal VALUE instead of running `ensure()`, which would start (replace) the computer
  * the owner just stopped — an app window's leftover poll (another tab, an older client) re-provisioned
- * one 0.23 s after its stop. The key is the placement's own `updated_at` with state STOPPED (no stop
- * reason is recorded, so any settled stop holds). Not `sandbox_starting`: the client's wake loop re-asks
- * that for 215 s and would start it once the hold ended. The desktop open is never held, so Settings →
- * Open desktop still starts it. Any read failure answers null: the existing path runs unchanged.
+ * one 0.23 s after its stop. The key is a settled STOPPED placement whose last RUN ended (its usage
+ * row closed, `readLastUsageStop`) less than `STOP_COOLDOWN_MS` ago — not the placement's `updated_at`:
+ * a pool-mode open of a long-stopped computer passes through STOPPED itself (ensure writes STOPPING
+ * `pool_open_release`, the release receipt lands STOPPED `pool_released`, the next ensure replaces), and
+ * that start must not be refused. No stop reason is recorded, so any recent run ending holds (user Stop,
+ * idle or session limit). STOPPING/DRAINING are not held: ensure() writes STOPPING to START a pool-mode
+ * open, and switch/restart pass through DRAINING. Not `sandbox_starting`: the client's wake loop re-asks
+ * that for 215 s and would start it once the hold ended; `computer_stopped` is terminal for the client's
+ * automatic re-ask (boot-phases AWS refusals) and has its own copy. The desktop open is never held, so
+ * Settings → Open desktop still starts it. Any read failure answers null: the existing path runs unchanged.
  */
 export async function stopCooldownAnswer(db: PlacementExecutor, computer: ComputerRef, now: number = Date.now()) {
     try {
         const { record } = await readPlacement(db, computer.computerId, computer.userId);
         if (record?.provider !== 'aws-ec2' || record.state !== 'STOPPED') return null;
-        const age = now - record.updatedAt.getTime();
+        const ended = await readLastUsageStop(db, computer.computerId, computer.userId);
+        if (!ended) return null;
+        const age = now - ended.getTime();
         if (!(age > -STOP_COOLDOWN_MS && age < STOP_COOLDOWN_MS)) return null;
     } catch {
         return null;
     }
-    return { ok: false as const, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: true,
+    return { ok: false as const, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
         provider: 'cloudflare-guacamole' as const, computeProvider: 'aws-ec2' as const };
 }
 

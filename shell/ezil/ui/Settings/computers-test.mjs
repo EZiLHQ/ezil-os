@@ -515,6 +515,18 @@ if ( haveBundle ) {
             assert.doesNotMatch(pane().textContent, /Now running on/);
         });
     }
+    // Review (hotfix r5): cleared means dismissed — a later Start, with the server still reporting the
+    // same done transition, must not bring "Now running on …" back.
+    progress = running('m6i.xlarge', { transition: doneT });
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+    await settle(3);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+    await settle();
+    check('🔴 bundle: after Stop then Start, the same done transition does not bring "Now running on" back', () => {
+        assert.equal(pane().querySelector('[data-role="computer-chip"]')?.textContent.trim(), 'Running');
+        assert.equal(pane().querySelector('[data-role="switch-done"]'), null);
+        assert.doesNotMatch(pane().textContent, /Now running on/);
+    });
 
     // HF3: the placement is not on the pre-switch size (2 vCPU after cmp-4 → cmp-8), so "Back to" is offered.
     progress = running('m6i.large', { transition: { transitionId: 't-2', kind: 'switch', current: 'cmp-4', target: 'cmp-8', phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true } });

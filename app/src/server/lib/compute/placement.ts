@@ -408,6 +408,19 @@ export async function readPlacement(db: PlacementExecutor, rawComputerId: string
     return { provider: record.provider, store: record.store, record };
 }
 
+/**
+ * When the computer's last AWS run ended: the newest `ezil_compute_usage.stopped_at` for this owner, or null
+ * when it never ran (or every row is still open). Read-only. Hotfix r5 stop hold (`stopCooldownAnswer`): a
+ * placement that is STOPPED because a pool-mode open just released its old host never closes a usage row,
+ * so this tells a stop the owner (or a session limit) just made apart from a start in progress.
+ */
+export async function readLastUsageStop(db: PlacementExecutor, rawComputerId: string, userId: string): Promise<Date | null> {
+    const [row] = rowsOf(await db.execute(sql`/* placement:usage-last-stop */ SELECT max(stopped_at) AS stopped_at
+        FROM public.ezil_compute_usage
+        WHERE computer_id = ${canonicalId(rawComputerId)}::uuid AND user_id = ${canonicalId(userId)}::uuid`));
+    return timestamp(row?.stopped_at) ?? null;
+}
+
 export class ImageJobConflictError extends Error {
     constructor() { super('image_job_conflict'); this.name = 'ImageJobConflictError'; }
 }
