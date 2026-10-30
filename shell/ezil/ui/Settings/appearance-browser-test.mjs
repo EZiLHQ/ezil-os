@@ -72,7 +72,8 @@ async function open (context) {
     await page.route('**/*', async route => {
         const target = fixtureUrl(route.request().url(), HOST);
         if ( ! target ) return route.abort();
-        if ( target.pathname === '/os' ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+        // The shell rewrites the address bar to /app/<id> (docs/APP-ROUTES.md); a reload asks for that.
+        if ( target.pathname === '/os' || /^\/app\/[a-z0-9-]+$/.test(target.pathname) ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
         if ( target.pathname.startsWith('/api/trpc/computer.list') ) {
             return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ result: { data: { json: [PAYLOAD.computer] } } }) });
         }
