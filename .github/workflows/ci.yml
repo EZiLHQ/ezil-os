@@ -224,6 +224,7 @@ jobs:
                    shell/ezil/native-test.mjs \
                    shell/ezil/native-persistence-test.mjs \
                    shell/ezil/app-link-test.mjs \
+                   shell/ezil/app-history-test.mjs \
                    shell/ezil/ui/Settings/usage-test.mjs \
                    shell/ezil/ui/Settings/billing-sheets-test.mjs \
                    shell/ezil/ui/Settings/billing-test.mjs \
@@ -238,6 +239,7 @@ jobs:
                    shell/ezil/ui/Settings/system-tab-test.mjs \
                    shell/ezil/runtime-recheck-test.mjs \
                    shell/ezil/ui/frame-controls-bridge-test.mjs \
+                   shell/ezil/ui/full-view-test.mjs \
                    shell/ezil/ui/feedback/capture-test.mjs \
                    shell/ezil/ui/feedback/feedback-test.mjs; do
             echo "── $t"
