@@ -12,7 +12,49 @@ export const Routes = {
      * computer (`/os`'s `CouldNotOpen`) or fails to boot (`<BootWatchdog>`).
      */
     OS: '/os',
+    /**
+     * `/app/<id>` serves the same shell as `/os`, opened at one app (see
+     * docs/APP-ROUTES.md). Build it with `shellAppRoute`.
+     */
+    APP: '/app',
 } as const;
+
+/**
+ * Every id `/app/<id>` accepts: the shell registry's app ids
+ * (`shell/ezil/apps/registry.js` `APPS`) and its URL aliases
+ * (`shell/ezil/app-link.js` `ALIASES`). Anything else is a 404. A test reads
+ * both shell files and fails if this list drifts from them.
+ */
+export const SHELL_APP_IDS = ['secure-browser', 'desktop', 'code', 'app-store', 'settings', 'preview'] as const;
+export const SHELL_APP_ALIASES = { browser: 'desktop' } as const;
+
+export function isShellAppId(id: unknown): id is string {
+    return typeof id === 'string'
+        && ((SHELL_APP_IDS as readonly string[]).includes(id) || Object.hasOwn(SHELL_APP_ALIASES, id));
+}
+
+/** `/app/<id>` for an allowlisted id; throws on anything else. */
+export function shellAppRoute(id: string): string {
+    if (!isShellAppId(id)) throw new Error('Not a shell app id');
+    return `${Routes.APP}/${id}`;
+}
+
+/**
+ * `pathname` plus a page's search params, re-serialised for a return URL.
+ * `/` is left readable in values: the shell refuses a project `path` whose
+ * separators arrive percent-encoded, so `path=src/main.ts` must survive the
+ * sign-in round trip as written.
+ */
+export function returnUrlFor(pathname: string, params: Record<string, string | string[] | undefined>): string {
+    const pairs: string[] = [];
+    const encode = (value: string) => encodeURIComponent(value).replace(/%2F/g, '/');
+    for (const [key, value] of Object.entries(params)) {
+        for (const item of Array.isArray(value) ? value : value === undefined ? [] : [value]) {
+            pairs.push(`${encode(key)}=${encode(item)}`);
+        }
+    }
+    return `${pathname}${pairs.length ? `?${pairs.join('&')}` : ''}`;
+}
 
 /** Query param carrying the URL to return to after a successful login. */
 export const RETURN_URL_PARAM = 'returnUrl';
@@ -43,34 +85,59 @@ export function getReturnUrlQueryParam(pathname: string): string {
  * just typed their password to somebody else's site, from a URL that starts
  * with ours.
  *
- * The rule is "a path on this origin and nothing else", which means:
+ * The rule is "one of this app's own pages, on this origin", which means:
  *   - it must start with `/`;
  *   - but NOT `//` or `/\`, which browsers read as protocol-relative
  *     ("//evil.example" is `https://evil.example`, not a path);
- *   - and it must carry no control characters or whitespace, which are the
- *     usual way a second URL is smuggled past a naive parse.
+ *   - it must carry no control characters or whitespace, which are the
+ *     usual way a second URL is smuggled past a naive parse, and no
+ *     backslash anywhere;
+ *   - and its PATH must be, exactly, one this app sends people back to:
+ *     `/os`, `/app/<shell app id>` (see `SHELL_APP_IDS`), `/computers`,
+ *     `/computer/<uuid>`, `/billing/return`. Matching whole paths is also
+ *     what refuses dot segments (`/app/../admin`) and encoded separators or
+ *     dots (`/app/%2e%2e/x`, `/os%2fadmin`): none of those shapes can be on
+ *     the list. The query is data and is kept as it is (`%2F` there is
+ *     ordinary encoding).
  *
- * 🔴 TWO DIFFERENT fallbacks, on purpose — these are not the same decision:
+ * 🔴 THREE outcomes, on purpose — these are not the same decision:
  *   - No `returnUrl` was supplied at all (absent, or an empty string): there
  *     is nothing to reject, this is just an ordinary sign-in, and it lands on
  *     `Routes.OS` — the product's actual entry point.
- *   - A `returnUrl` WAS supplied and it failed the checks above: that is an
- *     anomalous, possibly hostile input, arriving on a session that just
- *     authenticated. It is not rejected loudly — there is no useful error to
- *     show someone who followed a bad link — but it also does not get the
- *     benefit of the doubt that a plain sign-in gets: it lands on
- *     `Routes.COMPUTERS`, the plain list view, rather than on the shell.
+ *   - A `returnUrl` under `/app` that failed the checks (an unknown app, a
+ *     dot segment, an encoded separator): the person was on their way into
+ *     the OS, so they land on `Routes.OS`, the same page without the app.
+ *   - Any other `returnUrl` that failed: an anomalous, possibly hostile
+ *     input, arriving on a session that just authenticated. It is not
+ *     rejected loudly — there is no useful error to show someone who
+ *     followed a bad link — but it also does not get the benefit of the
+ *     doubt that a plain sign-in gets: it lands on `Routes.COMPUTERS`, the
+ *     plain list view, rather than on the shell.
  */
 export function safeReturnUrl(value: string | string[] | undefined | null): string {
     const raw = Array.isArray(value) ? value[0] : value;
     if (typeof raw !== 'string' || raw.length === 0) return Routes.OS;
     if (!raw.startsWith('/')) return Routes.COMPUTERS;
-    if (raw.startsWith('//') || raw.startsWith('/\\')) return Routes.COMPUTERS;
+    if (raw.startsWith('//') || raw.startsWith('/\\') || raw.includes('\\')) return Routes.COMPUTERS;
     // Control characters and whitespace, checked by codepoint rather than
     // by a regex literal so the guard itself contains no control bytes.
     for (let i = 0; i < raw.length; i += 1) {
         const code = raw.charCodeAt(i);
         if (code <= 0x20 || code === 0x7f) return Routes.COMPUTERS;
     }
-    return raw;
+    const end = raw.search(/[?#]/);
+    const path = end === -1 ? raw : raw.slice(0, end);
+    if (isReturnPath(path)) return raw;
+    return path === Routes.APP || path.startsWith(`${Routes.APP}/`) ? Routes.OS : Routes.COMPUTERS;
+}
+
+const UUID_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The pages a sign-in may return to. Producers: `/os` and `/app/[appId]`
+ * pages, `computers/layout.tsx`, `computer/layout.tsx`, `billing/return`. */
+function isReturnPath(path: string): boolean {
+    if (path === Routes.OS || path === Routes.COMPUTERS || path === '/billing/return') return true;
+    if (path.startsWith(`${Routes.APP}/`)) return isShellAppId(path.slice(Routes.APP.length + 1));
+    if (path.startsWith(`${Routes.COMPUTER}/`)) return UUID_PATH.test(path.slice(Routes.COMPUTER.length + 1));
+    return false;
 }

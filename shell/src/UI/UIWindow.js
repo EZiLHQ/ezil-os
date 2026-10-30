@@ -3084,6 +3084,9 @@ function delete_window_element (el_window) {
     if ( window.is_dashboard_mode && was_app ) {
         document.dispatchEvent(new CustomEvent('dashboard-app-windows-changed'));
     }
+    // MODIFIED BY EZIL 2026-10-30: same funnel, for `shell/ezil/app-history.js`
+    // (closing a window moves the address bar to the next focused app).
+    window.dispatchEvent(new CustomEvent('ezil:window-closed', { detail: { window: el_window, app: was_app ?? null } }));
 }
 
 $(document).on('click', '.window-sidebar-item', async function (e) {
@@ -4460,6 +4463,9 @@ $.fn.focusWindow = function (event) {
         }
 
         window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { focus: this[0], pointer: !!event } }));
+        // MODIFIED BY EZIL 2026-10-30: the address bar follows the focused app
+        // (`shell/ezil/app-history.js`); this file only says which window.
+        window.dispatchEvent(new CustomEvent('ezil:window-focus', { detail: { window: this[0] } }));
 
         // hide other global menubars
         $('.window-menubar-global').not(`.window-menubar-global[data-window-id="${win_id}"]`).hide();
