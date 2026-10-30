@@ -410,6 +410,38 @@ describe('create (fence-first, once per epoch)', () => {
   });
 });
 
+describe('restartPush (the open path\'s once-per-boot config push to a running desktop)', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  it('records the boot and the time on this epoch\'s record only; the next epoch starts without it', async () => {
+    const s = memStorage();
+    let t = 1_000;
+    const svc = createAwsTunnelService({ api: fakeApi().api, storage: s, zone: ZONE, nowMs: () => t });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    t = 5_000;
+    expect(await svc.restartPush(1, 2, BOOT)).toBe(true);
+    expect(s.map.get('tunnel')).toMatchObject({ restartPushBootId: BOOT, restartPushAt: 5_000, leaseEpoch: 2 });
+    for (const [g, e, b] of [[1, 3, BOOT], [2, 2, BOOT], [1, 2, 'not-a-boot']] as const) expect(await svc.restartPush(g, e, b)).toBe(false);
+    expect(s.map.get('tunnel')).toMatchObject({ restartPushAt: 5_000 });
+    expect((await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).restartPushBootId).toBeUndefined();
+    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT)).toBe(false);
+  });
+  it('the registry route answers 200 on a write and 409 for another epoch; lookups return the record with it', async () => {
+    const reg = new AwsTunnelRegistry({ storage: memStorage() }, {
+      AWS_TUNNEL_CF_ACCOUNT_ID: 'a', AWS_TUNNEL_CF_ZONE_ID: 'z', AWS_TUNNEL_CF_API_TOKEN: 't',
+    }, async (url) => new Response(JSON.stringify({ success: true,
+      result: url.endsWith('/token') ? 'tunnel-token-0123456789' : url.endsWith('/connections') ? [{ conns: [{ origin_ip: '13.200.1.2' }] }] : { id: 'tid' } })),
+    () => ZONE);
+    const create = await routeAwsTunnels('POST', claims(), body(), () => reg);
+    expect(create.status).toBe(200);
+    const push = (leaseEpoch: number) => reg.fetch(new Request('https://aws-tunnels/restart-push', {
+      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT }) }));
+    expect((await push(2)).status).toBe(200);
+    expect((await push(9)).status).toBe(409);
+    expect(await lookupAwsTunnel(() => reg, SID)).toMatchObject({ restartPushBootId: BOOT });
+  });
+});
+
 describe('remove', () => {
   it('deletes when the stored epoch is at or below the request; otherwise reports deleted:false', async () => {
     const s = memStorage(); const { api, calls } = fakeApi();
