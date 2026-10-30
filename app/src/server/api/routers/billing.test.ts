@@ -1518,8 +1518,15 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
             if (text.includes('placement:image-reservation')) return [];
             throw new Error(`unexpected query ${text}`);
         });
-        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2',
-            awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }] });
+        const cloudflareView = { provider: 'cloudflare', state: null, leaseEpoch: null, lifecycleJobId: null, instanceType: null };
+        const first = await userPlacement({ execute: execute as never }, userId);
+        expect(first).toEqual({ provider: 'aws-ec2', awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }],
+            ...(first.awsSize ? { awsSize: first.awsSize } : {}),
+            // Phase B (REVERSE-MOVE-CONTRACT §6.1.1): the live computers and the records already read, for the move computer.
+            computers: [
+                { computerId: C1.toLowerCase(), provider: 'aws-ec2', placement: expect.objectContaining({ provider: 'aws-ec2', state: rows[C1]!.state }) },
+                { computerId: C2.toLowerCase(), provider: 'cloudflare', placement: cloudflareView },
+            ] });
         await expect(userPlacementProvider({ execute: execute as never }, userId)).resolves.toBe('aws-ec2');
         // Only the aws-ec2 computer gets the rich read.
         expect(execute.mock.calls.filter(([q]) => dialect.sqlToQuery(q).sql.includes('placement:read')).map(([q]) => dialect.sqlToQuery(q).params[0])).toEqual([C1, C1]);
@@ -1540,14 +1547,17 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         rows[C2] = placementRow({ computer_id: C2, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' });
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         richFails = true;
-        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
+        // A failed rich read is no record: no volume, and no placement for the move computer (its fields fail closed).
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [],
+            computers: [{ computerId: C1.toLowerCase(), provider: 'aws-ec2', placement: null },
+                { computerId: C2.toLowerCase(), provider: 'cloudflare', placement: cloudflareView }] });
         expect(warn).toHaveBeenCalledWith('[billing.summary] volume placement unavailable');
         // A placement without a volume yet (provisioning) has nothing to read.
         richFails = false; rows[C1] = { ...rows[C1], volume_id: null };
-        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
-        // Placement reads off: nothing is read at all.
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ provider: 'aws-ec2', awsVolumes: [] });
+        // Placement reads off: nothing is read at all, and there is no computer (Phase B §6.1.1 rule 4: no move computer).
         vi.unstubAllEnvs(); execute.mockClear();
-        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: null, awsVolumes: [] });
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: null, awsVolumes: [], computers: [] });
         expect(execute).not.toHaveBeenCalled();
     });
 });

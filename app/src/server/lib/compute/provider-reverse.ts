@@ -16,10 +16,13 @@
  * - 🔴 **The point of no return** is `checking → flipping` (transaction 1 sets `commit_sent_at`). `flipping` only ever
  *   commits, retries the same commit, or ends `failed_needs_operator` (`flip_stuck` and the commit's own codes).
  */
-import { AWS_REGION_PATTERN } from './aws-config';
-import { ENROLLMENT_FAILED, ENROLLMENT_HOST_RETIRE, ENROLLMENT_SUCCEEDED, ImageJobConflictError, type Placement } from './placement';
+import { HOLD_SIZE } from '@/server/billing/v3/admission';
+import type { ComputerReverseMoveV3 } from '@/server/billing/v3/contract';
+import { AWS_REGION_PATTERN, meteredSizeForInstanceType } from './aws-config';
+import { ENROLLMENT_FAILED, ENROLLMENT_HOST_RETIRE, ENROLLMENT_SUCCEEDED, ImageJobConflictError, type Placement, type PlacementState } from './placement';
 import {
-    bitmapHas, EXPORT_MAX_CHUNKS, importComplete, REVERSE_MOVE_COMPENSABLE, REVERSE_MOVE_IN_FLIGHT, ReverseMoveConflictError, validExportHead,
+    bitmapHas, EXPORT_MAX_CHUNKS, importComplete, REVERSE_MOVE_COMPENSABLE, REVERSE_MOVE_DTO_STAGE, REVERSE_MOVE_HOLDING, REVERSE_MOVE_IN_FLIGHT,
+    ReverseMoveConflictError, validExportHead,
     type ComputeReverseMove, type ProviderReverseStore, type ReverseExportBoot, type ReverseExportHead, type ReverseMoveFailure, type ReverseMoveState,
 } from './provider-reverse-store';
 
@@ -58,6 +61,107 @@ export function reverseFailureClass(code: string | null): ReverseFailureClass | 
 /** §5.3 / §6.1.1: a `failed_needs_operator` row whose commit may have been sent, or whose code blocks Open. */
 export function reverseOpenBlocked(m: Pick<ComputeReverseMove, 'state' | 'commitSentAt' | 'lastError'>): boolean {
     return m.state === 'failed_needs_operator' && (m.commitSentAt !== null || has(REVERSE_OPEN_BLOCKED_CODES, m.lastError));
+}
+
+// ── The move as the user sees it (§6.1, §6.1.1, §5.9, §5.10; one pure builder for every surface) ──
+
+/** The move computer's placement as the summary, start/retry and progress read it (§6.1.1). */
+export interface ReverseMovePlacementView {
+    provider: 'aws-ec2' | 'cloudflare' | null;
+    state: PlacementState | null;
+    leaseEpoch: number | null;
+    lifecycleJobId: string | null;
+    instanceType: string | null;
+}
+export function reversePlacementView(p: Placement | null): ReverseMovePlacementView | null {
+    return p ? { provider: p.provider, state: p.state, leaseEpoch: p.leaseEpoch, lifecycleJobId: p.lifecycleJobId, instanceType: p.instanceType } : null;
+}
+/**
+ * §6.1.1 (r5): the D16 hold can open this AWS computer: its type meters as `HOLD_SIZE`, the billing gate's own test
+ * (compute-access.ts `gateComputerStart`). 6a's "held closed" is exactly its negation. Null when it is not an AWS computer.
+ */
+export function reverseHoldOpenable(p: Pick<ReverseMovePlacementView, 'provider' | 'instanceType'> | null): boolean | null {
+    if (p?.provider !== 'aws-ec2') return null;
+    return meteredSizeForInstanceType(p.instanceType) === HOLD_SIZE;
+}
+/**
+ * §6.1.1 `retry`, terminal rows only. `failed_needs_operator` → no. `failed_reopened` by the §5.5 class of its code:
+ * `reopen` → now (`entitlement_paid` → no: the standing is paid, nothing to retry); `reopen_after_session` → now once an AWS
+ * boot came after the export boot's (lease epoch above E+1), else only after one when the hold can open the computer, else
+ * never (Upgrade is the only way on); `reopen_final` → no until `operator_cleared` (itself a `reopen` code).
+ * A code outside the closed list is a lane A bug: it reads as `reopen`, the same as start/retry (`reverseTryAgainForbidden`).
+ */
+export function reverseMoveRetry(m: Pick<ComputeReverseMove, 'state' | 'lastError' | 'exportBoot'>, p: ReverseMovePlacementView | null):
+    'now' | 'after_aws_session' | 'no' | null {
+    if (m.state === 'failed_needs_operator') return 'no';
+    if (m.state !== 'failed_reopened') return null;
+    switch (reverseFailureClass(m.lastError)) {
+        case 'reopen_final': return 'no';
+        case 'reopen_after_session': {
+            const boot = m.exportBoot;
+            if (!boot || (p?.provider === 'aws-ec2' && p.leaseEpoch !== null && p.leaseEpoch > boot.leaseEpoch)) return 'now';
+            return reverseHoldOpenable(p) === true ? 'after_aws_session' : 'no';
+        }
+        default: return m.lastError === 'entitlement_paid' ? 'no' : 'now';
+    }
+}
+/**
+ * §5.9 step 6 and §6.1.1 `moveAvailable`: the newest row's failure forbids Try again (start answers `move_unavailable`): a
+ * `reopen_after_session` failure with no AWS session since, or a `reopen_final` failure an operator has not cleared.
+ * `entitlement_paid` never forbids: a user who is Free again may move.
+ */
+export function reverseTryAgainForbidden(m: Pick<ComputeReverseMove, 'state' | 'lastError' | 'exportBoot'> | null,
+    p: ReverseMovePlacementView | null): boolean {
+    if (m?.state !== 'failed_reopened') return false;
+    const cls = reverseFailureClass(m.lastError);
+    return cls === 'reopen_final' || (cls === 'reopen_after_session' && reverseMoveRetry(m, p) !== 'now');
+}
+/** §6.1 visibility (DB clock): a holding row, or a terminal row that entered its state less than 24 h ago. */
+export const REVERSE_MOVE_VISIBLE_SECONDS = 86_400;
+export function reverseMoveVisible(m: Pick<ComputeReverseMove, 'state' | 'ages'>): boolean {
+    return REVERSE_MOVE_HOLDING.includes(m.state) || m.ages.stateEntered < REVERSE_MOVE_VISIBLE_SECONDS;
+}
+/** A failed row's code for the user, from the closed list only (§5.5); null in flight and once committed (a §7.3 spent reason). */
+export function reverseMoveReason(m: Pick<ComputeReverseMove, 'state' | 'lastError'>): string | null {
+    return (m.state === 'failed_reopened' || m.state === 'failed_needs_operator') && reverseFailureClass(m.lastError) !== null ? m.lastError : null;
+}
+/** PostgreSQL timestamp text (`::text`, e.g. `2026-10-30 07:49:50.123456+00`) or ISO 8601 → ISO 8601; null when unreadable. */
+export function reverseIso(value: string | Date | null | undefined): string | null {
+    if (value == null) return null;
+    const ms = value instanceof Date ? value.getTime() : Date.parse(value.replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00'));
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+/**
+ * §5.9.1 (pinned, fail-closed, no new env): an account is founder-owned when its email's domain is exactly `ezil.work`
+ * (case-insensitive), when it is on the operator allow-list (`isOperator`: the `/admin/telemetry` gate), or when the email
+ * is missing or unreadable. A founder-owned account never gets an `'open'` row (and the summary's `moveOnOpen` is false);
+ * it moves only on its own Move click. An operator check that throws counts as founder-owned.
+ */
+export async function reverseFounderOwned(email: unknown, isOperator: (email: string) => boolean | Promise<boolean>): Promise<boolean> {
+    if (typeof email !== 'string') return true;
+    const normalized = email.trim().toLowerCase();
+    const at = normalized.lastIndexOf('@');
+    if (at <= 0 || at === normalized.length - 1) return true;
+    if (normalized.slice(at + 1) === 'ezil.work') return true;
+    try { return await isOperator(normalized); } catch { return true; }
+}
+/**
+ * `ComputerReverseMoveV3` (§6.1) from the row and the move computer's placement. The summary (through the 24 h rule) and
+ * `computer.move.start` (always: the answer carries the row) both build it here, so every surface agrees.
+ */
+export function reverseMoveView(m: ComputeReverseMove, p: ReverseMovePlacementView | null): ComputerReverseMoveV3 {
+    return {
+        direction: 'to_cloudflare',
+        stage: REVERSE_MOVE_DTO_STAGE[m.state],
+        bytesDone: String(m.importProgress?.bytes ?? 0),
+        bytesTotal: m.bytesTotal === null ? null : String(m.bytesTotal),
+        reason: reverseMoveReason(m),
+        skipped: m.exportHead ? m.skipped : null,
+        retainUntil: m.state === 'committed' ? reverseIso(m.retainUntil) : null,
+        retry: reverseMoveRetry(m, p),
+        openBlocked: reverseOpenBlocked(m),
+        holdOpenable: m.state === 'committed' ? null : reverseHoldOpenable(p),
+    };
 }
 
 // ── Deadlines (§5.4; every one on the DB clock, through `ages`) ──────────

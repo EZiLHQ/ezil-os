@@ -9,8 +9,12 @@ import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf, HOLD_SIZE } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
-import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
+import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
 import { deriveStanding, paidAccess } from './standing';
+import {
+    reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
+} from '../../lib/compute/provider-reverse';
+import { REVERSE_MOVE_HOLDING, type ComputeReverseMove } from '../../lib/compute/provider-reverse-store';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
 import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
@@ -197,6 +201,47 @@ export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: reado
     return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
 }
 
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1.1): the move computer's reads, made by the router (billing.ts). Pure
+ * here: no store, no placement query and no clock (visibility is the row's DB-clock age).
+ */
+export interface ReverseMoveSummaryInput {
+    /** `reverseMovesTablePresent`: false (production today) → no move, no action. */
+    tablePresent: boolean;
+    /** The move computer's newest row (null: none). */
+    row: ComputeReverseMove | null;
+    /** The move computer's placement (instanceType: for `holdOpenable`). */
+    placement: ReverseMovePlacementView | null;
+    /** aws-config.ts: AWS computers enabled, and the admission kill switch (as `computer.move.start` reads them). */
+    awsEnabled: boolean;
+    killSwitchOn: boolean;
+    /** §5.9.1: never an open-triggered move. */
+    founderOwned: boolean;
+}
+
+/**
+ * §6.1 / §6.1.1 derived fields. Omitted input → no key at all (today's output). `move` stays null for old shells.
+ * - `reverseMove`: the newest row while it holds, or for 24 h on the DB clock after it ended.
+ * - `moveOnOpen`: held here (files_on_aws on this aws-ec2 placement), no row holds, the newest row is not a failure,
+ *   not founder-owned, AWS on and the kill switch off. It picks the pre-move card's copy only; the trigger re-checks.
+ * - `moveAvailable`: held here, AWS on, the kill switch off, and the newest row's failure does not forbid Try again.
+ */
+export function reverseMoveFields(input: ReverseMoveSummaryInput | undefined, standing: ComputeStandingV3):
+    { reverseMove?: ComputerReverseMoveV3 | null; moveOnOpen?: boolean; moveAvailable?: boolean } {
+    if (!input) return {};
+    if (!input.tablePresent) return { reverseMove: null, moveOnOpen: false, moveAvailable: false };
+    const { row, placement } = input;
+    const held = standing === 'files_on_aws' && placement?.provider === 'aws-ec2';
+    const live = input.awsEnabled && !input.killSwitchOn;
+    const holding = !!row && REVERSE_MOVE_HOLDING.includes(row.state);
+    const failed = row?.state === 'failed_reopened' || row?.state === 'failed_needs_operator';
+    return {
+        reverseMove: row && reverseMoveVisible(row) ? reverseMoveView(row, placement) : null,
+        moveOnOpen: held && live && !holding && !failed && !input.founderOwned,
+        moveAvailable: held && live && !reverseTryAgainForbidden(row, placement),
+    };
+}
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
@@ -216,6 +261,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     volumeGiB?: number | null;
     /** Round 6 (R4-02): the metered size of the user's AWS computer as placed; null/omitted = none, unreadable or mixed. */
     awsSize?: SizeCode | null;
+    /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
+    reverseMove?: ReverseMoveSummaryInput;
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
@@ -282,7 +329,9 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null,
             // Round 6 (R4-02): the placed AWS size, so Billing and Usage can say a held 4/8 vCPU computer stays closed.
             awsSize: input.awsSize && SIZES[input.awsSize]?.provider === 'aws'
-                ? { size: input.awsSize, vcpu: SIZES[input.awsSize].vcpu, memoryGiB: SIZES[input.awsSize].memoryGiB } : null },
+                ? { size: input.awsSize, vcpu: SIZES[input.awsSize].vcpu, memoryGiB: SIZES[input.awsSize].memoryGiB } : null,
+            // Phase B (§6.1): the move rides its own key; `move` above stays null so an old shell never renders it.
+            ...reverseMoveFields(input.reverseMove, standing.standing) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
