@@ -180,7 +180,12 @@ async function fixture(options: FixtureOptions = {}) {
     region: 'test-region-1', publicIp: '192.0.2.10', tunnelId: 't-1', dnsRecordId: 'd-1', hostname: 'h', controlKey: CONTROL_KEY,
     createdAt: 0, originVerified: false, ...(options.record ?? {}) };
   const { host, fetchFn } = fakeHost(record);
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => fetchFn(String(input), init)) as typeof fetch;
+  /** Every outbound request of the Worker, before the fake host checks it (a store or desktop call would land here too). */
+  const fetches: Array<{ method: string; url: string }> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    fetches.push({ method: init?.method ?? 'GET', url: String(input) });
+    return fetchFn(String(input), init);
+  }) as typeof fetch;
   const registryPaths: string[] = [];
   const registry = { idFromName: (name: string) => name, get: (name: string) => ({ fetch: async (request: Request) => {
     const path = new URL(request.url).pathname;
@@ -233,11 +238,38 @@ async function fixture(options: FixtureOptions = {}) {
     host.state = 'ready';
     expect((await pull()).body.next).toBeNull();
   };
-  return { mod, r2, store, host, fake, env, record, registryPaths, request, call, begin, pull, verify, commit, abort, copied,
+  return { mod, r2, store, host, fake, env, record, registryPaths, fetches, request, call, begin, pull, verify, commit, abort, copied,
     previousSystem: () => previousSystem, execs };
 }
+type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 const importKeys = (map: Map<string, unknown>) => [...map.keys()].filter(key => key.startsWith(REVERSE_IMPORT_KEY));
+/** Fake S3 settings: enough for `resolveWorkspaceStore` to build a real S3 (or migrating) store, which v1 must refuse. */
+const S3_ENV = { EZIL_WORKSPACE_S3_BUCKET: 'test-bucket', EZIL_WORKSPACE_S3_REGION: 'test-region-1',
+  EZIL_WORKSPACE_S3_ACCESS_KEY_ID: 'test-access-key', EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY: 'test-secret-key' };
+/** This move's `ezil:reverseImport`, as begin writes it (seeded directly where a test needs no export). */
+const ownState = (extra: Record<string, unknown> = {}) => ({ ...ids, ...PLACEMENT, store: 'r2', prefix: P, headKind: 'none',
+  migratedEtag: null, systemMigratedEtag: null, startedAt: new Date().toISOString(), ...extra });
+
+/**
+ * One write log across R2 and Durable Object storage, in call order: an R2-only log cannot see a
+ * DO write that lands ahead of the flag. DO keys outside `ezil:` are the Sandbox SDK's own
+ * settings (`sleepAfter`, `sandboxName`, …), which every open of the DO writes before any route
+ * runs: they are not the import's writes.
+ */
+function writeLog(f: Fixture): string[] {
+  const log: string[] = [];
+  const bucket = f.r2.bucket as Record<string, any>;
+  const storage = f.store.api as Record<string, any>;
+  for (const [target, name, method] of [[bucket, 'r2', 'put'], [bucket, 'r2-delete', 'delete'], [storage, 'do', 'put'], [storage, 'do-delete', 'delete']] as const) {
+    const original = target[method];
+    target[method] = (key: string | string[], ...rest: unknown[]) => {
+      if (name.startsWith('r2') || String(key).startsWith('ezil:')) log.push(`${name} ${key}`);
+      return original(key, ...rest);
+    };
+  }
+  return log;
+}
 
 describe('reverse import: routing and request checks (§4.1)', () => {
   it('requires the signed control envelope', async () => {
@@ -333,11 +365,15 @@ describe('reverse import: begin (§4.2)', () => {
     expect(f.host.posts).toHaveLength(2);
   });
 
-  it('another move (or another export boot for this move) is import_busy', async () => {
+  it('another move is import_busy; the same move at another binding goes to step 7, where only a matching host is asked', async () => {
     const f = await fixture();
     await f.begin();
+    const state = f.store.map.get(REVERSE_IMPORT_KEY);
     expect(await f.call('begin', { ...beginBody, moveId: uuid() })).toEqual({ status: 409, body: { ok: false, error: 'import_busy' } });
-    expect(await f.call('begin', { ...beginBody, leaseEpoch: 4 })).toEqual({ status: 409, body: { ok: false, error: 'import_busy' } });
+    // §4.2 step 3 keys on {moveId, generation}; the tunnel record (7/3) does not carry epoch 4.
+    expect(await f.call('begin', { ...beginBody, leaseEpoch: 4 })).toEqual({ status: 409, body: { ok: false, error: 'export_host_mismatch' } });
+    expect(f.host.posts).toHaveLength(1);
+    expect(f.store.map.get(REVERSE_IMPORT_KEY)).toEqual(state);
   });
 
   it('a running Cloudflare container is container_running, before anything is written', async () => {
@@ -369,8 +405,12 @@ describe('reverse import: begin (§4.2)', () => {
     });
   }
 
-  it('v1 is R2-only: an S3 selection or pin, or no R2 store, is store_unsupported', async () => {
+  it('v1 is R2-only: an S3 store that resolves (env or pin), an unresolvable one, or no R2 store, is store_unsupported', async () => {
     for (const options of [
+      // These resolve for real: the migrating store over R2, and a pinned pure S3 store.
+      { env: { EZIL_WORKSPACE_STORE: 's3', ...S3_ENV } },
+      { env: S3_ENV, storage: { 'ezil:workspaceStoreKind': 's3' } },
+      // These do not resolve at all.
       { env: { EZIL_WORKSPACE_STORE: 's3' } },
       { storage: { 'ezil:workspaceStoreKind': 's3' } },
       { env: { SANDBOX_WORKSPACE_R2_BUCKET: undefined } },
@@ -378,17 +418,42 @@ describe('reverse import: begin (§4.2)', () => {
       const f = await fixture({ shape: 'none', ...options });
       expect(await f.begin()).toEqual({ status: 409, body: { ok: false, error: 'store_unsupported' } });
       expect(importKeys(f.store.map)).toEqual([]);
+      expect(f.r2.writes).toEqual([]);
+      // Neither the S3 store nor the host was ever called.
+      expect(f.fetches).toEqual([]);
     }
+  });
+
+  it('a resolved non-R2 store is never used by any op: store_unsupported with no store call', async () => {
+    const calls: string[] = [];
+    const recording = { get: async () => { calls.push('get'); return null; }, put: async () => { calls.push('put'); return { etag: 'x' }; },
+      list: async () => { calls.push('list'); return { objects: [], truncated: false }; }, delete: async () => { calls.push('delete'); } };
+    const store = fakeStorage({ [REVERSE_IMPORT_KEY]: ownState({ verified: { sha256: 'a'.repeat(64), chunkCount: 1 } }) });
+    const deps: ReverseImportDeps = {
+      sandboxName: NAME, storage: store.api as never, selectStore: async () => ({ kind: 's3', bucket: recording }),
+      prefixOverride: undefined, flushContext: async () => undefined, containerRunning: () => false, withStartQueue: op => op(),
+      adoptImportedWorkspace: async () => { calls.push('adopt'); }, host: null, now: Date.now,
+    };
+    const commitBody = { ...ids, sha256: 'a'.repeat(64), chunkCount: 1 };
+    for (const [op, body] of [['begin', beginBody], ['pull', { ...beginBody, from: 0, count: 1 }], ['commit', { ...commitBody, verifyOnly: true }],
+      ['commit', { ...commitBody, verifyOnly: false }], ['abort', ids]] as const) {
+      expect(await runReverseImport(parseImportRequest(op, body, NAME)!, deps)).toEqual({ status: 409, body: { ok: false, error: 'store_unsupported' } });
+    }
+    expect(calls).toEqual([]);
+    expect(store.map.has(REVERSE_IMPORT_KEY)).toBe(true);
   });
 
   it('never imports under a deployment-wide prefix, even one equal to P', async () => {
     for (const value of ['/fixed', '', `/${P}`]) {
       const f = await fixture({ env: { SANDBOX_WORKSPACE_S3_PREFIX: value } });
       const writes = f.r2.writes.length;
-      for (const op of [f.begin, f.pull, f.verify, f.commit, f.abort]) {
+      for (const op of [f.begin, f.pull, f.verify, f.commit]) {
         expect(await op()).toEqual({ status: 409, body: { ok: false, error: 'prefix_mismatch' } });
       }
+      // No key of this move: nothing was written, so the abort is idempotent (§4.5).
+      expect(await f.abort()).toEqual({ status: 200, body: { ok: true } });
       expect(f.r2.writes.length).toBe(writes);
+      expect(f.fetches).toEqual([]);
     }
   });
 
@@ -452,7 +517,10 @@ describe('reverse import: pull (§4.3)', () => {
     expect(await f.pull()).toEqual({ status: 409, body: { ok: false, error: 'import_not_started' } });
     await f.begin();
     expect((await f.call('pull', { ...beginBody, moveId: uuid(), from: 0, count: 1 })).body.error).toBe('import_mismatch');
-    expect((await f.call('pull', { ...beginBody, leaseEpoch: 9, from: 0, count: 1 })).body.error).toBe('import_mismatch');
+    // The ids pick the import (§4.3 step 1); a binding the tunnel record does not carry asks no host.
+    const requests = f.host.requests.length;
+    expect((await f.call('pull', { ...beginBody, leaseEpoch: 9, from: 0, count: 1 })).body.error).toBe('export_host_mismatch');
+    expect(f.host.requests.length).toBe(requests);
   });
 
   it('capturing is not ready; a host that lost the job is asked again', async () => {
@@ -759,6 +827,101 @@ describe('reverse import: abort (§4.5)', () => {
     expect(await f.begin()).toMatchObject({ status: 200 });
     expect(importKeys(f.store.map)).toEqual([REVERSE_IMPORT_KEY]);
   });
+
+  // The gate refusals begin answers before any write (§4.1), each as its own computer state.
+  const refusingGates: Array<[string, FixtureOptions, string]> = [
+    ['an S3 store that resolves', { env: { EZIL_WORKSPACE_STORE: 's3', ...S3_ENV } }, 'store_unsupported'],
+    ['a flush context for another prefix', { storage: { 'ezil:workspaceFlushContext': { prefix: `${uuid()}/branches/main`, mountPath: '/workspace' } } }, 'prefix_mismatch'],
+    ['a deployment-wide prefix', { env: { SANDBOX_WORKSPACE_S3_PREFIX: '/fixed' } }, 'prefix_mismatch'],
+  ];
+  for (const [name, options, code] of refusingGates) {
+    it(`after begin refused ${code} (${name}), the compensating abort is a 200 with no I/O`, async () => {
+      const f = await fixture({ shape: 'none', ...options });
+      expect(await f.begin()).toEqual({ status: 409, body: { ok: false, error: code } });
+      // §4.5: no key of this move → 200. A 409 here has no §5.5 abort row: `abort_unconfirmed`.
+      expect(await f.abort()).toEqual({ status: 200, body: { ok: true } });
+      expect(f.r2.writes).toEqual([]);
+      expect(importKeys(f.store.map)).toEqual([]);
+      expect(f.fetches).toEqual([]);
+    });
+
+    it(`with this move's key behind that gate (${name}), abort stays ${code}: its writes cannot be cleaned through it`, async () => {
+      const f = await fixture({ shape: 'none', ...options, storage: { ...(options.storage ?? {}), [REVERSE_IMPORT_KEY]: ownState() } });
+      expect(await f.abort()).toEqual({ status: 409, body: { ok: false, error: code } });
+      expect(f.store.map.has(REVERSE_IMPORT_KEY)).toBe(true);
+      // Another move's abort behind the same gate is idempotent.
+      expect(await f.call('abort', { ...ids, moveId: uuid(), generation: uuid() })).toEqual({ status: 200, body: { ok: true } });
+      expect(f.store.map.has(REVERSE_IMPORT_KEY)).toBe(true);
+    });
+  }
+
+  it('a begin that died between its flag and its key: abort (no key) still lowers this move\'s flag', async () => {
+    const f = await fixture();
+    const put = f.store.api.put;
+    f.store.api.put = async (key: string, value: unknown) => {
+      if (key === REVERSE_IMPORT_KEY) throw new Error('storage blip');
+      return put(key, value);
+    };
+    expect(await f.begin()).toEqual({ status: 503, body: { ok: false, error: 'store_unavailable' } });
+    expect(f.r2.json(FLAG).reverse).toEqual({ moveId: MOVE, generation: GEN });
+    expect(f.store.map.has(REVERSE_IMPORT_KEY)).toBe(false);
+    expect(f.host.posts).toEqual([]);
+    f.store.api.put = put;
+    expect(await f.abort()).toEqual({ status: 200, body: { ok: true } });
+    expect(f.r2.objects.has(FLAG)).toBe(false);
+  });
+
+  it('a flag whose body cannot be read is a 503, never "not this move\'s": the flag and the keys stay for the retry', async () => {
+    const f = await fixture();
+    await f.begin();
+    const get = f.r2.bucket.get;
+    f.r2.bucket.get = async (key: string) => {
+      const object = await get(key);
+      return key === FLAG && object ? { ...object, arrayBuffer: async () => { throw new Error('r2 body read failed'); } } : object;
+    };
+    expect(await f.abort()).toEqual({ status: 503, body: { ok: false, error: 'store_unavailable' } });
+    expect(f.r2.objects.has(FLAG)).toBe(true);
+    expect(f.store.map.has(REVERSE_IMPORT_KEY)).toBe(true);
+    f.r2.bucket.get = get;
+    expect(await f.abort()).toEqual({ status: 200, body: { ok: true } });
+    expect(f.r2.objects.has(FLAG)).toBe(false);
+    expect(importKeys(f.store.map)).toEqual([]);
+  });
+});
+
+describe('reverse import: a full-size key set (DO deletes take at most 128 keys)', () => {
+  /** A 300-chunk import's DO keys, seeded as metadata (no bytes move): 302 keys in all. */
+  function seeded(n = 300) {
+    const sha = 'e'.repeat(64);
+    const chunks = Array.from({ length: n }, (_, i) => ({ i, size: MIB, sha256: hex(new Uint8Array([i & 0xff, i >> 8])) }));
+    const head = { v: 1, moveId: MOVE, generation: GEN, sha256: sha, entries: 40, skipped: 0, bytes: n * MIB, chunks };
+    const storage: Record<string, unknown> = {
+      [REVERSE_IMPORT_KEY]: ownState({ verified: { sha256: sha, chunkCount: n } }),
+      [REVERSE_IMPORT_HEAD_KEY]: head,
+      ...Object.fromEntries(chunks.map(c => [`${REVERSE_IMPORT_PUT_PREFIX}${c.i}`, { etag: `e-${c.i}`, size: MIB, sha256: c.sha256 }])),
+    };
+    return { storage, sha, n };
+  }
+
+  it('commit clears every key in batches, the main key last', async () => {
+    const { storage, sha, n } = seeded();
+    const f = await fixture({ shape: 'none', storage });
+    expect(importKeys(f.store.map)).toHaveLength(n + 2);
+    const log = writeLog(f);
+    expect(await f.call('commit', { ...ids, sha256: sha, chunkCount: n, verifyOnly: false })).toEqual({ status: 200, body: { ok: true, committed: true, store: 'r2' } });
+    expect(f.r2.json(HEAD).chunks).toHaveLength(n);
+    expect(importKeys(f.store.map)).toEqual([]);
+    const deletes = log.filter(entry => entry.startsWith('do-delete '));
+    expect(deletes.length).toBeGreaterThanOrEqual(3);
+    expect(deletes.at(-1)).toBe(`do-delete ${REVERSE_IMPORT_KEY}`);
+  });
+
+  it('abort clears every key in batches', async () => {
+    const { storage } = seeded();
+    const f = await fixture({ shape: 'none', storage });
+    expect(await f.abort()).toEqual({ status: 200, body: { ok: true } });
+    expect(importKeys(f.store.map)).toEqual([]);
+  });
 });
 
 describe('reverse import: pull throughput bounds (unit, fake clock)', () => {
@@ -852,17 +1015,88 @@ describe('reverse import: one queue per Durable Object (§4.1)', () => {
   });
 });
 
+describe('reverse import: write order (§4.1 flag first, §4.4 step 1)', () => {
+  it('the flag is the first write of every begin, pull, verify and commit (R2 and DO storage together)', async () => {
+    const f = await fixture();
+    const log = writeLog(f);
+    const firstWrite = async (run: () => Promise<{ status: number }>) => {
+      log.length = 0;
+      expect((await run()).status).toBe(200);
+      return log[0];
+    };
+    expect(await firstWrite(f.begin)).toBe(`r2 ${FLAG}`);
+    expect(log).toContain(`do ${REVERSE_IMPORT_KEY}`);
+    expect(await firstWrite(f.begin)).toBe(`r2 ${FLAG}`);
+    f.host.state = 'ready';
+    expect(await firstWrite(() => f.pull(0, 2))).toBe(`r2 ${FLAG}`);
+    expect(log).toContain(`do ${REVERSE_IMPORT_HEAD_KEY}`);
+    expect(await firstWrite(() => f.pull(2, 1))).toBe(`r2 ${FLAG}`);
+    expect(await firstWrite(f.verify)).toBe(`r2 ${FLAG}`);
+    expect(await firstWrite(f.commit)).toBe(`r2 ${FLAG}`);
+    // Step 1 before step 2: `committing` is persisted before the head CAS.
+    expect(log.indexOf(`do ${REVERSE_IMPORT_KEY}`)).toBeLessThan(log.indexOf(`r2 ${HEAD}`));
+  });
+
+  it('the DO key already says committing when the head CAS reaches the store', async () => {
+    const f = await fixture();
+    await f.copied();
+    await f.verify();
+    const put = f.r2.bucket.put;
+    const seen: unknown[] = [];
+    f.r2.bucket.put = async (key: string, value: Uint8Array | string, opts?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
+      if (key === HEAD) seen.push((f.store.map.get(REVERSE_IMPORT_KEY) as Record<string, unknown> | undefined)?.committing);
+      return put(key, value, opts);
+    };
+    expect((await f.commit()).status).toBe(200);
+    expect(seen).toEqual([true]);
+  });
+});
+
 describe('reverse import: the no-push pin (§4.1 [r6])', () => {
+  const banned = /^(ensureAwsDesktop|restartPush|awsRestartPush|pushAwsDesktopConfig)/;
+  const identifiersOf = (node: ts.Node) => {
+    const names = new Set<string>();
+    const visit = (n: ts.Node) => { if (ts.isIdentifier(n)) names.add(n.text); ts.forEachChild(n, visit); };
+    visit(node);
+    return names;
+  };
+
   it('the import module never imports the desktop-config or restart paths', () => {
     const path = new URL('./workspace-migration-import.ts', import.meta.url);
     const source = ts.createSourceFile('m.ts', readFileSync(path, 'utf8'), ts.ScriptTarget.ESNext, true);
     const imports = source.statements.filter(ts.isImportDeclaration).map(s => (s.moduleSpecifier as ts.StringLiteral).text);
     expect(imports.filter(m => ['./aws-ice', './aws-restart', './aws-tunnels'].includes(m))).toEqual([]);
-    const identifiers = new Set<string>();
-    const visit = (node: ts.Node) => { if (ts.isIdentifier(node)) identifiers.add(node.text); ts.forEachChild(node, visit); };
-    visit(source);
-    for (const name of ['ensureAwsDesktop', 'ensureAwsDesktopConfig', 'awsRestartPush', 'restartPush', 'pushAwsDesktopConfig']) {
-      expect(identifiers.has(name)).toBe(false);
-    }
+    expect([...identifiersOf(source)].filter(name => banned.test(name))).toEqual([]);
+  });
+
+  it('the Durable Object\'s reverseImport, which builds the host access, uses only the tunnel lookup', () => {
+    const source = ts.createSourceFile('index.ts', readFileSync(new URL('./index.ts', import.meta.url), 'utf8'), ts.ScriptTarget.ESNext, true);
+    const methods: ts.MethodDeclaration[] = [];
+    const find = (node: ts.Node) => {
+      if (ts.isMethodDeclaration(node) && node.body && ts.isIdentifier(node.name) && node.name.text === 'reverseImport') methods.push(node);
+      ts.forEachChild(node, find);
+    };
+    find(source);
+    expect(methods).toHaveLength(1);
+    const names = identifiersOf(methods[0]!);
+    // Positive control: this is the method that reaches the host.
+    expect(names.has('lookupAwsTunnel')).toBe(true);
+    expect([...names].filter(name => banned.test(name) || name === 'lookupAwsTunnelForBrowser')).toEqual([]);
+  });
+
+  it('a whole move calls nothing but the export routes on the export boot\'s host, and only looks the tunnel up', async () => {
+    const f = await fixture();
+    await f.begin();
+    await f.pull(0, 0);
+    f.host.state = 'ready';
+    expect((await f.pull()).body.next).toBeNull();
+    await f.verify();
+    expect((await f.commit()).status).toBe(200);
+    await f.call('abort', { ...ids, moveId: uuid(), generation: uuid() });
+    expect(f.fetches.length).toBeGreaterThan(5);
+    const host = `c-${NAME}-g${PLACEMENT.placementGeneration}-e${PLACEMENT.leaseEpoch}.ezil.work`;
+    expect(f.fetches.filter(({ url }) => new URL(url).hostname !== host || !new URL(url).pathname.startsWith(`${EXPORT_CONTROL_PATH}/`))).toEqual([]);
+    expect(f.host.requests.filter(({ path }) => !path.startsWith(`${EXPORT_CONTROL_PATH}/`))).toEqual([]);
+    expect(new Set(f.registryPaths)).toEqual(new Set([REGISTRY_PATHS.get]));
   });
 });

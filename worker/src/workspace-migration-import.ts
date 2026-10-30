@@ -324,12 +324,16 @@ async function raiseFlag(bucket: ImportBucket, prefix: string, ids: ImportIds, d
   if (!await bucket.put(flagKey(prefix), body)) throw new Error('migrating flag write refused');
 }
 
-/** Whether P's flag is this move's (abort lowers only its own). */
+/**
+ * Whether P's flag is this move's (abort lowers only its own). A read failure throws (503, the
+ * abort is retried): only a flag that is readable and not this move's counts as not own.
+ */
 async function flagIsOwn(bucket: ImportBucket, prefix: string, ids: ImportIds): Promise<boolean> {
   const object = await bucket.get(flagKey(prefix));
   if (!object || typeof object.size !== 'number' || object.size > FLAG_MAX_BYTES) return false;
+  const bytes = new Uint8Array(await object.arrayBuffer());
   try {
-    const flag = JSON.parse(new TextDecoder().decode(new Uint8Array(await object.arrayBuffer()))) as { reverse?: { moveId?: unknown; generation?: unknown } };
+    const flag = JSON.parse(new TextDecoder().decode(bytes)) as { reverse?: { moveId?: unknown; generation?: unknown } };
     return flag?.reverse?.moveId === ids.moveId && flag.reverse.generation === ids.generation;
   } catch {
     return false;
@@ -356,8 +360,6 @@ async function listAll(bucket: ImportBucket, prefix: string): Promise<Array<{ ke
 
 const sameIds = (state: ImportIds, ids: ImportIds) => state.moveId === ids.moveId && state.generation === ids.generation
   && state.computerId === ids.computerId;
-const sameBinding = (state: ExportBinding, binding: ExportBinding) => state.placementGeneration === binding.placementGeneration
-  && state.leaseEpoch === binding.leaseEpoch;
 
 /** Every `ezil:reverseImport*` key, the main key LAST: a crash in between leaves no chunk record without its owner. */
 async function clearImportKeys(storage: ImportStorage): Promise<void> {
@@ -381,8 +383,13 @@ async function recordedChunks(storage: ImportStorage): Promise<Map<number, Chunk
 const isPlaceholder = (wctx: { prefix: string; freshProvision?: boolean }, name: string) => wctx.freshProvision === true
   && wctx.prefix === `${name}/branches/main`;
 
-/** Store and prefix, before any write: v1 is R2-only, and the DO's own context must be P's. */
+/**
+ * The gate, before any write: never under a deployment-wide prefix, v1 is R2-only, and the
+ * DO's own context must be P's. Refuses `prefix_mismatch` or `store_unsupported` only.
+ */
 async function importTarget(ids: ImportIds, deps: ReverseImportDeps): Promise<{ bucket: ImportBucket; prefix: string }> {
+  // A deployment-wide prefix would make this head every computer's (§4.1 env-prefix rule).
+  if (deps.prefixOverride !== undefined) throw refuse('prefix_mismatch');
   const selected = await deps.selectStore();
   if (!selected || selected.kind !== 'r2' || !selected.bucket) throw refuse('store_unsupported');
   const prefix = importWorkspacePrefix(ids.computerId);
@@ -534,8 +541,9 @@ async function begin(request: Extract<ImportRequest, { op: 'begin' }>, deps: Rev
   const target = await importTarget(request, deps);
   const existing = await deps.storage.get<ReverseImportState>(REVERSE_IMPORT_KEY);
   if (existing) {
-    // The same move (and the same export boot) only: anything else holds this computer.
-    if (!sameIds(existing, request) || !sameBinding(existing, request)) throw refuse('import_busy');
+    // Another move holds this computer. The same move goes to step 7 (§4.2 step 3), at the
+    // request's own binding: `exportHost` asks only a tunnel record that carries it.
+    if (!sameIds(existing, request)) throw refuse('import_busy');
     checkStateTarget(existing, target.prefix);
     await raiseFlag(target.bucket, target.prefix, request, deps);
     const status = await requestExport(deps, await exportHost(deps, request, request), request);
@@ -560,10 +568,12 @@ async function begin(request: Extract<ImportRequest, { op: 'begin' }>, deps: Rev
     const system = await readAnyHead(target.bucket, systemPrefix);
     if (system.kind === 'snapshot') throw refuse('system_head_moved');
     if (system.kind === 'unreadable') throw refuse('head_unreadable');
+    // Step 6: the flag is the first write (§4.1). A begin that dies before its key leaves only
+    // this move's flag, which an abort lowers (and which goes stale on its own).
+    await raiseFlag(target.bucket, target.prefix, request, deps);
     // An earlier move's commit or abort that died between its key deletes must not lend
     // this move its chunk records.
     await clearImportKeys(deps.storage);
-    await raiseFlag(target.bucket, target.prefix, request, deps);
     const fresh: ReverseImportState = {
       moveId: request.moveId, generation: request.generation, computerId: request.computerId,
       placementGeneration: request.placementGeneration, leaseEpoch: request.leaseEpoch, store: 'r2', prefix: target.prefix,
@@ -580,8 +590,8 @@ async function begin(request: Extract<ImportRequest, { op: 'begin' }>, deps: Rev
 // ── §4.3 pull ──
 
 async function pull(request: Extract<ImportRequest, { op: 'pull' }>, deps: ReverseImportDeps, startedAt: number): Promise<ImportAnswer> {
+  // The ids pick the import (§4.3 step 1); the request's binding picks the host (`exportHost`).
   const state = await requireState(deps.storage, request);
-  if (!sameBinding(state, request)) throw refuse('import_mismatch');
   const target = await importTarget(request, deps);
   checkStateTarget(state, target.prefix);
   await raiseFlag(target.bucket, target.prefix, request, deps);
@@ -736,17 +746,32 @@ async function commit(request: Extract<ImportRequest, { op: 'commit' }>, deps: R
 
 // ── §4.5 abort ──
 
+const ABORTED: ImportAnswer = { status: 200, body: { ok: true } };
+
 async function abort(request: Extract<ImportRequest, { op: 'abort' }>, deps: ReverseImportDeps): Promise<ImportAnswer> {
-  const target = await importTarget(request, deps);
   const state = await deps.storage.get<ReverseImportState>(REVERSE_IMPORT_KEY);
   if (state?.committing) throw refuse('commit_in_progress');
+  const own = state !== undefined && sameIds(state, request);
+  let target: { bucket: ImportBucket; prefix: string };
+  try {
+    target = await importTarget(request, deps);
+  } catch (err) {
+    // 🔴 With no key of this move, abort is idempotent (§4.5), also behind a refusing gate.
+    // Begin refuses before any write there, and every later write needs this move's key.
+    // At most a flag remains, from a begin that died before its key under a gate that let
+    // it through then; it goes stale on its own. Answering the refusal instead would turn the
+    // compensation of a refused begin into `abort_unconfirmed` (§5.5, §5.7). A key of this
+    // move keeps the 409: its chunks cannot be cleaned through this gate.
+    if (!own && err instanceof ImportRefusal && (err.code === 'prefix_mismatch' || err.code === 'store_unsupported')) return ABORTED;
+    throw err;
+  }
   if (isOwnHead(await readAnyHead(target.bucket, target.prefix), request.generation)) throw refuse('already_imported');
   const chunks = (await listAll(target.bucket, `${target.prefix}/.ezil-snapshots/${request.generation}/`)).map(o => o.key);
   for (let i = 0; i < chunks.length; i += 1000) await target.bucket.delete(chunks.slice(i, i + 1000));
   if (await flagIsOwn(target.bucket, target.prefix, request)) await target.bucket.delete([flagKey(target.prefix)]);
-  if (state && sameIds(state, request)) await clearImportKeys(deps.storage);
+  if (own) await clearImportKeys(deps.storage);
   // Nothing is sent to the host: the app retires the export boot.
-  return { status: 200, body: { ok: true } };
+  return ABORTED;
 }
 
 /**
@@ -756,8 +781,9 @@ async function abort(request: Extract<ImportRequest, { op: 'abort' }>, deps: Rev
  */
 export async function runReverseImport(request: ImportRequest, deps: ReverseImportDeps, startedAt = deps.now()): Promise<ImportAnswer> {
   // A deployment-wide prefix would make this head every computer's: no op runs under one,
-  // whatever else holds (§4.1 env-prefix rule).
-  if (deps.prefixOverride !== undefined) return { status: 409, body: { ok: false, error: 'prefix_mismatch' } };
+  // whatever else holds (§4.1 env-prefix rule). Abort meets it in its gate, after its key read:
+  // with no key of this move it is idempotent (§4.5).
+  if (deps.prefixOverride !== undefined && request.op !== 'abort') return { status: 409, body: { ok: false, error: 'prefix_mismatch' } };
   try {
     switch (request.op) {
       case 'begin': return await begin(request, deps);
