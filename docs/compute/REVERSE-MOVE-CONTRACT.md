@@ -1151,7 +1151,7 @@ anything placement-derived. With no 0012, or no row, the output is byte-for-byte
 | Newest reverse row | `computer.progress` |
 |---|---|
 | in flight (`requested` … `flipping`) | the **moving view** below. Nothing placement-derived drives it: no `opening` or `stopping` operation, no lifecycle stage, no `needsOperator` from UNCONFIRMED or enrollment expiry, no capacity wait, no transition. **`openingOptions` is not called**, so no opening record is read or written for the export boot's epoch. |
-| `failed_needs_operator` with `openBlocked` (§5.3) | the moving view with `stage: 'needs_operator'`, `needsOperator: true`, `active: false`, `move.outcome: 'failed_needs_operator'`, `move.openBlocked: true` |
+| `failed_needs_operator` with `openBlocked` (§5.3; **[r5]** including `boot_unsettled`) | the moving view with `stage: 'needs_operator'`, `needsOperator: true`, `active: false`, `move.outcome: 'failed_needs_operator'`, `move.openBlocked: true` |
 | `committed`, `failed_reopened`, or `failed_needs_operator` without `openBlocked`, and visible (§6.1) | today's placement description, unchanged, **plus** `move` with its outcome. A reverse `failed_reopened` never takes over `stage`: the old shell's copy for that stage says "The original computer was reopened" (`computer-progress.js:26`), which is wrong here. |
 | none, not visible, or no 0012 | unchanged, and `move` is `null` |
 
@@ -1192,6 +1192,7 @@ move?: null | {
     reason: string | null;               // failed_* only: last_error, from the §5.5 closed list; null for committed [r4]
     retry: 'now' | 'after_aws_session' | 'no' | null;   // terminal only, as §6.1
     openBlocked: boolean;
+    holdOpenable: boolean | null;        // [r5] as §6.1.1: the D16 hold can open this AWS computer; null once committed
     placementState: PlacementState | null; // [r4] diagnostics only: the export boot's placement state; no shell reads it
 };
 ```
@@ -1216,8 +1217,8 @@ move?: null | {
   answer (§5.3). The new shell follows §6.4. The real state is `move.placementState`, for diagnostics only.
 - **[r4] Terminal rows keep today's placement description, so `stage` never identifies the outcome.** A `failed_reopened`
   row arrives with the hold's own stage (for example `stopped`). A `failed_needs_operator` row without `openBlocked`
-  (`boot_unsettled`, placement UNCONFIRMED) can arrive with `stage: 'needs_operator'` and `move.openBlocked: false`. A
-  committed row arrives with the Cloudflare placement's stage (`unavailable` or `stopped`). **Whenever `move` is
+  (**[r5]** only `abort_unconfirmed`, placement settled) arrives with the hold's stage, and a placement that a later
+  recovery moved can still read `needs_operator` with `move.openBlocked: false`. A committed row arrives with the Cloudflare placement's stage (`unavailable` or `stopped`). **Whenever `move` is
   non-null and `move.outcome` is set, the shell keys the outcome on `move.outcome` and `move.openBlocked` only, never on
   `stage`** (§6.4). Only the openBlocked row (table above) sets `stage: 'needs_operator'` from the move itself.
 - **Lane A tests:** for each export-boot placement state with an in-flight row (LEASED, STARTING, MOUNTING, MOUNTING past
@@ -1229,13 +1230,21 @@ move?: null | {
 
 ## 6. Summary DTO and shell (lanes A + U)
 
-### 6.1 `summary.computer.move` and `summary.computer.moveOnOpen`
+### 6.1 `summary.computer.reverseMove`, `moveOnOpen` and `moveAvailable` **[r5]**
 
-`ComputerMoveV3` at `contract.ts:242-247` is extended. `summary.ts:262` stops hard-coding `null`.
+**[r5] The move rides a new additive key, `summary.computer.reverseMove`. `summary.computer.move` stays `null`.** r4 put
+the move in `computer.move`, which an old cached `computers.js` already renders (the dormant `moveView`,
+`computers.js:507-534`). Its failed card always offers [Try again], and that calls `switchTo` (`:1255-1258`), which is an
+open. After a failed row there is no open trigger (§5.9), so the click boots the AWS computer under the D16 hold and uses
+Free hours; for an open-blocked row it meets the refused open; and its step 4 still says "Starting your desktop"
+(`:503`). With `move` kept null, an old shell never renders a reverse move: it keeps today's files-held banner until the
+commit makes the standing `free`. Only the shell that ships with lane A (lane U) reads `reverseMove`. `ComputerMoveV3`
+(`contract.ts:242-247`) and `summary.ts:262`'s `move: null` stay as they are; the new type is `ComputerReverseMoveV3`.
+Everywhere below, "the summary's move" means `summary.computer.reverseMove`.
 
 ```ts
-interface ComputerMoveV3 {
-  direction: 'to_cloudflare' | 'to_aws';
+interface ComputerReverseMoveV3 {   // summary.computer.reverseMove: ComputerReverseMoveV3 | null (additive, optional)
+  direction: 'to_cloudflare';
   /** to_cloudflare: REVERSE_MOVE_DTO_STAGE[state] */
   stage: 'saving' | 'copying' | 'checking' | 'flipping' | 'committed' | 'failed_reopened' | 'failed_needs_operator' | string;
   bytesDone: string;          // decimal; import_progress.bytes, '0' before copying
@@ -1245,6 +1254,7 @@ interface ComputerMoveV3 {
   retainUntil: string | null; // ISO; committed only
   retry: 'now' | 'after_aws_session' | 'no' | null;  // failed_* only, from the §5.5 class
   openBlocked: boolean;       // true only for failed_needs_operator with openBlocked (§5.3)
+  holdOpenable: boolean | null; // [r5] the D16 hold can open this AWS computer (§6.1.1); null once committed
 }
 // summary.computer.moveOnOpen: boolean. True when standing is files_on_aws, no move holds, and the open
 // trigger would fire (§5.9: not founder-owned, newest row not failed_*). The pre-move card copy needs it.
@@ -1258,8 +1268,8 @@ interface ComputerMoveV3 {
   - These are keys the dormant `MOVE_STEP_OF` already has (`computers.js:504`), and a unit test pins that.
   - The shell's own `exporting: 1` entry is never sent for `to_cloudflare`.
 - **Visibility [clocks]:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
-- Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `move: null`, `moveOnOpen: false`, `moveAvailable: false`.
-- The shell already accepts `reason` with `/^[a-z0-9_:-]{1,64}$/i` (`computers.js:511`).
+- Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`.
+- Lane U's new `reverseMove` view accepts `reason` with the same `/^[a-z0-9_:-]{1,64}$/i` the dormant view uses (`computers.js:511`).
 - **[r4]** `reason` is null for `committed` and for in-flight rows. A committed row's `last_error` (a §7.1 spent reason) is
   never shown.
 
@@ -1288,7 +1298,7 @@ After a committed move the user has no `aws-ec2` placement, so "the newest row f
    several, the lowest computer id);
 3. else the computer whose newest row is terminal and **visible** (§6.1 24 h rule), the most recent by
    `ages.stateEntered`. This is the "after commit" case: the placement is now Cloudflare;
-4. else none: `move: null`, `moveOnOpen: false`, `moveAvailable: false`.
+4. else none: `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`.
 
 **New `buildSummaryV3` input (pure; lane A):**
 
@@ -1297,36 +1307,48 @@ reverseMove?: {
     tablePresent: boolean;                          // reverseMovesTablePresent
     row: ComputeReverseMove | null;                 // the move computer's newest row (null: none, or no 0012)
     placement: { provider: 'aws-ec2' | 'cloudflare' | null; state: PlacementState | null;
-                 leaseEpoch: number | null; lifecycleJobId: string | null } | null;  // the move computer's
+                 leaseEpoch: number | null; lifecycleJobId: string | null;
+                 instanceType: string | null } | null;  // the move computer's ([r5] instanceType: for holdOpenable)
     awsEnabled: boolean; killSwitchOn: boolean;     // aws-config.ts (as §5.9)
     founderOwned: boolean;                          // §5.9.1
-};  // omitted = today's output exactly (move null, moveOnOpen false, moveAvailable false)
+};  // omitted = today's output exactly (reverseMove null, moveOnOpen false, moveAvailable false; move is always null)
 ```
 
 **Derived fields (pinned):**
-- `move`: from `row` when visible (§6.1), else null.
+- `reverseMove`: from `row` when visible (§6.1), else null. `move` is always null (§6.1).
+- **[r5] `holdOpenable`:** the placement is `aws-ec2` and its `instanceType` meters as `HOLD_SIZE`
+  (`meteredSizeForInstanceType(instanceType) === HOLD_SIZE`, the billing gate's own test, `compute-access.ts:203,210-217`;
+  `billing/v3/admission.ts:12`). False for a held computer of another size: the gate refuses its opens with
+  `files_on_aws`, so the D16 hold can never open it. Null when the placement is not `aws-ec2` (after a commit).
+  `computer.progress`'s `move.holdOpenable` uses the same rule (§5.10).
 - `retry` (failed rows only): `failed_needs_operator` → `'no'`. For `failed_reopened`, by the §5.5 class of `last_error`:
   `reopen` → `'now'`, except `entitlement_paid` → `'no'` (standing is then paid; nothing to retry). `reopen_after_session`
   → `'now'` when `placement.leaseEpoch > row.exportBoot.leaseEpoch` (an AWS boot since: the next Free hold open is a
-  replace at E+2, §5.7), else `'after_aws_session'`. `reopen_final` → `'no'`; `operator_cleared` is a `reopen` code →
+  replace at E+2, §5.7); else **[r5]** `'after_aws_session'` when `holdOpenable`, and `'no'` when not (no AWS session can
+  ever come, so the only way on is Upgrade, §6.3). `reopen_final` → `'no'`; `operator_cleared` is a `reopen` code →
   `'now'`. In flight and `committed` → null.
-- `openBlocked`: `failed_needs_operator` and (`commitSentAt` set, or `last_error` ∈ {`already_imported`, `commit_in_progress`}).
+- `openBlocked`: `failed_needs_operator` and (`commitSentAt` set, or `last_error` ∈ {`already_imported`, `commit_in_progress`, **[r5]** `boot_unsettled`}).
 - `moveOnOpen`: `tablePresent`, standing `files_on_aws`, placement `aws-ec2`, no holding row, the newest row (if any)
   not `failed_*`, not `founderOwned`, `awsEnabled` and not `killSwitchOn`. It chooses the pre-move card's copy only, so it
   does not depend on the placement's state; the trigger re-checks everything (§5.9).
 - `moveAvailable`: `tablePresent`, `awsEnabled`, not `killSwitchOn`, standing `files_on_aws`, placement `aws-ec2`, and
   **[r4] the newest row's failure does not forbid Try again** (start would answer `move_unavailable`, §5.9 step 6). No
   action is ever shown that start would refuse for a reason the user cannot change.
-- **Copy precedence (U):** a reason-specific §6.3 row (`workspace_too_large`, the try-later codes, `entitlement_paid`)
-  wins over the `retry`-keyed rows.
+- **Copy precedence (U):** a reason-specific §6.3 row (`workspace_too_large`, the try-later codes, `entitlement_paid`,
+  **[r5]** `boot_unsettled`) wins over the `retry`-keyed rows. **[r5]** Within a row, `holdOpenable: false` selects the
+  variant without "keep using it", "remove some files" and [Open my AWS computer] (§6.3, §6.4).
 
 **Lane A tests:** the selection order (holding row first; then the `aws-ec2` computer; then the newest visible terminal
 row; a deleted computer's rows are ignored); no 0012 → today's output exactly; founder-owned → `moveOnOpen` false;
 `after_aws_session` → `now` once `leaseEpoch` passes the boot's; `moveAvailable` false after an uncleared `reopen_final`;
-a committed row's `reason` is null with `last_error = 'snapshot_failed'`.
+a committed row's `reason` is null with `last_error = 'snapshot_failed'`. **[r5]** `computer.move` is null in every case;
+`holdOpenable` true for a `std-2` placement and false for a larger one; `workspace_too_large` on a non-`HOLD_SIZE`
+computer gives `retry: 'no'`; `boot_unsettled` gives `openBlocked: true`.
 
 ### 6.2 Shell changes (lane U)
 
+- **[r5]** The move card reads `summary.computer.reverseMove` only, never `computer.move` (which stays null for old shells,
+  §6.1). The dormant `moveView`/`moveHtml` may be reused for it, with the changes below.
 - The step 4 label changes from "Starting your desktop" to **"Switching to your Free computer"** (`computers.js:503`).
 - `move-retry` calls `computer.move.retry`, and is shown only when `retry === 'now'`.
 - The done, failed and needs-attention cards use the §6.3 copy.
@@ -1348,7 +1370,7 @@ a committed row's `reason` is null with `last_error = 'snapshot_failed'`.
   not move copy, and stay unchanged.
 - **[G3] [r4]** `computer.move.start`/`retry` answers (§5.9) render as follows. `{ok: true, move}` renders that move's card,
   in any state: a stale pre-move card's click during a move shows the move. `move_in_progress` (retry) re-reads the summary
-  and shows the current move's card. Every refusal renders its §6.3 row.
+  and shows the current move's card (`reverseMove`). Every refusal renders its §6.3 row.
 - **[r4] [Stop and move my files]** (shown only after a `move_computer_running` refusal):
   1. It **first calls `computer.move.start` again**. `{ok: true, move}` → show the move card and stop nothing. Any refusal
      other than `move_computer_running` → show that refusal and stop nothing. This way, if a move started in another
@@ -1388,18 +1410,20 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | `committed` | Your files are on your Free computer. Not moved: {NOT_MOVED}{skipped > 0: ", and N items that can't be copied, like links that point outside your Workspace folder"}. Your AWS disk is kept until {retainUntil date}. |
 | `failed_reopened`, `retry: 'now'` (default) | We couldn't move your files. They're still on your AWS computer and nothing was deleted. [Try again] |
 | `failed_reopened`, `workspace_too_large` | Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Remove some files on your AWS computer and try again, or upgrade to keep using them. [Upgrade] (Try again appears once `retry` is `now`). **r3:** "537 MB" is `MOVE_LIMIT_BYTES` (536,870,912 bytes) in the shell's MB unit (§6.2), never a literal. |
-| `failed_reopened`, `kill_switch` or `boot_unavailable` (**try later**, §5.1.1) | We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again in a few minutes. [Try again] |
+| **[r5]** `failed_reopened`, `workspace_too_large`, `holdOpenable` false | Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Upgrade to use them again. [Upgrade] (no Try again: `retry` is `'no'`, §6.1.1; the Free plan cannot open this computer's size, so no files can be removed first) |
+| `failed_reopened`, `kill_switch` or `boot_unavailable` (**try later**, §5.1.1) | We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. **[r5]** Try again later. [Try again] (time-neutral: `boot_unavailable` also covers the monthly fleet caps `global_hours_cap` and `global_egress_cap`, `admission.ts:127,129`, which no number of minutes clears) |
 | `failed_reopened`, `entitlement_paid` | Your plan is active again, so your files stay on your AWS computer. (no button) |
-| `failed_reopened`, `retry: 'no'` (`reopen_final`) | We couldn't move your files. They're still on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again) |
-| `failed_needs_operator`, `openBlocked` false | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again; Send feedback when enabled) |
-| `failed_needs_operator`, `openBlocked` true | We're finishing moving your files to your Free computer. Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. (no Try again; Send feedback when enabled) |
+| `failed_reopened`, `retry: 'no'` (`reopen_final`) | We couldn't move your files. They're still on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again) **[r5]** With `holdOpenable` false, without ", and you can keep using it". |
+| `failed_needs_operator`, `openBlocked` false (**[r5]** `abort_unconfirmed`) | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again; Send feedback when enabled) **[r5]** With `holdOpenable` false, without ", and you can keep using it". |
+| `failed_needs_operator`, `openBlocked` true, **[r5]** `reason` `boot_unsettled` | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it. (no Try again; Send feedback when enabled) |
+| `failed_needs_operator`, `openBlocked` true, any other reason (the commit may have been sent) | We're finishing moving your files to your Free computer. Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. (no Try again; Send feedback when enabled) |
 
 **Start/retry refusals (§5.9) [G3]:**
 
 | `reason` | Copy |
 |---|---|
 | `move_computer_running` | **Your AWS computer is open.** Stop it first, and your files start moving to your Free computer as soon as it has stopped. [Stop and move my files] |
-| `move_paused`, `move_busy`, `move_computer_unsettled` | We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again in a few minutes. [Try again] |
+| `move_paused`, `move_busy`, `move_computer_unsettled` | We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. **[r5]** Try again later. [Try again] |
 | `move_in_progress` | (no new card: the current move's card stays) |
 | `move_unavailable` | (the newest failed row's own card above) |
 | `move_not_held`, `move_unsupported` | (no card / no action) |
@@ -1424,7 +1448,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 - **[r4] Outcome keying.** Whenever `move` is non-null and `move.outcome` is set, the overlay and the Computer tab choose
   the outcome **from `move.outcome` and `move.openBlocked` only, whatever `stage` says**. Terminal rows carry today's
   placement description (§5.10): `stopped` for a `failed_reopened` hold, possibly `needs_operator` for a
-  `failed_needs_operator` row without `openBlocked` (`boot_unsettled`, placement UNCONFIRMED), `unavailable` after a commit.
+  `failed_needs_operator` row without `openBlocked` (**[r5]** `abort_unconfirmed` whose placement a later recovery moved; `boot_unsettled` is now open blocked), `unavailable` after a commit.
   The open-blocked card is shown **if and only if** `move.outcome === 'failed_needs_operator' && move.openBlocked === true`,
   or the open was answered `computeMoveNeedsAttention: true` (§5.3). A lane U test feeds each terminal outcome with
   each of those stages and checks the card.
@@ -1441,15 +1465,16 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | `committing` | Moving your files to your Free computer | Step 4 of 4: Switching to your Free computer. | step 4 |
 | elapsed > `move.expectedSeconds` | (unchanged) | (unchanged) | meta line `OPENING_COPY.long` ("Taking a little longer than usual") |
 | outcome `committed` | Your files are on your Free computer | Opening your Free computer. | full, then the ordinary Cloudflare open |
-| outcome `failed_reopened` | We couldn't move your files | They're still on your AWS computer and nothing was deleted. (`entitlement_paid`: "Your plan is active again, so your files stay on your AWS computer." `workspace_too_large`: the §6.3 sentence with "537 MB".) | none. [Open my AWS computer] re-asks the open (the D16 hold). Send feedback when enabled. Try again for the move lives on the Computer tab card. |
-| outcome `failed_needs_operator`, `move.openBlocked` false | We couldn't finish moving your files | They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. | none. [Open my AWS computer]. Send feedback. |
-| outcome `failed_needs_operator`, `move.openBlocked` true (or the open answered `computeMoveNeedsAttention`) | We're finishing moving your files | Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. | none. Send feedback. No retry. |
+| outcome `failed_reopened` | We couldn't move your files | They're still on your AWS computer and nothing was deleted. (`entitlement_paid`: "Your plan is active again, so your files stay on your AWS computer." `workspace_too_large`: the §6.3 sentence with "537 MB", **[r5]** its `holdOpenable` variant when false.) | none. [Open my AWS computer] re-asks the open (the D16 hold), **[r5] shown only when `move.holdOpenable` is true** (otherwise the gate refuses the open, §5.3). Send feedback when enabled. Try again for the move lives on the Computer tab card. |
+| outcome `failed_needs_operator`, `move.openBlocked` false | We couldn't finish moving your files | They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (**[r5]** without ", and you can keep using it" when `move.holdOpenable` is false) | none. [Open my AWS computer] (**[r5]** only when `move.holdOpenable`). Send feedback. |
+| outcome `failed_needs_operator`, `move.openBlocked` true, **[r5]** `move.reason` `boot_unsettled` | We couldn't finish moving your files | Your files are safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it. | none. Send feedback. No retry. |
+| outcome `failed_needs_operator`, `move.openBlocked` true, any other reason (or the open answered `computeMoveNeedsAttention` with no `move` read yet) | We're finishing moving your files | Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. | none. Send feedback. No retry. **[r5]** On a bare `computeMoveNeedsAttention` answer the overlay reads `computer.progress` once and uses the `boot_unsettled` row when `move.reason` says so. |
 
-**Computer tab.** The move card keeps reading `billing.summary`'s `computer.move` (§6.1) for its copy. While the tab is open
+**Computer tab.** The move card reads `billing.summary`'s **[r5]** `computer.reverseMove` (§6.1) for its copy. While the tab is open
 during a move it may also poll `computer.progress` for live bytes. Both come from the same row through the same step map,
 so they agree.
 
-**[r4] Computer tab while a move is in flight** (`computer.progress` `operation: 'moving'`, or `summary.computer.move`
+**[r4] Computer tab while a move is in flight** (`computer.progress` `operation: 'moving'`, or `summary.computer.reverseMove`
 in a non-terminal stage):
 - `computerModel` (`computers.js:419-469`): **chip** `{state: 'moving', text: 'Moving files…'}`, which takes precedence
   over every chip except `stopping` while the user's own stop is in progress. `busy` is **true** when `operation === 'moving'`
@@ -1458,8 +1483,8 @@ in a non-terminal stage):
 - **Actions:** no Open desktop, no Stop and no Start now (`:700-702,642-645`). Rename stays; Delete is disabled (a delete
   is refused during a move, §5.3). Configuration cards stay locked (held).
 - **Body:** the move card only (`moveHtml`, §6.3 copy). No transition, "Now running" or switch-failed card.
-- If `computer.progress` shows `operation: 'moving'` while the summary's `move` is still null (a move started from an open
-  in another window), the tab re-reads `billing.summary` once per poll until `move` appears, at most 6 times.
+- If `computer.progress` shows `operation: 'moving'` while the summary's `reverseMove` is still null (a move started from an open
+  in another window), the tab re-reads `billing.summary` once per poll until `reverseMove` appears, at most 6 times.
 - `openBlocked` true: chip `{state: 'attention', text: 'Needs attention'}`, no Open, and the needs-attention card.
 - A lane U test renders the tab in each phase and in each terminal outcome, with every `lifecycleState` and `stage`
   value §5.10 can send.
@@ -1474,6 +1499,13 @@ in a non-terminal stage):
   - **Started** by the reverse sweep for every `committed` row with `aws_snapshot_id IS NULL` that is not marked spent (**[r4]**, §7.1 Failure).
   - **Recorded** with `recordSnapshot` (once) as soon as `CreateSnapshot` returns an id. A pending snapshot is already point-in-time.
   - **Alert:** a committed row with no snapshot 1 h after commit is listed by `retention.ts` as `snapshot_missing` and logged `[reverse-move] snapshot_missing`. An operator takes it by hand (T1 does so for canary2).
+  - **[r5] Its invoker (pinned).** r4 named the log line but no caller: `retention.ts` has no runtime caller at base,
+    only its unit test. Lane O's `advanceReverseSnapshots` runs the listing (`listUnsnapshotted(10, 3600, {includeSpent:
+    true})`, through `retention.ts`) **once per pass**, after its snapshot step and inside the same 20 s. When the listing
+    is not empty it logs **one** line, `[reverse-move] snapshot_missing {count, moveIds}` (at most 10 ids). The sweep runs
+    every minute, so the line repeats until the row has a snapshot or is purged (§3.4). It runs even when a region's
+    deployment has no ARN, which is exactly when such rows pile up; with no 0012 the step returns at once (§3.4). Lane O's tests: a row committed 61 min ago with no snapshot
+    makes the line fire with its id; a row committed 30 min ago does not; a spent row is still listed; a purged row is not.
   - Lane O ships before the app deploy (release order, §8), so every committed move gets one.
 
 ### 7.1 The `reverse_snapshot` operation (pinned) **[G4]**
