@@ -1157,9 +1157,10 @@ describe('billing.usage read-only boundary', () => {
         const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
         const result = await f.caller.usage();
         expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
-        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference'] as const)
+        // Round 6: open payment issues too, so usage derives the same standing as the summary (the D16 hold).
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference', 'openPaymentIssues'] as const)
             expect(f.store[name].mock.calls[0][0]).toBe(userId);
-        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference']);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference', 'openPaymentIssues']);
         for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
         for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
         expect(fetch).not.toHaveBeenCalled();
@@ -1386,6 +1387,21 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
             expect(f.volumeGiB).toHaveBeenCalledWith({ computerId: C1, region: 'ap-south-1', volumeId });
             expect(f.placement).toHaveBeenCalledWith(f.ctx.db, userId);
         }
+    });
+
+    it('round 6: Free held on AWS (D16): usage shows the held 2 vCPU computer and its real disk, as the summary does', async () => {
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        f.store.epochsFor.mockResolvedValue([{ id: 'hold', userId, computerId: C1, size: 'std-2', weight: 1, readyAt: '2026-10-11T11:30:00Z',
+            endedAt: null, endReason: null, overheadSeconds: 0, deadlineAt: '2026-10-11T12:29:59Z', lastHeartbeatAt: null }]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', size: 'std-2', disk: { provisionedGiB: 50 } } });
+        const usage = await f.caller.usage({ computerId: C1 });
+        expect(usage).toMatchObject({ period: { currentSize: 'std-2', allowanceStandardSeconds: 8 * 3600, equivalents: [{ size: 'std-2', weight: 1 }] },
+            storage: { disk: { provisionedGiB: 50 } } });
+        if (!usage.enabled) throw new Error('usage disabled');
+        expect(usage.period.equivalents).toHaveLength(1);
+        // The same standing as the summary: the open payment issues are read for usage too.
+        expect(f.store.openPaymentIssues).toHaveBeenLastCalledWith(userId);
     });
 
     it('an unreadable volume (error, missing, no AWS placement) shows 50 and never fails the summary or usage', async () => {

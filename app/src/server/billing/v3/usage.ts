@@ -2,14 +2,20 @@ import type { StoredComputeEpoch } from '../ports';
 import { buildSummaryV2 } from '../v2/summary';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { SIZES, type SizeCode } from '../v2/contract';
+import { HOLD_SIZE } from './admission';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
+import { deriveStanding } from './standing';
 import { fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow } from './summary';
 
 type Input = Parameters<typeof buildSummaryV2>[0] & {
     computerId?: string;
     /** Round 5 D3: the computer's real data-volume size in GiB; null/omitted = unreadable (fallback 50). */
     volumeGiB?: number | null;
+    /** Round 6: any aws-ec2 placement among the user's live computers (as billing.summary); null/omitted = none or unreadable. */
+    placementProvider?: 'aws-ec2' | 'cloudflare' | null;
+    /** Round 6: the Free effective date (tests); omitted = FREE_V2_EFFECTIVE_AT. */
+    freeEffectiveAt?: string | null;
 };
 
 /** Read-only meter observations, not provider readiness or a live storage inventory. */
@@ -35,7 +41,11 @@ export function buildUsageV3(input: Input) {
         : fresh ? 'recording' as const : 'stale' as const;
     // Round 3 D3/D8: hours left at the CURRENT configuration (the open session's size, else the
     // validated next-open choice, else the plan default), plus the same time at every allowed size.
-    const choices: readonly SizeCode[] = plan.sku === 'legacy' ? [plan.offer.defaultSize] : plan.offer.machineChoice;
+    // Round 6 (R1-07/R1-09): under the D16 hold the computer that opens is the held AWS computer at
+    // HOLD_SIZE (as billing.summary), so its disk is the AWS volume and there is no Cloudflare equivalent.
+    const held = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        placementProvider: input.placementProvider ?? null, now: input.now }).standing === 'files_on_aws';
+    const choices: readonly SizeCode[] = held ? [HOLD_SIZE] : plan.sku === 'legacy' ? [plan.offer.defaultSize] : plan.offer.machineChoice;
     const preferred = input.sizePreference !== null && choices.includes(input.sizePreference) ? input.sizePreference : choices[0]!;
     const running = epoch && epoch.endedAt === null ? epoch : undefined;
     const currentSize = running?.size ?? preferred;

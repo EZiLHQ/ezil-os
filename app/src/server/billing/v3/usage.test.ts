@@ -116,6 +116,45 @@ describe('round 3 storage in usage (D10)', () => {
     });
 });
 
+describe('round 6 settings truth: Free, and Free held on AWS (D16)', () => {
+    // contact@ on 10-30: every subscription cancelled at once, the AWS computer kept, a std-2 hold session running.
+    const held = (): Input => ({ ...input(), userCreatedAt: new Date('2026-10-22T00:00:00Z'), grants: [], sizePreference: 'std-2',
+        subs: [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'canceled',
+            currentPeriodStart: new Date('2026-10-27Z'), currentPeriodEnd: new Date('2026-11-27Z'), cancelAtPeriodEnd: false }],
+        epochs: [{ ...epoch, size: 'std-2', weight: 1, readyAt: '2026-10-26T11:30:00Z', deadlineAt: '2026-10-26T12:29:59Z', lastHeartbeatAt: null }],
+        placementProvider: 'aws-ec2' });
+    it('legacy Free: the allowance is the real 8 hours (FREE_V2_EFFECTIVE_AT is null), never the 5 the new Free offer has', () => {
+        const period = buildUsageV3(held()).period;
+        expect(period).toMatchObject({ allowanceStandardSeconds: 8 * 3600, usedStandardSeconds: 1800, remainingHoursAtCurrent: 7 });
+        const newer = held(); newer.freeEffectiveAt = '2026-10-01T00:00:00Z';
+        expect(buildUsageV3(newer).period.allowanceStandardSeconds).toBe(5 * 3600);
+    });
+    it('held std-2: the only configuration is the held 2 vCPU (no "Same as" Cloudflare equivalent) and the disk is the real AWS volume', () => {
+        const result = buildUsageV3({ ...held(), volumeGiB: 50 });
+        expect(result.period).toMatchObject({ currentSize: 'std-2', currentWeight: 1, equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] });
+        expect(result.storage).toMatchObject({ capBytes: String(50 * 1024 ** 3), disk: { provisionedGiB: 50 } });
+        // Stopped between hold sessions: still the held computer, still its disk (unreadable → the 50 GB fallback).
+        const stopped = held(); stopped.epochs = [{ ...stopped.epochs[0]!, endedAt: '2026-10-26T11:45:00Z' }];
+        expect(buildUsageV3(stopped).period).toMatchObject({ currentSize: 'std-2', equivalents: [{ size: 'std-2' }] });
+        expect(buildUsageV3(stopped).storage.disk.provisionedGiB).toBe(50);
+    });
+    it('Free with the files on Cloudflare, or an unknown placement, keeps the Cloudflare configuration and invents no disk', () => {
+        for (const placementProvider of ['cloudflare', null, undefined] as const) {
+            const free = held(); free.placementProvider = placementProvider; free.epochs = [];
+            const result = buildUsageV3(free);
+            expect(result.period).toMatchObject({ currentSize: 'free-cf', equivalents: [{ size: 'free-cf', weight: 1, hours: 8 }] });
+            expect(result.storage.disk.provisionedGiB).toBeNull();
+        }
+    });
+    it('a paid account in its payment grace is not held, even with an AWS placement', () => {
+        const grace = input(); grace.placementProvider = 'aws-ec2';
+        grace.subs = [{ ...grace.subs[0]!, status: 'past_due' }];
+        grace.paymentIssues = [{ subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed', resolvedAt: null,
+            stripeEventCreated: new Date('2026-10-25T00:00:00Z') } as Input['paymentIssues'][number]];
+        expect(buildUsageV3(grace).period.equivalents.map(item => item.size)).toEqual(['std-2', 'cmp-4', 'cmp-8']);
+    });
+});
+
 describe('round 5 D3: usage shows the REAL volume and used space in GiB', () => {
     const GiB = 1024 ** 3;
     it('the volume size passed in is the disk (100 GiB Premium today, 50 GiB older); unreadable falls back to 50', () => {
