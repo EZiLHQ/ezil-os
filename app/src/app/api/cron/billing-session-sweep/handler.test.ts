@@ -572,6 +572,28 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
     });
 });
 
+// Round 6 R2-3: a session opened while the new paid period's grant was still on its way is not out of allowance.
+describe('round 6 R2-3: a paid session waits for its period grant', () => {
+    function fresh(periodStartSeconds: number) {
+        const f = fixture([epoch({ readyAt: iso(0), deadlineAt: iso(0) })], { sku: 'standard_monthly_v3' });
+        f.store.subscriptionsFor.mockResolvedValue([{ stripeSubscriptionId: 'sub', sku: 'standard_monthly_v3', status: 'active',
+            currentPeriodStart: at(periodStartSeconds), currentPeriodEnd: at(periodStartSeconds + 30 * 86_400), cancelAtPeriodEnd: false }]);
+        f.store.grantsForPeriod.mockResolvedValue([]);
+        return f;
+    }
+    it('is not stopped as allowance_exhausted while the grant is pending', async () => {
+        const f = fresh(-120);
+        expect(await f.run(60)).toEqual({ ...zeros, examined: 1 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]!.endedAt).toBeNull();
+    });
+    it('is stopped once the pending bound has passed with no grant (unchanged)', async () => {
+        const f = fresh(-600);
+        await f.run(60);
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
+    });
+});
+
 describe('round 3: stale AWS epochs and drain counts (D9/D6)', () => {
     function run(f: ReturnType<typeof fixture>, seconds: number, awsStopProof?: SweepInput['awsStopProof']) {
         return handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop, isStillRunning: f.isStillRunning, awsStopProof });

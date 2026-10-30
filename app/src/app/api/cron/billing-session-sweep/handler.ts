@@ -134,6 +134,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
 
     for (const epoch of policyCandidates) {
         const state = await stateFor(epoch.userId);
+        // Round 6 R2-3: a paid plan (no session cap) whose new period's grant is still on its way is not out of
+        // allowance; GRANT_PENDING_SECONDS bounds the wait (compute-access.ts).
+        if (state.grantPending) continue;
         const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
         const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
             ? state.summary.computer.activeDeadline : epoch.deadlineAt;

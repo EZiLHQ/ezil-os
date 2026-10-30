@@ -12,7 +12,7 @@ import { applyLifecycleReceipt, enforceSessionLimits, isPoolMode, POOL_RELEASED,
 import { fixtureDeployment } from './aws-intent.test-support';
 import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent, type LifecycleWork } from './aws-intent';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { consumeEnrollmentNonce, finishEnrollment, ImageJobConflictError, publishAttachedPoolClaim, readPlacement,
+import { consumeEnrollmentNonce, ENROLLMENT_FAILED, finishEnrollment, ImageJobConflictError, publishAttachedPoolClaim, readPlacement,
     reservePoolHostForBoot, type PlacementDb, type PlacementExecutor, type Placement } from './placement';
 import { poolPriorityForEntitlement } from './select';
 import { stopComputerForPolicy } from './stop-policy';
@@ -47,7 +47,7 @@ function stopped(over: Record<string, unknown> = {}) {
         state: 'STOPPED', last_error: POOL_RELEASED, ...over });
 }
 function setup(o: { rows?: Record<string, unknown>[]; host?: PoolHostRow | null; entitlement?: EntitlementRecord | null;
-    noPool?: boolean; deployment?: typeof D; lostStart?: boolean; env?: Record<string, string> } = {}) {
+    noPool?: boolean; deployment?: typeof D; lostStart?: boolean; env?: Record<string, string>; grantPending?: AwsProviderDeps['grantPending'] } = {}) {
     let clock = NOW;
     let executionStatus = 'RUNNING';
     let inputOverride: string | undefined;
@@ -100,6 +100,7 @@ function setup(o: { rows?: Record<string, unknown>[]; host?: PoolHostRow | null;
     const meter = { ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) };
     const deps: AwsProviderDeps = { db, env: () => e, now: () => clock, randomBytes: () => Buffer.alloc(32, 7),
         entitlement: o.entitlement === undefined ? paid : o.entitlement, pool: o.noPool ? undefined : pool, meter, sleep: async () => {},
+        ...(o.grantPending ? { grantPending: o.grantPending } : {}),
         describer: { describeVolume: vi.fn(async () => volume),
             describeForEnrollment: vi.fn(async (_region, id) => id === INSTANCE ? poolView : source) },
         starter: { start: vi.fn(async (_region, work) => {
@@ -712,5 +713,75 @@ describe('WARM-118 adoption launches before replenishment', () => {
         expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
         expect(new Set(s.starts.map(w => w.intent.jobId)).size).toBe(1); // the start helper's own retries of ONE job
         expect(s.pool.replenish).toHaveBeenCalledOnce();
+    });
+});
+
+// Round 6 R2-3: a paid plan whose new period's grant has not landed reads as Free (entitlement 'expired') for a moment.
+describe('round 6 R2-3: an open while the paid grant is on its way', () => {
+    const notYet: EntitlementRecord = { ...paid, status: 'expired', planId: 'standard_monthly_v3' };
+    it('waits (computer_starting, retryable) without leasing, booting or touching the placement; the grant then adopts warm', async () => {
+        const grantPending = vi.fn(async () => true);
+        const s = setup({ rows: [stopped()], entitlement: notYet, grantPending });
+        const before = structuredClone(s.placements[0]);
+        expect(await s.ensure()).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
+        expect(grantPending).toHaveBeenCalledExactlyOnceWith(U);
+        expect(s.starts).toEqual([]);
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.placements[0]).toEqual(before);
+        // The next ask after the grant landed resolves to the paid tier and adopts the warm spare.
+        s.deps.entitlement = { ...paid, planId: 'standard_monthly_v3' };
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['adopt']);
+        expect(grantPending).toHaveBeenCalledOnce(); // a paid tier never asks
+    });
+    it.each<[string, NonNullable<AwsProviderDeps['grantPending']>]>([['not pending', async () => false],
+        ['unreadable', async () => { throw new Error('billing down'); }]])(
+        'a Free hold (%s) keeps today\'s cold open', async (_name, grantPending) => {
+            const s = setup({ rows: [stopped()], entitlement: notYet, grantPending });
+            expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+            expect(s.starts.map(w => w.intent.operation)).toEqual(['replace']);
+            expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        });
+});
+
+// Round 6 R2-2: one `aws-open` line per AWS boot decision says warm or cold, and why.
+describe('round 6 R2-2: aws-open decision lines', () => {
+    const lines = () => vi.mocked(console.info).mock.calls.map(call => String(call[0]))
+        .filter(line => line.startsWith('{"event":"aws-open"')).map(line => JSON.parse(line));
+    const open = async (s: ReturnType<typeof setup>) => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try { await s.ensure(); return lines(); } finally { info.mockRestore(); }
+    };
+    const id = C.slice(0, 8);
+    it.each([false, true])('a warm adopt (reopen=%s) is warm/adopted', async reopen => {
+        expect(await open(setup({ rows: reopen ? [stopped()] : [] }))).toEqual([{ event: 'aws-open', computer: id, path: 'warm', reason: 'adopted' }]);
+    });
+    it.each([
+        ['no_spare', () => setup({ rows: [stopped()], host: null })],
+        ['tier_free', () => setup({ rows: [stopped()], entitlement: null, grantPending: async () => false })],
+        ['not_stopped', () => setup({ rows: [stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED })] })],
+        ['not_pool', () => setup({ rows: [stopped({ last_error: null })], deployment: { ...D, namespace: 'pilot',
+            stateMachineVersionArn: D.stateMachineVersionArn.replace('mum', 'pilot') } })],
+    ] as const)('a cold boot says why: %s', async (reason, make) => {
+        expect(await open(make())).toEqual([{ event: 'aws-open', computer: id, path: 'cold', reason }]);
+    });
+    it('an attached volume releases first (wait/volume_attached); a pending grant waits (wait/grant_pending)', async () => {
+        const attached = setup({ rows: [stopped()] });
+        attached.volume.state = 'in-use'; attached.volume.attachments = [{ instanceId: attached.source.instanceId, state: 'attached' }];
+        expect(await open(attached)).toEqual([{ event: 'aws-open', computer: id, path: 'wait', reason: 'volume_attached' }]);
+        const pending = setup({ rows: [stopped()], entitlement: null, grantPending: async () => true });
+        expect(await open(pending)).toEqual([{ event: 'aws-open', computer: id, path: 'wait', reason: 'grant_pending' }]);
+    });
+    it('capacity waits and refusals are logged without a boot', async () => {
+        const waiting = setup({ rows: [stopped()] });
+        waiting.pool.validateCapacity = vi.fn(async () => {
+            throw new PoolCapacityPressure({ computerId: C, region: D.region, zoneId: D.zoneId, instanceType: 'm6i.large' });
+        });
+        waiting.pool.reserveDemand = vi.fn(async () => 'waiting' as const);
+        expect(await open(waiting)).toEqual([{ event: 'aws-open', computer: id, path: 'wait', reason: 'capacity' }]);
+        const refused = setup({ rows: [stopped()] });
+        refused.pool.validateCapacity = waiting.pool.validateCapacity;
+        refused.pool.reserveDemand = vi.fn(async () => 'refused' as const);
+        expect(await open(refused)).toEqual([{ event: 'aws-open', computer: id, path: 'none', reason: 'region_capacity' }]);
     });
 });
