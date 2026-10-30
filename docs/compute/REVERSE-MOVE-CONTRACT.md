@@ -1,8 +1,10 @@
 # Reverse move contract: AWS → Cloudflare (Phase B, round 6b)
 
-**Status:** pinned (S0 r2), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
+**Status:** pinned (S0 r3), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
 A change to any wire shape, state, code or limit below changes this file first. Every lane cites the
-section it implements. r2 applies the review of `dc362e53`; §10 lists what changed.
+section it implements. r2 applied the review of `dc362e53` (§10). r3 closes the S0 verifier's contract gaps
+G1–G4 and the minors (§11 maps each gap to its section). Sections r3 changed carry the gap id in brackets,
+e.g. **[G1]**.
 
 **Base:** citations are `path:line` at `74ed2c92`. They point to the code each rule is based on.
 Citations to `provider-reverse-store.ts`, `0012` and the edited `provider-migrate-store.ts` are to this
@@ -16,8 +18,16 @@ branch (`r6/phaseb-20261030`).
 - The Drizzle model `computeReverseMoves` in `app/src/server/db/schema/computers.ts`.
 - Registration: drizzle journal idx 8, staging `EXPLICIT_FILES` plus the aws-production refusal, and a
   production `snapshot` source (digest of the r2 file).
+- **r3 (store only; 0012 is unchanged, so its registered digest stands):**
+  - **[G4]** the lane O / lane A reads `listUnsnapshotted` and `listRetentionExpired`, and an idempotent
+    `recordSnapshot` (§3.4, §7);
+  - **[clocks]** no app clock in the store: `import_progress.first/last` are PostgreSQL's, and every row carries
+    DB-computed `ages` (§3.4, §5.4);
+  - **[0012 probe]** `reverseMovesTablePresent(db)` for every reader outside the machine (§3.4);
+  - **[operator]** the operator runbook SQL (§5.5.1), executed verbatim by the store's PG suite.
 
-Everything else below is a contract for lanes that have not started.
+Everything else below is a contract for lanes that have not started. **After r3, lane A is the only
+writer of `provider-reverse-store.ts` and its two test files** (§1.1).
 
 ---
 
@@ -49,12 +59,31 @@ Everything else below is a contract for lanes that have not started.
 
 | Lane | Owns | Builds | Must prove (live, canary2 only) |
 |---|---|---|---|
-| **S0** (done) | 0012, `provider-reverse-store.ts`, the forward exclusion, registry | §3 | 0012 applied on the staging DB before the app deploys: plan, then apply with `--target aws-preview` (schema before code). |
-| **H** host + AMI | `infra/host-agent/lib/ezil_host/{edge,agent,export,desktop}.py`, the additive codec op in `worker/src/workspace-snapshot-script.ts` (§2.6; W does not edit that file), codec parity, maintenance-agent bake | §2 | T0 (b), (b2), (e), (k); staged files on the root volume only. |
-| **W** Worker import | `worker/src/index.ts` routes, `workspace-migration-import.ts`, start-fence change, prefix helper | §4 | T0 (g), (h), (l); heads before and after (T3); the first Cloudflare open hydrates with no `workspace_migrated`. |
-| **A** app machine | `provider-reverse.ts`, `provider-reverse-runtime.ts`, the `aws-receipts.ts` export-boot mode, `placement.ts` writers, `select.ts` routing, trigger mutations and the open trigger, sweep hook, summary DTO | §5, §6.1 | T0 (c), (d), (f), (j); race T6. |
-| **U** shell | `shell/ezil/ui/Settings/tabs/computers.js` move cards, copy and retry | §6 | Copy matches §6.3 in every state, with screenshots. |
-| **O** retention | the D21 snapshot executor, `retention.ts` listing, `ops.ts` DLM role, operator purge runbook | §7 | `iam get-role` path; a snapshot recorded on the T3 row; listing shows the committed row after 14 days (dry run). |
+| **S0** (done, r3) | 0012, the store until r3, the forward exclusion, registry | §3 | 0012 applied on the staging DB before the app deploys: plan, then apply with `--target aws-preview` (schema before code). |
+| **H** host + AMI | §1.1 | §2 | T0 (b), (b2), (e), (k); staged files on the root volume only. |
+| **W** Worker import | §1.1 | §4 | T0 (g), (h), (l); heads before and after (T3); the first Cloudflare open hydrates with no `workspace_migrated`. |
+| **A** app machine | §1.1 | §5, §6.1, §5.10 (server side of `computer.progress`) | T0 (c), (d), (f), (j); race T6. |
+| **U** shell | §1.1 | §6, §5.10 rendering | Copy matches §6.3 and §6.4 in every state, with screenshots; an open during a move never shows the opening bar, `needs_operator` or a 10-minute failure. |
+| **O** retention | §1.1 | §7 | `iam get-role` path; a snapshot recorded on the T3 row; listing shows the committed row after 14 days (dry run). |
+
+### 1.1 File ownership (one lane per file) **[G1] [G4]**
+
+Every file a Phase B lane touches has exactly one owning lane. A lane that needs a change in another lane's
+file asks that lane (or the lead) and changes this table first. Files not listed are read-only for every lane.
+
+| Lane | Files (new files marked *new*) |
+|---|---|
+| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). |
+| **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
+| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer after r3)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4). Tests next to each. |
+| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
+| **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack/IAM wiring for that machine (`infra/app-computers/lib/reverse-snapshot.ts` *new* plus its registration in the app-computers stack), the additive optional deployment field `reverseSnapshotStateMachineVersionArn` in `infra/app-computers/lib/lifecycle/release-manifest.ts` and `app/src/server/lib/compute/aws-intent.ts` (§7.1), `infra/app-computers/lib/ops.ts` (DLM role), their tests, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). |
+
+Shared seams, each owned by one side:
+- `provider-reverse-store.ts` is **A**'s. O only calls `listUnsnapshotted`, `listRetentionExpired` and
+  `recordSnapshot`; a new read O needs is added by A.
+- The sweep's call site is **A**'s (`handler.ts`); the snapshot step it calls (`advanceReverseSnapshots`) is **O**'s (§5.4, §7).
+- `computer.progress`: the server DTO is **A**'s (`progress.ts`), its rendering is **U**'s (§5.10).
 
 ---
 
@@ -75,7 +104,18 @@ The signature is unchanged: `x-ezil-gw: gw1.<ts>.<hex>` = HMAC-SHA256(controlKey
 
 | Method + path | Body | Served by | Success | Errors (JSON `{ok:false,error}`) |
 |---|---|---|---|---|
-| `POST /__ezil/control/export/<sha256hex(body)>` | Required. `Content-Length` 1..1024, no `Transfer-Encoding`, no query. Canonical JSON `{"v":1,"moveId":"<uuid>","generation":"<uuid>"}` with exactly these keys, lowercase UUIDs. | edge → agent op `export` (§2.5), then the edge reads `state.json` | `202` with the §2.4 status. Idempotent for the same `{moveId, generation}`. | `400 export_body_invalid`, `400 export_digest_mismatch`, `409 export_busy` (another `{moveId, generation}` holds the host), `409 export_invalid` (the agent refused the message), `503 agent_unavailable` (the agent socket failed or timed out, as `edge.py:393,401`) |
+| `POST /__ezil/control/export/<sha256hex(body)>` | Required. `Content-Length` 1..1024, no `Transfer-Encoding`, no query. A JSON object with exactly the keys `v`, `moveId`, `generation`, lowercase UUIDs (byte rules below). | edge → agent op `export` (§2.5), then the edge reads `state.json` | `202` with the §2.4 status. Idempotent for the same `{moveId, generation}`. | `400 export_body_invalid`, `400 export_digest_mismatch`, `409 export_busy` (another `{moveId, generation}` holds the host), `409 export_invalid` (the agent refused the message), `503 agent_unavailable` (the agent socket failed or timed out, as `edge.py:393,401`) |
+
+**Body bytes and the path digest [minor: digest].** There is no canonical-JSON rule to agree on; the digest binds the bytes.
+- The Worker builds the body once, `JSON.stringify({v: 1, moveId, generation})` (this key order, no whitespace), and sends
+  **exactly those bytes**. The path digest is `sha256` of those bytes, lowercase hex.
+- The edge reads exactly `Content-Length` bytes (`_recv_exact`, as `_ice` does, `edge.py:408-425`), compares
+  `sha256(bytes)` with the path digest using `hmac.compare_digest` **before parsing**, then parses those same bytes once.
+  It **never re-serializes** to compare, and checks key order and whitespace not at all: the digest already fixed them.
+- Parse rules (`400 export_body_invalid` otherwise): UTF-8; `json.loads` with an `object_pairs_hook` that **refuses a
+  duplicate key** (plain `json.loads` keeps the last duplicate, which a key-set check cannot see); the top level is an
+  object whose key set is exactly `{v, moveId, generation}`; `v` is the integer `1` (not `true`, not `1.0`); `moveId`
+  and `generation` match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
 | `GET /__ezil/control/export/status` | none, no query | **edge, from disk** | `200` with the §2.4 status (`state: "none"` before any POST) | `503 export_state_unreadable` |
 | `GET /__ezil/control/export/head` | none, no query | **edge, from disk** | `200` with the §2.3 export head | `409 export_not_ready` |
 | `GET /__ezil/control/export/chunk/<i>` | none, no query. `<i>` is decimal with no leading zeros, `0 ≤ i < chunks.length`. | **edge, from disk**, streamed | `200 application/octet-stream`, exact chunk bytes, `Content-Length` = `chunks[i].size` | `400 bad_chunk_index`, `409 export_not_ready`, `404 export_chunk_missing` |
@@ -185,7 +225,7 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 | `generation` | uuid NOT NULL, default `gen_random_uuid()` | The import generation. Immutable; a retry is a **new row**. |
 | `export_boot` | jsonb object | `{placementGeneration, leaseEpoch, volumeId, jobId, instanceId, fsUuid, claimedAt}` (§5.1) |
 | `export_head` | jsonb object | §2.3 without `v` and `moveId` |
-| `import_progress` | jsonb object | `{bitmap, bytes, archiveSha256, first, last}`. The bitmap is 128 hex chars (512 bits): bit i = byte ⌊i/8⌋, mask `1<<(i%8)`, the same order as forward `restore_progress` (`provider-migrate-store.ts:89-106`). `last` is the time of the last new chunk (the copy-stall clock, §5.4). |
+| `import_progress` | jsonb object | `{bitmap, bytes, archiveSha256, first, last}`. The bitmap is 128 hex chars (512 bits): bit i = byte ⌊i/8⌋, mask `1<<(i%8)`, the same order as forward `restore_progress` (`provider-migrate-store.ts:89-106`). `last` is the time of the last new chunk (the copy-stall clock, §5.4). **[clocks] r3:** `first` and `last` are written by PostgreSQL (`to_jsonb(statement_timestamp())`, ISO 8601 with offset), never by the app; `last` is `GREATEST(previous last, statement time)` so it never moves back; `first` is kept for the same `archiveSha256`. |
 | `bytes_total` | bigint | 0..536,870,912. Set with the export head. |
 | `skipped` | integer ≥ 0 | Set with the export head. |
 | `aws_volume_id` | text | `^vol-[0-9a-f]{8,17}$` |
@@ -230,9 +270,10 @@ The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:43`). Every 
 | `flipping → committed` | `finish(m, {awsVolumeId, awsFsUuid, awsSnapshotId: null})` | machine, **in the same transaction as the placement flip** (§5.6 step 3) | `commit_sent_at` set; `retain_until` = DB clock + 14 d |
 | pre-flip in-flight → `failed_*` | `fail(m, to, reason)` | machine, after compensation (§5.7) | `failed_reopened` refused once `commit_sent_at` is set. |
 | `flipping → failed_needs_operator` | `fail(m,'failed_needs_operator', reason)` | machine (§5.4 `flip_stuck`, §5.5) | — |
-| `failed_needs_operator → failed_reopened` | `fail(m,'failed_reopened', reason)` | operator only, after manual cleanup | `commit_sent_at` is null. An operator who proved the commit never landed (P's head is not this move's) clears `commit_sent_at` by hand first, then releases. |
+| `failed_needs_operator → failed_reopened` | runbook SQL `operator_released` (§5.5.1); the store's `fail(m,'failed_reopened', reason)` has the same guard | operator only, after manual cleanup | `commit_sent_at` is null. An operator who proved the commit never landed (P's head is not this move's) runs `clear_commit_sent` first, then releases. |
 | `failed_needs_operator → committed` | `finish(m, …)` | operator only, through the same flip code (§5.6 step 3) | `commit_sent_at` is set. |
-| committed (self) | `recordSnapshot(m, snapId)` | lane O (§7) | Once. |
+| `failed_reopened` (self) | runbook SQL `operator_cleared` (§5.5.1) | operator only | The computer's newest row, with a `reopen_final` code. Sets `last_error = 'operator_cleared'`, so Try again is offered again (§5.9). No store method sets it. |
+| committed (self) | `recordSnapshot(m, snapId)` | lane O (§7) | **[G4]** Once: a CAS on `aws_snapshot_id IS NULL`. The same id again returns the row (a lost response); a different id never replaces it. |
 | any in-flight (self) | `recordRetry(m, reason)` | machine | `attempts < 5`, else `{exhausted:true}` and nothing is written; the caller compensates and `fail`s. **In `flipping` it is never exhausted** (attempts saturate at 5): `flipping` is bounded by time (§5.4). |
 
 A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throws `illegal_transition` and writes nothing. The caller re-reads; nothing retries inside the store.
@@ -255,11 +296,36 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 ### 3.4 Store surface (`createProviderReverseStore(db)`)
 
 - **Reads:** `readById`, `readByComputer` (newest, any state), `readActiveByComputer` (holding), **`readByExportBoot(computerId, placementGeneration, leaseEpoch, volumeId)`** (the newest row in any state **except `committed`** whose `export_boot` claimed exactly that triple; §5.2 keys on it).
+- **[G4] Reads added in r3** (plain reads, no row lock; bounds clamp like `claimStale`, and `0`, negative or `NaN` return nothing):
+  - **`listUnsnapshotted(limit ≤ 10, committedForSeconds = 0)`**: `committed` rows with `aws_snapshot_id IS NULL`, ordered by
+    `state_entered_at, id` (a committed row's `state_entered_at` is its commit time; `recordSnapshot` never moves it), and only
+    rows committed at least `committedForSeconds` ago **on the DB clock**. The sweep's snapshot step passes 0; the
+    `snapshot_missing` listing passes 3600 (§7).
+  - **`listRetentionExpired(limit ≤ 100)`**: `committed` rows with `retain_until < clock_timestamp()`, ordered by `retain_until, id`.
+  - `REVERSE_SNAPSHOT_LIST_MAX = 10`, `REVERSE_RETENTION_LIST_MAX = 100`.
 - **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, `claimStale(limit ≤ 10)`.
   - `claimStale` takes in-flight rows idle for 30 s, oldest first, with `FOR UPDATE SKIP LOCKED`, and bumps `updated_at` only. It mirrors forward `claimStale`. `failed_needs_operator` is never claimed.
+  - **[G4] `recordSnapshot` (r3)** is a compare-and-swap on `id`, `state = 'committed'` and `aws_snapshot_id IS NULL`, not on
+    `updated_at`. After a write that matched nothing it re-reads: the same id already recorded returns the row (the replay
+    after a lost response); a different id is `lost_race`. A caller whose copy already shows a different id gets
+    `illegal_transition` with no statement. It never moves `state_entered_at` or `retain_until`. A PG race test writes two
+    different ids at once: exactly one wins.
 - **Row fields added in r2:** `stateEnteredAt`, `commitSentAt` (DB-clock text).
+- **[clocks] Row field added in r3: `ages`**, `{created, stateEntered, commitSent | null, lastChunk | null}` in seconds, computed
+  by PostgreSQL as `clock_timestamp() − anchor` in the same statement that read or wrote the row (every read, every
+  `RETURNING`, `claimStale`). `lastChunk` is null before the first chunk, and also when `import_progress.last` is not ISO text
+  (a hand edit never breaks a read). Lane A compares deadlines against `ages` only (§5.4).
+- **Clock rule (r3):** the store has no app clock (the `now` option is removed). Every timestamp it writes is PostgreSQL's:
+  `created_at`, `state_entered_at`, `commit_sent_at`, `retain_until`, `updated_at`, `import_progress.first/last`. The one
+  app-clock value left in the row is `export_boot.claimedAt`; it is informational and **never** a deadline anchor (§5.4).
+- **[0012 probe] `reverseMovesTablePresent(db)`** (r3): one `to_regclass` statement. Every reader of the table outside the
+  reverse machine calls it first and treats `false` as "no reverse move": the forward create (`reverseMoveHolds`, now
+  built on it), the receipts' export-boot lookup (§5.2), routing (§5.3), `computer.progress` (§5.10), the summary DTO
+  (§6.1) and the open trigger (§5.9). Production has no 0012, and `readComputerProgress` swallows a throw into an empty
+  progress (`progress.ts:154-157`), so a missing probe would blank `computer.progress` for every production computer.
 - **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`.
 - To write inside a placement transaction, build the store over that `tx`.
+- **Owner after r3: lane A** (§1.1). Lane O consumes the three snapshot/retention calls and adds nothing here.
 
 ---
 
@@ -277,6 +343,12 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - `begin` records `store: 'r2'` in the DO key. Any later step that resolves differently → `409 store_unsupported`.
   - Only the common store surface is used: `get`, `put` (with `onlyIf`), `list` (key, size, etag), `delete` (`workspace-store-s3.ts:58-84`, the `WorkspaceStore` interface at `:78`). No R2 `head()`, no `customMetadata`.
 - **Prefix P.** P is the real key prefix the next Cloudflare hydrate of this computer reads: the derivation in `ensureWorkspaceMount` (`index.ts:1488-1525`), i.e. `realR2KeyPrefix(config.prefix ?? '/<projectId>/branches/<branch>')` (`workspace-seed.ts:94`), with the projectId and branch the app's Cloudflare open sends for this computer.
+  - **[minor: P] Pinned value: `P = ${computerId}/branches/main`**, `computerId` being the canonical lowercase uuid of the computer (the `computerId` of every import body). Evidence at base:
+    - `projectId` is the computer id: the app's Cloudflare open sends `projectId: c.computerId` (`cloudflare.ts:97`), the AWS preview sends `projectId: placement.computerId` (`aws-preview.ts:151`; the shared rule is noted at `cloudflare-guacamole-provider.ts:217-224`), and the Worker uses it unchanged as `workspaceProjectId` (`index.ts:4695,4789`).
+    - `branch` is `'main'`: the app sends none, and the Worker defaults it (`index.ts:4790`).
+    - `config.prefix` is `env.SANDBOX_WORKSPACE_S3_PREFIX` (`index.ts:1411`), read in both store branches (`index.ts:1513,1525`). It is a **deployment-wide** value (the same for every computer) and is unset in the deployed Worker; T0 (g) confirms that on canary2's DO.
+    - `realR2KeyPrefix` strips the leading slash (`workspace-seed.ts:94-95`); the stored flush context holds that real prefix (`index.ts:1660,3062`).
+  - **Env-prefix rule:** if `SANDBOX_WORKSPACE_S3_PREFIX` is set, v1 never imports: every `import/*` answers `409 prefix_mismatch` before any write. Importing into a deployment-wide prefix would overwrite every computer's head.
   - Lane W extracts that derivation into one helper used by both hydrate and import, and a unit test proves the import's P equals what the open route hydrates.
   - If the DO has a `WORKSPACE_FLUSH_CONTEXT_KEY` (`index.ts:1872`) **without** `freshProvision`, its `prefix` must equal P, else `409 prefix_mismatch`.
   - A `freshProvision` context with prefix `${name}/branches/main` (`index.ts:3470-3472`) is a fence placeholder for a never-used workspace. It is not compared; commit replaces it (§4.4).
@@ -392,19 +464,100 @@ Request: `{moveId, generation, computerId}`.
 
 ### 5.1 Export-boot claim (`requested → booting`)
 
-The claim runs under `withAdmission` and then the computer lock (`placement.ts:582-588,542-548`), in one transaction:
+The claim is **one** transaction: admission lock, then computer lock, then the lease and the reverse row's
+`recordExportBoot`. A Step Functions start never runs inside it.
 
-1. Read the published row. It must be `aws-ec2`, `STOPPED`, with no lifecycle job pending and the owner equal to the row's user. If it is RUNNING or has a job, the row waits in `requested` (§5.4); the machine never takes over a live session.
-2. Record a **cold replace** lease on the row (`leasePlacement` with `replace`, `placement.ts:1364-1405`; intent `aws-ec2.ts:258-283`): placement generation N+1, lease epoch E+1, the same `dataVolumeId`, ordinary user data (no new lease key, `lease.py:45`).
-   - The transaction records the placement bump and the job id only.
-   - `startLifecycleJob` (`aws-receipts.ts:218`, idempotent) runs **after commit**, never inside the lock transaction: a Step Functions start issued inside a transaction would be authorized against an uncommitted row (`aws-receipts.ts:294-295`). `refused` and `unknown` take the ordinary wake's undo paths (`markLifecycleStartUnknown`, `settleUnknownStart`, `aws-receipts.ts:481-517`).
-   - Free never uses the pool (`aws-ec2.ts:476`).
-   - Capacity admission (regional vCPU) applies. **Entitlement start-gate admission does not**: no `admitStart`/`decideStart`, which would refuse a Free user's size (`compute-access.ts:210-217`).
-3. In the same `tx`, call `recordExportBoot(m, {placementGeneration: N+1, leaseEpoch: E+1, volumeId, jobId, instanceId: null, fsUuid, claimedAt})`.
+#### 5.1.1 Composition **[G2]**
+
+**The lead's rule as worded cannot ship, so r3 pins the closest rule that can.** The rule says lane A composes
+`readAdmissionCounters → decideAdmission → mintAdmissionTicket → leasePlacement` by hand. But `mintAdmissionTicket` is
+"ADMISSION ONLY" (`placement.ts:690-697`). `placement.test.ts:505-518` scans the whole repository and fails when any
+non-test file other than `admission.ts` and `placement.ts` names it. That is the R-PL F3 invariant: holding the lock alone
+never leases. A hand composition in `provider-reverse-runtime.ts` therefore fails CI.
+
+**The workable rule keeps the same steps and moves them into one new function in `admission.ts`, owned by lane A:**
+
+```ts
+// admission.ts (lane A). The only new caller of mintAdmissionTicket, inside the file that may name it.
+export function admitExportBoot(db: PlacementDb, input: {
+    userId: string; computerId: string;
+    expected: { generation: number; leaseEpoch: number };   // the STOPPED row's N / E
+    leaseUntil: Date; fields: PlacementFields;              // the boot's job, digest, fence and nonce hash (below)
+}, recordInTx: (tx: PlacementExecutor, leased: Placement) => Promise<void>, deps?: AdmissionDeps): Promise<AdmissionOutcome>;
+```
+
+It does exactly this, in one `withAdmission` transaction (`placement.ts:582-588`):
+1. `readAwsAdmissionConfig`. If it is disabled, refuse with its reason before any statement, as `runAdmission` does (`admission.ts:242-244`).
+2. `lockComputerUnderAdmission(tx, lock, computerId)` (`placement.ts:660-663`), keeping the order admission → computer (§3.3).
+   `runAdmission` takes no computer lock (`leasePlacement` → `casInTx` takes none, `placement.ts:938-961`), so this lock is
+   added explicitly. It serialises the claim with the reverse create, `releaseExportBoot` and the flip.
+3. `readAdmissionCounters(tx, lock, {userId, computerId, monthStart: utcMonthStart(now), now})` (`placement.ts:1725-1735`).
+4. `readPlacement(tx, computerId)`. The row must be `aws-ec2`, owned by `userId`, `STOPPED`, `lifecycleJobId` null, and at
+   `expected`. Otherwise return `cas_conflict`.
+5. `decideAdmission({config, counters, userId, now, region: {kind:'lease', region: placement.region}, instanceType: placement.instanceType})`
+   (`admission.ts:93-143`). Then **remove `user_hours_cap` and `user_egress_cap` from `reasons`**. If any reason is left,
+   refuse with the first one left.
+6. `mintAdmissionTicket(tx, lock, {computerId, userId, kind: 'lease'})`.
+7. `leasePlacement(tx, lock, ticket, {computerId, ownerUserId: userId, expected, leaseUntil, replace: true, fields})`, with no
+   `resizeInstanceType`. **The export boot keeps the placement's own `instanceType`** (`placement.ts:1394-1397`) and its own region.
+8. `await recordInTx(tx, leased.placement)`. Lane A passes
+   `tx => createProviderReverseStore(tx).recordExportBoot(m, {placementGeneration: N+1, leaseEpoch: E+1, volumeId, jobId, instanceId: null, fsUuid, claimedAt})`.
+   If it throws (for example `lost_race`), the lease rolls back with it.
+
+A unit test pins the step order (lock statement first, then the computer lock, then the counters, then the CAS, then the
+reverse write) and the cap filter. The repository scan at `placement.test.ts:505-518` stays unchanged and green.
+
+**Admission policy for the export boot (pinned).** The move is EZiL's cost and ends EZiL's AWS cost. Real capacity limits
+apply; the user's own allowance does not.
+
+| `decideAdmission` reason | Applies? | Outcome in `requested` |
+|---|---|---|
+| `aws_disabled`, `aws_config_invalid`, `kill_switch` | yes | `reopen` → `kill_switch` (**try later**) |
+| `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap` | yes | **wait**: stay in `requested` with no `recordRetry`, and claim again on the next pass. At `ages.created ≥ 600` → `reopen` → `boot_unavailable` (**try later**). |
+| `cas_conflict` (the row moved, or the lease CAS was lost) | — | **wait**: re-read on the next pass, with no retry count. |
+| `user_hours_cap`, `user_egress_cap` | **no**: removed in step 5 | — |
+| `user_has_aws_computer` | yes. It passes for this computer: the counter excludes the target computer (`p.computer_id <> target`, `placement.ts:1803-1807`) and its own demand (`:1810-1816`). It fails only when the user holds **another** AWS computer or demand. | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
+| `computer_not_owned`, `computer_deleted`, `duplicate_placement`, `region_not_configured` | yes | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
+| `aws_tier_invalid` | cannot occur (no tier is requested) | — |
+
+The **try-later** outcomes are exactly `kill_switch` and `boot_unavailable`. Both are `failed_reopened` with `retry: 'now'`,
+and the user copy is the §6.3 "try later" row.
+
+**Entitlement start-gate admission does not apply**: there is no `admitStart`/`decideStart`, which would refuse a Free
+user's size (`compute-access.ts:210-217`). Free never uses the pool (`aws-ec2.ts:476`), so lane A calls `admitExportBoot`
+directly, not through `reservePoolHostForBoot`.
+
+#### 5.1.2 The lease fields (the wake's cold replace, rebuilt) **[G2]**
+
+The claim row must be `aws-ec2` and `STOPPED` with no job (step 4). **[G3]** `computer.move.start` already refuses a
+RUNNING or busy computer (§5.9). The `requested` wait therefore covers only races, such as a reconciler's job.
+
+Lane A rebuilds the cold replace from the exported builders, with the same values the wake uses (`aws-ec2.ts:698-742`):
+- `generation = N+1`, `leaseEpoch = E+1`, `nonce = issueEnrollmentNonce(now, randomBytes)`, `fenceToken = newId()`.
+- `userData = buildEnrollmentUserData({computerId, volumeId, fsUuid, generation: N+1, leaseEpoch: E+1, nonce, provision: false, enrollUrl})`:
+  ordinary user data, with no new lease key (`lease.py:45`).
+- The intent copies the private `replaceIntent` field for field (`aws-ec2.ts:270-286`): `{schemaVersion: 1, jobId: newId(),
+  computerId, revision: 1, operation: 'replace', targetGeneration: N+1, fenceToken, providerInstanceId: null, dataVolumeId:
+  p.volumeId, previousGeneration: N, previousInstanceId: p.instanceId, previousFenceToken: p.fenceToken, deployment,
+  instanceType: p.instanceType, dataVolumeGiB: null, leaseEpoch: E+1, userData}`. `work = buildLifecycleWork(intent)`.
+- `fields = {fenceToken, enrollNonceHash, enrollExpiresAt, enrollConsumedHash: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null}`
+  (`aws-ec2.ts:733-742`).
+- `leaseUntil = now + 120 min`. This is the host's own hard hold bound (§2.5 step 7). The boot never reaches RUNNING, so no
+  lease-lapse stop reads it.
+- **Parity test:** for the same STOPPED placement, lane A's intent equals the intent the provider's wake builds (drive
+  `aws-ec2.ts` with a fake starter). Only `jobId`, `fenceToken` and the nonce inside `userData` may differ.
+
+**After commit** (never inside the transaction: a Step Functions start issued inside a transaction would be authorized
+against an uncommitted row, `aws-receipts.ts:294-295`):
+- `startLifecycleJob` (`aws-receipts.ts:218`, idempotent);
+- `started` → `transitionPlacement(… to 'STARTING')`, as the wake does (`aws-ec2.ts:774`);
+- `refused` and `unknown` take the wake's undo for a replace, which is **UNCONFIRMED**, not STOPPED (`aws-ec2.ts:759-767`):
+  `markLifecycleStartUnknown`, then `settleUnknownStart` (`aws-receipts.ts:481-517`). The existing recovery settles it, and
+  §5.7 waits for STOPPED, bounded by `boot_unsettled`.
 
 ### 5.2 Export-boot placement path (receipts mode and release; no new placement edges)
 
-**Receipts: an export-boot mode, not a skip.** `applyLifecycleReceipt` (`aws-receipts.ts:247`) keeps running for the export boot. It switches to export-boot mode when `p0.provider === 'aws-ec2'` and `readByExportBoot(p0.computerId, p0.generation, p0.leaseEpoch, p0.volumeId)` returns a row. (A database without 0012 has none: probe `to_regclass` first, as §3.3 does.) The lookup matches every state **except `committed`**, on the same volume:
+**Receipts: an export-boot mode, not a skip.** `applyLifecycleReceipt` (`aws-receipts.ts:247`) keeps running for the export boot. It switches to export-boot mode when `p0.provider === 'aws-ec2'` and `readByExportBoot(p0.computerId, p0.generation, p0.leaseEpoch, p0.volumeId)` returns a row. (A database without 0012 has none: call `reverseMovesTablePresent` first, §3.4.) The lookup matches every state **except `committed`**, on the same volume:
 - a released (`failed_*`) row still keeps its own boot out of RUNNING, and that placement's next boot at N+2/E+2 never matches;
 - a committed row never matches: the flip deleted that placement row, so a later `aws-ec2` row (a forward move onto a fresh volume) may reach the same counters and must boot normally.
 
@@ -433,21 +586,50 @@ The machine reads the boot's receipt itself (pattern: `readMigrationReadyReceipt
 
 ### 5.3 Routing while a move exists (`select.ts`, before the placement provider, like `providerForPendingMigration`, `provider-migrate-placement.ts:27-34`, `select.ts:101`)
 
+Every read here starts with `reverseMovesTablePresent` (§3.4); no 0012 means no reverse row.
+
 | Newest reverse row for the computer | Open / session routing |
 |---|---|
-| in flight (`requested` … `flipping`) | The **waiting provider**. Opens wait and the shell shows the move card. They never boot or adopt the AWS computer for a session. |
+| in flight (`requested` … `flipping`) | The **reverse waiting provider** (below). Opens wait and the shell shows the move view (§5.10). They never boot or adopt the AWS computer for a session. |
 | `failed_needs_operator` with `openBlocked` (§5.5: `commit_sent_at` set, or reason `already_imported`/`commit_in_progress`) | **Refuse at once** with a typed `PRECONDITION_FAILED` `computer_move_needs_attention`. Never the waiting provider: the shell shows the needs-attention card, never a spinner. |
 | `failed_needs_operator` without `openBlocked` | Ordinary AWS routing. The files are intact on AWS; only Cloudflare-side cleanup is pending. The row still blocks new moves. |
 | `committed`, `failed_reopened`, none | Ordinary routing on the placement. |
 
 The open trigger (§5.9) runs in the open mutation path, never in `select.ts` reads or status polls.
 
+**The reverse waiting answer [G1] (pinned; `provider-reverse-placement.ts`, lane A).** It must not reuse the forward
+answer `computer_migrating`: `compute-dispatch.ts:162-165` turns that into `computeMigrating`, and the shell then
+applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,432-442`) and the 600 s boot hard stop
+(`boot-progress.js:23,30-31`). A move runs for up to 155 min (§5.10), so every open-triggered move would fail mid-move.
+- `ensure` → `{ok: false, error: 'computer_moving', errorCode: 'sandbox_starting', retryable: true, computeProvider: 'aws-ec2'}`.
+- `status` → the same plus `state: 'starting'`.
+- `activity`, `restart` → `{ok: false, error: 'computer_moving'}`; `stop`, `terminate` → `{ok: false, terminated: false, outcome: 'computer_moving'}`.
+  The user cannot stop the export boot; the machine owns it.
+- `compute-dispatch.ts` adds **`computeMoving: true`** (never `computeMigrating`) to any answer whose `error` is
+  `computer_moving`, next to `awsMigrationAnswer` (`compute-dispatch.ts:161-165`).
+- An old cached shell sees an ordinary retryable `sandbox_starting`: it re-asks under its wake deadline, then shows
+  Try again. The move goes on; the next open sees it. The shell that ships with A (lane U) reads `computeMoving` (§6.4).
+
 ### 5.4 Step work, deadlines and throughput
 
-**Driver.** A new `advanceReverseMoves(startedAt)` runs in `billing-session-sweep` right after `advanceStaleMigrations` (`billing-session-sweep/handler.ts:169`).
-- It has its **own 90 s budget**, measured from its own start, not the 40 s left over from the handler start that forward moves get (`provider-migrate-orchestrator.ts:136-147`).
-- It takes at most 3 rows per pass (`claimStale(3)`).
-- The route's `maxDuration` is 300 s (`billing-session-sweep/route.ts:11`). Lane A shows the handler's worst case stays under 240 s: billing work, forward work up to 40 s after handler start, then reverse work up to 90 s.
+**Driver [minor: sweep position].** A new `advanceReverseMoves(handlerStartedAt)` runs in `billing-session-sweep`
+**after `drain()`**, as the handler's last step:
+- **Main path:** `advanceStaleMigrations` → `reconcilePaidCloudflareUsers` → `drain()` → **`advanceReverseMoves`**
+  (`billing-session-sweep/handler.ts:169-171`).
+- **Metering-inactive early return:** `drain()` → **`advanceReverseMoves`** → `finish()` (`handler.ts:54`). Forward moves do not
+  run there at base. Reverse moves must, because only the driver enforces their deadlines (§5.4 table), and a held row with
+  no driver would hold the computer indefinitely.
+- **Why after `drain()`:** `reconcilePaidCloudflareUsers` and `drain()` each start no work later than handler start + 40 s
+  (`provider-migrate-reconcile.ts:59`, `handler.ts:46`). A 90 s reverse pass placed before them would starve both on every
+  tick with a move in flight.
+- It has its **own 90 s budget**, measured from its own start, not the 40 s left over from the handler start that forward
+  moves get (`provider-migrate-orchestrator.ts:136-147`). A Worker or AWS call starts only if its own timeout (§4.1)
+  fits in what is left of the budget, so the pass ends by its start + 90 s.
+- It does **nothing** when called later than `handlerStartedAt + 150 s`; the next tick takes the rows.
+- Order inside the budget: lane O's snapshot step `advanceReverseSnapshots` first (at most 3 rows and 20 s, §7), then the
+  in-flight rows, at most 3 per pass (`claimStale(3)`).
+- The route's `maxDuration` is 300 s (`billing-session-sweep/route.ts:11`). The worst case is 150 s + 90 s = 240 s.
+  Lane A's handler test proves the order and both gates.
 - Within its budget it drives a row step after step. A `copying` row gets back-to-back pulls (`count: 64`).
 - `computer.move.start`, `computer.move.retry` and the open trigger also schedule one immediate 60 s drive with `after()` (pattern `schedulePaidMigration`, `provider-migrate-orchestrator.ts:149-152`), so the first steps do not wait for a cron tick.
 - Two drivers on one row are safe: the Worker serialises per DO (§4.1), and every row write is a CAS.
@@ -457,12 +639,23 @@ The open trigger (§5.9) runs in the open mutation path, never in `select.ts` re
 - At 3 MiB/s or more, one pass moves its maximum, about 192 chunks, and 512 chunks take 3 passes.
 - Throughput is a live proof (T0 (e2)). If T0 measures below 0.5 MiB/s, this section changes before lane A ships.
 
-**Deadlines.** All are measured from durable DB timestamps: `created_at`, `exportBoot.claimedAt`, `state_entered_at`, `import_progress.last` and `commit_sent_at`. claimStale never moves any of them.
+**Deadlines [clocks].** Every deadline compares the **DB clock** with a **DB-written** timestamp, through the row's `ages`
+(§3.4), which PostgreSQL computes as `clock_timestamp() − anchor` when the row is read or written. Lane A never compares an
+anchor against `Date.now()`. claimStale never moves an anchor.
+
+| Deadline | Anchor (`ages` field) |
+|---|---|
+| `requested`: 10 min | `created_at` (`ages.created`) |
+| `booting`: 15 min | **`state_entered_at` of `booting`** (`ages.stateEntered`). It is written by `requested → booting` in the claim transaction itself (§5.1.1 step 8); completing the claim never moves it. `export_boot.claimedAt` is an app-clock record only and is never compared. |
+| `exporting` 20 min, `copying` 60 min, `checking` 20 min | `state_entered_at` (`ages.stateEntered`) |
+| `copying` stall: 10 min | `import_progress.last` (`ages.lastChunk`), written by PostgreSQL (§3.1); before the first chunk, `ages.stateEntered` |
+| `flipping`: 30 min | `commit_sent_at` (`ages.commitSent`) |
+| compensation (`boot_unsettled`, §5.5) | `ages.stateEntered ≥` that state's own deadline **+ 30 min**. Compensation runs while the row keeps its state, so `state_entered_at` is its DB anchor; a compensation that starts before the deadline (a failure answer) ends at the same absolute point. |
 
 | State | Work per pass | Done when | Deadline → outcome (compensation first, §5.7) |
 |---|---|---|---|
-| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Placement RUNNING or job pending → wait. Otherwise claim (§5.1). | claim recorded | 10 min after `created_at`: `computer_busy` if the placement never became claimable, else `boot_unavailable` (capacity refused). |
-| `booting` | Read the boot receipt and enrollment. | enrolled → `advance('exporting')` | Boot settled as failed (UNCONFIRMED, or STOPPED by an undo) → `boot_failed`. **15 min after `claimedAt`** → `boot_timeout`. |
+| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Placement not STOPPED, or a job pending → wait. Otherwise claim (§5.1.1); a capacity refusal or `cas_conflict` → wait (§5.1.1 table). | claim recorded | 10 min after `created_at` (`ages.created ≥ 600`): `computer_busy` if the placement never became claimable, else `boot_unavailable` (capacity refused). |
+| `booting` | Read the boot receipt and enrollment. | enrolled → `advance('exporting')` | Boot settled as failed (UNCONFIRMED, or STOPPED by an undo) → `boot_failed`. **15 min after `booting`'s `state_entered_at`** (`ages.stateEntered`) → `boot_timeout`. |
 | `exporting` | Worker `begin` (until it succeeds), then `pull{count:0}` on every pass | status `ready` and a valid head → `recordExportHead` | Host `failed` → §5.5. **20 min after `state_entered_at`** → `export_timeout`. |
 | `copying` | `pull{from:next, count:64}` until the budget is spent, then `recordImportProgress(stored)` | bitmap complete → `advance('checking')` | No new chunk for **10 min** (`import_progress.last`, or `state_entered_at` before the first chunk) → `copy_stalled`. **60 min after `state_entered_at`** → `copy_timeout`. |
 | `checking` | (1) Worker `commit{verifyOnly:true}` until verified. (2) Then `releaseExportBoot` + `retireUnenrolledHost` until the placement is `STOPPED` at N+1/E+1 with no job. (3) Then the §5.6 transaction 1. | `advance('flipping')` | **20 min after `state_entered_at`** → `check_timeout`. |
@@ -485,6 +678,9 @@ The classes are:
 |---|---|---|
 | any pre-flip | entitlement became paid (re-read at every pass) | `reopen` → `entitlement_paid` (no Try again button needed, §6.3) |
 | `requested` | kill switch on | `reopen` → `kill_switch` |
+| `requested` (claim, §5.1.1) **[G2]** | admission `aws_disabled`, `aws_config_invalid`, `kill_switch` | `reopen` → `kill_switch` (try later) |
+| `requested` (claim) **[G2]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, or `cas_conflict` | wait (no `recordRetry`); at `ages.created ≥ 600` → `reopen` → `boot_unavailable` (try later) |
+| `requested` (claim) **[G2]** | admission `user_has_aws_computer`, `computer_not_owned`, `computer_deleted`, `duplicate_placement`, `region_not_configured` | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `begin` (`exporting`) | `container_running`, `export_host_mismatch`, `unavailable` (incl. `export_unreachable`), `not_found` | `retry` |
 | `begin` | `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `other` | `reopen_final` → the code (`other` → `worker_conflict`) |
 | `begin`/`pull` | `already_imported` | `operator` → `already_imported` (impossible before `flipping`; the Cloudflare head is ours) |
@@ -507,17 +703,72 @@ The classes are:
 | `abort` | `unavailable`, `not_found` | retried inside compensation; still failing after 5 → `operator` → `abort_unconfirmed` |
 | `abort` | `already_imported`, `commit_in_progress` | `operator` → that code (impossible before `flipping`) |
 | boot (`booting`) | the boot settles failed / 15 min | `reopen` → `boot_failed` / `boot_timeout` |
-| compensation | the placement does not settle to `STOPPED` with no job within 30 min of the first compensation step | `operator` → `boot_unsettled` |
+| compensation | the placement does not settle to `STOPPED` with no job by the state's deadline + 30 min (`ages.stateEntered`, §5.4) | `operator` → `boot_unsettled` |
 
 **Closed `last_error` vocabulary** (U keys copy on it; anything else is a lane A bug):
 - `failed_reopened`:
   - `reopen`: `entitlement_paid`, `kill_switch`, `computer_busy`, `boot_unavailable`, `boot_failed`, `boot_timeout`, `export_timeout`, `export_failed`, `copy_stalled`, `copy_timeout`, `check_timeout`, `import_corrupt`, `import_lost`, `requested_retries`, `booting_retries`, `exporting_retries`, `copying_retries`, `checking_retries`, `operator_released`, `operator_cleared`;
   - `reopen_after_session`: `workspace_too_large`;
-  - `reopen_final`: `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `workspace_missing`, `worker_conflict`.
+  - `reopen_final`: `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `workspace_missing`, `worker_conflict`, **`boot_refused`** (r3, §5.1.1).
+  - **Try later** (r3, §5.1.1): `kill_switch` and `boot_unavailable` only. They are `reopen` codes with their own copy (§6.3).
 - `failed_needs_operator`:
   - Open works: `abort_unconfirmed`, `boot_unsettled`;
   - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`.
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
+
+#### 5.5.1 Operator runbook SQL (pinned; the only operator writes) **[minor: operator_cleared]**
+
+No store method sets `operator_cleared`, and the app has no operator surface. Operators use exactly these statements,
+on the staging DB, one row at a time (`<move-id>` is the row's `id`). Each one:
+- is guarded, so it changes 0 rows unless the precondition holds;
+- bumps `updated_at` with the store's own STAMP expression, so any writer holding an older copy loses its CAS. The store's
+  CAS also checks `state` (`provider-reverse-store.ts`, `cas`), so a careless hand edit that keeps `updated_at` still
+  refuses a stale writer; a PG test proves both.
+
+`provider-reverse-store.pg.test.ts` reads every `-- runbook:` block **from this file** (these three and §7.1's
+`operator_snapshot`) and runs them verbatim against 0012. Editing a block here without keeping that test green is a
+contract break.
+
+**Release** a `failed_needs_operator` row whose commit was never sent, after the manual cleanup it names: the Worker
+import aborted (or proven never begun), and the placement `STOPPED` with no job. Try again is offered afterwards.
+
+```sql
+-- runbook: operator_released
+UPDATE public.ezil_compute_reverse_moves
+   SET state = 'failed_reopened', last_error = 'operator_released', state_entered_at = clock_timestamp(),
+       updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+ WHERE id = '<move-id>'::uuid AND state = 'failed_needs_operator' AND commit_sent_at IS NULL
+RETURNING id, state, last_error, updated_at::text AS updated_at;
+```
+
+**Clear `commit_sent_at`**, only after proving the Worker commit never landed: P's `latest.json` is not this move's v1 head
+(`generation` ≠ the row's `generation`) and no `ezil:reverseImport` key says `committing`. Then run `operator_released`.
+
+```sql
+-- runbook: clear_commit_sent
+UPDATE public.ezil_compute_reverse_moves
+   SET commit_sent_at = NULL, updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+ WHERE id = '<move-id>'::uuid AND state = 'failed_needs_operator' AND commit_sent_at IS NOT NULL
+RETURNING id, state, commit_sent_at, updated_at::text AS updated_at;
+```
+
+**Clear a final failure** (`reopen_final`), after fixing its cause, so Try again is offered again (§5.9). Only the computer's
+newest row counts, so only the newest row is cleared.
+
+```sql
+-- runbook: operator_cleared
+UPDATE public.ezil_compute_reverse_moves m
+   SET last_error = 'operator_cleared', updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
+ WHERE m.id = '<move-id>'::uuid AND m.state = 'failed_reopened'
+   AND m.last_error IN ('head_moved', 'head_invalid', 'head_unreadable', 'system_head_moved', 'import_busy', 'import_mismatch',
+                        'store_unsupported', 'prefix_mismatch', 'export_refused', 'workspace_missing', 'worker_conflict', 'boot_refused')
+   AND m.id = (SELECT n.id FROM public.ezil_compute_reverse_moves n WHERE n.computer_id = m.computer_id
+               ORDER BY n.created_at DESC, n.id DESC LIMIT 1)
+RETURNING id, state, last_error, updated_at::text AS updated_at;
+```
+
+Finishing a `flip_stuck` row (`failed_needs_operator → committed`) is **not** SQL: it changes the placement, so it runs the
+§5.6 transaction 2 code after the Worker confirms the commit.
 
 ### 5.6 Flip (`checking → flipping → committed`)
 
@@ -529,8 +780,18 @@ The classes are:
    - No HTTP call is made inside the lock transaction.
 2. **After commit:** Worker `commit{verifyOnly:false}`. This and every retry of it are the only Worker calls in `flipping`.
 3. **Transaction 2**, under `withAdmission` then the computer lock. A new `flipPlacementToCloudflare` in `placement.ts` mirrors `flipPlacementToAws` (`placement.ts:806-848`); `placement.ts` stays the single writer.
-   - Delete the `aws-ec2` row by CAS on `STOPPED`, N+1/E+1, no job.
-   - Insert a `cloudflare` `STOPPED` row with storage = the commit's `store` (`r2`; allowed values `placement.ts:57-61`).
+   - **[minor: flip walk] The walk is the same as `flipPlacementToAws` (`placement.ts:829-842`), on the `aws-ec2` row:**
+     1. Read the row inside the transaction. It must be `aws-ec2`, owned by the move's user, `STOPPED` at N+1/E+1 (the row's `exportBoot`),
+        with no `lifecycleJobId`, and on the move's volume. Anything else throws, the transaction rolls back, and the row stays `flipping`.
+     2. `STOPPED → RETIRING → RETIRED`, each by `casInTx(…, {generation: 0, leaseEpoch: 0}, {}, {ownerUserId, provider: 'aws-ec2'})`.
+        Both edges are in `PLACEMENT_TRANSITIONS` (`STOPPED: ['RETIRING']`, `RETIRING: [… 'RETIRED' …]`, `placement.ts:107,120`).
+        No lifecycle job is recorded and no usage effect applies: the host is already terminated (§5.4 `checking`).
+     3. `DELETE … WHERE computer_id AND owner_user_id AND provider = 'aws-ec2' AND state = 'RETIRED' AND generation = N+1 AND lease_epoch = E+1`.
+        Exactly one row, else throw (as `placement.ts:839-842`).
+     4. Insert the Cloudflare row with `createInTx(tx, {computerId, ownerUserId, provider: 'cloudflare', state: 'STOPPED'}, true)`
+        (the computer lock is already held). **Its counters are those of every new Cloudflare row: `generation = 1`, `lease_epoch = 0`,
+        `workspace_store = 'r2'`** (`placement.ts:749-752`, `INITIAL_LEASE_EPOCH` `:72`, `DEFAULT_STORE` `:63`). This is the same row
+        `pinCloudflarePlacement` creates (`placement.ts:866-867`). The commit's `store` must be `'r2'` (§4.1, v1 is R2-only); anything else throws.
    - **In the same transaction**, call the reverse store over `tx`: `finish(m, {awsVolumeId, awsFsUuid, awsSnapshotId: null})`.
    - So there is never a moment where the placement is Cloudflare while the row is not `committed`.
    - An operator finishing a `flip_stuck` row runs this same transaction from `failed_needs_operator`, after the Worker confirms the commit.
@@ -561,12 +822,28 @@ If step 1 or step 2 cannot be confirmed within its bound, write `failed_needs_op
 
 ### 5.9 Triggers and gates
 
-- **`computer.move.start`** (new mutation, `startedBy:'user'`).
+- **`computer.move.start`** (new mutation in `app/src/server/api/routers/computer.ts`, `startedBy:'user'`).
   - Requires standing `files_on_aws` (`standing.ts:12-13`), an `aws-ec2` placement, the kill switch off, and no forward work.
   - It refuses `move_unavailable` after a `reopen_after_session` failure with no AWS session since, or a `reopen_final` failure that is not `operator_cleared`.
   - It returns the holding row (creating it when none holds).
-- **`computer.move.retry`** (new mutation). It is the same as start. It exists because the shell's `move-retry` must stop calling `switchTo` (`computers.js:1255-1258`). It is refused while a row holds the computer, which includes `failed_needs_operator`.
-- **Next open (`startedBy:'open'`, D20, in v1).** In the open mutation path (not reads), the open creates a row and returns the waiting provider when ALL of these hold:
+  - **[G3] It never creates a row for a computer that is in use.** Refusals are **values**, like `switchConfiguration`'s
+    (`computer.ts:241-246`): `{ok: false, reason}` or `{ok: true, move: ComputerMoveV3}`. They are checked in this order,
+    on the placement read in the same request:
+
+    | `reason` | When | Copy key (§6.3) |
+    |---|---|---|
+    | `move_not_held` | standing is not `files_on_aws`, or the placement is not `aws-ec2` | none; the card is not shown |
+    | `move_paused` | the kill switch is on (`aws-config.ts:274`) | try later |
+    | `move_busy` | forward work for the computer (`forward_active`, §3.3) | try later |
+    | **`move_computer_running`** | the placement is `RUNNING`, `LEASED`, `STARTING`, `MOUNTING`, `DRAINING` or `STOPPING`, **or has a `lifecycleJobId`** (a D16 hold session is open or a job is pending) | **stop first** |
+    | `move_computer_unsettled` | any other non-`STOPPED` state (`UNCONFIRMED`, `RECOVERING`, `RETIRING`, …) | try later |
+    | `move_unavailable` | the newest row's failure forbids Try again (above) | the failed card's own copy |
+
+  - So a held computer is only ever claimed from `STOPPED`. The `requested` wait (§5.4) is left for races, such as a
+    reconciler's job, and is still bounded by `computer_busy` at 10 min. The next-open trigger fires only from `STOPPED`
+    (below), so it is unaffected.
+- **`computer.move.retry`** (new mutation). It is the same as start, with the same refusals. It exists because the shell's `move-retry` must stop calling `switchTo` (`computers.js:1255-1258`). It is refused while a row holds the computer, which includes `failed_needs_operator` (`reason: 'move_in_progress'`).
+- **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:190-193`), before `routeComputer`, never in reads, `computer.progress`, `status` or the hosted-app routes. The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
   - standing `files_on_aws`;
   - the placement is `aws-ec2` `STOPPED` with no lifecycle job and no lease (no transition active);
   - no reverse row holds the computer, and the newest reverse row, if any, is not `failed_*` (after any failure, only a click starts the next move);
@@ -587,6 +864,89 @@ An account is founder-owned for this contract when ANY of these holds:
 The rule over-excludes on purpose. A founder-owned account never gets an `'open'` or `'cron'` row; it moves only on the explicit Move click from its own session. The same helper drives the DTO's `moveOnOpen` (§6.1).
 
 ---
+
+### 5.10 `computer.progress` during a move **[G1]**
+
+**Why.** At base, `describeProgress` reads only forward rows (`progress.ts:70-136`). During a move it would describe the
+export boot's own `aws-ec2` placement, and the user watches that overlay for the whole move (D20 makes the next open the
+main trigger):
+- LEASED, STARTING and MOUNTING become `operation: 'opening'` (`progress.ts:86`). The overlay applies its 240 s expectation and
+  the 600 s budget (`computer-progress.js:149-155`, `boot-progress.js:23,30-31`, `app-spinner.js:252-253`).
+- `releaseExportBoot`'s UNCONFIRMED in every successful `checking` step sets `needsOperator` (`progress.ts:112`), and so does a
+  MOUNTING boot past enrollment grace (`progress.ts:111`). Both are a false "needs attention".
+- RECOVERING and RETIRING read as `stopping` (`progress.ts:87,101-104`).
+- `openingOptions` stamps an opening record for the export boot's epoch (`progress.ts:166-190`, `describeOpening` `:404-412`).
+
+**Ownership.** Lane A owns the server description (`progress.ts`). Lane U owns its rendering in `computer-progress.js`, the
+open overlay and the Computer tab (§6.4).
+
+**Server rule (lane A).** `readComputerProgress` calls `reverseMovesTablePresent` (§3.4), then reads the newest reverse row
+with `readByComputer`. It checks the owner exactly as for the forward row (`progress.ts:145`). This happens **before**
+anything placement-derived. With no 0012, or no row, the output is byte-for-byte today's.
+
+| Newest reverse row | `computer.progress` |
+|---|---|
+| in flight (`requested` … `flipping`) | the **moving view** below. Nothing placement-derived drives it: no `opening` or `stopping` operation, no lifecycle stage, no `needsOperator` from UNCONFIRMED or enrollment expiry, no capacity wait, no transition. **`openingOptions` is not called**, so no opening record is read or written for the export boot's epoch. |
+| `failed_needs_operator` with `openBlocked` (§5.3) | the moving view with `stage: 'needs_operator'`, `needsOperator: true`, `active: false`, `move.outcome: 'failed_needs_operator'`, `move.openBlocked: true` |
+| `committed`, `failed_reopened`, or `failed_needs_operator` without `openBlocked`, and visible (§6.1) | today's placement description, unchanged, **plus** `move` with its outcome. A reverse `failed_reopened` never takes over `stage`: the old shell's copy for that stage says "The original computer was reopened" (`computer-progress.js:26`), which is wrong here. |
+| none, not visible, or no 0012 | unchanged, and `move` is `null` |
+
+**The moving view (pinned DTO; additive; `version` stays 2).**
+
+```ts
+// Existing fields, with their values in the moving view:
+operation: 'moving';                    // NEW value. Never 'opening', 'stopping' or 'migration'.
+stage: 'moving' | 'needs_operator';     // 'moving' is NEW: an old shell has no copy for it, so its progressView returns null.
+recordedStage: ReverseMoveState;        // the row's state (diagnostics only)
+lifecycleState: PlacementState | null;  // the export boot's placement state (diagnostics only; drives nothing here)
+paused: false; operationsPaused: false; // an in-flight move continues under the kill switch: D-7 gates new work only
+needsOperator: boolean;                 // true only in the openBlocked row above
+active: boolean;                        // true while in flight
+startedAt: string;                      // the row's created_at (ISO)
+updatedAt: string;                      // the row's updated_at (ISO)
+durable: true; resumePolicy: 'unavailable';
+bytes: { transferred: number | null; total: number | null };  // import_progress.bytes / bytes_total; null before the head
+percent: number | null;                 // floor(100 × transferred / total) in 'importing', else null
+etaSeconds: null;                       // no speed or duration claims (§6.3)
+transferStartedAt: string | null; transferUpdatedAt: string | null;  // import_progress.first / .last (DB clock)
+typicalSeconds: number;                 // = move.expectedSeconds
+openingStartedAt: null; path: null; expectedSeconds: null; milestones: [];  // never an opening
+transition: null; selectedNextOpenHardware: null;           // hardware: unchanged
+
+// NEW, additive and optional (absent or null with no visible reverse row; old shells ignore it):
+move?: null | {
+    moveId: string;
+    direction: 'to_cloudflare';
+    phase: 'export_boot' | 'exporting' | 'importing' | 'checking' | 'committing' | null;  // null once terminal
+    step: 0 | 1 | 2 | 3 | null;          // the §6.1 step of `phase`; null once terminal
+    startedAt: string;                   // created_at (ISO)
+    phaseStartedAt: string;              // state_entered_at (ISO, DB clock)
+    expectedSeconds: number;             // whole move, from startedAt (below)
+    budgetSeconds: number;               // 9300 (below)
+    bytesDone: number | null; bytesTotal: number | null;
+    outcome: null | 'committed' | 'failed_reopened' | 'failed_needs_operator';
+    reason: string | null;               // terminal only: last_error, from the §5.5 closed list
+    retry: 'now' | 'after_aws_session' | 'no' | null;   // terminal only, as §6.1
+    openBlocked: boolean;
+};
+```
+
+- **Phases** (the lead's "export boot, exporting, importing, checking, committing"): `requested` and `booting` → `export_boot`
+  (step 0); `exporting` → `exporting` (step 0); `copying` → `importing` (step 1); `checking` → `checking` (step 2); `flipping` →
+  `committing` (step 3). The steps equal `REVERSE_MOVE_DTO_STAGE`'s (§6.1), so the overlay and the Computer tab never disagree.
+- **`expectedSeconds`** is the bar's time ease only, never shown as a number. It is provisional and is re-pinned from T0 (e)
+  and (e2), like §5.4: `clamp(240 + 120 + import + 150, 600, 3600)`, where 240 is the export boot (`OPENING_TYPICAL_SECONDS`,
+  `progress.ts:45`), 120 the capture, `import = ceil(bytesTotal / 1,048,576)` seconds (1 MiB/s; 120 before the head is known),
+  and 150 the check, host retire and commit.
+- **`budgetSeconds = 9300`**, the sum of the §5.4 deadlines: 600 (`requested`) + 900 (`booting`) + 1200 (`exporting`) +
+  3600 (`copying`) + 1200 (`checking`) + 1800 (`flipping`). With the driver running (§5.4), every row is terminal by then.
+  The shell never fails a move on its own clock before `startedAt + budgetSeconds + 300 s` (§6.4).
+- **Old cached shells:** `progressView` returns null for the unknown stage `moving` (`computer-progress.js:131-133`), so they
+  show no opening bar, no `needs_operator` and no wrong copy. Their open loop sees an ordinary `sandbox_starting` (§5.3).
+- **Lane A tests:** for each export-boot placement state with an in-flight row (LEASED, STARTING, MOUNTING, MOUNTING past
+  enrollment grace, UNCONFIRMED/`ENROLLMENT_FAILED` from `releaseExportBoot`, RECOVERING, RETIRING, STOPPED/`INSTANCE_LOST`),
+  check `operation: 'moving'`, `needsOperator: false`, `typicalSeconds` equal to the move's, and no opening written. Also: a
+  database without 0012 gives today's output exactly.
 
 ## 6. Summary DTO and shell (lanes A + U)
 
@@ -614,7 +974,8 @@ interface ComputerMoveV3 {
 - **Stage map** (`REVERSE_MOVE_DTO_STAGE`, `provider-reverse-store.ts:57`): `requested`, `booting` and `exporting` → `saving` (step 0); `copying` → `copying` (1, with bytes); `checking` → `checking` (2); `flipping` → `flipping` (3).
   - These are keys the dormant `MOVE_STEP_OF` already has (`computers.js:504`), and a unit test pins that.
   - The shell's own `exporting: 1` entry is never sent for `to_cloudflare`.
-- **Visibility:** non-null when the newest row for the computer is holding, or is terminal with `updated_at` within the last 24 h. Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible.
+- **Visibility:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
+- Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `move: null`, `moveOnOpen: false`.
 - The shell already accepts `reason` with `/^[a-z0-9_:-]{1,64}$/i` (`computers.js:511`).
 
 ### 6.2 Shell changes (lane U)
@@ -625,6 +986,16 @@ interface ComputerMoveV3 {
 - Add a pre-move card with the "Move my files…" action on the files-held state, with the variant chosen by `moveOnOpen`.
 - An open refused with `computer_move_needs_attention` shows the needs-attention card, never a spinner.
 - The `files_on_aws` banner (`computers.js:499`) drops the region name.
+- **[G3]** `computer.move.start`/`retry` refusals (§5.9) render their §6.3 row. `move_computer_running` shows **[Stop and move my files]**:
+  it runs the tab's existing Stop for this computer (`computers.js:923,1245`, the same confirm), watches `computer.progress` until
+  `stage` is `stopped` (bounded by the existing stop budget, `computer-progress.js:341-342`: 200 polls), then calls `computer.move.start`
+  **once**. If that refuses again, the card shows that refusal. Closing the tab in between starts nothing; the pre-move card returns.
+- **[G1]** The open overlay and the Computer tab render the moving view of `computer.progress` (§5.10) as §6.4 says.
+- **[minor: too-large]** The cap in copy comes from one constant, `MOVE_LIMIT_BYTES = 536870912`, exported by
+  `computer-progress.js` and imported by `computers.js`. It is formatted by the shell's own MB unit (÷ 1,000,000, no decimals,
+  as `formatBytes` at `computer-progress.js:69` and `moveView` at `computers.js:515`), which gives **"537 MB"**. The string
+  "512 MB" appears nowhere. Lane U's shell test pins "537 MB". Lane A's `provider-reverse-store.test.ts` reads the constant
+  from `computer-progress.js` and asserts it equals `EXPORT_MAX_BYTES`, the same cross-file pattern as the `MOVE_STEP_OF` test.
 
 ### 6.3 User copy per state (no city or region names, no speed or duration claims)
 
@@ -640,11 +1011,59 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | `flipping` | Step 4 of 4: Switching to your Free computer. |
 | `committed` | Your files are on your Free computer. Not moved: {NOT_MOVED}{skipped > 0: ", and N items that can't be copied, like links that point outside your Workspace folder"}. Your AWS disk is kept until {retainUntil date}. |
 | `failed_reopened`, `retry: 'now'` (default) | We couldn't move your files. They're still on your AWS computer and nothing was deleted. [Try again] |
-| `failed_reopened`, `workspace_too_large` | Your Workspace folder is larger than a Free computer can hold (512 MB), so your files stay on your AWS computer. Nothing was deleted. Remove some files on your AWS computer and try again, or upgrade to keep using them. [Upgrade] (Try again appears once `retry` is `now`) |
+| `failed_reopened`, `workspace_too_large` | Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Remove some files on your AWS computer and try again, or upgrade to keep using them. [Upgrade] (Try again appears once `retry` is `now`). **r3:** "537 MB" is `MOVE_LIMIT_BYTES` (536,870,912 bytes) in the shell's MB unit (§6.2), never a literal. |
+| `failed_reopened`, `kill_switch` or `boot_unavailable` (**try later**, §5.1.1) | We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again in a few minutes. [Try again] |
 | `failed_reopened`, `entitlement_paid` | Your plan is active again, so your files stay on your AWS computer. (no button) |
 | `failed_reopened`, `retry: 'no'` (`reopen_final`) | We couldn't move your files. They're still on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again) |
 | `failed_needs_operator`, `openBlocked` false | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again; Send feedback when enabled) |
 | `failed_needs_operator`, `openBlocked` true | We're finishing moving your files to your Free computer. Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. (no Try again; Send feedback when enabled) |
+
+**Start/retry refusals (§5.9) [G3]:**
+
+| `reason` | Copy |
+|---|---|
+| `move_computer_running` | **Your AWS computer is open.** Stop it first, and your files start moving to your Free computer as soon as it has stopped. [Stop and move my files] |
+| `move_paused`, `move_busy`, `move_computer_unsettled` | We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again in a few minutes. [Try again] |
+| `move_in_progress` | (no new card: the current move's card stays) |
+| `move_unavailable` | (the newest failed row's own card above) |
+| `move_not_held` | (no card) |
+
+### 6.4 The open overlay and the Computer tab during a move (lane U) **[G1]**
+
+**Open loop (`session.js`, `desktop-window.js`, `boot-progress.js`).**
+- An open answered with `computeMoving: true` (§5.3) is **a move, not a boot**. The 10-minute `MIGRATION_DEADLINE_MS`
+  (`session.js:239`), the wake deadline and the 600 s `AWS_BOOT_HARD_STOP_MS` (`boot-progress.js:23`) do not apply to it, and
+  `awsBootTimeoutVerdict`/`awsBootWaitVerdict` never return `budget_spent` or `fail` for it.
+- The overlay watches `computer.progress` (5 s polls, as today) and re-asks the open **at most every 30 s**. Each ask is
+  harmless: the reverse waiting provider never boots anything.
+- The watch ends when, after this open has itself seen `operation: 'moving'` (the `seenInFlight` rule of
+  `watchComputerTransition`, `computer-progress.js:353-370`):
+  - `move.outcome` is `committed`, or the open stops answering `computeMoving` → re-ask the open (it now opens the Free computer);
+  - `move.outcome` is `failed_reopened` or `failed_needs_operator` → show the outcome below. **Never auto-open the AWS
+    computer**: under the D16 hold that boot uses Free hours at the AWS size, so the user chooses it;
+  - `startedAt + budgetSeconds + 300 s` passes with no outcome → `OPENING_COPY.runningLong` and Send feedback. That is
+    never a failure claim: only the server's outcome ends a move.
+- `progressView` maps `operation: 'moving'` and `stage: 'moving'` before its unknown-stage return (`computer-progress.js:133`).
+  When a visible `move` has an outcome, the `move` object is read even when `stage` is `unavailable` (a committed move's
+  Cloudflare placement reports `unavailable`). `activeAws` is false in the moving view; it is never an AWS opening.
+
+**Overlay copy** (status line / one sentence / bar). No countdown, no speed or duration claims.
+
+| Moving view | Status line | Sentence | Bar |
+|---|---|---|---|
+| `phase` `export_boot` or `exporting` | Moving your files to your Free computer | Step 1 of 4: Saving your files. | determinate: four equal steps, time-eased by `move.expectedSeconds` from `move.startedAt`, never past the next step's floor |
+| `importing` | Moving your files to your Free computer | Step 2 of 4: Copying your files. X MB of Y GB copied. (`moveView`'s units) | step 2's segment, filled by `bytesDone / bytesTotal` |
+| `checking` | Moving your files to your Free computer | Step 3 of 4: Checking your files. | step 3 |
+| `committing` | Moving your files to your Free computer | Step 4 of 4: Switching to your Free computer. | step 4 |
+| elapsed > `move.expectedSeconds` | (unchanged) | (unchanged) | meta line `OPENING_COPY.long` ("Taking a little longer than usual") |
+| outcome `committed` | Your files are on your Free computer | Opening your Free computer. | full, then the ordinary Cloudflare open |
+| outcome `failed_reopened` | We couldn't move your files | They're still on your AWS computer and nothing was deleted. (`entitlement_paid`: "Your plan is active again, so your files stay on your AWS computer." `workspace_too_large`: the §6.3 sentence with "537 MB".) | none. [Open my AWS computer] re-asks the open (the D16 hold). Send feedback when enabled. Try again for the move lives on the Computer tab card. |
+| `failed_needs_operator`, `openBlocked` false | We couldn't finish moving your files | They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. | none. [Open my AWS computer]. Send feedback. |
+| `stage` `needs_operator` (`openBlocked` true) | We're finishing moving your files | Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. | none. Send feedback. No retry. |
+
+**Computer tab.** The move card keeps reading `billing.summary`'s `computer.move` (§6.1) for its copy. While the tab is open
+during a move it may also poll `computer.progress` for live bytes. Both come from the same row through the same step map,
+so they agree.
 
 ---
 
@@ -657,8 +1076,32 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
   - **Recorded** with `recordSnapshot` (once) as soon as `CreateSnapshot` returns an id. A pending snapshot is already point-in-time.
   - **Alert:** a committed row with no snapshot 1 h after commit is listed by `retention.ts` as `snapshot_missing` and logged `[reverse-move] snapshot_missing`. An operator takes it by hand (T1 does so for canary2).
   - Lane O ships before the app deploy (release order, §8), so every committed move gets one.
-- **Purge.** Extend `retention.ts` (dry run, `retention.ts:1-13,58-64`) with a read-only listing of `committed` rows whose `retain_until < now()`, and the `snapshot_missing` rows.
-  - Deletion is a separate founder-owned principal, never a workflow role. Both workflow roles deny `DeleteVolume` and `DeleteSnapshot` (rule R11).
+
+### 7.1 The `reverse_snapshot` operation (pinned) **[G4]**
+
+| Item | Rule |
+|---|---|
+| **Name** | `reverse_snapshot`. It is a **separate** Standard Step Functions state machine, owned, deployed and versioned by lane O like the preparation machine (`infra/app-computers/lib/rebase-preparation.ts`). Its version ARN reaches the app on the deployment as **`reverseSnapshotStateMachineVersionArn`**, next to `preparationStateMachineVersionArn` (`aws-intent.ts`, `release-manifest.ts`; lane O owns both edits, which are additive and optional). It is **not** a new value in `LIFECYCLE_OPERATIONS` (`aws-intent.ts:183`): the placement lifecycle machine and its allowlist are unchanged. |
+| **Intent** | Strict JSON with exactly these keys: `{"schemaVersion": 1, "operation": "reverse_snapshot", "jobId": "<moveId>", "moveId": "<moveId>", "computerId": "<uuid>", "region": "ap-south-1", "accountId": "<12 digits>", "volumeId": "<the row's aws_volume_id>", "fsUuid": "<the row's aws_fs_uuid> \| null", "committedAt": "<ISO of the row's commit, state_entered_at>"}`. The execution input is `{schemaVersion: 1, document, digest}` with `digest = sha256(document)`, as `buildRebasePreparation` builds it (`aws-rebase-preparation.ts:23-32`). |
+| **Idempotency key** | **`jobId = moveId`, so the execution name is `computer-<moveId>`** (the `EXECUTION_NAME` grammar, `aws-clients.ts:212`). A start whose name is already used counts as success (`ExecutionAlreadyExists`, `aws-clients.ts:228-247`). A Standard execution's name cannot be reused for 90 days, longer than the 14-day retention. So a lost StartExecution response, a retried start, or two sweeps never run a second execution for one move. Names are scoped to one state machine, so `computer-<moveId>` never collides with a placement job's name. |
+| **EC2 dedupe inside the execution** | EC2 `CreateSnapshot` takes **no client token** (the preparation step passes only `VolumeId`, `Description` and `TagSpecifications`, `preparation-definition.ts:40-42`). So the lead's "client token derived from the move id" is the execution name above, and inside the one execution the helper dedupes as the preparation helper does (`preparation-helper.ts:83-96`): it calls create **at most once** (`createAttempted`), tags the snapshot at creation with `ezil:reverse-move = <moveId>` and `ezil:computer-id = <computerId>`, looks that tag up before creating, and resolves an uncertain create by the tag (`snapshot_ambiguous` when 2 or more exist, `snapshot_create_unconfirmed` when none exists after an attempt). |
+| **Preconditions** | As above, plus `volumeId` equals the row's `aws_volume_id`. Any failure ends the execution failed with a closed code; the helper never mutates the volume. |
+| **Success** | As soon as the tagged snapshot is `pending` or `completed`. `error` → failed `snapshot_error`. The output is the receipt `{schemaVersion: 1, jobId, digest, moveId, computerId, volumeId, snapshotId, snapshotState: 'pending' \| 'completed', snapshotStartedAt}`, at most 8 KiB, as the preparation receipt is (`preparation-helper.ts:104`). |
+| **How the id reaches the app** | Lane O's `advanceReverseSnapshots` reads execution `computer-<moveId>` with the existing reader (`createSfnExecutionReader`, `aws-clients.ts:254`). It validates the receipt against the intent it built (digest, `moveId`, `computerId`, `volumeId`; the `validateRebaseSnapshotReceipt` pattern, `aws-rebase-preparation.ts:44-53`), then calls `recordSnapshot(m, snapshotId)`. A replay of the same id returns the row (§3.4). |
+| **Which sweep starts it** | `advanceReverseSnapshots(budget)` (lane O, `provider-reverse-snapshot.ts`). Lane A's `advanceReverseMoves` calls it **first** in its pass (at most 3 rows and 20 s, §5.4), with `listUnsnapshotted(3)`. Per row: no execution yet → StartExecution; running → nothing; succeeded → record. The deployment has no `reverseSnapshotStateMachineVersionArn` → nothing (the row then appears under `snapshot_missing`). |
+| **Failure** | A failed, timed-out or aborted execution is **not** retried automatically: its name is spent, and a second name could create a second snapshot. It logs `[reverse-move] snapshot_failed`. After 1 h the row is listed `snapshot_missing` (`listUnsnapshotted(limit, 3600)`), an operator snapshots by hand, and records the id with the runbook statement below. |
+
+```sql
+-- runbook: operator_snapshot
+UPDATE public.ezil_compute_reverse_moves
+   SET aws_snapshot_id = '<snapshot-id>', updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+ WHERE id = '<move-id>'::uuid AND state = 'committed' AND aws_snapshot_id IS NULL
+RETURNING id, state, aws_snapshot_id, updated_at::text AS updated_at;
+```
+
+- **Purge listing.** `retention.ts` (dry run, `retention.ts:1-13,58-64`) lists `listRetentionExpired(100)` and the
+  `snapshot_missing` rows (`listUnsnapshotted(10, 3600)`). Both are read-only (§3.4).
+- **Purge.** Deletion is a separate founder-owned principal, never a workflow role. Both workflow roles deny `DeleteVolume` and `DeleteSnapshot` (rule R11).
 - **DLM.** `dlmRoleArn` pins `role/service-role/…` (`ops.ts:36`). Change it only after `iam get-role` confirms the path. T0 saw a DLM 12-hourly snapshot of the founder's volume (snap-053333a158f9cc895, 10-29 19:38Z), so DLM runs for at least that volume; DLM snapshots never replace the D21 snapshot.
 
 ---
