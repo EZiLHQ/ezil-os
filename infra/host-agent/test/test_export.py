@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 from ezil_host import agent as agentmod, config, desktop, edge, export  # noqa: E402
 from ezil_host.fsops import Refused  # noqa: E402
 
+REAL_START_EXPORT = agentmod.Agent._start_export
 KEY = b"k" * 32
 CID = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b"
 LEASE = {"computerId": CID, "generation": 3, "leaseEpoch": 7}
@@ -202,6 +203,38 @@ class AgentOp(unittest.TestCase):
         self.assertEqual(self.send(moveId=str(uuid.uuid4()), importGeneration=g), {"ok": False, "error": "export_busy"})
         self.assertEqual(self.start.call_count, 2)
 
+    def test_a_host_committed_to_stopping_answers_stopping(self):
+        # A control-plane stop or fence accepted, or a shutdown begun: no job may start. The
+        # export's own guard (runDir/stopping alone) is not that: its re-POSTs still report.
+        g = str(uuid.uuid4())
+        self.assertEqual(self.send(moveId=MOVE, importGeneration=g), {"ok": True})
+        open(os.path.join(self.cfg.runDir, desktop.STOPPING), "w").close()
+        self.assertEqual(self.send(moveId=MOVE, importGeneration=g), {"ok": True})
+        for commit in ("stop_request", "shutdown_pending"):
+            with self.subTest(commit=commit):
+                if commit == "stop_request":
+                    self.agent.stop_request = {"kind": "stop", "warn": 0, "reason": "control_plane"}
+                else:
+                    self.agent.stop_request = None
+                    open(os.path.join(self.cfg.runDir, agentmod.SHUTDOWN_PENDING), "w").close()
+                for ids in ((MOVE, g), (MOVE, str(uuid.uuid4()))):
+                    self.assertEqual(self.send(moveId=ids[0], importGeneration=ids[1]), {"ok": False, "error": "stopping"})
+        self.assertEqual(self.start.call_count, 2)
+        self.assertEqual(export.read_state(self.cfg)["importGeneration"], g)
+
+    def test_the_job_is_told_when_the_host_commits_to_stopping(self):
+        with mock.patch.object(export, "Job") as job, mock.patch.object(agentmod.threading, "Thread"):
+            REAL_START_EXPORT(self.agent)                  # setUp patched the method itself
+        stopping = job.call_args.kwargs["stopping"]
+        self.assertFalse(stopping())
+        self.agent.stop_request = {"kind": "fence", "warn": 0, "reason": "fence"}
+        self.assertTrue(stopping())
+        self.agent.stop_request = None
+        open(os.path.join(self.cfg.runDir, desktop.STOPPING), "w").close()
+        self.assertFalse(stopping(), "the export's own desktop stop is not a host stop")
+        open(os.path.join(self.cfg.runDir, agentmod.SHUTDOWN_PENDING), "w").close()
+        self.assertTrue(stopping())
+
     def test_unreadable_record_is_busy_never_overwritten(self):
         export.ensure_root(self.cfg)
         with open(os.path.join(self.cfg.stateDir, "export", "state.json"), "w") as f:
@@ -300,20 +333,41 @@ class EdgePost(EdgeRig):
 
     def test_agent_unavailable_is_503(self):
         body = body_for(MOVE, str(uuid.uuid4()))
-        for failure in (OSError("connect"), ValueError("bad json"), {"ok": False, "error": "internal"}):
+        # Only a refusal the agent sent is 409 (final for the Worker); the agent failing is not.
+        for failure in (OSError("connect"), ValueError("bad json"), {"ok": False, "error": "internal"},
+                        {}, {"ok": False}, {"ok": False, "error": 7}, {"ok": False, "error": "stopping"},
+                        {"ok": "yes"}, {"ok": False, "error": "something_new"}, []):
             with self.subTest(failure=failure):
                 def send(op, **fields):
                     if op != "export":
                         return {"ok": True}
-                    if isinstance(failure, dict):
+                    if isinstance(failure, (dict, list)):
                         return failure
                     raise failure
                 with mock.patch.object(self.seq, "send", side_effect=send):
                     self.assertEqual(self.post(body).json(), (503, {"ok": False, "error": "agent_unavailable"}))
+        self.assertIsNone(export.read_state(self.cfg))
+
+    def test_a_post_to_a_host_committed_to_stopping_is_503_and_starts_nothing(self):
+        self.agent.stop_request = {"kind": "stop", "warn": 0, "reason": "control_plane"}
+        self.assertEqual(self.post(body_for(MOVE, str(uuid.uuid4()))).json(),
+                         (503, {"ok": False, "error": "agent_unavailable"}))
+        self.assertIsNone(export.read_state(self.cfg))
+        self.start.assert_not_called()
+
+    def test_an_agent_that_closes_the_socket_unanswered_is_503(self):
+        # The agent died or restarted mid-request: the sequencer reads EOF and json.loads(b"{}")
+        # (or a reply that is not an object). Retryable (export_unreachable), never export_refused.
+        body = body_for(MOVE, str(uuid.uuid4()))
+        for reply in ({}, [], "x"):
+            with self.subTest(reply=reply):
+                self.seq._send_once = lambda msg, reply=reply: reply if msg["op"] == "export" else {"ok": True}
+                self.assertEqual(self.post(body).json(), (503, {"ok": False, "error": "agent_unavailable"}))
 
     def test_an_agent_refusal_is_409_export_invalid(self):
         body = body_for(MOVE, str(uuid.uuid4()))
-        for error in ("export_invalid", "wrong_epoch", "stale_request", "replayed"):
+        for error in ("export_invalid", "wrong_epoch", "stale_request", "replayed", "bad_mac", "bad_seq", "bad_ts",
+                      "bad_json"):
             with self.subTest(error=error):
                 with mock.patch.object(self.seq, "send", return_value={"ok": False, "error": error}):
                     self.assertEqual(self.post(body).json(), (409, {"ok": False, "error": "export_invalid"}))
@@ -481,16 +535,19 @@ class Jobs(unittest.TestCase):
         os.mkfifo(os.path.join(self.ws, "pipe"))
         self.record = write_record(self.cfg)
         self.g = self.record["importGeneration"]
-        for name in ("remove_container",):
-            p = mock.patch.object(export, name)
+        # The host's real free space never decides a test (the refusal test sets its own).
+        for name, kw in (("remove_container", {}), ("_free_bytes", {"return_value": export.MIN_FREE_BYTES})):
+            p = mock.patch.object(export, name, **kw)
             p.start()
             self.addCleanup(p.stop)
+        self.host_stopping = []
 
     def job(self):
         def stop():
             self.stops.append(time.time())
             return self.stop_ok
-        return export.Job(self.cfg, LEASE, stop, log=self.logs.append)
+        return export.Job(self.cfg, LEASE, stop, log=self.logs.append,
+                          stopping=lambda: bool(self.host_stopping and self.host_stopping.pop(0)))
 
     def run_with(self, runner):
         with mock.patch.object(export, "run_container", side_effect=runner):
@@ -598,6 +655,65 @@ class Jobs(unittest.TestCase):
         self.job()._finish(MOVE, self.g, "ready", head=record["head"])
         self.assertEqual(export.read_state(self.cfg), other)
 
+    def test_a_host_committed_to_stopping_never_starts_the_container(self):
+        # Checked at the job's start and again right before the container binds /workspace (a
+        # stop committed during the desktop stop): the quiesce must find nothing holding the volume.
+        for checks, stopped in (([True], 0), ([False, True], 1)):
+            with self.subTest(checks=checks):
+                write_record(self.cfg)
+                self.stops.clear()
+                self.host_stopping[:] = checks
+                runner = CodecRunner(self)
+                record = self.run_with(runner)
+                self.assertEqual((record["state"], record["error"]), ("failed", "capture_failed"))
+                self.assertEqual((runner.calls, len(self.stops)), ([], stopped))
+
+    def test_the_job_budget_runs_from_started_at(self):
+        # A capture never outlives the app's 20 min `exporting` deadline: the container's timeout
+        # is what is left of 15 min after the job started, and a resumed job past it fails at once.
+        self.assertEqual(export.JOB_BUDGET_SECONDS, 15 * 60)
+        timeouts = []
+
+        def runner(cfg, bundle, result_path, timeout):
+            timeouts.append(timeout)
+            return CodecRunner(self)(cfg, bundle, result_path)
+        write_record(self.cfg, startedAt=export.iso(time.time() - 600))
+        self.assertEqual(self.run_with(runner)["state"], "ready")
+        self.assertTrue(0 < timeouts[0] <= 300, timeouts)
+        write_record(self.cfg, startedAt=export.iso(time.time() - export.JOB_BUDGET_SECONDS - 1))
+        record = self.run_with(runner)
+        self.assertEqual((record["state"], record["error"], len(timeouts)), ("failed", "capture_failed", 1))
+
+    def test_a_job_that_fails_before_its_capture_still_reports(self):
+        # The export dir's own setup is inside the job's guard: the record never stays capturing.
+        real, calls = export.ensure_root, []
+
+        def flaky(cfg):
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError("export dir")
+            return real(cfg)
+        with mock.patch.object(export, "ensure_root", side_effect=flaky):
+            record = self.run_with(CodecRunner(self))
+        self.assertEqual((record["state"], record["error"]), ("failed", "capture_failed"))
+
+    def test_a_failed_final_write_is_retried_once_then_left_to_the_app_deadline(self):
+        real = export._write_state
+        for failures, state in ((1, "ready"), (2, "capturing")):
+            with self.subTest(failures=failures):
+                write_record(self.cfg)
+                left = [failures]
+
+                def write(cfg, record):
+                    if left[0]:
+                        left[0] -= 1
+                        raise OSError(28, "No space left on device")
+                    return real(cfg, record)
+                with mock.patch.object(export, "_write_state", side_effect=write), \
+                        mock.patch.object(export.time, "sleep"):
+                    record = self.run_with(CodecRunner(self))      # never raises
+                self.assertEqual(record["state"], state)
+
 
 class AgentJob(unittest.TestCase):
     """The agent answers within 1 s while a capture runs in its worker thread."""
@@ -608,7 +724,7 @@ class AgentJob(unittest.TestCase):
         self.seq = 0
         self.release = threading.Event()
         self.running = threading.Event()
-        for name, kw in (("remove_container", {}),):
+        for name, kw in (("remove_container", {}), ("_free_bytes", {"return_value": export.MIN_FREE_BYTES})):
             p = mock.patch.object(export, name, **kw)
             p.start()
             self.addCleanup(p.stop)

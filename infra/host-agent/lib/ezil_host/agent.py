@@ -263,18 +263,29 @@ class Agent:
 
     def _accept_export(self, move_id, import_generation, now):
         """Lock held. Validate, persist, answer: never wait for the stop or the capture (the
-        socket has one thread and a 5 s client timeout). The same ids resume or report."""
+        socket has one thread and a 5 s client timeout). The same ids resume or report. A host
+        that committed to stopping answers `stopping` (the edge's retryable 503): no job may
+        start a container that binds /workspace while the quiesce unmounts it. runDir/stopping
+        alone is not that: the export's own desktop stop sets it, and its re-POSTs must report."""
+        if self._host_stopping():
+            return {"ok": False, "error": "stopping"}
         if export.accept(self.cfg, move_id, import_generation, now) == "busy":
             return {"ok": False, "error": "export_busy"}
         self._start_export()
         return {"ok": True}
+
+    def _host_stopping(self):
+        """A control-plane stop or fence was accepted, or a shutdown began (it sets
+        shutdown-pending before its quiesce; an idle stop sets it too)."""
+        return bool(self.stop_request) or os.path.exists(self._marker(SHUTDOWN_PENDING))
 
     def _start_export(self):
         """Start the job's worker thread unless it already runs (one job per host). The job
         itself does nothing unless the record is still `capturing`."""
         if self.export_thread is not None and self.export_thread.is_alive():
             return
-        job = export.Job(self.cfg, self.lease, self._export_stop_desktop, log=self.log, clock=self.clock)
+        job = export.Job(self.cfg, self.lease, self._export_stop_desktop, log=self.log, clock=self.clock,
+                         stopping=self._host_stopping)
         self.export_thread = threading.Thread(target=job.run, name="ezil-export", daemon=True)
         self.export_thread.start()
 

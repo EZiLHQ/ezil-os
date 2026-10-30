@@ -77,6 +77,10 @@ CHUNK_INDEX_RE = re.compile(r"0|[1-9][0-9]{0,2}")   # decimal, no leading zeros,
 EXPORT_CL_RE = re.compile(r"[0-9]{1,4}")
 MAX_EXPORT_BODY = 1024
 STREAM_BLOCK = 65536
+# The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
+# answer that is not ok, an empty one included, is 503 agent_unavailable.
+AGENT_REFUSALS = frozenset({"export_invalid", "bad_json", "bad_mac", "wrong_epoch", "bad_ts", "stale_request",
+                            "bad_seq", "replayed"})
 FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
                       "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
@@ -483,15 +487,21 @@ class Edge:
             return
         try:
             resp = self.seq.send("export", moveId=req["moveId"], importGeneration=req["generation"])
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):    # AttributeError: a reply that is not an object
             _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return
-        if not resp.get("ok"):
-            error = resp.get("error")
-            if error == "internal":                 # the agent failed, not the message: retryable
-                _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+        if not isinstance(resp, dict) or resp.get("ok") is not True:
+            # 409 only for a refusal the agent actually sent (the Worker makes it final, §4.2, §5.5).
+            # Anything else is the agent failing, not the message, and stays retryable: an empty
+            # reply (it closed the socket unanswered: died or restarted mid-request), `internal`,
+            # `stopping` (a committed stop or shutdown) or a reply without a known error.
+            error = resp.get("error") if isinstance(resp, dict) else None
+            if error == "export_busy":
+                _reply(client, 409, {"ok": False, "error": "export_busy"})
+            elif error in AGENT_REFUSALS:
+                _reply(client, 409, {"ok": False, "error": "export_invalid"})
             else:
-                _reply(client, 409, {"ok": False, "error": "export_busy" if error == "export_busy" else "export_invalid"})
+                _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return
         try:
             record = export.read_state(self.cfg)

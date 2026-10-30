@@ -48,7 +48,10 @@ MIN_FREE_BYTES = 7 * 1024**3 // 4          # 1.75 GiB: archive + chunk copies + 
 READY_HOLD_SECONDS = 15 * 60               # idle hold while ready: 15 min after the last GET
 HOLD_CAP_SECONDS = 185 * 60                # never held more than 185 min after the job started
 SERVED_WRITE_INTERVAL = 15                 # lastServedAt is written at most once per 15 s
-CAPTURE_TIMEOUT_SECONDS = 18 * 60          # below the app's 20 min `exporting` deadline (§5.4)
+# The whole job (desktop stop + capture) ends within 15 min of its startedAt, so a capture never
+# outlives the app's 20 min `exporting` deadline (§5.4), which starts before `begin` reaches this
+# host (up to 3 ticks and a drive earlier). A resumed job past it fails at once.
+JOB_BUDGET_SECONDS = 15 * 60
 STATES = ("capturing", "ready", "failed")
 ERRORS = ("workspace_too_large", "workspace_missing", "capture_failed", "desktop_stop_failed", "staging_space_low")
 RECORD_KEYS = {"moveId", "importGeneration", "state", "startedAt", "finishedAt", "lastServedAt", "error", "head"}
@@ -309,7 +312,7 @@ def remove_container(cfg):
         pass
 
 
-def run_container(cfg, bundle, result_path, timeout=CAPTURE_TIMEOUT_SECONDS):
+def run_container(cfg, bundle, result_path, timeout):
     """Run the export container to completion. The codec's stdout goes to a file (bounded by
     the caller's read, never held in this process's memory). The exit code, or None on timeout."""
     remove_container(cfg)
@@ -423,12 +426,19 @@ def stage(cfg, export_dir, move_id, generation, raw_result):
 
 class Job:
     """One export, run in the agent's worker thread. `stop_desktop()` is the agent's: it stops
-    the desktop under the runDir/stopping guard and says whether it is down."""
+    the desktop under the runDir/stopping guard and says whether it is down. `stopping()` is the
+    agent's too: True once it committed to stopping the host (a control-plane stop or fence, a
+    shutdown begun), when no container may start: the quiesce is about to unmount /workspace."""
 
-    def __init__(self, cfg, lease, stop_desktop, log=lambda m: print(m, flush=True), clock=time.time):
+    def __init__(self, cfg, lease, stop_desktop, log=lambda m: print(m, flush=True), clock=time.time,
+                 stopping=lambda: False):
         self.cfg, self.lease, self.stop_desktop, self.log, self.clock = cfg, lease, stop_desktop, log, clock
+        self.stopping = stopping
 
     def run(self):
+        """Never raises and never leaves its own record `capturing` while it can still write:
+        the Worker re-POSTs only on `none` (§4.3), so a dead job would be polled until the
+        app's deadline instead of failing at once."""
         try:
             record = read_state(self.cfg)
         except Refused:
@@ -436,23 +446,29 @@ class Job:
         if record is None or record["state"] != "capturing":
             return
         move_id, generation = record["moveId"], record["importGeneration"]
-        export_dir = os.path.join(ensure_root(self.cfg), generation)
+        export_dir = None
         try:
-            head = self._capture(export_dir, move_id, generation)
+            export_dir = os.path.join(ensure_root(self.cfg), generation)
+            head = self._capture(export_dir, move_id, generation, parse_iso(record["startedAt"]) + JOB_BUDGET_SECONDS)
         except Failed as f:
             self.log(f"export: failed {f.error}")
-            shutil.rmtree(export_dir, ignore_errors=True)
-            self._finish(move_id, generation, "failed", error=f.error)
+            self._failed(export_dir, move_id, generation, f.error)
             return
         except Exception as e:  # noqa: BLE001 — a job that dies must still report, never hang `capturing`
             self.log(f"export: failed capture_failed ({type(e).__name__})")
-            shutil.rmtree(export_dir, ignore_errors=True)
-            self._finish(move_id, generation, "failed", error="capture_failed")
+            self._failed(export_dir, move_id, generation, "capture_failed")
             return
         self.log(f"export: ready chunks={len(head['chunks'])} entries={head['entries']} skipped={head['skipped']}")
         self._finish(move_id, generation, "ready", head=head)
 
-    def _capture(self, export_dir, move_id, generation):
+    def _failed(self, export_dir, move_id, generation, error):
+        if export_dir is not None:
+            shutil.rmtree(export_dir, ignore_errors=True)
+        self._finish(move_id, generation, "failed", error=error)
+
+    def _capture(self, export_dir, move_id, generation, deadline):
+        if self.stopping():
+            raise Failed("capture_failed")
         remove_container(self.cfg)                 # a resumed job: the old container still runs
         shutil.rmtree(export_dir, ignore_errors=True)
         os.mkdir(export_dir, 0o700)
@@ -470,7 +486,13 @@ class Job:
             raise Failed("capture_failed")
         result_path = os.path.join(export_dir, RESULT_FILE)
         started = self.clock()
-        rc = run_container(self.cfg, bundle, result_path)
+        budget = deadline - started
+        # Checked last, right before the container binds /workspace: a stop committed meanwhile
+        # quiesces (removes the container, unmounts) and would find this capture holding the volume.
+        if budget <= 0 or self.stopping():
+            self.log("export: no capture (budget spent or the host is stopping)")
+            raise Failed("capture_failed")
+        rc = run_container(self.cfg, bundle, result_path, timeout=budget)
         self.log(f"export: codec exit={rc} seconds={int(self.clock() - started)}")
         if rc == 3:
             raise Failed("workspace_too_large")
@@ -486,17 +508,26 @@ class Job:
         return stage(self.cfg, export_dir, move_id, generation, raw)
 
     def _finish(self, move_id, generation, state, error=None, head=None):
-        """Only this job's own `capturing` record changes; lastServedAt is kept."""
-        with _locked(self.cfg):
+        """Only this job's own `capturing` record changes; lastServedAt is kept. One retry of a
+        failed write (the root volume briefly full or erroring); after that the record stays
+        `capturing` and the app's `exporting` deadline ends the move."""
+        for attempt in (1, 2):
             try:
-                record = read_state(self.cfg)
-            except Refused:
+                with _locked(self.cfg):
+                    try:
+                        record = read_state(self.cfg)
+                    except Refused:
+                        return
+                    if (record is None or record["state"] != "capturing"
+                            or (record["moveId"], record["importGeneration"]) != (move_id, generation)):
+                        return
+                    record.update(state=state, error=error, head=head, finishedAt=iso(self.clock()))
+                    _write_state(self.cfg, record)
                 return
-            if (record is None or record["state"] != "capturing"
-                    or (record["moveId"], record["importGeneration"]) != (move_id, generation)):
-                return
-            record.update(state=state, error=error, head=head, finishedAt=iso(self.clock()))
-            _write_state(self.cfg, record)
+            except OSError as e:
+                self.log(f"export: {state} not recorded (attempt {attempt}): {type(e).__name__}")
+                if attempt == 1:
+                    time.sleep(1)
 
 
 __all__ = ["accept", "holds_idle", "note_served", "open_chunk", "parse_request", "pending", "read_state",
