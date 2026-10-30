@@ -14,7 +14,8 @@
 // took that first paint as settled skipped its cleanup Stop.
 //
 // What it pins (every chip text painted from mount is recorded by a MutationObserver):
-//   1. positive control: STOPPED reads Stopped, no Stop control;
+//   1. positive control: STOPPED reads Stopped, no Stop control; on the session's first open
+//      with billing.summary held, the summary's late answer repaints the pane (disk shown);
 //   2. reopen over a now-RUNNING computer with progress held: never "Stopped"; then Running + Stop;
 //   3. tab switch back over a now-STOPPED computer with progress held: never "Running", no Stop;
 //   4. ordering: progress is asked alongside billing.summary — with the summary held, the chip
@@ -128,10 +129,24 @@ function recordChips () {
 const progressAsks = () => calls.filter(c => c.url.includes('/api/trpc/computer.progress')).length;
 
 // 1. Settings opened while the computer is STOPPED (true): the chip says Stopped.
+//    The FIRST open of the session, with billing.summary held: progress answers first (the
+//    normal order now they are asked together), so the summary's own answer must repaint the
+//    pane — no module-scope summary from an earlier window exists yet to paint the disk, and a
+//    STOPPED pane's next poll is 20 s away.
 lifecycle = 'STOPPED';
+summaryGate.hold();
+const firstSummaryBefore = summaryAnswered;
 await openComputers();
 await waitFor(() => chip() === 'Stopped');
 push('positive control: a STOPPED computer reads Stopped, no Stop control', chip() === 'Stopped' && ! stopBtn(), `${chip()} stop=${stopBtn()}`);
+const paneText = () => (pane()?.textContent ?? '').replace(/\s+/g, ' ').trim();
+push('first open, summary held: the disk is not painted before billing.summary answers',
+    ! paneText().includes('50 GB disk') && summaryAnswered === firstSummaryBefore, paneText().slice(0, 160));
+summaryGate.release();
+await waitFor(() => summaryAnswered > firstSummaryBefore);
+const diskShown = await waitFor(() => paneText().includes('50 GB disk'), 2000);
+push('🔴 first open: billing.summary answering after progress repaints the pane (disk shown well before the 20 s poll)',
+    diskShown && chip() === 'Stopped' && ! stopBtn(), `chip=${chip()} stop=${stopBtn()} pane=${paneText().slice(0, 160)}`);
 
 // 2. Close Settings; the computer starts (Code adopted a pool host); reopen while progress is on the wire.
 await closeSettings();
