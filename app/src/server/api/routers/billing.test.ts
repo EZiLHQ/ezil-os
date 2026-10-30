@@ -1357,6 +1357,56 @@ describe('round 5 D1: summary enrollment state and top-up gating', () => {
     });
 });
 
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1.1): the `summary` procedure wires the move computer's reads into the
+ * builder. With 0012 the three keys come from the newest row; without it (production today) none of them appears.
+ */
+describe('Phase B: billing.summary carries the reverse move from the router\'s reads', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const C1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const view = { provider: 'aws-ec2' as const, state: 'STOPPED' as const, leaseEpoch: 12, lifecycleJobId: null, instanceType: 'm6i.large' };
+    const row = { id: '33333333-3333-4333-8333-333333333333', user_id: userId, computer_id: C1, started_by: 'open', state: 'copying', generation: 'g',
+        export_boot: { placementGeneration: 8, leaseEpoch: 12, region: 'ap-south-1', volumeId: 'vol-0aaaaaaaaaaaaaaaa', jobId: null, instanceId: null,
+            fsUuid: null, claimedAt: '2026-10-11T11:00:00.000Z' },
+        bytes_total: 2_000_000, attempts: 0, last_error: null, state_entered_at: '2026-10-11 11:00:00+00', commit_sent_at: null,
+        created_at: '2026-10-11 10:59:00+00', updated_at: '2026-10-11 11:00:01+00', age_created: 120, age_state_entered: 60 };
+    const held = (present: boolean) => {
+        for (const [k, v] of Object.entries({ EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '0', AWS_REGIONS: 'ap-south-1', AWS_MAX_RUNNING: '10',
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '10', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+            EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200' })) vi.stubEnv(k, v);
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: 'aws-ec2', awsVolumes: [],
+            computers: [{ computerId: C1, provider: 'aws-ec2', placement: view }] }));
+        const dialect = new PgDialect();
+        const execute = vi.fn(async (q: Parameters<typeof dialect.sqlToQuery>[0]) => {
+            const text = dialect.sqlToQuery(q).sql;
+            if (text.includes("to_regclass('public.ezil_compute_reverse_moves')")) return [{ present }];
+            if (text.includes('FROM public.ezil_compute_reverse_moves')) return [row];
+            throw new Error(`unexpected query ${text}`);
+        });
+        const caller = createBillingRouter(() => f.deps, { placement, isOperator: () => false })
+            .createCaller({ ...f.ctx, db: { execute } as unknown as typeof f.ctx.db });
+        return { caller, execute };
+    };
+    it('with 0012: reverseMove from the newest row, moveOnOpen false while it holds, moveAvailable true; computer.move stays null', async () => {
+        const summary = await held(true).caller.summary();
+        expect(summary).toMatchObject({ computer: { standing: 'files_on_aws', move: null, moveOnOpen: false, moveAvailable: true,
+            reverseMove: { direction: 'to_cloudflare', stage: 'copying', bytesDone: '0', bytesTotal: '2000000', reason: null, retry: null,
+                openBlocked: false, holdOpenable: true } } });
+    });
+    it('without 0012 (production today): none of the three keys, and no reverse read', async () => {
+        const { caller, execute } = held(false);
+        const summary = await caller.summary();
+        if (!summary.enabled) throw new Error('summary disabled');
+        for (const key of ['reverseMove', 'moveOnOpen', 'moveAvailable']) expect(summary.computer).not.toHaveProperty(key);
+        expect(summary.computer.move).toBeNull();
+        // Only the probe touched the reverse table (the AI member lookup shares this executor).
+        const reverse = execute.mock.calls.map(([q]) => new PgDialect().sqlToQuery(q).sql).filter(text => text.includes('ezil_compute_reverse_moves'));
+        expect(reverse).toEqual([expect.stringContaining('to_regclass')]);
+    });
+});
+
 describe('round 5 D3: the summary and usage show the computer\'s REAL volume', () => {
     afterEach(() => vi.unstubAllEnvs());
     const [C1, C2] = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
