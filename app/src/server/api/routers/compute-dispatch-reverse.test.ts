@@ -54,6 +54,7 @@ import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-p
 import { reverseBlockedProvider, reverseWaitingProvider } from '@/server/lib/compute/provider-reverse-placement';
 import { REVERSE_MOVE_IN_FLIGHT } from '@/server/lib/compute/provider-reverse-store';
 import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
+import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 
 const U = '11111111-1111-4111-8111-111111111111';
 const C = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
@@ -409,5 +410,32 @@ describe('computer.move.start / retry (§5.9): nested, pinned order, every refus
         const transactional = { ...db, transaction: async <T>(fn: (tx: typeof db) => Promise<T>) => fn(db) };
         expect(await startReverseMove(transactional as never, { userId: U, computerId: C }, 'start', { schedule: () => {} }))
             .toEqual({ ok: false, reason: 'move_busy' });
+    });
+});
+
+/**
+ * §5.2 actor: billing-session-sweep. Its only placement-acting path is `tryStop` → `stopComputerForPolicy`, which routes; during
+ * a move it meets the waiting provider's stop (`computer_moving`), counted as a failed stop: nothing reaches AWS or the row.
+ * (Its held pass also skips an in-flight move: handler.test.ts; its epoch reads write nothing.)
+ */
+describe('§5.2 actors: the sweep\'s policy stop never stops an export boot', () => {
+    it.each([['LEASED', { state: 'LEASED', lifecycle_job_id: J }], ['STARTING', { state: 'STARTING', lifecycle_job_id: J }], ['MOUNTING', { state: 'MOUNTING' }]] as const)(
+        'export boot %s: stop and confirmed stop answer computer_moving; the placement and usage are untouched', async (_name, p) => {
+            for (const confirm of [false, true]) {
+                const w = world([held({ generation: 8, lease_epoch: 12, ...p })], { moves: [moveRow({ state: 'booting' })] });
+                const before = JSON.stringify(w.fake.placements);
+                for (const reason of ['session_max', 'allowance_exhausted', 'user_stop'] as const) {
+                    expect(await stopComputerForPolicy(w.db, { userId: U, computerId: C }, reason, { confirm }))
+                        .toEqual({ kind: 'aws-ec2', result: { ok: false, terminated: false, outcome: 'computer_moving' } });
+                }
+                expect(JSON.stringify(w.fake.placements)).toBe(before);
+                expect(w.fake.usage).toEqual([]);
+                expect(w.fake.statements.some(s => /^(UPDATE|INSERT|DELETE)/.test(s.sql))).toBe(false);
+            }
+        });
+    it('an open-blocked row: the blocked provider\'s stop, also a refusal', async () => {
+        const w = world([held()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
+        expect(await stopComputerForPolicy(w.db, { userId: U, computerId: C }, 'session_max'))
+            .toEqual({ kind: 'aws-ec2', result: { ok: false, terminated: false, outcome: 'computer_move_needs_attention' } });
     });
 });

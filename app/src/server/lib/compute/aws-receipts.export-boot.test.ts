@@ -145,11 +145,14 @@ describe('the export-boot mode of applyLifecycleReceipt (§5.2)', () => {
 /**
  * §5.2: every actor that acts on an `aws-ec2` row in LEASED, STARTING or MOUNTING leaves an export boot below RUNNING and
  * opens no usage. The two that apply receipts to a live computer are driven here (aws-reconcile and sandbox-reap both run
- * `runAwsBackgroundReconcile`; aws-stop-settle runs `runAwsStopSettlement`). The others, by construction:
- * - billing-session-sweep: never transitions a placement; its held pass skips an in-flight move (handler.test.ts);
+ * `runAwsBackgroundReconcile`; aws-stop-settle runs `runAwsStopSettlement`). The others:
+ * - billing-session-sweep: its only placement actor, the policy stop, meets the reverse waiting provider
+ *   (compute-dispatch-reverse.test.ts); its held pass skips an in-flight move (handler.test.ts);
+ * - internal lifecycle-authority: authorizes only the boot's own recorded job and writes nothing (its route.test.ts);
  * - internal image-rebase: a reservation is refused while a reverse row holds the computer (rebase.pg.test.ts), so it never
- *   acts on an export boot; lifecycle-authority only authorizes the boot's own recorded job (readLifecyclePlacement);
- * - pool-replenish: works on pool hosts only, and a Free export boot is never a pool adopt (aws-ec2.ts `tier_free`).
+ *   acts on an export boot;
+ * - pool-replenish, by construction: it works on pool hosts and demands only, and a Free export boot is never a pool adopt
+ *   (aws-ec2.ts `tier_free`).
  */
 describe('§5.2 actors: an enrolled export boot stays below RUNNING with no usage', () => {
     const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '10', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
