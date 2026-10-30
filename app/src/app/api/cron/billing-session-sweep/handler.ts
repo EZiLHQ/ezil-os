@@ -1,6 +1,7 @@
 import { reconcilePaidCloudflareUsers } from '@/server/lib/compute/provider-migrate-reconcile';
 import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
+import type { HeldCandidate } from '@/server/billing/store';
 import { drainAiCreditOutbox } from '@/server/billing/ai-credit-outbox';
 import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { ComputerRef } from '@/server/lib/compute/provider';
@@ -9,6 +10,21 @@ import type { PolicyStopReason, StopOutcome } from '@/server/lib/compute/stop-po
 type SweepReason = Exclude<PolicyStopReason, 'user_stop'>;
 const HEARTBEAT_STALE_MS = 15 * 60 * 1000;
 const RETRY_WINDOW_MS = 2 * 60 * 60 * 1000;
+/**
+ * Round 6: an AWS epoch opens right after its host goes RUNNING (aws-receipts.ts `step`), and a placement row's
+ * `updated_at` is never before that. A RUNNING host whose row last changed longer ago than this, with no open
+ * epoch, has none being opened: only then may a stop act on it (the held bound, and the retry: CR-4).
+ */
+export const RUNNING_GRACE_MS = 2 * 60 * 1000;
+/** Round 6 R1-01: ledger rows (AWS computers with a closed newest session) one held page reads, and pages per pass. */
+export const HELD_PAGE_SIZE = 100;
+export const HELD_PAGES = 10;
+/**
+ * Round 6 R1-01: the held pass's own time, and the latest it may run into the sweep (from its start), so the
+ * migration, reconcile and AI outbox steps after it keep their shared budget (the outbox drain ends at 40 s).
+ */
+export const HELD_BUDGET_MS = 10_000;
+export const HELD_SWEEP_BUDGET_MS = 30_000;
 
 export interface BillingSessionSweepCounts {
     examined: number;
@@ -22,6 +38,8 @@ export interface BillingSessionSweepCounts {
     shadow: number;
     /** Round 3 D9: open AWS epochs whose computer is proven not running (stop receipt never arrived). */
     awsStaleClosed?: number;
+    /** Round 6 R1-01: held (Free, files on AWS) hosts still RUNNING with no open session, stopped (or shadowed). */
+    heldOverrun?: number;
     /** Round 3 D6: the AI credit outbox drain of this sweep. */
     ai?: { drained: number; delivered: number; retried: number; failed: number };
 }
@@ -29,18 +47,29 @@ export interface BillingSessionSweepCounts {
 /** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
 export type AwsStopProof = (computer: ComputerRef) => Promise<{ running: boolean; stoppedAt: Date | null }>;
 
-export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, limit = 50 }: {
+/**
+ * Round 6 R1-01: one page of aws-ec2 computers whose newest session is closed and which are RUNNING with nothing in
+ * flight (or UNCONFIRMED), found through the billing ledger at any age (store.ts `runningAwsComputersAfterEpochs`);
+ * `after` is the previous page's `next` (null first), `next` null on the last page.
+ */
+export type RunningAwsPlacements = (after: string | null, limit: number) =>
+    Promise<{ candidates: readonly HeldCandidate[]; next: string | null }>;
+
+export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, limit = 50 }: {
     deps: BillingDeps;
     now: Date;
     stop: (computer: ComputerRef, reason: SweepReason) => Promise<StopOutcome>;
-    isStillRunning: (computer: ComputerRef) => Promise<boolean>;
+    /** `closedAt`: the policy close being retried. A host that stopped after it is a later open, never that session. */
+    isStillRunning: (computer: ComputerRef, closedAt: Date) => Promise<boolean>;
     /** Placement proof for stale AWS epochs (with the proven stop time); omitted = no AWS stale closes. */
     awsStopProof?: AwsStopProof;
+    /** The held bound's placement read; omitted = no held pass. */
+    runningAwsPlacements?: RunningAwsPlacements;
     limit?: number;
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
     const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
-        ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
+        heldOverrun: 0, ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
     const drain = async () => {
         try {
             const drained = await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 });
@@ -119,16 +148,30 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
 
     for (const epoch of policyCandidates) {
         const state = await stateFor(epoch.userId);
+        // Round 6 R2-3: a paid plan (no session cap) whose new period's grant is still on its way is not out of
+        // allowance; GRANT_PENDING_SECONDS bounds the wait (compute-access.ts).
+        if (state.grantPending) continue;
         const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
         const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
             ? state.summary.computer.activeDeadline : epoch.deadlineAt;
-        const deadline = Math.min(maximum, storedDeadline === null ? Infinity : Date.parse(storedDeadline));
+        const stored = storedDeadline === null ? Infinity : Date.parse(storedDeadline);
+        // Round 6 R1-04: a session opened on a paid plan with no session cap (its stored deadline lies past this
+        // plan's cap) and still open on Free ends at the drop: its recorded time, else now (the sweep runs every
+        // minute), never back-dated to ready + 1 h, and never before the Free hour itself. Only a STORED deadline says
+        // paid era (openComputeEpochAtReady always stores one): a Worker-opened free-cf epoch has none, and keeps its hour.
+        const paidEra = state.planSku === 'free_v3' && storedDeadline !== null && maximum !== Infinity && stored > maximum + 1000;
+        const dropAt = state.freeSince ? Math.min(Date.parse(state.freeSince), now.getTime()) : now.getTime();
+        const deadline = paidEra ? Math.max(maximum, dropAt) : Math.min(maximum, stored);
         const due = now.getTime() >= deadline;
+        const overageOn = state.family === 'compute' && state.overage?.enabled === true;
+        // Round 6 CR-1: store.ts rounds readiness up and the deadline down to whole seconds, so a session cut by the
+        // cap can be stored one second short of ready + cap (05:42:01 → 06:42:00). That bound is still the cap unless
+        // the allowance is spent (used is clamped at deadline_at); an allowance bound sits a full second or more lower.
+        const sessionCut = deadline >= maximum - 1000 && (overageOn || state.usedStdSeconds < state.allowanceStdSeconds);
         let reason: SweepReason;
         if (state.paymentIssue) reason = 'allowance_exhausted';
-        else if (state.sessionMaxSeconds !== null && due && deadline === maximum) reason = 'session_max';
+        else if (state.sessionMaxSeconds !== null && due && sessionCut) reason = 'session_max';
         else {
-            const overageOn = state.family === 'compute' && state.overage?.enabled === true;
             if (!due) {
                 const exhausted = overageOn
                     ? (state.summary.version === 2 ? state.summary.overage?.accruedCents ?? 0 : 0) >= state.overage!.capCents
@@ -160,10 +203,56 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             if (epoch.endReason === 'session_max' && (await stateFor(epoch.userId)).sessionMaxSeconds === null) continue;
             const computer = { userId: epoch.userId, computerId: epoch.computerId };
             let running = false;
-            try { running = await isStillRunning(computer); } catch { /* No blind retries on an unavailable status. */ }
+            try { running = await isStillRunning(computer, new Date(epoch.endedAt!)); } catch { /* No blind retries on an unavailable status. */ }
             if (!running) continue;
             counts.retried++;
             await tryStop(computer, epoch.endReason as SweepReason);
+        }
+    }
+
+    // Round 6 R1-01: a held host (Free, its files still on AWS: the D16 hold) is bounded by its session alone, and
+    // the policy pass above sees open sessions only. One still RUNNING with no open epoch is stopped every pass until
+    // it is not RUNNING: its session closed but the host never stopped (a stop that left the row RUNNING: a lost CAS,
+    // a config failure; also past RETRY_WINDOW_MS), or a later open's epoch never opened (a metering error). A stop
+    // refused or failed by Step Functions leaves the row UNCONFIRMED, which nothing here may stop: it is reported
+    // (`held-unconfirmed`) for an operator. Candidates come from the billing ledger at any age, paged within
+    // HELD_BUDGET_MS; a computer that never had an epoch needs a placement-side lister (placement.ts, C-2). Paid hosts
+    // are not touched here: no lapsed-lease stop (ROOT-FLEET-LEASE-INCIDENT-118); their policy closes keep the window.
+    if (runningAwsPlacements) {
+        const heldDeadline = Math.min(Date.now() + HELD_BUDGET_MS, startedAt + HELD_SWEEP_BUDGET_MS);
+        let after: string | null = null;
+        for (let page = 0; page < HELD_PAGES; page++) {
+            if (Date.now() >= heldDeadline) { console.warn('[billing.sweep] held pass out of time', { page }); break; }
+            let read: Awaited<ReturnType<RunningAwsPlacements>>;
+            try { read = await runningAwsPlacements(after, HELD_PAGE_SIZE); } catch { console.warn('[billing.sweep] held scan unavailable'); break; }
+            for (const candidate of read.candidates) {
+                const computer = { userId: candidate.userId, computerId: candidate.computerId };
+                if (attempted.has(computer.computerId) || now.getTime() - candidate.since.getTime() < RUNNING_GRACE_MS) continue;
+                try {
+                    if (await deps.store.openEpochFor(computer.computerId)) continue;
+                    const state = await stateFor(computer.userId);
+                    // The gate's hold test (compute-access.ts gateComputerStart): Free-effective with an AWS computer.
+                    if (!state.v3 || state.provider === 'aws') continue;
+                    const closedSeconds = Math.floor((now.getTime() - candidate.closedAt.getTime()) / 1000);
+                    if (candidate.state === 'UNCONFIRMED') {
+                        console.warn(JSON.stringify({ event: 'held-unconfirmed', computer: computer.computerId.slice(0, 8), closedSeconds }));
+                        continue;
+                    }
+                    counts.heldOverrun++;
+                    // 'closed': the closed session's host never stopped (over since that close). 'none': it stopped, and
+                    // this later run never opened an epoch (over since the row's last write: at least that long).
+                    const session = candidate.stoppedSinceClose ? 'none' : 'closed';
+                    console.info(JSON.stringify({ event: 'held-overrun', computer: computer.computerId.slice(0, 8), session,
+                        enforced: deps.config.enforcementEnabled,
+                        overSeconds: session === 'closed' ? closedSeconds : Math.floor((now.getTime() - candidate.since.getTime()) / 1000) }));
+                    if (!deps.config.enforcementEnabled) { counts.shadow++; continue; }
+                    await tryStop(computer, 'session_max');
+                } catch {
+                    console.warn('[billing.sweep] held check failed', { computer: computer.computerId.slice(0, 8) });
+                }
+            }
+            if (read.next === null) break;
+            after = read.next;
         }
     }
     await advanceStaleMigrations(startedAt);

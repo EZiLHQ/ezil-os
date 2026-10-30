@@ -5,7 +5,7 @@ import type { SubscriptionRow } from '../meters';
 import type { BillingDeps, BillingStore, GrantRow, PaymentIssueRow, StoredComputeEpoch } from '../ports';
 import { freeSkuFor } from './catalog';
 import { CATALOG_V2, SIZES, type ComputeEpoch } from './contract';
-import { billingMeteringActive, billingV2EntitlementReader, loadComputeBillingState, gateComputerStart, openComputeEpochAtReady } from './compute-access';
+import { billingMeteringActive, billingV2EntitlementReader, computeGrantPending, loadComputeBillingState, gateComputerStart, openComputeEpochAtReady } from './compute-access';
 import { buildSummaryV2 } from './summary';
 import { buildSummaryV3 } from '../v3/summary';
 import * as rating from './rating';
@@ -616,5 +616,53 @@ describe('round 4: grace (D17), dropped plans (D18) and the Free hold on AWS (D1
         input.subs = [subscription({ sku: 'premium_monthly_v3', cancelAtPeriodEnd: true, currentPeriodEnd: NOW })];
         expect(await gate(deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'files_on_aws' });
         expect(await gate(deps, { instanceType: 'm6i.large' })).toEqual({ allowed: true });
+    });
+});
+
+// Round 6 R2-3: Stripe reports a new paid period active before its invoice receipt (the compute grant) is processed.
+// The open in between was refused as fair use used up (or, unenforced, cold-booted as the Free hold).
+describe('round 6 R2-3: a paid period whose compute grant has not landed yet', () => {
+    const enforced = () => readBillingConfig({ BILLING_ENFORCEMENT: '1' });
+    const started = (secondsAgo: number) => subscription({ sku: 'standard_monthly_v3',
+        currentPeriodStart: new Date(NOW.getTime() - secondsAgo * 1000), currentPeriodEnd: new Date(NOW.getTime() + 30 * 86_400_000) });
+    const gate = (deps: BillingDeps, kind: 'aws-ec2' | 'cloudflare' = 'aws-ec2') =>
+        gateComputerStart({ deps, userId: USER, computerId: 'computer_a', kind, instanceType: kind === 'aws-ec2' ? 'm6i.large' : null, now: NOW });
+
+    it.each([[0, true], [120, true], [599, true], [600, false], [8 * 86_400, false]])('%i s after the period start, pending = %s', async (ago, pending) => {
+        const { deps } = fixture({ config: enforced(), subs: [started(ago)] });
+        expect((await loadComputeBillingState(deps, USER, NOW)).grantPending).toBe(pending);
+        expect(await computeGrantPending(USER, () => deps)).toBe(pending);
+    });
+
+    it('an AWS open passes the gate to ensure() (which waits) instead of a fair_use_paused refusal; the grant then admits it', async () => {
+        const { deps, input } = fixture({ config: enforced(), subs: [started(120)] });
+        expect(await gate(deps)).toEqual({ allowed: true });
+        // The Cloudflare path has no wait of its own: unchanged.
+        expect(await gate(deps, 'cloudflare')).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        // The entitlement stays unpaid until the grant lands (ensure() reads it as Free, so it must wait).
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ status: 'expired' });
+        input.grants = [grant({ amount: BigInt(144000), periodStart: new Date(NOW.getTime() - 120_000), periodEnd: new Date(NOW.getTime() + 30 * 86_400_000) })];
+        expect((await loadComputeBillingState(deps, USER, NOW)).grantPending).toBe(false);
+        expect(await gate(deps)).toEqual({ allowed: true });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ status: 'active', provider: 'aws', size: 'std-2' });
+    });
+
+    it.each<[string, Partial<Input>]>([
+        ['a revoked grant for the period', { grants: [grant({ kind: 'revoke', amount: BigInt(-144000), periodStart: new Date(NOW.getTime() - 120_000), periodEnd: new Date(NOW.getTime() + 86_400_000) })] }],
+        ['a canceled plan (Free)', { subs: [{ ...started(120), status: 'canceled' }] }],
+        ['a payment issue (grace has its own allowance)', { paymentIssues: [issue()] }],
+        ['Free', { subs: [] }],
+    ])('is not pending with %s', async (_name, over) => {
+        const { deps } = fixture({ config: enforced(), subs: [started(120)], ...over });
+        expect((await loadComputeBillingState(deps, USER, NOW)).grantPending).toBe(false);
+    });
+
+    it('metering off or an unreadable state is never pending', async () => {
+        const off = fixture({ config: readBillingConfig({}), subs: [started(120)] });
+        expect(await computeGrantPending(USER, () => off.deps)).toBe(false);
+        expect(off.calls).toEqual([]);
+        const broken = fixture({ config: enforced(), subs: [started(120)] });
+        broken.deps.store.subscriptionsFor = async () => { throw new Error('db down'); };
+        await expect(computeGrantPending(USER, () => broken.deps)).rejects.toThrow('db down');
     });
 });
