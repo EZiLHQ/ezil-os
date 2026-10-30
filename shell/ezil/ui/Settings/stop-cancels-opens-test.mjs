@@ -27,6 +27,17 @@
 //   - after the stop request, no ask reaches any of the three ensure routes;
 //   - the same holds for a Code window whose computer stamp is missing (the
 //     unknown-ownership fail-safe closes it, and its loop is cancelled too).
+//
+// Review follow-up (2026-10-29), each check killed a mutation the first version let live:
+//   - hover-warm: after Stop, moving the pointer over the Browser dock icon must
+//     not send `POST /api/shell/desktop` (it ran ensure() and restarted the
+//     computer); an explicit open afterwards still does;
+//   - a closed Code / Preview window stops its own loop, with no Stop at all;
+//   - a request ALREADY ON THE WIRE at Stop: its signal is aborted before the stop
+//     leaves, and when the transport ignores the abort the stop waits for it to
+//     answer (closeSandboxWindows awaits the cancelled loops);
+//   - Open desktop on the current computer keeps a Code window that streams it
+//     AND its loop (the `keep` branch).
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -63,17 +74,43 @@ const ensureRoute = (c) => c.method === 'POST' && ENSURE_ROUTES.includes(new URL
 const calls = [];
 let listRows = [];
 let progressState = 'RUNNING';
+/** One clock for asks AND answers, so "the stop left after that answer" is a plain comparison. */
+let seq = 0;
+/**
+ * How `/api/shell/code-preview-url` answers: 'fast' (at once), or 'held' — the ask stays on
+ * the wire until `releaseHeld` is called, then answers; `honourAbort` rejects it on abort instead.
+ */
+let codeMode = { kind: 'fast', honourAbort: false };
+let heldAsks = [];
+let releaseHeld = () => {};
+let heldGate = new Promise(r => { releaseHeld = r; });
+const rearmHeld = () => { heldAsks = []; heldGate = new Promise(r => { releaseHeld = r; }); };
 window.fetch = async (url, opts = {}) => {
     const u = String(url);
-    const rec = { url: u, method: opts.method ?? 'GET', at: calls.length, domAtCall: {
+    const rec = { url: u, method: opts.method ?? 'GET', at: seq++, domAtCall: {
         desktop: window.document.querySelectorAll('.window[data-app="desktop"]').length,
         preview: window.document.querySelectorAll('.window[data-app="preview"]').length,
         code: window.document.querySelectorAll('.window[data-app="code"]').length,
     } };
     calls.push(rec);
     const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) });
-    // AWS "still starting": a fast not-ready VALUE the wake loop re-asks every 1.5 s.
-    if ( ensureRoute(rec) ) return json({ ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2', retryable: true });
+    // AWS "still starting": a not-ready VALUE the wake loop re-asks every 1.5 s.
+    if ( ensureRoute(rec) ) {
+        const starting = () => { rec.resolvedAt = seq++; return json({ ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2', retryable: true }); };
+        if ( codeMode.kind !== 'held' || ! u.endsWith('/api/shell/code-preview-url') ) return starting();
+        rec.signal = opts.signal ?? null;
+        heldAsks.push(rec);
+        if ( codeMode.honourAbort ) {
+            await new Promise((resolve, reject) => {
+                heldGate.then(resolve);
+                const abort = () => { rec.abortedAt = seq++; reject(new window.DOMException('The operation was aborted.', 'AbortError')); };
+                if ( opts.signal?.aborted ) abort(); else opts.signal?.addEventListener('abort', abort, { once: true });
+            });
+        } else {
+            await heldGate; // a transport that ignores the abort: it answers when it answers
+        }
+        return starting();
+    }
     if ( u.includes('/api/trpc/computer.list') ) return json({ result: { data: { json: listRows } } });
     if ( u.includes('/api/trpc/computer.progress') ) {
         const id = JSON.parse(decodeURIComponent(u.split('input=')[1] ?? '%7B%7D')).json?.computerId;
@@ -82,6 +119,7 @@ window.fetch = async (url, opts = {}) => {
     }
     if ( u.endsWith('/api/shell/stop') ) {
         rec.body = JSON.parse(opts.body ?? '{}');
+        rec.heldAtStop = heldAsks.map(h => ({ answered: h.resolvedAt !== undefined, signalAborted: h.signal?.aborted === true }));
         progressState = 'STOPPED';
         return json({ ok: true, terminated: true });
     }
@@ -91,7 +129,7 @@ window.fetch = async (url, opts = {}) => {
 const X = { id: 'c-x', name: 'Xenon', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null };
 const PAYLOAD = {
     user: { id: '11111111-2222-3333-4444-555555555555', email: 'ada@example.com', name: 'Ada', provider: 'google', createdAt: '2026-10-01T18:30:00.000Z' },
-    apps: [{ id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop' }],
+    apps: [{ id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop', pinned: true }],
     computer: { ...X, isNew: false },
     // A configured provider, so each window really starts its open (with `{}` they stop at not_configured).
     desktopState: { configured: true },
@@ -120,7 +158,7 @@ const ctx = { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOA
 const asksTo = (route, from = 0) => calls.filter(c => c.at >= from && ensureRoute(c) && new URL(c.url, 'https://ezil.local').pathname === route);
 
 /** Settings → Computer → Stop → the sheet's Stop. Returns the stop call (or undefined). */
-async function stopFromSettings () {
+async function stopFromSettings ({ onConfirm } = {}) {
     if ( q('.window[data-app="settings"]') ) { $('.window[data-app="settings"]').close(); await settle(6); }
     await ezil.registry.launch('settings', ctx);
     await settle(8);
@@ -130,14 +168,51 @@ async function stopFromSettings () {
     click(q('.window[data-app="settings"] [data-action="stop"]'));
     await settle(6);
     click(q('[role="dialog"][data-sheet="confirm-stop"] [data-action="confirm"]'));
-    for ( let i = 0; i < 160 && ! calls.slice(before).some(c => c.url.endsWith('/api/shell/stop')); i++ ) await tick(25);
+    onConfirm?.();
+    for ( let i = 0; i < 240 && ! calls.slice(before).some(c => c.url.endsWith('/api/shell/stop')); i++ ) await tick(25);
     return calls.slice(before).find(c => c.url.endsWith('/api/shell/stop'));
 }
+
+listRows = [X];
+// ═══════════════════════════════════════════════════════════════════════════
+// 0. Hover-warm (runs first: a hover only warms a computer no Stop holds yet).
+//    After Stop, pointing at the Browser dock icon must not start
+//    the computer again (it POSTed /api/shell/desktop → ensure()). An explicit
+//    open afterwards still does.
+// ═══════════════════════════════════════════════════════════════════════════
+progressState = 'RUNNING';
+const dock = () => q('.taskbar-item[data-app="desktop"]');
+const hover = () => dock()?.dispatchEvent(new window.PointerEvent('pointerenter', { bubbles: false }));
+for ( let i = 0; i < 80 && ! dock(); i++ ) await tick(25);
+push('setup: the Browser dock icon exists', !! dock());
+const preHover = seq;
+hover();
+await tick(300);
+push('positive control: a hover before Stop warms the computer (POST /api/shell/desktop)',
+    asksTo('/api/shell/desktop', preHover).length >= 1, `${asksTo('/api/shell/desktop', preHover).length} asks`);
+const stop3 = await stopFromSettings();
+push('the hover-section stop went out', stop3?.body?.computerId === 'c-x', JSON.stringify(stop3?.body));
+hover();
+await tick(300);
+hover();
+await tick(3_600);
+const hoverAfter = stop3 ? asksTo('/api/shell/desktop', stop3.at + 1) : [];
+push('🔴 after Stop, a hover over the Browser dock icon asks nothing (no warm → no restart)',
+    stop3 && hoverAfter.length === 0, `${hoverAfter.length} desktop asks after the stop`);
+const preOpen = seq;
+await ezil.registry.launch('desktop', ctx);
+await tick(600);
+push('an explicit Browser open after Stop still starts the computer',
+    asksTo('/api/shell/desktop', preOpen).length >= 1, `${asksTo('/api/shell/desktop', preOpen).length} asks`);
+progressState = 'RUNNING';
+const stop3b = await stopFromSettings();
+push('cleanup stop went out', stop3b?.body?.computerId === 'c-x');
+await tick(1_600);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Browser + Preview + Code, all stamped for c-x, all still waking.
 // ═══════════════════════════════════════════════════════════════════════════
-listRows = [X];
+progressState = 'RUNNING';
 await ezil.registry.launch('desktop', ctx);
 await settle(4);
 await ezil.registry.launch('preview', ctx);
@@ -182,6 +257,82 @@ push('🔴 the un-attributable Code window was closed before the stop request (f
 await tick(4_000);
 const after2 = stop2 ? asksTo('/api/shell/code-preview-url', stop2.at + 1) : [];
 push('🔴 after Stop, the un-attributable Code window\'s loop asks nothing more', stop2 && after2.length === 0, `${after2.length} asks after the stop`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. Closing a Code or Preview window by hand (no Stop) ends its own loop.
+// ═══════════════════════════════════════════════════════════════════════════
+progressState = 'RUNNING';
+for ( const [app, route] of [['code', '/api/shell/code-preview-url'], ['preview', '/api/shell/preview-url']] ) {
+    const from = seq;
+    await ezil.registry.launch(app, ctx);
+    await tick(3_200);
+    push(`setup: the ${app} window is open and asking`, q(`.window[data-app="${app}"]`) && asksTo(route, from).length >= 2,
+        `${asksTo(route, from).length} asks`);
+    $(q(`.window[data-app="${app}"]`)).close();
+    await tick(200);
+    const closedAt = seq;
+    await tick(3_600);
+    const after = asksTo(route, closedAt);
+    push(`🔴 a ${app} window closed by hand asks ${route} nothing more`, qa(`.window[data-app="${app}"]`).length === 0 && after.length === 0,
+        `${after.length} asks after the close`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. A Code ask ALREADY ON THE WIRE when Stop is confirmed.
+// ═══════════════════════════════════════════════════════════════════════════
+for ( const honourAbort of [false, true] ) {
+    const label = honourAbort ? 'a transport that honours the abort' : 'a transport that IGNORES the abort';
+    progressState = 'RUNNING';
+    rearmHeld();
+    codeMode = { kind: 'held', honourAbort };
+    await ezil.registry.launch('code', ctx);
+    for ( let i = 0; i < 80 && heldAsks.length === 0; i++ ) await tick(25);
+    push(`setup (${label}): a code-preview-url ask is on the wire`, heldAsks.length === 1 && heldAsks[0].resolvedAt === undefined);
+    // The transport answers 800 ms after the user confirms Stop.
+    const stop5 = await stopFromSettings({ onConfirm: () => { window.setTimeout(() => releaseHeld(), 800); } });
+    push(`(${label}) the stop went out`, stop5?.body?.computerId === 'c-x');
+    push(`🔴 (${label}) the ask on the wire had its signal aborted before the stop request left`,
+        stop5?.heldAtStop?.length === 1 && stop5.heldAtStop[0].signalAborted === true, JSON.stringify(stop5?.heldAtStop));
+    if ( ! honourAbort ) {
+        push('🔴 (abort ignored) the stop request waited until that ask had answered (closeSandboxWindows awaits the loop)',
+            stop5 && heldAsks[0]?.resolvedAt !== undefined && heldAsks[0].resolvedAt < stop5.at,
+            `answered at ${heldAsks[0]?.resolvedAt}, stop at ${stop5?.at}`);
+    } else {
+        push('(abort honoured) the ask was aborted, not answered, before the stop request',
+            stop5 && heldAsks[0]?.abortedAt !== undefined && heldAsks[0].abortedAt < stop5.at && heldAsks[0].resolvedAt === undefined,
+            `aborted at ${heldAsks[0]?.abortedAt}, stop at ${stop5?.at}`);
+    }
+    await tick(3_600);
+    const after = stop5 ? asksTo('/api/shell/code-preview-url', stop5.at + 1) : [];
+    push(`🔴 (${label}) after Stop, nothing asks /api/shell/code-preview-url`, stop5 && after.length === 0, `${after.length} asks after the stop`);
+    codeMode = { kind: 'fast', honourAbort: false };
+    releaseHeld();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. Open desktop on the CURRENT computer keeps a Code window streaming it,
+//    and keeps its loop asking (closeSandboxWindows(undefined, keepId)).
+// ═══════════════════════════════════════════════════════════════════════════
+progressState = 'RUNNING';
+await ezil.registry.launch('code', ctx);
+await tick(400);
+const codeWin6 = q('.window[data-app="code"][data-ezil-computer-id="c-x"]');
+push('setup: a Code window streams c-x', !! codeWin6);
+if ( q('.window[data-app="settings"]') ) { $('.window[data-app="settings"]').close(); await settle(6); }
+await ezil.registry.launch('settings', ctx);
+await settle(8);
+click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+await settle(10);
+const openBtn = q('.window[data-app="settings"] [data-role="computer-actions"] [data-action="open"]')
+    ?? q('.window[data-app="settings"] [data-action="open"]');
+push('setup: Settings offers Open desktop', !! openBtn);
+click(openBtn);
+await tick(800);
+const keptFrom = seq;
+await tick(3_200);
+push('🔴 Open desktop on the current computer keeps its Code window', q('.window[data-app="code"]') === codeWin6 && codeWin6?.isConnected === true);
+push('🔴 … and that window keeps asking (its loop was not cancelled)', asksTo('/api/shell/code-preview-url', keptFrom).length >= 1,
+    `${asksTo('/api/shell/code-preview-url', keptFrom).length} asks`);
 
 push('no uncaught page errors', uncaught.length === 0, uncaught.slice(0, 2).join(' | '));
 

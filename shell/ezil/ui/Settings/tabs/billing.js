@@ -272,7 +272,8 @@ export function timeV3Html ({ computer, fairUse }, usage = null) {
     const tone = fairUse.status === 'paused' ? 'danger' : fairUse.status === 'near' ? 'warn' : 'ok';
     // Hotfix r5 (ACCEPT #3): advise a smaller configuration only when the plan allows one that counts less time.
     const currentSize = period?.currentSize ?? computer.size;
-    const currentWeight = computer.machineChoice.find(machine => machine.size === currentSize)?.weight;
+    // A size the plan no longer offers (a downgrade, until the next start) still has its own weight.
+    const currentWeight = (computer.machineChoice.find(machine => machine.size === currentSize) ?? SIZE_INFO[currentSize])?.weight;
     const smaller = Number.isFinite(currentWeight) && computer.machineChoice.some(machine => machine.weight < currentWeight);
     const fair = { ok: 'Within fair use', near: smaller ? '! Running low. A smaller configuration makes your time last longer.' : '! Running low.', paused:`■ Used up. You can start your computer again on ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status] ?? '';
     const weighted = computer.machineChoice.filter(machine => machine.weight > 1);

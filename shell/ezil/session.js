@@ -623,6 +623,35 @@ export async function cancelComputerOpens (computerId, { keep } = {}) {
     return hit.length;
 }
 
+/**
+ * Computers the owner stopped from Settings in this page.
+ *
+ * 🔴 HOTFIX r5 (review of ACCEPT-11865d06 B6): every hover-warm (`warm.js`) is a
+ * `POST /api/shell/desktop`, which runs the server's `ensure()` — and on a
+ * STOPPED computer that STARTS it. After Settings → Stop, merely moving the
+ * pointer over the Browser dock icon (or its Start-menu entry) restarted the
+ * computer the owner had just stopped. So a stopped computer is never warmed
+ * until the owner opens it on purpose (the desktop window's `claim()`, which
+ * calls `releaseStopHold`). No timer: a hover a minute later would be the same
+ * restart, only later. A reload forgets it; the page then starts cold anyway.
+ */
+const stoppedHolds = new Set();
+
+/** Settings → Stop, confirmed: no hover-warm may start `computerId` again until an explicit open. */
+export function holdAfterStop (computerId) {
+    if ( computerId ) stoppedHolds.add(computerId);
+}
+
+/** An explicit open of `computerId` (Browser window, Settings → Open desktop): hover may warm it again. */
+export function releaseStopHold (computerId) {
+    stoppedHolds.delete(computerId);
+}
+
+/** True while `computerId` is held by `holdAfterStop`. */
+export function stoppedByUser (computerId) {
+    return stoppedHolds.has(computerId);
+}
+
 // Local preview routes currently only mint URLs for a running container. Code
 // and Preview must pay the same cold start as Browser, even when opened first.
 const localStarts = new Map();
@@ -1441,7 +1470,7 @@ export default {
     get, set, del,
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
-    openDesktop, cancelOpenDesktop, cancellableWake, cancelComputerOpens, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
+    openDesktop, cancelOpenDesktop, cancellableWake, cancelComputerOpens, holdAfterStop, releaseStopHold, stoppedByUser, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
     previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,

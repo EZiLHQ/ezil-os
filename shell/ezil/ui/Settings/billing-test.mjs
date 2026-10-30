@@ -924,7 +924,9 @@ try {
     pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
     // Hotfix r5 (ACCEPT #3): the smaller-configuration advice only when the plan allows a size with a
     // smaller time weight than the current one. Standard (2 vCPU only) and Premium on 2 vCPU have none.
-    for ( const [tier, size, advice] of [['standard', 'std-2', false], ['premium', 'std-2', false], ['premium', 'cmp-4', true], ['premium', 'cmp-8', true]] ) {
+    // Review: a computer still on a size its plan no longer offers (Standard on 4 vCPU after a downgrade)
+    // takes that size's own weight, so the plan's 2 vCPU still counts as smaller.
+    for ( const [tier, size, advice] of [['standard', 'std-2', false], ['premium', 'std-2', false], ['premium', 'cmp-4', true], ['premium', 'cmp-8', true], ['standard', 'cmp-4', true]] ) {
         summary = summaryV3(tier); summary.computer.size = size; summary.fairUse.status = 'near'; await refresh();
         contains('[data-role="fair-use"]', '! Running low.');
         assert.equal(/A smaller configuration makes your time last longer\./.test(q('[data-role="fair-use"]').textContent), advice, `${tier} on ${size}`);

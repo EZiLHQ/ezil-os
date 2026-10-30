@@ -4,6 +4,12 @@
  * starts (replaces) a STOPPED AWS computer. It answers a refusal VALUE instead (`computer_stopped`, never the
  * waking `sandbox_starting` the wake loop keeps re-asking). The desktop open (`previewUrl`: Settings → Open
  * desktop) is not held: an explicit open still starts the computer. Driven through the real router procedures.
+ *
+ * Review follow-up: the key is the computer's last RUN ending (its `ezil_compute_usage` row closing), not the
+ * placement's `updated_at`. A pool-mode open of a long-stopped computer passes through STOPPED itself (ensure
+ * writes STOPPING `pool_open_release`; the release receipt lands STOPPED `pool_released`, fresh `updated_at`;
+ * the next ensure replaces). Keyed on `updated_at`, a receipt applied by any other reader (status, the fleet
+ * pass) made that start answer `computer_stopped` for 60 s.
  */
 import { initTRPC } from '@trpc/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +20,7 @@ const NOW = new Date('2026-10-29T19:25:53.000Z');
 const ensure = vi.hoisted(() => vi.fn());
 const sync = vi.hoisted(() => vi.fn());
 const read = vi.hoisted(() => vi.fn());
+const lastStop = vi.hoisted(() => vi.fn());
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({ now: () => new Date(), config: {} }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ gateComputerStart: async () => ({ allowed: true }) }));
 vi.mock('@/server/billing/v2/compute-meter-observation', () => ({ recordComputeMeter: async () => 'ok' }));
@@ -31,7 +38,7 @@ vi.mock('@/server/lib/compute/aws-preview', () => ({
     requestAwsPreview: vi.fn(), prepareAwsPoolSession: vi.fn(async () => {}), waitForAwsPreviewPlacement: async () => false,
 }));
 vi.mock('@/server/lib/compute/placement', async original => ({
-    ...await original<Record<string, unknown>>(), readPlacement: read,
+    ...await original<Record<string, unknown>>(), readPlacement: read, readLastUsageStop: lastStop,
 }));
 vi.mock('@/server/api/routers/compute-dispatch', async original => ({
     ...await original<Record<string, unknown>>(),
@@ -50,7 +57,10 @@ const starting = { ok: false, error: 'computer_starting', errorCode: 'computer_s
 beforeEach(() => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(NOW);
-    for (const f of [ensure, sync, read]) f.mockReset();
+    for (const f of [ensure, sync, read, lastStop]) f.mockReset();
+    // By default the computer's last run ended when its placement settled.
+    read.mockImplementation(async () => placement('STOPPED', 230));
+    lastStop.mockImplementation(async () => (await read.getMockImplementation()!()).record.updatedAt);
     ensure.mockResolvedValue(starting);
     sync.mockResolvedValue({ ok: true });
 });
@@ -62,6 +72,8 @@ describe('a hosted-app poll right after a stop does not restart the computer', (
         read.mockResolvedValue(placement('STOPPED', 230));
         const answer = await caller()[name]({ computerId });
         expect(answer).toMatchObject({ ok: false, errorCode: 'computer_stopped', computeProvider: 'aws-ec2' });
+        // Terminal for the client's automatic re-ask (boot-phases AWS refusals): the same answer would come back.
+        expect(answer).toMatchObject({ retryable: false });
         // Not the waking code: the client's wake loop would re-ask that every 1.5 s for 215 s.
         expect(answer).not.toMatchObject({ errorCode: 'sandbox_starting' });
         expect(ensure).not.toHaveBeenCalled();
@@ -74,6 +86,25 @@ describe('a hosted-app poll right after a stop does not restart the computer', (
         expect(ensure).toHaveBeenCalledOnce();
     });
 
+    it.each(['codePreviewUrl', 'appPreviewUrl'] as const)('🔴 %s: a pool-mode open mid-start (STOPPED pool_released 0.2 s ago, last run ended 10 min ago) is NOT held', async name => {
+        read.mockResolvedValue(placement('STOPPED', 200));
+        lastStop.mockResolvedValue(new Date(NOW.getTime() - 600_000));
+        expect(await caller()[name]({ computerId })).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+        expect(ensure).toHaveBeenCalledOnce();
+    });
+
+    it('a computer that never ran (no usage row) or an unreadable usage read is not held (fail open)', async () => {
+        read.mockResolvedValue(placement('STOPPED', 200));
+        lastStop.mockResolvedValueOnce(null);
+        await caller().codePreviewUrl({ computerId });
+        lastStop.mockRejectedValueOnce(new Error('usage table missing'));
+        await caller().codePreviewUrl({ computerId });
+        expect(ensure).toHaveBeenCalledTimes(2);
+    });
+
+    // STOPPING and DRAINING are deliberately NOT held: ensure() itself writes STOPPING (`pool_open_release`) as
+    // the first step of a pool-mode START (aws-ec2.ts), and switch/restart pass through DRAINING. Holding
+    // them would refuse an open that is already starting the computer.
     it.each([['RUNNING', 1_000], ['STOPPING', 1_000], ['DRAINING', 1_000]] as const)('codePreviewUrl: %s (not settled stopped) is not held', async (state, ago) => {
         read.mockResolvedValue(placement(state, ago));
         await caller().codePreviewUrl({ computerId });

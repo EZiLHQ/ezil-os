@@ -767,6 +767,9 @@ async function refreshProgress ($win) {
     if ( res?.ok && res.data ) {
         progress = { ...res.data, computerId: res.data.computerId ?? computer.id };
         const t = transitionOf(progress);
+        // Hotfix r5 review: a stop (here or in another tab) ends the run "Now running on …" was about —
+        // dismissed, not just hidden, so the next Start does not bring the same done transition back.
+        if ( t?.phase === 'done' && (progress.lifecycleState === 'STOPPED' || progress.operation === 'stopping') ) dismissed.add(t.transitionId);
         if ( t && ! IN_FLIGHT.has(t.phase) && (t.phase === 'done' || t.phase === 'failed') ) {
             clearSwitchRequestId(computer.id, t.target);
             if ( before && IN_FLIGHT.has(before.phase) && before.transitionId === t.transitionId ) await readSummary();
@@ -906,6 +909,12 @@ async function handleStop ($win) {
         render($win);
     });
     if ( ! confirmed ) return;
+    // Hotfix r5 review: from the confirm on, no hover over the Browser dock icon may warm (= start)
+    // it again — set BEFORE the windows close, so a warm begun meanwhile cannot slip past the cancel.
+    session.holdAfterStop?.(computer.id);
+    // "Now running on …" belongs to the run that is ending: dismissed, so the next Start does not repeat it.
+    const doneT = transitionOf(progress);
+    if ( doneT?.phase === 'done' ) dismissed.add(doneT.transitionId);
     try {
         // Same guarantee as Delete: every window on this computer closes first.
         await closeSandboxWindows(computer.id);
