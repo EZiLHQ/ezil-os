@@ -350,16 +350,22 @@ async function ordered() {
     done(w);
 }
 // The boot's own route launch (its link, the billing link), slow to open,
-// with a click on another app made while it opens (`click`), or none.
+// with a click on another app made while it opens (`click`), or none. The
+// 80/120ms focuses wait, as in `ordered`, and run in the order queued once
+// the boot's launch has resolved: which window ends in front no longer
+// depends on how fast this machine builds one.
 async function bootOvertaken(entry, id, click) {
     let release, started;
     const opening = new Promise(resolve => { started = resolve; });
     const held = new Promise(resolve => { release = resolve; });
+    const delayed = [];
     const booted = await boot(entry, { ready: async w => {
         // Before the boot's first await reaches the launch.
         const app = w.ezil.registry.getApp(id);
         const open = app.open;
         app.open = async launchCtx => { app.open = open; started(); await held; return open(launchCtx); };
+        const setTimeout = w.setTimeout;
+        w.setTimeout = (fn, ms, ...args) => (ms === 80 || ms === 120 ? delayed.push({ ms, run: () => fn(...args) }) : setTimeout.call(w, fn, ms, ...args));
         await opening;
     } });
     const { w, url, win, ctx } = booted;
@@ -370,7 +376,9 @@ async function bootOvertaken(entry, id, click) {
     release();
     await appeared(w, `.window[data-app="${id}"]`); await wait(300);
     ok(win(id), `${entry}: ${id} opened`);
-    return booted;
+    for (const ms of [80, 120]) for (const timer of delayed.filter(t => t.ms === ms)) timer.run();
+    const front = [...w.document.querySelectorAll('.window.window-active')].map(el => el.dataset.app).join();
+    return { ...booted, front };
 }
 for (const [entry, id, click, canonical] of [
     [`/os?app=code&computer=${COMPUTER}`, 'code', 'settings', `/app/code?computer=${COMPUTER}`],
@@ -378,11 +386,11 @@ for (const [entry, id, click, canonical] of [
 ]) {
     // Review N5 (the boot link) and N11 (the billing link's `adopt`).
     const overtaken = await bootOvertaken(entry, id, click);
-    same([overtaken.url().replace(/\?.*/, ''), overtaken.w.history.length, overtaken.w.history.state.ezilApp], [`/app/${click}`, 2, click],
-        `${entry}: resolving after the click, the boot's launch does not relabel the click's entry`);
+    same([overtaken.url().replace(/\?.*/, ''), overtaken.w.history.length, overtaken.w.history.state.ezilApp, overtaken.front], [`/app/${click}`, 2, click, click],
+        `${entry}: resolving after the click, the boot's launch takes neither the click's entry nor the front`);
     done(overtaken.w);
     const alone = await bootOvertaken(entry, id, null);
-    same([alone.url(), alone.w.history.length, alone.w.history.state.ezilApp], [canonical, 1, id], `positive control: ${entry} with no click names ${id}`);
+    same([alone.url(), alone.w.history.length, alone.w.history.state.ezilApp, alone.front], [canonical, 1, id, id], `positive control: ${entry} with no click names ${id}`);
     done(alone.w);
 }
 

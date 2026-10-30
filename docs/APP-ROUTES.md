@@ -214,7 +214,11 @@ Known limits, not changed here:
   while it is built (UIWindow). If that happens more than about 120ms after
   the newer launch opened, after the newer `ensureOnTop` has run, it stays
   in front while the address bar keeps the newer intent, until the next
-  focus that counts.
+  focus that counts. A route launch's new window (Back/Forward, the boot's
+  links) is the exception: no hold covers it and it is not settling until
+  its `commit`, so its focus while built also writes its URL (the address
+  bar follows the front). If the newer launch's `ensureOnTop` has not run
+  yet, it puts both back (app-link-test, the boot's links held open).
 - If the newer launch fails only after the older launch's `ensureOnTop` has
   already stood down, nothing re-asserts the older launch's window against
   a late focus of some other window.
