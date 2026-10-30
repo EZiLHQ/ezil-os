@@ -628,8 +628,6 @@ const MOVE_STEP_OF = { requested: 0, fenced: 0, saving: 0, exporting: 1, copying
 /** §6.3 {NOT_MOVED}, verbatim wherever the copy says what a move leaves behind. */
 export const MOVE_NOT_MOVED = 'settings and programs you added on your AWS computer, saved browser sign-ins, installed packages, and build folders you can recreate (node_modules, .next, .turbo and dist, unless Git tracks them)';
 const MOVE_RETRY = new Set(['now', 'after_aws_session', 'no']);
-/** §5.9 refusals that mean "not now" (§6.3: try later). */
-const MOVE_TRY_LATER = new Set(['move_paused', 'move_busy', 'move_computer_unsettled']);
 /** §5.9 refusals with no card of their own: the summary, re-read, shows what is true. */
 const MOVE_RE_READ = new Set(['move_in_progress', 'move_unavailable', 'move_not_held', 'move_unsupported']);
 

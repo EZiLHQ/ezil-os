@@ -14,7 +14,6 @@ import { MOVE_COMPUTER, waitingAnswer, blockedAnswer, movingProgress, blockedPro
 
 const pending = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' };
 const preparing = { ...pending, computePreparing: true };
-const launching = { ...pending, computeLaunching: true };
 /** A Cloudflare wake answer: what the open of the Free computer says after the commit. */
 const cfStarting = { ok: false, errorCode: 'sandbox_starting' };
 /** apps/code.js `mintCodePreviewUrlOnce`'s mapping: ok passes, anything else is `pendingOrRefused`. */

@@ -19,7 +19,6 @@ async function until (fn, what = 'the move UI') {
 }
 const COMPUTER = 'computer-1';
 const START = Date.parse(MOVE_STARTED);
-const TITLES = { code: 'Opening Code…', desktop: 'Opening Browser…', preview: 'Opening Preview…' };
 const OPEN_PATHS = { desktop: '/api/shell/desktop', code: '/api/shell/code-preview-url', preview: '/api/shell/preview-url' };
 const label = spinner => spinner.querySelector('.ezil-app-spinner-label').textContent;
 const line = spinner => spinner.querySelector('.ezil-app-spinner-sub').textContent;
