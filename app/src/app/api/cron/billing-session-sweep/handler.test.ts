@@ -5,7 +5,7 @@ import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { handleBillingSessionSweep } from './handler';
+import { handleBillingSessionSweep, RUNNING_GRACE_MS } from './handler';
 import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
@@ -17,7 +17,7 @@ const T = new Date('2026-10-18T00:00:00Z');
 const at = (seconds: number) => new Date(T.getTime() + seconds * 1000);
 const iso = (seconds: number) => isoSeconds(epochSeconds(at(seconds)));
 const window = { start: '2026-10-01T00:00:00Z', end: '2026-11-01T00:00:00Z' };
-const zeros = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
+const zeros = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0, heldOverrun: 0,
     ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
 const ref = { userId: 'owner', computerId: 'computer' };
 type SweepInput = Parameters<typeof handleBillingSessionSweep>[0];
@@ -469,6 +469,106 @@ describe('paid sessions have no time cap', () => {
         expect(advanceStaleMigrations).toHaveBeenCalledExactlyOnceWith(1234);
         expect(reconcilePaidCloudflareUsers).toHaveBeenCalledExactlyOnceWith(1234);
         expect(vi.mocked(advanceStaleMigrations).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reconcilePaidCloudflareUsers).mock.invocationCallOrder[0]!);
+    });
+});
+
+describe('round 6 R1-01: a held host is bounded by its session alone', () => {
+    const canceled = [{ stripeSubscriptionId: 'sub', sku: 'standard_monthly_v3', status: 'canceled',
+        currentPeriodStart: new Date(window.start), currentPeriodEnd: new Date(window.end), cancelAtPeriodEnd: false }];
+    /** A Free (held) owner unless `paid`; `since` is the placement row's last write, in seconds from T. */
+    function held(epochs: StoredComputeEpoch[], { paid = false, enforcement = true, since = -600 } = {}) {
+        const f = fixture(epochs, { sku: paid ? 'standard_monthly_v3' : null, allowance: 144000, enforcement });
+        if (!paid) f.store.subscriptionsFor.mockResolvedValue(canceled);
+        const runningAwsPlacements = vi.fn<NonNullable<SweepInput['runningAwsPlacements']>>().mockResolvedValue([{ ...ref, since: at(since) }]);
+        const run = (seconds: number) => handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop,
+            isStillRunning: f.isStillRunning, runningAwsPlacements });
+        return { ...f, runningAwsPlacements, run };
+    }
+    const overrunLines = () => vi.mocked(console.info).mock.calls.map(call => String(call[0])).filter(line => line.startsWith('{"event":"held-overrun"'))
+        .map(line => JSON.parse(line));
+
+    it('the grace is two minutes (route.test pins the same value for the retry check)', () => {
+        expect(RUNNING_GRACE_MS).toBe(120_000);
+    });
+
+    it('stops a held RUNNING host whose session never opened, once the grace has passed', async () => {
+        const f = held([]);
+        expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
+        expect(f.runningAwsPlacements).toHaveBeenCalledExactlyOnceWith(200);
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(overrunLines()).toEqual([{ event: 'held-overrun', computer: 'computer', session: 'none', enforced: true, overSeconds: 600 }]);
+    });
+
+    it.each([0, 60, 119])('leaves a held host alone %i s after its row changed (an epoch may be opening now)', async age => {
+        const f = held([], { since: -age });
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.store.openEpochFor).not.toHaveBeenCalled();
+        expect(f.stop).not.toHaveBeenCalled();
+    });
+
+    it('leaves an open held session to the policy pass (stopped at its deadline there, not here)', async () => {
+        const f = held([epoch({ deadlineAt: iso(3600) })]);
+        expect(await f.run(100)).toEqual({ ...zeros, examined: 1 });
+        expect(f.stop).not.toHaveBeenCalled();
+    });
+
+    it('keeps stopping a held host past the 2 h retry window while it still runs', async () => {
+        const f = held([epoch({ readyAt: iso(-4 * 3600), endedAt: iso(-3 * 3600), endReason: 'session_max', deadlineAt: iso(-3 * 3600) })],
+            { since: -4 * 3600 });
+        f.isStillRunning.mockResolvedValue(true);
+        expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
+        expect(f.store.policyClosedEpochsSince).toHaveBeenCalledExactlyOnceWith(at(-7200), 50);
+        expect(f.isStillRunning).not.toHaveBeenCalled(); // outside the retry window: only the held bound acts
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(overrunLines()).toEqual([expect.objectContaining({ session: 'closed', overSeconds: 3 * 3600 })]);
+    });
+
+    it('a paid host keeps the 2 h window: no stop past it, and no lapsed-lease stop', async () => {
+        const f = held([epoch({ readyAt: iso(-4 * 3600), endedAt: iso(-3 * 3600), endReason: 'allowance_exhausted' })],
+            { paid: true, since: -4 * 3600 });
+        f.isStillRunning.mockResolvedValue(true);
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(overrunLines()).toEqual([]);
+    });
+
+    it('a paid host with no open session is not the held bound\'s to stop', async () => {
+        const f = held([], { paid: true });
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+    });
+
+    it('stops a computer once per pass: a retry inside the window already attempted it', async () => {
+        const f = held([epoch({ readyAt: iso(-3600), endedAt: iso(-60), endReason: 'session_max', deadlineAt: iso(-60) })], { since: -3600 });
+        f.isStillRunning.mockResolvedValue(true);
+        expect(await f.run(0)).toEqual({ ...zeros, retried: 1, stopped: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it('shadow-logs with BILLING_ENFORCEMENT off, never stopping', async () => {
+        const f = held([], { enforcement: false });
+        expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, shadow: 1 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(overrunLines()).toEqual([expect.objectContaining({ enforced: false, session: 'none' })]);
+    });
+
+    it('a failed stop is counted and retried on the next pass', async () => {
+        const f = held([]);
+        f.stop.mockRejectedValueOnce(new Error('stop unavailable'));
+        expect(await f.run(0)).toMatchObject({ heldOverrun: 1, stopFailed: 1 });
+        expect(await f.run(60)).toMatchObject({ heldOverrun: 1, stopped: 1 });
+        expect(f.stop).toHaveBeenCalledTimes(2);
+    });
+
+    it('an unreadable placement list or billing state skips the held pass, never the rest of the sweep', async () => {
+        const f = held([]);
+        f.runningAwsPlacements.mockRejectedValueOnce(new Error('placements unavailable'));
+        expect(await f.run(0)).toEqual(zeros);
+        f.store.subscriptionsFor.mockRejectedValueOnce(new Error('billing unavailable'));
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(console.warn).toHaveBeenCalledWith('[billing.sweep] held scan unavailable');
+        expect(console.warn).toHaveBeenCalledWith('[billing.sweep] held check failed', { computer: 'computer' });
     });
 });
 
