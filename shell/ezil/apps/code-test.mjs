@@ -779,6 +779,87 @@ await settle(4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5d. 🔴 ROUND 6a (seam C wiring + C2), through the BUILT bundle. The Code
+//     window hands its spinner `isPreparing: () => session.isComputePreparing(
+//     computer.id)` (code.js). Without that one line the spinner never learns
+//     the computer is taking its config and reads "Connecting to Code…" over
+//     the whole bounded wait. And the wait itself: preparing first seen at
+//     ~70 s, the container restarting, then the Worker's answer at ~222 s,
+//     past the old 215 s give-up (session.js PREPARE_DEADLINE_MS). The clock
+//     is skewed, not waited.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const originalFetch = window.fetch, realNow = window.Date.now;
+    let skew = 0, mintAsks = 0, mintAnswer = null;
+    window.Date.now = () => realNow.call(window.Date) + skew;
+    const RUNNING = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        durable: false, openingStartedAt: null, path: null, milestones: [], expectedSeconds: 30 };
+    const starting = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' };
+    const preparing = { ...starting, computePreparing: true };
+    window.fetch = async (url, opts) => {
+        const u = String(url);
+        if ( u.includes('/api/trpc/computer.progress') ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: RUNNING } } }) };
+        }
+        if ( u.startsWith(ENDPOINTS.codePreviewUrl) && mintAnswer ) {
+            mintAsks++;
+            const answer = mintAnswer;
+            return { ok: true, status: 200, json: async () => answer };
+        }
+        return originalFetch(url, opts);
+    };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    const PREPARING = 'Preparing Code — the first open after your computer starts takes a minute or two.';
+
+    // (a) The wiring: a preparing answer for THIS computer shows the preparing wait, not a connect.
+    mintAnswer = preparing; mintAsks = 0;
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    let w = q('.window[data-app="code"]');
+    let spinner = w?.querySelector('.ezil-app-spinner');
+    const status = () => spinner?.querySelector('.ezil-opening-status')?.textContent ?? '';
+    await waitFor(() => mintAsks >= 1 && status() === PREPARING, 8000);
+    push('🔴 seam C wiring: Code opened while its computer prepares shows the preparing wait, never "Connecting to Code…"',
+        mintAsks >= 1 && status() === PREPARING && ! /Connecting to Code|under a minute/.test(spinner?.textContent ?? ''),
+        `${mintAsks} ask(s): "${status()}"`);
+    await window.$(w).close();
+    await settle(4);
+
+    // (b) C2: plain starting answers until ~70 s, preparing, the container restarting (unflagged starting
+    //     answers), then the Worker's answer at ~222 s. The loop is still asking there, and Code opens.
+    mintAnswer = starting; mintAsks = 0; skew = 0;
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    w = q('.window[data-app="code"]');
+    spinner = w?.querySelector('.ezil-app-spinner');
+    const kind = () => spinner?.getAttribute('data-kind');
+    await waitFor(() => mintAsks >= 1, 8000);
+    skew = 70_000;
+    mintAnswer = preparing;
+    let asked = mintAsks;
+    await waitFor(() => mintAsks > asked && status() === PREPARING, 8000);
+    const preparingSeen = status() === PREPARING;
+    mintAnswer = starting;
+    skew = 222_000;
+    asked = mintAsks;
+    // Two asks past 215 s: the old deadline would have ended the loop at the first of them.
+    await waitFor(() => mintAsks >= asked + 2, 10_000);
+    push('🔴 C2: preparing first seen at ~70 s keeps Code waiting past 215 s (the Worker answers at ~222 s)',
+        preparingSeen && mintAsks >= asked + 2 && kind() === 'progress' && status() === PREPARING
+        && ! /isn't reachable|taking too long/.test(spinner?.textContent ?? ''),
+        `seen=${preparingSeen} asks=${mintAsks - asked} kind=${kind()} "${status()}"`);
+    const mintsBefore = mintedUrls.length;
+    mintAnswer = null; // the stub's own ok mint
+    await waitFor(() => mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1], 8000);
+    push('🔴 C2: the answer at ~222 s opens Code (its frame gets that URL), never "Code isn\'t reachable right now"',
+        mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]
+        && ! /isn't reachable/.test(spinner?.textContent ?? ''),
+        `${mintedUrls.length - mintsBefore} mint(s) kind=${kind()}`);
+    await window.$(w).close();
+    await settle(4);
+    window.fetch = originalFetch;
+    window.Date.now = realNow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 // Every request must be same-origin EXCEPT the code-preview frame itself,
