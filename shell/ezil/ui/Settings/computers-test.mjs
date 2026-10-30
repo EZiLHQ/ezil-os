@@ -463,12 +463,19 @@ check('Round 4: after grace the plan block may still describe the past_due paid 
     assert.ok(! /data-action="switch-config"/.test(computerHtml(held, stoppedAws(), [])));
     // Round 6 review: the server rates a lapsed plan's computer as Free (1-hour sessions, Free's month), so the hold
     // line and the session end show for a dunning hold exactly as for an immediate cancel.
-    const lapsedRunning = withStanding({ ...premium(), computer: { ...premium().computer, sessionMaxSeconds: 3600, activeDeadline: '2026-10-30T06:42:00Z' } },
+    // The server's shape for that state: the Premium plan block with Free's session cap, machine choice and opening.
+    const lapsedRunning = withStanding({ ...premium(), computer: { ...premium().computer, size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: 3600,
+        opening: free().computer.opening, machineChoice: free().computer.machineChoice, activeDeadline: '2026-10-30T06:42:00Z' } },
         'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
     const dunning = computerModel({ computer: me, data: lapsedRunning, prog: running(), usage: heldUsage, now: HELD_NOW });
+    assert.deepEqual(states(dunning), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
     assert.equal(dunning.holdLine, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
     assert.equal(dunning.sessionEnds, '2026-10-30T06:42:00Z');
-    assert.match(scan(computerHtml(dunning, running(), [])), /data-role="session-ends"/);
+    const dunningHtml = scan(computerHtml(dunning, running(), []));
+    assert.match(dunningHtml, /data-role="session-ends"/);
+    assert.match(card(dunningHtml, 'std-2'), /config-free-limits/);
+    assert.match(text(dunningHtml), /On the Free plan your AWS computer opens at 2 vCPU · 8 GB\. Upgrade to choose a size\./);
+    assert.doesNotMatch(dunningHtml, /data-action="switch-config"|data-size="free-cf"/);
     const onCf = computerModel({ computer: me, data: withStanding(premium(), 'free', { filesOn: 'cloudflare' }, { status: 'past_due', paymentIssue: 'payment_failed' }),
         prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
     assert.deepEqual(states(onCf), { 'free-cf': 'current', 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });

@@ -336,7 +336,8 @@ function aiMeterV3 (summary) {
     const extras = [
         purchased && purchased.remaining > 0 ? split ? `Extra credits expire ${dateLabel(purchased.expiresAt, true)}` : `+ ${whole(purchased.remaining)} purchased · expire ${dateLabel(purchased.expiresAt, true)}` : '',
         starter && starter.remaining > 0 && ! split ? `${whole(starter.remaining)} starter credits left` : '',
-        previous ? `${whole(previous.remaining)} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'your last billing period'} · expire ${dateLabel(previous.expiresAt, true)}` : '',
+        // Review: on a paid plan these may be this plan's last period or a cancelled earlier plan's, so the label fits both.
+        previous ? `${whole(previous.remaining)} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'} · expire ${dateLabel(previous.expiresAt, true)}` : '',
         pending && ! awaitingPayment ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
     ];
     // Round 6 (R1-10): the one-time starter grant is said once, by the starter line when the server reports it.

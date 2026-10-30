@@ -1038,12 +1038,26 @@ try {
         Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
         has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
-        // Round 6 review: past its grace the computer runs as Free, so the time meter says Free's month, not a size.
+        // Round 6 review: past its grace the server rates the computer as Free (summary.ts computePlanV3): the plan block
+        // is still Premium, the computer carries Free's session cap, machine choice and opening, and fairUse Free's month.
+        const freeComputer = summaryV3('free').computer;
+        Object.assign(summary.computer, { size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: freeComputer.sessionMaxSeconds,
+            opening: freeComputer.opening, machineChoice: freeComputer.machineChoice, disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } });
+        summary.fairUse = { status: 'ok', resetsAt: '2026-12-01T00:00:00Z' };
+        Object.assign(summary.ai, { previous: { remaining: 200, expiresAt: '2026-11-04T00:00:00Z' } });
         getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 27000,
             allowanceStandardSeconds: 28800, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 7, equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] } });
-        await refresh();
+        await refresh(); audit();
         contains('[data-role="meter-time"]', 'About 7 of 8 hours left this month');
         assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /left at 2 vCPU|Same as/);
+        contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        contains('[data-role="billing-usage"]', 'Resets Dec 1, 2026');
+        contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
+        // Earlier credits on a paid plan (this plan's tail or a cancelled plan's): one label true for both.
+        contains('[data-role="meter-ai"]', '200 from an earlier billing period');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /previous plan|last billing period/);
+        assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
         getUsage = () => failure('unavailable');
         assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
         // Unknown or missing standing: no standing banner.

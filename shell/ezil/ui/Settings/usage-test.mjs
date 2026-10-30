@@ -327,10 +327,12 @@ check('round 6: AI credits on Free after a cancel — no full bar, the 100 said 
     assert.match(ai.textContent, /100 starter credits left/);
     assert.doesNotMatch(ai.textContent, /one-time trial credits/);
     assert.match(ai.textContent, /663 from your previous plan · expire Nov 30, 2026/);
-    // A paid plan's last-period tail is "your last billing period", never "previous plan".
+    // On a paid plan the earlier credits may be its last period's tail or a cancelled plan's (a re-subscribe): "an earlier
+    // billing period" fits both, never "previous plan" or "last billing period".
     const paid = rendered(sample, withAI({ balance: 1012, included: { granted: 1000, remaining: 812, periodEnd: '2026-11-27T00:00:00Z' },
         previous: { remaining: 200, expiresAt: '2026-10-13T00:00:00Z' } }));
-    assert.match(meter(paid, 'ai').textContent, /200 from your last billing period · expire Oct 13, 2026/);
+    assert.match(meter(paid, 'ai').textContent, /200 from an earlier billing period · expire Oct 13, 2026/);
+    assert.doesNotMatch(meter(paid, 'ai').textContent, /previous plan|last billing period/);
     assert.equal(progress(paid, 'ai').getAttribute('aria-valuenow'), '81');
     // Spent or unknown: no line.
     for (const previous of [null, undefined, { remaining: 0, expiresAt: '2026-11-30T12:00:00Z' }, { remaining: 5, expiresAt: 'soon' }])

@@ -119,7 +119,8 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const extras = [
         purchased > 0 ? splitParts ? `Extra credits expire ${timestamp(ai.purchased.expiresAt)}` : `+ ${esc(creditsLabel(null, purchased))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
         starter > 0 && !splitParts ? `${esc(creditsLabel(null, starter))} starter credits left` : '',
-        previous ? `${esc(creditsLabel(null, previous.remaining))} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'your last billing period'} · expire ${timestamp(previous.expiresAt)}` : '',
+        // Review: on a paid plan these may be this plan's last period or a cancelled earlier plan's, so the label fits both.
+        previous ? `${esc(creditsLabel(null, previous.remaining))} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'} · expire ${timestamp(previous.expiresAt)}` : '',
         ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
     ].filter(Boolean);
     const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
