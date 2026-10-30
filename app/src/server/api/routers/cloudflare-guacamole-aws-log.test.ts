@@ -109,3 +109,34 @@ describe.each([['app', 'appPreviewUrl'], ['code', 'codePreviewUrl']] as const)('
         expect(lines()).toMatchObject([{ surface, status: null, error: 'computer_stopped', reason: 'computer_stopped' }]);
     });
 });
+
+// Round 6 (seams B and C): each route names its window to the Worker, and the preparing answer and the
+// terminal desktop answers reach the shell as their own codes.
+describe.each(surfaces)('%s (%s): round 6 seams', (surface, procedure) => {
+    it('the preview is asked with this route\'s surface (none for the desktop)', async () => {
+        await ask(procedure);
+        expect(mocks.preview).toHaveBeenCalledOnce();
+        const options = mocks.preview.mock.calls[0]![2] as Record<string, unknown>;
+        if (surface === 'desktop') expect(options).not.toHaveProperty('surface');
+        else expect(options.surface).toBe(surface);
+        // The provider's ensure never sees it.
+        for (const call of mocks.ensure.mock.calls) expect(call[2]).not.toHaveProperty('surface');
+        const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0]![1]!.body)) as Record<string, unknown>;
+        expect(body.surface).toBe(surface === 'desktop' ? undefined : surface);
+    });
+    it('a config being applied: sandbox_starting with computePreparing, and the Worker\'s reason in the line', async () => {
+        vi.mocked(fetch).mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }, { status: 503 }));
+        expect(await ask(procedure)).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computePreparing: true, computeProvider: 'aws-ec2' });
+        expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: 503, error: 'sandbox_starting',
+            reason: 'aws_desktop_starting', detail: 'config_pending', ms: expect.any(Number) }]);
+    });
+    it.each([['aws_desktop_config_unapplied', 'desktop_config_unapplied'], ['aws_desktop_failed', 'desktop_failed']])(
+        'the Worker\'s terminal %s reaches the shell as %s', async (error, errorCode) => {
+            vi.mocked(fetch).mockResolvedValue(Response.json({ ok: false, error }, { status: 502 }));
+            const out = await ask(procedure);
+            expect(out).toMatchObject({ ok: false, error, errorCode, computeProvider: 'aws-ec2' });
+            expect(out).not.toHaveProperty('computePreparing');
+            expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: 502, error: errorCode,
+                reason: error, ms: expect.any(Number) }]);
+        });
+});

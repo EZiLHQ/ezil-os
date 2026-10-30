@@ -143,7 +143,9 @@ function awsAnswered<T extends { ok: boolean }>(kind: string, surface: 'desktop'
     const refusal = preview ? awsPreviewRefusal(preview) : undefined;
     const code = (value: unknown) => typeof value === 'string' && LOG_CODE.test(value) ? value : 'other';
     console.info(JSON.stringify({ event: 'aws-preview', surface, computer: computerId.toLowerCase().slice(0, 8), status: refusal?.status ?? null,
-        error: code(own.errorCode), reason: code(refusal?.reason ?? own.error), ms: Date.now() - startedAt }));
+        error: code(own.errorCode), reason: code(refusal?.reason ?? own.error),
+        // Round 6: the Worker's allow-listed `aws_desktop_starting` reason (config_pending, code_starting, …) when it gave one.
+        ...(refusal?.detail ? { detail: code(refusal.detail) } : {}), ms: Date.now() - startedAt }));
     return answer;
 }
 
@@ -541,7 +543,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 let preview: AwsPreviewResult | undefined;
                 const answer = await awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
-                    async () => (preview = await requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId)),
+                    // Round 6 (seam B): the Worker answers the hosted app once the desktop config is applied, not on its relay.
+                    async () => (preview = await requestAwsPreview(ctx.db, computer, { ...ensureOptions, surface: 'app' }, config, hmacSecret, correlationId)),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
                 return awsAnswered(routed.kind, 'app', input.computerId, answer, startedAt, preview);
@@ -752,7 +755,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 let preview: AwsPreviewResult | undefined;
                 const answer = await awsPreviewAnswer(
                     ensured.value,
-                    async () => (preview = await requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId)),
+                    // Round 6 (seam B): the Worker answers Code once the desktop config is applied and code-server answers.
+                    async () => (preview = await requestAwsPreview(ctx.db, computer, { ...ensureOptions, surface: 'code' }, config, hmacSecret, correlationId)),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },

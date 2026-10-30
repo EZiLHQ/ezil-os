@@ -4,9 +4,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { AWS_BROWSER_ROUTE_TOKEN, awsPreviewRefusal, prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from './aws-preview';
+import {
+    AWS_BROWSER_ROUTE_TOKEN, AWS_DESKTOP_STARTING_REASONS, AWS_PREPARING_REASONS, awsPreviewRefusal, prepareAwsPoolSession, requestAwsPreview,
+    waitForAwsPreviewPlacement, type AwsPreviewOptions,
+} from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import type { EnsureOptions } from './provider';
 import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
 
 const NOW = Date.parse('2026-10-14T12:00:00Z');
@@ -32,7 +34,7 @@ function setup(placements = [row()], instant = false) {
     const fake = createFakePlacementDb({ placements }, instant ? { yield: async () => {} } : {});
     return {
         fake,
-        open: (cfg = config, secret = 'test-secret', opts: EnsureOptions = options) =>
+        open: (cfg = config, secret = 'test-secret', opts: AwsPreviewOptions = options) =>
             requestAwsPreview(fake.db, { userId, computerId: computerId.toUpperCase() }, opts, cfg, secret, 'corr'),
     };
 }
@@ -353,8 +355,10 @@ describe('AWS preview handoff', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    // Round 6 (seam A): 502 aws_desktop_failed left this list on purpose; it is terminal with its own code now
+    // (`AWS preview Worker answers (seam A)` below), never this generic one-silent-re-ask answer.
     it.each([
-        [502, 'tunnel_origin_mismatch'], [502, 'aws_desktop_failed'], [502, 'aws_desktop_config_refused'],
+        [502, 'tunnel_origin_mismatch'], [502, 'aws_desktop_config_refused'],
         [401, 'aws_preview_auth_required'], [403, 'aws_origin_starting'], [409, 'unknown_conflict'],
         [503, 'unknown_starting'], [409, 'aws_desktop_unreachable'],
     ])('keeps the invalid Worker state %s %s unavailable', async (status, error) => {
@@ -575,4 +579,128 @@ it('pool relay preparation sends only an enrolled pending epoch and never return
         await prepareAwsPoolSession(refused.db, { userId, computerId }, options, config, 'test-secret', 'test');
         expect(fetcher).toHaveBeenCalledOnce();
     }
+});
+
+// Round 6 (seam B): the asking window rides in the SIGNED v2 body, only when set. Code and the hosted app are
+// answered by the new Worker once the desktop config is applied; a desktop ask keeps today's exact bytes, so
+// a Worker that has not been redeployed sees no change, and one that predates the field never reads it.
+describe('AWS preview surface (seam B)', () => {
+    const signedBody = () => {
+        const [, init] = fetchMock.mock.calls[0]!;
+        const body = String(init!.body);
+        const [, encoded, signature] = new Headers(init!.headers).get('x-ezil-auth')!.split('.');
+        const claims = JSON.parse(Buffer.from(encoded!, 'base64url').toString('utf8')) as Record<string, unknown>;
+        const digest = createHash('sha256').update(body).digest('hex');
+        expect(signature).toBe(createHmac('sha256', 'test-secret').update([
+            'v2', claims.ts, 'POST', '/sandbox/preview', sandboxId, computerId, userId, 'aws-ec2', '', 7, 11, digest,
+        ].join('|')).digest('hex'));
+        return body;
+    };
+    it.each(['code', 'app'] as const)('%s: the body carries surface last, and the v2 token signs that exact body', async (surface) => {
+        await expect(setup().open(config, 'test-secret', { ...options, surface })).resolves.toMatchObject({ ok: true });
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko', surface }));
+    });
+    it('a measured screen comes before the surface', async () => {
+        const screen = { width: 1280, height: 800 };
+        await setup().open(config, 'test-secret', { ...options, screen, surface: 'code' });
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko', screen, surface: 'code' }));
+    });
+    it('a desktop ask (no surface) keeps the body byte-identical to before the field existed', async () => {
+        await setup().open();
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
+        expect(signedBody()).not.toContain('surface');
+    });
+    it('a Code answer with no relay fields is accepted (the Worker sends none for Code or the app)', async () => {
+        fetchMock.mockResolvedValue(Response.json({ ...ready(), relay: undefined, turnRelay: undefined }));
+        const out = await setup().open(config, 'test-secret', { ...options, surface: 'code' });
+        expect(out).toMatchObject({ ok: true, codePreviewUrl: url(8443) });
+        expect(out).not.toHaveProperty('relay');
+    });
+    it('pool relay preparation is the desktop exchange: never a surface, whatever the options say', async () => {
+        const pending = row({ state: 'MOUNTING', last_error: 'pool_session_pending', enroll_nonce_hash: null,
+            enroll_consumed_hash: 'a'.repeat(64), instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
+            lifecycle_job_id: '11111111-1111-4111-8111-111111111111', lifecycle_digest: 'b'.repeat(64) });
+        const fake = createFakePlacementDb({ placements: [pending] });
+        await prepareAwsPoolSession(fake.db, { userId, computerId }, { ...options, surface: 'code' }, config, 'test-secret', 'test');
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
+    });
+    it('pins the surface key and values to the Worker source', () => {
+        const worker = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-origin.ts'), 'utf8');
+        expect(worker).toContain("return value === 'code' || value === 'app' ? value : 'desktop';");
+        const index = readFileSync(path.resolve(__dirname, '../../../../../worker/src/index.ts'), 'utf8');
+        expect(index).toContain('surface: awsPreviewSurface(body.surface),');
+    });
+});
+
+// Round 6 (seam A): each answer the Worker's AWS preview can now give has a deliberate outcome.
+//  - 503 aws_desktop_starting, whatever its reason: retryable (`sandbox_starting`) within the shell's wake bound;
+//    the config-apply reasons and code_starting also say `computePreparing` (seam C).
+//  - aws_desktop_config_unapplied (after the Worker's 150 s bound) and aws_desktop_failed: terminal, each its own code.
+//  - Everything else keeps its existing outcome: turn_unavailable, a refused config push, a host code, an unknown 503.
+describe('AWS preview Worker answers (seam A)', () => {
+    it.each(AWS_DESKTOP_STARTING_REASONS.map(r => [r] as const))('503 aws_desktop_starting reason=%s: retryable', async (reason) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_starting', reason }, { status: 503 }));
+        const out = await setup().open(config, 'test-secret', { ...options, surface: 'code' });
+        const preparing = reason !== 'desktop_starting';
+        expect(out).toEqual(preparing ? { ...waking, computePreparing: true } : waking);
+        expect(awsPreviewRefusal(out)).toEqual({ reason: 'aws_desktop_starting', status: 503, detail: reason });
+    });
+    it('the preparing set is exactly the config-apply reasons and code_starting', () => {
+        expect([...AWS_PREPARING_REASONS].sort()).toEqual(['code_starting', 'config_pending', 'config_pushed', 'restart_scheduled']);
+    });
+    it.each([undefined, 'LEAK', 'Config_Pending', ['config_pending']])('503 aws_desktop_starting with reason %j: retryable, no flag, nothing echoed', async (reason) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_starting', reason }, { status: 503 }));
+        const out = await setup().open();
+        expect(out).toEqual(waking);
+        expect(awsPreviewRefusal(out)).toEqual({ reason: 'aws_desktop_starting', status: 503 });
+    });
+    it('a preparing reason on a 502 is not a start (only 503 aws_desktop_starting is)', async () => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }, { status: 502 }));
+        await expect(setup().open()).resolves.toEqual(failure);
+    });
+    it.each([
+        [502, 'aws_desktop_config_unapplied', 'desktop_config_unapplied'], [503, 'aws_desktop_config_unapplied', 'desktop_config_unapplied'],
+        [502, 'aws_desktop_failed', 'desktop_failed'], [503, 'aws_desktop_failed', 'desktop_failed'],
+    ] as const)('%s %s: terminal, as %s', async (status, error, errorCode) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK', detail: 'LEAK' }, { status }));
+        const out = await setup().open(config, 'test-secret', { ...options, surface: 'code' });
+        expect(out).toEqual({ ok: false, error, errorCode });
+        expect(awsPreviewRefusal(out)).toEqual({ reason: error, status });
+    });
+    it.each([500, 504, 409, 401])('a terminal code at HTTP %s is not classified (unavailable, as before)', async (status) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_failed' }, { status }));
+        await expect(setup().open()).resolves.toEqual(failure);
+    });
+    it('a terminal answer about an epoch replaced during the ask re-asks instead', async () => {
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => {
+            fake.placements[0]!.lease_epoch = 12;
+            return Response.json({ ok: false, error: 'aws_desktop_failed' }, { status: 502 });
+        });
+        const out = await open();
+        expect(out).toEqual(waking);
+        expect(awsPreviewRefusal(out)).toEqual({ reason: 'epoch_moved', status: 502 });
+    });
+    it.each([
+        [502, 'turn_unavailable'], [502, 'aws_desktop_config_refused'], [502, 'desktop_unit_failed'], [503, 'unknown_starting'],
+        [502, 'relay_refresh_failed'], [502, 'tunnel_origin_mismatch'],
+    ])('%s %s keeps its existing outcome: aws_preview_unavailable', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error }, { status }));
+        const out = await setup().open(config, 'test-secret', { ...options, surface: 'code' });
+        expect(out).toEqual(failure);
+        expect(awsPreviewRefusal(out)).toEqual({ reason: `worker_status_${status}`, status });
+    });
+    it('503 aws_desktop_unreachable (a push that timed out) stays retryable with no flag', async () => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_unreachable' }, { status: 503 }));
+        await expect(setup().open()).resolves.toEqual(waking);
+    });
+    it('pins the reason set and the terminal codes to the Worker source', () => {
+        const ice = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-ice.ts'), 'utf8');
+        expect(ice).toContain("reason: 'config_pushed' | 'restart_scheduled' | 'desktop_starting' | 'config_pending';");
+        expect(ice).toContain("throw new RelayFailure('aws_desktop_config_unapplied', 502)");
+        expect(ice).toContain("throw new RelayFailure('aws_desktop_failed', 502)");
+        const origin = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-origin.ts'), 'utf8');
+        expect(origin).toContain("return json({ ok: false, error: 'aws_desktop_starting', reason: 'code_starting' }, 503);");
+    });
 });
