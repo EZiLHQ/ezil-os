@@ -771,6 +771,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     open_desktop(window);
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
     push('the desktop window opens on the React host, on request', !!win);
+    // `app-history.js`: a click on the dock pushes `/app/desktop`.
+    push('opening it named it in the address bar', window.location.pathname === '/app/desktop', window.location.pathname);
 
     // Capture what the shell was actually tracking BEFORE the regeneration, so
     // the "did this really get destroyed" check is about the shell's own
@@ -829,6 +831,10 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         !!rebuilt, `attempts=${window.ezil.mountAttempts}`);
     push('🔴 ...and the rebuild opens ZERO windows, same as the original login',
         $$(window, '.window').length === 0, `${$$(window, '.window').length} windows`);
+    // The address bar named the desktop the regeneration destroyed; the
+    // rebuild must neither reopen it from there (above) nor keep naming it.
+    push('...and the address bar no longer names the destroyed window',
+        window.location.pathname === '/os', window.location.pathname);
     push('the rebuild adopted a genuinely new desktop node, not the disconnected one',
         !!window.ezil.desktop && window.ezil.desktop !== stale_desktop && window.ezil.desktop.isConnected,
         `same-node=${window.ezil.desktop === stale_desktop} connected=${window.ezil.desktop?.isConnected}`);

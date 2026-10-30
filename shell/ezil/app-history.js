@@ -245,6 +245,17 @@ export function createAppHistory () {
             }
         },
 
+        /**
+         * Make the entry name the app in front, or `/os`: after a shell
+         * rebuild, whose destroyed windows never reported closing.
+         */
+        sync () {
+            if ( ! deps || ! enabled ) return;
+            for ( const id of [...params.keys()] ) if ( ! liveWindow(id) ) params.delete(id);
+            const next = frontApp();
+            if ( currentApp() !== next ) write('replaceState', urlFor(next), stateFor(next));
+        },
+
         /** The view this entry recorded for `id`, if any. */
         recordedView (id) {
             const state = deps ? win().history.state : null;
@@ -282,7 +293,9 @@ export function createAppHistory () {
                     ended = true;
                     holds -= 1;
                     if ( el ) {
-                        if ( currentApp() !== id ) write('replaceState', urlFor(id), stateFor(id));
+                        // Not for a window already gone again (closed, or
+                        // destroyed by a rebuild while the launch was open).
+                        if ( el.isConnected !== false && currentApp() !== id ) write('replaceState', urlFor(id), stateFor(id));
                         return;
                     }
                     if ( before.params === undefined ) params.delete(id);

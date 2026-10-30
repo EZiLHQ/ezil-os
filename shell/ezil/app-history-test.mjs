@@ -146,8 +146,31 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     same(url(), `/app/desktop?computer=${C}`, 'a minimised window is not in front');
     close(desktop);
     same([url(), w.history.length, w.history.state.ezilApp], [`/os?computer=${C}`, 5, undefined], 'the last close returns to /os, in place');
-    focus(open('code', 30));
+    const again = open('code', 30);
+    focus(again);
     same(url(), `/app/code?computer=${C}`, "a closed app's parameters are forgotten");
+    // A rebuild destroyed the windows without a close: sync names what is left.
+    again.remove();
+    controller.sync();
+    same([url(), w.history.length], [`/os?computer=${C}`, 5], 'sync: nothing open, so /os, in place');
+    const front = open('settings', 40);
+    focus(front);
+    w.history.replaceState(w.history.state, '', '/app/code');
+    controller.sync();
+    same(url(), `/app/settings?computer=${C}`, 'sync: the app in front');
+    // A launch that resolves after its window was destroyed does not
+    // re-name it; one whose window is alive does.
+    const gone = open('code', 50);
+    const late = controller.begin('code', {});
+    gone.remove(); focus(front); controller.sync();
+    w.history.replaceState(w.history.state, '', `/app/settings?computer=${C}`);
+    late.end(gone);
+    same(url(), `/app/settings?computer=${C}`, 'a destroyed window is not re-named');
+    const alive = open('code', 60);
+    const live = controller.begin('code', {});
+    w.history.replaceState(w.history.state, '', `/app/settings?computer=${C}`);
+    live.end(alive);
+    same(url(), `/app/code?computer=${C}`, 'positive control: a live one is');
 }
 {
     // Back/Forward: focus or launch, with the entry's own context; never push.

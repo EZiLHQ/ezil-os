@@ -93,6 +93,11 @@ import { mount_feedback_chip } from './ui/feedback/feedback.js';
 import { applyPersistedAppearance } from './ui/Settings/tabs/appearance.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
+// The URL's app link is acted on once per page load. A rebuild (see
+// `ensure_intact`) opens nothing, like any login: by then the address bar
+// follows the apps the user opened, and re-reading it would reopen them
+// (and start a computer for Browser) on the rebuild's own initiative.
+let appLinkHandled = false;
 let stopBillingSessionEnd = null;
 
 const PHASE = 'ezil-os:boot';
@@ -852,6 +857,9 @@ async function build (payload) {
         launch: registry.launch,
         launchContext: () => registry.launchContext(current_ctx),
     });
+    // A rebuild: the windows a regeneration destroyed never went through
+    // `close()`, so the address bar may still name one of them.
+    if (appLinkHandled) appHistory.sync();
 
     // The taskbar. Built BEFORE the window, so it exists for
     // `exit_fullpage_mode` to un-hide rather than have to re-create, and so
@@ -957,7 +965,9 @@ async function build (payload) {
         }
     }
 
-    if (appLink && !billingLink) {
+    const firstLink = ! appLinkHandled;
+    appLinkHandled = true;
+    if (appLink && !billingLink && firstLink) {
         // Canonical first, so the window's own first focus finds `/app/<id>`.
         appHistory.adopt(appLink);
         await registry.launch(appLink.id, {

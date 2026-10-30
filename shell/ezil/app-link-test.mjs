@@ -176,6 +176,11 @@ for (const [entry, canonical] of [
     // Apps spread their ctx into launches of their own (clicks): a route's
     // historyMode must not ride along and turn those into replaces.
     same(routed.opens.map(c => 'historyMode' in c), [false], 'the app never sees historyMode');
+    // A click inside a window a ROUTE opened is still a click: the drawer's
+    // Settings button must push, whatever routing keys that window's ctx has.
+    routed.w.ezil.registry.settingsDrawerAction({ ...routed.ctx, historyMode: 'replace', view: 'full', initialTab: 'usage' }).onClick();
+    await wait(200);
+    same([routed.url(), routed.w.history.length], ['/app/settings', 2], "a drawer click pushes, without the route's keys");
     done(routed.w);
     const rejected = await boot(`/os?app=code&${pr}&path=a%2Fb`);
     same(rejected.opens.map(c => c.project), [{ projectId: P, repoId: R }], 'an invalid path is dropped, the project is not');
