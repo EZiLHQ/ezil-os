@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
 import {
+  AI_PUSH_SETTLE_MS,
   awsRelayContainer,
   awsRelayRefresh,
   buildAwsDesktopConfig,
@@ -72,6 +73,11 @@ interface HostState {
   /** The desktop unit's state the host reports; undefined = an older host that does not. */
   unit?: string;
   restartsExhausted?: boolean;
+  /** Host boot identity and whether the running desktop has the AI config (omitted = an older host). */
+  bootId?: string;
+  aiConfigured?: boolean;
+  /** The host's clock (gw1 freshness), when a test moves time. */
+  now?: number;
 }
 
 function fakeHost(over: Partial<HostState> = {}) {
@@ -88,12 +94,13 @@ function fakeHost(over: Partial<HostState> = {}) {
     const body = typeof init.body === 'string' ? init.body : undefined;
     calls.push({ method, path: u.pathname, body });
     if (u.hostname !== `c-${SID}-g1-e2.${ZONE}`) bad.push(`host ${u.hostname}`);
-    const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, record(), method, u.pathname, Math.floor(NOW / 1000));
+    const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, record(), method, u.pathname, Math.floor((st.now ?? NOW) / 1000));
     if (!v.ok) return new Response(JSON.stringify({ ok: false, error: v.error }), { status: 401 });
     const j = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s });
     if (method === 'GET' && u.pathname === '/__ezil/control/desktop') {
       return j({ ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice,
-        ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }) });
+        ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }),
+        ...(st.bootId === undefined ? {} : { bootId: st.bootId, aiConfigured: st.aiConfigured === true }) });
     }
     if (method === 'POST' && u.pathname.startsWith('/__ezil/control/ice/')) {
       if (u.pathname.slice('/__ezil/control/ice/'.length) !== (await sha256Hex(body ?? ''))) return j({ ok: false, error: 'ice_digest_mismatch' }, 400);
@@ -336,6 +343,98 @@ describe('ensureAwsDesktop: the open flow', () => {
     }
     expect(msgs.length).toBeGreaterThan(0);
     for (const m of msgs) for (const s of [TURN_USER, TURN_PASS, NEKO.user, NEKO.admin]) expect(m).not.toContain(s);
+  });
+});
+
+describe('ensureAwsDesktop: the AI config is pushed once per boot and lease epoch (G12)', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  const AI = { baseUrl: 'https://aws-8443-x.example/ai/v1', proxyToken: 'p'.repeat(64) };
+  /**
+   * A desktop already running WITHOUT the AI config (the host restarts it onto a pushed one at its
+   * next tick), and a registry record that evolves like the real one: `aiConfig` mints the boot's
+   * nonce (`aiBootId`), `aiDelivered` records an accepted push.
+   */
+  function scene(over: Partial<HostState> = {}) {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'running', ice: 'applied',
+      bootId: BOOT, aiConfigured: false, pushState: 'restart_scheduled', ...over });
+    let rec = record();
+    const m = mintOk();
+    const delivered: Array<{ bootId: string; expiresAt: number }> = [];
+    let deliverFails = false;
+    const open = (now = NOW) => {
+      h.st.now = now;
+      return ensureAwsDesktop({ record: rec, zone: ZONE, fetch: h.fetch, nowMs: () => now, neko: NEKO, mint: m.mint,
+        aiConfig: async (bootId) => { rec = { ...rec, aiBootId: bootId }; return AI; },
+        aiDelivered: async (bootId, expiresAt) => {
+          if (deliverFails) throw new Error('registry down');
+          delivered.push({ bootId, expiresAt });
+          rec = { ...rec, aiDelivered: { bootId, expiresAt, at: now } };
+        } });
+    };
+    const pushes = () => h.calls.filter((c) => c.method === 'POST' && c.path.startsWith('/__ezil/control/ice/')).length;
+    return { h, m, delivered, open, pushes, failDelivery: () => { deliverFails = true; } };
+  }
+
+  it('one push, recorded; every later open while the host restarts onto it pushes nothing and stays starting', async () => {
+    const s = scene();
+    expect(await s.open()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(s.pushes()).toBe(1);
+    expect(s.h.st.config!.ai).toEqual(AI);
+    expect(s.delivered).toEqual([{ bootId: BOOT, expiresAt: s.h.st.expiresAt! }]);
+    // The client re-asks every ~2 s. The old rule re-minted and re-pushed on each one.
+    for (let t = 2_000; t < 60_000; t += 2_000) {
+      expect(await s.open(NOW + t)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    }
+    expect(s.pushes()).toBe(1);
+    expect(s.m.count()).toBe(1);
+    // The host restarted onto it: ready, still one push.
+    s.h.st.aiConfigured = true;
+    expect((await s.open(NOW + 62_000)).state).toBe('ready');
+    expect(s.pushes()).toBe(1);
+    expect(s.h.bad).toEqual([]);
+  });
+
+  it('a desktop that is still booting from the delivered config is not pushed again either', async () => {
+    const s = scene({ configured: false, expiresAt: null, desktop: 'absent', ice: 'none', pushState: 'accepted' });
+    expect(await s.open()).toEqual({ state: 'starting', reason: 'config_pushed' });
+    for (let t = 2_000; t < 30_000; t += 2_000) {
+      expect(await s.open(NOW + t)).toEqual({ state: 'starting', reason: 'desktop_starting' });
+    }
+    expect(s.pushes()).toBe(1);
+  });
+
+  it('a host that never restarts onto it gets one more push only after AI_PUSH_SETTLE_MS', async () => {
+    const s = scene();
+    await s.open();
+    await s.open(NOW + AI_PUSH_SETTLE_MS - 1);
+    expect(s.pushes()).toBe(1);
+    expect(await s.open(NOW + AI_PUSH_SETTLE_MS)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(s.pushes()).toBe(2);
+    await s.open(NOW + AI_PUSH_SETTLE_MS + 2_000);
+    expect(s.pushes()).toBe(2);
+  });
+
+  it('a new host boot, or a held config that changed, is pushed again', async () => {
+    const s = scene();
+    await s.open();
+    s.h.st.bootId = '22222222-2222-4222-8222-222222222222';
+    await s.open(NOW + 2_000);
+    expect(s.pushes()).toBe(2);
+    expect(s.delivered.at(-1)!.bootId).toBe('22222222-2222-4222-8222-222222222222');
+    s.h.st.expiresAt = NOW + 900_000; // the host holds some other config now
+    await s.open(NOW + 4_000);
+    expect(s.pushes()).toBe(3);
+  });
+
+  it('an unrecorded push costs one more push, never the open; a refused push is not recorded', async () => {
+    const s = scene();
+    s.failDelivery();
+    expect(await s.open()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    await s.open(NOW + 2_000);
+    expect(s.pushes()).toBe(2);
+    const r = scene({ pushError: 'ice_store_failed' });
+    await expect(r.open()).rejects.toThrow('ice_store_failed');
+    expect(r.delivered).toEqual([]);
   });
 });
 
