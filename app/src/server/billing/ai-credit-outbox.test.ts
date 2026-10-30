@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
 import { aiCreditBackoffMs, drainAiCreditOutbox, planAiCreditRequeue, type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
-import { lookupAiAccount, missingAiAccountView, previewAiCreditRecovery, requeueFailedAiCredits } from './ai-credit-outbox-store';
+import { createAiCreditOutboxStore, lookupAiAccount, missingAiAccountView, previewAiCreditRecovery, requeueFailedAiCredits } from './ai-credit-outbox-store';
 
 const NOW = Date.parse('2026-10-21T00:00:00Z');
 function row(overrides: Partial<AiCreditOutboxRow> = {}): AiCreditOutboxRow {
@@ -238,6 +238,93 @@ describe('Works account lookup', () => {
         const execute = vi.fn().mockRejectedValue(error);
         await expect(lookupAiAccount({ execute } as unknown as Parameters<typeof lookupAiAccount>[0], 'user')).rejects.toBe(error);
         expect(missingAiAccountView(error)).toBe(false);
+    });
+    it.each(['https://ai-staging.ezil.work', 'https://gateway.test', undefined])('keeps the Works view read for funding URL %s', async fundingUrl => {
+        const execute = vi.fn().mockResolvedValue([{ public_id: 'works-id' }]);
+        const transaction = vi.fn();
+        expect(await lookupAiAccount({ execute, transaction } as unknown as Parameters<typeof lookupAiAccount>[0], 'user', fundingUrl)).toBe('works-id');
+        expect(new PgDialect().sqlToQuery(execute.mock.calls[0]![0]).sql).toBe('select public_id from ezil_works.ai_members where auth_user_id = $1::uuid limit 1');
+        expect(transaction).not.toHaveBeenCalled();
+    });
+});
+
+describe('production (Gateway 0030) account lookup', () => {
+    const PRODUCTION = 'https://ai.ezil.work';
+    const READ = "select ezil_ai.os_member_by_auth($1::uuid)->>'public_id' as public_id";
+    /** A drizzle transaction double: SET LOCAL ROLE lasts until its COMMIT/ROLLBACK; `failAt` fails the nth statement. */
+    function production(rows: unknown[] = [{ public_id: 'os-public-id' }], failAt?: { statement: number; error: unknown }) {
+        const statements: { sql: string; params: unknown[]; role: string }[] = [];
+        let role = 'postgres';
+        const execute = vi.fn();
+        const transaction = vi.fn(async (work: (tx: unknown) => Promise<unknown>) => {
+            const tx = { execute: vi.fn(async (query: Parameters<PgDialect['sqlToQuery']>[0]) => {
+                const { sql, params } = new PgDialect().sqlToQuery(query);
+                statements.push({ sql, params, role });
+                if (statements.length === failAt?.statement) throw failAt.error;
+                if (sql === 'set local role ezil_os_ai_enroller') role = 'ezil_os_ai_enroller';
+                else if (sql === 'set local role none') role = 'postgres';
+                else if (sql === READ) return rows;
+                else throw new Error('Unexpected SQL');
+                return [];
+            }) };
+            try { return await work(tx); } finally { role = 'postgres'; }
+        });
+        const lookup = (userId = 'user') =>
+            lookupAiAccount({ execute, transaction } as unknown as Parameters<typeof lookupAiAccount>[0], userId, PRODUCTION);
+        return { statements, execute, transaction, lookup, role: () => role };
+    }
+
+    it('reads ezil_ai.os_member_by_auth under SET LOCAL ROLE ezil_os_ai_enroller, then drops the role', async () => {
+        const db = production();
+        const userId = "user'; not SQL";
+        expect(await db.lookup(userId)).toBe('os-public-id');
+        expect(db.statements).toEqual([
+            { sql: 'set local role ezil_os_ai_enroller', params: [], role: 'postgres' },
+            { sql: READ, params: [userId], role: 'ezil_os_ai_enroller' },
+            { sql: 'set local role none', params: [], role: 'ezil_os_ai_enroller' },
+        ]);
+        expect(db.transaction).toHaveBeenCalledOnce();
+        expect(db.execute).not.toHaveBeenCalled();
+    });
+    it.each([[], [{ public_id: null }]])('returns null when there is no OS member (%j)', async (...rows) => {
+        expect(await production(rows).lookup()).toBeNull();
+    });
+    it.each([
+        { name: 'missing role', statement: 1, code: '22023' },
+        { name: 'missing function', statement: 2, code: '42883' },
+        { name: 'missing schema', statement: 2, code: '3F000' },
+    ])('treats a $name before 0030 as absent, including Drizzle causes', async ({ statement, code }) => {
+        const db = production(undefined, { statement, error: { message: 'Failed query', cause: { code } } });
+        expect(await db.lookup()).toBeNull();
+        expect(db.statements).toHaveLength(statement);
+    });
+    it.each([
+        { name: 'enroller not granted to the app role', statement: 1, code: '42501' },
+        { name: 'no schema usage or EXECUTE', statement: 2, code: '42501' },
+        { name: 'lost connection at SET ROLE', statement: 1, code: '08006' },
+        { name: 'lost connection at the read', statement: 2, code: '08006' },
+        { name: 'invalid parameter at the read', statement: 2, code: '22023' },
+        { name: 'undefined object at SET ROLE', statement: 1, code: '42704' },
+        { name: 'failed role drop', statement: 3, code: '42883' },
+        { name: 'codeless failure', statement: 2, code: undefined },
+    ])('throws (retry) on $name ($code)', async ({ statement, code }) => {
+        const error = { message: 'credential', cause: { code } };
+        await expect(production(undefined, { statement, error }).lookup()).rejects.toBe(error);
+    });
+    it('throws when the transaction cannot begin', async () => {
+        const db = production();
+        const error = { code: '08006' };
+        db.transaction.mockRejectedValueOnce(error);
+        await expect(db.lookup()).rejects.toBe(error);
+        expect(db.statements).toEqual([]);
+    });
+    it('is used by accountFor when no mapping is frozen yet', async () => {
+        const db = production();
+        db.execute.mockResolvedValue([]);
+        const store = createAiCreditOutboxStore(db as unknown as Parameters<typeof createAiCreditOutboxStore>[0], PRODUCTION);
+        expect(await store.accountFor(row())).toBe('os-public-id');
+        expect(db.execute).toHaveBeenCalledOnce();
+        expect(db.statements.map(statement => statement.sql)).toEqual(['set local role ezil_os_ai_enroller', READ, 'set local role none']);
     });
 });
 

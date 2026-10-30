@@ -33,7 +33,7 @@ export function getBillingDeps(): BillingDeps {
     return {
         config,
         store: createBillingStore(db),
-        aiCredits: createAiCreditOutboxStore(db),
+        aiCredits: createAiCreditOutboxStore(db, config.fundingUrl),
         stripe: secretKey
             ? createStripeClient({ secretKey, priceProMonthly: config.stripePriceProMonthly })
             : null,

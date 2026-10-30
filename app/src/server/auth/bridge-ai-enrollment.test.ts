@@ -6,7 +6,7 @@ const stub = vi.hoisted(() => ({
     generateLink: vi.fn(), verifyOtp: vi.fn(), signOut: vi.fn(), enroll: vi.fn(),
 }));
 vi.mock('./supabase-admin', () => ({ createAdminClient: stub.adminClient }));
-vi.mock('./staging-ai-enrollment', () => ({ enrollStagingAiMember: stub.enroll }));
+vi.mock('./ai-enrollment', () => ({ enrollAiMember: stub.enroll }));
 vi.mock('@/utils/supabase/server', () => ({
     createClient: async () => ({ auth: { verifyOtp: stub.verifyOtp, signOut: stub.signOut } }),
 }));
@@ -30,7 +30,7 @@ beforeEach(() => {
     stub.verifyOtp.mockResolvedValue({ data: { user, session: { access_token: 'fixture-supabase-token' } }, error: null });
 });
 
-describe('Auth0 bridge staging enrollment boundary', () => {
+describe('Auth0 bridge AI enrollment boundary', () => {
     it.each(['create', 'link', 'reuse'] as const)('awaits enrollment after %s and before minting the Supabase session', async path => {
         if (path === 'link') stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, app_metadata: {} }] }, error: null });
         if (path === 'reuse') stub.listUsers.mockResolvedValue({ data: { users: [user] }, error: null });
