@@ -13,8 +13,9 @@
 //
 // 🔴 ONLY THE LATEST INTENT DECIDES. Launches resolve out of order (a click
 // on Code, then on Settings; Settings opens first). A launch, or a
-// Back/Forward launch, that resolves after a newer intent writes nothing —
-// see `generation` below and docs/APP-ROUTES.md §5 "Order".
+// Back/Forward launch, that resolves after a newer intent took the entry
+// (wrote it, or moved to another) writes nothing for it — see `owner` below
+// and docs/APP-ROUTES.md §5 "Order".
 //
 // 🔴 EVERY WRITE STARTS FROM `history.state`. `/os` is a Next.js App Router
 // page, and Next keeps its own keys there (`__NA`, its route tree). Its
@@ -134,25 +135,41 @@ export function createAppHistory () {
     const params = new Map();
     // Every intent takes the next number (`issued`, never reused): a click's
     // launch (`begin`), Back/Forward, a route launch the boot starts
-    // (`route`), the close of an app window, a focus this module writes
-    // for. `generation` is the number of the intent that decides the
-    // address bar: the latest one, unless the latest launch failed and gave
-    // it back (`end`) to the intent it took it from. `launchGeneration` is
-    // the same for LAUNCH intents (a click, Back/Forward, a boot route)
-    // alone. A pending launch compares its own number with these when it
-    // ends (`end`, `commit`).
+    // (`route`), a close or a focus this module writes for.
+    //
+    // 🔴 THE ENTRY'S OWNER, not the latest number, decides what a pending
+    // launch may still write. `owner` is the number of the intent that last
+    // TOOK the current entry: wrote it (a click's push, or its replace in
+    // place; a close or focus that renamed it) or moved to another one
+    // (Back/Forward). An intent that wrote nothing took nothing: a click on
+    // the app the entry already names, with the same parameters (it
+    // coalesces with that app's launch if one is still opening), a close
+    // behind the front window, the boot's `route` (its `commit` writes
+    // later). A pending launch keeps the owner it began under (`held`: its
+    // own number if it took the entry, else the owner it found), and writes
+    // for the entry (`commit`, `adopt`, the give-back in `end(null)`) only
+    // while `owner` is still that one. Its own late write (`end`, `commit`,
+    // `adopt`) takes nothing: it is made under the owner it held. A failed
+    // click gives `owner` back to the one before it.
+    //
+    // `launchGeneration` is the newest LAUNCH intent (a click, Back/Forward,
+    // a boot route), given back the same way. It decides the front: which
+    // launch names its app when it opens (`end`), and whose window's late
+    // focus counts (`superseded`).
     let issued = 0;
-    let generation = 0;
+    let owner = 0;
     let launchGeneration = 0;
-    // A click's launch that failed while a newer intent decided -> its
-    // give-back, run if the address bar comes back to it (every launch since
-    // failed too). An intent that cannot fail ends every such chain.
+    // A click's launch that failed while it could not give back (a newer
+    // intent had taken the entry, or a newer launch still stood) -> a retry
+    // of its give-back, run when the front comes back to it (every newer
+    // launch failed too). An intent that took the entry and cannot fail
+    // (Back/Forward, a close, a focus) ends every such chain.
     const failed = new Map();
-    const intent = () => { failed.clear(); generation = issued += 1; return generation; };
+    const take = () => { failed.clear(); owner = issued += 1; return owner; };
     // A route launch's ctx (Back/Forward, or the boot's own through `route`)
-    // -> its number, for `commit` and `adopt`. Keyed by the object
-    // `registry.launch` hands back: a key added to the ctx itself would
-    // reach the app.
+    // -> `{ gen, held }`: its number, and the owner it began under, for
+    // `commit` and `adopt`. Keyed by the object `registry.launch` hands
+    // back: a key added to the ctx itself would reach the app.
     const routes = new WeakMap();
     // A launched window -> the launch number it opened under, until
     // `settled`. Until then its focus events are the launch's own (UIWindow's
@@ -192,10 +209,10 @@ export function createAppHistory () {
     };
 
     function onPopState () {
-        // The newest intent, whichever entry it lands on (`/os` included): a
-        // click's launch or an earlier traversal's still opening must not
-        // write over it.
-        const gen = launchGeneration = intent();
+        // The newest intent, and it moved to another entry, whichever one it
+        // lands on (`/os` included): a click's launch or an earlier
+        // traversal's still opening must not write over it.
+        const gen = launchGeneration = take();
         const link = parseAppLink(win().location, apps());
         if ( ! link ) return;
         params.set(link.id, linkParams(link));
@@ -208,7 +225,7 @@ export function createAppHistory () {
             }),
             historyMode: 'replace',
         };
-        routes.set(ctx, gen);
+        routes.set(ctx, { gen, held: gen });
         void deps.launch(link.id, ctx);
     }
 
@@ -226,7 +243,7 @@ export function createAppHistory () {
         // begun since: this is that launch's late focus, not the user's.
         if ( superseded(el) ) return;
         if ( currentApp() === id ) return;
-        intent();
+        take();
         write('replaceState', urlFor(id), stateFor(id));
     }
 
@@ -248,15 +265,15 @@ export function createAppHistory () {
     function onClosed (event) {
         if ( ! enabled ) return;
         const closed = event.detail?.app;
-        if ( known(closed) ) {
-            // An intent: a launch still opening may not give back, over what
-            // this decides, the URL it replaced (`end(null)`). Not a LAUNCH
-            // intent: a launch whose window opens still names it.
-            intent();
-            if ( ! liveWindow(closed) ) params.delete(closed);
-        }
+        if ( known(closed) && ! liveWindow(closed) ) params.delete(closed);
         const next = frontApp();
         if ( currentApp() === next ) return;
+        // The close of an app window that renames the entry takes it: a
+        // launch still opening may not give back, over what this decides,
+        // the URL it replaced (`end(null)`). Not a LAUNCH intent: a launch
+        // whose window opens still names it. One that renames nothing takes
+        // nothing.
+        if ( known(closed) ) take();
         write('replaceState', urlFor(next), stateFor(next));
     }
 
@@ -294,14 +311,16 @@ export function createAppHistory () {
          * @param {{search?: string, route?: object}} [options] `search`: the
          *   query to keep, when the caller has already consumed some of it
          *   (the billing deep link). `route`: the ctx of the launch this
-         *   adopts after (numbered by `route`); a newer intent since writes
-         *   nothing.
+         *   adopts after (numbered by `route`); once a newer intent has taken
+         *   the entry, this writes nothing.
          */
         adopt (link, { search, route } = {}) {
             if ( ! deps || ! link ) return;
             params.set(link.id, linkParams(link));
-            // The click made while it opened has the entry now.
-            if ( routes.has(route) && routes.get(route) !== generation ) return;
+            // A click made while it opened took the entry (pushed, or
+            // rewrote it): it is that click's now. One that wrote nothing (a
+            // click on Settings itself) did not.
+            if ( routes.has(route) && routes.get(route).held !== owner ) return;
             if ( enabled ) {
                 write('replaceState', canonicalUrl(win().location, link, { search }), stateFor(link.id));
             } else if ( search !== undefined ) {
@@ -311,14 +330,15 @@ export function createAppHistory () {
 
         /**
          * Number a route launch the boot starts itself (its link, the
-         * billing link) as an intent, as `popstate` does a Back/Forward's: a
-         * click, Back/Forward, close or focus after it decides, and `commit`
-         * (and `adopt`, given it) then write nothing for it.
+         * billing link) as a LAUNCH intent, as `popstate` does a
+         * Back/Forward's. It takes nothing yet: the entry is the boot's, and
+         * its `commit` (and `adopt`, given it) canonicalise it, unless a
+         * click, Back/Forward, close or focus after it has taken the entry.
          * @param {object} ctx the ctx it will pass to `registry.launch`
          * @returns {object} `ctx`
          */
         route (ctx) {
-            if ( deps && ctx && typeof ctx === 'object' ) routes.set(ctx, launchGeneration = intent());
+            if ( deps && ctx && typeof ctx === 'object' ) routes.set(ctx, { gen: launchGeneration = issued += 1, held: owner });
             return ctx;
         },
 
@@ -354,37 +374,49 @@ export function createAppHistory () {
          * as a duplicate of the one before it.
          *
          * Out of order (docs/APP-ROUTES.md §5 "Order"): `end(el)` names the
-         * app only while no newer click or Back/Forward has happened;
-         * `end(null)` puts anything back only while no newer intent at all
-         * has (a close included), and the app's parameters only while no
-         * later launch has set them. A launch that fails gives the address
-         * bar back to the intent it took it from: an older launch still
-         * pending decides again, and one that failed meanwhile gives it back
-         * in turn.
+         * app only while it is the newest launch (no newer click or
+         * Back/Forward: its window is the one in front); `end(null)` gives
+         * back only while it still holds the entry (no newer intent has
+         * taken it, a close included) and is still the newest launch, and
+         * the app's parameters only while no later launch has set them. A
+         * launch that fails gives the address bar back to the intent it took
+         * it from: an older launch still pending decides again, and one that
+         * failed meanwhile gives it back in turn.
          * @returns {{end: (el: Element|null) => void}|null} null when this
          *   module will not write for `id` (an /os-only host, an unknown app).
          */
         begin (id, ctx = {}) {
             if ( ! deps || ! enabled || ! known(id) ) return null;
-            const prior = [generation, launchGeneration];
-            const gen = launchGeneration = generation = issued += 1;
+            const prior = { owner, launch: launchGeneration };
+            const gen = launchGeneration = issued += 1;
             holds += 1;
             const before = { url: here(), state: win().history.state, params: params.get(id) };
             const pushed = currentApp() !== id;
+            // A push, or a replace in place (the app's own parameters
+            // changed), takes the entry. A click on the app the entry already
+            // names, with the same parameters, writes nothing and takes
+            // nothing: it holds the entry under the owner it found.
             if ( remember(id, ctx) || pushed ) {
+                owner = gen;
                 write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: undefined } : stateFor(id));
             }
+            const held = owner;
             const mine = params.get(id);
             // As if this launch never happened: the URL and state it
-            // replaced, and the numbers from before it. If those are an older
-            // launch's that failed meanwhile, that one gives back too.
+            // replaced, the owner and the newest launch from before it. If
+            // that launch failed meanwhile, it gives back too.
             const giveBack = () => {
                 if ( pushed ) win().history.replaceState(before.state, '', before.url);
-                [generation, launchGeneration] = prior;
-                const older = failed.get(generation);
-                failed.delete(generation);
+                ({ owner, launch: launchGeneration } = prior);
+                const older = failed.get(launchGeneration);
+                failed.delete(launchGeneration);
                 older?.();
             };
+            // Only while it still holds the entry and is still the newest
+            // launch: a newer launch that took nothing (a click on the same
+            // app, which shares this one's window and outcome) defers it,
+            // and gives it back with its own.
+            const mayGiveBack = () => owner === held && launchGeneration === gen;
             let ended = false;
             return {
                 end (el) {
@@ -403,8 +435,8 @@ export function createAppHistory () {
                         if ( before.params === undefined ) params.delete(id);
                         else params.set(id, before.params);
                     }
-                    if ( gen === generation ) giveBack();
-                    else failed.set(gen, giveBack);
+                    if ( mayGiveBack() ) giveBack();
+                    else failed.set(gen, () => { if ( mayGiveBack() ) giveBack(); });
                 },
             };
         },
@@ -431,15 +463,15 @@ export function createAppHistory () {
          * Back/Forward) resolved with a window: never adds an entry. The
          * entry's URL is kept as it is when it already names `id`, unless the
          * launch changed the app's own parameters. 'none' writes nothing,
-         * and so does a numbered route launch (Back/Forward, `route`) any
-         * intent has overtaken.
+         * and so does a numbered route launch (Back/Forward, `route`) once a
+         * newer intent has taken the entry.
          * @param {Element} [el] the window it resolved with
          */
         commit (id, ctx = {}, el = null) {
             if ( ! deps || ! enabled || ctx.historyMode === 'none' || ! known(id) ) return;
-            const gen = routes.get(ctx) ?? launchGeneration;
-            settle(el, gen);
-            if ( routes.has(ctx) && gen !== generation ) return;
+            const route = routes.get(ctx);
+            settle(el, route?.gen ?? launchGeneration);
+            if ( route && route.held !== owner ) return;
             const changed = remember(id, ctx);
             const same = currentApp() === id;
             write('replaceState', same && ! changed ? here() : urlFor(id), stateFor(id));

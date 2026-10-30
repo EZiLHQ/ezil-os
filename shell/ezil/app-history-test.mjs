@@ -371,6 +371,26 @@ for (const closed of [true, false]) {
     code.end(null);
     same([url(), w.history.length], [closed ? '/app/desktop' : '/app/settings', 5], closed ? 'then Code fails: still the close\'s' : 'positive control: then Code fails, the URL it replaced');
 }
+for (const olderFirst of [true, false]) for (const closed of [true, false]) {
+    // A close BETWEEN two clicks: the newer one fails and gives back to the
+    // close's URL, and the older one's give-back, reached through it, finds
+    // the entry taken by the close and stays put, in either end order.
+    // Positive control: without the close, the cascade walks back to `/os`.
+    const { w, controller, open, close, url } = harness('/os');
+    const settings = open('settings', 5);
+    const desktop = open('desktop', 4);
+    const code = controller.begin('code');
+    if ( closed ) {
+        close(settings);
+        same(url(), '/app/desktop', 'the close names the front app');
+    }
+    const newer = controller.begin('settings');
+    for (const launch of olderFirst ? [code, newer] : [newer, code]) launch.end(null);
+    same([url(), w.history.length], closed ? ['/app/desktop', 3] : ['/os', 3], closed
+        ? `${olderFirst ? 'older' : 'newer'} fails first: nothing is given back over the close`
+        : `positive control (${olderFirst ? 'older' : 'newer'} first): both give back, to /os`);
+    void desktop;
+}
 {
     // A newer launch that fails gives the front back too: the older launch's
     // window, still settling, is no longer superseded (its ensureOnTop runs,
@@ -576,6 +596,147 @@ for (const click of [null, 'opens', 'fails']) {
         click === 'opens' ? "a click while the billing link opens keeps its entry: neither commit nor adopt relabels it"
             : `positive control (${click ? 'a click that failed' : 'no click'}): the billing link is canonicalised`);
 }
+for (const [tab, order] of [[undefined, 'commit first'], [undefined, 'click first'], ['billing', 'commit first'], ['usage', 'commit first']]) {
+    // The recheck of 118ebea9 (2026-10-30): a click on Settings ITSELF while
+    // the billing link opens it. The alias already names Settings and no tab
+    // of its own is recorded yet, so a plain click writes nothing and takes
+    // nothing: the link's commit and adopt still canonicalise the boot's
+    // entry (base ba36b095 did; 118ebea9 left `upgrade`/`section` on it). A
+    // click at a tab rewrites the entry in place: that click took it, and
+    // keeps it (positive controls). The two launches share one window.
+    const { w, controller, open, url } = harness('/os?settings=billing&section=ai-credits&x=1');
+    const route = controller.route({ initialTab: 'billing', historyMode: 'replace' });
+    const click = controller.begin('settings', tab ? { initialTab: tab } : {});
+    same([url(), w.history.length], [tab ? `/app/settings?tab=${tab}` : '/os?settings=billing&section=ai-credits&x=1', 1],
+        tab ? `a click at ${tab}: rewritten in place` : 'a plain click on Settings: nothing written');
+    const settings = open('settings', 10);
+    if ( order === 'click first' ) click.end(settings);
+    controller.commit('settings', route, settings);
+    if ( order === 'commit first' ) click.end(settings);
+    controller.adopt({ id: 'settings', initialTab: 'billing' }, { search: '?x=1', route });
+    same([url(), w.history.length, w.history.state.ezilApp, controller.superseded(settings)],
+        [tab ? `/app/settings?tab=${tab}` : '/app/settings?tab=billing&x=1', 1, 'settings', false],
+        tab ? `a click at ${tab} took the entry: the billing link writes nothing over it`
+            : `a plain click on Settings (${order}): the billing link still canonicalises its entry`);
+}
+for (const renames of [false, true]) {
+    // A close takes the entry only if it renames it. Behind the front window
+    // it renames nothing, and a Back launch still opening still commits
+    // (stamping the entry's app); a close of the front window renames it,
+    // and the Back launch writes nothing (positive control).
+    const routes = [];
+    const { w, open, focus, close, url, traverse } = harness('/os', { routes });
+    const desktop = open('desktop', 5);
+    const settings = open('settings', 6);
+    focus(settings);
+    w.history.pushState({ __NA: true }, '', '/app/settings?tab=usage');
+    w.history.pushState({ __NA: true }, '', '/app/code');
+    await traverse(-1);
+    same([url(), w.history.state.ezilApp, routes.map(r => r.id)], ['/app/settings?tab=usage', undefined, ['settings']], 'Back to Settings at Usage, still opening');
+    close(renames ? settings : desktop);
+    same(url(), renames ? '/app/desktop' : '/app/settings?tab=usage', renames ? 'the close of the front window renames the entry' : 'a close behind it renames nothing');
+    routes.shift().resolve(renames ? open('settings', 20) : settings);
+    same([url(), w.history.state.ezilApp], renames ? ['/app/desktop', 'desktop'] : ['/app/settings?tab=usage', 'settings'],
+        renames ? 'it took the entry: the Back launch writes nothing over it' : 'it took nothing: the Back launch commits');
+}
+{
+    // The independent review's interleavings (2026-10-30), wired as boot.js
+    // calls `route` (N5 and N11 are the boot-link and billing-link cases
+    // above). N5 and N8's lengths were 3 and 4 in the review's harness: a
+    // route launch never pushes and a click on the named app at a new
+    // project replaces in place, so 2 and 3 are right.
+    const ids = ['desktop', 'code', 'settings'];
+    const apps = (w) => [...w.document.querySelectorAll('.window[data-app]')].map(el => el.getAttribute('data-app'));
+    {
+        const { w, controller, open, url } = harness('/os');
+        const [a, b, c] = ids.map(id => controller.begin(id));
+        c.end(null); b.end(null); a.end(open('desktop', 10));
+        same([url(), apps(w)], ['/app/desktop', ['desktop']], 'N1: Settings fails, Code fails, Desktop opens: Desktop is named');
+    }
+    {
+        const { w, controller, url } = harness('/os');
+        const [a, b, c] = ids.map(id => controller.begin(id));
+        c.end(null); b.end(null); a.end(null);
+        same([url(), apps(w)], ['/os', []], 'N1b: all three fail, newest first: /os');
+    }
+    {
+        const { w, controller, url } = harness('/os');
+        const a = controller.begin('code'); const b = controller.begin('settings');
+        b.end(null); a.end(null);
+        same([url(), apps(w)], ['/os', []], 'N2: Settings fails, then Code fails: /os');
+    }
+    {
+        const { controller, open, focus, url, traverse } = harness('/os');
+        const code = open('code', 10);
+        controller.begin('code').end(code);
+        await traverse(-1);
+        const afterBack = url();
+        focus(code);
+        const afterLateFocus = url();
+        controller.settled(code);
+        focus(code);
+        same([afterBack, afterLateFocus, url()], ['/os', '/os', '/app/code'], "N3: Back while Code settles; Code's late focus does not name it, the user's later focus does");
+    }
+    {
+        const { w, controller, open, close, url } = harness('/os');
+        const older = controller.begin('code'); const newer = controller.begin('settings');
+        const s = open('settings', 20); newer.end(s);
+        close(s);
+        const afterClose = url();
+        older.end(open('code', 10));
+        same([afterClose, url(), apps(w)], ['/os', '/os', ['code']], "N4: the newer window closes, then the older launch opens: it was superseded and names nothing (its next focus that counts does)");
+    }
+    {
+        const { w, controller, open, url, traverse } = harness('/os');
+        w.history.pushState({ __NA: true }, '', '/app/code');
+        controller.adopt({ id: 'code' });
+        const boot = controller.route({ computer: { id: C }, view: 'full', historyMode: 'replace' });
+        await traverse(-1);
+        const afterBack = url();
+        controller.commit('code', boot, open('code', 10));
+        same([afterBack, url()], ['/os', '/os'], 'N6: the boot link resolves after Back: it writes nothing over the entry Back moved to');
+    }
+    {
+        const { controller, open, focus, url } = harness('/os?app=code');
+        controller.adopt({ id: 'code' });
+        const boot = controller.route({ computer: { id: C }, view: 'full', historyMode: 'replace' });
+        const code = open('code', 10);
+        controller.commit('code', boot, code);
+        const committed = url();
+        const settings = open('settings', 20);
+        controller.begin('settings').end(settings); controller.settled(settings);
+        focus(code);
+        same([committed, url()], ['/app/code', '/app/settings'], "N7: the boot link commits, a click lands, then the boot window's late focus: the click keeps the address bar");
+    }
+    {
+        const routes = [];
+        const { w, controller, open, url, traverse } = harness('/os', { routes });
+        w.history.pushState({ __NA: true }, '', '/app/code');
+        settledLaunch(controller, 'settings', open('settings', 5));
+        await traverse(-1);
+        const click = controller.begin('code', { project: { projectId: P, repoId: R } });
+        const code = open('code', 10);
+        click.end(code);
+        const mid = url();
+        routes.shift().resolve(code);
+        same([mid, url(), w.history.length], [`/app/code?project=${P}&repo=${R}`, `/app/code?project=${P}&repo=${R}`, 3],
+            'N8: Back to Code, a click on Code at a project (in place), then the Back launch resolves: it writes nothing over the click');
+    }
+    {
+        const { controller, open, url } = harness('/os');
+        const [a, b, c] = ids.map(id => controller.begin(id));
+        b.end(null); c.end(open('settings', 30)); a.end(open('desktop', 10));
+        same(url(), '/app/settings', 'N9: the middle one fails, the newest opens, then the oldest: the newest keeps it');
+    }
+    {
+        const { w, controller, open, url } = harness('/os');
+        const a = controller.begin('code'); const b = controller.begin('settings');
+        const code = open('code', 10);
+        b.end(null);
+        a.end(code);
+        same([url(), apps(w)], ['/app/code', ['code']], 'N10: the newer fails, then the older opens: the older is named');
+    }
+}
 {
     // Parameters: an older failed launch leaves a newer launch's alone...
     const { controller, open, focus, url } = harness('/os');
@@ -612,4 +773,4 @@ for (const click of [null, 'opens', 'fails']) {
     controller.begin('code');
     same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
 }
-console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (latest intent decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, parameters)`);
+console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);
