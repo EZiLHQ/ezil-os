@@ -133,6 +133,12 @@ local_protocol = "http"
 # Cloudflare Realtime TURN relay minted per-session from
 # SANDBOX_NEKO_TURN_KEY_ID + SANDBOX_NEKO_TURN_API_TOKEN (secrets, by name).
 [vars]
+# AWS computers (namespace prd) route through this Worker on ezil.org: browser hosts
+# `aws-<port>-<sandboxId>-aws.ezil.org` and per-host `c-…ezil.org` tunnel CNAMEs.
+# Kept here so a later deploy never silently drops a --var override.
+AWS_ROUTING_ENABLED = "on"
+AWS_ORIGIN_ZONE = "ezil.org"
+AWS_ORIGIN_ZONE_ALLOWLIST = "ezil.org"
 SANDBOX_AI_PROXY = "off"
 EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"
 # ── The default desktop mode ─────────────────────────────────────────────────
