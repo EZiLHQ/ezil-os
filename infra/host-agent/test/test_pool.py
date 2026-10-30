@@ -298,6 +298,91 @@ class Requests(PoolTest):
         client.ready.assert_not_called()
 
 
+class Readiness(PoolTest):
+    """R2-4: a warm desktop's readiness miss is never fatal (first boot or refresh)."""
+
+    def test_first_boot_bound_is_two_waits_with_a_liveness_enrollment_between(self):
+        self.assertEqual((pool.FIRST_BOOT_READY_ATTEMPTS, pool.REFRESH_SECONDS), (2, 300))
+        client = mock.Mock()
+        events = []
+        client.enroll.side_effect = lambda **kw: events.append(("enroll", self.clock.now))
+        client.ready.side_effect = lambda health: events.append(("ready", self.clock.now))
+        health = self.patch(pool, "health", side_effect=lambda cfg: HEALTH if self.clock.now >= 200 else {"ok": False})
+        self.assertTrue(pool.first_ready(client, self.cfg))
+        # 180 s miss, then re-enroll (the planner fails a spare not ready 5 min after enrolling),
+        # then the second wait answers.
+        self.assertEqual([e[0] for e in events], ["enroll", "ready"])
+        self.assertAlmostEqual(events[0][1], 180.0, delta=0.5)
+        self.assertLess(events[1][1], 180 + 180)
+        self.assertGreater(health.call_count, 2)
+
+    def test_first_boot_exhausted_returns_unready_never_raises(self):
+        client = mock.Mock()
+        self.patch(pool, "health", return_value={"ok": False})
+        self.assertFalse(pool.first_ready(client, self.cfg))
+        client.ready.assert_not_called()
+        self.assertEqual(client.enroll.call_count, pool.FIRST_BOOT_READY_ATTEMPTS - 1)
+        self.assertLessEqual(self.clock.now, pool.FIRST_BOOT_READY_ATTEMPTS * 180 + 1, "bounded")
+
+    def test_first_boot_retry_enrollment_tolerates_an_outage_but_not_a_refusal(self):
+        for code, raises in (("pool_retry_exhausted", False), ("pool_unavailable", False), ("pool_request_refused", True)):
+            with self.subTest(code=code):
+                self.clock.now = 0
+                client = mock.Mock()
+                client.enroll.side_effect = Refused(code)
+                self.patch(pool, "wait_ready", side_effect=[Refused("pool_desktop_not_ready"), HEALTH])
+                if raises:
+                    with self.assertRaisesRegex(Refused, code):
+                        pool.first_ready(client, self.cfg)
+                    client.ready.assert_not_called()
+                else:
+                    self.assertTrue(pool.first_ready(client, self.cfg))
+                    client.ready.assert_called_once_with(HEALTH)
+
+    def test_other_first_boot_failures_still_raise(self):
+        client = mock.Mock()
+        self.patch(pool, "wait_ready", side_effect=Refused("pool_desktop_start_failed"))
+        with self.assertRaisesRegex(Refused, "pool_desktop_start_failed"):
+            pool.first_ready(client, self.cfg)
+
+    def test_refresh_miss_keeps_the_host_and_tries_again_next_refresh(self):
+        client = mock.Mock()
+        client.claim.side_effect = [None] * 700 + [CLAIM]
+        calls = []
+        client.enroll.side_effect = lambda **kw: calls.append(("enroll", self.clock.now))
+        client.ready.side_effect = lambda h, **kw: calls.append(("ready", self.clock.now))
+        ok = iter([False, True])
+        self.patch(pool, "wait_ready", side_effect=lambda cfg, timeout: HEALTH if next(ok) else (_ for _ in ()).throw(
+            Refused("pool_desktop_not_ready")))
+        self.assertEqual(pool.wait_claim(client, self.cfg), CLAIM)
+        # The miss at 300 refreshed nothing (an unready host ages out of the claimable set); the
+        # next refresh, 300 s later, enrolled and posted ready.
+        self.assertEqual([c[0] for c in calls], ["enroll", "ready"])
+        self.assertEqual(calls[0][1], 600)
+
+    def test_unit_restarts_a_failed_agent_rate_bounded_and_never_a_refusal(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "systemd", "ezil-guard.service")
+        sections, current = {}, None
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    current = sections.setdefault(line[1:-1], {})
+                    continue
+                key, _, value = line.partition("=")
+                current[key] = value
+        service, unit = sections["Service"], sections["Unit"]
+        self.assertEqual((service["Type"], service["Restart"]), ("oneshot", "on-failure"),
+                         "oneshot allows on-failure only (systemd refuses always/on-success)")
+        self.assertGreater(int(service["RestartSec"]), 0)
+        self.assertGreater(int(unit["StartLimitIntervalSec"]), 0)
+        self.assertGreater(int(unit["StartLimitBurst"]), 0)
+        self.assertLessEqual(int(unit["StartLimitBurst"]), 5, "bounded restart rate")
+        self.assertIn("2", service["RestartPreventExitStatus"].split(), "a C-4 refusal is never retried")
+
+
 class Timing(PoolTest):
     def test_relay_poll_detects_arrival_within_quarter_second(self):
         self.patch(desktop, "read_desktop_config", side_effect=[None, None, {"expiresAt": 1000}])
@@ -567,14 +652,30 @@ class Lifecycle(PoolTest):
         stopped.assert_called_once()
 
     def test_unready_host_without_claim_never_reports_ready_or_adopts(self):
+        # R2-4 changed this from "pool_desktop_not_ready ends the agent" (one miss ended the
+        # host's pool agent for good): the unready host is kept, never posts ready, and waits
+        # for a claim, which the app never publishes to an unready host. Here the planner then
+        # fails it (the refresh's enrollment is refused) and nothing is adopted.
         client, guarded, stopped = self.lifecycle_stubs()
         self.patch(pool, "wait_ready", side_effect=Refused("pool_desktop_not_ready"))
-        with self.assertRaisesRegex(Refused, "pool_desktop_not_ready"):
+        waited = self.patch(pool, "wait_claim", side_effect=Refused("pool_request_refused", "enroll HTTP 409"))
+        with self.assertRaisesRegex(Refused, "pool_request_refused"):
             pool.run(self.cfg, POOL)
         client.ready.assert_not_called()
+        waited.assert_called_once()
+        self.assertEqual(client.enroll.call_count, pool.FIRST_BOOT_READY_ATTEMPTS)
         client.claim.assert_called_once_with()
         guarded.assert_not_called()
         stopped.assert_called_once()
+
+    def test_first_boot_miss_then_success_ends_ready_and_adopts(self):
+        client, guarded, _ = self.lifecycle_stubs()
+        self.patch(pool, "wait_ready", side_effect=[Refused("pool_desktop_not_ready"), HEALTH])
+        self.patch(enroll.http, "request", return_value=(200, ANSWER))
+        self.assertIn("pool claimed", pool.run(self.cfg, POOL))
+        client.ready.assert_called_once_with(HEALTH)
+        self.assertEqual(client.enroll.call_args_list, [mock.call(), mock.call(retry_seconds=20)])
+        guarded.assert_called_once()
 
     def test_failed_warm_stop_revokes_guard_and_unmounts_adopted_disk(self):
         _, _, stopped = self.lifecycle_stubs()

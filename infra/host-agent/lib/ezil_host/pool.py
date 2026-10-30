@@ -21,7 +21,14 @@ from .fsops import DIR_FLAGS, Refused, read_regular_at
 EPOCH_FILE = "pool-epoch.json"       # host root disk; survives reboots, never guest-visible
 POLL_SECONDS = 1.0
 READY_POLL_SECONDS = 0.25
+REFRESH_SECONDS = 300
 REFRESH_RETRY_SECONDS = 20
+# R2-4: a readiness miss is never fatal. A cold first boot (lazily loaded root volume) can need
+# more than one 180 s wait; each retry re-enrolls first, which is this host's liveness for the
+# planner's stall rule (ready-pool.ts bootStalled: not ready 5 min after enrolling = dead).
+# Bounded: after FIRST_BOOT_READY_ATTEMPTS misses the host waits for a claim unready, its
+# refreshes try again, and a host that never gets ready ages past that rule and is retired.
+FIRST_BOOT_READY_ATTEMPTS = 2
 TIMING_FILE = "pool-session-timing.json"
 TIMING_PHASES = ("claimObservedMs", "guardDoneMs", "enrollDoneMs", "warmStoppedMs",
                  "relayAvailableMs", "desktopStartedMs", "desktopHealthyMs")
@@ -293,26 +300,56 @@ def wait_ready(cfg, timeout=180):
         time.sleep(min(READY_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
+def first_ready(client, warm):
+    """The first boot's readiness: post ready once the warm desktop answers. True once posted;
+    False after FIRST_BOOT_READY_ATTEMPTS misses (never pool_desktop_not_ready: the caller keeps
+    the host and waits for a claim, and the next refresh tries again)."""
+    for attempt in range(FIRST_BOOT_READY_ATTEMPTS):
+        if attempt:
+            try:
+                client.enroll(retry_seconds=REFRESH_RETRY_SECONDS)
+            except Refused as e:
+                if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+                    raise                          # e.g. the planner already failed this host
+        try:
+            health = wait_ready(warm)
+        except Refused as e:
+            if e.code != "pool_desktop_not_ready":
+                raise
+            print(f"[pool] warm desktop not ready (attempt {attempt + 1}/{FIRST_BOOT_READY_ATTEMPTS})", flush=True)
+            continue
+        client.ready(health)
+        return True
+    return False
+
+
 def wait_claim(client, warm):
-    refresh_at = time.monotonic() + 300
+    refresh_at = time.monotonic() + REFRESH_SECONDS
     while True:
         claim = client.claim()
         if claim is not None:
             return claim
         if time.monotonic() >= refresh_at:
-            # Ready hosts require enrollment age < 10 min even when idle for hours.
+            # Ready hosts require enrollment age < 10 min even when idle for hours. Health first:
+            # an unready warm desktop never refreshes the enrollment, so a host that stays unready
+            # ages out of the claimable set instead of being handed to a user.
             try:
+                health = wait_ready(warm, timeout=REFRESH_RETRY_SECONDS)
                 client.enroll(retry_seconds=REFRESH_RETRY_SECONDS)
-                client.ready(wait_ready(warm, timeout=REFRESH_RETRY_SECONDS), retry_seconds=REFRESH_RETRY_SECONDS)
+                client.ready(health, retry_seconds=REFRESH_RETRY_SECONDS)
             except Refused as e:
                 # Leasing can refuse a refresh before the claim response is published.
                 claim = client.claim()
                 if claim is not None:
                     return claim
-                if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+                if e.code == "pool_desktop_not_ready":
+                    # R2-4: never fatal. The host stays; the next refresh tries again.
+                    print("[pool] warm desktop not ready at refresh; keeping the host", flush=True)
+                    refresh_at = time.monotonic() + REFRESH_SECONDS
+                elif e.code not in ("pool_retry_exhausted", "pool_unavailable"):
                     raise
             else:
-                refresh_at = time.monotonic() + 300
+                refresh_at = time.monotonic() + REFRESH_SECONDS
         time.sleep(POLL_SECONDS)
 
 
@@ -359,7 +396,8 @@ def _adopt(cfg, pool_lease):
                 # A guard process may have died while waiting for a claim.
                 if desktop.state(warm) != "running":
                     start_warm(warm, pool_lease)
-                client.ready(wait_ready(warm))
+                if not first_ready(client, warm):
+                    print("[pool] warm desktop not ready after the first boot's waits; refreshes retry", flush=True)
                 claim = wait_claim(client, warm)
             timing(cfg, "claimObservedMs", claim)
             record = reserve_claim(cfg, pool_lease, claim)

@@ -2,6 +2,12 @@
 Description=EZiL: mount the data volume by volume id + fs UUID (nosuid,nodev) and run the C-4 marker guard
 Requires=ezil-lease.service
 After=ezil-lease.service
+# A guard that crashes (in pool mode, the long-lived pool agent waiting for a claim) is restarted,
+# at most 3 starts per 15 minutes (R2-4: one failure must not end a warm host's pool agent for
+# good). Exit 2 is a refusal (a C-4 marker mismatch, a refused claim) and is never restarted.
+# A warm desktop's readiness miss is not a failure at all: pool.py keeps the host.
+StartLimitIntervalSec=900
+StartLimitBurst=3
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -11,3 +17,6 @@ Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
 UMask=0077
 ExecStart=/opt/ezil-host/bin/ezil-host-agent guard
 ExecStop=/opt/ezil-host/bin/ezil-host-agent data-down
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
