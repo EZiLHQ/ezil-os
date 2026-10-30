@@ -1,10 +1,11 @@
 # Reverse move contract: AWS → Cloudflare (Phase B, round 6b)
 
-**Status:** pinned (S0 r3), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
+**Status:** pinned (S0 r4), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
 A change to any wire shape, state, code or limit below changes this file first. Every lane cites the
 section it implements. r2 applied the review of `dc362e53` (§10). r3 closes the S0 verifier's contract gaps
-G1–G4 and the minors (§11 maps each gap to its section). Sections r3 changed carry the gap id in brackets,
-e.g. **[G1]**.
+G1–G4 and the minors (§11 maps each gap to its section). r4 applies the review of r3 (`4abd237a`; §12 maps each
+finding to its section). Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections r4 changed carry
+**[r4]**.
 
 **Base:** citations are `path:line` at `74ed2c92`. They point to the code each rule is based on.
 Citations to `provider-reverse-store.ts`, `0012` and the edited `provider-migrate-store.ts` are to this
@@ -25,6 +26,8 @@ branch (`r6/phaseb-20261030`).
     DB-computed `ages` (§3.4, §5.4);
   - **[0012 probe]** `reverseMovesTablePresent(db)` for every reader outside the machine (§3.4);
   - **[operator]** the operator runbook SQL (§5.5.1), executed verbatim by the store's PG suite.
+- **r4 (store only; 0012 still unchanged):** `markSnapshotSpent` and the spent-row filter of `listUnsnapshotted`, so one
+  failed snapshot execution can never hold the snapshot queue (§3.4, §7.1), with PG tests.
 
 Everything else below is a contract for lanes that have not started. **After r3, lane A is the only
 writer of `provider-reverse-store.ts` and its two test files** (§1.1).
@@ -75,13 +78,20 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 |---|---|
 | **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). |
 | **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
-| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer after r3)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4). Tests next to each. |
-| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
+| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer after r3)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
+| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the files-held banner, §6.2)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
 | **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack/IAM wiring for that machine (`infra/app-computers/lib/reverse-snapshot.ts` *new* plus its registration in the app-computers stack), the additive optional deployment field `reverseSnapshotStateMachineVersionArn` in `infra/app-computers/lib/lifecycle/release-manifest.ts` and `app/src/server/lib/compute/aws-intent.ts` (§7.1), `infra/app-computers/lib/ops.ts` (DLM role), their tests, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). |
 
+**[r4] Read-only on purpose:** `app/src/components/desktop/boot-phases.ts` and `boot-phases.shell.js` (drift-guarded
+against each other) belong to no lane. Nothing in this contract needs a new `BootErrorCode`: the move answers reuse
+existing codes, and lane U reads the move flags before `classifyFailure` (§5.3, §6.4). `shell/ezil/apps/code.js` is
+read-only too; its mint goes through the same answers.
+
 Shared seams, each owned by one side:
-- `provider-reverse-store.ts` is **A**'s. O only calls `listUnsnapshotted`, `listRetentionExpired` and
-  `recordSnapshot`; a new read O needs is added by A.
+- `provider-reverse-store.ts` is **A**'s. O only calls `listUnsnapshotted`, `listRetentionExpired`, `recordSnapshot` and
+  **[r4] `markSnapshotSpent`**; a new read O needs is added by A.
+- **[r4]** The summary: the reads (`billing.ts`) and the builder (`summary.ts`) are **A**'s; the rendering (`computers.js`,
+  `billing.js`) is **U**'s (§6.1, §6.2).
 - The sweep's call site is **A**'s (`handler.ts`); the snapshot step it calls (`advanceReverseSnapshots`) is **O**'s (§5.4, §7).
 - `computer.progress`: the server DTO is **A**'s (`progress.ts`), its rendering is **U**'s (§5.10).
 
@@ -274,6 +284,7 @@ The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:43`). Every 
 | `failed_needs_operator → committed` | `finish(m, …)` | operator only, through the same flip code (§5.6 step 3) | `commit_sent_at` is set. |
 | `failed_reopened` (self) | runbook SQL `operator_cleared` (§5.5.1) | operator only | The computer's newest row, with a `reopen_final` code. Sets `last_error = 'operator_cleared'`, so Try again is offered again (§5.9). No store method sets it. |
 | committed (self) | `recordSnapshot(m, snapId)` | lane O (§7) | **[G4]** Once: a CAS on `aws_snapshot_id IS NULL`. The same id again returns the row (a lost response); a different id never replaces it. |
+| committed (self) | **[r4]** `markSnapshotSpent(m, reason)` | lane O (§7.1 Failure) | `reason` ∈ `REVERSE_SNAPSHOT_SPENT_REASONS`. Once: a CAS on `state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL`. It writes only `last_error` and `updated_at`. A replay, or a row that already left the queue (snapshotted, or spent with another reason), returns the current row. |
 | any in-flight (self) | `recordRetry(m, reason)` | machine | `attempts < 5`, else `{exhausted:true}` and nothing is written; the caller compensates and `fail`s. **In `flipping` it is never exhausted** (attempts saturate at 5): `flipping` is bounded by time (§5.4). |
 
 A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throws `illegal_transition` and writes nothing. The caller re-reads; nothing retries inside the store.
@@ -297,13 +308,25 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 
 - **Reads:** `readById`, `readByComputer` (newest, any state), `readActiveByComputer` (holding), **`readByExportBoot(computerId, placementGeneration, leaseEpoch, volumeId)`** (the newest row in any state **except `committed`** whose `export_boot` claimed exactly that triple; §5.2 keys on it).
 - **[G4] Reads added in r3** (plain reads, no row lock; bounds clamp like `claimStale`, and `0`, negative or `NaN` return nothing):
-  - **`listUnsnapshotted(limit ≤ 10, committedForSeconds = 0)`**: `committed` rows with `aws_snapshot_id IS NULL`, ordered by
-    `state_entered_at, id` (a committed row's `state_entered_at` is its commit time; `recordSnapshot` never moves it), and only
-    rows committed at least `committedForSeconds` ago **on the DB clock**. The sweep's snapshot step passes 0; the
-    `snapshot_missing` listing passes 3600 (§7).
+  - **`listUnsnapshotted(limit ≤ 10, committedForSeconds = 0, {includeSpent = false} = {})`**: `committed` rows with
+    `aws_snapshot_id IS NULL`, ordered by `state_entered_at, id` (a committed row's `state_entered_at` is its commit time;
+    `recordSnapshot` and `markSnapshotSpent` never move it), and only rows committed at least `committedForSeconds` ago
+    **on the DB clock**. **[r4]** Rows marked spent (`last_error IN REVERSE_SNAPSHOT_SPENT_REASONS`) are left out unless
+    `includeSpent` is true. The sweep's snapshot step calls `listUnsnapshotted(3)`; the `snapshot_missing` listing calls
+    `listUnsnapshotted(10, 3600, {includeSpent: true})` (§7.1).
   - **`listRetentionExpired(limit ≤ 100)`**: `committed` rows with `retain_until < clock_timestamp()`, ordered by `retain_until, id`.
   - `REVERSE_SNAPSHOT_LIST_MAX = 10`, `REVERSE_RETENTION_LIST_MAX = 100`.
-- **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, `claimStale(limit ≤ 10)`.
+- **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, **[r4] `markSnapshotSpent`**, `claimStale(limit ≤ 10)`.
+  - **[r4] `markSnapshotSpent(m, reason)`**: takes a committed row whose snapshot execution is spent out of the sweep's
+    queue (§7.1). `reason` is `snapshot_failed` (the execution ended FAILED, TIMED_OUT or ABORTED) or
+    `snapshot_receipt_invalid` (it SUCCEEDED, but its receipt fails validation): `REVERSE_SNAPSHOT_SPENT_REASONS`. The CAS
+    is on `state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL`, so the first reason wins and a
+    replay is free. After a write that matched nothing it re-reads: a committed row that is snapshotted or already
+    spent is returned unchanged; anything else is `lost_race`. A copy that is not `committed` is `illegal_transition`,
+    and an unknown reason is `invalid_input`, both with no statement. It never moves `state_entered_at`,
+    `retain_until` or `aws_snapshot_id`. A spent row still takes `recordSnapshot` and the `operator_snapshot` runbook
+    statement. **A committed row's `last_error` is never shown to the user**: the summary's and `computer.progress`'s
+    `reason` is null for `committed` (§5.10, §6.1).
   - `claimStale` takes in-flight rows idle for 30 s, oldest first, with `FOR UPDATE SKIP LOCKED`, and bumps `updated_at` only. It mirrors forward `claimStale`. `failed_needs_operator` is never claimed.
   - **[G4] `recordSnapshot` (r3)** is a compare-and-swap on `id`, `state = 'committed'` and `aws_snapshot_id IS NULL`, not on
     `updated_at`. After a write that matched nothing it re-reads: the same id already recorded returns the row (the replay
@@ -330,9 +353,11 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - `summary.computer.moveAvailable` is false (§6.1), so no move action is shown;
   - routing, `computer.progress`, the summary and the open trigger behave exactly as today.
   - Lane A tests each of these on a database without 0012.
-- **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`.
+- **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`,
+  **[r4]** `REVERSE_SNAPSHOT_SPENT_REASONS = ['snapshot_failed', 'snapshot_receipt_invalid']`.
 - To write inside a placement transaction, build the store over that `tx`.
-- **Owner after r3: lane A** (§1.1). Lane O consumes the three snapshot/retention calls and adds nothing here.
+- **Owner after r3: lane A** (§1.1). Lane O consumes the four snapshot/retention calls (`listUnsnapshotted`,
+  `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`) and adds nothing here.
 
 ---
 
@@ -501,6 +526,12 @@ It does exactly this, in one `withAdmission` transaction (`placement.ts:582-588`
 3. `readAdmissionCounters(tx, lock, {userId, computerId, monthStart: utcMonthStart(now), now})` (`placement.ts:1725-1735`).
 4. `readPlacement(tx, computerId)`. The row must be `aws-ec2`, owned by `userId`, `STOPPED`, `lifecycleJobId` null, and at
    `expected`. Otherwise return `cas_conflict`.
+   **[r4]** An image-rebase reservation makes `readPlacement`, `readAdmissionCounters` (through `readCounters`) and
+   `leasePlacement` (through `casInTx`) throw `ImageJobConflictError` (`assertNoImageReservation`, `placement.ts:428-436`, called by
+   `readPlacement` at `:401,407`, by `readCounters` through `readPlacement` at `:1780`, and by `casInTx` at `:961`, whose CAS also
+   requires `image_upgrade_job_id IS NULL` at `:981`).
+   `admitExportBoot` catches exactly that error from steps 3, 4 and 7, lets the transaction roll back, and returns
+   `cas_conflict`. It never escapes as a 500 or an unclassified failure (§5.2.1).
 5. `decideAdmission({config, counters, userId, now, region: {kind:'lease', region: placement.region}, instanceType: placement.instanceType})`
    (`admission.ts:93-143`). Then **remove `user_hours_cap` and `user_egress_cap` from `reasons`**. If any reason is left,
    refuse with the first one left.
@@ -520,15 +551,26 @@ apply; the user's own allowance does not.
 | `decideAdmission` reason | Applies? | Outcome in `requested` |
 |---|---|---|
 | `aws_disabled`, `aws_config_invalid`, `kill_switch` | yes | `reopen` → `kill_switch` (**try later**) |
-| `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap` | yes | **wait**: stay in `requested` with no `recordRetry`, and claim again on the next pass. At `ages.created ≥ 600` → `reopen` → `boot_unavailable` (**try later**). |
-| `cas_conflict` (the row moved, or the lease CAS was lost) | — | **wait**: re-read on the next pass, with no retry count. |
+| `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap` | yes | **wait**: stay in `requested` with no `recordRetry`, and claim again on the next pass. At `ages.created ≥ 600` → the deadline rule below. |
+| **[r4]** `duplicate_placement`, `region_not_configured` | yes | **wait**, exactly like the capacity row, and log `[reverse-move] anomaly` once per pass. These come from the whole fleet or the deployment, not from this computer: `findDuplicatePlacements` groups the whole table (`placement.ts:501-508`, read at `:1819`, refused at `admission.ts:123`), and `region_not_configured` is deployment configuration (`admission.ts:136-137`). A final failure would need operator SQL on every move in `requested` during one episode. |
+| `cas_conflict` (the row moved, the lease CAS was lost, or **[r4]** an image-rebase reservation, step 4) | — | **wait**: re-read on the next pass, with no retry count. |
 | `user_hours_cap`, `user_egress_cap` | **no**: removed in step 5 | — |
 | `user_has_aws_computer` | yes. It passes for this computer: the counter excludes the target computer (`p.computer_id <> target`, `placement.ts:1803-1807`) and its own demand (`:1810-1816`). It fails only when the user holds **another** AWS computer or demand. | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
-| `computer_not_owned`, `computer_deleted`, `duplicate_placement`, `region_not_configured` | yes | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
+| `computer_not_owned`, `computer_deleted` | yes | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `aws_tier_invalid` | cannot occur (no tier is requested) | — |
 
+**[r4] The `requested` deadline rule (one rule; §5.4 and §5.5 say the same).** Nothing durable records why earlier passes
+waited (waits write no `last_error`), so the outcome is decided **only from the deadline pass itself**, the first pass
+with `ages.created ≥ 600`. That pass runs its ordinary work first (kill switch, entitlement, the placement read, then the
+claim when the read is claimable), then, if the row is still `requested`:
+- the pass's own placement read was **not claimable**: not `aws-ec2` `STOPPED`, a `lifecycleJobId` set, or the read
+  threw `ImageJobConflictError` → `reopen` → **`computer_busy`**;
+- otherwise the pass attempted the claim and it was refused (any wait reason above, including `cas_conflict`) →
+  `reopen` → **`boot_unavailable`** (**try later**).
+
 The **try-later** outcomes are exactly `kill_switch` and `boot_unavailable`. Both are `failed_reopened` with `retry: 'now'`,
-and the user copy is the §6.3 "try later" row.
+and the user copy is the §6.3 "try later" row. `computer_busy` is an ordinary `reopen` (§6.3 default row).
+`boot_refused` is now only computer-specific: `user_has_aws_computer`, `computer_not_owned`, `computer_deleted`.
 
 **Entitlement start-gate admission does not apply**: there is no `admitStart`/`decideStart`, which would refuse a Free
 user's size (`compute-access.ts:210-217`). Free never uses the pool (`aws-ec2.ts:476`), so lane A calls `admitExportBoot`
@@ -591,6 +633,42 @@ Lane A lists **every actor that acts on an `aws-ec2` row in LEASED, STARTING or 
 
 The machine reads the boot's receipt itself (pattern: `readMigrationReadyReceipt`, `aws-receipts.ts:1116-1130`). It records `jobId`, `instanceId` and `fsUuid` with `recordExportBoot`, and advances to `exporting` once enrollment succeeded (`lastError === ENROLLMENT_SUCCEEDED`, the row MOUNTING with no job).
 
+### 5.2.1 Image-rebase reservations and reverse moves exclude each other **[r4]**
+
+**The gap at base.** The image store reserves an `aws-ec2` placement that is `STOPPED` or `RUNNING`
+(`aws-rebase-store.ts:396-401`). It refuses while a forward migration is active (`:402-405`) or a pool host is leased
+(`:406-408`), but it never looks at reverse rows. A move's placement is `STOPPED` in `requested`, in `checking` after the
+host retire, and in `flipping`. A reservation taken then makes every ordinary placement read and CAS throw
+`ImageJobConflictError` (§5.1.1 step 4), and the image job may move `generation`/`leaseEpoch` (`writeImagePlacement`,
+`placement.ts:470-498`). The flip's "STOPPED at N+1/E+1" check would then fail for good.
+
+**Rule (lane A owns `aws-rebase-store.ts` for this one edit, §1.1).** In `reserve`, inside the same `withAdmission`
+transaction, after `lockImagePlacement` (`aws-rebase-store.ts:389`; it takes the computer lock, `placement.ts:445-447`) and
+right after the `ezil_compute_migrations` check (`:405`), call `reverseMoveHolds(tx, j.computerId)`
+(`provider-reverse-store.ts:225-230`). It probes 0012 first (none → no reverse move, so production is unchanged), re-takes the
+same computer lock (re-entrant within the transaction) and reads the holding states. `true` →
+`throw new ImageJobConflictError()`, exactly like the migrations check. A holding row includes `failed_needs_operator`.
+
+**Why that closes it.** The reverse create inserts and then takes the same computer lock (§3.3). So under READ COMMITTED,
+a reservation that locks after a reverse create commits sees the row and refuses. The reverse create does not check
+reservations. One race is left: a reservation that committed **before** the row was created. Its only effect is in
+`requested`: the claim catches `ImageJobConflictError` and waits (§5.1.1 step 4), bounded by the deadline rule
+(`computer_busy`). Every later state (`booting` onward) is reached only through a claim that succeeded, which is a CAS
+with `image_upgrade_job_id IS NULL` (`placement.ts:981`) under the computer lock. Any reservation after that point locks
+after the row exists and is refused. So in `booting` … `flipping` a reservation is impossible, not merely handled.
+
+**Mapping elsewhere (values, never a 500):**
+- `computer.move.start`/`retry`: a placement read that throws `ImageJobConflictError` → `move_computer_unsettled` (§5.9).
+- The open trigger (§5.9): it does not fire, and the open proceeds as today (today's open also fails closed on a reservation).
+- `computer.progress` and the summary: unchanged from today for that read.
+
+**Lane A tests:**
+- `rebase.pg`: `reserve` is refused while a reverse row is in each holding state (`requested`, `booting`, `checking`,
+  `flipping`, `failed_needs_operator`). It succeeds after `committed`/`failed_reopened`, and on a schema without 0012.
+- The admission unit test: `admitExportBoot` turns a thrown `ImageJobConflictError` into `cas_conflict`, and the lease
+  rolls back.
+- start/retry answer `move_computer_unsettled`, never a throw.
+
 ### 5.3 Routing while a move exists (`select.ts`, before the placement provider, like `providerForPendingMigration`, `provider-migrate-placement.ts:27-34`, `select.ts:101`)
 
 Every read here starts with `reverseMovesTablePresent` (§3.4); no 0012 means no reverse row.
@@ -598,7 +676,7 @@ Every read here starts with `reverseMovesTablePresent` (§3.4); no 0012 means no
 | Newest reverse row for the computer | Open / session routing |
 |---|---|
 | in flight (`requested` … `flipping`) | The **reverse waiting provider** (below). Opens wait and the shell shows the move view (§5.10). They never boot or adopt the AWS computer for a session. |
-| `failed_needs_operator` with `openBlocked` (§5.5: `commit_sent_at` set, or reason `already_imported`/`commit_in_progress`) | **Refuse at once** with a typed `PRECONDITION_FAILED` `computer_move_needs_attention`. Never the waiting provider: the shell shows the needs-attention card, never a spinner. |
+| `failed_needs_operator` with `openBlocked` (§5.5: `commit_sent_at` set, or reason `already_imported`/`commit_in_progress`) | **[r4]** The **reverse blocked provider** (below): it refuses at once **as a value**, never a thrown tRPC error. Never the waiting provider: the shell shows the needs-attention card, never a spinner. |
 | `failed_needs_operator` without `openBlocked` | Ordinary AWS routing. The files are intact on AWS; only Cloudflare-side cleanup is pending. The row still blocks new moves. |
 | `committed`, `failed_reopened`, none | Ordinary routing on the placement. |
 
@@ -616,6 +694,31 @@ applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,432-442`) and the
   `computer_moving`, next to `awsMigrationAnswer` (`compute-dispatch.ts:161-165`).
 - An old cached shell sees an ordinary retryable `sandbox_starting`: it re-asks under its wake deadline, then shows
   Try again. The move goes on; the next open sees it. The shell that ships with A (lane U) reads `computeMoving` (§6.4).
+
+**The reverse blocked answer [r4] (pinned; `provider-reverse-placement.ts`, lane A).** r3 threw `PRECONDITION_FAILED` from
+`select.ts`. That breaks the shell's rule that the open route answers failures as values on a 200 (`session.js:705-708`).
+The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`). `unknown` is retryable
+(`boot-phases.shell.js:334-340,367-372`), so the shell re-asks once in silence. A throw from routing also reaches every
+`routeComputer` caller. So `select.ts` returns a blocked provider, the same pattern as the waiting provider:
+- `ensure` → `{ok: false, error: 'computer_move_needs_attention', errorCode: 'preconditions_unmet', retryable: false, computeProvider: 'aws-ec2'}`.
+  `preconditions_unmet` is an existing deterministic code on both sides (`cloudflare-guacamole-provider.ts:344,391-397`;
+  `boot-phases.shell.js:334-340`). The AWS preview path answers every `ok: false` as a value (`awsPreviewAnswer`,
+  `compute-dispatch.ts:207-239`), and `shellCodeForAwsEnsure` passes the code through unchanged (`:144-146`). The shell
+  therefore never re-asks it, and no new `BootErrorCode` is needed (§1.1).
+- `status` → the same plus `state: 'error'`.
+- `activity`, `restart` → `{ok: false, error: 'computer_move_needs_attention'}`. `stop`, `terminate` →
+  `{ok: false, terminated: false, outcome: 'computer_move_needs_attention'}`.
+- `compute-dispatch.ts` adds **`computeMoveNeedsAttention: true`** to any answer whose provider `error` is
+  `computer_move_needs_attention`, next to `computeMoving`. (`awsPreviewAnswer` rewrites `error` to the errorCode, so the
+  flag is the only carrier.)
+- Lane U reads the flag in `session.js` **before** `classifyFailure` (`openDesktopOnce` and `pendingOrRefused`, which
+  `code.js:209` also uses). It shows the §6.4 needs-attention card, with no retry and no spinner. An old cached shell gets
+  the generic deterministic failure copy (`preconditions_unmet` → `unknown` copy, `boot-phases.ts:506-511`) with no
+  silent re-ask. That is disclosed, and acceptable: the state is rare and operator-attended.
+- Every other `routeComputer` caller sees an ordinary refusal value. `computer.delete` gets a `terminate` with `ok: false`
+  and refuses with `PRECONDITION_FAILED aws_retire_unavailable: computer_move_needs_attention` (`computer.ts:103-108`; `AWS_RETIREMENT_UNDERWAY` is only the retire outcomes, `aws-ec2.ts:131`),
+  as it does today for `computer_migrating`. The same holds during a move (`computer_moving`). A computer with a move
+  in flight or open-blocked is never deleted, and its export boot is never retired by a delete.
 
 ### 5.4 Step work, deadlines and throughput
 
@@ -661,7 +764,7 @@ anchor against `Date.now()`. claimStale never moves an anchor.
 
 | State | Work per pass | Done when | Deadline → outcome (compensation first, §5.7) |
 |---|---|---|---|
-| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Placement not STOPPED, or a job pending → wait. Otherwise claim (§5.1.1); a capacity refusal or `cas_conflict` → wait (§5.1.1 table). | claim recorded | 10 min after `created_at` (`ages.created ≥ 600`): `computer_busy` if the placement never became claimable, else `boot_unavailable` (capacity refused). |
+| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Read the placement: not `aws-ec2` STOPPED, a job pending, or **[r4]** the read throws `ImageJobConflictError` → wait. Otherwise claim (§5.1.1); a capacity, fleet or deployment refusal, or `cas_conflict` → wait (§5.1.1 table). | claim recorded | **[r4]** 10 min after `created_at` (`ages.created ≥ 600`), decided from **this pass only** (§5.1.1 deadline rule): this pass's placement read was not claimable → `computer_busy`; otherwise this pass's claim was refused → `boot_unavailable`. |
 | `booting` | Read the boot receipt and enrollment. | enrolled → `advance('exporting')` | Boot settled as failed (UNCONFIRMED, or STOPPED by an undo) → `boot_failed`. **15 min after `booting`'s `state_entered_at`** (`ages.stateEntered`) → `boot_timeout`. |
 | `exporting` | Worker `begin` (until it succeeds), then `pull{count:0}` on every pass | status `ready` and a valid head → `recordExportHead` | Host `failed` → §5.5. **20 min after `state_entered_at`** → `export_timeout`. |
 | `copying` | `pull{from:next, count:64}` until the budget is spent, then `recordImportProgress(stored)` | bitmap complete → `advance('checking')` | No new chunk for **10 min** (`import_progress.last`, or `state_entered_at` before the first chunk) → `copy_stalled`. **60 min after `state_entered_at`** → `copy_timeout`. |
@@ -686,8 +789,9 @@ The classes are:
 | any pre-flip | entitlement became paid (re-read at every pass) | `reopen` → `entitlement_paid` (no Try again button needed, §6.3) |
 | `requested` | kill switch on | `reopen` → `kill_switch` |
 | `requested` (claim, §5.1.1) **[G2]** | admission `aws_disabled`, `aws_config_invalid`, `kill_switch` | `reopen` → `kill_switch` (try later) |
-| `requested` (claim) **[G2]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, or `cas_conflict` | wait (no `recordRetry`); at `ages.created ≥ 600` → `reopen` → `boot_unavailable` (try later) |
-| `requested` (claim) **[G2]** | admission `user_has_aws_computer`, `computer_not_owned`, `computer_deleted`, `duplicate_placement`, `region_not_configured` | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
+| `requested` (claim) **[G2] [r4]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, `duplicate_placement`, `region_not_configured` (the last two also log `[reverse-move] anomaly`), or `cas_conflict` (including a caught `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `boot_unavailable` (try later) |
+| `requested` (read) **[r4]** | the pass's placement read is not claimable (not `aws-ec2` STOPPED, a job, or `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `computer_busy` |
+| `requested` (claim) **[G2] [r4]** | admission `user_has_aws_computer`, `computer_not_owned`, `computer_deleted` | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `begin` (`exporting`) | `container_running`, `export_host_mismatch`, `unavailable` (incl. `export_unreachable`), `not_found` | `retry` |
 | `begin` | `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `other` | `reopen_final` → the code (`other` → `worker_conflict`) |
 | `begin`/`pull` | `already_imported` | `operator` → `already_imported` (impossible before `flipping`; the Cloudflare head is ours) |
@@ -716,11 +820,12 @@ The classes are:
 - `failed_reopened`:
   - `reopen`: `entitlement_paid`, `kill_switch`, `computer_busy`, `boot_unavailable`, `boot_failed`, `boot_timeout`, `export_timeout`, `export_failed`, `copy_stalled`, `copy_timeout`, `check_timeout`, `import_corrupt`, `import_lost`, `requested_retries`, `booting_retries`, `exporting_retries`, `copying_retries`, `checking_retries`, `operator_released`, `operator_cleared`;
   - `reopen_after_session`: `workspace_too_large`;
-  - `reopen_final`: `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `workspace_missing`, `worker_conflict`, **`boot_refused`** (r3, §5.1.1).
+  - `reopen_final`: `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `workspace_missing`, `worker_conflict`, **`boot_refused`** (r3, §5.1.1; r4: computer-specific refusals only).
   - **Try later** (r3, §5.1.1): `kill_switch` and `boot_unavailable` only. They are `reopen` codes with their own copy (§6.3).
 - `failed_needs_operator`:
   - Open works: `abort_unconfirmed`, `boot_unsettled`;
   - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`.
+- **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`.
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
 
 #### 5.5.1 Operator runbook SQL (pinned; the only operator writes) **[minor: operator_cleared]**
@@ -832,25 +937,47 @@ If step 1 or step 2 cannot be confirmed within its bound, write `failed_needs_op
 - **`computer.move.start`** (new mutation in `app/src/server/api/routers/computer.ts`, `startedBy:'user'`).
   - Requires standing `files_on_aws` (`standing.ts:12-13`), an `aws-ec2` placement, the kill switch off, and no forward work.
   - It refuses `move_unavailable` after a `reopen_after_session` failure with no AWS session since, or a `reopen_final` failure that is not `operator_cleared`.
-  - It returns the holding row (creating it when none holds).
+  - It returns the holding row, or creates one when none holds and every check below passes.
   - **[G3] It never creates a row for a computer that is in use.** Refusals are **values**, like `switchConfiguration`'s
-    (`computer.ts:241-246`): `{ok: false, reason}` or `{ok: true, move: ComputerMoveV3}`. They are checked in this order,
-    on the placement read in the same request:
+    (`computer.ts:241-246`): `{ok: false, reason}` or `{ok: true, move: ComputerMoveV3}`.
+  - **[r4] Order.** r3 ran the placement checks before the holding-row check. With D20 the move usually starts from an open
+    in another window, and the export boot's placement is LEASED/STARTING/MOUNTING (`booting`) or
+    UNCONFIRMED/RECOVERING/RETIRING (`checking`). So a stale card's click answered `move_computer_running` or
+    `move_computer_unsettled` in the middle of the move. With the kill switch on it answered `move_paused`, although an
+    in-flight move continues under the kill switch (§5.10). **The holding-row check now comes first, and the placement
+    checks run only when no row holds.** The steps, in this order, all in the same request:
 
-    | `reason` | When | Copy key (§6.3) |
-    |---|---|---|
-    | `move_unsupported` | this database has no 0012 (`reverseMovesTablePresent` false: production today) | none; the action is not shown (`moveAvailable` false) |
-    | `move_not_held` | standing is not `files_on_aws`, or the placement is not `aws-ec2` | none; the card is not shown |
-    | `move_paused` | the kill switch is on (`aws-config.ts:274`) | try later |
-    | `move_busy` | forward work for the computer (`forward_active`, §3.3) | try later |
-    | **`move_computer_running`** | the placement is `RUNNING`, `LEASED`, `STARTING`, `MOUNTING`, `DRAINING` or `STOPPING`, **or has a `lifecycleJobId`** (a D16 hold session is open or a job is pending) | **stop first** |
-    | `move_computer_unsettled` | any other non-`STOPPED` state (`UNCONFIRMED`, `RECOVERING`, `RETIRING`, …) | try later |
-    | `move_unavailable` | the newest row's failure forbids Try again (above) | the failed card's own copy |
+    | # | Check | start answers | retry answers | Copy key (§6.3) |
+    |---|---|---|---|---|
+    | 1 | this database has no 0012 (`reverseMovesTablePresent` false: production today) | `move_unsupported` | `move_unsupported` | none; the action is not shown (`moveAvailable` false) |
+    | 2 | **a reverse row holds the computer** (`readActiveByComputer`: any in-flight state or `failed_needs_operator`), owned by the user | **`{ok: true, move}` for that row**, in every state, with the kill switch on or off | `move_in_progress` | the move's own card (§6.3) |
+    | 3 | standing is not `files_on_aws`, or the placement is not `aws-ec2` | `move_not_held` | `move_not_held` | none; the card is not shown |
+    | 4 | the kill switch is on (`aws-config.ts:274`) | `move_paused` | `move_paused` | try later |
+    | 5 | forward work for the computer (`forward_active`, §3.3) | `move_busy` | `move_busy` | try later |
+    | 6 | the newest row's failure forbids Try again (above) | `move_unavailable` | `move_unavailable` | the failed card's own copy |
+    | 7 | the placement is `RUNNING`, `LEASED`, `STARTING`, `MOUNTING`, `DRAINING` or `STOPPING`, **or has a `lifecycleJobId`** (a D16 hold session is open or a job is pending) | **`move_computer_running`** | `move_computer_running` | **stop first** |
+    | 8 | any other non-`STOPPED` state (`UNCONFIRMED`, `RECOVERING`, `RETIRING`, …), or **the placement read throws `ImageJobConflictError`** (§5.2.1) | `move_computer_unsettled` | `move_computer_unsettled` | try later |
+    | 9 | none of the above | `createOrGetActive` → `{ok: true, move}` | same (a new row) | the move's card |
 
+  - `move_unavailable` (6) comes **before** the placement checks (7, 8) on purpose. The "stop first" copy promises that
+    the move starts once the computer has stopped. For a computer whose Try again is forbidden, that promise would be
+    false: the user would stop the computer only to be told the move is unavailable.
+  - Store refusals from step 9 are values too: `forward_active` → `move_busy`; `owner_mismatch` → `move_not_held`;
+    `create_failed` → `move_busy`. Step 2 checks the owner exactly like the forward row (`progress.ts:145`); another
+    owner's row → `move_not_held`.
+  - The closed union, in check order: `move_unsupported`, `move_in_progress` (retry only), `move_not_held`, `move_paused`,
+    `move_busy`, `move_unavailable`, `move_computer_running`, `move_computer_unsettled`.
   - So a held computer is only ever claimed from `STOPPED`. The `requested` wait (§5.4) is left for races, such as a
-    reconciler's job, and is still bounded by `computer_busy` at 10 min. The next-open trigger fires only from `STOPPED`
-    (below), so it is unaffected.
-- **`computer.move.retry`** (new mutation). It is the same as start, with the same refusals. It exists because the shell's `move-retry` must stop calling `switchTo` (`computers.js:1255-1258`). It is refused while a row holds the computer, which includes `failed_needs_operator` (`reason: 'move_in_progress'`).
+    reconciler's job or an image-rebase reservation, and is still bounded by the deadline rule (`computer_busy`) at
+    10 min. The next-open trigger fires only from `STOPPED` (below), so it is unaffected.
+  - **Lane A tests [r4]:** start and retry in every in-flight state (`requested` … `flipping`, with the export boot's
+    placement in each of LEASED, STARTING, MOUNTING, MOUNTING with a job, UNCONFIRMED, RECOVERING, RETIRING and STOPPED) and in
+    `failed_needs_operator`: start returns that row, retry answers `move_in_progress`. One test turns the kill switch on
+    mid-move: start still returns the row. One test per refusal in the order above, including `ImageJobConflictError` →
+    `move_computer_unsettled` and `move_unavailable` before `move_computer_running`.
+- **`computer.move.retry`** (new mutation). It is the same as start, except that a holding row answers
+  `move_in_progress` (step 2). It exists because the shell's `move-retry` must stop calling `switchTo`
+  (`computers.js:1255-1258`).
 - **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:190-193`), before `routeComputer`, never in reads, `computer.progress`, `status` or the hosted-app routes. The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
   - standing `files_on_aws`;
   - the placement is `aws-ec2` `STOPPED` with no lifecycle job and no lease (no transition active);
@@ -906,7 +1033,7 @@ anything placement-derived. With no 0012, or no row, the output is byte-for-byte
 operation: 'moving';                    // NEW value. Never 'opening', 'stopping' or 'migration'.
 stage: 'moving' | 'needs_operator';     // 'moving' is NEW: an old shell has no copy for it, so its progressView returns null.
 recordedStage: ReverseMoveState;        // the row's state (diagnostics only)
-lifecycleState: PlacementState | null;  // the export boot's placement state (diagnostics only; drives nothing here)
+lifecycleState: null;                   // [r4] always null in the moving view (the real state is move.placementState)
 paused: false; operationsPaused: false; // an in-flight move continues under the kill switch: D-7 gates new work only
 needsOperator: boolean;                 // true only in the openBlocked row above
 active: boolean;                        // true while in flight
@@ -933,9 +1060,10 @@ move?: null | {
     budgetSeconds: number;               // 9300 (below)
     bytesDone: number | null; bytesTotal: number | null;
     outcome: null | 'committed' | 'failed_reopened' | 'failed_needs_operator';
-    reason: string | null;               // terminal only: last_error, from the §5.5 closed list
+    reason: string | null;               // failed_* only: last_error, from the §5.5 closed list; null for committed [r4]
     retry: 'now' | 'after_aws_session' | 'no' | null;   // terminal only, as §6.1
     openBlocked: boolean;
+    placementState: PlacementState | null; // [r4] diagnostics only: the export boot's placement state; no shell reads it
 };
 ```
 
@@ -951,9 +1079,23 @@ move?: null | {
   The shell never fails a move on its own clock before `startedAt + budgetSeconds + 300 s` (§6.4).
 - **Old cached shells:** `progressView` returns null for the unknown stage `moving` (`computer-progress.js:131-133`), so they
   show no opening bar, no `needs_operator` and no wrong copy. Their open loop sees an ordinary `sandbox_starting` (§5.3).
+- **[r4] Why `lifecycleState` is null.** The Computer tab derives `running`, `stopped`, its chip and the Stop button from
+  `lifecycleState` (`computers.js:429-431,444-449,692,702`) and dismisses on `STOPPED` (`:790`). The export boot's placement
+  is `STOPPED` in `requested`, in `checking` after the host retire and in `flipping`, and `MOUNTING` in `booting`. Passed
+  through, it would show "Stopped" and offer Open or Start mid-move in old and new shells alike. With `null`, an old
+  shell shows no chip, no Stop and no "Now running". Its Open button stays enabled, and opening meets the waiting
+  answer (§5.3). The new shell follows §6.4. The real state is `move.placementState`, for diagnostics only.
+- **[r4] Terminal rows keep today's placement description, so `stage` never identifies the outcome.** A `failed_reopened`
+  row arrives with the hold's own stage (for example `stopped`). A `failed_needs_operator` row without `openBlocked`
+  (`boot_unsettled`, placement UNCONFIRMED) can arrive with `stage: 'needs_operator'` and `move.openBlocked: false`. A
+  committed row arrives with the Cloudflare placement's stage (`unavailable` or `stopped`). **Whenever `move` is
+  non-null and `move.outcome` is set, the shell keys the outcome on `move.outcome` and `move.openBlocked` only, never on
+  `stage`** (§6.4). Only the openBlocked row (table above) sets `stage: 'needs_operator'` from the move itself.
 - **Lane A tests:** for each export-boot placement state with an in-flight row (LEASED, STARTING, MOUNTING, MOUNTING past
   enrollment grace, UNCONFIRMED/`ENROLLMENT_FAILED` from `releaseExportBoot`, RECOVERING, RETIRING, STOPPED/`INSTANCE_LOST`),
-  check `operation: 'moving'`, `needsOperator: false`, `typicalSeconds` equal to the move's, and no opening written. Also: a
+  check `operation: 'moving'`, `needsOperator: false`, **[r4] `lifecycleState: null` with the real state in `move.placementState`**,
+  `typicalSeconds` equal to the move's, and no opening written. **[r4]** A committed row's `move.reason` is null even when
+  `last_error` is a §7.1 spent reason. Also: a
   database without 0012 gives today's output exactly.
 
 ## 6. Summary DTO and shell (lanes A + U)
@@ -978,8 +1120,9 @@ interface ComputerMoveV3 {
 // summary.computer.moveOnOpen: boolean. True when standing is files_on_aws, no move holds, and the open
 // trigger would fire (§5.9: not founder-owned, newest row not failed_*). The pre-move card copy needs it.
 // summary.computer.moveAvailable: boolean (r3). True only when this database has 0012, AWS computers are enabled
-// with the kill switch off (aws-config.ts:274), standing is files_on_aws and the placement is aws-ec2. Without it
-// no move action is shown: production has no 0012 today, and its users must never see a button that cannot work.
+// with the kill switch off (aws-config.ts:274), standing is files_on_aws and the placement is aws-ec2 (r4: and the
+// newest row's failure does not forbid Try again, §6.1.1). Without it no move action is shown: production has no
+// 0012 today, and its users must never see a button that cannot work.
 ```
 
 - **Stage map** (`REVERSE_MOVE_DTO_STAGE`, `provider-reverse-store.ts:57`): `requested`, `booting` and `exporting` → `saving` (step 0); `copying` → `copying` (1, with bytes); `checking` → `checking` (2); `flipping` → `flipping` (3).
@@ -988,6 +1131,70 @@ interface ComputerMoveV3 {
 - **Visibility [clocks]:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
 - Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `move: null`, `moveOnOpen: false`, `moveAvailable: false`.
 - The shell already accepts `reason` with `/^[a-z0-9_:-]{1,64}$/i` (`computers.js:511`).
+- **[r4]** `reason` is null for `committed` and for in-flight rows. A committed row's `last_error` (a §7.1 spent reason) is
+  never shown.
+
+#### 6.1.1 The summary's move computer and its reads **[r4]**
+
+**Why this needs pinning.** `billing.summary` takes no input. Its only placement read is `placementAndVolume(ctx.db,
+ctx.user.id)` (`billing.ts:302-311`), which feeds `buildSummaryV3` the provider of "any aws-ec2 placement among the user's
+live computers" (`userPlacement`, `billing.ts:153-180`; builder input `summary.ts:184-200`). `buildSummaryV3` is pure and
+hard-codes `move: null` (`summary.ts:262`). The operator gate is in the router (`telemetryOperator`, `billing.ts:277-280`).
+After a committed move the user has no `aws-ec2` placement, so "the newest row for the computer" needs a computer.
+**Lane A owns `billing.ts` for these reads (§1.1).**
+
+**Reads (router, lane A), with no new store method and no new placement query:**
+- `userPlacement` also returns the live computer ids it already reads (`billing.ts:158-161`) and, for each `aws-ec2`
+  computer, the placement record it already reads (`:168`): `state`, `leaseEpoch` and `lifecycleJobId`. A read that
+  throws (including `ImageJobConflictError`) is no record, as today (`:171-173`).
+- `reverseMovesTablePresent(ctx.db)` once (§3.4). If true, `readByComputer(id)` for each live computer id. Users hold few
+  computers (one main computer, round 3), so this is a handful of indexed reads (`computer_id, created_at`, 0012).
+- The kill switch and "AWS enabled" from `aws-config.ts` (the same reads as §5.9). Founder-owned (§5.9.1) from
+  `ctx.user.email` and `telemetryOperator`.
+
+**The move computer, first match wins:**
+1. the computer whose newest row **holds** (in flight or `failed_needs_operator`). The holding row is always that
+   computer's newest row, because a new row is created only when none holds;
+2. else the computer of the user's `aws-ec2` placement (a Free user holds at most one: `user_has_aws_computer`; with
+   several, the lowest computer id);
+3. else the computer whose newest row is terminal and **visible** (§6.1 24 h rule), the most recent by
+   `ages.stateEntered`. This is the "after commit" case: the placement is now Cloudflare;
+4. else none: `move: null`, `moveOnOpen: false`, `moveAvailable: false`.
+
+**New `buildSummaryV3` input (pure; lane A):**
+
+```ts
+reverseMove?: {
+    tablePresent: boolean;                          // reverseMovesTablePresent
+    row: ComputeReverseMove | null;                 // the move computer's newest row (null: none, or no 0012)
+    placement: { provider: 'aws-ec2' | 'cloudflare' | null; state: PlacementState | null;
+                 leaseEpoch: number | null; lifecycleJobId: string | null } | null;  // the move computer's
+    awsEnabled: boolean; killSwitchOn: boolean;     // aws-config.ts (as §5.9)
+    founderOwned: boolean;                          // §5.9.1
+};  // omitted = today's output exactly (move null, moveOnOpen false, moveAvailable false)
+```
+
+**Derived fields (pinned):**
+- `move`: from `row` when visible (§6.1), else null.
+- `retry` (failed rows only): `failed_needs_operator` → `'no'`. For `failed_reopened`, by the §5.5 class of `last_error`:
+  `reopen` → `'now'`, except `entitlement_paid` → `'no'` (standing is then paid; nothing to retry). `reopen_after_session`
+  → `'now'` when `placement.leaseEpoch > row.exportBoot.leaseEpoch` (an AWS boot since: the next Free hold open is a
+  replace at E+2, §5.7), else `'after_aws_session'`. `reopen_final` → `'no'`; `operator_cleared` is a `reopen` code →
+  `'now'`. In flight and `committed` → null.
+- `openBlocked`: `failed_needs_operator` and (`commitSentAt` set, or `last_error` ∈ {`already_imported`, `commit_in_progress`}).
+- `moveOnOpen`: `tablePresent`, standing `files_on_aws`, placement `aws-ec2`, no holding row, the newest row (if any)
+  not `failed_*`, not `founderOwned`, `awsEnabled` and not `killSwitchOn`. It chooses the pre-move card's copy only, so it
+  does not depend on the placement's state; the trigger re-checks everything (§5.9).
+- `moveAvailable`: `tablePresent`, `awsEnabled`, not `killSwitchOn`, standing `files_on_aws`, placement `aws-ec2`, and
+  **[r4] the newest row's failure does not forbid Try again** (start would answer `move_unavailable`, §5.9 step 6). No
+  action is ever shown that start would refuse for a reason the user cannot change.
+- **Copy precedence (U):** a reason-specific §6.3 row (`workspace_too_large`, the try-later codes, `entitlement_paid`)
+  wins over the `retry`-keyed rows.
+
+**Lane A tests:** the selection order (holding row first; then the `aws-ec2` computer; then the newest visible terminal
+row; a deleted computer's rows are ignored); no 0012 → today's output exactly; founder-owned → `moveOnOpen` false;
+`after_aws_session` → `now` once `leaseEpoch` passes the boot's; `moveAvailable` false after an uncleared `reopen_final`;
+a committed row's `reason` is null with `last_error = 'snapshot_failed'`.
 
 ### 6.2 Shell changes (lane U)
 
@@ -997,12 +1204,36 @@ interface ComputerMoveV3 {
 - Add a pre-move card with the "Move my files…" action on the files-held state, with the variant chosen by `moveOnOpen`.
   **r3:** the card and its action are shown only when `moveAvailable` is true. Otherwise the files-held state keeps the
   banner without any move sentence or button (§6.3, "files held, `moveAvailable` false").
-- An open refused with `computer_move_needs_attention` shows the needs-attention card, never a spinner.
-- The `files_on_aws` banner (`computers.js:499`) drops the region name.
-- **[G3]** `computer.move.start`/`retry` refusals (§5.9) render their §6.3 row. `move_computer_running` shows **[Stop and move my files]**:
-  it runs the tab's existing Stop for this computer (`computers.js:923,1245`, the same confirm), watches `computer.progress` until
-  `stage` is `stopped` (bounded by the existing stop budget, `computer-progress.js:341-342`: 200 polls), then calls `computer.move.start`
-  **once**. If that refuses again, the card shows that refusal. Closing the tab in between starts nothing; the pre-move card returns.
+- **[r4]** An open answered with `computeMoveNeedsAttention: true` (§5.3, the blocked answer: a value with errorCode
+  `preconditions_unmet`) shows the needs-attention card, never a spinner and never a retry. `session.js` reads the flag
+  before `classifyFailure`, in `openDesktopOnce` and in `pendingOrRefused` (which the Code app's mint also uses,
+  `code.js:209`). `boot-phases.*` is unchanged (§1.1).
+- **[r4] The files-held banner, both tabs.** `standingCopy('files_on_aws')` drops the region name in **both** copies of the
+  function, `computers.js:499` and `Settings/tabs/billing.js:78`, to exactly: **"Your files are still on your AWS
+  computer. Open it on the Free plan with Free limits, or upgrade to restore full use."** `billing-test.mjs` keeps its
+  cross-tab equality check (`:1014-1015`) and updates its pinned sentence (`:988`). The Billing tab shows only this banner
+  (`billing.js:452`) for files-held and **during a move**: no move card, no move action and no move sentence. During a
+  move the standing stays `files_on_aws` (the placement is `aws-ec2` until the flip); after the commit the standing is
+  `free` and the banner goes. The move lives on the Computer tab. The provider label "AWS (India) · files kept"
+  (`computers.js:468`) and the System tab's "AWS (India)" are the round-4 provider labels (`system-describe.js:33-36`),
+  not move copy, and stay unchanged.
+- **[G3] [r4]** `computer.move.start`/`retry` answers (§5.9) render as follows. `{ok: true, move}` renders that move's card,
+  in any state: a stale pre-move card's click during a move shows the move. `move_in_progress` (retry) re-reads the summary
+  and shows the current move's card. Every refusal renders its §6.3 row.
+- **[r4] [Stop and move my files]** (shown only after a `move_computer_running` refusal):
+  1. It **first calls `computer.move.start` again**. `{ok: true, move}` → show the move card and stop nothing. Any refusal
+     other than `move_computer_running` → show that refusal and stop nothing. This way, if a move started in another
+     window in the meantime, `closeSandboxWindows` (`computers.js:939`) never closes a window that shows the move.
+  2. Only on `move_computer_running` again: run the tab's existing Stop (`handleStop`, `computers.js:918-950,1245`, the
+     same confirm). Watch `computer.progress` until `stage` is `stopped`, bounded by the existing stop budget
+     (`computer-progress.js:341-342`: 200 polls). Then call `computer.move.start` **once**. If that refuses again, the card
+     shows that refusal.
+  3. Closing the tab in between starts nothing; the pre-move card returns.
+- **[r4] A stop answered `computer_moving` or `computer_move_needs_attention`** (the waiting or blocked provider's `stop`,
+  §5.3; `confirmAwsStop` returns that first answer unchanged, `compute-dispatch.ts:282,292`; `/api/shell/stop` passes the
+  `terminate` answer through, `app/api/shell/stop/route.ts:11`) is **not** "couldn't confirm the stop". `handleStop`
+  reads `data.outcome`, re-reads the summary and shows the move card (or the needs-attention card) instead of the
+  `computers.js:943` notice.
 - **[G1]** The open overlay and the Computer tab render the moving view of `computer.progress` (§5.10) as §6.4 says.
 - **[minor: too-large]** The cap in copy comes from one constant, `MOVE_LIMIT_BYTES = 536870912`, exported by
   `computer-progress.js` and imported by `computers.js`. It is formatted by the shell's own MB unit (÷ 1,000,000, no decimals,
@@ -1060,8 +1291,16 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
   - `startedAt + budgetSeconds + 300 s` passes with no outcome → `OPENING_COPY.runningLong` and Send feedback. That is
     never a failure claim: only the server's outcome ends a move.
 - `progressView` maps `operation: 'moving'` and `stage: 'moving'` before its unknown-stage return (`computer-progress.js:133`).
-  When a visible `move` has an outcome, the `move` object is read even when `stage` is `unavailable` (a committed move's
-  Cloudflare placement reports `unavailable`). `activeAws` is false in the moving view; it is never an AWS opening.
+  `activeAws` is false in the moving view; it is never an AWS opening.
+- **[r4] Outcome keying.** Whenever `move` is non-null and `move.outcome` is set, the overlay and the Computer tab choose
+  the outcome **from `move.outcome` and `move.openBlocked` only, whatever `stage` says**. Terminal rows carry today's
+  placement description (§5.10): `stopped` for a `failed_reopened` hold, possibly `needs_operator` for a
+  `failed_needs_operator` row without `openBlocked` (`boot_unsettled`, placement UNCONFIRMED), `unavailable` after a commit.
+  The open-blocked card is shown **if and only if** `move.outcome === 'failed_needs_operator' && move.openBlocked === true`,
+  or the open was answered `computeMoveNeedsAttention: true` (§5.3). A lane U test feeds each terminal outcome with
+  each of those stages and checks the card.
+- **[r4]** An open answered `computeMoveNeedsAttention: true` shows the open-blocked row below at once. There is no watch
+  and no re-ask: the answer is deterministic (`preconditions_unmet`).
 
 **Overlay copy** (status line / one sentence / bar). No countdown, no speed or duration claims.
 
@@ -1074,12 +1313,27 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | elapsed > `move.expectedSeconds` | (unchanged) | (unchanged) | meta line `OPENING_COPY.long` ("Taking a little longer than usual") |
 | outcome `committed` | Your files are on your Free computer | Opening your Free computer. | full, then the ordinary Cloudflare open |
 | outcome `failed_reopened` | We couldn't move your files | They're still on your AWS computer and nothing was deleted. (`entitlement_paid`: "Your plan is active again, so your files stay on your AWS computer." `workspace_too_large`: the §6.3 sentence with "537 MB".) | none. [Open my AWS computer] re-asks the open (the D16 hold). Send feedback when enabled. Try again for the move lives on the Computer tab card. |
-| `failed_needs_operator`, `openBlocked` false | We couldn't finish moving your files | They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. | none. [Open my AWS computer]. Send feedback. |
-| `stage` `needs_operator` (`openBlocked` true) | We're finishing moving your files | Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. | none. Send feedback. No retry. |
+| outcome `failed_needs_operator`, `move.openBlocked` false | We couldn't finish moving your files | They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. | none. [Open my AWS computer]. Send feedback. |
+| outcome `failed_needs_operator`, `move.openBlocked` true (or the open answered `computeMoveNeedsAttention`) | We're finishing moving your files | Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. | none. Send feedback. No retry. |
 
 **Computer tab.** The move card keeps reading `billing.summary`'s `computer.move` (§6.1) for its copy. While the tab is open
 during a move it may also poll `computer.progress` for live bytes. Both come from the same row through the same step map,
 so they agree.
+
+**[r4] Computer tab while a move is in flight** (`computer.progress` `operation: 'moving'`, or `summary.computer.move`
+in a non-terminal stage):
+- `computerModel` (`computers.js:419-469`): **chip** `{state: 'moving', text: 'Moving files…'}`, which takes precedence
+  over every chip except `stopping` while the user's own stop is in progress. `busy` is **true** when `operation === 'moving'`
+  (today it is true only for opening and stopping, `:469`). `running` and `stopped` are false (`lifecycleState` is null,
+  §5.10).
+- **Actions:** no Open desktop, no Stop and no Start now (`:700-702,642-645`). Rename stays; Delete is disabled (a delete
+  is refused during a move, §5.3). Configuration cards stay locked (held).
+- **Body:** the move card only (`moveHtml`, §6.3 copy). No transition, "Now running" or switch-failed card.
+- If `computer.progress` shows `operation: 'moving'` while the summary's `move` is still null (a move started from an open
+  in another window), the tab re-reads `billing.summary` once per poll until `move` appears, at most 6 times.
+- `openBlocked` true: chip `{state: 'attention', text: 'Needs attention'}`, no Open, and the needs-attention card.
+- A lane U test renders the tab in each phase and in each terminal outcome, with every `lifecycleState` and `stage`
+  value §5.10 can send.
 
 ---
 
@@ -1088,7 +1342,7 @@ so they agree.
 - After the flip, the placement row no longer exists (`placement.ts:838` deletes rows on flips). So **the committed reverse row is the only DB record of the AWS volume.** It holds `aws_volume_id`, `aws_fs_uuid`, `aws_snapshot_id` and `retain_until` (commit + 14 d, DB clock).
 - **Snapshot (D21, mandatory).**
   - **Executor:** lane O ships a fenced `reverse_snapshot` lifecycle operation, modelled on the preparation machine's `createSnapshot` step (`preparation-helper.ts:83-96`, `preparation-definition.ts:40-47`). Its preconditions: the volume is `available` and unattached, owned by the account, and tagged with this computer's id.
-  - **Started** by the reverse sweep for every `committed` row with `aws_snapshot_id IS NULL`.
+  - **Started** by the reverse sweep for every `committed` row with `aws_snapshot_id IS NULL` that is not marked spent (**[r4]**, §7.1 Failure).
   - **Recorded** with `recordSnapshot` (once) as soon as `CreateSnapshot` returns an id. A pending snapshot is already point-in-time.
   - **Alert:** a committed row with no snapshot 1 h after commit is listed by `retention.ts` as `snapshot_missing` and logged `[reverse-move] snapshot_missing`. An operator takes it by hand (T1 does so for canary2).
   - Lane O ships before the app deploy (release order, §8), so every committed move gets one.
@@ -1104,8 +1358,8 @@ so they agree.
 | **Preconditions** | As above, plus `volumeId` equals the row's `aws_volume_id`. Any failure ends the execution failed with a closed code; the helper never mutates the volume. |
 | **Success** | As soon as the tagged snapshot is `pending` or `completed`. `error` → failed `snapshot_error`. The output is the receipt `{schemaVersion: 1, jobId, digest, moveId, computerId, volumeId, snapshotId, snapshotState: 'pending' \| 'completed', snapshotStartedAt}`, at most 8 KiB, as the preparation receipt is (`preparation-helper.ts:104`). |
 | **How the id reaches the app** | Lane O's `advanceReverseSnapshots` reads execution `computer-<moveId>` with the existing reader (`createSfnExecutionReader`, `aws-clients.ts:254`). It validates the receipt against the intent it built (digest, `moveId`, `computerId`, `volumeId`; the `validateRebaseSnapshotReceipt` pattern, `aws-rebase-preparation.ts:44-53`), then calls `recordSnapshot(m, snapshotId)`. A replay of the same id returns the row (§3.4). |
-| **Which sweep starts it** | `advanceReverseSnapshots(budget)` (lane O, `provider-reverse-snapshot.ts`). Lane A's `advanceReverseMoves` calls it **first** in its pass (at most 3 rows and 20 s, §5.4), with `listUnsnapshotted(3)`. Per row: no execution yet → StartExecution; running → nothing; succeeded → record. The deployment has no `reverseSnapshotStateMachineVersionArn` → nothing (the row then appears under `snapshot_missing`). |
-| **Failure** | A failed, timed-out or aborted execution is **not** retried automatically: its name is spent, and a second name could create a second snapshot. It logs `[reverse-move] snapshot_failed`. After 1 h the row is listed `snapshot_missing` (`listUnsnapshotted(limit, 3600)`), an operator snapshots by hand, and records the id with the runbook statement below. |
+| **Which sweep starts it** | `advanceReverseSnapshots(budget)` (lane O, `provider-reverse-snapshot.ts`). Lane A's `advanceReverseMoves` calls it **first** in its pass (at most 3 rows and 20 s, §5.4), with `listUnsnapshotted(3)`, which **[r4]** leaves out spent rows. Per row: no execution yet → StartExecution; running → nothing; succeeded with a valid receipt → `recordSnapshot`; succeeded with an invalid receipt → `markSnapshotSpent(m, 'snapshot_receipt_invalid')`; FAILED, TIMED_OUT or ABORTED → `markSnapshotSpent(m, 'snapshot_failed')`. The deployment has no `reverseSnapshotStateMachineVersionArn` → nothing (the row then appears under `snapshot_missing`). |
+| **Failure** | A failed, timed-out or aborted execution is **not** retried automatically: its name is spent, and a second name could create a second snapshot. **[r4]** The sweep marks the row spent with `markSnapshotSpent` (§3.4) and logs `[reverse-move] snapshot_failed`. A spent row leaves the sweep's queue, so spent rows never fill `listUnsnapshotted(3)` and starve newer commits. (r3's queue was the oldest 3 unsnapshotted rows with no other filter, so three spent rows stopped every later D21 snapshot.) It stays listed as `snapshot_missing` (`listUnsnapshotted(10, 3600, {includeSpent: true})`) until an operator snapshots by hand and records the id with the runbook statement below. `recordSnapshot` also still accepts it. **PG test (store, r4):** 3 spent rows plus 1 new row → `listUnsnapshotted(3)` returns only the new row; the `snapshot_missing` listing returns all 4 once they are 1 h old. |
 
 ```sql
 -- runbook: operator_snapshot
@@ -1116,7 +1370,7 @@ RETURNING id, state, aws_snapshot_id, updated_at::text AS updated_at;
 ```
 
 - **Purge listing.** `retention.ts` (dry run, `retention.ts:1-13,58-64`) lists `listRetentionExpired(100)` and the
-  `snapshot_missing` rows (`listUnsnapshotted(10, 3600)`). Both are read-only (§3.4).
+  `snapshot_missing` rows (`listUnsnapshotted(10, 3600, {includeSpent: true})`, **[r4]** spent rows included). Both are read-only (§3.4).
 - **Purge.** Deletion is a separate founder-owned principal, never a workflow role. Both workflow roles deny `DeleteVolume` and `DeleteSnapshot` (rule R11).
 - **DLM.** `dlmRoleArn` pins `role/service-role/…` (`ops.ts:36`). Change it only after `iam get-role` confirms the path. T0 saw a DLM 12-hourly snapshot of the founder's volume (snap-053333a158f9cc895, 10-29 19:38Z), so DLM runs for at least that volume; DLM snapshots never replace the D21 snapshot.
 
@@ -1216,3 +1470,25 @@ and gives the closest workable rule.
 | r3 review: the EC2 client token | §7.1 | Checked against the SDK on disk: `CreateSnapshotRequest` has no `ClientToken` (`models_2.d.ts:1969`, client-ec2 3.1140.0). The idempotency key stays the execution name, with the tag as the EC2 dedupe. |
 | blind spot: CAS `state` predicate (m3a survived) | §5.5.1, store PG test | A new PG test changes `state` by hand without bumping `updated_at`; the stale writer must lose. With the `state =` predicate removed, that test fails. |
 | blind spot: `billing-test-db.sh` now applies 0012 for every PG suite | — | r3 ran the three table-enumerating suites against a DB built by `billing-test-db.sh` (journal 0000–0007 and 0012): `feedback/ingest.pg` 4/4, `rebase.pg` 15/15, `ready-pool.pg` 167/167, 0 skipped. Each filters by table name, so 0012 does not disturb them. |
+
+## 12. Changes in r4 (review of r3, `4abd237a`)
+
+Each row names the section that closes the finding. "Proposed" means the reviewer's proposed fix, adopted unless the row
+says otherwise.
+
+| Finding | Section(s) | Resolution |
+|---|---|---|
+| **major** (A+U): start/retry ran the placement checks before the holding-row check, so a stale card's click mid-move answered `move_computer_running`, `move_computer_unsettled` or `move_paused` | §5.9, §6.2 | The holding-row check is now step 2, right after `move_unsupported`. start returns `{ok: true, move}` for the holding row in every state, with the kill switch on or off; retry answers `move_in_progress`. The placement checks run only when no row holds. **Deviation from the proposed order:** `move_unavailable` comes before `move_computer_running`/`move_computer_unsettled`. Otherwise the "stop first" copy would promise a move that cannot start. [Stop and move my files] calls start again before stopping. A stop answered `computer_moving`/`computer_move_needs_attention` shows the move card, not "couldn't confirm the stop". Lane A tests every in-flight state and the kill switch mid-move. |
+| **major** (A): image-rebase reservations and reverse moves did not exclude each other, and `ImageJobConflictError` was unmapped | §5.2.1, §5.1.1 step 4, §5.4, §5.5, §5.9, §1.1 | `aws-rebase-store.ts` `reserve` calls `reverseMoveHolds` after its migrations check, under the same computer lock. Lane A owns that one edit and `rebase.pg`. `admitExportBoot` maps the error to `cas_conflict` (wait); `requested` at the deadline → `computer_busy`; start/retry → `move_computer_unsettled`. In `booting` … `flipping` a reservation is impossible, with the argument written down; lane A tests it. |
+| **major** (A): lane A could not implement the summary fields; `billing.ts` was unowned and no computer was chosen | §6.1.1, §1.1 | `billing.ts` (summary reads, `userPlacement`) moves to lane A. The move computer, first match: the holding row; then the `aws-ec2` placement; then the newest visible terminal row. No new store read: `readByComputer` per live computer. The new pure `reverseMove` builder input is pinned, and so are `retry` (incl. `after_aws_session` from `leaseEpoch`), `openBlocked`, `moveOnOpen` and `moveAvailable`. |
+| **major** (O+A): one spent snapshot execution per row could stop every later D21 snapshot | §3.2, §3.4, §7, §7.1 | **Store, shipped in r4:** `markSnapshotSpent` (CAS, idempotent, first reason wins) and `listUnsnapshotted`'s spent filter (`{includeSpent}` for the `snapshot_missing` listing). The PG test proves that 3 spent rows plus 1 new row give `[new]`. Two mutants (filter removed; CAS without `last_error IS NULL`) each fail it. A committed row's `last_error` is never shown. |
+| minor (U): the Billing tab's copy of `standingCopy` keeps the region; `billing.js` was unowned | §6.2, §1.1 | `tabs/billing.js` and `billing-test.mjs` move to lane U. Both copies of `standingCopy('files_on_aws')` drop "(India)" to the same pinned sentence; the cross-tab equality test stays. The Billing tab shows only that banner, for files-held and during a move. **Accepted as is:** the provider label "AWS (India) · files kept" and the System tab's "AWS (India)" are round-4 provider labels, not move copy. |
+| minor (A+U): `computer_move_needs_attention` was a thrown `PRECONDITION_FAILED` | §5.3, §6.2, §6.4, §1.1 | A **reverse blocked provider** answers as a value: `errorCode: 'preconditions_unmet'`, `retryable: false`, and the dispatch flag `computeMoveNeedsAttention`. The shell reads the flag before `classifyFailure`; `boot-phases.*` and `code.js` stay read-only. Old shells get the generic deterministic copy with no silent re-ask (disclosed). `computer.delete` is refused during a move or while open-blocked, as for `computer_migrating` today. |
+| minor (A): the `requested` deadline outcome could not be decided from the row | §5.1.1, §5.4, §5.5 | One rule, decided from the deadline pass only. If this pass's placement read was not claimable (not STOPPED, a job, or `ImageJobConflictError`) → `computer_busy`. Otherwise this pass's claim was refused → `boot_unavailable`. All three sections say the same. |
+| minor (A): fleet-wide `duplicate_placement` and deployment-wide `region_not_configured` were per-move final failures | §5.1.1, §5.5 | They now wait like capacity refusals, end as `boot_unavailable` (try later) at the deadline, and log `[reverse-move] anomaly`. `boot_refused` keeps only `user_has_aws_computer`, `computer_not_owned` and `computer_deleted`. The `operator_cleared` runbook list is unchanged. |
+| minor (U+A): the moving view passed the export boot's `lifecycleState` through | §5.10, §6.4 | `lifecycleState: null` in the moving view; the real state is `move.placementState` (diagnostics only). The Computer tab during a move is pinned: chip "Moving files…", `busy` true, no Open/Stop/Start, move card only. |
+| minor (U): overlay rules keyed partly on `stage`, which terminal rows do not set from the move | §5.10, §6.4 | Whenever `move.outcome` is set, the outcome is keyed on `move.outcome` + `move.openBlocked` only. The open-blocked card shows if and only if both `failed_needs_operator` and `openBlocked` hold (or the open answered `computeMoveNeedsAttention`). A lane U test feeds each outcome with each stage. |
+| fold-in: `billing-test-db.sh` applies 0012 for every PG suite | — | r4 re-ran the suites against its own DB (`billing-test-db.sh`, journal 0000–0007 and 0012), the three table-enumerating ones among them: `feedback/ingest.pg` 4/4, `rebase.pg` 15/15, `ready-pool.pg` 167/167. The same run passed all 8 PG files, 239/239, 0 skipped. |
+
+The review's findings list reached this revision truncated inside its tenth finding. Anything after it was not visible
+and is not addressed here.
