@@ -177,7 +177,7 @@ function endpoint (name) {
  *
  * @returns {Promise<{ok: true, data: any} | {ok: false, code: string, status: number, message: string}>}
  */
-async function request (url, { method = 'GET', body, timeoutMs } = {}) {
+async function request (url, { method = 'GET', body, timeoutMs, signal } = {}) {
     let res;
     try {
         res = await fetch(url, {
@@ -185,13 +185,16 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
             credentials: 'same-origin',
             headers: body === undefined ? undefined : { 'content-type': 'application/json' },
             body: body === undefined ? undefined : JSON.stringify(body),
-            signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
+            signal: requestSignal(timeoutMs, signal),
         });
     } catch ( err ) {
         // `AbortSignal.timeout` rejects with a DOMException named
         // 'TimeoutError'; everything else here is a genuine transport
         // failure. The distinction survives into the boot UI's copy.
         const timedOut = err && err.name === 'TimeoutError';
+        if ( ! timedOut && signal?.aborted ) {
+            return { ok: false, code: 'CANCELLED', status: 0, message: 'The request was cancelled.' };
+        }
         return {
             ok: false,
             code: timedOut ? 'TIMEOUT' : 'NETWORK',
@@ -228,6 +231,53 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
  * `withWakeAndOneRetry`'s loop for why a ceiling and not just the conditions.
  */
 const MAX_ISSUES = 40;
+// AWS pending responses return immediately, unlike Cloudflare's held wake
+// requests. Allow the full existing 215s deadline at the 1.5s polling cadence.
+const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
+// A paid upgrade includes host provisioning and workspace/system restore.
+// Count from the first migration answer, then allow a full ordinary AWS wake.
+export const MIGRATION_DEADLINE_MS = 10 * 60_000;
+// A replacement AMI boot gets one bounded budget, retained after enrollment. Both match the
+// loader's 10-minute calm ceiling; a stalled pool adoption self-recovers well inside it.
+export const LAUNCH_DEADLINE_MS = 10 * 60_000;
+export { LAUNCH_COPY } from './launch-copy.js';
+
+const LAUNCH_MAX_ISSUES = Math.ceil(LAUNCH_DEADLINE_MS / WAKE_REASK_MS) + 2;
+const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 2;
+
+// Per-request observations let a window show a warm request's progress too.
+// Concurrent opens cannot clear one another's still-active migration signal.
+const migratingRequests = new Map();
+const launchingRequests = new Map();
+export function isComputeLaunching (computerId) {
+    return !!computerId && [...launchingRequests.values()].includes(computerId);
+}
+export function isComputeMigrating (computerId) {
+    return !!computerId && [...migratingRequests.values()].includes(computerId);
+}
+
+/**
+ * The fetch signal for one request: its timeout and, when given, the caller's
+ * cancel. An engine without `AbortSignal.any` keeps the timeout only; the
+ * caller's loop still stops at its next cancel check, it just cannot cut the
+ * request already on the wire.
+ */
+function requestSignal (timeoutMs, cancel) {
+    const timeout = timeoutMs ? AbortSignal.timeout?.(timeoutMs) : undefined;
+    if ( ! cancel ) return timeout;
+    if ( ! timeout ) return cancel;
+    return typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout, cancel]) : timeout;
+}
+
+/** A sleep that ends early when `signal` aborts. */
+function pause (ms, signal) {
+    return new Promise((resolve) => {
+        if ( signal?.aborted ) return resolve();
+        const done = () => { clearTimeout(timer); signal?.removeEventListener?.('abort', done); resolve(); };
+        const timer = setTimeout(done, ms);
+        signal?.addEventListener?.('abort', done, { once: true });
+    });
+}
 
 /**
  * 🔴 THE BEAT BEFORE THE ONE AUTOMATIC RETRY — AND IT USED TO BE ZERO.
@@ -304,7 +354,8 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  *      socket for three minutes" (see `SANDBOX_WAKE_ANSWER_BUDGET_MS` in
  *      `app/src/server/lib/cloudflare-guacamole-provider.ts`). The honest
  *      response is to ask again, which is what this does, until
- *      `WAKE_DEADLINE_MS`. The caller's boot panel is on a `setInterval` of its
+ *      `WAKE_DEADLINE_MS`. A flagged migration first gets its own bounded
+ *      deadline, then a fresh wake budget when the flag drops. The caller's boot panel is on a `setInterval` of its
  *      own, so the phase list keeps running the whole time — the user sees
  *      "Waking your machine" for as long as that is the true statement, instead
  *      of a dead socket followed by "We couldn't start your computer."
@@ -326,75 +377,134 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
  *   Sends the request once. Must never throw.
  * @param {string} what For the log line only.
+ * @param {string} [computerId] Scopes migration progress to this computer.
  */
-async function withWakeAndOneRetry (issue, what) {
+async function withWakeAndOneRetry (issue, what, computerId, signal) {
     const t0 = Date.now();
     let retried = false;
     let asks = 0;
+    let maxIssues = MAX_ISSUES;
+    let deadline = t0 + WAKE_DEADLINE_MS;
+    let migrationStartedAt = null;
+    let launchStartedAt = null;
+    let wakeResumed = false;
+    const progressKey = Symbol();
+    // 🔴 A CANCELLED LOOP NEVER ASKS AGAIN. Every ask runs the server's ensure,
+    // and on an UNCONFIRMED + ENROLLMENT_FAILED placement that ensure launches a
+    // replacement host. A window that has stopped waiting (needs_operator, its
+    // ten-minute stop, a close) must not leave this loop asking behind its back.
+    const cancelled = () => {
+        migratingRequests.delete(progressKey);
+        launchingRequests.delete(progressKey);
+        console.info(`[ezil-os:session] ${what}: cancelled by the caller after ${asks} ask(s); not asking again`);
+        return { ok: false, errorCode: 'cancelled', message: 'Stopped asking: the caller cancelled.' };
+    };
 
-    for (;;) {
-        // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
-        // bound in this function is a CONDITION — a clock for the wake, a
-        // boolean for the retry — and a condition can be edited away. Removing
-        // the `retried = true` line was tried during review and it turned this
-        // into an unbounded, zero-delay request loop that HUNG the headless
-        // suite rather than failing it. A browser would have hammered the
-        // server for as long as the tab stayed open.
-        //
-        // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
-        // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
-        // use, and it turns any future breakage of the two real bounds into a
-        // stop rather than a spin. With it in place the same mutation now
-        // reports `attempts=40` and fails three named checks.
-        if ( asks >= MAX_ISSUES ) {
-            console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
-            telemetry.capture({
-                eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
-                durationMs: Date.now() - t0, detail: `${asks} asks`,
-            });
-            return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
-        }
-        asks++;
-        const res = await issue();
-        if ( res.ok === true ) return res;
-
-        if ( res.errorCode === 'sandbox_starting' ) {
-            const waited = Date.now() - t0;
-            if ( waited >= WAKE_DEADLINE_MS ) {
-                console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
+    try {
+        for (;;) {
+            if ( signal?.aborted ) return cancelled();
+            // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
+            // bound in this function is a CONDITION — a clock for the wake, a
+            // boolean for the retry — and a condition can be edited away. Removing
+            // the `retried = true` line was tried during review and it turned this
+            // into an unbounded, zero-delay request loop that HUNG the headless
+            // suite rather than failing it. A browser would have hammered the
+            // server for as long as the tab stayed open.
+            //
+            // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
+            // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
+            // use, and it turns any future breakage of the two real bounds into a
+            // stop rather than a spin. With it in place the same mutation now
+            // reports `attempts=40` and fails three named checks.
+            if ( asks >= maxIssues ) {
+                console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
                 telemetry.capture({
-                    eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
-                    durationMs: waited, detail: `gave up after ${asks} asks`,
+                    eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
+                    durationMs: Date.now() - t0, detail: `${asks} asks`,
                 });
-                // The honest code for "it never finished waking within our
-                // budget". `classifyFailure` in boot-phases.js turns it into
-                // the `timeout` copy — "it may still come up in the background
-                // — try again" — which is exactly what is true.
-                return res;
+                return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
             }
-            await new Promise(r => setTimeout(r, WAKE_REASK_MS));
-            continue;
-        }
+            asks++;
+            const res = await issue();
+            // Checked before anything reads `res`: an aborted request surfaces as a
+            // transport failure, which would otherwise buy the one silent re-ask.
+            if ( signal?.aborted ) return cancelled();
+            const now = Date.now();
+            const migrating = res.ok !== true && res.errorCode === 'sandbox_starting'
+                && res.computeProvider === 'aws-ec2' && res.computeMigrating === true;
+            if (migrating) {
+                if (computerId) migratingRequests.set(progressKey, computerId);
+                if (migrationStartedAt === null) {
+                    migrationStartedAt = now;
+                    deadline = migrationStartedAt + MIGRATION_DEADLINE_MS;
+                    maxIssues = asks - 1 + MIGRATION_MAX_ISSUES;
+                }
+            } else {
+                migratingRequests.delete(progressKey);
+                if (migrationStartedAt !== null && !wakeResumed) {
+                    wakeResumed = true;
+                    deadline = now + WAKE_DEADLINE_MS;
+                    maxIssues = asks - 1 + AWS_MAX_ISSUES;
+                }
+            }
+            const launching = res.ok !== true && res.errorCode === 'sandbox_starting'
+                && res.computeProvider === 'aws-ec2' && res.computeLaunching === true;
+            if (launching && !migrating) {
+                if (computerId) launchingRequests.set(progressKey, computerId);
+                if (launchStartedAt === null) {
+                    launchStartedAt = now;
+                    deadline = Math.max(deadline, launchStartedAt + LAUNCH_DEADLINE_MS);
+                    maxIssues = Math.max(maxIssues, asks - 1 + LAUNCH_MAX_ISSUES);
+                }
+            } else {
+                launchingRequests.delete(progressKey);
+            }
+            if ( res.ok === true ) return res;
 
-        // A genuine failure. One silent re-ask if a second attempt could
-        // plausibly answer differently, then hand it to the user.
-        if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
-             && isRetryableBootErrorCode(res.errorCode) ) {
-            retried = true;
-            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
-            telemetry.capture({
-                eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
-                durationMs: Date.now() - t0,
-            });
-            // Measured: without this the second ask landed 405-1636ms after
-            // the first and returned the same answer 10 times out of 10. See
-            // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
-            // wait, so its `durationMs` still marks the first failure and the
-            // arithmetic in that comment keeps working.
-            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-            continue;
+            if ( res.errorCode === 'sandbox_starting' ) {
+                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null && launchStartedAt === null) maxIssues = AWS_MAX_ISSUES;
+                const waited = now - t0;
+                if ( now >= deadline ) {
+                    console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
+                    telemetry.capture({
+                        eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
+                        durationMs: waited, detail: `gave up after ${asks} asks`,
+                    });
+                    // The honest code for "it never finished waking within our
+                    // budget". `classifyFailure` in boot-phases.js turns it into
+                    // the `timeout` copy — "it may still come up in the background
+                    // — try again" — which is exactly what is true.
+                    return res;
+                }
+                await pause(WAKE_REASK_MS, signal);
+                continue;
+            }
+
+            // A genuine failure. One silent re-ask if a second attempt could
+            // plausibly answer differently, then hand it to the user. Round 4: a
+            // `billing_*` refusal never qualifies (`isRetryableBootErrorCode`);
+            // only `billing_unavailable` does.
+            if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
+                 && isRetryableBootErrorCode(res.errorCode) ) {
+                retried = true;
+                console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
+                telemetry.capture({
+                    eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
+                    durationMs: Date.now() - t0,
+                });
+                // Measured: without this the second ask landed 405-1636ms after
+                // the first and returned the same answer 10 times out of 10. See
+                // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
+                // wait, so its `durationMs` still marks the first failure and the
+                // arithmetic in that comment keeps working.
+                await pause(RETRY_DELAY_MS, signal);
+                continue;
+            }
+            return res;
         }
-        return res;
+    } finally {
+        migratingRequests.delete(progressKey);
+        launchingRequests.delete(progressKey);
     }
 }
 
@@ -428,11 +538,44 @@ export function openSession () {
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId, screen) {
+export async function openDesktop (computerId, screen, { signal } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop');
+    // Every open is cancellable two ways: by the caller's own `signal`, and by
+    // `cancelOpenDesktop(computerId)` — which also reaches an open the caller
+    // did not start itself (the paint-time warm, via `warm.js`).
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    if ( signal?.aborted ) cancel(); else signal?.addEventListener?.('abort', cancel, { once: true });
+    const key = Symbol();
+    openCancels.set(key, { computerId, cancel });
+    try {
+        return await withWakeAndOneRetry(() => openDesktopOnce(computerId, screen, controller.signal),
+            'openDesktop', computerId, controller.signal);
+    } finally {
+        openCancels.delete(key);
+        signal?.removeEventListener?.('abort', cancel);
+    }
+}
+
+/** In-flight `openDesktop` loops, so a caller can stop every one for a computer. */
+const openCancels = new Map();
+
+/**
+ * Stop every in-flight `openDesktop` for `computerId`: each stops asking at once
+ * (its request on the wire is aborted where the engine allows) and resolves
+ * `{ok: false, errorCode: 'cancelled'}`. `warm.js` drops a failed entry, so a
+ * cancelled warm is never replayed. Returns how many were cancelled.
+ *
+ * @param {string} computerId
+ */
+export function cancelOpenDesktop (computerId) {
+    let n = 0;
+    for ( const entry of openCancels.values() ) {
+        if ( entry.computerId === computerId ) { entry.cancel(); n++; }
+    }
+    return n;
 }
 
 // Local preview routes currently only mint URLs for a running container. Code
@@ -448,7 +591,7 @@ export async function ensureLocalDesktop (computerId) {
 }
 
 /** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId, screen) {
+async function openDesktopOnce (computerId, screen, signal) {
     // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
     // for. The server treats absent and malformed identically, but a body that
     // is byte-identical to the pre-change one is the strongest form of "an old
@@ -462,9 +605,11 @@ async function openDesktopOnce (computerId, screen) {
             ? { computerId, screen: { width: screen.width, height: screen.height } }
             : { computerId },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
+        signal,
     });
 
     if ( ! res.ok ) {
+        if ( res.code === 'CANCELLED' ) return { ok: false, errorCode: 'cancelled', message: res.message };
         // Transport/HTTP failure. `TIMEOUT` is the one code `previewUrl`
         // itself can never produce and the boot UI has real copy for.
         if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
@@ -499,6 +644,10 @@ async function openDesktopOnce (computerId, screen) {
         return {
             ok: false,
             errorCode: data.errorCode ?? 'unknown',
+            computeProvider: data.computeProvider,
+            ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
+            ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
+            ...capacityAttemptOf(data),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }
@@ -558,11 +707,28 @@ async function openDesktopOnce (computerId, screen) {
  * @returns {Promise<{ok: true, url: string, expiresAt?: number}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
+/**
+ * A not-ok preview body for the wake loop. Preserve the provider and explicit
+ * migration or fresh-launch signal so fast AWS replies receive the appropriate bounded budget.
+ */
+export function pendingOrRefused (data) {
+    return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
+        ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
+        ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
+        ...capacityAttemptOf(data) };
+}
+
+/** RETRY-118: only a `capacity_attempt_expired` answer carries the attempt an explicit Retry may reset. */
+function capacityAttemptOf (data) {
+    return data?.errorCode === 'capacity_attempt_expired' && typeof data.capacityAttemptId === 'string'
+        && data.capacityAttemptId !== '' ? { capacityAttemptId: data.capacityAttemptId } : {};
+}
+
 export async function previewUrl (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
-    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl');
+    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl', computerId);
 }
 
 /** One `POST /api/shell/preview-url`. The loop that may call it more than once is above. */
@@ -583,9 +749,7 @@ async function previewUrlOnce (computerId) {
     }
 
     const data = res.data ?? {};
-    if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown' };
-    }
+    if ( data.ok !== true ) return pendingOrRefused(data);
     if ( typeof data.appPreviewUrl !== 'string' || data.appPreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // as `openDesktop` above.
@@ -646,14 +810,40 @@ export async function focusApp (computerId, app, timeoutMs = STATUS_TIMEOUT_MS) 
  *   desktop and must not be read as either verdict.
  */
 export async function confirmFrame (computerId, frameUrl, surface = 'desktop') {
-    if ( ! computerId || ! frameUrl ) return undefined;
+    return (await observeFrame(computerId, frameUrl, surface)).confirmed;
+}
+
+/**
+ * Keep the authenticated probe's transient failure evidence for Code's bounded
+ * recovery. The boolean API above still exposes just the health verdict.
+ * A retryable negative is still unconfirmed; auth/origin refusals never qualify.
+ */
+export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
+    const unknown = { confirmed: undefined, retryable: false };
+    const refused = { confirmed: false, retryable: false };
+    if ( ! computerId || ! frameUrl ) return unknown;
     const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
         + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`
         + (payload()?.desktopState?.provider === 'local-vm' ? `&surface=${encodeURIComponent(surface)}` : '');
     const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
-    if ( ! res.ok ) return undefined;
-    if ( res.data?.ok !== true ) return undefined;
-    return res.data.confirmed === true;
+    // An HTTP authentication/authorization refusal is an answer, even if the
+    // response body is absent, non-JSON, or claims success. Never retry it.
+    if ( ! res.ok ) return res.status === 401 || res.status === 403 ? refused : unknown;
+    const data = res.data;
+    if ( surface === 'code' && data?.confirmed === true ) {
+        // Both hosted/local HTTP probes return a successful status and omit
+        // reason on success. A malformed or contradictory positive must not
+        // release Code's overlay, including after its recovery navigation.
+        const confirmed = data.ok === true && Number.isInteger(data.status)
+            && data.status >= 200 && data.status < 400 && !Object.hasOwn(data, 'reason');
+        return { confirmed, retryable: false };
+    }
+    if ( data?.ok !== true ) return unknown;
+    return {
+        confirmed: data.confirmed === true,
+        retryable: data.confirmed === false && (data.reason === 'unreachable'
+            || (data.reason === 'http_error' && [500, 502, 503, 504].includes(data.status))),
+    };
 }
 
 /**
@@ -790,6 +980,114 @@ export async function restartDesktop (computerId) {
         return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message };
     }
     return { ok: true };
+}
+
+/**
+ * RETRY-118. Is the explicit capacity Retry route published by THIS deployment?
+ * Feature-detected exactly like `restartEndpoint()`: the payload only, never an
+ * invented path. Absent → a Retry simply reopens (the pre-RETRY-118 behaviour).
+ *
+ * @returns {string|null}
+ */
+export function capacityRetryEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.capacityRetry;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+const capacityResetsInFlight = new Map();
+
+/** The only reset outcomes the server can answer, and the app-level `ok` each must carry. */
+const CAPACITY_RESET_OUTCOMES = { reset: true, already_reset: true, superseded: true, not_found: false };
+
+/**
+ * Strictly read a `POST <endpoints.capacityRetry>` reply. Only an app-level `ok`
+ * consistent with a known outcome counts; anything else (an `ok:false` claiming
+ * `reset`, a missing or unknown outcome, a non-object body) is `malformed_reply`.
+ * Exported for tests.
+ *
+ * @returns {{reset: boolean, outcome?: string, errorCode?: string}}
+ */
+export function readCapacityResetReply (data) {
+    const outcome = data && typeof data === 'object' ? data.outcome : undefined;
+    if ( typeof outcome !== 'string' || ! Object.prototype.hasOwnProperty.call(CAPACITY_RESET_OUTCOMES, outcome)
+        || data.ok !== CAPACITY_RESET_OUTCOMES[outcome] ) {
+        return { reset: false, errorCode: 'malformed_reply' };
+    }
+    return { reset: outcome === 'reset', outcome };
+}
+
+/**
+ * RETRY-118: the ONE place an explicit user "Try again" resets an expired capacity
+ * attempt. Call it ONLY from a user's Retry handler, with the failure that is on
+ * screen; never from polling, the wake loop or a transport retry (those keep
+ * `capacity_attempt_expired` terminal: `isRetryableBootErrorCode` is false for it).
+ *
+ * - Not a `capacity_attempt_expired` failure with a stored id, or the route not
+ *   published: no request (`{ reset: false }`), and the caller reopens as before.
+ * - Otherwise exactly one `POST <endpoints.capacityRetry>` per computer AND attempt
+ *   at a time: every caller for that attempt (any window) joins the same request.
+ * - The reply is read strictly (`readCapacityResetReply`); a transport failure is
+ *   `{ reset: false, errorCode }`. Callers reopen whatever this answers: the
+ *   server's next answer is the truth, never this one.
+ *
+ * @returns {Promise<{reset: boolean, outcome?: string, errorCode?: string}>}
+ */
+export function retryCapacityAttempt (computerId, failure) {
+    const attemptId = failure?.errorCode === 'capacity_attempt_expired' ? failure.capacityAttemptId : null;
+    const url = capacityRetryEndpoint();
+    if ( ! computerId || typeof attemptId !== 'string' || attemptId === '' || ! url ) {
+        return Promise.resolve({ reset: false });
+    }
+    const key = `${computerId}|${attemptId}`;
+    const inFlight = capacityResetsInFlight.get(key);
+    if ( inFlight ) return inFlight;
+    const pending = request(url, { method: 'POST', body: { computerId, attemptId }, timeoutMs: STATUS_TIMEOUT_MS })
+        .then((res) => {
+            if ( ! res.ok ) {
+                return { reset: false, errorCode: res.code === 'TIMEOUT' ? 'timeout' : res.code === 'NETWORK' ? 'fetch_failed'
+                    : res.code === 'UNAUTHORIZED' ? 'unauthorized' : 'request_failed' };
+            }
+            return readCapacityResetReply(res.data);
+        }, () => ({ reset: false, errorCode: 'fetch_failed' }))
+        .finally(() => capacityResetsInFlight.delete(key));
+    capacityResetsInFlight.set(key, pending);
+    return pending;
+}
+
+/** computer|attempt -> the reopen callbacks still owed one reopen when that reset settles. */
+const reopensOwed = new Map();
+
+/**
+ * RETRY-118: what every surface's user-facing "Try again" calls, with the failure it
+ * is showing and ITS OWN stable reopen callback (defined once per window, so a double
+ * click is recognisable). Shared so Desktop, Code and Preview behave identically.
+ * - Anything but `capacity_attempt_expired` with a stored id (or no published route):
+ *   reopens immediately, exactly as before.
+ * - Otherwise the RESET is shared per computer+attempt (one request, whichever window
+ *   clicks), and every window whose Retry was clicked is reopened exactly once after
+ *   it settles, whatever the outcome. A second click in the same window while that
+ *   is pending joins it (no second reset, no second reopen). A window closed in the
+ *   meantime is skipped by its own callback (`disposed`), never at another's expense.
+ * Never call this from polling, a wake loop or an automatic retry.
+ *
+ * @returns {Promise<{reset: boolean, outcome?: string, errorCode?: string}>}
+ */
+export function userRetry (computerId, failure, reopen) {
+    const expired = failure?.errorCode === 'capacity_attempt_expired' && typeof failure.capacityAttemptId === 'string'
+        && failure.capacityAttemptId !== '' && capacityRetryEndpoint() !== null && !! computerId;
+    if ( ! expired ) { reopen(); return Promise.resolve({ reset: false }); }
+    const key = `${computerId}|${failure.capacityAttemptId}`;
+    const shared = retryCapacityAttempt(computerId, failure);
+    let owed = reopensOwed.get(key);
+    if ( owed?.has(reopen) ) return shared; // the same window's second click: joined
+    if ( ! owed ) { owed = new Set(); reopensOwed.set(key, owed); }
+    owed.add(reopen);
+    return shared.then((result) => {
+        owed.delete(reopen);
+        if ( owed.size === 0 && reopensOwed.get(key) === owed ) reopensOwed.delete(key);
+        reopen();
+        return result;
+    });
 }
 
 /**
@@ -1095,12 +1393,13 @@ export default {
     get, set, del,
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
-    openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, confirmDisplay,
-    previewUrl, focusApp,
+    openDesktop, cancelOpenDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
+    previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
+    capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry,
+    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

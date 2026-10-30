@@ -106,6 +106,7 @@ ARG GUAC_VERSION=1.3.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
       x11vnc \
+      xclip \
       fluxbox \
       guacd \
       libguac-client-vnc0 \
@@ -119,12 +120,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dbus-x11 \
       x11-utils \
       xdotool \
+      x11-xkb-utils \
+      x11-xserver-utils \
+      fontconfig \
       fonts-liberation \
+      fonts-noto-core \
+      fonts-noto-cjk \
+      fonts-noto-color-emoji \
       xterm \
   && wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb \
   && apt-get install -y --no-install-recommends /tmp/chrome.deb \
   && rm -f /tmp/chrome.deb \
   && test -x /usr/sbin/guacd \
+  && fc-cache -f \
   && rm -rf /var/lib/apt/lists/*
 
 # Apache Guacamole HTML5 client web application (version-matched to guacd).
@@ -241,27 +249,69 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # instance_type history in wrangler.toml). code-server serves the IDE over
 # plain HTTP and renders nothing into Xvfb.
 COPY --from=neko /usr/bin/neko   /usr/bin/neko
+# Neko reads and writes the X clipboard ONLY through xclip (m1k1o/neko@d74052bb
+# server/internal/desktop/clipboard.go:49,82,133). Without it every clipboard sync
+# fails with "could not get clipboard content" (seen 2026-10-22).
+RUN command -v xclip >/dev/null || { echo 'xclip is required by the Neko clipboard' >&2; exit 1; }
 COPY --from=neko /var/www        /var/www
 COPY --from=neko /etc/neko       /etc/neko
+COPY scripts/neko-client.js /var/www/ezil-input.js
+RUN sed -i 's#</head>#<script defer src="ezil-input.js"></script></head>#' /var/www/index.html \
+  && grep -q 'src="ezil-input.js"' /var/www/index.html
 RUN chmod +x /usr/bin/neko \
   && if ldd /usr/bin/neko | grep -qi "not found"; then echo "ERROR: neko has unresolved shared libraries:" >&2; ldd /usr/bin/neko | grep -i "not found" >&2; exit 1; fi \
   && test -x /usr/bin/neko \
   && test -d /var/www \
   && test -f /etc/neko/neko.yaml
+# The pinned (legacy-protocol) Neko syncs the clipboard itself over
+# control/clipboard once the browser exposes navigator.clipboard read+write to
+# its frame: the shell iframe allow= plus the app Permissions-Policy, then the
+# user's normal permission grant. It has no server clipboard flag (that is
+# Neko v3). Fail the build if a Neko swap drops this client path.
+RUN grep -rl 'clipboard_read_available' /var/www/js >/dev/null \
+  && grep -rl 'clipboard.readText' /var/www/js >/dev/null \
+  && grep -rl 'clipboard.writeText' /var/www/js >/dev/null
 
-# ── code-server (replaces the pinned Electron VS Code build above) ───────────
-# Installed via the official installer, which on Debian/Ubuntu fetches and
-# installs the .deb release from GitHub (detected automatically; see
-# https://code-server.dev/install.sh). Binds **0.0.0.0**:8443 with `--auth
-# none`; start-neko.sh/start-codeserver.sh launch it. It bound 127.0.0.1 until
-# a live test showed Cloudflare's proxy reaches containers on their routable
-# address (10.0.0.1), never loopback — see the note in start-codeserver.sh.
-# Safe because the container network is not publicly routable and the sole
-# ingress is the HMAC/cookie-gated `*-code.ezil.org` bridge.
-# This RUN step must stay in the SAME commit as the /usr/share/code
-# COPY removal above so the two IDEs are never both present in one image.
-RUN curl -fsSL https://code-server.dev/install.sh | sh \
-  && test -x /usr/bin/code-server
+# ── Pinned code-server + bundled Copilot Chat (EZiL Chat) ────────────────────
+# Update the release and digest together; patches are exact-count gated against
+# this bundle. Keep defaultChatAgent: anonymous BYOK setup depends on it.
+# The launchers bind 0.0.0.0:8443 behind the authenticated code bridge.
+ARG CODE_SERVER_VERSION=4.141.0
+ARG CODE_SERVER_SHA256=f384beb4f3ba207e0bca27d0dbd36dd825d5aa909d78c6d4baa8703eaf6b77ba
+RUN curl --fail --location --silent --show-error \
+      "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \
+      --output /tmp/code-server.deb \
+  && echo "${CODE_SERVER_SHA256}  /tmp/code-server.deb" | sha256sum --check --strict \
+  && dpkg -i /tmp/code-server.deb \
+  && rm -f /tmp/code-server.deb \
+  && test -x /usr/bin/code-server \
+  && code-server --version | grep -q "^${CODE_SERVER_VERSION} "
+RUN node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot/package.json');if(j.publisher!=='GitHub'||j.name!=='copilot-chat'||j.version!=='0.69.0'||!j.contributes?.languageModelChatProviders)throw new Error('expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders');if(!require('/usr/lib/code-server/lib/vscode/product.json').defaultChatAgent)throw new Error('defaultChatAgent missing')"
+
+# MIT upstream code; exact anchors, copyright and modification notices are
+# documented in copilot-chat/PATCHES.md. Statsbeat reads its switch at load time.
+COPY copilot-chat/patch-copilot-chat.sh /usr/local/lib/ezil/patch-copilot-chat.sh
+COPY copilot-chat/PATCHES.md /usr/local/lib/ezil/PATCHES.md
+RUN chmod 0755 /usr/local/lib/ezil/patch-copilot-chat.sh \
+  && /usr/local/lib/ezil/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode \
+  && /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode
+# telemetry.telemetryLevel is application-scoped, so the Machine settings seed cannot turn
+# extension telemetry off in the web workbench; the product switch does, for every user.
+RUN node -e "const f='/usr/lib/code-server/lib/vscode/product.json',fs=require('fs'),j=JSON.parse(fs.readFileSync(f,'utf8'));if(j.enableTelemetry!==true)throw new Error('expected enableTelemetry true in the pinned product.json');j.enableTelemetry=false;fs.writeFileSync(f,JSON.stringify(j,null,'\\t'));if(JSON.parse(fs.readFileSync(f,'utf8')).enableTelemetry!==false||!j.defaultChatAgent)throw new Error('product.json telemetry switch failed')"
+ENV APPLICATION_INSIGHTS_NO_STATSBEAT=true
+
+# Built-in vendor ezil survives ephemeral user extension directories. The VSIX
+# is built from extensions/ezil-models outside this Docker build context.
+COPY ezil-models/dist/ezil-models-0.1.0.vsix /tmp/ezil-models.vsix
+RUN mkdir -p /tmp/ezil-models \
+  && unzip -q /tmp/ezil-models.vsix 'extension/*' -d /tmp/ezil-models \
+  && mv /tmp/ezil-models/extension /usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models \
+  && rm -rf /tmp/ezil-models /tmp/ezil-models.vsix \
+  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models/package.json');if(j.publisher!=='ezil'||j.name!=='ezil-models'||!(j.contributes.languageModelChatProviders||[]).some(p=>p.vendor==='ezil'))throw new Error('expected ezil.ezil-models with vendor ezil');console.log('built-in ezil-models',j.version)" \
+  && test -f /usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models/dist/extension.js
+COPY ezil-models/models.json /etc/ezil/models.json
+ENV EZIL_MODELS_CONFIG=/etc/ezil/models.json
+RUN node -e "const fs=require('fs'),raw=fs.readFileSync('/etc/ezil/models.json','utf8'),j=JSON.parse(raw);if(!j.providers||!Object.keys(j.providers).length||!Array.isArray(j.models)||!j.models.length)throw new Error('models.json needs providers and models');if(/ANTHROPIC_|OPENAI_|AZURE_|sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/.test(raw))throw new Error('models.json contains a direct-provider reference or literal secret');for(const p of Object.values(j.providers)){if(p.type!=='ezil-gateway'||p.baseUrl!=='{env:EZIL_AI_BASE_URL}'||p.apiKey!=='{env:EZIL_AI_PROXY_TOKEN}'||Object.keys(p).some(k=>!['type','baseUrl','apiKey'].includes(k)))throw new Error('providers must use only the EZiL gateway environment references');}if(j.models.filter(m=>m.default===true).length!==1||j.models.some(m=>!j.providers[m.provider]))throw new Error('models need valid providers and exactly one default');console.log('models.json gateway-only config verified')"
 
 # ── EZiL OS desktop assets + deterministic validators ────────────────────────
 # Explicit Openbox config (app-switch keybindings + root menu), the mandatory

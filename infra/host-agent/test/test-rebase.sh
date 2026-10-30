@@ -3,6 +3,7 @@
 # rebase_failed and nothing starts, restore + rebase succeeds, every rule mutation-
 # proven, planted preserve dir and a 5000-level tree handled. No container needed: the
 # result is inspected through a read-only overlay view (upper:new:old), kernel semantics.
+# The shared lower is extracted from the reviewed local Docker image.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "$HERE/lib.sh"
 OLDL="$(shared_lower)/$DHEX"
 LW="$T/rlowers"; rm -rf "$LW"; mkdir -p "$LW"; ln -s "$OLDL" "$LW/$DHEX"
@@ -10,7 +11,9 @@ NEWL="$T/newlayer"; rm -rf "$NEWL"
 H="$(host_new r "$LW")"; IMG="$(vol_new r 1G)"; DEV="$(vol_attach r "$IMG")"; stubs_up r
 VIEW="$T/rview"; mkdir -p "$VIEW"
 cleanup() { mountpoint -q "$VIEW" && umount "$VIEW"; for m in "$LW"/*; do mountpoint -q "$m" && umount "$m"; done
-            agent r teardown >/dev/null 2>&1; stubs_down r; vol_detach "$IMG"; rm -f "$T/snap-r.img"; }
+            agent r teardown >/dev/null 2>&1; stubs_down r; vol_detach "$IMG"
+            [ -z "${FAILED_IMG:-}" ] || vol_detach "$FAILED_IMG"
+            rm -f "$T/snap-r.img" "$T/snap-rebound-r.img"; }
 trap cleanup EXIT
 D="$H/srv/ezil-data"; U="$D/root/upper"
 
@@ -65,7 +68,37 @@ check "boot-chain stops at the guard: no clean/overlay/desktop" bash -c "! grep 
 userdata r 1 3 false "$RB"; agent r lease >/dev/null
 expect_refuse "next epoch, valid receipt: still refused until the snapshot is restored" rebase_failed agent r guard
 check "state file records rebase_failed + exit code + snapshot" bash -c "mount -o ro,nosuid,nodev '$DEV' '$D' && jq -e '.state==\"rebase_failed\" and .exitCode!=0 and .receipt.snapshotId==\"snap-0123456789abcdef0\"' '$D/.ezil-rebase-state.json'; rc=\$?; umount '$D'; exit \$rc"
-vol_detach "$IMG"; cp --sparse=always "$T/snap-r.img" "$IMG"; DEV="$(vol_attach r "$IMG")"    # control plane restores the snapshot
+# Restore to a DIFFERENT provider volume identity; retain the failed source untouched.
+FAILED_IMG="$IMG"; FAILED_HASH="$(sha256sum "$FAILED_IMG" | cut -d' ' -f1)"
+ORIGINAL_VOL="$VOL_ID"; vol_detach "$IMG"
+IMG="$T/vol-restored-r.img"; cp --sparse=always "$T/snap-r.img" "$IMG"
+rm -f "$H/byid/nvme-Amazon_Elastic_Block_Store_${ORIGINAL_VOL//-/}"
+VOL_ID=vol-22222222222222222; DEV="$(vol_attach r "$IMG")"
+echo "$DIGEST" > "$H/etc/lower-image-digest"
+userdata r 2 4 false; agent r lease >/dev/null
+expect_refuse "ordinary lease cannot rebind a snapshot's old volume ID" volume_id_mismatch agent r guard
+userdata r 2 4 false
+python3 "$HA/test/rebase-fixture.py" rebind "$H/stub/user-data" "$ORIGINAL_VOL" "$DIGEST" 1 1
+jq '.instanceId="i-11111111111111111"' "$H/stub/identity.json" > "$T/rebind-identity.json"
+cp "$T/rebind-identity.json" "$H/stub/identity.json"
+printf '%s' '{"maintenance":true,"accepted":true}' > "$H/stub/issue.json"
+agent r lease >/dev/null
+check "maintenance rebind succeeds on the different volume" agent r guard
+check "rebind changes only identity, retaining the source lower" jq -e --arg v "$VOL_ID" --arg d "$DIGEST" '.volumeId==$v and .lowerImageDigest==$d and .generation==2 and .leaseEpoch==4' "$D/.ezil-marker.json"
+check "maintenance report accepted without desktop credentials" agent r maintenance-enroll
+check "maintenance has its own receipt and never guard-ok or tunnel credentials" bash -c "[ -f '$H/state/maintenance-enrolled.json' ] && [ ! -e '$H/run/guard-ok' ] && [ ! -e '$H/state/tunnel.json' ] && [ ! -e '$H/state/control.key' ]"
+for downstream in clean overlay desktop edge cloudflared agent; do
+    expect_refuse "maintenance blocks direct $downstream" maintenance_only agent r "$downstream"
+done
+agent r data-down >/dev/null; agent r lease >/dev/null
+check "same authorized rebind repeats after completion" agent r guard
+check "maintenance receipt reuses after same-instance reboot" agent r maintenance-enroll
+check "failed source volume retained byte-for-byte" bash -c "[ \$(sha256sum '$FAILED_IMG' | cut -d' ' -f1) = '$FAILED_HASH' ]"
+agent r data-down >/dev/null
+# A NEW preparation checkpoint/receipt names the rebound volume before retry.
+cp --sparse=always "$IMG" "$T/snap-rebound-r.img"
+RB="$(jq -nc --arg v "$VOL_ID" --arg f "$DIGEST" --arg t "$NEWD" '{snapshotId:"snap-22222222222222222", volumeId:$v, fromDigest:$f, toDigest:$t}')"
+echo "$NEWD" > "$H/etc/lower-image-digest"
 
 # ---- 3. every rule must matter (copies of the seeded upper, rebased with one rule off)
 mount -o ro,nosuid,nodev "$DEV" "$D"; rm -rf "$T/seed-upper"; cp -a "$U" "$T/seed-upper"; umount "$D"
@@ -89,12 +122,65 @@ for rule in none 1 2 3 3w 4 5 P; do
     else grep -qx "rule$rule" <<<"$red" && pass "[mutation] rule $rule off -> its own check goes red" || fail "[mutation] rule $rule off and its check stayed green (red: $red)"; fi
 done
 
+# ---- crash, permit and capacity boundaries on disposable clones of the rebound checkpoint
+reset_rebound() {
+    agent r data-down >/dev/null 2>&1
+    vol_detach "$IMG"; cp --sparse=always "$T/snap-rebound-r.img" "$IMG"
+    DEV="$(vol_attach r "$IMG")"
+}
+userdata r 3 6 false "$RB"
+python3 "$HA/test/rebase-fixture.py" permit "$H/stub/user-data" -601
+agent r lease >/dev/null
+expect_refuse "expired permit refuses before upper mutation" permit_expired agent r guard
+check "expired permit left no rebase state" bash -c "mount -o ro,noload '$DEV' '$D' && [ ! -e '$D/.ezil-rebase-state.json' ]; rc=\$?; umount '$D'; exit \$rc"
+for point in before-marker after-marker; do
+    reset_rebound
+    userdata r 3 6 false "$RB"; agent r lease >/dev/null
+    EZIL_REBASE_FAULT_AFTER="$point" agent r guard >/dev/null 2>&1; rc=$?
+    check "crash $point exits at the injected commit boundary" test "$rc" -eq 99
+    expected="$DIGEST"; [ "$point" != after-marker ] || expected="$NEWD"
+    check "crash $point retains state and expected marker" bash -c "[ -f '$D/.ezil-rebase-state.json' ] && [ ! -e '$H/run/guard-ok' ] && jq -e --arg d '$expected' '.lowerImageDigest==\$d' '$D/.ezil-marker.json'"
+    agent r data-down >/dev/null
+    expect_refuse "crash $point stays blocked on next boot" rebase_failed agent r guard
+done
+for resource in blocks inodes; do
+    reset_rebound
+    mount -o rw,nosuid,nodev "$DEV" "$D"
+    python3 - "$D" "$resource" <<'FILL'
+import errno, os, sys
+root, resource = sys.argv[1:]
+try:
+    if resource == 'blocks':
+        with open(root + '/.fill-blocks', 'wb', buffering=0) as f:
+            block = b'\0' * (1024 * 1024)
+            while True: f.write(block)
+    else:
+        path = root + '/.fill-inodes'
+        os.mkdir(path)
+        i = 0
+        while True:
+            fd = os.open(path + '/' + str(i), os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd); i += 1
+except OSError as e:
+    if e.errno != errno.ENOSPC: raise
+os.sync()
+v = os.statvfs(root)
+assert (v.f_bavail == 0 if resource == 'blocks' else v.f_favail == 0), 'wrong resource exhausted'
+FILL
+    check "fixture exhausted real filesystem $resource" test "$?" -eq 0
+    umount "$D"
+    userdata r 3 6 false "$RB"; agent r lease >/dev/null
+    expect_refuse "full $resource refuses before rebase" rebase_failed agent r guard
+    expect_refuse "full $resource leaves downstream blocked" guard_not_passed agent r overlay
+done
+reset_rebound
+
 # ---- 4. restored volume + valid receipt: rebase through the guard
-userdata r 1 4 false "$RB"; agent r lease >/dev/null
+userdata r 3 6 false "$RB"; agent r lease >/dev/null
 gout="$(agent r guard 2>&1)"
 check "guard with snapshot receipt rebases and accepts" grep -q 'guard rebase_needed' <<<"$gout"
 grep -q 'guard rebase_needed' <<<"$gout" || log "guard said: $(tail -c 600 <<<"$gout")"
-check "marker carries the NEW digest, epoch 4; no state file left" bash -c "jq -e --arg d '$NEWD' '.lowerImageDigest==\$d and .leaseEpoch==4' '$D/.ezil-marker.json' && [ ! -e '$D/.ezil-rebase-state.json' ]"
+check "marker carries the NEW digest, epoch 6; no state file left" bash -c "jq -e --arg d '$NEWD' '.lowerImageDigest==\$d and .leaseEpoch==6' '$D/.ezil-marker.json' && [ ! -e '$D/.ezil-rebase-state.json' ]"
 PD="$(jq -r .preserved_dir "$H/run/rebase-report.json")"
 check "colliding /usr/local and /opt user files moved aside intact" bash -c "[ \$(sha256sum '$U$PD/usr/local/bin/ezil-collide' | cut -d' ' -f1) = $COLL ] && [ \$(sha256sum '$U$PD/opt/ezil-collide/tool' | cut -d' ' -f1) = $COLLO ]"
 check "kept user files byte-identical (/usr/local, /var/lib, /etc edit, file in opaque dir)" bash -c "cd '$U' && [ \"\$(sha256sum usr/local/bin/user-tool var/lib/svc/data etc/bash.bashrc usr/share/doc/dpkg/user-note)\" = \"$KEEP\" ]"

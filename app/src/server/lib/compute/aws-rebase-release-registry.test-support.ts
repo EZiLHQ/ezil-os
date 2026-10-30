@@ -1,0 +1,144 @@
+import { fixtureRebaseDeployments, fixtureRebaseRelease } from './aws-intent.test-support';
+import type { LifecycleDeployment, SourceLifecycleDeployment } from './aws-intent';
+import type { RebaseRelease, RebaseSourceRelease } from './aws-rebase-release';
+
+// Synthetic pins reuse local fixtures; full digests retain the contract's prefixes.
+export const LOWER_102 = 'sha256:' + '8dbc'.padEnd(64, '0');
+export const LOWER_105 = 'sha256:' + '34ac'.padEnd(64, '0');
+export const PREMIUM_LOWER = 'sha256:' + '0769'.padEnd(64, '0');
+
+export function fixtureReleaseRegistry106() {
+    const base = fixtureRebaseDeployments();
+    const deployment102: SourceLifecycleDeployment = {
+        ...base.sourceDeployment, lowerImageDigest: LOWER_102, previousLowerImageDigest: null,
+        launchTemplateId: 'lt-22222222222222222', launchTemplateVersion: '3',
+        stateMachineVersionArn: base.sourceDeployment.stateMachineVersionArn.replace(/:2$/, ':8'),
+        preparationStateMachineVersionArn: null, recoveryStateMachineVersionArn: null,
+    };
+    const deployment105: LifecycleDeployment = {
+        ...base.deployment, lowerImageDigest: LOWER_105, previousLowerImageDigest: LOWER_102,
+        amiId: 'ami-55555555555555555', launchTemplateVersion: '4',
+        stateMachineVersionArn: base.deployment.stateMachineVersionArn.replace(/:1$/, ':9'),
+    };
+    const deployment106: LifecycleDeployment = {
+        ...deployment105, amiId: 'ami-66666666666666666', launchTemplateVersion: '5',
+        stateMachineVersionArn: deployment105.stateMachineVersionArn.replace(/:9$/, ':10'),
+        preparationStateMachineVersionArn: deployment105.preparationStateMachineVersionArn!.replace(/:1$/, ':2'),
+        recoveryStateMachineVersionArn: deployment105.recoveryStateMachineVersionArn!.replace(/:1$/, ':2'),
+    };
+    const release102: RebaseSourceRelease = {
+        ...fixtureRebaseRelease(deployment102), recipeVersion: '1.0.2', createdAt: '2026-10-20T10:00:00.000Z',
+    };
+    const base105 = fixtureRebaseRelease(deployment105);
+    const release105: RebaseRelease = {
+        ...base105, recipeVersion: '1.0.5', createdAt: '2026-10-21T10:00:00.000Z',
+        lowerImageRef: base105.previousLowerImageRef!, previousLowerImageRef: release102.lowerImageRef,
+    };
+    const release106: RebaseRelease = {
+        ...fixtureRebaseRelease(deployment106), recipeVersion: '1.0.6', createdAt: '2026-10-22T10:00:00.000Z',
+        lowerImageRef: release105.lowerImageRef, previousLowerImageRef: release102.lowerImageRef,
+    };
+    const releases = [release102, release105, release106];
+    return { deployment102, deployment105, deployment106, release102, release105, release106, releases,
+        entry: { ...deployment106, releases }, repository: release106.lowerImageRef.split('@')[0]! };
+}
+
+/** Synthetic successor makes 34ac eligible, so tests can inspect the selected immutable source. */
+export function fixtureSharedLowerSuccessor() {
+    const f = fixtureReleaseRegistry106();
+    const deployment = { ...f.deployment106, amiId: 'ami-77777777777777777',
+        lowerImageDigest: 'sha256:' + '7'.repeat(64), previousLowerImageDigest: LOWER_105 };
+    const target: RebaseRelease = { ...f.release106, amiId: deployment.amiId, lowerImageDigest: deployment.lowerImageDigest,
+        previousLowerImageDigest: deployment.previousLowerImageDigest, recipeVersion: '1.0.7',
+        lowerImageRef: `${f.repository}@${deployment.lowerImageDigest}`, previousLowerImageRef: f.release105.lowerImageRef,
+        createdAt: '2026-10-22T11:00:00.000Z' };
+    return { ...f, deployment, target, entry: { ...deployment, releases: [...f.releases, target] } };
+}
+
+/** Offline capacity fixture: 1.0.16 is the tenth record, corrective 1.0.17 the eleventh, the next train the twelfth.
+ * Pins are synthetic, not live evidence. */
+export function fixtureReleaseRegistry12() {
+    const f = fixtureReleaseRegistry106();
+    const retained = [...f.releases];
+    for (const n of [7, 8, 9, 10, 11, 13, 16, 17, 18]) retained.push({ ...f.release106,
+        amiId: `ami-${n.toString(16).padStart(17, '0')}`, recipeVersion: `1.0.${n}`,
+        launchTemplateVersion: String(n),
+        stateMachineVersionArn: f.release106.stateMachineVersionArn.replace(/:[0-9]+$/, `:${n + 10}`),
+        preparationStateMachineVersionArn: f.release106.preparationStateMachineVersionArn.replace(/:[0-9]+$/, `:${n}`),
+        recoveryStateMachineVersionArn: f.release106.recoveryStateMachineVersionArn.replace(/:[0-9]+$/, `:${n}`),
+        createdAt: `2026-10-23T${String(n).padStart(2, '0')}:00:00.000Z`,
+    });
+    const release116 = retained[9]!, release117 = retained[10]!, release118 = retained[11]!;
+    const deploymentFor = (r: RebaseSourceRelease): LifecycleDeployment => ({ ...f.deployment106,
+        amiId: r.amiId, launchTemplateVersion: r.launchTemplateVersion, stateMachineVersionArn: r.stateMachineVersionArn,
+        preparationStateMachineVersionArn: r.preparationStateMachineVersionArn!, recoveryStateMachineVersionArn: r.recoveryStateMachineVersionArn! });
+    return { ...f, retained, release116, release117, release118,
+        deployment116: deploymentFor(release116), deployment117: deploymentFor(release117), deployment118: deploymentFor(release118) };
+}
+
+/** Synthetic thirteenth record; not actual 1.0.19 release proof. */
+export function fixtureReleaseRegistry13() {
+    const f = fixtureReleaseRegistry12();
+    const release119 = { ...f.release118, amiId: 'ami-00000000000000013', recipeVersion: '1.0.19',
+        createdAt: '2026-10-23T19:00:00.000Z' };
+    return { ...f, release119, retained: [...f.retained, release119],
+        deployment119: { ...f.deployment118, amiId: release119.amiId } };
+}
+
+/** Synthetic fourteenth record; not actual 1.0.20 release proof. */
+export function fixtureReleaseRegistry14() {
+    const f = fixtureReleaseRegistry13();
+    const release120 = { ...f.release119, amiId: 'ami-00000000000000014', recipeVersion: '1.0.20',
+        createdAt: '2026-10-23T20:00:00.000Z' };
+    return { ...f, release120, retained: [...f.retained, release120],
+        deployment120: { ...f.deployment119, amiId: release120.amiId } };
+}
+
+/** Synthetic fifteenth record; not actual 1.0.21 release proof. */
+export function fixtureReleaseRegistry15() {
+    const f = fixtureReleaseRegistry14();
+    const release121 = { ...f.release120, amiId: 'ami-00000000000000015', recipeVersion: '1.0.21',
+        createdAt: '2026-10-24T20:00:00.000Z' };
+    return { ...f, release121, retained: [...f.retained, release121],
+        deployment121: { ...f.deployment120, amiId: release121.amiId } };
+}
+
+/** Synthetic sixteenth record; not actual 1.0.22 release proof. */
+export function fixtureReleaseRegistry16() {
+    const f = fixtureReleaseRegistry15();
+    const release122 = { ...f.release121, amiId: 'ami-00000000000000016', recipeVersion: '1.0.22',
+        createdAt: '2026-10-25T20:00:00.000Z' };
+    return { ...f, release122, retained: [...f.retained, release122],
+        deployment122: { ...f.deployment121, amiId: release122.amiId } };
+}
+
+/** Synthetic seventeenth and eighteenth records; not actual release proof. */
+export function fixtureReleaseRegistry18() {
+    const f = fixtureReleaseRegistry16();
+    const release123 = { ...f.release122, amiId: 'ami-00000000000000017', recipeVersion: '1.0.23',
+        createdAt: '2026-10-26T20:00:00.000Z' };
+    const release124 = { ...release123, amiId: 'ami-00000000000000018', recipeVersion: '1.0.24',
+        createdAt: '2026-10-27T20:00:00.000Z' };
+    return { ...f, release123, release124, retained: [...f.retained, release123, release124],
+        deployment124: { ...f.deployment122, amiId: release124.amiId } };
+}
+
+/** Synthetic nineteenth maintenance record; not actual 1.0.25 release proof. */
+export function fixtureReleaseRegistry19() {
+    const f = fixtureReleaseRegistry18();
+    const release125 = { ...f.release124, amiId: 'ami-00000000000000019', recipeVersion: '1.0.25',
+        previousLowerImageDigest: null, previousLowerImageRef: null, createdAt: '2026-10-28T20:00:00.000Z' };
+    return { ...f, release125, retained: [...f.retained, release125],
+        deployment125: { ...f.deployment124, amiId: release125.amiId, previousLowerImageDigest: null } };
+}
+
+/** Synthetic twentieth to twenty-fourth normal records; not actual 1.0.26+ release proof.
+ * The count cap is 24: the hashed readback no longer bounds the registry, only the 65,536-byte secret does. */
+export function fixtureReleaseRegistry24() {
+    const f = fixtureReleaseRegistry19();
+    const later = [26, 27, 28, 29, 30].map((n, i) => ({ ...f.release124, amiId: `ami-${String(20 + i).padStart(17, '0')}`,
+        recipeVersion: `1.0.${n}`, createdAt: `2026-11-0${1 + i}T20:00:00.000Z` }));
+    const release130 = later[4]!;
+    return { ...f, later, release130, retained: [...f.retained, ...later],
+        deployment130: { ...f.deployment124, amiId: release130.amiId } };
+}

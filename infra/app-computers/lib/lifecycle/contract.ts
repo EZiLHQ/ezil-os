@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { LifecycleDeploymentSchema, type LifecycleIntent } from './intent.js';
+import { parseLease } from './lease.js';
 
 // Infrastructure pins are shared by the workflow; adding a computer never
 // redeploys this graph. R5: there is no per-writer instance profile and no
@@ -35,23 +36,38 @@ export const tagsFor = (i:LifecycleIntent,generation=i.targetGeneration,fence=i.
  * (computer-id, managed-by, stage) are set once, at creation (ec2:CreateAction). */
 export const RETAG_KEYS = ['ezil:generation','ezil:fence-token'] as const;
 export const retagsFor = (i:LifecycleIntent) => ({'ezil:generation':String(i.targetGeneration),'ezil:fence-token':i.fenceToken});
+export { POOL_INSTANCE_TYPES as POOL_IAM_TYPES } from './deployment.js';
+export const POOL_CLAIM_KEYS = ['ezil:computer','ezil:generation','ezil:fence'] as const;
+export const poolTagsFor = (i:LifecycleIntent) => ({
+    'ezil:managed-by':'app-computer-platform','ezil:stage':i.deployment.namespace,
+    'ezil:namespace':i.deployment.namespace,'ezil:pool':'1','ezil:pool-host':i.poolHostId!,
+});
+export const claimTagsFor = (i:LifecycleIntent) => ({
+    'ezil:computer':i.computerId,'ezil:generation':String(i.targetGeneration),'ezil:fence':i.fenceToken,
+});
+export const poolLease = (i:LifecycleIntent) => Buffer.from(JSON.stringify({
+    kind:'pool',poolHostId:i.poolHostId,poolGeneration:i.poolGeneration,
+})).toString('base64');
 export const tagList = (tags:Record<string,string>) => Object.entries(tags).map(([Key,Value])=>({Key,Value}));
 /** DLM (I6) snapshots data volumes carrying this tag, valued with the
  * namespace. Set only at creation; root disks never carry it. */
 export const BACKUP_TAG='ezil:backup';
 export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume'),[BACKUP_TAG]:i.deployment.namespace});
 export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
-export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest});
-export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started'] as const;
+export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest,
+    ...(i.rebasePreparation ? { imageJobId: i.rebasePreparation.preparationJobId,
+        imageJobPhase: parseLease(i.userData!).ebsRestore ? 'rebind' : 'launch' } : {}),
+    ...(['pool-provision','pool-retire'].includes(i.operation)?{operation:i.operation,poolHostId:i.poolHostId,poolGeneration:i.poolGeneration}:{})});
+export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started','detached','claimed','unpooled'] as const;
 export type Phase=typeof phases[number];
 /** `runBurstableInstances` is RunInstances for a T-family type: the same EC2
  * API, but its graph state also forwards CreditSpecification (standard). A
  * separate state keeps every forwarded key mandatory in the fixed graph. */
-export type Action='createVolume'|'runInstances'|'runBurstableInstances'|'attachVolume'|'createTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
+export type Action='createVolume'|'runInstances'|'runBurstableInstances'|'attachVolume'|'detachVolume'|'createTags'|'claimInstance'|'deleteTags'|'modifyInstanceAttribute'|'startInstances'|'stopInstances'|'terminateInstances';
 export const afterAction:Record<Action,Phase>={createVolume:'volume',runInstances:'instance',runBurstableInstances:'instance',attachVolume:'attached',
-    modifyInstanceAttribute:'userdata',createTags:'tagged',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
+    modifyInstanceAttribute:'userdata',createTags:'tagged',claimInstance:'claimed',deleteTags:'unpooled',detachVolume:'detached',startInstances:'started',stopInstances:'stopped',terminateInstances:'terminated'};
 /** Graph states that call RunInstances. Recovery treats entering ANY of them
  * as evidence that a launch may have happened. */
 export const LAUNCH_ACTIONS:readonly Action[]=['runInstances','runBurstableInstances'];
 /** The EC2 API each graph action calls (aws-sdk:ec2:<api>). */
-export const ec2Api=(action:Action)=>action==='runBurstableInstances'?'runInstances':action;
+export const ec2Api=(action:Action)=>action==='runBurstableInstances'?'runInstances':action==='claimInstance'?'createTags':action;

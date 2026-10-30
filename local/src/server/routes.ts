@@ -301,13 +301,14 @@ async function handleDesktopGet(req: Request, deps: ShellRouterDeps): Promise<Re
             : deps.probeFrame
                 ? await deps.probeFrame(raw, offset)
                 : await probeFrameOrigin(raw, surface, offset);
-        // `session.js#confirmFrame` reads `data.ok === true` then
-        // `data.confirmed === true`; anything else is `undefined`, which is not
-        // an observation and must not be read as either verdict.
+        // Match hosted confirmation: successful HTTP evidence has a status but
+        // no reason. Keep the lower-level probe diagnostic and refusals intact.
+        const confirmed = probe.alive && probe.reason === 'ok' && Number.isInteger(probe.status)
+            && probe.status! >= 200 && probe.status! < 400;
         return shellJson({
             ok: true,
-            confirmed: probe.alive,
-            reason: probe.reason,
+            confirmed,
+            ...(confirmed ? {} : { reason: probe.reason }),
             ...(probe.status === undefined ? {} : { status: probe.status }),
             correlationId,
         });

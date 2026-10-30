@@ -80,6 +80,13 @@ async function run(f = fixture(), options: { lose?: string; noEffect?: string; s
     return { error: result.error, cause: result.cause, receipt: result.output, calls, f };
 }
 
+for (const operation of ['pool-provision', 'pool-retire', 'adopt', 'release'] as const) test(`historical recovery refuses ${operation} without mutation or a false fencing receipt`, async () => {
+    const f = fixture(operation), history = f.deps.history; let historyReads = 0;
+    f.deps.history = async (...args) => { historyReads++; return history(...args); };
+    const result = await run(f);
+    assert.equal(historyReads, 0, 'pool intents must not enter historical cleanup');
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined); assert.deepEqual(result.calls, []);
+});
 for (const operation of ['provision', 'start', 'stop', 'replace', 'retire'] as const) test(`recovery fences ${operation} writers and retains their data disk`, async () => {
     const f = fixture(operation);
     const result = await run(f); assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced');
@@ -92,6 +99,46 @@ test('a failure before any allocation can prove no resource effects', async () =
     const result = await run(fixture('provision', false)); assert.equal(result.error, undefined);
     assert.equal(result.receipt.volumeId, null); assert.deepEqual(result.receipt.instances, []); assert.deepEqual(result.calls, []);
 });
+test('a terminated source without subnet or placement still allows stop-target with the original disk attached', async () => {
+    const f = fixture('replace'), source = f.state.instances[0]!, target = f.state.instances[1]!;
+    delete source.SubnetId; delete source.Placement;
+    assert.equal(source.State?.Name, 'terminated'); assert.equal(target.State?.Name, 'running');
+    assert.equal(f.state.volumes[0]!.Attachments![0]!.InstanceId, target.InstanceId);
+    assert.deepEqual(await createRecoveryHelper(f.settings, f.deps)({ executionArn: f.arn, phase: 'initial' }), {
+        decision: 'stop-target', parameters: { InstanceIds: [target.InstanceId], Force: false, Hibernate: false, SkipOsShutdown: false },
+    });
+    const result = await run(f);
+    assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced');
+    assert.deepEqual(result.calls.map(c => c.action), ['stopInstances', 'terminateInstances']);
+    assert.ok(result.calls.every(c => c.parameters.InstanceIds[0] === target.InstanceId));
+    assert.equal(f.state.volumes[0]!.VolumeId, f.i.dataVolumeId); assert.equal(f.state.volumes[0]!.State, 'available');
+});
+test('a terminated target without subnet or placement can confirm fencing once its disk is free', async () => {
+    const f = fixture(), target = f.state.instances[0]!;
+    target.State = { Name: 'terminated' }; target.BlockDeviceMappings = [];
+    delete target.SubnetId; delete target.Placement;
+    f.state.volumes[0]!.State = 'available'; f.state.volumes[0]!.Attachments = [];
+    const result = await run(f);
+    assert.equal(result.error, undefined); assert.equal(result.receipt.state, 'fenced'); assert.deepEqual(result.calls, []);
+});
+for (const state of ['terminated', 'running', 'stopped', 'stopping', 'pending', 'shutting-down'] as const) {
+    for (const field of ['subnet', 'zone'] as const) test(`recovery refuses a ${state} instance with a wrong present ${field}`, async () => {
+        const f = fixture('replace'), source = f.state.instances[0]!;
+        source.State = { Name: state };
+        if (field === 'subnet') source.SubnetId = 'subnet-99999999999999999';
+        else source.Placement = { AvailabilityZoneId: 'aps1-az2' };
+        const result = await run(f);
+        assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+    });
+}
+for (const state of ['running', 'stopped', 'stopping', 'pending', 'shutting-down'] as const) {
+    test(`recovery refuses a ${state} target with a missing subnet`, async () => {
+        const f = fixture(), target = f.state.instances[0]!;
+        target.State = { Name: state }; delete target.SubnetId;
+        const result = await run(f);
+        assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+    });
+}
 for (const rootDeviceName of ['/dev/sda1', '/dev/xvda'] as const) test(`recovery honors configured ${rootDeviceName} root`, async () => {
     const result = await run(fixture('provision', true, 'runInstances', rootDeviceName));
     assert.equal(result.error, undefined);
@@ -237,4 +284,77 @@ test('recovery lets interrupted SDK tasks settle for 60 s before reading termina
     f.state.now += 51000;
     const later = await createRecoveryHelper(f.settings, f.deps)({ executionArn: f.arn, phase: 'initial' });
     assert.notDeepEqual(later, { decision: 'wait', phase: 'initial' }); assert.ok(historyReads > 0);
+});
+
+// 1.0.16 canary (2026-10-25): a failed cold replace whose source is a RELEASED pool host (claim identity).
+function releasedReplace(state: 'terminated' | 'shutting-down' | 'running' | 'stopped' = 'terminated',
+    edit?: (tags: { Key: string; Value: string }[]) => { Key: string; Value: string }[]) {
+    const f = fixture('replace', false), old = f.state.instances[0]!, i = f.i, ns = i.deployment.namespace;
+    old.State = { Name: state }; old.BlockDeviceMappings = [];
+    // Recovery keeps its existing rule: only a TERMINATED instance may omit its subnet.
+    if (state === 'terminated') delete old.SubnetId;
+    const tags = [{ Key: 'ezil:managed-by', Value: 'app-computer-platform' }, { Key: 'ezil:stage', Value: ns }, { Key: 'ezil:namespace', Value: ns },
+        { Key: 'ezil:pool-host', Value: '98703145-8dff-4138-b632-cc3584321bc9' }, { Key: 'ezil:computer', Value: i.computerId },
+        { Key: 'ezil:generation', Value: String(i.previousGeneration) }, { Key: 'ezil:fence', Value: i.previousFenceToken! }];
+    old.Tags = edit ? edit(tags) : tags;
+    const v = f.state.volumes[0]!; v.State = 'available'; v.Attachments = [];
+    return f;
+}
+test('cleanup of a no-launch replace accepts a terminated released pool source without any mutation', async () => {
+    const f = releasedReplace(), result = await run(f);
+    assert.equal(result.error, undefined, result.cause); assert.equal(result.receipt.state, 'fenced'); assert.deepEqual(result.calls, []);
+    assert.deepEqual(result.receipt.instances.map((x: any) => [x.instanceId, x.generation, x.state]), [[f.i.previousInstanceId, f.i.previousGeneration, 'terminated']]);
+    assert.equal(result.receipt.volumeId, f.i.dataVolumeId);
+});
+test('cleanup waits for a shutting-down released pool source, then fences without mutation', async () => {
+    const f = releasedReplace('shutting-down'), original = f.deps.instances; let reads = 0;
+    f.deps.instances = async selector => { const rows = await original(selector);
+        if (Array.isArray(selector) && ++reads >= 3) for (const r of rows) if (r.instance.State?.Name === 'shutting-down') { r.instance.State = { Name: 'terminated' }; delete r.instance.SubnetId; }
+        return rows; };
+    const result = await run(f);
+    assert.equal(result.error, undefined, result.cause); assert.equal(result.receipt.state, 'fenced'); assert.deepEqual(result.calls, []); assert.ok(reads >= 3);
+});
+for (const state of ['running', 'stopped'] as const) test(`cleanup refuses a LIVE (${state}) claim-tagged source: never stops or terminates a pool host`, async () => {
+    const f = releasedReplace(state), result = await run(f);
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+});
+for (const [label, edit] of [
+    ['another fence', (t: { Key: string; Value: string }[]) => t.map(x => x.Key === 'ezil:fence' ? { ...x, Value: '00000000-0000-4000-8000-000000000000' } : x)],
+    ['another generation', (t: { Key: string; Value: string }[]) => t.map(x => x.Key === 'ezil:generation' ? { ...x, Value: '99' } : x)],
+    ['a cold-launch alias', (t: { Key: string; Value: string }[]) => [...t, { Key: 'ezil:computer-id', Value: '00000000-0000-4000-8000-000000000000' }]],
+    ['a still-pooled tag', (t: { Key: string; Value: string }[]) => [...t, { Key: 'ezil:pool', Value: '1' }]],
+    ['no pool-host', (t: { Key: string; Value: string }[]) => t.filter(x => x.Key !== 'ezil:pool-host')],
+] as const) test(`cleanup refuses a terminated released source with ${label}`, async () => {
+    const result = await run(releasedReplace('terminated', edit));
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+});
+test('cleanup still refuses a released source when the volume remains attached to it (waits, no false fencing)', async () => {
+    const f = releasedReplace(), v = f.state.volumes[0]!; v.State = 'in-use';
+    v.Attachments = [{ InstanceId: f.i.previousInstanceId!, VolumeId: v.VolumeId, State: 'detaching', Device: '/dev/sdf', DeleteOnTermination: false }];
+    const result = await run(f);
+    assert.notEqual(result.receipt?.state, 'fenced'); assert.deepEqual(result.calls, []);
+});
+test('cleanup waits on a shutting-down released source whose subnet EC2 already cleared, then fences without mutation', async () => {
+    const f = releasedReplace('shutting-down'); delete f.state.instances[0]!.SubnetId;
+    const original = f.deps.instances; let reads = 0;
+    f.deps.instances = async selector => { const rows = await original(selector);
+        if (Array.isArray(selector) && ++reads >= 3) for (const r of rows) if (r.instance.State?.Name === 'shutting-down') r.instance.State = { Name: 'terminated' };
+        return rows; };
+    const result = await run(f);
+    assert.equal(result.error, undefined, result.cause); assert.equal(result.receipt.state, 'fenced'); assert.deepEqual(result.calls, []); assert.ok(reads >= 3);
+});
+test('a shutting-down source with a cleared subnet but a contradictory reported zone is still refused', async () => {
+    const f = releasedReplace('shutting-down'); delete f.state.instances[0]!.SubnetId; f.state.instances[0]!.Placement = { AvailabilityZoneId: 'aps1-az2' };
+    const result = await run(f);
+    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+});
+for (const state of ['terminated', 'running', 'stopped'] as const) test(`cleanup refuses a ${state} canonical-valid source carrying contradictory claim/namespace aliases`, async () => {
+    for (const alias of [{ Key: 'ezil:computer', Value: '00000000-0000-4000-8000-000000000000' }, { Key: 'ezil:fence', Value: '00000000-0000-4000-8000-000000000000' },
+        { Key: 'ezil:namespace', Value: 'other' }]) {
+        const f = fixture('replace', false), old = f.state.instances[0]!;
+        old.State = { Name: state }; old.Tags = [...old.Tags!, alias];
+        if (state === 'terminated') { old.BlockDeviceMappings = []; const v = f.state.volumes[0]!; v.State = 'available'; v.Attachments = []; }
+        const result = await run(f);
+        assert.equal(result.error, 'LifecycleRecoveryUnconfirmed', alias.Key); assert.deepEqual(result.calls, [], alias.Key);
+    }
 });

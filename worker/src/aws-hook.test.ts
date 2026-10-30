@@ -18,8 +18,9 @@ mock.module('cloudflare:workers', () => ({
 
 import vectors from './aws-gateway.vectors.json';
 import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-origin';
-import { AwsTunnelRegistry, type TunnelStorage } from './aws-tunnels';
-import { deriveNekoCredentials, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { AwsTunnelRegistry, verifyAwsTunnelOrigin, type TunnelStorage } from './aws-tunnels';
+import { deriveNekoCredentials, hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
+import { deriveAiProxyToken } from './ai-proxy';
 import { sha256Hex } from './aws-ice';
 import { relayExpiryFor } from './relay-refresh';
 
@@ -90,9 +91,10 @@ afterEach(() => { globalThis.fetch = realFetch; });
  * API) plus a fake Cloudflare Realtime TURN API. Records what the Worker sent.
  */
 interface FakeHost {
+  bootId?: string; aiConfigured?: boolean;
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
-  pushed?: { expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
-  turnCalls: number; bad: string[]; paths: string[];
+  pushed?: { ai?: { baseUrl: string; proxyToken: string }; expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
+  turnCalls: number; turnStatus?: number; bad: string[]; paths: string[];
 }
 function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
   const h: FakeHost = { configured: false, desktop: 'absent', ice: 'none', relayExpiresAt: Date.now() + 1_200_000,
@@ -107,6 +109,7 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (url.hostname === 'rtc.live.cloudflare.com') {
       h.turnCalls++;
       if (headers.get('authorization') !== 'Bearer turn-api-token') h.bad.push('turn auth');
+      if (h.turnStatus) return j({}, h.turnStatus);
       return j({ iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] },
         { urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'], username: 'tu', credential: 'tp' }] }, 201);
     }
@@ -114,7 +117,8 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (url.hostname !== `c-${SID}-g1-e2.${ORIGIN_ZONE}`) h.bad.push(`host ${url.hostname}`);
     const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
-    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice });
+    if (url.pathname.startsWith('/__ezil/control/restart-desktop/')) return j({ ok: true, state: 'restart_requested' });
+    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
       h.pushed = JSON.parse(body);
@@ -224,6 +228,56 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     }
   });
 
+  it.each(['matching', 'empty', 'mismatch'])('first browser route verifies %s connectors without a preview open', async (mode) => {
+    let checks = 0;
+    const deleted: string[] = [];
+    const tunnelFetch: FetchLike = async (url, init) => {
+      if (init.method === 'DELETE') deleted.push(new URL(url).pathname);
+      if (init.method === 'GET' && url.endsWith('/connections')) {
+        checks++;
+        const origins = mode === 'matching' ? ['13.200.1.2'] : mode === 'empty' ? [] : ['203.0.113.9'];
+        return Response.json({ success: true, result: [{ conns: origins.map((origin_ip) => ({ origin_ip })) }] });
+      }
+      return cfApiFetch(url);
+    };
+    const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch);
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    let forwarded = 0;
+    globalThis.fetch = (async () => { forwarded++; return new Response('origin'); }) as typeof fetch;
+    for (let i = 0; i < 2; i++) {
+      const response = await worker.fetch(new Request(`https://aws-8443-${SID}-aws.ezil.work/vscode`, { headers: { cookie } }), e);
+      expect(response.status).toBe(mode === 'matching' ? 200 : 502);
+      if (mode !== 'matching') expect(await response.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    }
+    expect(checks).toBe(1);
+    expect(forwarded).toBe(mode === 'matching' ? 2 : 0);
+    expect(deleted).toEqual(mode === 'mismatch' ? [
+      '/client/v4/zones/zone/dns_records/tid',
+      '/client/v4/accounts/acct/cfd_tunnel/tid/connections',
+      '/client/v4/accounts/acct/cfd_tunnel/tid',
+    ] : []);
+  });
+
+  it.each(['empty', 'mismatch'])('preview route preserves the %s connector verdict', async (mode) => {
+    const deleted: string[] = [];
+    const tunnelFetch: FetchLike = async (url, init) => {
+      if (init.method === 'DELETE') deleted.push(new URL(url).pathname);
+      if (init.method === 'GET' && url.endsWith('/connections')) {
+        const origins = mode === 'empty' ? [] : ['203.0.113.9'];
+        return Response.json({ success: true, result: [{ conns: origins.map((origin_ip) => ({ origin_ip })) }] });
+      }
+      return cfApiFetch(url);
+    };
+    const e = env({ AWS_ROUTING_ENABLED: '1' }, tunnelFetch);
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const response = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(response.status).toBe(mode === 'empty' ? 503 : 502);
+    expect(await response.json()).toEqual({ ok: false,
+      error: mode === 'empty' ? 'aws_origin_starting' : 'tunnel_origin_mismatch' });
+    expect(deleted).toHaveLength(mode === 'empty' ? 0 : 3);
+  });
+
   it('preview, HTTP and WebSocket requests recheck expired origins and fence mismatches', async () => {
     for (const target of ['preview', 'http', 'websocket']) {
       let now = Date.now();
@@ -283,6 +337,86 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
   });
 });
 
+describe('neko preview TURN dispatch on the real route', () => {
+  const nekoBody = JSON.stringify({ userId: USER, projectId: CID, desktopMode: 'neko' });
+  const relay = {
+    AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_ICE_POLICY: 'relay',
+    SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token',
+  };
+
+  it('an AWS boot mints exactly the relay config it pushes; a healthy reopen mints nothing', async () => {
+    const e = env(relay);
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const host = installAwsHost();
+    const boot = await worker.fetch(await signed('POST', '/sandbox/preview', nekoBody), e);
+    expect(boot.status).toBe(503);
+    expect(await boot.json()).toEqual({ ok: false, error: 'aws_desktop_starting', reason: 'config_pushed' });
+    expect(host.turnCalls).toBe(1);
+    expect(host.pushed!.backend.flatMap((s) => s.urls).every((u) => /^turns?:/.test(u))).toBe(true);
+    expect(host.pushed!.neko).toEqual(await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID));
+
+    host.configured = true; host.desktop = 'running'; host.ice = 'applied';
+    const reopened = await worker.fetch(await signed('POST', '/sandbox/preview', nekoBody), e);
+    expect(reopened.status).toBe(200);
+    expect(await reopened.json()).toMatchObject({ provider: 'aws-ec2', relay: { runtimeId: 'c'.repeat(32) } });
+    expect(host.turnCalls).toBe(1);
+    expect(host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/'))).toHaveLength(1);
+    expect(host.bad).toEqual([]);
+  });
+
+  it.each(['user', 'computer', 'sandbox', 'signature', 'disabled', 'no registry', 'scope', 'mode', 'missing TURN'])
+    ('%s refusal has no TURN, host or namespace side effects', async (refusal) => {
+      let namespaceCalls = 0;
+      const forbidden = { idFromName: () => { namespaceCalls++; throw new Error('unexpected namespace access'); } };
+      const e = env({ ...relay, Sandbox: forbidden, AWS_TUNNELS: forbidden,
+        ...(refusal === 'disabled' ? { AWS_ROUTING_ENABLED: undefined } : {}),
+        ...(refusal === 'no registry' ? { AWS_TUNNELS: undefined } : {}),
+        ...(refusal === 'missing TURN' ? { SANDBOX_NEKO_TURN_KEY_ID: undefined, SANDBOX_NEKO_TURN_API_TOKEN: undefined } : {}),
+      });
+      const c = claims(refusal === 'user' ? { userId: 'other-user' }
+        : refusal === 'computer' ? { computerId: '1b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b' }
+        : refusal === 'sandbox' ? { sandboxId: 'guac-other-computer' } : {});
+      const raw = refusal === 'scope' ? JSON.stringify({ userId: USER, desktopMode: 'neko' })
+        : refusal === 'mode' ? JSON.stringify({ userId: USER, projectId: CID, desktopMode: 'invalid' }) : nekoBody;
+      const req = await signed('POST', '/sandbox/preview', raw, c);
+      if (refusal === 'signature') req.headers.set('x-ezil-auth', 'v2.invalid.00');
+      const host = installAwsHost();
+      const res = await worker.fetch(req, e);
+      expect(res.status).toBe(refusal === 'missing TURN' ? 412 : ['scope', 'mode'].includes(refusal) ? 400 : 401);
+      if (refusal === 'missing TURN') expect(await res.json()).toMatchObject({ error: 'turn_required' });
+      if (['user', 'computer', 'sandbox'].includes(refusal)) expect(await res.json()).toMatchObject({ error: 'hmac_v2_identity_mismatch' });
+      expect(host.turnCalls).toBe(0); expect(host.paths).toEqual([]); expect(namespaceCalls).toBe(0);
+    });
+
+  it.each(['relay', 'diagnostic'])('actual AWS mint failure remains fatal under %s policy', async (policy) => {
+    const e = env({ ...relay, SANDBOX_NEKO_ICE_POLICY: policy });
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    const host = installAwsHost({ turnStatus: 503 });
+    const res = await worker.fetch(await signed('POST', '/sandbox/preview', nekoBody), e);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, error: 'relay_refresh_failed' });
+    expect(host.paths).toEqual(['GET /__ezil/control/desktop']);
+    expect(host.turnCalls).toBe(1); expect(host.pushed).toBeUndefined(); expect(host.bad).toEqual([]);
+  });
+
+  it.each(['v1', 'v2'])('Cloudflare %s still performs the generic mint and fails closed', async (version) => {
+    const host = installAwsHost({ turnStatus: 503 });
+    let req: Request;
+    if (version === 'v2') {
+      req = await signed('POST', '/sandbox/preview', nekoBody, claims({ provider: 'cloudflare', generation: 0, leaseEpoch: 0 }));
+    } else {
+      const ts = Date.now();
+      const token = `t=${ts},v1=${await hmacSha256Hex(SECRET, PREVIEW_TOKEN_PAYLOAD(ts))}`;
+      req = new Request('https://api.ezil.work/sandbox/preview', { method: 'POST',
+        body: JSON.stringify({ userId: USER, projectId: CID, desktopMode: 'neko', token }) });
+    }
+    const res = await worker.fetch(req, env(relay));
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, error: 'turn_unavailable', mode: 'neko' });
+    expect(host.turnCalls).toBe(1); expect(host.paths).toEqual([]);
+  });
+});
+
 describe('AWS desktop relay through the hook (aws-ice)', () => {
   const relayEnv = (over: Record<string, unknown> = {}) => env({
     AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token', ...over,
@@ -326,8 +460,8 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
       expect(renewed.status).toBe(200);
       const { expiresAt } = await renewed.json() as { expiresAt: number };
       expect(expiresAt).toBeGreaterThan(bootExpiry);
-      // Preserve the existing AWS renewal lifetime; only boot gains the margin.
-      expect(expiresAt).toBe(issuedAt + 1000 + ttlSeconds * 1000);
+      // Renewal keeps the clock margin too: the host refuses an expiry beyond 30 min on its own clock.
+      expect(expiresAt).toBe(relayExpiryFor(issuedAt + 1000, ttlSeconds));
       expect(host.bad).toEqual([]);
     } finally {
       now.mockRestore();
@@ -492,5 +626,60 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
     const res = await worker.fetch(await signed('GET', `/sandbox/${SID}/relay-refresh`, '', claims({ sandboxId: other })), e);
     expect(res.status).toBe(401);
     expect(host.paths).toEqual([]);
+  });
+});
+
+
+describe('AWS AI signed boot delivery', () => {
+  it.each(['on', 'off'])('pushes a scoped token through signed control, stable on retry and rotated after reboot (proxy %s)', async (flag) => {
+    const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_AI_PROXY: flag, SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+    await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied', aiConfigured: false });
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(503);
+    const first = host.pushed!.ai!;
+    expect(first.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+    const ns = (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS;
+    const rec = await (await ns.get(SID).fetch(new Request('https://aws-tunnels/get'))).json() as { record: { aiProxyNonce: string } };
+    expect(first.proxyToken).toBe(await deriveAiProxyToken(SECRET, SID, rec.record.aiProxyNonce));
+    await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(host.pushed!.ai).toEqual(first);
+    host.bootId = '22222222-2222-4222-8222-222222222222';
+    await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(host.pushed!.ai!.proxyToken).not.toBe(first.proxyToken);
+    host.aiConfigured = true;
+    const count = host.turnCalls;
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    expect(host.turnCalls).toBe(count);
+    expect(host.bad).toEqual([]);
+  });
+});
+
+
+describe('AWS restart route registration', () => {
+  it('routes signed retries to the host and refuses unsigned, foreign and fenced requests', async () => {
+    const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+    expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e)).status).toBe(200);
+    await verifyAwsTunnelOrigin(name => (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS.get(name), SID);
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', desktop: 'running', ice: 'applied', aiConfigured: true });
+    const path = `/sandbox/${SID}/restart`;
+    const body = JSON.stringify({ requestId: 'a'.repeat(64) });
+    let originalAi: unknown;
+    for (let i = 0; i < 2; i++) {
+      const r = await worker.fetch(await signed('POST', path, body), e);
+      expect(r.status).toBe(202);
+      expect(await r.json()).toEqual({ ok: true, outcome: 'restart_requested' });
+      expect(host.pushed!.neko).toEqual(await deriveNekoCredentials(e, SID));
+      expect(host.pushed!.ai?.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+      if (i === 0) originalAi = host.pushed!.ai;
+      else expect(host.pushed!.ai).toEqual(originalAi);
+    }
+    expect(host.paths.filter(p => p.includes('/restart-desktop/'))).toEqual(Array(2).fill(`POST /__ezil/control/restart-desktop/${'a'.repeat(64)}`));
+    expect(host.paths.map(p => p.split('/')[3])).toEqual(['desktop', 'ice', 'restart-desktop', 'desktop', 'ice', 'restart-desktop']);
+    expect(host.turnCalls).toBe(2);
+    expect(host.bad).toEqual([]);
+    expect((await worker.fetch(new Request(`https://api.ezil.work${path}`, { method: 'POST', body }), e)).status).toBe(401);
+    expect((await worker.fetch(await signed('POST', path, body, claims({ leaseEpoch: 99 })), e)).status).toBe(502);
+    expect((await worker.fetch(await signed('POST', path, JSON.stringify({ requestId: 'a'.repeat(64), action: 'exec' })), e)).status).toBe(400);
+    expect(host.paths).toHaveLength(6);
   });
 });

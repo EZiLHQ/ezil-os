@@ -5,6 +5,8 @@ After=ezil-lease.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Pool mode warms a clean desktop and waits here until this single-use host is claimed.
+TimeoutStartSec=infinity
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
 UMask=0077
 ExecStart=/opt/ezil-host/bin/ezil-host-agent guard

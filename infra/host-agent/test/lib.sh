@@ -10,7 +10,7 @@ T="${EZIL_HOST_TEST_DIR:-/var/tmp/${TAG}}"
 IMAGE="${EZIL_HOST_TEST_IMAGE:-ezil-final:82b0f33-local}"
 AGENT="$HA/bin/ezil-host-agent"
 AA_PROFILE="${TAG}-desktop"
-CID_COMPUTER=11111111-2222-3333-4444-555555555555
+CID_COMPUTER=11111111-2222-3333-8444-555555555555
 VOL_ID=vol-0123456789abcdef0
 FS_UUID=6b1f0c9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f
 mkdir -p "$T"; chmod 700 "$T"
@@ -112,6 +112,7 @@ userdata() {
         --argjson p "$p" --arg n "$n" --argjson rb "$rb" \
         '{v:1, computerId:$c, volumeId:$v, fsUuid:$u, generation:$g, leaseEpoch:$e, nonce:$n, provision:$p}
          + (if $rb == null then {} else {rebase:$rb} end)' > "$H/stub/user-data"
+    if [ "$rb" != null ]; then python3 "$HA/test/rebase-fixture.py" permit "$H/stub/user-data"; fi
     printf '%s' "$n" > "$H/stub/nonce"
     jq -nc --arg c "$CID_COMPUTER" --argjson g "$g" --argjson e "$e" '{computerId:$c, generation:$g, leaseEpoch:$e}' > "$H/stub/expect.json"
     jq -nc --arg t "tunnel-token-$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" --arg k "$(head -c 32 /dev/urandom | base64)" \

@@ -7,7 +7,9 @@ schemaVersion: 1.0
 parameters:
   - AgentSrcS3Uri: {type: string}
   - DesktopImageRef: {type: string, description: "<registry>/<repo>@sha256:<manifest digest>"}
-  - DesktopImageId: {type: string, description: "image config digest sha256:… (lowerImageDigest)"}
+  - DesktopImageId: {type: string, description: "exact baked image ID sha256:… (lowerImageDigest)"}
+  - PreviousDesktopImageRef: {type: string, default: ""}
+  - PreviousDesktopImageId: {type: string, default: ""}
   - CloudflaredVersion: {type: string}
   - CloudflaredSha256: {type: string}
   - EnrollUrl: {type: string}
@@ -27,6 +29,8 @@ phases:
             - >-
               AGENT_SRC=/tmp/ezil-host-agent DESKTOP_IMAGE_REF='{{ DesktopImageRef }}'
               DESKTOP_IMAGE_ID='{{ DesktopImageId }}' CLOUDFLARED_VERSION='{{ CloudflaredVersion }}'
+              PREVIOUS_DESKTOP_IMAGE_REF='{{ PreviousDesktopImageRef }}'
+              PREVIOUS_DESKTOP_IMAGE_ID='{{ PreviousDesktopImageId }}'
               CLOUDFLARED_SHA256='{{ CloudflaredSha256 }}' ENROLL_URL='{{ EnrollUrl }}'
               bash /tmp/ezil-host-agent/ami/build-host-ami.sh
   - name: validate
@@ -39,5 +43,6 @@ phases:
             # Quoted: an unquoted ": " (as in cut -d: -f2) makes YAML parse the line as a map,
             # which Image Builder rejects ("cannot unmarshal map into string").
             - 'test -s /etc/ezil-host/lower-image-digest && test -d "/var/lib/ezil/lowers/$(cut -d: -f2 /etc/ezil-host/lower-image-digest)/usr"'
+            - python3 /opt/ezil-host/validate-lowers.py --current '{{ DesktopImageId }}' --previous '{{ PreviousDesktopImageId }}'
             - test "$(systemctl is-enabled ezil-host.target)" = enabled
             - apparmor_parser -Q -K /etc/apparmor.d/ezil-desktop

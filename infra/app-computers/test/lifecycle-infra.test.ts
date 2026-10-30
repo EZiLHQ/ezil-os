@@ -84,16 +84,20 @@ test('item 5/6: CreateVolume is pinned to the ZoneId, encrypted, gp3 and the con
     assert.equal(attach.Condition!.StringEquals!['ec2:AvailabilityZoneId'], 'aps1-az1');
 });
 
-test('item 6: identity tags only at creation; retag limited to generation and fence', () => {
+test('item 6: identity tags only at creation; pool claims and volume retags have exact key lists', () => {
     const { t } = synth(), all = statements(t);
     const tags = allows(all, 'ec2:CreateTags');
-    assert.equal(tags.length, 2);
+    assert.equal(tags.length, 4);
     for (const s of tags) {
         const createAction = s.Condition!.StringEquals?.['ec2:CreateAction'];
         const keys = s.Condition!['ForAllValues:StringEquals']?.['aws:TagKeys'] as string[] | undefined;
         assert.ok(createAction || keys, 'every CreateTags allow is bounded by CreateAction or a key list');
         if (keys) {
-            assert.deepEqual([...keys].sort(), ['ezil:fence-token', 'ezil:generation']);
+            if (s.Condition!.StringEquals?.['aws:ResourceTag/ezil:pool'])
+                assert.deepEqual(keys, ['ezil:computer', 'ezil:generation', 'ezil:fence']);
+            else if (s.Condition!.StringEquals?.['aws:RequestTag/ezil:computer'])
+                assert.deepEqual(keys, ['ezil:computer', 'ezil:generation', 'ezil:fence', 'ezil:fence-token']);
+            else assert.deepEqual([...keys].sort(), ['ezil:fence-token', 'ezil:generation']);
             assert.equal(s.Condition!.Null!['aws:TagKeys'], 'false', 'an empty tag set must not satisfy ForAllValues');
         }
         else assert.deepEqual(createAction, ['RunInstances', 'CreateVolume']);
@@ -103,15 +107,25 @@ test('item 6: identity tags only at creation; retag limited to generation and fe
     assert.equal(deny.Condition!.Null!['ec2:CreateAction'], 'true');
 });
 
-test('item 6: no DeleteVolume, DeleteSnapshot or DetachVolume is allowed, and each is explicitly denied', () => {
+test('item 6: storage deletion is denied; only lifecycle may detach an owned volume', () => {
     const { t } = synth(true), all = statements(t);
-    for (const action of ['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume']) {
+    for (const action of ['ec2:DeleteVolume', 'ec2:DeleteSnapshot']) {
         assert.equal(allows(all, action).length, 0, action);
         // Each workflow role carries its own explicit deny.
         for (const prefix of ['LifecycleControllerRole', 'RecoveryRecoveryRole']) {
             assert.ok(statements(t, prefix).some(s => s.Effect === 'Deny' && actions(s).includes(action)), `${prefix} denies ${action}`);
         }
     }
+    const detach = allows(all, 'ec2:DetachVolume'); assert.equal(detach.length, 4);
+    assert.equal(detach[0]!.Condition!.Null!['aws:ResourceTag/ezil:computer-id'], 'false');
+    assert.equal(detach[1]!.Condition!.Null!['aws:ResourceTag/ezil:computer'], 'false');
+    for (const statement of detach) {
+        assert.equal(statement.Condition!.StringEquals!['ec2:ResourceTag/ezil:managed-by'], 'app-computer-platform');
+        assert.equal(statement.Condition!.StringEquals!['ec2:ResourceTag/ezil:stage'], 'pilot');
+        if (JSON.stringify(statement.Resource).includes(':volume/'))
+            assert.equal(statement.Condition!.StringEquals!['ec2:AvailabilityZoneId'], 'aps1-az1');
+    }
+    assert.ok(statements(t, 'RecoveryRecoveryRole').some(s => s.Effect === 'Deny' && actions(s).includes('ec2:DetachVolume')));
     assert.ok(!all.some(s => s.Effect === 'Allow' && actions(s).some(a => a === 'ec2:*' || a === '*' || a === 'iam:CreateRole')));
     const stop = allows(all, 'ec2:StopInstances');
     for (const s of stop) assert.equal(s.Condition!.StringEquals!['ec2:ResourceTag/ezil:managed-by'], 'app-computer-platform');

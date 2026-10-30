@@ -1,5 +1,10 @@
 // current-computer-test.mjs — EZiL-authored. ONE current computer.
 //
+// Round 3 (plan §6.1, D6): Settings shows ONE computer, "Your computer", and
+// any other live row read-only as an older computer. It must be the SAME
+// computer the dock, Start menu and App Store launch with — the boot payload's
+// (here c-2, the higher slot, so "lowest slot wins" would fail).
+//
 // Run:  node shell/ezil/ui/Settings/current-computer-test.mjs
 //       (after shell/build-shell.sh — it tests the BUILT bundle, in jsdom)
 //
@@ -84,11 +89,10 @@ const settle = async (n = 12, ms = 25) => { for ( let i = 0; i < n; i++ ) await 
 const click = el => el?.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
 const appWindow = id => q(`.window[data-app="${id}"]`);
 const stamp = id => appWindow(id)?.getAttribute('data-ezil-computer-id');
-const row = id => q(`.window[data-app="settings"] .ezil-settings-row[data-id="${id}"]`);
-const currentRows = () => qa('.window[data-app="settings"] .ezil-settings-row')
-    .filter(el => el.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current');
-const isCurrent = id => currentRows().length === 1 && currentRows()[0].getAttribute('data-id') === id;
-const switchButton = id => row(id)?.querySelector('[data-action="switch"]');
+const yours = () => q('.window[data-app="settings"] [data-role="your-computer"]');
+const isYours = id => qa('.window[data-app="settings"] [data-role="your-computer"]').length === 1 && yours()?.getAttribute('data-id') === id;
+const older = id => q(`.window[data-app="settings"] [data-role="older-computer"][data-id="${id}"]`);
+const openButton = () => yours()?.querySelector('[data-role="computer-actions"] [data-action="open"]');
 const dock = async id => {
     window.$(`.taskbar-item[data-app="${id}"]`).trigger('click');
     await settle();
@@ -110,34 +114,27 @@ try {
     push('bundle self-boots the real desktop dock item', !! q('.taskbar-item[data-app="desktop"]'));
 
     await dock('settings');
-    push('boot computer c-2 is the only Current row', isCurrent('c-2'));
-    push('c-1 offers Switch', switchButton('c-1')?.textContent.trim() === 'Switch');
-    // Keep a store opened with c-2's context across the switch as well.
+    push('boot computer c-2 is "Your computer" (not the lowest slot)', isYours('c-2'));
+    push('c-1 is an older computer, read-only: Delete only, no Open or Switch',
+        !! older('c-1') && [...older('c-1').querySelectorAll('button')].map(b => b.dataset.action).join() === 'delete');
+    push('no Switch-between-computers control exists', ! q('.window[data-app="settings"] [data-action="switch"]'));
     await dock('app-store');
     const store = appWindow('app-store');
-    push('App Store opens from the dock before switching', !! store);
+    push('App Store opens from the dock', !! store);
 
-    click(switchButton('c-1'));
+    click(openButton());
     await settle(20, 40);
-    push('Switch opens a desktop stamped c-1', stamp('desktop') === 'c-1');
-    await closeApp('desktop');
-    await reopenSettings();
-    push('closing the desktop keeps c-1 as the only Current row', isCurrent('c-1'));
-    push('current c-1 offers Open with Your current computer subtext',
-        switchButton('c-1')?.textContent.trim() === 'Open'
-        && row('c-1')?.querySelector('.ezil-settings-row-sub')?.textContent === 'Your current computer');
-
+    push('Open desktop opens a desktop stamped c-2', stamp('desktop') === 'c-2');
     await dock('code');
-    push('real dock Code uses c-1 after switching', stamp('code') === 'c-1', stamp('code'));
-    await dock('desktop');
-    push('real dock Desktop uses c-1 after switching', stamp('desktop') === 'c-1', stamp('desktop'));
-    push('session exposes the current computer c-1',
+    push('real dock Code uses c-2', stamp('code') === 'c-2', stamp('code'));
+    push('session exposes the current computer c-2',
         typeof window.ezil?.session?.currentComputer === 'function'
-        && window.ezil.session.currentComputer()?.id === 'c-1');
+        && window.ezil.session.currentComputer()?.id === 'c-2');
+    await reopenSettings();
     const sandboxWindows = qa('.window').filter(el => el.querySelector('.window-app-iframe'));
-    push('every open sandbox window matches Settings Current',
-        sandboxWindows.length >= 2 && isCurrent('c-1')
-        && sandboxWindows.every(el => el.getAttribute('data-ezil-computer-id') === currentRows()[0].getAttribute('data-id')),
+    push('every open sandbox window matches Settings "Your computer"',
+        sandboxWindows.length >= 2 && isYours('c-2')
+        && sandboxWindows.every(el => el.getAttribute('data-ezil-computer-id') === yours()?.getAttribute('data-id')),
         sandboxWindows.map(el => `${el.dataset.app}:${el.getAttribute('data-ezil-computer-id')}`).join(', '));
 
     window.dispatchEvent(new window.CustomEvent('ezil:start-click', { detail: { element: null } }));
@@ -147,42 +144,25 @@ try {
     push('Start menu exposes the Preview launcher', !! previewItem);
     click(previewItem);
     await settle();
-    push('Start menu Preview uses c-1', stamp('preview') === 'c-1', stamp('preview'));
+    push('Start menu Preview uses c-2', stamp('preview') === 'c-2', stamp('preview'));
     await closeApp('preview');
     const storePreview = store?.querySelector('[data-action="open"][data-id="preview"]');
     push('existing App Store exposes Preview Open', !! storePreview);
     click(storePreview);
     await settle();
-    push('App Store opened on c-2 launches Preview on current c-1', stamp('preview') === 'c-1', stamp('preview'));
-
-    await reopenSettings();
-    push('current desktop on screen says Active now and needs no Open button',
-        isCurrent('c-1') && ! switchButton('c-1')
-        && row('c-1')?.querySelector('.ezil-settings-row-sub')?.textContent === 'Active now');
-    click(switchButton('c-2'));
-    await settle(20, 40);
-    push('switching back closes every sandbox window stamped c-1',
-        ! qa('.window[data-ezil-computer-id="c-1"]').some(el => el.querySelector('.window-app-iframe')));
-    // Settings is not a sandbox window; refresh its launch-time stamp too.
-    await reopenSettings();
-    push('switching back leaves no window stamped c-1', ! q('.window[data-ezil-computer-id="c-1"]'));
-    push('switching back opens desktop c-2', stamp('desktop') === 'c-2');
-    push('switching back closes Code before relaunch', ! appWindow('code'));
-    await dock('code');
-    push('dock Code uses c-2 after switching back', stamp('code') === 'c-2', stamp('code'));
-    push('Settings now marks only c-2 Current', isCurrent('c-2'));
+    push('App Store launches Preview on c-2', stamp('preview') === 'c-2', stamp('preview'));
 
     const code = appWindow('code');
     await closeApp('desktop');
     await reopenSettings();
-    push('c-2 offers Open while Code c-2 remains open',
-        switchButton('c-2')?.textContent.trim() === 'Open' && stamp('code') === 'c-2');
-    click(switchButton('c-2'));
+    push('🔴 closing the desktop keeps c-2 as "Your computer", offering Open desktop',
+        isYours('c-2') && openButton()?.textContent.trim() === 'Open desktop' && stamp('code') === 'c-2');
+    click(openButton());
     await settle(20, 40);
-    push('Open preserves the same Code window on c-2',
+    push('Open desktop preserves the same Code window on c-2',
         !! code && code.isConnected && appWindow('code') === code && stamp('code') === 'c-2');
-    push('Open restores the desktop on c-2', stamp('desktop') === 'c-2');
-    push('Settings switches never mutate the boot computer', window.__EZIL_BOOT__.computer === C2);
+    push('Open desktop restores the desktop on c-2', stamp('desktop') === 'c-2');
+    push('Settings never mutates the boot computer', window.__EZIL_BOOT__.computer === C2);
     push('Computers list was loaded through the fetch stub', calls.some(call => call.url.includes('computer.list')));
 } catch (error) {
     push('scenario completes without throwing', false, error?.stack ?? String(error));

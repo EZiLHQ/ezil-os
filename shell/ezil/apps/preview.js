@@ -88,7 +88,7 @@ import { selectRuntimeAdapter, watchNativeSurface } from '../native-runtime.js';
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
-import { computeBootUiState } from '../boot-phases.js';
+import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
@@ -100,14 +100,14 @@ const TICK_MS = 250;
 const POLL_MS = 2_000;
 
 /**
- * The post-handoff frame confirmation. Kept byte-for-byte in step with
- * `desktop-window.js`'s own constants of the same name — this is the same
- * contract applied to a different URL, not a separate policy. See that file's
- * header for what each one is for.
+ * Probe early without depending on iframe load. With immediate unknown replies,
+ * asks fall at 300, 900, 2100, 4000, 5500 and 7000 ms: retain the old late
+ * retry window while adding three early opportunities. Requests are serial;
+ * the existing handoff deadline also caps slow/in-flight replies.
+ * Keep this schedule in step with the other Code/Preview window.
  */
-const FRAME_CONFIRM_FALLBACK_MS = 4_000;
-const FRAME_CONFIRM_ATTEMPTS = 3;
-const FRAME_CONFIRM_RETRY_MS = 1_500;
+const FRAME_CONFIRM_DELAYS_MS = [300, 600, 1_200, 1_900, 1_500, 1_500];
+const FRAME_CONFIRM_ATTEMPTS = FRAME_CONFIRM_DELAYS_MS.length;
 
 /**
  * Open the Preview window.
@@ -191,15 +191,22 @@ export async function openPreviewWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
+    let last_failure = null;
+    /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
+    let stop_confirmation = () => {};
 
     const stop_timers = () => {
+        stop_confirmation(); stop_confirmation = () => {};
         stop_monitor(); stop_monitor = () => {};
         clearInterval(tick_timer); tick_timer = null;
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Preview…', onRetry: () => { void start_boot(); },
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Preview…', isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
         failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
 
@@ -235,6 +242,7 @@ export async function openPreviewWindow (ctx = {}) {
     const show_unavailable = () => { progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        last_failure = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -295,6 +303,7 @@ export async function openPreviewWindow (ctx = {}) {
         stop_timers();
 
         if ( ! res.ok ) {
+            last_failure = res;
             // `app_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve a preview at all" rather than
             // "something went wrong": the port could not be exposed, or the
@@ -371,6 +380,7 @@ export async function openPreviewWindow (ctx = {}) {
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
         el_iframe.src = preview_url;
+        trace.step('frame_nav');
         settle_frame(my_attempt);
     }
 
@@ -383,22 +393,21 @@ export async function openPreviewWindow (ctx = {}) {
      */
     function settle_frame (my_attempt) {
         let settled = false;
+        let in_flight = false;
         let asks = 0;
+        let probe_timer = null;
+        let deadline_timer = null;
+        const frame_url = el_iframe.src;
+        const stale = () => settled || disposed || my_attempt !== attempt;
+        stop_confirmation = () => {
+            settled = true;
+            clearTimeout(probe_timer);
+            clearTimeout(deadline_timer);
+            el_iframe.removeEventListener('load', on_load);
+        };
 
-        const ask = async () => {
-            if ( settled || disposed || my_attempt !== attempt ) return;
-            asks++;
-            const seen = await (nativeSurface ? nativeSurface.confirm() : session.confirmFrame(computer.id, el_iframe.src, 'preview'));
-            if ( settled || disposed || my_attempt !== attempt ) return;
-
-            if ( seen === undefined ) {
-                if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
-                    setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
-                    return;
-                }
-                console.warn(`[${PHASE}] gave up confirming the preview frame after ${asks} tries`);
-            }
-
+        const finish = (seen) => {
+            if ( stale() ) return;
             settled = true;
             // The handoff clock has done its job — stop repainting it before
             // writing a settled state, or the next tick overwrites the answer.
@@ -440,11 +449,44 @@ export async function openPreviewWindow (ctx = {}) {
             trace.end('error');
         };
 
-        el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
-        setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
+        const ask = async () => {
+            if ( stale() || in_flight || asks >= FRAME_CONFIRM_ATTEMPTS ) return;
+            clearTimeout(probe_timer);
+            in_flight = true;
+            asks++;
+            // Keep the exported trace short enough to retain confirm_ok.
+            if ( asks === 1 ) trace.step('confirm_ask');
+            // Keep the authenticated server/native gate. A load event cannot
+            // prove readiness, and HTTP confirmation is not an editor-ready
+            // message: the hosted frame exposes no such signal to this shell.
+            const seen = await (nativeSurface ? nativeSurface.confirm() : session.confirmFrame(computer.id, frame_url, 'preview'));
+            in_flight = false;
+            if ( stale() ) return;
+            // Never apply a positive verdict to a replaced frame URL.
+            if ( el_iframe.src !== frame_url ) { finish(false); return; }
+            if ( seen === undefined && asks < FRAME_CONFIRM_ATTEMPTS ) {
+                probe_timer = setTimeout(() => { void ask(); }, FRAME_CONFIRM_DELAYS_MS[asks]);
+                return;
+            }
+            if ( seen === undefined ) console.warn(`[${PHASE}] gave up confirming the preview frame after ${asks} tries`);
+            finish(seen);
+        };
+        const on_load = () => {
+            trace.step('frame_load');
+            // Load can accelerate the first probe, but must not race an
+            // in-flight request or defeat the retry spacing/count bound.
+            if ( asks === 0 ) void ask();
+        };
+        el_iframe.addEventListener('load', on_load, { once: true });
+        probe_timer = setTimeout(() => { void ask(); }, FRAME_CONFIRM_DELAYS_MS[0]);
+        deadline_timer = setTimeout(() => {
+            trace.step('confirm_timeout');
+            finish(undefined);
+        }, FRAME_CONFIRM_DEADLINE_MS);
     }
 
     const dispose = () => {
+        progress.dispose();
         if (disposed) return;
         disposed = true;
         nativeSurface?.dispose();

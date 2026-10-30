@@ -36,7 +36,15 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import { getBillingDeps } from '@/server/billing/deps';
+import { gateComputerStart } from '@/server/billing/v2/compute-access';
+import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
+import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
+import { syncAiCredential } from '@/server/lib/ai-credential';
 import { stampOpened } from './computer-store';
+
+/** Loaded on use: the Supabase server module validates the server env at import time. */
+const supabaseServerClient = async () => (await import('@/utils/supabase/server')).createClient();
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
     composeAppPreviewBootstrapUrl,
@@ -67,9 +75,12 @@ import {
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
-import { requestAwsPreview } from '@/server/lib/compute/aws-preview';
-import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
-import { awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, routeComputer } from './compute-dispatch';
+import { prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from '@/server/lib/compute/aws-preview';
+import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
+import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer } from './compute-dispatch';
+import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -85,6 +96,16 @@ async function assertOwnedComputer(
     if (!computer) {
         // NOT_FOUND, never FORBIDDEN — mirrors computer.get's anti-enumeration contract.
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+    }
+    if (isPlacementReadEnabled(process.env)) {
+        try {
+            // A re-inserted computer row cannot disclose another owner's image job.
+            // This also gates controls and frame probes that do not use routeComputer.
+            await readPlacement(db as unknown as PlacementExecutor, computerId, userId);
+        } catch (err) {
+            if (err instanceof PlacementOwnerError) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            throw err;
+        }
     }
 }
 
@@ -102,6 +123,9 @@ async function controlTarget(db: typeof import('@/server/db').db, userId: string
         throw err;
     }
 }
+
+// One lazy factory for router metering; tests can mock billingComputeMeter.
+const getComputeMeter = () => billingComputeMeter();
 
 export const cloudflareGuacamoleRouter = createTRPCRouter({
     relayState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
@@ -163,7 +187,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 screen: z.unknown().optional(),
             }),
         )
-        .query(async ({ ctx, input }) => {
+        .query(async ({ ctx, input, signal }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
             // Starting this computer's desktop is choosing it: remember it.
             await stampOpened(ctx.db, ctx.user.id, input.computerId, { throttled: false });
@@ -201,13 +225,42 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
+            // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
+            await syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
+                        ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -450,13 +503,34 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // when the shell has no separate session concept for it.
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
                 return awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -605,7 +679,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      */
     codePreviewUrl: protectedProcedure
         .input(z.object({ computerId: z.string().uuid() }))
-        .query(async ({ ctx, input }) => {
+        .query(async ({ ctx, input, signal }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
             const config = resolveCloudflareGuacamoleConfig();
@@ -623,13 +697,48 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
+            // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
+            const syncCredential = () => syncAiCredential({
+                config, hmacSecret,
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             if (routed.kind === 'aws-ec2') {
+                // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
+                // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown
+                // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
+                const [ensured] = await Promise.allSettled([routed.provider.ensure({ correlationId }, computer, ensureOptions), syncCredential()]);
+                if (ensured.status === 'rejected') throw ensured.reason;
                 return awsPreviewAnswer(
-                    await routed.provider.ensure({ correlationId }, computer, ensureOptions),
+                    ensured.value,
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
+                    { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
+                        ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
             }
+            await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
+            const migrating = cloudflareMigrationAnswer(result);
+            if (migrating) return migrating;
+            // This branch is Cloudflare-only, after admission and a provider readiness signal.
+            if (result.ok && (result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl)) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -897,6 +1006,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ...aws, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const status = await routed.provider.status({ correlationId }, computer);
+            // The fence can land after dispatch. The legacy status adapter drops
+            // non-2xx bodies, so re-read routing on conflict rather than guessing
+            // that every 409 means migration. The new read repeats owner checks.
+            if (!status.ok && (status.error === 'http_409' || status.error === 'migrating')) {
+                const current = await routeComputer(ctx.db, computer);
+                if (current.kind === 'aws-ec2') {
+                    return { ...awsStatusAnswer(await current.provider.status({ correlationId }, computer)),
+                        sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),
@@ -919,14 +1038,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const routed = await routeComputer(ctx.db, computer);
-            // A user stop of an AWS computer STOPS the instance (data and root disks kept;
-            // reopen is a cold boot). It never retires: retire is the computer delete.
-            const result = routed.kind === 'aws-ec2'
-                ? input.confirm
-                    ? await confirmAwsStop(routed.provider, { correlationId }, computer)
-                    : await routed.provider.stop({ correlationId }, computer, 'user')
-                : await routed.provider.terminate({ correlationId }, computer);
+            const { kind, result } = await stopComputerForPolicy(ctx.db, computer, 'user_stop', {
+                confirm: input.confirm, correlationId,
+            });
+            if (kind === 'cloudflare' && result.ok && result.terminated) await recordComputeMeter(() => getComputeMeter().stopped({
+                ...computer, endedAt: new Date(), reason: 'user_stop',
+            }));
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,
             // a rejected signature, or an unreachable Worker.
@@ -1201,9 +1318,17 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer);
+            await syncAiCredential({
+                config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+                sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
+                userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+            });
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,
             });
+            if (routed.kind === 'cloudflare' && result.ok) await recordComputeMeter(() => getComputeMeter().heartbeat({
+                ...computer, at: new Date(),
+            }));
 
             return {
                 ok: result.ok,
@@ -1229,7 +1354,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * string, not a raw message.
      */
     restartDesktop: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), requestId: z.string().uuid().optional() }))
         .mutation(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
 
@@ -1242,15 +1367,36 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const correlationId = newCorrelationId();
+            const correlationId = input.requestId ?? newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const billingDeps = getBillingDeps();
+            const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
+                instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
+            if (!gate.allowed) return {
+                ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
+                billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
+            };
             if (routed.kind === 'aws-ec2') {
-                // No in-place desktop restart on AWS yet; a refusal the UI renders, never Cloudflare.
                 const aws = await routed.provider.restart({ correlationId }, computer);
-                return { ok: false as const, errorCode: aws.outcome ?? 'aws_not_supported', correlationId, provider: 'cloudflare-guacamole' as const };
+                // Round 3: the distinct `restart_<code>` from aws-restart.ts (`restart_unavailable` stays the catch-all).
+                const errorCode = /^restart_(not_running|busy|budget_exhausted|host_unreachable|timeout|unavailable)$/.test(aws.outcome ?? '')
+                    ? aws.outcome! : 'restart_unavailable';
+                return aws.ok
+                    ? { ok: true as const, outcome: 'restart_requested', correlationId, provider: 'cloudflare-guacamole' as const }
+                    : { ok: false as const, errorCode, correlationId, provider: 'cloudflare-guacamole' as const };
             }
             const result = await routed.provider.restart({ correlationId }, computer);
+            if (result.ok) {
+                const metered = await recordComputeMeter(() => getComputeMeter().ready({
+                    ...computer, size: 'free-cf', readyAt: new Date(), overheadSeconds: 0,
+                }));
+                if (metered === 'concurrent' && billingDeps.config.enforcementEnabled) {
+                    await stopComputerForPolicy(ctx.db, computer, 'user_stop', { correlationId });
+                    return { ok: false as const, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+                        billingRefusal: 'concurrent_limit' as const, provider: 'cloudflare-guacamole' as const };
+                }
+            }
 
             if (!result.ok) {
                 return {
@@ -1286,5 +1432,24 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,
             };
+        }),
+
+    /**
+     * RETRY-118: the owner's explicit "Try again" after `capacity_attempt_expired`. Resets ONLY the
+     * stated expired capacity attempt of this owned computer, and only while it is the newest,
+     * unreleased one with no placement and no active demand (capacity-demand.ts
+     * `resetExpiredAttempt`). It never starts anything: the client reopens through the normal
+     * boot afterwards. Ownership is checked here, once, like `restartDesktop`.
+     * - `reset`: released; the reopen begins a fresh attempt.
+     * - `already_reset` / `superseded`: nothing written; the client just reopens and rereads.
+     * - `not_found`: unknown id, another computer's or owner's, or not expired; nothing written.
+     */
+    resetCapacityAttempt: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid(), attemptId: z.string().uuid() }))
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            const outcome = await resetCapacityAttempt(ctx.db as unknown as Parameters<typeof resetCapacityAttempt>[0],
+                { computerId: input.computerId, ownerUserId: ctx.user.id, attemptId: input.attemptId });
+            return { ok: outcome !== 'not_found', outcome, provider: 'cloudflare-guacamole' as const };
         }),
 });

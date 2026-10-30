@@ -33,10 +33,11 @@ import { computers } from '@/server/db/schema';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { AWS_RETIREMENT_UNDERWAY } from '@/server/lib/compute/aws-ec2';
-import type { PlacementExecutor } from '@/server/lib/compute/placement';
+import type { PlacementDb, PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
+import { readComputerProgress } from '@/server/lib/compute/progress';
 import { readSystemInfo } from '@/server/lib/compute/system-info';
-import { routeComputer } from './compute-dispatch';
+import { restartWholeComputer, routeComputer, switchComputerConfiguration } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
 import {
     createComputerInLowestFreeSlot,
@@ -222,6 +223,57 @@ export const computerRouter = createTRPCRouter({
             const info = await readSystemInfo(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
             if (!info) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
             return info;
+        }),
+
+    /** Recorded progress only: this query cannot start or reconcile a computer. */
+    progress: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+            });
+            if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            const progress = await readComputerProgress(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
+            if (!progress) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            return progress;
+        }),
+
+    /**
+     * Round 3 (contract v3 D5): one computer, selectable configuration. RUNNING → the server
+     * stops it and wakes it on `size` (same data disk, generation + 1); STOPPED → the next start
+     * opens on `size`. Refusals are values (`SwitchRefusalV3`), never thrown. A computer that is
+     * not the caller's live computer is `foreign_computer` (the same answer for missing).
+     * The phase is read from `computer.progress` (`transition`). docs/aws-computers/SWITCH-CONTRACT.md.
+     */
+    switchConfiguration: protectedProcedure
+        .input(z.object({
+            computerId: z.string().uuid(),
+            size: z.enum(['free-cf', 'std-2', 'cmp-4', 'cmp-8']),
+            requestId: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/),
+        }))
+        .mutation(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+            });
+            if (!owned) return { ok: false as const, reason: 'foreign_computer' as const };
+            return switchComputerConfiguration(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId },
+                { size: input.size, requestId: input.requestId });
+        }),
+
+    /**
+     * Round 3: restart the WHOLE computer (a confirmed stop, then a server-initiated open on the
+     * same size), reported as a transition whose opening path is `restart`. The desktop-only
+     * restart stays `cloudflareGuacamole.restartDesktop`.
+     */
+    restartComputer: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid(), requestId: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/) }))
+        .mutation(async ({ ctx, input }) => {
+            const owned = await ctx.db.query.computers.findFirst({
+                where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+            });
+            if (!owned) return { ok: false as const, reason: 'foreign_computer' as const };
+            return restartWholeComputer(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId },
+                { requestId: input.requestId });
         }),
 
     /** Rename a computer. Ownership-scoped. */

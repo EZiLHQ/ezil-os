@@ -18,7 +18,8 @@ export async function cleanupHostedComputer(env = process.env, chromium, send, {
   const evidence = { ok: false, phase: 'prerequisites' };
   let browser;
   try {
-    for (const key of ['EZIL_E2E_APP', 'EZIL_E2E_COMPUTER_ID', 'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD']) {
+    for (const key of ['EZIL_E2E_APP', 'EZIL_E2E_COMPUTER_ID', 'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD',
+      'NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']) {
       if (!env[key]) { evidence.missingPrerequisite = key; throw new Error('missing_cleanup_prerequisite'); }
     }
     const computerId = env.EZIL_E2E_COMPUTER_ID;
@@ -38,8 +39,7 @@ export async function cleanupHostedComputer(env = process.env, chromium, send, {
     const page = await context.newPage();
     // Login lands on the management page. Loading /os would open applications
     // and start the computer again while its cleanup is being verified.
-    await page.goto(`${app}/login?method=email&returnUrl=%2Fcomputers`);
-    await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers' });
+    await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers', app, env });
     evidence.phase = 'computer_identity';
     const session = await context.request.get(`${app}/api/shell/session`, { headers, maxRedirects: 0, timeout: 30000 });
     try {

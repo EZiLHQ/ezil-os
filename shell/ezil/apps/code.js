@@ -89,8 +89,9 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import { computeBootUiState } from '../boot-phases.js';
+import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
+import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
@@ -101,12 +102,16 @@ const TICK_MS = 250;
 const POLL_MS = 2_000;
 
 /**
- * The post-handoff frame confirmation. Kept in step with `preview.js`'s own
- * constants of the same name — this is the same contract, a different URL.
+ * Probe early without depending on iframe load. With immediate unknown replies,
+ * asks fall at 300, 900, 2100, 4000, 5500 and 7000 ms: retain the old late
+ * retry window while adding three early opportunities. Requests are serial;
+ * the existing handoff deadline also caps slow/in-flight replies.
+ * Transport-unknown replies retain the Preview window's schedule. An observed
+ * transient backend failure gets a longer recovery budget, under the same deadline.
  */
-const FRAME_CONFIRM_FALLBACK_MS = 4_000;
-const FRAME_CONFIRM_ATTEMPTS = 3;
-const FRAME_CONFIRM_RETRY_MS = 1_500;
+const FRAME_CONFIRM_DELAYS_MS = [300, 600, 1_200, 1_900, 1_500, 1_500];
+const FRAME_CONFIRM_ATTEMPTS = FRAME_CONFIRM_DELAYS_MS.length;
+const FRAME_RECOVERY_ATTEMPTS = 12;
 
 /**
  * Mint a fresh code-server window URL. Mirrors `session.js`'s `previewUrl()`
@@ -128,7 +133,7 @@ async function mintCodePreviewUrl (computerId) {
     // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
     // 5460ms). Re-implementing the loop here is how the two surfaces would
     // stop waiting for the same length of time — see `withWakeAndOneRetry`.
-    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl');
+    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl', computerId);
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
@@ -187,9 +192,7 @@ async function mintCodePreviewUrlOnce (computerId) {
         return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.' };
     }
 
-    if ( data?.ok !== true ) {
-        return { ok: false, errorCode: data?.errorCode ?? 'unknown' };
-    }
+    if ( data?.ok !== true ) return session.pendingOrRefused(data);
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.
@@ -284,16 +287,24 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
+    let last_failure = null;
+    /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
+    let stop_confirmation = () => {};
 
     const stop_timers = () => {
+        stop_confirmation(); stop_confirmation = () => {};
         stop_monitor(); stop_monitor = () => {};
         clearInterval(tick_timer); tick_timer = null;
         clearInterval(poll_timer); poll_timer = null;
     };
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id),
+        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -348,6 +359,7 @@ export async function openCodeWindow (ctx = {}) {
     const show_unavailable = () => { progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        last_failure = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -397,6 +409,7 @@ export async function openCodeWindow (ctx = {}) {
         stop_timers();
 
         if ( ! res.ok ) {
+            last_failure = res;
             if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the
@@ -466,34 +479,31 @@ export async function openCodeWindow (ctx = {}) {
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
         el_iframe.src = code_preview_url;
+        trace.step('frame_nav');
         settle_frame(my_attempt);
     }
 
-    /**
-     * The post-handoff frame confirmation. Byte-for-byte `preview.js`'s
-     * `settle_frame`, targeted at the code-preview URL — see that file's
-     * header for why the honesty gate itself is unchanged rather than
-     * reimplemented, and `app-preview-frame-honesty.test.ts` for both
-     * directions proven against a real HTTP bridge.
-     */
+    /** Confirm Code's HTTP route, recovering transient startup failures before the deadline. */
     function settle_frame (my_attempt) {
         let settled = false;
+        let in_flight = false;
         let asks = 0;
+        let recovering = false;
+        let needs_reload = false;
+        let awaiting_reload = false;
+        let probe_timer = null;
+        let deadline_timer = null;
+        const frame_url = el_iframe.src;
+        const stale = () => settled || disposed || my_attempt !== attempt;
+        stop_confirmation = () => {
+            settled = true;
+            clearTimeout(probe_timer);
+            clearTimeout(deadline_timer);
+            el_iframe.removeEventListener('load', on_load);
+        };
 
-        const ask = async () => {
-            if ( settled || disposed || my_attempt !== attempt ) return;
-            asks++;
-            const seen = await (nativeSurface ? nativeSurface.confirm() : session.confirmFrame(computer.id, el_iframe.src, 'code'));
-            if ( settled || disposed || my_attempt !== attempt ) return;
-
-            if ( seen === undefined ) {
-                if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
-                    setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
-                    return;
-                }
-                console.warn(`[${PHASE}] gave up confirming the code frame after ${asks} tries`);
-            }
-
+        const finish = (seen) => {
+            if ( stale() ) return;
             settled = true;
             // Either way the handoff clock has done its job — stop repainting
             // it before writing a settled state, or the next tick overwrites
@@ -523,11 +533,7 @@ export async function openCodeWindow (ctx = {}) {
                 attrs: { seen: String(seen) },
             });
             show_panel();
-            // 🔴 `false`, explicitly, and this is the ONLY place this window
-            // says it. We asked, and either the origin refused or we exhausted
-            // `FRAME_CONFIRM_ATTEMPTS` trying to reach our own server. That is
-            // a real negative observation, and it is a failure now, not at the
-            // deadline.
+            // A terminal refusal or an exhausted confirmation/recovery budget.
             progress.render(computeBootUiState({
                 requestStatus: 'success',
                 elapsedMs: 0,
@@ -538,8 +544,64 @@ export async function openCodeWindow (ctx = {}) {
             trace.end('error');
         };
 
-        el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
-        setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
+        const ask = async () => {
+            if ( stale() || in_flight || awaiting_reload ) return;
+            clearTimeout(probe_timer);
+            in_flight = true;
+            asks++;
+            // Keep the exported trace short enough to retain confirm_ok.
+            if ( asks === 1 ) trace.step('confirm_ask');
+            // Keep the authenticated server/native gate. A load event cannot
+            // prove readiness, and HTTP confirmation is not an editor-ready
+            // message: the hosted frame exposes no such signal to this shell.
+            const observation = nativeSurface
+                ? { confirmed: await nativeSurface.confirm(), retryable: false }
+                : await session.observeFrame(computer.id, frame_url, 'code');
+            const seen = observation.confirmed;
+            in_flight = false;
+            if ( stale() ) return;
+            // Never apply a positive verdict to a replaced frame URL.
+            if ( el_iframe.src !== frame_url ) { finish(false); return; }
+            if ( observation.retryable ) {
+                recovering = true;
+                needs_reload = true;
+            }
+            const max_asks = recovering ? FRAME_RECOVERY_ATTEMPTS : FRAME_CONFIRM_ATTEMPTS;
+            if ( seen === true && needs_reload ) {
+                // The iframe may still contain the earlier 502 document. Replace
+                // it only after the backend answers, then wait for that navigation
+                // and a fresh authenticated probe. Neither load nor health alone
+                // can reveal the old error page. Reloads share the fixed ask cap.
+                if ( asks >= max_asks ) { finish(undefined); return; }
+                needs_reload = false;
+                awaiting_reload = true;
+                el_iframe.src = frame_url;
+                trace.step('frame_recover');
+                return;
+            }
+            if ( (seen === undefined || observation.retryable) && asks < max_asks ) {
+                const delay = recovering ? Math.min(500 * 2 ** (asks - 1), 5_000) : FRAME_CONFIRM_DELAYS_MS[asks];
+                probe_timer = setTimeout(() => { void ask(); }, delay);
+                return;
+            }
+            if ( seen === undefined ) console.warn(`[${PHASE}] gave up confirming the code frame after ${asks} tries`);
+            finish(seen);
+        };
+        const on_load = () => {
+            trace.step('frame_load');
+            // Load can accelerate the first probe, but must not race an
+            // in-flight request or defeat the retry spacing/count bound.
+            if ( awaiting_reload ) {
+                awaiting_reload = false;
+                void ask();
+            } else if ( asks === 0 ) void ask();
+        };
+        el_iframe.addEventListener('load', on_load);
+        probe_timer = setTimeout(() => { void ask(); }, FRAME_CONFIRM_DELAYS_MS[0]);
+        deadline_timer = setTimeout(() => {
+            trace.step('confirm_timeout');
+            finish(undefined);
+        }, FRAME_CONFIRM_DEADLINE_MS);
     }
 
     // ── Presence heartbeat: activity belongs to the COMPUTER ─────────────────
@@ -583,9 +645,27 @@ export async function openCodeWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
+    // Restart desktop (Settings → Troubleshoot) restarts code-server too on an AWS host, and the
+    // open frame then shows "Cannot reconnect". Re-mint for the same computer (live 2026-10-22).
+    const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
+    // A switch or a computer restart replaces the machine; re-mint once the server settles it (round 3).
+    let transition_watch = null;
+    const on_transition = (e) => {
+        if ( disposed || nativeSurface || e?.detail?.computerId !== computer.id || transition_watch?.active() ) return;
+        transition_watch = watchComputerTransition({
+            computerId: computer.id, element: el_window,
+            transitionId: typeof e.detail.transitionId === 'string' ? e.detail.transitionId : null,
+            onSettled: () => { transition_watch = null; if ( ! disposed ) void start_boot(); },
+        });
+    };
+
     const dispose = () => {
+        progress.dispose();
         if (disposed) return;
         disposed = true;
+        window.removeEventListener('ezil:desktop-restarted', on_restarted);
+        window.removeEventListener(TRANSITION_EVENT, on_transition);
+        transition_watch?.stop();
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();
@@ -610,6 +690,8 @@ export async function openCodeWindow (ctx = {}) {
         return true;
     };
     window.addEventListener('ezil:teardown', dispose);
+    window.addEventListener('ezil:desktop-restarted', on_restarted);
+    window.addEventListener(TRANSITION_EVENT, on_transition);
 
     void start_boot();
     return el_window;

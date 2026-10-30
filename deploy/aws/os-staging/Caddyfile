@@ -1,0 +1,12 @@
+{
+    admin off
+}
+
+os-staging.ezil.work {
+    encode gzip zstd
+    header Strict-Transport-Security "max-age=31536000"
+    request_body {
+        max_size 2MB
+    }
+    reverse_proxy 127.0.0.1:3000
+}

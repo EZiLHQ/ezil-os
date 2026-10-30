@@ -1,27 +1,31 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import type { Dependencies } from '../lib/lifecycle/aws.js';
-import { SettingsSchema, tagsFor, tagList, token, initialVolumeTags } from '../lib/lifecycle/contract.js';
+import { SettingsSchema, tagsFor, tagList, token, initialVolumeTags, poolTagsFor, claimTagsFor } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { DEFAULT_STORAGE, type InstanceType, type Storage } from '../lib/lifecycle/deployment.js';
+import { leaseFixture } from './lease-fixture.js';
 export const REGION='ap-south-1',ZONE_ID='aps1-az1';
 export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:InstanceType;instanceTypes?:InstanceType[];dataVolumeGiB?:number;rootDeviceName?:Storage['rootDeviceName'];userData?:string|null;userDataNonce?:boolean}={}){
-    const computerId=randomUUID(),generation=operation==='replace'?2:1;
+    const computerId=randomUUID(),generation=['replace','adopt','release'].includes(operation)?2:1;
     const deployment={accountId:'123456789012',region:REGION,zoneId:ZONE_ID,
         subnetId:'subnet-11111111111111111',securityGroupId:'sg-11111111111111111',launchTemplateId:'lt-11111111111111111',launchTemplateVersion:'1',
-        amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:options.instanceTypes??['m6i.large','c6i.xlarge'] as InstanceType[],
+        amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:options.instanceTypes??['m6i.large','c6i.xlarge','m6i.xlarge','m6i.2xlarge'] as InstanceType[],
         storage:{...DEFAULT_STORAGE,rootDeviceName:options.rootDeviceName??DEFAULT_STORAGE.rootDeviceName},
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
         stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-lifecycle:1`};
     const settings=SettingsSchema.parse({deployment,features:{userDataNonce:options.userDataNonce??false},authorityOrigin:'https://control.example',
         authoritySecretArn:`arn:aws:secretsmanager:${REGION}:123456789012:secret:ezil/pilot/lifecycle-key-abcdef`});
-    const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:null;
+    const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:operation==='adopt'?options.dataVolumeGiB??null:null;
     const i:LifecycleIntent={schemaVersion:1,jobId:randomUUID(),computerId,revision:1,operation,targetGeneration:generation,fenceToken:randomUUID(),
-        providerInstanceId:['provision','replace'].includes(operation)?null:'i-11111111111111111',dataVolumeId:operation==='provision'?null:'vol-11111111111111111',
+        providerInstanceId:['provision','replace','pool-provision'].includes(operation)?null:'i-11111111111111111',
+        dataVolumeId:['provision','pool-provision','pool-retire'].includes(operation)||(operation==='adopt'&&dataVolumeGiB!==null)?null:'vol-11111111111111111',
+        ...(['pool-provision','pool-retire'].includes(operation)?{poolHostId:computerId,poolGeneration:generation}:operation==='adopt'?{poolHostId:randomUUID()}:{}),
         previousGeneration:operation==='replace'?1:null,previousInstanceId:operation==='replace'?'i-22222222222222222':null,
         previousFenceToken:operation==='replace'?randomUUID():null,
         deployment,instanceType,dataVolumeGiB,leaseEpoch:operation==='provision'?1:3,
         userData:options.userData!==undefined?options.userData:['provision','replace'].includes(operation)?'ZXppbC1ub25jZQ==':null};
+    if (i.userData === 'ZXppbC1ub25jZQ==' || i.userData === 'bm9uY2UtZTM=') i.userData = leaseFixture(i);
     const document=JSON.stringify(i),digest=createHash('sha256').update(document).digest('hex');
     const envelope={schemaVersion:1,document,digest};const machine=deployment.stateMachineVersionArn.slice(0,-2);
     const executionArn=machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`;
@@ -39,10 +43,23 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         Encrypted:true,KmsKeyId:deployment.dataKeyArn,MultiAttachEnabled:false,Attachments:[],Tags:tagList(initialVolumeTags(i,digest))};}
     function attach(v:Volume,target:Instance){v.State='in-use';v.Attachments=[{InstanceId:target.InstanceId,VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
         target.BlockDeviceMappings=[...(target.BlockDeviceMappings??[]).filter(m=>m.Ebs?.VolumeId!==v.VolumeId),{DeviceName:'/dev/sdf',Ebs:{VolumeId:v.VolumeId,Status:'attached',DeleteOnTermination:false}}];}
-    if(operation!=='provision'){
+    if(!['provision','pool-provision'].includes(operation)){
         const old=instance(i.previousInstanceId??i.providerInstanceId!,i.previousGeneration??i.targetGeneration,i.previousFenceToken??i.fenceToken);
         old.ClientToken='historical-token';if(operation==='start')old.State={Name:'stopped'};
-        const v=volume();v.Tags=old.Tags;attach(v,old);state.instances.push(old);state.volumes.push(v);
+        const v=volume();v.Tags=old.Tags;
+        if(operation==='pool-retire'){
+            old.Tags=tagList(poolTagsFor(i));
+        }else if(operation==='adopt'){
+            old.Tags=tagList(poolTagsFor(i));v.Tags=tagList(tagsFor(i,1,randomUUID()));
+        }else{
+            attach(v,old);
+            if(operation==='release'){
+                old.Tags=tagList({'ezil:managed-by':'app-computer-platform','ezil:stage':deployment.namespace,'ezil:namespace':deployment.namespace,...claimTagsFor(i)});
+                v.Tags=tagList({...tagsFor(i),...claimTagsFor(i)});
+            }
+        }
+        old.Tags!.push({Key:'aws:ec2launchtemplate:id',Value:deployment.launchTemplateId});
+        state.instances.push(old);if(i.dataVolumeId!==null)state.volumes.push(v);
     }
     const deps:Dependencies={now:()=>state.now,execution:async()=>structuredClone(state.execution),authority:async()=>{state.authorityCalls++;return state.authorized;},
         instances:async selector=>structuredClone(state.instances.filter(v=>Array.isArray(selector)?selector.includes(v.InstanceId!):v.ClientToken===selector.token)

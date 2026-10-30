@@ -112,7 +112,7 @@ try {
     await check('Open launches the actual Settings window', async () => {
         await store.getByRole('button', { name: 'Open Settings', exact: true }).click();
         const settings = page.locator('.window[data-app="settings"]');
-        await settings.getByRole('button', { name: 'Computers', exact: true }).waitFor();
+        await settings.getByRole('button', { name: 'Computer', exact: true }).waitFor();
         assert.equal(await settings.count(), 1);
         await settings.getByRole('button', { name: 'Close', exact: true }).click();
         await settings.waitFor({ state: 'detached' });

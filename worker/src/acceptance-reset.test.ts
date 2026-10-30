@@ -1,3 +1,4 @@
+import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { describe, expect, it, mock } from 'bun:test';
 mock.module('cloudflare:workers', () => ({ DurableObject: class {}, WorkerEntrypoint: class {}, RpcTarget: class {}, RpcStub: class {}, env: {} }));
 
@@ -6,7 +7,7 @@ const pending = () => { let release!: () => void; const promise = new Promise<vo
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fakeObject({ running = false, checkpoint, env }: { running?: boolean; checkpoint?: Promise<void>; env?: Record<string, string> } = {}) {
-  const { Sandbox, ACCEPTANCE_RESET_DELAY_MS } = await import('./index');
+  const { Sandbox } = await import('./index');
   const aborts: string[] = [];
   const fake = Object.assign(Object.create(Sandbox.prototype), {
     // A checkpoint in flight holds both persistence locks, as a teardown's final

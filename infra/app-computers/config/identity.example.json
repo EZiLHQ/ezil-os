@@ -4,5 +4,6 @@
   "region": "ap-south-1",
   "githubOidcProviderArn": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
   "deploySubject": "repo:example-org@1000/ezil-os@2000:environment:aws-pilot",
-  "assetBucketName": "ezil-pilot-deploy-assets-123456789012"
+  "assetBucketName": "ezil-pilot-deploy-assets-123456789012",
+  "poolLifecycle": false
 }

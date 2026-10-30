@@ -71,8 +71,11 @@ import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../n
 import UIAlert from '../../../../src/UI/UIAlert.js';
 import log from '../../../log.js';
 import session from '../../../session.js';
+import trpc from '../trpc.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
+import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
+import { TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -109,6 +112,15 @@ function openDesktopComputerId () {
 // state is safe under that lifetime.
 let status = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
 let failReason = '';
+// Round 3 (plan §6.6): "Restart computer" — a confirmed stop, then a start on the
+// same configuration, tracked as a server transition (`computer.progress`).
+let computerStatus = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
+let computerReason = '';
+let computerTransition = null;
+let computerTimer = null;
+const RESTART_KEY = 'ezil-os:restart.';
+/** D11: the AWS ledger cap, distinct from plan time ("Paused until <date>"). */
+const AWS_CAP_COPY = "You've used this month's AWS computer time. It resets on the 1st — or contact us.";
 // 'idle' | 'copied' | 'manual' — 'manual' means the clipboard was unavailable
 // (no `navigator.clipboard`, a denied permission, a non-secure origin) and the
 // report is shown in a textarea for the user to select and copy by hand.
@@ -215,7 +227,7 @@ async function copyToClipboard (text) {
  * Anything unrecognised still lands on the honest default rather than echoing
  * a server string into the DOM.
  */
-function reasonCopy (errorCode) {
+export function reasonCopy (errorCode) {
     switch ( errorCode ) {
         case 'unsupported': return "This deployment hasn't turned on desktop restarts yet.";
         case 'timeout': return 'The request took too long. Your desktop may still be fine — check back in a moment.';
@@ -229,6 +241,17 @@ function reasonCopy (errorCode) {
         case 'boot_failed': return 'The desktop stopped, but did not come back up. Try again in a moment.';
         case 'unsupported_mode': return 'This desktop runs on an older stack that cannot be restarted in place.';
         case 'restart_in_progress': return 'A restart is already running. Give it a few seconds.';
+        case 'restart_unavailable': return 'The desktop restart could not be confirmed. Try again in a moment.';
+        // ── round 3: the server's distinct restart codes (SWITCH-CONTRACT §2) ──
+        case 'restart_not_running': return "Your computer isn't running. Open the desktop to start it.";
+        case 'restart_busy': return 'Your computer is starting, stopping or switching. Try again in a minute.';
+        case 'restart_budget_exhausted': return 'The desktop was restarted several times in the last few minutes. Wait about 10 minutes, or use Restart computer.';
+        case 'restart_host_unreachable': return "We couldn't reach your computer. Try Restart computer.";
+        case 'restart_timeout': return "The restart was sent, but the desktop didn't come back within 3 minutes. Try Restart computer.";
+        case 'restart_switch_in_progress': return 'A configuration switch is in progress. Try again when it finishes.';
+        case 'restart_foreign_computer': return "This computer can't be restarted from here.";
+        case 'restart_not_entitled': return "Your plan can't start this computer right now.";
+        case 'user_hours_cap': case 'aws_monthly_cap': case 'billing_user_hours_cap': case 'billing_aws_monthly_cap': return AWS_CAP_COPY;
         case 'provider_not_configured': return "This deployment hasn't turned on desktop restarts yet.";
         default: return 'Something went wrong. Please try again.';
     }
@@ -247,7 +270,7 @@ function render ($win) {
         // confirm it is gone (`RESTART_STOP_DEADLINE_MS`) BEFORE it starts the
         // ~22s boot. Quoting only the boot half would make a normal restart
         // look overdue while it is still going fine.
-        statusHtml = '<p class="ezil-settings-muted">Restarting… this can take up to about 45 seconds.</p>';
+        statusHtml = '<p class="ezil-settings-muted">Restarting… this usually takes about 45 seconds and can take up to 3 minutes.</p>';
     } else if ( status === 'restarted' ) {
         statusHtml = '<p class="ezil-settings-muted">Restart requested. Give it a few seconds, then reopen the '
             + 'desktop from the taskbar or Start menu if it does not reconnect on its own.</p>';
@@ -259,8 +282,18 @@ function render ($win) {
         statusHtml = '<p class="ezil-settings-muted">Open a desktop first, then come back here.</p>';
     }
 
-    const disabled = status === 'restarting' || ! supported || ! computerId;
+    const disabled = status === 'restarting' || computerStatus === 'restarting' || ! supported || ! computerId;
     const label = status === 'restarting' ? 'Restarting…' : 'Restart desktop';
+    const machineId = session.currentComputer()?.id ?? computerId;
+    const computerDisabled = computerStatus === 'restarting' || status === 'restarting' || ! supported || ! machineId;
+    let computerHtml = '';
+    if ( computerStatus === 'restarting' ) {
+        computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Restarting your computer… this usually takes 1–4 minutes. Your files stay.</p>';
+    } else if ( computerStatus === 'restarted' ) {
+        computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Your computer restarted. Open the desktop to continue.</p>';
+    } else if ( computerStatus === 'failed' ) {
+        computerHtml = `<p class="ezil-settings-error" data-role="restart-computer-status">${html_encode(computerReason)}</p>`;
+    }
 
     // ── the diagnostic-log section ───────────────────────────────────────
     // Counts are read at render time, so re-opening the tab shows what has
@@ -284,13 +317,16 @@ function render ($win) {
 
     $body.html(`
         <p class="ezil-settings-lead">
-            ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If the desktop is frozen or not responding, restarting it can help. This shuts the
-            desktop down and starts it again inside the SAME container — your files in
-            storage are not touched, and the computer itself is not deleted.`}
+            ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If the desktop is frozen or not responding, restart it. Your files are not touched
+            by either restart, and the computer itself is not deleted.`}
         </p>
+        ${isNative() ? '' : '<h3>Restart desktop</h3><p class="ezil-settings-muted">Restarts the desktop and its apps on this machine. Files stay. About 20 seconds.</p>'}
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
             ${isNative() ? 'hidden' : ''} ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
         ${statusHtml}
+        ${isNative() ? '' : `<h3>Restart computer</h3><p class="ezil-settings-muted">Stops your computer and starts it again. Files stay. 1–4 minutes.</p>
+        <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart-computer" ${computerDisabled ? 'disabled' : ''}>${computerStatus === 'restarting' ? 'Restarting…' : 'Restart computer'}</button>
+        ${computerHtml}`}
         <hr class="ezil-settings-rule">
         <p class="ezil-settings-lead">
             EZiL OS keeps a short record of what this page did — ${consoleCount} console
@@ -303,7 +339,14 @@ function render ($win) {
         </p>
         <button type="button" class="ezil-settings-btn" data-action="copy-diagnostics"
             ${nothingRecorded ? 'disabled' : ''}>Copy diagnostic log</button>
+        ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="report-problem">Report a problem</button>' : ''}
         ${copyHtml}
+        ${feedback_enabled() ? `<section aria-label="Your reports">
+            <h3>Your reports</h3>
+            <button type="button" class="ezil-settings-btn" data-action="load-reports">Load your reports</button>
+            <div data-role="feedback-reports" aria-live="polite"></div>
+            <p class="ezil-settings-muted">Deleted reports are removed immediately; database backups expire on their own schedule.</p>
+        </section>` : ''}
     `);
 }
 
@@ -324,12 +367,12 @@ async function confirmRestart () {
 }
 
 async function handleRestart ($win) {
-    if ( status === 'restarting' ) return;
+    if ( status === 'restarting' || computerStatus === 'restarting' ) return;
     const computerId = openDesktopComputerId();
     if ( ! computerId ) return;
 
     const confirmed = await confirmRestart();
-    if ( ! confirmed ) return;
+    if ( ! confirmed || status === 'restarting' ) return;
 
     status = 'restarting';
     render($win);
@@ -338,6 +381,9 @@ async function handleRestart ($win) {
 
     if ( res.ok ) {
         status = 'restarted';
+        // The AWS route now waits for the new runtime (including code-server's startup gate).
+        // Notify once, only after completion; a queue acknowledgment alone is not readiness.
+        window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } }));
     } else {
         status = 'failed';
         failReason = reasonCopy(res.errorCode);
@@ -356,6 +402,90 @@ async function handleRestart ($win) {
     render($win);
 }
 
+async function confirmRestartComputer () {
+    const value = await UIAlert({
+        message: '<strong>Restart your computer?</strong>'
+            + '<p>Your computer stops and starts again on the same configuration. Open apps close and '
+            + 'anything unsaved in them is lost. Your files stay. This takes 1–4 minutes.</p>',
+        type: 'warning',
+        body_icon: ALERT_WARNING_ICON,
+        buttons: [
+            { label: 'Restart computer', value: 'confirm', type: 'danger' },
+            { label: 'Cancel', value: 'cancel', type: 'secondary' },
+        ],
+    });
+    return value === 'confirm';
+}
+
+function restartRequestId (computerId) {
+    const key = RESTART_KEY + computerId;
+    let store = null;
+    try { store = typeof sessionStorage === 'undefined' ? null : sessionStorage; } catch { store = null; }
+    try { const kept = store?.getItem(key); if ( kept && /^[A-Za-z0-9_-]{8,64}$/.test(kept) ) return kept; } catch { /* mint below */ }
+    let id = '';
+    try { id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : ''; } catch { id = ''; }
+    if ( ! id ) id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    id = id.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64).padEnd(8, '0');
+    try { store?.setItem(key, id); } catch { /* the id still works for this click */ }
+    return id;
+}
+function clearRestartRequestId (computerId) {
+    try { sessionStorage.removeItem(RESTART_KEY + computerId); } catch { /* nothing kept */ }
+}
+
+/** Follow the restart transition the server reported until it is done or failed. */
+function watchComputerRestart ($win, computerId) {
+    clearTimeout(computerTimer);
+    computerTimer = setTimeout(async () => {
+        if ( computerStatus !== 'restarting' || ! $win.get(0)?.isConnected ) return;
+        const res = await trpc.query('computer.progress', { computerId }).catch(() => ({ ok: false }));
+        const t = res?.ok ? res.data?.transition : null;
+        if ( t && t.kind === 'restart' && (! computerTransition || t.transitionId === computerTransition) && ['done', 'failed'].includes(t.phase) ) {
+            clearRestartRequestId(computerId);
+            computerStatus = t.phase === 'done' ? 'restarted' : 'failed';
+            computerReason = t.phase === 'done' ? '' : reasonCopy(t.reason) === 'Something went wrong. Please try again.'
+                ? "We couldn't restart your computer. Your files are safe. Try again in a moment." : reasonCopy(t.reason);
+            if ( t.phase === 'done' ) window.dispatchEvent(new CustomEvent('ezil:computer-restarted', { detail: { computerId } }));
+            render($win);
+            return;
+        }
+        watchComputerRestart($win, computerId);
+    }, 3000);
+}
+
+async function handleRestartComputer ($win) {
+    if ( computerStatus === 'restarting' || status === 'restarting' ) return;
+    const computerId = session.currentComputer()?.id ?? openDesktopComputerId();
+    const url = session.restartEndpoint();
+    if ( ! computerId || ! url ) return;
+    if ( ! await confirmRestartComputer() || computerStatus === 'restarting' ) return;
+    computerStatus = 'restarting';
+    computerReason = '';
+    computerTransition = null;
+    render($win);
+    let answer = null;
+    try {
+        const res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ computerId, scope: 'computer', requestId: restartRequestId(computerId) }) });
+        answer = res.status === 401 ? { ok: false, errorCode: 'unauthorized' } : await res.json().catch(() => null);
+        if ( ! res.ok && answer?.ok !== false ) answer = { ok: false, errorCode: 'unknown' };
+    } catch {
+        answer = { ok: false, errorCode: 'fetch_failed' };
+    }
+    if ( answer?.ok === true ) {
+        computerTransition = typeof answer.transitionId === 'string' ? answer.transitionId : null;
+        if ( computerTransition ) window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId, transitionId: computerTransition } }));
+        render($win);
+        watchComputerRestart($win, computerId);
+        return;
+    }
+    clearRestartRequestId(computerId);
+    computerStatus = 'failed';
+    computerReason = reasonCopy(answer?.errorCode);
+    telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:settings/troubleshoot#restart-computer', code: String(answer?.errorCode ?? 'unknown') });
+    render($win);
+}
+
 async function handleCopyDiagnostics ($win) {
     const nativeEvents = await selectRuntimeAdapter()?.diagnostics() ?? [];
     copyText = buildDiagnosticReport(nativeEvents);
@@ -370,10 +500,76 @@ async function handleCopyDiagnostics ($win) {
     }
 }
 
+// Loading is explicit: opening the feedback form must not cause a request.
+// Refresh only this list, so a response cannot replace a newly opened form.
+async function loadReports ($win) {
+    if ( ! feedback_enabled() ) return;
+    const host = $win.find('[data-role="feedback-reports"]')[0];
+    if ( ! host ) return;
+    host.textContent = 'Loading your reports…';
+    host.dataset.loaded = '1';
+    try {
+        const reports = await list_my_reports();
+        if ( ! host.isConnected || ! feedback_enabled() ) return;
+        host.textContent = '';
+        if ( reports.length === 0 ) { host.textContent = 'You have no reports yet.'; return; }
+        const list = document.createElement('ul');
+        list.className = 'ezil-feedback-reports';
+        for ( const report of reports ) {
+            const row = document.createElement('li');
+            const heading = document.createElement('strong');
+            const date = new Date(report.createdAt);
+            const category = { bug: 'Bug', idea: 'Idea', other: 'Other' }[report.category] || 'Report';
+            heading.textContent = `${category} · ${Number.isNaN(date.getTime()) ? 'Date unavailable' : date.toLocaleDateString()}`;
+            const preview = document.createElement('p');
+            preview.textContent = String(report.descriptionPreview ?? '').slice(0, 140);
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'ezil-settings-btn';
+            remove.textContent = 'Delete';
+            remove.addEventListener('click', async () => {
+                if ( ! feedback_enabled() || ! window.confirm('Delete this report and its screenshot?') ) return;
+                remove.disabled = true;
+                const message = document.createElement('p');
+                message.className = 'ezil-settings-error';
+                try {
+                    if ( ! await delete_my_report(report.id) ) throw new Error('delete_failed');
+                    row.remove();
+                    if ( ! list.children.length ) host.textContent = 'You have no reports yet.';
+                } catch {
+                    message.textContent = 'Could not delete this report. Try again.';
+                    row.append(message);
+                    remove.disabled = false;
+                }
+            });
+            row.append(heading, preview, remove);
+            list.append(row);
+        }
+        host.append(list);
+    } catch {
+        if ( host.isConnected ) host.textContent = 'Could not load your reports. Try again.';
+    }
+}
+
 function bind ($win) {
     $win.find('[data-role="troubleshoot-body"]')
         .on('click', '[data-action="restart"]', () => { void handleRestart($win); })
-        .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); });
+        .on('click', '[data-action="restart-computer"]', () => { void handleRestartComputer($win); })
+        .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); })
+        .on('click', '[data-action="report-problem"]', function () {
+            this.focus();
+            if ( feedback_enabled() ) open_feedback_dialog({ source: 'troubleshoot' });
+        })
+        .on('click', '[data-action="load-reports"]', () => { void loadReports($win); });
+    // A report sent from anywhere (chip, this pane, or a queued resend on
+    // reconnect) shows up in an already-loaded "Your reports" list. Loading
+    // stays explicit: an unloaded list is left alone.
+    const body = $win.find('[data-role="troubleshoot-body"]')[0];
+    const onSent = () => {
+        if ( ! body?.isConnected ) { window.removeEventListener('ezil:feedback-sent', onSent); return; }
+        if ( $win.find('[data-role="feedback-reports"]')[0]?.dataset.loaded ) void loadReports($win);
+    };
+    window.addEventListener('ezil:feedback-sent', onSent);
 }
 
 export default {
@@ -388,6 +584,10 @@ export default {
     init ($win) {
         status = 'idle';
         failReason = '';
+        computerStatus = 'idle';
+        computerReason = '';
+        computerTransition = null;
+        clearTimeout(computerTimer);
         copyState = 'idle';
         copyText = '';
         bind($win);

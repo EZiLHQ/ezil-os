@@ -46,6 +46,8 @@ import {
 // result type requires it); callers that only need `key` ignore the rest.
 
 export interface WorkspaceObjectBody {
+  /** Native streaming body when the backing store exposes one. */
+  body?: ReadableStream<Uint8Array> | null;
   /** Normalized: no weak `W/` marker, no surrounding quotes. */
   etag: string;
   /** From `Content-Length`. The caller refuses an unknown/invalid size. */
@@ -582,7 +584,7 @@ export class MigratingWorkspaceStore implements WorkspaceStore {
 // provided for completeness and type-fit but never called on the R2 side.
 
 interface R2BucketLike {
-  get(key: string, options?: WorkspaceGetOptions): Promise<{ etag: string; size: number; arrayBuffer(): Promise<ArrayBuffer> } | null>;
+  get(key: string, options?: WorkspaceGetOptions): Promise<WorkspaceObjectBody | null>;
   put(
     key: string,
     value: Uint8Array | string,
@@ -605,7 +607,7 @@ export function r2AsWorkspaceStore(r2: R2BucketLike): WorkspaceStore {
       // Lazy body: the caller (readBounded) refuses an unknown/over-limit size
       // from `o.size` BEFORE any bytes are buffered — matching the pure-R2 path,
       // so a huge legacy loose file fails cheaply instead of being buffered whole.
-      return { etag: normalizeEtag(o.etag), size: o.size, arrayBuffer: () => o.arrayBuffer() };
+      return { etag: normalizeEtag(o.etag), size: o.size, body: o.body, arrayBuffer: () => o.arrayBuffer() };
     },
     async put(key, value, options) {
       const o = await r2.put(key, value, options);

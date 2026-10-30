@@ -10,6 +10,8 @@
  * variable means.
  */
 
+import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
+
 export type Env = Record<string, string | undefined>;
 
 /** The only value that enables AWS admission and the aws-ec2 provider. */
@@ -60,12 +62,18 @@ export function inAwsCanary(canary: AwsCanaryConfig, userId: string): boolean {
 const CANARY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CANARY_SINCE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
+/** Cutoff for direct AWS creation, independent of canary user membership. Fail closed. */
+export function awsDirectSince(env: Env = process.env): Date | null {
+    const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
+    if (!sinceText || !CANARY_SINCE.test(sinceText)) return null;
+    const since = new Date(sinceText);
+    return Number.isFinite(since.getTime()) ? since : null;
+}
+
 export function awsCanaryConfig(env: Env = process.env): AwsCanaryConfig | null {
     const list = env.EZIL_AWS_CANARY_USER_IDS?.trim();
-    const sinceText = env.EZIL_AWS_CANARY_SINCE?.trim();
-    if (!list || !sinceText || !CANARY_SINCE.test(sinceText)) return null;
-    const since = new Date(sinceText);
-    if (!Number.isFinite(since.getTime())) return null;
+    const since = awsDirectSince(env);
+    if (!list || !since) return null;
     // `*` only as the WHOLE value; `*` beside ids is not a uuid, so the list is malformed.
     if (list === '*') return { everyone: true, userIds: new Set(), since };
     const ids = list.split(',').map((id) => id.trim().toLowerCase());
@@ -89,10 +97,12 @@ export interface AwsAdmissionCaps {
  * and every later wake uses the placement's region; a full region refuses
  * (`region_capacity`), it never moves a computer.
  *
- * `maxRunning` is the computers this deployment may run there. It must come
+ * `maxRunning` is a budget in 2-vCPU units: admission requires running vCPU
+ * plus requested vCPU <= maxRunning * 2, globally and in the chosen region.
+ * Unknown instance types count as 8 vCPU. The regional budget must come
  * from the region's VERIFIED On-Demand Standard vCPU quota minus every other
  * workload in the same quota (e.g. ezil-db-aws holds 4 of Mumbai's 5), divided
- * by the vCPU of the largest tier type. There is no default: an unset or
+ * by 2 vCPU (rounded down). There is no default: an unset or
  * malformed cap disables AWS admission.
  */
 export interface AwsRegionConfig {
@@ -123,15 +133,61 @@ export function regionCapEnv(region: string): string {
  * - free: 2 vCPU / 4 GiB. Burstable, launched with standard CPU credits
  *   (T3 defaults to unlimited, which bills surplus CPU).
  * - plus: 2 vCPU / 8 GiB.
+ * - compute4 / compute8: billing v2 paid Compute sizes, 4 / 8 vCPU.
  */
 export const AWS_TIERS = {
     free: ['t3a.medium', 't3.medium'],
-    plus: ['m6i.large'],
+    plus: [SIZES['std-2'].machine],
+    compute4: [SIZES['cmp-4'].machine],
+    compute8: [SIZES['cmp-8'].machine],
 } as const satisfies Record<string, readonly string[]>;
 export type AwsTier = keyof typeof AWS_TIERS;
 
 /** Data-volume size at provision (infra DEFAULT_DATA_TIERS_GIB: free 20, premium 50); must fall inside the deployment's range. */
-export const AWS_TIER_DATA_GIB: Readonly<Record<AwsTier, number>> = { free: 20, plus: 50 };
+export const AWS_TIER_DATA_GIB: Readonly<Record<AwsTier, number>> = { free: 20, plus: 50, compute4: 50, compute8: 50 };
+
+export const INSTANCE_VCPU: Readonly<Record<string, number>> = Object.freeze({
+    't3a.medium': 2,
+    't3.medium': 2,
+    'm6i.large': 2,
+    'c6i.xlarge': 4,
+    'm6i.xlarge': 4,
+    'm6i.2xlarge': 8,
+});
+
+/** Missing or unknown types consume the largest size: never under-count capacity. */
+export function instanceVcpu(type: string | null | undefined): number {
+    return type && Object.prototype.hasOwnProperty.call(INSTANCE_VCPU, type) ? INSTANCE_VCPU[type]! : 8;
+}
+
+export function awsTierForSize(size: SizeCode): AwsTier | null {
+    switch (size) {
+        case 'std-2': return 'plus';
+        case 'cmp-4': return 'compute4';
+        case 'cmp-8': return 'compute8';
+        case 'free-cf': return null;
+    }
+}
+
+/** Conservative legacy sizing; billing must use meteredSizeForInstanceType. */
+export function sizeForInstanceType(type: string | null | undefined): SizeCode {
+    switch (instanceVcpu(type)) {
+        case 2: return 'std-2';
+        case 4: return 'cmp-4';
+        default: return 'cmp-8';
+    }
+}
+
+/** Only explicitly listed machine types have a billing size. */
+export function meteredSizeForInstanceType(type: string | null | undefined): SizeCode | null {
+    if (!type || !Object.prototype.hasOwnProperty.call(INSTANCE_VCPU, type)) return null;
+    switch (INSTANCE_VCPU[type]) {
+        case 2: return 'std-2';
+        case 4: return 'cmp-4';
+        case 8: return 'cmp-8';
+        default: return null;
+    }
+}
 
 export function isAwsTier(value: unknown): value is AwsTier {
     return typeof value === 'string' && Object.prototype.hasOwnProperty.call(AWS_TIERS, value);

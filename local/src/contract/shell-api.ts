@@ -54,8 +54,9 @@ export type {
 } from '../../../app/src/server/shell/boot-payload.ts';
 
 /**
- * The nine routes the shell talks to. Same keys, same paths, same order as
- * `SHELL_API_ROUTES` in `app/src/server/shell/boot-payload.ts`.
+ * The nine routes the local host serves. Same keys, paths and order as
+ * `SHELL_API_ROUTES` in `app/src/server/shell/boot-payload.ts`, excluding
+ * hosted TURN renewal (`relayRefresh`) and cloud machine metadata (`system`).
  *
  * 🔴 A KEY HERE IS A SWITCH, NOT DOCUMENTATION. Five of these
  * (`focus`, `telemetry`, `restart`, `activity`, `screen`) are feature-detected

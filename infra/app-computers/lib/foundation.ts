@@ -5,12 +5,13 @@ import {
 import type { Construct } from 'constructs';
 import { z } from 'zod';
 import { NAMESPACE_TAG } from './identity.js';
-import { DEFAULT_STORAGE, InstanceTypeSchema, RootDeviceNameSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
+import { DEFAULT_STORAGE, InstanceTypeSchema, NamespaceSchema, RootDeviceNameSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
 
 /** Foundation configuration. Region and ZoneIds are configuration, never
  * literals (R1); zone names are never stored because they are account-mapped. */
 export const FoundationConfigSchema = z.object({
-    stage: z.enum(['pilot', 'production']),
+    /** Workload namespace; must match the identity, keys and ops configs. */
+    stage: NamespaceSchema,
     region: z.string().regex(REGION_PATTERN),
     /** One public subnet per ZoneId. A pilot uses exactly one. */
     zoneIds: z.array(z.string().regex(ZONE_ID_PATTERN)).min(1).max(3),

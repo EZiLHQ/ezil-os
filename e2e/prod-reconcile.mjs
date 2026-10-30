@@ -85,8 +85,7 @@ try {
     })());
   });
 
-  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-  await signIn(p, { email: EMAIL, password: PASS });
+  await signIn(p, { email: EMAIL, password: PASS, app: APP });
   check('sign-in leaves /login', !/\/login/.test(p.url()), p.url().slice(0, 50));
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
   const isolatedComputerId = await verifySelectedComputer(p, { required: true });

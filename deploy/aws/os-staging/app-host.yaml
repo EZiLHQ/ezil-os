@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable EZiL OS app host (billing staging in the Mumbai preview VPC, or production in the prod VPC); no app or database deployed.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    must: [Deploy only in account 452630323510 and ap-south-1, Staging never uses production resources and production never uses staging resources]
+    ref: [INFRASTRUCTURE.md]
+Parameters:
+  Environment:
+    Type: String
+    Default: staging
+    AllowedValues: [staging, production]
+    Description: staging resolves exactly as before this parameter existed; production is pinned by the Rules below.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0f6bc19fdfd4209aa
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0dd4cf8f7d3d92e20
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium]
+  AmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  ArtifactBucket:
+    Type: String
+    AllowedPattern: '(?:(?!ezil-main-prod-)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]|ezil-main-prod-artifacts-452630323510-aps1)'
+    Description: Staging, an existing non-production bucket reachable through the preview S3 endpoint; production, ezil-main-prod-artifacts-452630323510-aps1.
+  AppCallerRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(arn:aws:iam::452630323510:role/[A-Za-z0-9+=,.@_/-]+)?'
+    Description: Exact existing app-caller role; empty until the Mumbai lifecycle stack exists. No wildcard or account root.
+Rules:
+  ProductionUsesOnlyProductionResources:
+    RuleCondition: !Equals [!Ref Environment, production]
+    Assertions:
+      - Assert: !Equals [!Ref VpcId, vpc-040bdd6e09e35425f]
+        AssertDescription: Production uses the prod VPC vpc-040bdd6e09e35425f.
+      - Assert: !Equals [!Ref SubnetId, subnet-0e7c19ed848d0fcea]
+        AssertDescription: Production uses the prod subnet subnet-0e7c19ed848d0fcea.
+      - Assert: !Equals [!Ref ArtifactBucket, ezil-main-prod-artifacts-452630323510-aps1]
+        AssertDescription: Production uses ezil-main-prod-artifacts-452630323510-aps1, the only artifacts bucket its S3 endpoint allows.
+      - Assert: !Equals [!Ref AppCallerRoleArn, '']
+        AssertDescription: The only app-caller role is staging's (its trust requires ezil:env=billing-staging); production passes ''.
+  StagingNeverUsesProductionResources:
+    RuleCondition: !Equals [!Ref Environment, staging]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcId, vpc-040bdd6e09e35425f]]
+        AssertDescription: Staging never uses the prod VPC.
+      - Assert: !Not [!Equals [!Ref SubnetId, subnet-0e7c19ed848d0fcea]]
+        AssertDescription: Staging never uses the prod subnet.
+      - Assert: !Not [!Equals [!Ref ArtifactBucket, ezil-main-prod-artifacts-452630323510-aps1]]
+        AssertDescription: Staging never uses a production bucket.
+Mappings:
+  # Staging values are the literals this template used before the Environment
+  # parameter, so an existing staging stack resolves to identical resources.
+  Environments:
+    staging:
+      Env: billing-staging
+      Purpose: os-staging
+      Name: ezil-os-billing-staging-host
+      Slug: ezil-os-staging
+      ImagePrefix: os-staging/images
+      SecretName: ezil-os/billing-staging/app
+      GroupDescription: OS billing staging HTTP and HTTPS
+      PolicyName: BillingStagingRuntime
+    production:
+      Env: production
+      Purpose: os
+      Name: ezil-os-prod-host
+      Slug: ezil-os-production
+      ImagePrefix: os/images
+      SecretName: ezil-os/production/app
+      GroupDescription: OS production HTTP and HTTPS
+      PolicyName: OsProductionRuntime
+Conditions:
+  HasAppCaller: !Not [!Equals [!Ref AppCallerRoleArn, '']]
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Public HTTP and HTTPS terminate on the app host; administration uses SSM.
+        must: [No SSH ingress, No public database ingress]
+    Properties:
+      GroupDescription: !FindInMap [Environments, !Ref Environment, GroupDescription]
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags:
+        - {Key: 'ezil:env', Value: !FindInMap [Environments, !Ref Environment, Env]}
+        - {Key: 'ezil:purpose', Value: !FindInMap [Environments, !Ref Environment, Purpose]}
+  InstanceRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: EC2 supplies temporary credentials for artifacts, the environment's secret and the app caller.
+        must: [No secret writes, No bucket listing or writes, Exact app-caller role only]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !FindInMap [Environments, !Ref Environment, PolicyName]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ImagePrefix}/*
+                  - ImagePrefix: !FindInMap [Environments, !Ref Environment, ImagePrefix]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub
+                  - arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*
+                  - SecretName: !FindInMap [Environments, !Ref Environment, SecretName]
+              - !If
+                - HasAppCaller
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Ref AppCallerRoleArn
+                - !Ref AWS::NoValue
+      Tags:
+        - {Key: 'ezil:env', Value: !FindInMap [Environments, !Ref Environment, Env]}
+        - {Key: 'ezil:purpose', Value: !FindInMap [Environments, !Ref Environment, Purpose]}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # CloudFormation InstanceProfile has no Tags property; use stack tags as well.
+    Properties:
+      Roles: [!Ref InstanceRole]
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Single disposable host; container credentials need an IMDS hop limit of two.
+        must: [Encrypted disposable root, IMDSv2 required, No application in bootstrap]
+    Properties:
+      ImageId: !Ref AmazonLinuxAmi
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      DisableApiTermination: false
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref AppSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeType: gp3, VolumeSize: 30, Encrypted: true, DeleteOnTermination: true}
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - {Key: Name, Value: !FindInMap [Environments, !Ref Environment, Name]}
+        - {Key: 'ezil:env', Value: !FindInMap [Environments, !Ref Environment, Env]}
+        - {Key: 'ezil:purpose', Value: !FindInMap [Environments, !Ref Environment, Purpose]}
+      # Same as bootstrap-host.sh (kept in sync); dnf cannot reach the S3-hosted mirrors here.
+      # The script text is unchanged for staging: only ${Slug}, the marker directory, varies.
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/usr/bin/env bash
+            # Docker + Compose for the os-staging host without dnf: the preview VPC's S3
+            # endpoint only allows the preview buckets, so the Amazon Linux mirrors (served
+            # from S3) return 403. Static Docker comes from download.docker.com (no published
+            # checksum: the sha256 below was recorded on 2026-10-21) and Compose is verified
+            # against its release checksums.
+            set -euo pipefail
+            umask 022
+            [[ $(uname -m) == x86_64 ]]
+            docker_version=29.9.2
+            docker_sha256=9ac225999fd5e863f7694c728ef23d480616b1e5639328fa309befd4243d69eb
+            compose_version=v2.39.4
+            compose_asset=docker-compose-linux-x86_64
+
+            temporary=$(mktemp -d)
+            trap 'rm -rf "$temporary"' EXIT
+            if ! command -v dockerd >/dev/null; then
+                for attempt in $(seq 1 30); do
+                    curl --fail --location --silent --show-error --retry 5 \
+                        "https://download.docker.com/linux/static/stable/x86_64/docker-$docker_version.tgz" -o "$temporary/docker.tgz" && break
+                    sleep 10
+                done
+                echo "$docker_sha256  $temporary/docker.tgz" | sha256sum --check --quiet
+                tar -xzf "$temporary/docker.tgz" -C "$temporary"
+                install -m 0755 "$temporary"/docker/* /usr/local/bin/
+            fi
+            cat > /etc/systemd/system/docker.service <<'UNIT'
+            [Unit]
+            Description=Docker (static binaries)
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            # No iptables/nft on the host: no bridge, host-networked containers only.
+            ExecStart=/usr/local/bin/dockerd --host=unix:///run/docker.sock --bridge=none --iptables=false --ip6tables=false
+            Restart=always
+            LimitNOFILE=1048576
+            Delegate=yes
+            KillMode=process
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable docker
+            systemctl reset-failed docker 2>/dev/null || true
+            systemctl restart docker
+            for attempt in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+
+            if ! docker compose version >/dev/null 2>&1; then
+                base="https://github.com/docker/compose/releases/download/$compose_version"
+                curl --fail --location --silent --show-error --retry 5 "$base/$compose_asset" -o "$temporary/$compose_asset"
+                curl --fail --location --silent --show-error --retry 5 "$base/checksums.txt" -o "$temporary/checksums.txt"
+                (cd "$temporary" && sha256sum --check --ignore-missing --quiet checksums.txt)
+                install -D -m 0755 "$temporary/$compose_asset" /usr/local/lib/docker/cli-plugins/docker-compose
+            fi
+            docker compose version --short | python3 -c 'import re,sys; v=re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)",sys.stdin.read().strip()); assert v and tuple(map(int,v.groups())) >= (2,30,0)'
+            systemctl enable --now amazon-ssm-agent
+            install -d -m 0755 /var/lib/${Slug}
+            touch /var/lib/${Slug}/bootstrap.done
+            echo "docker $(docker version --format '{{.Server.Version}}') compose $(docker compose version --short)"
+          - Slug: !FindInMap [Environments, !Ref Environment, Slug]
+  PublicIp:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: 'ezil:env', Value: !FindInMap [Environments, !Ref Environment, Env]}
+        - {Key: 'ezil:purpose', Value: !FindInMap [Environments, !Ref Environment, Purpose]}
+  PublicIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Associations do not support tags.
+    Properties:
+      AllocationId: !GetAtt PublicIp.AllocationId
+      InstanceId: !Ref AppInstance
+Outputs:
+  InstanceId:
+    Description: App host to administer with SSM (OS_STAGING_INSTANCE_ID or OS_PRODUCTION_INSTANCE_ID).
+    Value: !Ref AppInstance
+  PublicIp:
+    Description: DNS A record for os-staging.ezil.work (staging) or os-prod.ezil.work (production).
+    Value: !Ref PublicIp
+  InstanceRoleArn:
+    Description: Staging only, add this exact ARN to appCaller.ec2CallerRoleArns after host creation.
+    Value: !GetAtt InstanceRole.Arn
+  AppSecurityGroupId:
+    Description: Source SG for the separate DB ingress stack (db-access.yaml).
+    Value: !Ref AppSecurityGroup

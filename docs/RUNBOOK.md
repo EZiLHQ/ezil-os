@@ -30,18 +30,26 @@ system, which is out of scope for a docs-only pass.
 Open a feature PR and merge it to the long-lived `preview` branch. Each push
 runs `preview.yml`: deploy the staging Worker and app, update the stable preview
 URL <https://ezil-os-staging.vercel.app>, then run `e2e/live-check.mjs`.
-After that check passes, merge `preview` to `main`. The same workflow deploys
-production at <https://os.ezil.work> and runs the live check. Main first applies
+After that check passes, merge `preview` to `main`. That push builds and tests
+images but never deploys production, which is moving to AWS. Dispatching the same
+workflow on `main` with `deploy_production` set deploys the legacy production at
+<https://os.ezil.work> and runs the live check. It first applies
 reviewed production migrations; a failed apply stops deployment. A failed deploy
 or live check restores the previous Worker version and Vercel deployment and,
 when the image changed, restores the captured container image and waits for its
 rollout. Recovery uses `previous-release.json`, uploaded before mutation; SQL is
 never reversed. Recovery failures remain visible and fail the run. Live-check
-and recovery evidence is uploaded on every run. PR CI runs on
+and recovery evidence is uploaded by every staging and production deployment
+run. PR CI runs on
 Ubuntu; `preview.yml` also supports manual dispatch on `preview` or `main`,
 and the macOS workflows remain available manually. Container images build
-only when their inputs change; other pushes leave the container rollout
-disabled. `preview.yml` keeps the shared `IMAGE_INPUTS` list, checked against
+only when their inputs differ from the image source in the branch's newest
+deployment receipt: the `live-evidence` artifact of a successful staging deploy
+on `preview`, or of a production dispatch on `main`. Otherwise the container
+rollout stays disabled. Main pushes and dispatches without `deploy_production`
+deploy nothing and leave no receipt, so after an image-input change every main
+push rebuilds and tests the images until a production dispatch deploys them.
+An expired newest receipt also rebuilds. `preview.yml` keeps the shared `IMAGE_INPUTS` list, checked against
 `image-plan.mjs` and every local `worker/Dockerfile` COPY/ADD source. Manual
 dispatch on branches and new branches rebuild images conservatively.
 
@@ -152,8 +160,14 @@ digest and publishes the draft with the verified identities. `deploy.yml` and
     `/auth/confirm`, and that path needs allow-listing too.
   - **E2E default-host prerequisite:**
     Every `e2e/prod*.mjs` suite and `e2e/release-and-wait.mjs` sign in as
-    `$EZIL_E2E_EMAIL` and then load `/os`. Any account that can sign in works;
-    no allow-list grant is needed since the invite gate was removed.
+    `$EZIL_E2E_EMAIL` and then load `/os`. `/login` offers only EZiL ID, so
+    they sign in without the UI (`e2e/sign-in.mjs`): a Supabase password grant,
+    then the app's own SSR auth cookie in the browser. The account therefore
+    needs an email/password identity on the target's Supabase project, and the
+    run needs that project's public `NEXT_PUBLIC_SUPABASE_URL` and
+    `NEXT_PUBLIC_SUPABASE_ANON_KEY`. `preview.yml`'s live checks read both from
+    the `staging` and `production` GitHub environment variables of the same
+    names. No allow-list grant is needed since the invite gate was removed.
 
 ---
 

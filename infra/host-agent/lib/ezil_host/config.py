@@ -5,6 +5,7 @@ scratch directory, a loop device and stub endpoints without any test-only branch
 """
 import json
 import os
+import re
 
 DEFAULTS = {
     "dataMount": "/srv/ezil-data",
@@ -100,7 +101,7 @@ def load(path=None):
 def host_digest(cfg):
     with open(cfg.lowerDigestFile, encoding="utf-8") as f:
         d = f.read().strip()
-    if not d.startswith("sha256:") or len(d) != 71:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", d):
         raise SystemExit("lower image digest file is malformed")
     return d
 

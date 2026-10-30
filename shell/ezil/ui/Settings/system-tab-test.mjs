@@ -191,7 +191,7 @@ test('late responses from the old computer cannot replace the current computer d
     oldScreen.resolve({ ok: true, width: 800, height: 600 });
     await settle();
     assert.equal(host.innerHTML, current);
-    assert.doesNotMatch(host.innerHTML, /old-image|AWS EC2/);
+    assert.doesNotMatch(host.innerHTML, /old-image|ezil-sys-v">AWS/);
 });
 
 test('a failed read retries and refreshes slowly after recovery', async () => {
@@ -202,4 +202,56 @@ test('a failed read retries and refreshes slowly after recovery', async () => {
     await advance(60_000);
     assert.deepEqual(infoCalls.map(call => call.at), [0, 15_000, 75_000]);
     assert.match(host.innerHTML, /running-image/);
+});
+
+test('stream vitals render only from the desktop frame, and only as text', async () => {
+    const frame = { postMessage () {} };
+    const iframe = { contentWindow: frame };
+    globalThis.document = { querySelector: selector => selector === '.ezil-settings-system' ? host
+        : selector.includes('data-app="desktop"') ? iframe : null };
+    await activate();
+    const post = (source, vitals) => {
+        const ev = new Event('message');
+        Object.assign(ev, { source, data: { source: 'ezil-mobile', type: 'stream_vitals', vitals } });
+        window.dispatchEvent(ev);
+    };
+    post({}, { width: 640, height: 480, fps: 30 });
+    assert.doesNotMatch(host.innerHTML, /640 × 480/, 'another window cannot report vitals');
+    post(frame, { width: '<img src=x onerror=alert(1)>', height: 1, fps: '<b>9</b>', relayProtocol: '<i>' });
+    assert.doesNotMatch(host.innerHTML, /<img|<b>|<i>/);
+    post(frame, { width: 1920, height: 1080, fps: 30, localCandidateType: 'relay', remoteCandidateType: 'srflx', relayProtocol: 'udp' });
+    assert.match(host.innerHTML, /1920 × 1080/);
+    assert.match(host.innerHTML, /30 fps/);
+    assert.match(host.innerHTML, /Relayed through TURN over UDP/, 'route fields survive cleaning');
+    post(frame, { localCandidateType: 'host', remoteCandidateType: 'srflx' });
+    assert.match(host.innerHTML, /Direct \(host → srflx\)/);
+});
+
+test('Round 4: a Free user with files on the AWS computer sees truthful Running on and Configuration rows', async () => {
+    answer = () => ({ ok: true, info: { provider: 'aws-ec2', providerSource: 'placement', lifecycleState: 'STOPPED', usage: null,
+        machine: { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' },
+        image: { id: 'running-image', source: 'running' }, plan: { standing: 'files_on_aws' } } });
+    await activate();
+    // `host` is a plain innerHTML holder here; read the row's value cell by its data-role.
+    const rowText = role => host.innerHTML.match(new RegExp(`data-role="${role}">\\s*<div class="ezil-sys-k">[^<]*</div>\\s*<div class="ezil-sys-v">([^<]*)</div>`))?.[1];
+    assert.equal(rowText('sys-running-on'), 'AWS (India) · 2 vCPU / 8 GiB · stopped');
+    assert.equal(rowText('sys-configuration'), 'Plan: Free · files kept on this computer');
+    assert.doesNotMatch(host.innerHTML, /Not reported<|Plan entitlement is not available|ap-south-1|Mumbai/);
+});
+
+test('HF3: a real failed switch names the size the computer is on; a recovered one is ready on the running size', async () => {
+    const machine = { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' };
+    const t = { transitionId: 't-f', kind: 'switch', current: 'std-2', target: 'cmp-4', phase: 'failed', reason: 'wake_timeout', revertAvailable: true };
+    let plan = { standing: 'paid', vcpu: 4, memoryGB: 16, status: 'failed', reason: 'wake_timeout', current: 'std-2', selected: 'std-2', transition: t };
+    answer = () => ({ ok: true, info: { provider: 'aws-ec2', providerSource: 'placement', lifecycleState: 'RUNNING', usage: null, machine, image: { id: 'running-image', source: 'running' }, plan } });
+    await activate();
+    const row = role => host.innerHTML.match(new RegExp(`data-role="${role}">\\s*<div class="ezil-sys-k">[^<]*</div>\\s*<div class="ezil-sys-v">([^<]*)</div>\\s*(?:<div class="ezil-sys-h">([^<]*)</div>)?`));
+    assert.equal(row('sys-configuration')?.[1], 'Switch to 4 vCPU / 16 GB didn&#39;t finish');
+    assert.equal(row('sys-configuration')?.[2], 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.');
+    assert.doesNotMatch(host.innerHTML, /back on/);
+    system.onDeactivate();
+    plan = { standing: 'paid', vcpu: 4, memoryGB: 16, status: 'ready', reason: null, current: 'cmp-4', selected: 'cmp-4', transition: null };
+    await activate();
+    assert.equal(row('sys-configuration')?.[1], '4 vCPU / 16 GB on AWS (India)');
+    assert.doesNotMatch(host.innerHTML, /didn&#39;t finish|back on/);
 });

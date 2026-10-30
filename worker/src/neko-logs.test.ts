@@ -379,9 +379,14 @@ describe('neko-logs: the writers this route actually exposes are enumerated', ()
     // marketplace errors. No env value, no page content, no workspace file
     // content — and `redactNekoLogContent` still rewrites absolute paths on
     // every line, same as for every other writer here.
+    // `setxkbmap` / `xset` configure the X keyboard (layout, repeat) at desktop start.
+    // They print only X keyboard-configuration errors (e.g. an unknown layout name
+    // from NEKO_XKB_LAYOUT): no env value beyond that operator-set layout, no page
+    // or workspace content.
     const known = new Set([
       'log()', 'echo', 'if', 'Xvfb', 'openbox', 'setsid', '--capture.video.display',
       '_screen_has_pixels', '--install-extension', 'ezil_editor_restore_extensions',
+      'setxkbmap', 'xset',
     ]);
     for (const w of writers) expect(known.has(w)).toBe(true);
   });

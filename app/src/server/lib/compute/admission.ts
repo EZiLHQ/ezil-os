@@ -25,12 +25,13 @@ import {
     peekAdmissionCounters,
     readAdmissionCounters,
     readPlacement,
+    RUNNING_CLASS_STATES,
     type AdmissionCounters,
     type Placement,
     type PlacementDb,
     type PlacementFields,
 } from './placement';
-import { instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, type AwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
+import { instanceTypeForTier, instanceVcpu, isAwsTier, readAwsAdmissionConfig, type AwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
 import { BYTES_PER_GB, usageFor, utcMonthStart } from './usage';
 
 export type AdmissionRefusal =
@@ -60,24 +61,31 @@ export type RegionPlan = { kind: 'create' } | { kind: 'lease'; region: string | 
 export type AdmissionDecision = { admit: true; region?: string } | { admit: false; reason: AdmissionRefusal; reasons: AdmissionRefusal[] };
 
 /**
- * Exact per-region running counts, as `readAdmissionCounters` supplies them.
- * A region absent from `runningByRegion` has NO running computers (0), and
- * running rows without a region (`runningUnplaced`) count against every
- * region. Only a caller that supplies no per-region counts at all (pure cap
- * checks) falls back to the GLOBAL count, an upper bound that never
- * over-admits.
+ * Exact running vCPU, as `readAdmissionCounters` supplies it. An absent region
+ * has no running computers. Unplaced rows count against every region. Missing
+ * vCPU data falls back to counts times 8; missing regional data uses the global
+ * upper bound, so a pure caller never over-admits.
  */
-export type RegionalCounters = { runningByRegion?: Readonly<Record<string, number>>; runningUnplaced?: number };
+export type RegionalCounters = {
+    runningByRegion?: Readonly<Record<string, number>>;
+    runningUnplaced?: number;
+    runningVcpu?: number;
+    runningVcpuByRegion?: Readonly<Record<string, number>>;
+    runningVcpuUnplaced?: number;
+};
 
-function regionRunning(counters: { runningCount: number } & RegionalCounters, region: string): number {
-    if (counters.runningByRegion === undefined) return counters.runningCount;
-    const exact = Object.prototype.hasOwnProperty.call(counters.runningByRegion, region) ? counters.runningByRegion[region]! : 0;
-    return exact + (counters.runningUnplaced ?? 0);
+function regionRunningVcpu(counters: { runningCount: number } & RegionalCounters, region: string): number {
+    const regional = counters.runningVcpuByRegion ?? counters.runningByRegion;
+    if (regional === undefined) return counters.runningVcpu ?? counters.runningCount * 8;
+    const exact = Object.prototype.hasOwnProperty.call(regional, region) ? regional[region]! : 0;
+    return exact * (counters.runningVcpuByRegion === undefined ? 8 : 1)
+        + (counters.runningVcpuUnplaced ?? (counters.runningUnplaced ?? 0) * 8);
 }
 
 /**
  * Pure. Refusals in a fixed priority order; `reason` is the first and
- * `reasons` all of them. Every comparison is `>=`: reaching a cap refuses.
+ * `reasons` all of them. A launch must fit the vCPU budget; reaching a monthly
+ * usage cap refuses.
  */
 export function decideAdmission(input: {
     config: AwsAdmissionConfig;
@@ -87,10 +95,13 @@ export function decideAdmission(input: {
     now: Date;
     /** Omitted only by callers that decide no placement (pure cap checks). */
     region?: RegionPlan;
+    /** Type being launched; omitted/unknown counts as 8 vCPU. */
+    instanceType?: string | null;
 }): AdmissionDecision {
     const { config, counters } = input;
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
     const { caps } = config;
+    const requestedVcpu = instanceVcpu(input.instanceType);
     const usage = usageFor(counters.usage, input.userId);
     const reasons: AdmissionRefusal[] = [];
     // The caller's pair is re-checked here: caps are per user, so admitting
@@ -110,21 +121,21 @@ export function decideAdmission(input: {
     if (counters.targetDeleted) reasons.push('computer_deleted');
     if (config.killSwitch) reasons.push('kill_switch');
     if (counters.duplicates.length > 0) reasons.push('duplicate_placement');
-    if (counters.runningCount >= caps.maxRunning) reasons.push('max_running');
+    if ((counters.runningVcpu ?? counters.runningCount * 8) + requestedVcpu > caps.maxRunning * 2) reasons.push('max_running');
     if (counters.userOtherAwsComputers >= 1) reasons.push('user_has_aws_computer');
-    if (usage.user.hours >= caps.userMonthlyHours) reasons.push('user_hours_cap');
-    if (usage.global.hours >= caps.globalMonthlyHours) reasons.push('global_hours_cap');
+    if (usage.user.weightedSeconds >= caps.userMonthlyHours * 3_600) reasons.push('user_hours_cap');
+    if (usage.global.weightedSeconds >= caps.globalMonthlyHours * 3_600) reasons.push('global_hours_cap');
     if (usage.user.egressBytes >= caps.userMonthlyEgressGb * BYTES_PER_GB) reasons.push('user_egress_cap');
     if (usage.global.egressBytes >= caps.globalMonthlyEgressGb * BYTES_PER_GB) reasons.push('global_egress_cap');
     let region: string | undefined;
     if (input.region?.kind === 'create') {
-        region = config.regions.find((r) => regionRunning(counters, r.name) < r.maxRunning)?.name;
+        region = config.regions.find((r) => regionRunningVcpu(counters, r.name) + requestedVcpu <= r.maxRunning * 2)?.name;
         if (region === undefined) reasons.push('region_capacity');
     } else if (input.region?.kind === 'lease') {
         const home = input.region.region;
         const configured = home === null ? undefined : config.regions.find((r) => r.name === home);
         if (configured === undefined) reasons.push('region_not_configured');
-        else if (regionRunning(counters, configured.name) >= configured.maxRunning) reasons.push('region_capacity');
+        else if (regionRunningVcpu(counters, configured.name) + requestedVcpu > configured.maxRunning * 2) reasons.push('region_capacity');
         else region = configured.name;
     }
     if (reasons.length > 0) return { admit: false, reason: reasons[0]!, reasons };
@@ -140,6 +151,8 @@ export type AdmissionRequest =
           expected: { generation: number; leaseEpoch: number };
           leaseUntil: Date;
           replace?: boolean;
+          /** A paid plan change always replaces; admission reserves the new tier's vCPU. */
+          resizeTo?: Exclude<AwsTier, 'free'>;
           /** Recorded in the lease's own compare-and-swap (this boot's job, fence and enrollment nonce hash). */
           fields?: PlacementFields;
       }
@@ -163,7 +176,7 @@ export type AdmissionRequest =
 
 export type AdmissionOutcome =
     | { admitted: true; placement: Placement }
-    | { admitted: false; reason: AdmissionRefusal | 'cas_conflict' | 'placement_exists'; reasons?: AdmissionRefusal[] };
+    | { admitted: false; reason: AdmissionRefusal | 'cas_conflict' | 'placement_exists' | 'capacity_waiting'; reasons?: AdmissionRefusal[] };
 
 export interface AdmissionDeps {
     env?: Env;
@@ -180,13 +193,50 @@ export interface AdmissionDeps {
  */
 export async function precheckAdmission(
     db: PlacementExecutor,
-    input: { userId: string; computerId: string; env?: Env; now?: Date },
+    input: { userId: string; computerId: string; tier?: AwsTier; env?: Env; now?: Date },
 ): Promise<AdmissionDecision> {
     const config = readAwsAdmissionConfig(input.env ?? process.env);
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
     const now = input.now ?? new Date();
     const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.computerId, monthStart: utcMonthStart(now), now });
-    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' } });
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' }, instanceType: instanceTypeForTier(input.tier ?? 'free') });
+}
+
+/**
+ * A placement that is replaced (resize, enrollment recovery) or stopped before its next boot
+ * (round-3 switch preflight) frees its own running slot: count only the new type, never both.
+ */
+export function releaseOwnSlot(counters: AdmissionCounters, placement: Pick<Placement, 'region' | 'instanceType'>): void {
+    if (!placement.region) return;
+    counters.runningCount = Math.max(0, counters.runningCount - 1);
+    const reusedVcpu = instanceVcpu(placement.instanceType);
+    counters.runningVcpu = Math.max(0, counters.runningVcpu - reusedVcpu);
+    counters.runningVcpuByRegion = {
+        ...counters.runningVcpuByRegion,
+        [placement.region]: Math.max(0, (counters.runningVcpuByRegion[placement.region] ?? 0) - reusedVcpu),
+    };
+    counters.runningByRegion = {
+        ...counters.runningByRegion,
+        [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
+    };
+}
+
+/**
+ * Round 3 switch preflight: would admission lease this RUNNING computer again on
+ * `instanceType` once it is stopped? Read-only and unlocked (`peekAdmissionCounters`), the
+ * same counters and `decideAdmission` rules as `runAdmission`, with the computer's own slot
+ * released. Not a reservation: the wake re-decides under the admission lock.
+ */
+export async function admissionDryRun(
+    db: PlacementExecutor,
+    input: { userId: string; placement: Placement; instanceType: string; env?: Env; now?: Date },
+): Promise<AdmissionDecision> {
+    const config = readAwsAdmissionConfig(input.env ?? process.env);
+    if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
+    const now = input.now ?? new Date();
+    const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.placement.computerId, monthStart: utcMonthStart(now), now });
+    if (input.placement.provider === 'aws-ec2' && RUNNING_CLASS_STATES.includes(input.placement.state)) releaseOwnSlot(counters, input.placement);
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'lease', region: input.placement.region }, instanceType: input.instanceType });
 }
 
 export async function runAdmission(db: PlacementDb, request: AdmissionRequest, deps: AdmissionDeps = {}): Promise<AdmissionOutcome> {
@@ -195,7 +245,9 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
     const now = (deps.now ?? (() => new Date()))();
 
     // An unknown tier refuses before any statement: never a default size.
-    if (request.kind === 'create' && !isAwsTier(request.tier)) {
+    const requestedTier = request.kind === 'create' ? request.tier : request.resizeTo;
+    if ((request.kind === 'create' || requestedTier !== undefined) &&
+        (!isAwsTier(requestedTier) || (request.kind === 'lease' && requestedTier === 'free'))) {
         return { admitted: false, reason: 'aws_tier_invalid', reasons: ['aws_tier_invalid'] };
     }
 
@@ -209,20 +261,24 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         // The lease's region is the placement's own, read inside this transaction
         // after the lock: never caller-supplied.
         const placement = request.kind === 'lease' ? (await readPlacement(tx, request.computerId)).record : null;
+        if (request.kind === 'lease' && placement &&
+            (placement.generation !== request.expected.generation || placement.leaseEpoch !== request.expected.leaseEpoch)) {
+            return { admitted: false, reason: 'cas_conflict' };
+        }
+        const replace = request.kind === 'lease' && (request.replace || request.resizeTo !== undefined);
         const region: RegionPlan =
             request.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: placement?.region ?? null };
-        // Replacing this failed boot reuses its running slot. Keep every other cap
-        // and ownership check; the lease CAS rechecks the failure and exact boot.
-        if (request.kind === 'lease' && request.replace && placement?.provider === 'aws-ec2' &&
-            placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED && placement.region &&
+        // A resize or enrollment recovery replaces its own running slot. Count the
+        // new type below, without charging both old and new vCPU against capacity.
+        if (request.kind === 'lease' && replace && placement?.provider === 'aws-ec2' &&
+            ((placement.state === 'UNCONFIRMED' && placement.lastError === ENROLLMENT_FAILED) ||
+                (placement.state === 'RUNNING' && request.resizeTo !== undefined)) && placement.region &&
             placement.generation === request.expected.generation && placement.leaseEpoch === request.expected.leaseEpoch) {
-            counters.runningCount = Math.max(0, counters.runningCount - 1);
-            counters.runningByRegion = {
-                ...counters.runningByRegion,
-                [placement.region]: Math.max(0, (counters.runningByRegion[placement.region] ?? 0) - 1),
-            };
+            releaseOwnSlot(counters, placement);
         }
-        const decision = decideAdmission({ config, counters, userId: request.userId, now, region });
+        const instanceType = request.kind === 'create' ? instanceTypeForTier(request.tier)
+            : request.resizeTo !== undefined ? instanceTypeForTier(request.resizeTo) : placement?.instanceType;
+        const decision = decideAdmission({ config, counters, userId: request.userId, now, region, instanceType });
         if (!decision.admit) return { admitted: false, reason: decision.reason, reasons: decision.reasons };
 
         // The only place a ticket is minted: after the decision admitted this exact request.
@@ -234,7 +290,8 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
                       ownerUserId: request.userId,
                       expected: request.expected,
                       leaseUntil: request.leaseUntil,
-                      replace: request.replace,
+                      replace,
+                      resizeInstanceType: request.resizeTo !== undefined ? instanceType! : undefined,
                       fields: request.fields,
                   })
                 : await createAwsPlacement(tx, lock, ticket, {

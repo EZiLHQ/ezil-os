@@ -1,0 +1,29 @@
+-- Staging only; requires 0002_ready_pool.sql.txt. Additive and repeatable.
+-- Keep the original id/generation as the P8 poolHostId/poolGeneration.
+-- State remains text: guarded writers use booting/ready/leased/retiring/retired/failed.
+-- Legacy draining rows remain drainable by their existing owner; never recycle them.
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS ready_at timestamptz NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS enrolled_at timestamptz NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS pool_priority integer NOT NULL DEFAULT 1;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS claim_generation bigint NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS claim_lease_epoch bigint NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS claim_fence text NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ADD COLUMN IF NOT EXISTS claim_volume_serial text NULL;
+-- A provision reservation precedes RunInstances; no placeholder instance identity.
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN instance_id DROP NOT NULL;
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN generation SET DEFAULT 1;
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN state SET DEFAULT 'booting';
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN health SET DEFAULT 'unknown';
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE public.ezil_compute_pool_hosts ALTER COLUMN updated_at SET DEFAULT now();
+CREATE INDEX IF NOT EXISTS ezil_pool_v2_lease_idx
+    ON public.ezil_compute_pool_hosts (region, zone_id, instance_type, pool_priority DESC, ready_at ASC, id)
+    WHERE state = 'ready';
+CREATE INDEX IF NOT EXISTS ezil_pool_v2_demand_idx
+    ON public.ezil_compute_pool_hosts (region, zone_id, instance_type, state, created_at);
+CREATE INDEX IF NOT EXISTS ezil_pool_v2_boot_time_idx
+    ON public.ezil_compute_pool_hosts (region, zone_id, instance_type, ready_at)
+    WHERE ready_at IS NOT NULL;
+-- No client policy or grant. Existing owner/service bypass-RLS access is unchanged.
+REVOKE ALL ON TABLE public.ezil_compute_pool_hosts FROM public, anon, authenticated;
+ALTER TABLE public.ezil_compute_pool_hosts ENABLE ROW LEVEL SECURITY;

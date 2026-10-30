@@ -1,0 +1,61 @@
+ALTER TABLE public.ezil_computer_placements ADD COLUMN lower_image_digest text NULL;
+ALTER TABLE public.ezil_computer_placements ADD COLUMN lower_digest_observed_at timestamptz NULL;
+ALTER TABLE public.ezil_computer_placements ADD COLUMN image_upgrade_job_id uuid NULL;
+CREATE TABLE public.ezil_computer_image_jobs (
+  job_id uuid NOT NULL,
+  computer_id uuid NOT NULL,
+  owner_user_id uuid NOT NULL,
+  parent_job_id uuid NULL,
+  region text NOT NULL,
+  zone_id text NOT NULL,
+  source_instance_id text NOT NULL,
+  source_volume_id text NOT NULL,
+  fs_uuid uuid NOT NULL,
+  source_generation bigint NOT NULL,
+  source_lease_epoch bigint NOT NULL,
+  source_fence_token uuid NOT NULL,
+  from_digest text NOT NULL,
+  to_digest text NOT NULL,
+  source_release jsonb NOT NULL,
+  target_release jsonb NOT NULL,
+  phase text NOT NULL,
+  preparation_document text NOT NULL,
+  preparation_digest text NOT NULL,
+  preparation_execution_arn text NULL,
+  snapshot_id text NULL,
+  snapshot_evidence jsonb NULL,
+  launch_job_id uuid NULL,
+  launch_document text NULL,
+  launch_digest text NULL,
+  launch_execution_arn text NULL,
+  target_generation bigint NULL,
+  target_lease_epoch bigint NULL,
+  target_fence_token uuid NULL,
+  recovery_job_id uuid NULL,
+  recovery_document text NULL,
+  recovery_digest text NULL,
+  recovery_execution_arn text NULL,
+  restored_volume_id text NULL,
+  quarantined_volume_id text NULL,
+  rebind_job_id uuid NULL,
+  rebind_document text NULL,
+  rebind_digest text NULL,
+  rebind_execution_arn text NULL,
+  rebind_generation bigint NULL,
+  rebind_lease_epoch bigint NULL,
+  rebind_fence_token uuid NULL,
+  host_evidence jsonb NULL,
+  failure_code text NULL,
+  retention_hold boolean NOT NULL,
+  retain_until timestamptz NULL,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  reconciled_at timestamptz NULL,
+  completed_at timestamptz NULL
+);
+CREATE INDEX ezil_computer_image_jobs_job_idx ON public.ezil_computer_image_jobs (job_id);
+CREATE INDEX ezil_computer_image_jobs_computer_idx ON public.ezil_computer_image_jobs (computer_id);
+CREATE INDEX ezil_computer_image_jobs_phase_idx ON public.ezil_computer_image_jobs (phase, reconciled_at);
+CREATE INDEX ezil_computer_image_jobs_snapshot_idx ON public.ezil_computer_image_jobs (snapshot_id);
+REVOKE ALL ON TABLE public.ezil_computer_image_jobs FROM public, anon, authenticated;
+ALTER TABLE public.ezil_computer_image_jobs ENABLE ROW LEVEL SECURITY;

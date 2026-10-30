@@ -234,16 +234,26 @@ export interface BootNotConfiguredState {
  * request cannot fail this way. See `applyDisplayEvidence`.
  */
 export type BootFailureReason =
+    | 'operations_paused'
+    | 'capacity_unavailable'
+    | 'user_hours_cap'
+    | 'global_hours_cap'
     | 'worker_unreachable'
     | 'sandbox_crashed'
     | 'desktop_unreachable'
     | 'display_not_streaming'
     | 'timeout'
+    | 'payment_issue'
+    | 'plan_required'
+    | 'fair_use_paused'
+    | 'files_on_aws'
     | 'unknown';
 
 export interface BootFailureState {
     kind: 'failed';
     reason: BootFailureReason;
+    /** Round 4: the raw server code (e.g. `billing_files_on_aws`) for the feedback prefill; absent when nothing failed with a code. */
+    errorCode?: string;
 }
 
 /**
@@ -286,13 +296,21 @@ export type BootUiState =
 export type DisplayEvidence = 'live' | 'blank' | 'unknown';
 
 /**
- * The error codes `requestGuacamolePreview` can genuinely produce, plus
- * `timeout`. Kept in lockstep with `GuacamolePreviewErrorCode` — including
+ * AWS admission refusals and the codes `requestGuacamolePreview` can produce,
+ * plus `timeout`. The Worker subset mirrors `GuacamolePreviewErrorCode`, including
  * the four DETERMINISTIC codes, which have no honest specific copy of their
  * own (see `classifyFailure`) but must still be representable, or this union
  * silently stops mirroring the thing it claims to mirror.
  */
 export type BootErrorCode =
+    | 'kill_switch'
+    | 'aws_disabled'
+    | 'capacity_unavailable'
+    | 'capacity_attempt_expired'
+    | 'region_capacity'
+    | 'max_running'
+    | 'user_hours_cap'
+    | 'global_hours_cap'
     | 'bad_request'
     | 'unauthorized'
     | 'preconditions_unmet'
@@ -305,7 +323,26 @@ export type BootErrorCode =
     | 'worker_http_error'
     | 'desktop_unreachable'
     | 'timeout'
+    | BillingBootErrorCode
     | 'unknown';
+
+/**
+ * Round 4: the billing gate's refusals, returned as values (`billing_<reason>`) by the
+ * preview routers. Every one is deterministic except `billing_unavailable`.
+ */
+export type BillingBootErrorCode =
+    | 'billing_payment_issue'
+    | 'billing_no_plan'
+    | 'billing_size_not_allowed'
+    | 'billing_fair_use_paused'
+    | 'billing_files_on_aws'
+    | 'billing_concurrent_limit'
+    | 'billing_upgrade_pending'
+    | 'billing_allowance_exhausted'
+    | 'billing_overage_cap_reached'
+    | 'billing_user_hours_cap'
+    | 'billing_aws_monthly_cap'
+    | 'billing_unavailable';
 
 /**
  * The deterministic family, restated for the browser. Byte-for-byte the same
@@ -327,6 +364,20 @@ const DETERMINISTIC_BOOT_ERROR_CODES: readonly string[] = [
     'sandbox_runtime_blocked',
 ];
 
+// AWS admission refusals need an operations, capacity or monthly-limit change.
+// Keep these separate from the Worker's deterministic preview codes above.
+const AWS_REFUSAL_ERROR_CODES: readonly string[] = [
+    'kill_switch',
+    'aws_disabled',
+    'capacity_unavailable',
+    // RETRY-118: never automatic; only an explicit user Retry resets the expired attempt.
+    'capacity_attempt_expired',
+    'region_capacity',
+    'max_running',
+    'user_hours_cap',
+    'global_hours_cap',
+];
+
 /**
  * True when re-sending the identical request could plausibly change the answer.
  *
@@ -335,7 +386,10 @@ const DETERMINISTIC_BOOT_ERROR_CODES: readonly string[] = [
  */
 export function isRetryableBootErrorCode(code: string | undefined): boolean {
     if (!code) return true;
-    return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code);
+    // Round 4: a billing refusal answers the same until the plan or payment changes. Only
+    // `billing_unavailable` (the billing state could not be read) may answer differently.
+    if (typeof code === 'string' && code.startsWith('billing_')) return code === 'billing_unavailable';
+    return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code) && !AWS_REFUSAL_ERROR_CODES.includes(code);
 }
 
 export interface ComputeBootUiStateInput {
@@ -386,6 +440,17 @@ export interface ComputeBootUiStateInput {
 /** Map a genuine error code to the plain-language failure taxonomy this UI renders. */
 function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReason {
     switch (errorCode) {
+        case 'kill_switch':
+        case 'aws_disabled':
+            return 'operations_paused';
+        case 'capacity_unavailable':
+        case 'capacity_attempt_expired':
+        case 'region_capacity':
+        case 'max_running':
+            return 'capacity_unavailable';
+        case 'user_hours_cap':
+        case 'global_hours_cap':
+            return errorCode;
         case 'connection_refused':
         case 'fetch_failed':
             return 'worker_unreachable';
@@ -394,6 +459,22 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
             return 'sandbox_crashed';
         case 'desktop_unreachable':
             return 'desktop_unreachable';
+        // Round 4: billing gate refusals. Each has its own copy; `billing_unavailable`
+        // takes the generic copy and stays retryable.
+        case 'billing_payment_issue':
+            return 'payment_issue';
+        case 'billing_no_plan':
+        case 'billing_size_not_allowed':
+            return 'plan_required';
+        case 'billing_fair_use_paused':
+        case 'billing_allowance_exhausted':
+        case 'billing_overage_cap_reached':
+            return 'fair_use_paused';
+        case 'billing_files_on_aws':
+            return 'files_on_aws';
+        case 'billing_user_hours_cap':
+        case 'billing_aws_monthly_cap':
+            return 'user_hours_cap';
         // `sandbox_starting` is the server saying "still waking, ask again" —
         // it is normally consumed as PROGRESS by the caller's wake loop and
         // never reaches here at all. It only lands in this switch when that
@@ -493,7 +574,10 @@ export function computeBootUiState(input: ComputeBootUiStateInput): BootUiState 
         };
     }
     if (input.requestStatus === 'error') {
-        return { kind: 'failed', reason: classifyFailure(input.errorCode) };
+        // The raw code travels with the classified reason, so "Send feedback" names what the server said.
+        return typeof input.errorCode === 'string' && input.errorCode
+            ? { kind: 'failed', reason: classifyFailure(input.errorCode), errorCode: input.errorCode }
+            : { kind: 'failed', reason: classifyFailure(input.errorCode) };
     }
 
     // pending
@@ -588,7 +672,9 @@ export function classifyPreviewFetchError(err: unknown): 'timeout' | undefined {
 // `BOOT_PHASES` doc comment above for why. Kept in lockstep with
 // `boot-phases.shell.js` by the drift guard in `boot-phases.shell.test.ts`.
 export const BOOT_PROGRESS_HEADLINE = 'Opening your workspace';
-export const BOOT_PROGRESS_SUBTEXT = 'This usually takes about 20 seconds.';
+// Round 3 (plan §6.5): no time promise. The old "about 20 seconds" was a Cloudflare
+// timing shown on AWS boots that take minutes.
+export const BOOT_PROGRESS_SUBTEXT = 'Your apps open as soon as your computer is ready.';
 export const BOOT_PROGRESS_LONG_SUBTEXT =
     'Still working — first boots and larger workspaces can take a bit longer.';
 
@@ -598,6 +684,22 @@ export interface BootFailureCopy {
 }
 
 export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
+    operations_paused: {
+        title: 'Your AWS computer is paused by operations',
+        body: 'Your files are kept. Only operations can resume this computer. Try again only checks whether the pause has been lifted.',
+    },
+    capacity_unavailable: {
+        title: 'No capacity in India right now',
+        body: 'Your files are kept. This computer can start when capacity in India is available. Try again checks availability.',
+    },
+    user_hours_cap: {
+        title: "This month's computer hours are used up",
+        body: 'Your files are kept. Your monthly computer hours renew next month. Try again only checks whether the limit has changed.',
+    },
+    global_hours_cap: {
+        title: "This month's computer hours are used up",
+        body: "The service has reached its monthly computer hours limit. Your files are kept. Try again only checks whether the limit has changed.",
+    },
     worker_unreachable: {
         title: "Can't reach your computer",
         body: "The service that runs your computer isn't responding right now. This is usually temporary — try again in a moment.",
@@ -627,6 +729,23 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
     timeout: {
         title: 'This is taking too long',
         body: "Starting your computer is taking longer than it should. It may still come up in the background — try again.",
+    },
+    // Round 4 (D16-D18): billing refusals. Never retried automatically.
+    payment_issue: {
+        title: "Your payment didn't go through",
+        body: 'Update your payment method in Settings → Billing to keep using your computer.',
+    },
+    plan_required: {
+        title: 'This configuration needs a paid plan.',
+        body: 'Your files are kept. Choose a plan in Settings → Billing.',
+    },
+    fair_use_paused: {
+        title: 'Computer time is paused',
+        body: "You've reached fair use for now. Your files are kept. Settings → Billing shows when it resets.",
+    },
+    files_on_aws: {
+        title: 'Your files are on a bigger AWS (India) computer.',
+        body: "That size can't open on the Free plan. Your files are kept. Upgrade to open it again.",
     },
     unknown: {
         title: 'Something went wrong',

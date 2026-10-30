@@ -16,14 +16,14 @@
 .ezil-store-sidebar nav { display: grid; gap: 6px; }
 .ezil-store-sidebar nav button { display: flex; align-items: center; gap: 10px; padding: 11px 12px; border: 0; border-radius: 7px; color: #b3bcba; background: transparent; text-align: left; white-space: nowrap; }
 .ezil-store-sidebar nav button:hover { background: #ffffff08; }
-.ezil-store-sidebar nav button[aria-pressed="true"] { background: #00adb51a; color: #8be1df; }
+.ezil-store-sidebar nav button[aria-pressed="true"] { background: rgba(var(--ezil-accent-rgb, 0, 173, 181), 0.1); color: var(--ezil-accent, #8be1df); }
 .ezil-store-nav-count { margin-left: auto; font-size: 11px; color: #a1aaa8; }
 .ezil-store-sidebar-note { margin: auto 6px 0; padding-top: 24px; color: #b3bcba; font-size: 11px; line-height: 1.8; }
 .ezil-store-sidebar-note span { color: #858f8d; }
 .ezil-store-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .ezil-store-toolbar { display: flex; align-items: center; gap: 24px; min-height: 66px; padding: 14px 28px; border-bottom: 1px solid #ffffff0d; }
 .ezil-store-search { display: flex; align-items: center; gap: 9px; width: 310px; max-width: 100%; min-width: 0; padding: 0 10px; border: 1px solid #ffffff16; border-radius: 7px; color: #9aa5a2; background: #1f2221; }
-.ezil-store-search:focus-within { border-color: #63c9c6; box-shadow: 0 0 0 2px #00adb518; }
+.ezil-store-search:focus-within { border-color: var(--ezil-accent, #63c9c6); box-shadow: 0 0 0 2px rgba(var(--ezil-accent-rgb, 0, 173, 181), 0.09); }
 .ezil-store-search input { width: 100%; min-width: 0; height: 34px; padding: 0; border: 0; outline: 0; background: transparent; color: var(--color-offwhite); box-shadow: none; }
 .ezil-store-search input::placeholder { color: #929d99; }
 .ezil-store-search input::-webkit-search-cancel-button { display: none; }

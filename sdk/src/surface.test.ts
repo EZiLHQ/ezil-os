@@ -57,6 +57,9 @@ const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.reportActivity': 'the shell\'s presence heartbeat against the idle reaper',
     'cloudflareGuacamole.relayState': 'runtime-scoped relay metadata for the hosted shell viewer',
     'cloudflareGuacamole.refreshRelay': 'renews the hosted shell viewer\'s active TURN session',
+    'cloudflareGuacamole.resetCapacityAttempt': 'the shell\'s explicit Retry of its own expired capacity attempt (RETRY-118); never an SDK action',
+    'computer.switchConfiguration': 'round-3 one-computer configuration switch driven from Settings (docs/aws-computers/SWITCH-CONTRACT.md); an SDK action only once the contract is frozen',
+    'computer.restartComputer': 'round-3 whole-computer restart from Troubleshoot; same contract, same deferral',
 };
 
 describe('SDK surface vs. the real routers', () => {

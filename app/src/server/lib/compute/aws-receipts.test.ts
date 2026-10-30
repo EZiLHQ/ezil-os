@@ -5,7 +5,14 @@
  * RUNNING → stop → STOPPED (tunnel fenced) → wake by replace → enroll → RUNNING.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { billingComputeMeter, type ComputeMeter } from '@/server/billing/v2/compute-meter';
+import { readBillingConfig } from '@/server/billing/config';
+import type { BillingStore } from '@/server/billing/ports';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
+afterEach(() => vi.restoreAllMocks());
 
 import { createAwsEc2Provider, type LifecycleStarter } from './aws-ec2';
 import { handleAwsEnrollment, nonceHashOf, type Ec2EnrollmentView, type TunnelClient } from './aws-enroll';
@@ -15,12 +22,15 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
 import {
     applyLifecycleReceipt, FLEET_RECONCILE_LIMIT, reconcileGuestStop, startRetireAsReconciler, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileAwsFleet, reconcileDeletedAwsComputers, recoverDeletedAwsPlacement,
-    runAwsBackgroundReconcile, type GuestStopDeps, type LifecycleExecutionReader,
+    runAwsBackgroundReconcile, runAwsStopSettlement, sessionLimitFor, enforceSessionLimits, type GuestStopDeps, type LifecycleExecutionReader,
 } from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import {
-    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
+    consumeEnrollmentNonce, finishEnrollment, ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, claimAwsPlacementsPendingRetire, INSTANCE_LOST, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
 } from './placement';
+import { monthUsageFromRows } from './usage';
+import { requestAwsPreview } from './aws-preview';
+import { awsPreviewAnswer, awsStatusAnswer } from '@/server/api/routers/compute-dispatch';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -56,7 +66,7 @@ const env = (over: Record<string, string> = {}) => ({
     ...over,
 });
 
-type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null };
+type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null };
 
 function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string; instanceLost?: true } = {}) {
     return JSON.stringify({
@@ -74,7 +84,7 @@ const row = (over: Record<string, unknown> = {}) =>
         lease_until: new Date(NOW.getTime() + 3_600_000), ...over,
     });
 
-function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[] } = {}) {
+function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[]; meter?: ComputeMeter } = {}) {
     // The database clock is the scenario clock: usage rows are dated by it.
     const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }], usage: opts.usage }, { clock: () => NOW });
     const read: string[] = [];
@@ -100,7 +110,7 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     const provider = createAwsEc2Provider({
         db: fake.db, env: () => env(), now: () => NOW, newId: () => crypto.randomUUID(), starter, tierFor: async () => 'free',
-        randomBytes: () => Buffer.from(NONCE_BYTES), executions, ...(opts.noTunnels ? {} : { tunnels }),
+        randomBytes: () => Buffer.from(NONCE_BYTES), executions, meter: opts.meter, ...(opts.noTunnels ? {} : { tunnels }),
     });
     const status = () => provider.status(ctx, { userId: U1, computerId: C1 });
     const enroll = () => {
@@ -125,6 +135,306 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     return { ...fake, provider, status, enroll, read, deleted, created, starts, tunnels, executions };
 }
+
+describe('minute stop settlement', () => {
+    const pending = (over: Record<string, unknown> = {}) => row({ state: 'STOPPING', instance_id: I_NEW,
+        enroll_nonce_hash: null, enroll_expires_at: null, last_error: 'lease_expired', ...over });
+    const stoppedAt = new Date(NOW.getTime() - 42_000);
+    const success = { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }), stopDate: stoppedAt };
+    const usage = () => [{ computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium',
+        started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW }];
+    const run = (s: ReturnType<typeof setup>) => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels });
+
+    it('settles a SUCCEEDED stop, fences the tunnel, clears the job, closes usage and meters the execution stop time exactly once', async () => {
+        const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn() };
+        const s = setup([pending()], success, { usage: usage() });
+        const pass = () => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels, meter });
+        expect(await pass()).toEqual({ ok: true, checked: 1, settled: 1 });
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, lifecycle_digest: null,
+            last_error: null, volume_id: VOL, generation: 2, lease_epoch: 3 });
+        expect(s.deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1,
+            sandboxId: expect.any(String), generation: 2, leaseEpoch: 3 } }]);
+        expect(s.usage[0]).toMatchObject({ stopped_at: NOW, observed_by: 'lifecycle-receipt' });
+        expect(meter.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason: 'provider_stop' });
+        expect(await pass()).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.read).toHaveLength(1);
+        expect(s.deleted).toHaveLength(1);
+        expect(meter.stopped).toHaveBeenCalledTimes(1);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('settles a successful retire through the same fence and receipt path', async () => {
+        const s = setup([pending({ state: 'RETIRING' })], { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) });
+        expect(await run(s)).toEqual({ ok: true, checked: 1, settled: 1 });
+        expect(s.placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null, lifecycle_digest: null, volume_id: VOL });
+        expect(s.deleted).toHaveLength(1);
+    });
+
+    it.each(['RUNNING', 'PENDING_REDRIVE', 'throw'])('leaves an execution with status/error %s pending', async status => {
+        const s = setup([pending()], status === 'throw' ? 'throw' : { status }, { usage: usage() });
+        const before = { ...s.placements[0] };
+        expect(await run(s)).toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.placements[0]).toEqual({ ...before, reconciled_at: NOW });
+        expect(s.deleted).toEqual([]);
+        expect(s.usage[0]!.stopped_at).toBeNull();
+    });
+
+    it('does not undo or restart an absent execution after the unknown-start window', async () => {
+        const s = setup([pending({ last_error: 'lifecycle_start_unknown:RUNNING', updated_at: new Date(NOW.getTime() - 600_000) })]);
+        const before = { ...s.placements[0] };
+        s.executions.describe = vi.fn().mockRejectedValue(Object.assign(new Error('missing'), {
+            name: 'ExecutionDoesNotExist', $metadata: { httpStatusCode: 400 },
+        }));
+        expect(await runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels, clock: () => NOW }))
+            .toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.placements[0]).toEqual({ ...before, reconciled_at: NOW });
+        expect(s.deleted).toEqual([]);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('retries a failed tunnel fence before closing usage or clearing the stop job', async () => {
+        const s = setup([pending()], success, { usage: usage() });
+        const fence = vi.spyOn(s.tunnels, 'deleteTunnel').mockResolvedValueOnce({ ok: false });
+        expect(await run(s)).toMatchObject({ checked: 1, settled: 0 });
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST });
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(await run(s)).toMatchObject({ settled: 1 });
+        expect(fence).toHaveBeenCalledTimes(2);
+        expect(s.usage[0]!.stopped_at).toEqual(NOW);
+    });
+
+    it.each(['FAILED', 'TIMED_OUT', 'ABORTED'])('uses existing failure settlement for a terminal %s execution', async status => {
+        const s = setup([pending()], { status });
+        expect(await run(s)).toMatchObject({ checked: 1, settled: 0 });
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: `failed:${status}` });
+        expect(s.deleted).toEqual([]);
+    });
+
+    it('filters other placement states before describing or enforcing expired leases/caps', async () => {
+        const s = setup(['RUNNING', 'STARTING', 'UNCONFIRMED'].map((state, i) => pending({ state,
+            computer_id: `c0c0c0c0-c0c0-4c0c-8c0c-${String(i).padStart(12, '0')}`, lease_until: new Date(0) })));
+        expect(await run(s)).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.read).toEqual([]);
+        expect(s.statements.some(s => s.sql.includes('usage-month'))).toBe(false);
+        expect(s.starts).toEqual([]);
+    });
+
+    it('bounds each pass to 20 claims and reaches a stop behind unresolved jobs on the next pass', async () => {
+        const rows = Array.from({ length: 25 }, (_, i) => pending({
+            computer_id: `c0c0c0c0-c0c0-4c0c-8c0c-${String(i).padStart(12, '0')}`,
+            lifecycle_job_id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}`,
+        }));
+        rows.push(pending());
+        const s = setup(rows, arn => arn.endsWith(JOB) ? success : { status: 'RUNNING' });
+        expect(await run(s)).toEqual({ ok: true, checked: 20, settled: 0 });
+        expect(s.read).toHaveLength(20);
+        expect(s.placements.filter(p => p.reconciled_at !== null)).toHaveLength(20);
+        expect(await run(s)).toEqual({ ok: true, checked: 20, settled: 1 });
+        expect(s.placements.at(-1)).toMatchObject({ state: 'STOPPED' });
+    });
+
+    it('skips without touching the database when AWS is disabled, configuration is invalid, or the reader is absent', async () => {
+        const s = setup([pending()]);
+        for (const [environment, executions, skipped] of [
+            [env({ EZIL_AWS_COMPUTERS_ENABLED: '0' }), s.executions, 'aws_disabled'],
+            [env({ AWS_REGIONS: '' }), s.executions, 'aws_config_invalid'],
+            [env({ [LIFECYCLE_DEPLOYMENTS_ENV]: '{}' }), s.executions, 'aws_config_invalid'],
+            [env(), undefined, 'aws_executions_unconfigured'],
+        ] as const) {
+            expect(await runAwsStopSettlement(environment, { db: s.db, executions })).toEqual({ ok: true, skipped });
+        }
+        expect(s.statements).toEqual([]);
+    });
+
+    it('honors cancellation before claiming and between rows', async () => {
+        const s = setup([pending(), pending({ computer_id: U2 })]);
+        const controller = new AbortController();
+        const pass = () => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, signal: controller.signal });
+        s.executions.describe = vi.fn(async () => { controller.abort(); return { status: 'RUNNING' }; });
+        expect(await pass()).toEqual({ ok: true, checked: 1, settled: 0 });
+        expect(s.executions.describe).toHaveBeenCalledTimes(1);
+        const statementCount = s.statements.length;
+        expect(await pass()).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(s.statements).toHaveLength(statementCount);
+    });
+});
+
+describe('billing v2 observations', () => {
+    const meter = () => ({ ready: vi.fn(async () => {}), stopped: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) });
+    const enrolled = { enroll_nonce_hash: null, last_error: ENROLLMENT_SUCCEEDED, instance_id: I_NEW };
+    const stoppedAt = new Date(NOW.getTime() - 42_321);
+    const readyInput = { userId: U1, computerId: C1, size: 'cmp-8', readyAt: NOW, overheadSeconds: 12 };
+
+    it.each(['m7g.large', '', null, 'toString', '__proto__', 'constructor'])
+    ('unknown instance type %j completes readiness without opening an epoch', async instanceType => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const m = meter();
+        const s = setup([row({ state: 'STARTING', ...enrolled, instance_type: instanceType })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        await s.status();
+        expect(s.placements[0]).toMatchObject({ state: 'RUNNING', lifecycle_job_id: null });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(m.stopped).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledExactlyOnceWith('[billing.meter] unknown instance type, epoch not opened', { computerId: C1 });
+    });
+
+    it('unknown instance type also skips metering when enrollment completes after the receipt', async () => {
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const m = meter();
+        const s = setup([row({ state: 'MOUNTING', ...enrolled, instance_type: 'm7g.large', lifecycle_job_id: null, lifecycle_digest: null })],
+            { status: 'RUNNING' }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(error).toHaveBeenCalledExactlyOnceWith('[billing.meter] unknown instance type, epoch not opened', { computerId: C1 });
+    });
+
+    it('provision waits for enrollment, then meters the actual cmp-8 instance once, after commit', async () => {
+        const m = meter();
+        const s = setup([row({ state: 'PROVISIONING', instance_type: 'm6i.2xlarge', volume_id: null })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        let inTransaction = false;
+        const transaction = s.db.transaction.bind(s.db);
+        s.db.transaction = async fn => {
+            inTransaction = true;
+            try { return await transaction(fn); } finally { inTransaction = false; }
+        };
+        const observations: { inTransaction: boolean; state: unknown }[] = [];
+        m.ready.mockImplementation(async () => {
+            observations.push({ inTransaction, state: s.placements[0]!.state });
+        });
+        await s.status();
+        expect(m.ready).not.toHaveBeenCalled();
+        const beforeEnroll = (await readPlacement(s.db, C1)).record!;
+        const consumed = await consumeEnrollmentNonce(s.db, { computerId: C1, expected: beforeEnroll,
+            nonceHash: nonceHashOf(NONCE), fields: { instanceId: I_NEW, volumeId: VOL } });
+        expect(consumed.ok).toBe(true);
+        if (!consumed.ok) throw new Error('consume failed');
+        expect((await finishEnrollment(s.db, { computerId: C1, expected: consumed.placement, success: true })).ok).toBe(true);
+        const stale = (await readPlacement(s.db, C1)).record!;
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        await s.status();
+        await applyLifecycleReceipt({ db: s.db, executions: s.executions, meter: m, now: () => NOW }, stale, D);
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith(readyInput);
+        expect(observations).toEqual([{ inTransaction: false, state: 'RUNNING' }]);
+    });
+
+    it('logs a concurrent AWS ready without rolling back the running receipt', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const m = { ...meter(), ready: vi.fn<ComputeMeter['ready']>().mockResolvedValue('concurrent') };
+        const s = setup([row({ state: 'STARTING', ...enrolled, instance_type: 'm6i.2xlarge' })],
+            { status: 'SUCCEEDED', output: receiptOf() }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        expect(info).toHaveBeenCalledWith('[billing.epoch] concurrent AWS ready', { userId: U1, computerId: C1 });
+        expect(m.ready).toHaveBeenCalledTimes(1);
+        expect(m.stopped).not.toHaveBeenCalled();
+    });
+
+    it.each(['STARTING', 'MOUNTING'])('%s with receipt and enrollment meters first RUNNING', async state => {
+        const m = meter();
+        const s = setup([row({ state, ...enrolled, instance_type: 'm6i.2xlarge' })],
+            { status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 12_999) }, { meter: m });
+        await s.status();
+        await s.status();
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith(readyInput);
+    });
+
+    it('enrollment replay preserves MOUNTING; the next receipt check meters once with unknown overhead zero', async () => {
+        const m = meter();
+        const s = setup([row()], { status: 'SUCCEEDED', output: receiptOf() }, { meter: m });
+        await s.status();
+        expect((await s.enroll()).status).toBe(200);
+        expect((await s.enroll()).status).toBe(200);
+        expect(s.placements[0]!.state).toBe('MOUNTING');
+        expect(m.ready).not.toHaveBeenCalled();
+        await s.status();
+        expect((await s.enroll()).status).toBe(200);
+        await s.status();
+        expect(m.ready).toHaveBeenCalledExactlyOnceWith({ ...readyInput, size: 'std-2', overheadSeconds: 0 });
+    });
+
+    it.each(['FAILED', 'TIMED_OUT', 'ABORTED'])('failed provision (%s) never opens an epoch or bills overhead', async status => {
+        const m = meter();
+        const s = setup([row({ state: 'PROVISIONING', ...enrolled })],
+            { status, startDate: new Date(NOW.getTime() - 300_000) }, { meter: m });
+        expect(await s.status()).toMatchObject({ placementState: 'UNCONFIRMED' });
+        expect(m.ready).not.toHaveBeenCalled();
+        expect(m.stopped).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['STOPPING', 'stopped', undefined, 'user_stop'],
+        ['DRAINING', 'stopped', true, 'platform_failure'],
+        ['RETIRING', 'retired', undefined, 'provider_stop'],
+    ] as const)('%s closes at execution stopDate with %s receipt', async (state, receiptState, instanceLost, reason) => {
+        const m = meter();
+        const s = setup([row({ state, instance_id: I_NEW })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: receiptState, instanceLost }), stopDate: stoppedAt }, { meter: m });
+        await s.status();
+        await s.status();
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason });
+    });
+
+    it('missing execution stopDate falls back to transition time', async () => {
+        const m = meter();
+        const s = setup([row({ state: 'STOPPING', instance_id: I_NEW })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) }, { meter: m });
+        await s.status();
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: NOW, reason: 'user_stop' });
+    });
+
+    it.each([true, false])('guest idle stop uses the EC2 observation time when available (%s)', async hasTime => {
+        const m = meter();
+        const s = setup([row({ state: 'RUNNING', ...enrolled, lifecycle_job_id: null, lifecycle_digest: null })]);
+        const p = (await readPlacement(s.db, C1)).record!;
+        const started = await reconcileGuestStop({ db: s.db, meter: m, now: () => NOW,
+            starter: { start: async () => {} }, newId: () => JOB,
+            describer: { describeForEnrollment: async () => ({ state: 'stopped', stateTransitionAt: hasTime ? stoppedAt : null } as Ec2EnrollmentView) },
+        }, p, D);
+        expect(started).toBe(true);
+        expect(s.placements[0]!.state).toBe('STOPPING');
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: hasTime ? stoppedAt : NOW, reason: 'idle_sleep' });
+    });
+
+    it.each(['lease_expired', 'user_hours_cap', 'global_hours_cap'] as const)('%s leaves closure to the receipt, using provider_stop', async limit => {
+        const m = meter();
+        const s = setup([row({ state: 'RUNNING', ...enrolled, lifecycle_job_id: null, lifecycle_digest: null,
+            ...(limit === 'lease_expired' ? { lease_until: NOW } : {}) })]);
+        const p = (await readPlacement(s.db, C1)).record!;
+        const deps = { db: s.db, meter: m, now: () => NOW, newId: () => JOB, starter: { start: async () => {} } };
+        expect(await enforceSessionLimits(deps, p, D, { now: NOW,
+            caps: { userMonthlyHours: limit === 'user_hours_cap' ? 0 : 100, globalMonthlyHours: limit === 'global_hours_cap' ? 0 : 600 },
+        })).toBe(limit);
+        expect(m.stopped).not.toHaveBeenCalled();
+        const stopping = (await readPlacement(s.db, C1)).record!;
+        await applyLifecycleReceipt({ ...deps, executions: { describe: async () => ({ status: 'SUCCEEDED', stopDate: stoppedAt,
+            output: receiptOf({ state: 'stopped', digest: stopping.lifecycleDigest! }) }) } }, stopping, D);
+        expect(m.stopped).toHaveBeenCalledExactlyOnceWith({ userId: U1, computerId: C1, endedAt: stoppedAt, reason: 'provider_stop' });
+    });
+
+    it.each(['PROVISIONING', 'STOPPING'] as const)('throwing meters cannot fail or roll back %s transitions', async state => {
+        const m = meter();
+        m.ready.mockRejectedValue(new Error('meter failed'));
+        m.stopped.mockRejectedValue(new Error('meter failed'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const s = setup([row({ state, ...enrolled })],
+            { status: 'SUCCEEDED', output: receiptOf({ state: state === 'STOPPING' ? 'stopped' : 'running' }) }, { meter: m });
+        await expect(s.status()).resolves.toMatchObject({ placementState: state === 'STOPPING' ? 'STOPPED' : 'RUNNING' });
+        expect(warn).toHaveBeenCalledWith('[billing.meter] observation failed', expect.any(Object));
+    });
+
+    it('real meter with flags off never accesses the store for AWS readiness or stops', async () => {
+        const access = vi.fn(() => { throw new Error('billing tables absent'); });
+        const m = billingComputeMeter(() => ({ config: readBillingConfig({}),
+            store: new Proxy({} as BillingStore, { get: access }), stripe: null, usage: null, now: () => NOW }));
+        for (const state of ['PROVISIONING', 'STOPPING'] as const) {
+            const s = setup([row({ state, ...enrolled })],
+                { status: 'SUCCEEDED', output: receiptOf({ state: state === 'STOPPING' ? 'stopped' : 'running' }) }, { meter: m });
+            expect(await s.status()).toMatchObject({ placementState: state === 'STOPPING' ? 'STOPPED' : 'RUNNING' });
+        }
+        expect(access).not.toHaveBeenCalled();
+    });
+});
 
 describe('the execution read', () => {
     it('reads exactly the placement job in its region (version ARN → execution under the machine)', async () => {
@@ -429,6 +739,20 @@ describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps
     });
 });
 
+describe('weighted monthly session limits', () => {
+    it.each([U1, U2])('one cmp-8 hour reaches a four-hour cap for %s', async userId => {
+        const { db } = createFakePlacementDb({ placements: [row({ state: 'RUNNING' })] });
+        const placement = (await readPlacement(db, C1)).record!;
+        const usage = monthUsageFromRows([{
+            computerId: C1, userId, instanceType: 'm6i.2xlarge',
+            startedAt: new Date(NOW.getTime() - 3_600_000), stoppedAt: null, egressBytes: null,
+        }], NOW);
+        expect(sessionLimitFor(placement, { now: NOW, caps: { userMonthlyHours: 4, globalMonthlyHours: 4 } }, usage))
+            .toBe(userId === U1 ? 'user_hours_cap' : 'global_hours_cap');
+        expect(sessionLimitFor(placement, { now: NOW, caps: { userMonthlyHours: 5, globalMonthlyHours: 5 } }, usage)).toBeNull();
+    });
+});
+
 describe('retire receipts (computer.delete)', () => {
     const retiring = (over: Record<string, unknown> = {}) => row({ state: 'RETIRING', instance_id: I_NEW, enroll_nonce_hash: null, enroll_expires_at: null, ...over });
 
@@ -495,6 +819,55 @@ describe('failed executions', () => {
 });
 
 describe('one computer, end to end (fake AWS; real admission, provider, enrollment and receipts)', () => {
+    it.each([
+        [503, 'aws_desktop_unreachable'],
+        [502, 'aws_origin_unavailable'],
+        [409, 'relay_busy'],
+    ])('cold replacement keeps Code waking through Worker %s %s, then opens the enrolled epoch', async (status, error) => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(NOW);
+        try {
+            const s: ReturnType<typeof setup> = setup([row({
+                state: 'STOPPED', generation: 8, lease_epoch: 9, instance_id: I_OLD,
+                lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null,
+            })], () => {
+                const job = s.starts[0]!;
+                return { status: 'SUCCEEDED', output: receiptOf({ jobId: job.intent.jobId, digest: job.digest,
+                    generation: job.intent.targetGeneration, leaseEpoch: job.intent.leaseEpoch, fenceToken: job.intent.fenceToken }) };
+            });
+            let originReady = false;
+            const worker = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+                const token = new Headers(init?.headers).get('x-ezil-auth')!;
+                const claims = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString());
+                // The fake Worker trusts the tunnel created by real enrollment, not an inferred generation.
+                const tunnel = s.created[0] as { computerId: string; sandboxId: string; generation: number; leaseEpoch: number };
+                expect(claims).toMatchObject({ computerId: tunnel.computerId, sandboxId: tunnel.sandboxId,
+                    generation: tunnel.generation, leaseEpoch: tunnel.leaseEpoch });
+                if (!originReady) return Response.json({ ok: false, error }, { status });
+                const url = (port: number) => `https://aws-${port}-${claims.sandboxId}-aws.ezil.org/preview-bootstrap?token=test`;
+                return Response.json({ ok: true, provider: 'aws-ec2', mode: 'neko', sandboxId: claims.sandboxId,
+                    generation: claims.generation, leaseEpoch: claims.leaseEpoch,
+                    guacamoleUrl: url(8181), appPreviewUrl: url(3002), codePreviewUrl: url(8443), expiresAt: NOW.getTime() + 60_000 });
+            });
+            const preview = () => requestAwsPreview(s.db, { userId: U1, computerId: C1 }, opts,
+                { workerUrl: 'https://worker.example.test', isConfigured: true, hasHmacSecret: true }, 'test-secret', 'corr', env());
+            const open = async () => awsPreviewAnswer(await s.provider.ensure(ctx, { userId: U1, computerId: C1 }, opts), preview);
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            expect(worker).not.toHaveBeenCalled();
+            expect(s.starts[0]!.intent).toMatchObject({ operation: 'replace', previousGeneration: 8, targetGeneration: 9, leaseEpoch: 10 });
+            expect((await s.enroll()).status).toBe(200);
+            // A lifecycle receipt makes the desktop API say "up" before its origin services answer.
+            expect(awsStatusAnswer(await s.status())).toMatchObject({ guacamoleRunning: true });
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            expect(await open()).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
+            originReady = true;
+            expect(await open()).toMatchObject({ ok: true, generation: 9, leaseEpoch: 10 });
+            expect(s.starts).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('provision → enroll → RUNNING → stop → STOPPED (fenced) → wake by replace → enroll → RUNNING', async () => {
         // The scripted provider: every execution succeeds with the receipt its intent implies.
         const instanceFor = (i: LifecycleIntent) => (i.operation === 'provision' || i.operation === 'replace' ? I_NEW : i.providerInstanceId!);
@@ -814,11 +1187,11 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         return { ...fake, deps, starts };
     }
 
-    it('the cron pass stops a RUNNING computer whose lease lapsed while EC2 still says running', async () => {
+    it('incident 2026-10-25: the background pass never stops a RUNNING computer solely because its lease lapsed while EC2 still says running', async () => {
         const f = fleet([live(1, { lease_until: new Date(NOW.getTime() - 1) }), live(2)]);
-        expect(await runAwsBackgroundReconcile(env(), f.deps)).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 1 } });
-        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
-        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired' });
+        expect(await runAwsBackgroundReconcile(env(), f.deps)).toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 0 } });
+        expect(f.starts).toEqual([]);
+        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
         expect(f.placements.find((r) => r.computer_id === Cn(2))).toMatchObject({ state: 'RUNNING' });
     });
 
@@ -840,7 +1213,7 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         const hidden = total; // the most recently changed row: last in updated_at order
         const f = fleet(Array.from({ length: total }, (_, k) => live(k + 1)), new Set([In(hidden)]));
         const first = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
-        expect(first).toEqual({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 0, limitStops: 0 });
+        expect(first).toEqual({ checked: FLEET_RECONCILE_LIMIT, stopsStarted: 0, limitStops: 0, hostRetires: 0 });
         expect(f.starts).toEqual([]);
         const second = await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null });
         // The second pass claims the 5 never-reconciled rows first (then 15 more): the hidden one is among them.
@@ -848,6 +1221,62 @@ describe('the background pass: lapsed sessions stop (Codex 4275911832) and the f
         expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(hidden)]]);
         // Every row has now been looked at once.
         expect(f.placements.every((r) => r.reconciled_at !== null)).toBe(true);
+    });
+
+    // ROOT-IDLE-POLICY-118 (b) + ROOT-FLEET-LEASE-INCIDENT-118: every fleet pass (minute, daily reap, a capacity refusal's direct
+    // reconcileAwsFleet) never stops a still-running guest solely for a lapsed technical lease; caps and guest stops still run.
+    const lapsed = (i: number) => live(i, { lease_until: new Date(NOW.getTime() - 1) });
+    const hours = (userId: string, i: number, h: number, instanceType = 't3a.medium') => ({ computer_id: Cn(i), user_id: userId, instance_id: In(i), instance_type: instanceType,
+        started_at: new Date(NOW.getTime() - h * HOUR), stopped_at: null, egress_bytes: null, observed_by: 'x', updated_at: NOW });
+
+    it('fleet pass: a running guest with a lapsed lease and no reached cap stays RUNNING (no stop, no lifecycle start)', async () => {
+        const f = fleet([lapsed(1), live(2)]);
+        expect(await runAwsBackgroundReconcile(env(), f.deps))
+            .toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 0, limitStops: 0 } });
+        expect(f.starts).toEqual([]);
+        expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
+        // A RUNNING row with no lease at all is likewise left to the default callers.
+        const g = fleet([live(3, { lease_until: null })]);
+        await runAwsBackgroundReconcile(env(), g.deps);
+        expect(g.starts).toEqual([]);
+    });
+
+    it('fleet pass: the same lapsed row still stops at the user hour cap and at the global hour cap', async () => {
+        const user = fleet([lapsed(1)]);
+        user.usage.push(hours(U1, 1, 100)); // the user's 100 h cap
+        await runAwsBackgroundReconcile(env(), user.deps);
+        expect(user.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(user.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'user_hours_cap' });
+        const global = fleet([lapsed(1)]);
+        global.usage.push(hours(U2, 9, 150, 'm6i.2xlarge')); // another user's 150 h × weight 4 reaches the 600 h global cap; U1 has none
+        await runAwsBackgroundReconcile(env(), global.deps);
+        expect(global.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(global.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'global_hours_cap' });
+    });
+
+    it('fleet pass: a guest-stopped instance is still settled through the ordinary stop', async () => {
+        const f = fleet([lapsed(1), live(2)], new Set([In(1)]));
+        expect(await runAwsBackgroundReconcile(env(), f.deps))
+            .toMatchObject({ ok: true, fleet: { checked: 2, stopsStarted: 1, limitStops: 0 } });
+        expect(f.starts.map((i) => [i.operation, i.computerId])).toEqual([['stop', Cn(1)]]);
+        expect(f.placements.find((r) => r.computer_id === Cn(2))).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('the direct fleet call (a capacity refusal) is caps-only too, whatever policy the caller passes; the owner-scoped default still binds', async () => {
+        for (const enforceLeaseExpiry of [undefined, true]) {
+            const f = fleet([lapsed(1)]);
+            await reconcileAwsFleet(f.deps, { 'ap-south-1': D }, FLEET_RECONCILE_LIMIT, { now: NOW, caps: null, enforceLeaseExpiry });
+            expect(f.starts).toEqual([]);
+            expect(f.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'RUNNING' });
+        }
+        // enforceSessionLimits itself (owner status/ensure/heartbeat) keeps the default lease rule.
+        const own = fleet([lapsed(1)]);
+        const p1 = (await readPlacement(own.db, Cn(1))).record!;
+        expect(await enforceSessionLimits(own.deps, p1, D, { now: NOW, caps: null })).toBe('lease_expired');
+        expect(own.placements.find((r) => r.computer_id === Cn(1))).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired' });
+        const p = (await readPlacement(fleet([live(4, { lease_until: null })]).db, Cn(4))).record!;
+        expect(sessionLimitFor(p, { now: NOW, caps: null }, null)).toBe('lease_expired');
+        expect(sessionLimitFor(p, { now: NOW, caps: null, enforceLeaseExpiry: false }, null)).toBeNull();
     });
 });
 
@@ -890,6 +1319,12 @@ describe('Codex 4277262199: settling a recorded job whose start got no answer', 
     it('a provision that never reached Step Functions → UNCONFIRMED, job cleared, lifecycle_start_failed', async () => {
         expect(await settle({ state: 'PROVISIONING', last_error: 'lifecycle_start_unknown:UNCONFIRMED' }))
             .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: null, lifecycle_digest: null, last_error: 'lifecycle_start_failed' });
+    });
+
+    it('a replacement with no execution keeps its job reserved and never guesses the source generation', async () => {
+        expect(await settle({ state: 'LEASED', last_error: 'lifecycle_start_unknown:UNCONFIRMED' }))
+            .toMatchObject({ state: 'UNCONFIRMED', lifecycle_job_id: JOB, lifecycle_digest: DIGEST,
+                generation: 2, lease_epoch: 3, enroll_nonce_hash: null, enroll_consumed_hash: null, enroll_expires_at: null });
     });
 
     it('a start-mode wake that never ran → back to STOPPED, where a refusal would have left it', async () => {

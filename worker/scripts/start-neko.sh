@@ -1221,6 +1221,20 @@ if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
 fi
 phase_end xvfb ok
 
+# Neko's Guacamole keyboard sends X keysyms (including Unicode/dead keys),
+# not physical scan codes. Keep a deterministic XKB baseline; do not guess an
+# X layout from navigator.language, which describes language, not keyboard.
+# Operators can select a layout/variant for physical keyboards when needed.
+setxkbmap -display "$DISPLAY" -layout "${NEKO_XKB_LAYOUT:-us}" -variant "${NEKO_XKB_VARIANT:-}" -option '' >>"$LOG" 2>&1 \
+  || log "WARNING: could not configure XKB layout"
+# The client generates repeat. X's independent repeat timer otherwise creates
+# duplicate characters while a delayed keyup is in flight. Set a conservative
+# rate for tools that re-enable it, then leave server repeat disabled.
+xset -display "$DISPLAY" r rate 500 25 >>"$LOG" 2>&1 \
+  || log "WARNING: could not set the X keyboard repeat rate"
+xset -display "$DISPLAY" r off >>"$LOG" 2>&1 \
+  || log "WARNING: could not disable X server key repeat"
+
 # ── Window manager (openbox) ──────────────────────────────────────────────────
 # Prefer the EBuilder-owned Openbox config (explicit app-switch keybindings +
 # root menu) over the pinned image's decoration-only config, so window
@@ -1976,6 +1990,7 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \
   --disable-telemetry \
+  --disable-update-check \
   --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
   --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"
@@ -3052,6 +3067,8 @@ else
   log "ICE: no TURN relay configured — relay-less/STUN-only (media gated)"
 fi
 cd /etc/neko 2>/dev/null || true
+# Clipboard: the pinned Neko client syncs it when the browser grants
+# clipboard read/write to this frame (see the Dockerfile guard); no flag here.
 NEKO_SERVER_BIND="0.0.0.0:${NEKO_HTTP_PORT}" \
 NEKO_DESKTOP_INPUT_ENABLED="false" \
   "$NEKO_BIN" serve \

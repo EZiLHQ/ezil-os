@@ -19,6 +19,7 @@ import { describe, expect, it, mock } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 // ── The workerd-only `cloudflare:workers` stub, registered HERE ─────────────
 // Several assertions below `await import('./index')`. `./index.ts` imports
@@ -254,7 +255,7 @@ describe('resolveNekoIceEnv: boot relay expiry', () => {
   const issuedAt = 1_800_000_000_000;
 
   async function bootEnv(ttlSeconds: number) {
-    const { resolveNekoIceEnv } = await import('./index');
+    const { resolveNekoIceEnv } = await import('./index-test-helpers.test');
     const realNow = Date.now;
     const realFetch = globalThis.fetch;
     Date.now = () => issuedAt;
@@ -1192,27 +1193,27 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
 // (e.g. dropping the `mounted` check, or hardcoding `/workspace`) fails these.
 describe('codePreviewFolderParams', () => {
   it('mints `folder` from the REAL workspace.mountPath when the workspace is mounted', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' })).toEqual({
       folder: '/workspace',
     });
   });
 
   it('never hardcodes /workspace — whatever resolveWorkspaceMountConfig resolved wins', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true, mountPath: '/some/other/root' })).toEqual({
       folder: '/some/other/root',
     });
   });
 
   it('omits folder when the workspace bucket was never mounted (container falls back to its own default root)', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: false, mountPath: '/workspace' })).toBeUndefined();
     expect(codePreviewFolderParams({ mounted: false })).toBeUndefined();
   });
 
   it('omits folder when mounted is true but mountPath is missing (defensive — should not happen)', async () => {
-    const { codePreviewFolderParams } = await import('./index');
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true })).toBeUndefined();
   });
 });
@@ -1386,14 +1387,13 @@ describe('source pin: every test that loads ./index registers the cloudflare:wor
     expect(testFiles.length).toBeGreaterThan(20);
     expect(testFiles).toContain('index.test.ts');
     expect(indexLoaders.length).toBeGreaterThanOrEqual(5);
-    // The five known at the time of writing; a sixth is welcome, a missing one
-    // means the matcher stopped seeing a real import.
+    // Known production-entrypoint loaders; private-helper tests use their own loader.
     for (const known of [
-      'desktop-release.test.ts',
-      'index.test.ts',
+      'acceptance-reset.test.ts',
+      'aws-hook.test.ts',
       'route-auth.test.ts',
       'workspace-flush-loop.test.ts',
-      'workspace-idle.test.ts',
+      'workspace-store-wiring.test.ts',
     ]) {
       expect(indexLoaders).toContain(known);
     }
@@ -1442,5 +1442,102 @@ describe('source pin: every test that loads ./index registers the cloudflare:wor
     const src = sources.get('app-preview-port-validation.test.ts');
     expect(src).toBeDefined();
     expect(REGISTERS_STUB.test(src!)).toBe(true);
+  });
+});
+
+// Check response construction itself: a JSON replacer cannot break CodeQL's
+// exception-to-response flow. Follow local aliases as well as direct references.
+function exceptionResponseLeaks(source: string): string[] {
+  const file = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
+  const leaks: string[] = [];
+  const walk = (node: ts.Node, visit: (node: ts.Node) => void): void => {
+    visit(node);
+    ts.forEachChild(node, (child) => walk(child, visit));
+  };
+  walk(file, (clause) => {
+    if (!ts.isCatchClause(clause) || !clause.variableDeclaration
+        || !ts.isIdentifier(clause.variableDeclaration.name)) return;
+    const tainted = new Set([clause.variableDeclaration.name.text]);
+    const containsException = (node: ts.Node): boolean => {
+      if (ts.isIdentifier(node)) return tainted.has(node.text);
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+          && node.expression.text === 'publicErrorCode') return false;
+      // Tests may select fixed codes based on the exception's type/name.
+      if (ts.isConditionalExpression(node)) {
+        return containsException(node.whenTrue) || containsException(node.whenFalse);
+      }
+      if (ts.isPropertyAccessExpression(node)) return containsException(node.expression);
+      if (ts.isPropertyAssignment(node)) {
+        return containsException(node.initializer)
+          || (ts.isComputedPropertyName(node.name) && containsException(node.name.expression));
+      }
+      return ts.forEachChild(node, (child) => containsException(child) || undefined) === true;
+    };
+    let changed: boolean;
+    do {
+      changed = false;
+      walk(clause.block, (node) => {
+        let target: ts.Node | undefined;
+        let value: ts.Node | undefined;
+        if (ts.isVariableDeclaration(node)) {
+          target = node.name;
+          value = node.initializer;
+        } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          target = node.left;
+          value = node.right;
+          while (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+            target = target.expression;
+          }
+        }
+        if (target && ts.isIdentifier(target) && value && containsException(value) && !tainted.has(target.text)) {
+          tainted.add(target.text);
+          changed = true;
+        }
+      });
+    } while (changed);
+    walk(clause.block, (node) => {
+      if (!((ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'json')
+          || (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'Response'))) return;
+      // Status selection is intentionally unchanged; the first argument is the body.
+      const body = node.arguments?.[0];
+      if (body && containsException(body)) {
+        const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1;
+        leaks.push(`line ${line}: ${node.getText(file)}`);
+      }
+    });
+  });
+  return leaks;
+}
+
+describe('caught exceptions never enter response bodies', () => {
+  it('allows only public codes or fixed response fields in index.ts catch blocks', () => {
+    expect(exceptionResponseLeaks(readWorkerSource('./index.ts'))).toEqual([]);
+  });
+
+  it.each([
+    'return json({ error: caught });',
+    'return json({ error: caught.message });',
+    'return json({ error: String(caught) });',
+    'return json({ stack: caught.stack });',
+    'return new Response(caught);',
+    'return new Response(caught.message);',
+    'return new Response(String(caught));',
+    'return new Response(caught.stack);',
+    'const message = caught.message; return json({ error: message });',
+    'let message; message = String(caught); return new Response(message);',
+    'const body = {}; body.error = caught; return json(body);',
+    'if (true) { return json({ error: caught instanceof Error ? caught.message : String(caught) }); }',
+    'return json({ error: sanitizeErrorMessage(caught) });',
+  ])('rejects exception data before serialization: %s', (body) => {
+    expect(exceptionResponseLeaks(`try {} catch (caught) { ${body} }`)).toHaveLength(1);
+  });
+
+  it('allows publicErrorCode, fixed codes and exception-based status selection', () => {
+    expect(exceptionResponseLeaks(`try {} catch (caught) {
+      const code = publicErrorCode(caught);
+      json({ ok: false, error: code }, caught instanceof Error ? 500 : 502);
+      json({ error: caught instanceof Error ? 'screen_timeout' : 'internal_error' });
+      new Response(publicErrorCode(caught));
+    }`)).toEqual([]);
   });
 });

@@ -293,7 +293,7 @@ describe('ensureWorkspaceMount: a store claim cannot be honoured by the s3fs fal
     return { calls, mountBucket: async () => { calls.mount++; }, hydrateWorkspace: async () => { calls.hydrate++; return { mounted: true }; },
       exec: async () => ({ exitCode: 0, stdout: '' }) };
   };
-  const mount = async () => (await import('./index')).ensureWorkspaceMount as unknown as
+  const mount = async () => (await import('./index-test-helpers.test')).ensureWorkspaceMount as unknown as
     (s: unknown, e: unknown, p: unknown, o?: unknown) => Promise<{ mounted: boolean; detail?: string }>;
 
   it('refuses a claimed store instead of mounting something else', async () => {

@@ -386,39 +386,39 @@ describe('workspaceFlushLoopIsAlive', () => {
   const sec = (msFromNow: number) => Math.floor((nowMs + msFromNow) / 1000);
 
   it('is false with no pending schedules at all', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [], nowMs })).toBe(false);
   });
 
   it('is true for a schedule due in the future', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(10_000) }], nowMs })).toBe(true);
   });
 
   it('is true for a schedule slightly past due — alarm delivery is not instantaneous', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-30_000) }], nowMs })).toBe(true);
   });
 
   it('is true just inside the 5-minute staleness horizon', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-5 * 60_000 + 1_000) }], nowMs })).toBe(true);
   });
 
   it('is false at and beyond the 5-minute staleness horizon', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-5 * 60_000) }], nowMs })).toBe(false);
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-60 * 60_000) }], nowMs })).toBe(false);
   });
 
   it('stays below IDLE_STOP_MS, so it can never resurrect a loop the idle path just retired', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     // A row exactly IDLE_STOP_MS old must already read as dead.
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-IDLE_STOP_MS) }], nowMs })).toBe(false);
   });
 
   it('treats a row with a non-finite time as debris, not as a live loop', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: Number.NaN }], nowMs })).toBe(false);
     expect(
       workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: 'soon' as unknown as number }], nowMs }),
@@ -434,7 +434,7 @@ describe('workspaceFlushLoopIsAlive', () => {
   });
 
   it('one live row among stale ones is enough', async () => {
-    const { workspaceFlushLoopIsAlive } = await import('./index');
+    const { workspaceFlushLoopIsAlive } = await import('./index-test-helpers.test');
     expect(
       workspaceFlushLoopIsAlive({ pendingSchedules: [{ time: sec(-3_600_000) }, { time: sec(5_000) }], nowMs }),
     ).toBe(true);

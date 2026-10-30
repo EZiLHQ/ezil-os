@@ -46,7 +46,8 @@ def tls_context(ca_file=None):
     return ctx
 
 
-def request(method, url, body=None, headers=None, timeout=10, ca_file=None, server_name=None):
+def request(method, url, body=None, headers=None, timeout=10, ca_file=None, server_name=None,
+            response_limit=1 << 20):
     u = urllib.parse.urlsplit(url)
     headers = dict(headers or {})
     if u.scheme == "http":
@@ -69,6 +70,6 @@ def request(method, url, body=None, headers=None, timeout=10, ca_file=None, serv
     try:
         conn.request(method, path, body=body, headers=headers)
         r = conn.getresponse()
-        return r.status, r.read(1 << 20)
+        return r.status, r.read(response_limit)
     finally:
         conn.close()

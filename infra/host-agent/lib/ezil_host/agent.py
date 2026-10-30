@@ -125,6 +125,9 @@ class Agent:
         with open(os.path.join(cfg.stateDir, "control.key"), "rb") as f:
             self.key = f.read()
         self.last_seq = self._load_seq()
+        self.restart_in_progress = False
+        self.restart_ids = []
+        self._load_restart_requests()
 
     # ---------------------------------------------------------------- control
     def handle(self, raw):
@@ -164,6 +167,10 @@ class Agent:
                 relay_config = desktop.validate_desktop_config(msg.get("config"), int(now * 1000))
             except ValueError:
                 return {"ok": False, "error": "ice_config_invalid"}   # never echo the config
+        elif op == "restart-desktop":
+            request_id = msg.get("requestId")
+            if not isinstance(request_id, str) or len(request_id) != 64 or any(c not in "0123456789abcdef" for c in request_id):
+                return {"ok": False, "error": "restart_unavailable"}
         elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
@@ -177,12 +184,63 @@ class Agent:
                 return self._accept_relay(relay_config)
             if op == "desktop_status":
                 return self._desktop_status(now)
+            if op == "restart-desktop":
+                return self._accept_restart(msg["requestId"], now)
             if op == "stop":
                 self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
             tunnel.fence(self.cfg, f"fence:{str(msg.get('newEpoch'))[:32]}")
             self.stop_request = {"kind": "fence", "warn": 0, "reason": "fence"}
             return {"ok": True}
+
+    def _restart_path(self):
+        return os.path.join(self.cfg.stateDir, "desktop-restart-requests.json")
+
+    def _load_restart_requests(self):
+        try:
+            with open(self._restart_path()) as f:
+                record = json.load(f)
+        except FileNotFoundError:
+            return
+        # A corrupt journal must not silently forget acknowledged requests.
+        if record.get("leaseEpoch") != self.lease["leaseEpoch"]:
+            return
+        ids = record.get("ids")
+        if not isinstance(ids, list) or len(ids) > 128 or any(
+                not isinstance(i, str) or len(i) != 64 or any(c not in "0123456789abcdef" for c in i) for i in ids):
+            raise ValueError("invalid desktop restart journal")
+        self.restart_ids = ids
+        self.restart_request = record.get("pending") is True
+
+    def _save_restart_requests(self, ids, pending):
+        from .enroll import _write_private
+        _write_private(self._restart_path(), json.dumps({
+            "leaseEpoch": self.lease["leaseEpoch"], "ids": ids, "pending": pending,
+        }).encode())
+
+    def _accept_restart(self, request_id, now):
+        """Lock held. Deduplicate retries across ticks and agent restarts within this epoch.
+        Only the desktop unit is queued; never stop the host, unmount data or kill host tmux.
+        The bounded journal refuses new IDs when full, retaining all acknowledged IDs."""
+        unavailable = {"ok": False, "error": "restart_unavailable"}
+        if self.stop_request or any(os.path.exists(self._marker(m)) for m in (desktop.STOPPING, SHUTDOWN_PENDING)):
+            return unavailable
+        if request_id in self.restart_ids:
+            return {"ok": True, "state": "restart_requested"}
+        if len(self.restart_ids) >= 128:
+            return unavailable
+        pending = self.restart_request or self.restart_in_progress
+        if not pending and (self._restarts_exhausted(now) or self._desktop_unit() not in ("active", "inactive", "failed")):
+            return unavailable
+        ids = self.restart_ids + [request_id]
+        try:
+            self._save_restart_requests(ids, True)
+        except OSError:
+            return unavailable
+        self.restart_ids = ids
+        if not self.restart_in_progress:
+            self.restart_request = True
+        return {"ok": True, "state": "restart_requested"}
 
     def _desktop_state(self):
         try:
@@ -231,7 +289,7 @@ class Agent:
                 return {"ok": False, "error": "desktop_restart_exhausted"}
             self.restart_request = True
             return {"ok": True, "state": "restart_scheduled"}
-        if desktop.read_ice_state(self.cfg) == "applied":
+        if desktop.read_ice_state(self.cfg) == "applied" and (not relay_config.get("ai") or desktop.ai_configured(self.cfg)):
             return {"ok": True, "state": "already_running"}
         self.restart_request = True
         return {"ok": True, "state": "restart_scheduled"}
@@ -241,9 +299,16 @@ class Agent:
         the desktop runs, its unit's state and whether the agent's restarts are exhausted.
         Never the config itself."""
         c = desktop.read_desktop_config(self.cfg, int(now * 1000))
-        return {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
+        result = {"ok": True, "configured": c is not None, "expiresAt": c["expiresAt"] if c else None,
+                "bootId": desktop.host_boot_id(), "aiConfigured": desktop.ai_configured(self.cfg),
                 "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg),
                 "unit": self._desktop_unit(), "restartsExhausted": self._restarts_exhausted(now)}
+        from . import pool
+        if os.path.lexists(os.path.join(self.cfg.stateDir, pool.EPOCH_FILE)):
+            result["sessionReady"] = c is not None and pool.session_ready(self.cfg, self.lease)
+            if result["desktop"] == "running" and not result["sessionReady"]:
+                result["desktop"] = "starting"
+        return result
 
     def restart_desktop(self):
         """Restart the desktop through its unit: a relay config arrived after it started
@@ -251,7 +316,7 @@ class Agent:
         stopped by its start limit can start again. ExecStop stops a running desktop the
         normal way (terminal shells hung up first); the desktop step then starts it with the
         stored config. Non-blocking; counted against desktopRestartMax."""
-        self.log("desktop restart: through its unit (relay config, or the desktop exited)")
+        self.log("desktop restart: through its unit (signed request, relay config, or desktop exit)")
         with self.lock:
             self.desktop_restarts.append(self.clock())
         for cmd in (self.cfg.get("desktopResetCmd"), self.cfg.desktopRestartCmd):
@@ -454,8 +519,18 @@ class Agent:
         with self.lock:
             req = self.stop_request
             restart, self.restart_request = self.restart_request and not req, False
+            # A persisted pending request cannot undo a committed shutdown after a crash.
+            if any(os.path.exists(self._marker(m)) for m in (desktop.STOPPING, SHUTDOWN_PENDING)):
+                restart = False
+            self.restart_in_progress = bool(restart)
         if restart:
-            self.restart_desktop()
+            try:
+                self.restart_desktop()
+            finally:
+                with self.lock:
+                    self.restart_in_progress = False
+                    if self.restart_ids:
+                        self._save_restart_requests(self.restart_ids, False)
             return "restarting"
         if req:
             self._set_marker(desktop.STOPPING)     # committed: no desktop may start again

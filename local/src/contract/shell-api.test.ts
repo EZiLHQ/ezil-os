@@ -44,9 +44,21 @@ import {
     type ShellBootPayload,
 } from '../../../app/src/server/shell/boot-payload.ts';
 
-// Relay renewal belongs to Cloudflare's hosted transport. The local host
-// serves direct loopback media and must not advertise a refresh URL it lacks.
-const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_ROUTES } = APP_ROUTES;
+// The local host has neither hosted TURN renewal, recorded cloud machine
+// metadata, nor AWS capacity attempts to reset (RETRY-118: the hosted shell's
+// explicit Retry). Feedback is hosted-only too: the app publishes it per user,
+// behind a flag, and stores reports in the hosted database
+// (docs/FEEDBACK-CONTROLS-CONTRACT.md). Exclude only these named operations;
+// any other app route must still pass the complete key and path comparisons below.
+const {
+    relayRefresh: HOSTED_RELAY_ROUTE,
+    system: HOSTED_SYSTEM_ROUTE,
+    capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
+    feedback: HOSTED_FEEDBACK_ROUTE,
+    // Configuration switching moves a hosted AWS computer between sizes; local has one fixed machine.
+    switch: HOSTED_SWITCH_ROUTE,
+    ...COMMON_ROUTES
+} = APP_ROUTES;
 
 const encoder = new TextEncoder();
 
@@ -60,8 +72,12 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(10);
+        expect(Object.keys(APP_ROUTES).length).toBe(14);
         expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
+        expect(HOSTED_SYSTEM_ROUTE).toBe('/api/shell/system');
+        expect(HOSTED_CAPACITY_RETRY_ROUTE).toBe('/api/shell/capacity-retry');
+        expect(HOSTED_FEEDBACK_ROUTE).toBe('/api/shell/feedback');
+        expect(HOSTED_SWITCH_ROUTE).toBe('/api/shell/switch');
         expect(typeof appSerialize).toBe('function');
     });
 
@@ -86,6 +102,14 @@ describe('the route table has not drifted from the app', () => {
 
     it('does not advertise the unsupported hosted relay operation', () => {
         expect('relayRefresh' in LOCAL_ROUTES).toBe(false);
+    });
+
+    it('does not advertise the unsupported hosted system operation', () => {
+        expect('system' in LOCAL_ROUTES).toBe(false);
+    });
+
+    it('does not advertise the hosted-only feedback endpoint', () => {
+        expect('feedback' in LOCAL_ROUTES).toBe(false);
     });
 
     it('every path is same-origin and relative — never an absolute URL', () => {

@@ -1,0 +1,477 @@
+{
+  "identity": {
+    "before": {
+      "Resources": {}
+    },
+    "after": {
+      "Resources": {}
+    }
+  },
+  "workflows": {
+    "before": {
+      "Resources": {
+        "LifecycleControllerRoleDefaultPolicy31C0D948": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecycleObserverCurrentVersion3A1B23A03942f65580cfbad19a9f5f58028ed5ce"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:computer": "true",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "Null": {
+                      "aws:RequestTag/ezil:pool": "false"
+                    },
+                    "StringNotEquals": {
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecycleControllerRoleDefaultPolicy31C0D948",
+            "Roles": [
+              {
+                "Ref": "LifecycleControllerRole1FB8E154"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/ControllerRole/DefaultPolicy/Resource"
+          }
+        },
+        "LifecyclePreparationRebasePreparationRole07C3BE8F": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-rebase-preparation",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/Resource"
+          }
+        },
+        "RecoveryRecoveryRole1B60FF4C": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-recovery",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/Resource"
+          }
+        }
+      }
+    },
+    "after": {
+      "Resources": {
+        "LifecycleControllerRoleDefaultPolicy31C0D948": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecycleObserverCurrentVersion3A1B23A05b9388c91adab4f602d2a4adcfc7ad23"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances",
+                    "ec2:DetachVolume"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:computer": "true",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances",
+                    "ec2:DetachVolume"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "Null": {
+                      "aws:RequestTag/ezil:pool": "false"
+                    },
+                    "StringNotEquals": {
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecycleControllerRoleDefaultPolicy31C0D948",
+            "Roles": [
+              {
+                "Ref": "LifecycleControllerRole1FB8E154"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/ControllerRole/DefaultPolicy/Resource"
+          }
+        },
+        "LifecyclePreparationRebasePreparationRole07C3BE8F": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-rebase-preparation",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/Resource"
+          }
+        },
+        "RecoveryRecoveryRole1B60FF4C": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-recovery",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/Resource"
+          }
+        }
+      }
+    }
+  },
+  "artifact": {
+    "namespace": "mum",
+    "schemaVersion": 1,
+    "stacks": {
+      "identity": {},
+      "workflows": {
+        "LifecycleControllerRoleDefaultPolicy31C0D948": {
+          "added": [
+            {
+              "Action": "lambda:invokefunction",
+              "Effect": "Allow",
+              "Resource": {
+                "Ref": "LifecycleObserverCurrentVersion3A1B23A05b9388c91adab4f602d2a4adcfc7ad23"
+              }
+            },
+            {
+              "Action": [
+                "ec2:detachvolume",
+                "ec2:startinstances",
+                "ec2:stopinstances",
+                "ec2:terminateinstances"
+              ],
+              "Condition": {
+                "Null": {
+                  "aws:ResourceTag/ezil:computer": "true",
+                  "aws:ResourceTag/ezil:computer-id": "false",
+                  "aws:ResourceTag/ezil:pool": "true"
+                },
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1",
+                  "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                  "ec2:ResourceTag/ezil:stage": "mum"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+            },
+            {
+              "Action": [
+                "ec2:detachvolume",
+                "ec2:stopinstances",
+                "ec2:terminateinstances"
+              ],
+              "Condition": {
+                "Null": {
+                  "aws:ResourceTag/ezil:computer": "false",
+                  "aws:ResourceTag/ezil:pool": "true"
+                },
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1",
+                  "aws:ResourceTag/ezil:namespace": "mum",
+                  "ec2:InstanceType": [
+                    "m6i.large",
+                    "m6i.xlarge"
+                  ],
+                  "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                  "ec2:ResourceTag/ezil:stage": "mum"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+            }
+          ],
+          "removed": [
+            {
+              "Action": "lambda:invokefunction",
+              "Effect": "Allow",
+              "Resource": {
+                "Ref": "LifecycleObserverCurrentVersion3A1B23A03942f65580cfbad19a9f5f58028ed5ce"
+              }
+            },
+            {
+              "Action": [
+                "ec2:startinstances",
+                "ec2:stopinstances",
+                "ec2:terminateinstances"
+              ],
+              "Condition": {
+                "Null": {
+                  "aws:ResourceTag/ezil:computer": "true",
+                  "aws:ResourceTag/ezil:computer-id": "false",
+                  "aws:ResourceTag/ezil:pool": "true"
+                },
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1",
+                  "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                  "ec2:ResourceTag/ezil:stage": "mum"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+            },
+            {
+              "Action": [
+                "ec2:stopinstances",
+                "ec2:terminateinstances"
+              ],
+              "Condition": {
+                "Null": {
+                  "aws:ResourceTag/ezil:computer": "false",
+                  "aws:ResourceTag/ezil:pool": "true"
+                },
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1",
+                  "aws:ResourceTag/ezil:namespace": "mum",
+                  "ec2:InstanceType": [
+                    "m6i.large",
+                    "m6i.xlarge"
+                  ],
+                  "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                  "ec2:ResourceTag/ezil:stage": "mum"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "review": {
+    "schemaVersion": 1,
+    "changes": {
+      "LifecycleControllerRoleDefaultPolicy31C0D948": {
+        "action": "Modify",
+        "properties": [
+          "PolicyDocument"
+        ],
+        "attributes": []
+      }
+    }
+  }
+}

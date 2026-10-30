@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { signIn } from './sign-in.mjs';
 
 const app = process.env.EZIL_E2E_APP ?? 'https://os.ezil.work';
 const email = process.env.EZIL_E2E_EMAIL;
@@ -61,12 +62,7 @@ try {
             });
 
             try {
-                await page.goto(new URL('/login?method=email&returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
-                await page.locator('#email').fill(email);
-                await page.locator('#password').fill(password);
-                await page.locator('form').filter({ has: page.locator('#email') })
-                    .locator('button[type="submit"]').click();
-                await page.waitForURL(url => !url.pathname.startsWith('/login'), { timeout: 60_000 });
+                await signIn(page, { email, password, app, destination: '/os' });
                 await page.goto(new URL('/os', app).toString(), { waitUntil: 'domcontentloaded' });
 
                 const dock = page.locator('.taskbar-item[data-app="app-store"]');
@@ -78,7 +74,7 @@ try {
                     shell: Boolean(document.querySelector('.taskbar')),
                     dockItems: document.querySelectorAll('.taskbar-item').length,
                     storeItems: document.querySelectorAll('.taskbar-item[data-app="app-store"]').length,
-                    loginForm: Boolean(document.querySelector('#email')),
+                    lockScreen: Boolean(document.querySelector('.ezil-lock')),
                     invitedPage: location.pathname.startsWith('/auth/invited'),
                     title: document.title.slice(0, 80),
                 })).catch(() => null);

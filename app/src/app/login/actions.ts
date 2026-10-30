@@ -7,6 +7,13 @@ import { Routes, safeReturnUrl } from '@/utils/constants';
 import { forwardedHost, forwardedProto } from '@/utils/forwarded';
 import { createClient } from '@/utils/supabase/server';
 
+/*
+ * 🔴 NOTHING IN THE UI CALLS THESE. `/login` offers only "Continue with EZiL
+ * ID" (`/auth/auth0/*`); the Google and email/password form was deleted. The
+ * actions are kept, unreferenced, with the document-load contract that
+ * `entry-contract.test.ts` pins, so restoring a method is a deliberate act.
+ */
+
 export interface AuthActionResult {
     error?: string;
     /**
@@ -14,7 +21,7 @@ export interface AuthActionResult {
      * path, already narrowed by `safeReturnUrl`.
      *
      * 🔴 A VALUE, not a `redirect()`. See `signInWithPassword` for why; the
-     * client half of the contract is in `login-form.tsx`, which navigates
+     * client half of the contract (in the deleted `login-form.tsx`) navigated
      * with `window.location.assign` so the destination arrives as a real
      * document load.
      */

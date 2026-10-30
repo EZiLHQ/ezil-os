@@ -1,8 +1,10 @@
-import { NextResponse } from 'next/server';
+import { parseRebaseJson } from '@/server/lib/compute/aws-rebase-json';
+import { after, NextResponse } from 'next/server';
 
 import { db } from '@/server/db';
 import { awsEnrollmentDescriber } from '@/server/lib/compute/aws-describer';
 import { handleAwsEnrollment, workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
+import { primePoolRelay } from '@/server/lib/compute/aws-pool-session';
 
 /**
  * `POST /api/compute/aws/enroll`: C-6 host enrollment (docs/AWS-COMPUTERS.md;
@@ -23,7 +25,7 @@ const NO_STORE = { 'cache-control': 'no-store' };
 export async function POST(req: Request): Promise<Response> {
     let body: unknown;
     try {
-        body = await req.json();
+        body = parseRebaseJson(await req.text(), 32768);
     } catch {
         return NextResponse.json({ error: 'enroll_request_invalid' }, { status: 400, headers: NO_STORE });
     }
@@ -42,6 +44,11 @@ export async function POST(req: Request): Promise<Response> {
         // unstructured 500: before the consume the nonce check repeats, after it the pending
         // path finishes the same enrollment (aws-enroll.ts). The host keeps its nonce.
         result = { status: 503, body: { error: 'enroll_unavailable', retryable: true } };
+    }
+    if (result.status === 200 && result.poolRelay) {
+        const enrollment = result.poolRelay;
+        try { after(() => primePoolRelay({ db, env: process.env }, enrollment)); }
+        catch { /* Scheduling must never turn durable enrollment into a failed response. */ }
     }
     return NextResponse.json(result.body, { status: result.status, headers: NO_STORE });
 }
