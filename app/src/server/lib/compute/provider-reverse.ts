@@ -226,7 +226,9 @@ const hostRetireResumable = (p: Placement) => p.provider === 'aws-ec2' && p.life
 /** The host's export head (§2.3): `v` 1, this move's id, valid for its generation; stored without `v` and `moveId`. */
 export function exportHeadFor(m: Pick<ComputeReverseMove, 'id' | 'generation'>, raw: Record<string, unknown> | null): ReverseExportHead | null {
     if (!raw || raw.v !== 1 || raw.moveId !== m.id) return null;
-    const { v: _v, moveId: _moveId, ...rest } = raw;
+    const rest: Record<string, unknown> = { ...raw };
+    delete rest.v;
+    delete rest.moveId;
     const head = rest as unknown as ReverseExportHead;
     return validExportHead(head, m.generation) ? head : null;
 }

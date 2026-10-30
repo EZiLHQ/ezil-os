@@ -61,7 +61,7 @@ function claimDb(seed: Parameters<typeof createFakePlacementDb>[0], hostBound = 
     const db: PlacementDb = { execute: q => wrap(fake.db).execute(q), transaction: fn => fake.db.transaction(tx => fn(wrap(tx))) };
     return { ...fake, db };
 }
-const record = vi.fn(async (tx: PlacementExecutor, _leased: Placement) => { await tx.execute(sql`/* reverse:record-export-boot */ SELECT 1`); });
+const record = vi.fn(async (tx: PlacementExecutor) => { await tx.execute(sql`/* reverse:record-export-boot */ SELECT 1`); });
 const seed = (over: Partial<Row> = {}, extra: Partial<Parameters<typeof createFakePlacementDb>[0]> = {}) =>
     ({ placements: [held(over)], computers: [{ id: C1, user_id: U1 }], ...extra });
 
@@ -75,7 +75,7 @@ describe('admitExportBoot (REVERSE-MOVE-CONTRACT §5.1.1)', () => {
     it('pins the order: admission lock, computer lock, counters, placement, move cap, the replace CAS, then the reverse write; one transaction', async () => {
         const { db, statements, placements } = claimDb(seed());
         let leasedSeen: Placement | null = null;
-        const r = await admitExportBoot(db, input(), async (tx, leased) => { leasedSeen = leased; await record(tx, leased); }, deps);
+        const r = await admitExportBoot(db, input(), async (tx, leased) => { leasedSeen = leased; await record(tx); }, deps);
         expect(r).toMatchObject({ admitted: true, placement: { state: 'LEASED', generation: 5, leaseEpoch: 8 } });
         const tags = statements.map(s => s.sql === 'BEGIN' || s.sql === 'COMMIT' ? s.sql : s.sql.match(/(placement|reverse):([a-z-]+)/)?.[0] ?? s.sql.slice(0, 30))
             .filter(t => t !== 'placement:image-reservation');

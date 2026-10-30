@@ -235,7 +235,8 @@ describe('§5.4 deadlines (DB clock, through ages)', () => {
         ['checking', { stateEntered: 1200 }, 'check_timeout'],
         ['flipping', { stateEntered: 99_999, commitSent: 1799 }, null], ['flipping', { stateEntered: 0, commitSent: 1800 }, 'flip_stuck'],
     ] as const)('%s with %j → %s', (state, ages, expected) => {
-        expect(reverseDeadlineFailure({ state, ages: { created: 0, stateEntered: 0, commitSent: null, lastChunk: null, ...ages } })).toBe(expected);
+        const base: ComputeReverseMove['ages'] = { created: 0, stateEntered: 0, commitSent: null, lastChunk: null };
+        expect(reverseDeadlineFailure({ state, ages: { ...base, ...ages } })).toBe(expected);
     });
 });
 
