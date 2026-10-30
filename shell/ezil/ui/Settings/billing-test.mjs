@@ -985,10 +985,33 @@ try {
         has('[data-role="cancels-banner"]', false);
         contains('[data-role="plan-ending"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
         summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
-        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.');
         assert.equal(qa('[data-role="files-held"]').length, 1, 'the hold is said once');
-        contains('[data-role="your-computer"]', 'AWS (India), with Free limits');
+        // Round 6 (R1-11): one provider string; the limit is the session line, and nothing to configure under the hold.
+        contains('[data-role="your-computer"]', 'AWS (India)');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /with Free limits|Cloudflare/);
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Computer details ›');
         contains('[data-role="plan-actions"] .ezil-settings-btn-primary', 'Upgrade to Standard');
+        // Round 6: the founder's Billing on 10-30 (Free, held std-2, 763 AI credits of which 663 are from the cancelled Premium period).
+        Object.assign(summary.computer, { size: 'std-2', vcpu: 2, memoryGiB: 8, disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } });
+        Object.assign(summary.ai, { grant: { amount: 100, per: 'once' }, balance: 763, state: 'ok', included: null, purchased: null, starter: { remaining: 100 },
+            previous: { remaining: 663, expiresAt: '2026-11-30T12:00:00Z' }, pendingFromRenewal: null });
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 20160,
+            allowanceStandardSeconds: 28800, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 5, equivalents: [{ size: 'free-cf', weight: 1, hours: 5 }] } });
+        await refresh(); audit();
+        contains('[data-role="meter-time"]', '5 h left');
+        contains('[data-role="meter-time"]', 'About 5 of 8 hours left this month');
+        assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /Same as/);
+        contains('[data-role="meter-ai"]', '763 left');
+        has('[data-role="meter-ai"] [role="meter"]', false);
+        contains('[data-role="meter-ai"]', '100 starter credits left');
+        contains('[data-role="meter-ai"]', '663 from your previous plan · expire Nov 30, 2026');
+        assert.equal((q('[data-role="meter-ai"]').textContent.match(/\b100\b/g) ?? []).length, 1, 'the 100 starter credits are said once');
+        contains('[data-role="meter-storage"]', '50 GB disk for your projects');
+        contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
+        assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        getUsage = () => failure('unavailable');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
         Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
@@ -1042,7 +1065,8 @@ try {
     assert.equal(q('#ai-credits .ezil-billing-meter-value').textContent, '4,000 left');
     // ADV-1: no breakdown from the server, so no invented "plan + extra" split.
     assert.doesNotMatch(q('#ai-credits').textContent, /from your plan|3,800 extra/);
-    assert.equal(q('#ai-credits [role="meter"]').getAttribute('aria-valuenow'), '100');
+    // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).
+    has('#ai-credits [role="meter"]', false);
     has('#ai-credits button', false); has('[data-role="ai-topup"]', false);
     summary.catalog.packs = packs; await refresh(); has('[data-role="ai-topup"]', false);
     summary.actions.topup = false; await refresh(); has('[data-role="ai-topup"]', false);

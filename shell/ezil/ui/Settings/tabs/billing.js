@@ -75,7 +75,7 @@ export function standingCopy (standing, data) {
         return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
             : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
     }
-    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
     return '';
 }
 
@@ -261,10 +261,11 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
  * the share of this period's time LEFT, and the warning follows the server's fair-use state.
  * Never "standard-hour" or "compute hours" (scanCopy).
  */
-export function timeV3Html ({ computer, fairUse }, usage = null) {
+export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
-    const lines = hoursLeftLines(period, computer.machineChoice);
+    // Round 6 (R1-06): Free (also held on AWS) says the month's allowance, "About 5 of 8 hours left this month".
+    const lines = hoursLeftLines(period, computer.machineChoice, { monthly: plan?.sku === 'free_v3' });
     const hours = lines ? period.remainingHoursAtCurrent : null;
     const value = hours === null ? usage === null ? 'Checking…' : 'Not measured yet' : hours === 0 && period.remainingStandardSeconds > 0 ? 'Less than 1 h left' : `${whole(hours)} h left`;
     const percent = lines && safeCount(period.remainingStandardSeconds) && safeCount(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0
@@ -310,6 +311,8 @@ function aiMeterV3 (summary) {
     const state = { low: '! Running low', exhausted: '■ No credits left' }[ai.state] ?? '';
     const purchased = ai.purchased && safeCount(ai.purchased.remaining) ? ai.purchased : null;
     const starter = ai.starter && safeCount(ai.starter.remaining) ? ai.starter : null;
+    // Round 6 (R4-05): credits kept from an earlier plan or period (a cancel keeps them until they expire), named and dated.
+    const previous = ai.previous && safeCount(ai.previous.remaining) && ai.previous.remaining > 0 && Number.isFinite(Date.parse(ai.previous.expiresAt ?? '')) ? ai.previous : null;
     let value, percent = null, split = null;
     if ( awaitingPayment ) value = `0 of ${whole(pending.credits)} this period`;
     else if ( included && included.granted > 0 ) { value = `${whole(included.remaining)} of ${whole(included.granted)} left`; percent = percentOf(included.remaining, included.granted); }
@@ -317,19 +320,22 @@ function aiMeterV3 (summary) {
         const balance = Math.floor(ai.balance);
         if ( grant && balance <= grant.amount ) { value = `${whole(balance)} of ${whole(grant.amount)} left`; percent = percentOf(balance, grant.amount); }
         else {
+            // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).
             value = `${whole(balance)} left`;
-            if ( grant ) percent = 100;
             // ADV-1: the split comes only from the server's breakdown, and only when it adds up to
             // the balance. Never balance minus grant (that assumes the grant is unspent).
-            if ( grant && purchased && purchased.remaining > 0 && (starter?.remaining ?? 0) + purchased.remaining === balance ) split = { plan: starter?.remaining ?? 0, extra: purchased.remaining };
+            if ( grant && purchased && purchased.remaining > 0 && (starter?.remaining ?? 0) + purchased.remaining + (previous?.remaining ?? 0) === balance ) split = { plan: starter?.remaining ?? 0, extra: purchased.remaining };
         }
     } else value = '—';
     const extras = [
         purchased && purchased.remaining > 0 ? split ? `Extra credits expire ${dateLabel(purchased.expiresAt, true)}` : `+ ${whole(purchased.remaining)} purchased · expire ${dateLabel(purchased.expiresAt, true)}` : '',
         starter && starter.remaining > 0 && ! split ? `${whole(starter.remaining)} starter credits left` : '',
+        previous ? `${whole(previous.remaining)} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'your last billing period'} · expire ${dateLabel(previous.expiresAt, true)}` : '',
         pending && ! awaitingPayment ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
     ];
-    const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.` : `${whole(grant.amount)} credits to start.` : '';
+    // Round 6 (R1-10): the one-time starter grant is said once, by the starter line when the server reports it.
+    const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.`
+        : starter && starter.remaining > 0 ? '' : `${whole(grant.amount)} credits to start.` : '';
     split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
@@ -426,12 +432,14 @@ function yourComputerV3 (summary) {
     const free = plan.sku === 'free_v3' || standing === 'free' || standing === 'files_on_aws';
     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
     const gb = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
-    const where = standing === 'files_on_aws' ? 'AWS (India), with Free limits' : free ? 'Cloudflare' : 'AWS (India)';
+    // Round 6 (R1-11): one provider string, "AWS (India)", on every tab; the Free limits are the session line below.
+    const held = standing === 'files_on_aws';
+    const where = free && ! held ? 'Cloudflare' : 'AWS (India)';
     const parts = [`${computer.vcpu} vCPU · ${computer.memoryGiB} GB memory`, gb ? `${gb} GB disk` : 'files saved between sessions', where];
     return `<div class="ezil-billing-computer" data-role="your-computer">
         <p><span class="ezil-billing-note">Your computer</span> <strong>${encode(parts.join(' · '))}</strong></p>
-        ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`, 'ezil-billing-note')}
-        ${linkAction('computer-tab', 'Change configuration ›')}</div>`;
+        ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
+        ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 
 function currentPlanV3 (summary, banner) {

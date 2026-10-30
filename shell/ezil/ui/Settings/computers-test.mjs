@@ -65,7 +65,8 @@ check('Premium running on 2 vCPU: current + two available, no slot UI', () => {
     const model = computerModel({ computer: me, data: premium(), prog: running() });
     assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'available', 'cmp-8': 'available' });
     assert.equal(model.chip.text, 'Running');
-    assert.equal(model.provider, 'AWS · Mumbai');
+    // Round 6 (R1-11): one provider string, "AWS (India)", on every tab.
+    assert.equal(model.provider, 'AWS (India)');
     const html = scan(computerHtml(model, running(), []));
     assert.match(html, /<h3>Your computer<\/h3>/);
     assert.match(text(html), /2 vCPU · 8 GB memory · 50 GB disk/);
@@ -304,7 +305,7 @@ check('Round 4 grace: the paid computer stays usable; banner with the date and F
     assert.match(html, /data-action="fix-payment" href="\/os\?settings=billing">Fix payment<\/a>/);
     assert.equal((html.match(/data-action="switch-config"/g) ?? []).length, 2, 'Switch stays enabled');
     assert.doesNotMatch(html, /data-action="open" disabled/);
-    assert.equal(model.provider, 'AWS · Mumbai');
+    assert.equal(model.provider, 'AWS (India)');
 });
 
 check('Round 4 plan_ending: the end date and that nothing is deleted', () => {
@@ -314,32 +315,105 @@ check('Round 4 plan_ending: the end date and that nothing is deleted', () => {
     assert.match(text(html), /Premium ends on Nov 26, 2026\. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted\./);
 });
 
-check('Round 4 files_on_aws: AWS (India) · files kept, Open desktop, every AWS configuration locked with Upgrade, no Cloudflare "Current"', () => {
-    const data = withStanding(free(), 'files_on_aws');
-    const model = computerModel({ computer: me, data, prog: stoppedAws(), streaming: false });
+// Round 6 (R1-08/R1-11/R4-02/CR-2): the founder's Computer tab on 10-30 — contact@ on Free, files held on
+// AWS, a std-2 hold session Running. The running size is CURRENT (with Free limits), only 4/8 vCPU are locked.
+const HELD_NOW = Date.parse('2026-10-30T05:44:00Z');
+const heldData = (extra = {}) => withStanding({ ...free(), computer: { ...free().computer, size: 'std-2', vcpu: 2, memoryGiB: 8,
+    activeDeadline: '2026-10-30T06:42:00Z', disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } } }, 'files_on_aws', extra);
+const heldUsage = { enabled: true, version: 1, session: { computerId: 'c-1', state: 'stale' },
+    period: { unit: 'standard_seconds', usedStandardSeconds: 8640, allowanceStandardSeconds: 28800, remainingStandardSeconds: 20160,
+        currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 5, equivalents: [] } };
+const clock = iso => new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(iso));
+const card = (html, size) => html.match(new RegExp(`<li class="ezil-computer-config" data-size="${size}"[\\s\\S]*?</li>`))?.[0] ?? '';
+
+check('Round 6 held std-2 Running: current with a Free limits pill, 4/8 vCPU locked as Premium, the hold in numbers and the session end', () => {
+    const model = computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: HELD_NOW });
     assert.equal(model.held, true);
-    assert.deepEqual(states(model), { 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });
-    assert.equal(model.chip.text, 'Stopped');
-    assert.equal(model.provider, 'AWS (India) · files kept');
-    const html = scan(computerHtml(model, stoppedAws(), []));
+    assert.equal(model.heldClosed, false);
+    assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    assert.equal(model.provider, 'AWS (India)');
+    const html = scan(computerHtml(model, running(), []));
     assert.deepEqual(roles(html), ['files-held']);
-    assert.match(text(html), /Your computer My computer AWS \(India\) · files kept Stopped/);
-    assert.match(text(html), /2 vCPU · 8 GB memory/);
+    assert.match(text(html), /Your computer My computer AWS \(India\) Running/);
+    assert.match(text(html), /2 vCPU · 8 GB memory · 50 GB disk/);
     assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
-    assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 3);
-    assert.equal((html.match(/data-action="config-upgrade"/g) ?? []).length, 3);
-    assert.doesNotMatch(html, /data-role="config-current"|data-size="free-cf"|data-action="switch-config"/);
-    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. Open it on the Free plan with Free limits, or upgrade to restore full use\./);
-    assert.match(text(html), /Upgrade to restore full use\. Compare plans/);
-    const runningHeld = computerModel({ computer: me, data, prog: running() });
-    assert.equal(runningHeld.chip.text, 'Running');
+    assert.match(card(html, 'std-2'), /data-state="current"/);
+    assert.match(card(html, 'std-2'), /data-role="config-current">Current<\/span><span class="ezil-settings-pill" data-role="config-free-limits">Free limits<\/span>/);
+    assert.doesNotMatch(card(html, 'std-2'), /Included in|config-upgrade/);
+    for ( const size of ['cmp-4', 'cmp-8'] ) assert.match(text(card(html, size)), /Included in Premium Upgrade/);
+    assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 2);
+    assert.doesNotMatch(html, /data-size="free-cf"|data-action="switch-config"|Included in Standard/);
+    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits; upgrade for no session time limit\./);
+    assert.match(html, /data-role="hold-time">Free sessions last 1 hour · About 5 of 8 hours left this month<\/p>/);
+    assert.match(text(html), new RegExp(`This session ends at ${clock('2026-10-30T06:42:00Z')} ?\\.`));
+    assert.match(html, /<time datetime="2026-10-30T06:42:00Z">/);
+    assert.doesNotMatch(text(html), /Pick a size|More sizes come with|restore full use/);
+    assert.match(text(html), /On the Free plan your AWS computer opens at 2 vCPU · 8 GB\. Upgrade to choose a size\./);
+    assert.match(text(html), /Standard and Premium have no session time limit; Premium unlocks 4 and 8 vCPU\. Compare plans/);
+});
+
+check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented hours), a passed deadline (no line)', () => {
+    const stopped = computerModel({ computer: me, data: heldData(), prog: stoppedAws(), usage: heldUsage, now: HELD_NOW });
+    assert.equal(stopped.chip.text, 'Stopped');
+    assert.deepEqual(states(stopped), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    const stoppedHtml = scan(computerHtml(stopped, stoppedAws(), []));
+    assert.doesNotMatch(stoppedHtml, /data-role="session-ends"/);
+    assert.match(stoppedHtml, /About 5 of 8 hours left this month/);
+    const unread = scan(computerHtml(computerModel({ computer: me, data: heldData(), prog: running(), usage: null, now: HELD_NOW }), running(), []));
+    assert.match(unread, /data-role="hold-time">Free sessions last 1 hour<\/p>/);
+    const late = computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: Date.parse('2026-10-30T06:42:30Z') });
+    assert.equal(late.sessionEnds, null);
+    assert.equal(computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: HELD_NOW, stopping: true }).sessionEnds, null);
+    const under = computerModel({ computer: me, data: heldData(), prog: running(), now: HELD_NOW,
+        usage: { ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } } });
+    assert.equal(under.holdLine, 'Free sessions last 1 hour · Less than an hour left this month');
+});
+
+check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
+    for ( const [type, size, vcpu] of [['m6i.xlarge', 'cmp-4', 4], ['m6i.2xlarge', 'cmp-8', 8]] ) {
+        const prog = stoppedAws(type);
+        const model = computerModel({ computer: me, data: heldData(), prog, usage: heldUsage, now: HELD_NOW });
+        assert.equal(model.heldClosed, true, type);
+        assert.equal(model.current, size);
+        assert.equal(model.holdLine, null);
+        const html = scan(computerHtml(model, prog, []));
+        assert.doesNotMatch(html, /data-action="open"/);
+        assert.doesNotMatch(html, /ezil-settings-btn-primary/, 'D6: no primary stands in for Open desktop');
+        assert.match(text(html), new RegExp(`Your files are still on your ${vcpu} vCPU AWS \\(India\\) computer\\. The Free plan can't open it at that size; upgrade to open it again\\.`));
+        assert.match(html, /data-action="held-upgrade" href="\/os\?settings=billing&amp;upgrade=pro">Upgrade<\/a>/);
+        assert.match(card(html, size), /data-state="current"/);
+        assert.match(text(card(html, size)), /Can't open on Free/);
+        assert.doesNotMatch(html, /config-free-limits|Free sessions last|It opens on the Free plan/);
+        assert.match(text(card(html, 'std-2')), /Included in Standard Upgrade/);
+        assert.match(text(html), new RegExp(`On the Free plan a ${vcpu} vCPU computer can't open\\. Upgrade to choose a size\\.`));
+    }
+});
+
+check('Round 6: a held computer before the lifecycle read shows the size the hold opens (std-2), Open, no chip', () => {
+    const model = computerModel({ computer: me, data: heldData(), prog: null, usage: null, now: HELD_NOW });
+    assert.equal(model.chip, null);
+    assert.equal(model.current, 'std-2');
+    assert.equal(model.heldClosed, false);
+    assert.equal(model.sessionEnds, null, 'not known to be running');
+    const html = scan(computerHtml(model, null, []));
+    assert.match(html, /data-action="open"/);
+    assert.match(card(html, 'std-2'), /config-free-limits/);
+});
+
+check('Round 6: a Free session on Cloudflare also says when it ends; a paid session (no cap) never does', () => {
+    const cf = { ...free(), computer: { ...free().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
+    const model = computerModel({ computer: me, data: cf, prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true, now: HELD_NOW });
+    assert.match(scan(computerHtml(model, null, [])), /data-role="session-ends"/);
+    const paid = { ...premium(), computer: { ...premium().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
+    assert.equal(computerModel({ computer: me, data: paid, prog: running(), now: HELD_NOW }).sessionEnds, null);
 });
 
 check('Round 4: after grace the plan block may still describe the past_due paid plan; the standing decides the card', () => {
     const lapsed = withStanding(premium(), 'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
     const held = computerModel({ computer: me, data: lapsed, prog: stoppedAws() });
     assert.equal(held.held, true);
-    assert.deepEqual(states(held), { 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });
+    // Round 6: the held std-2 is current; only the sizes the hold cannot open are locked.
+    assert.deepEqual(states(held), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
     assert.ok(! /data-action="switch-config"/.test(computerHtml(held, stoppedAws(), [])));
     const onCf = computerModel({ computer: me, data: withStanding(premium(), 'free', { filesOn: 'cloudflare' }, { status: 'past_due', paymentIssue: 'payment_failed' }),
         prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
@@ -382,14 +456,11 @@ check('Round 4 move (Phase B): dormant while move is null or another direction; 
     assert.match(failed, /data-action="move-feedback" data-code="move_copy_failed">Send feedback/);
 });
 
-check('Round 4: the standing copy passes the copy guard and names no region code or city', () => {
+check('Round 4/6: every rendered state passes the copy guard and names no region code or city (R1-11: never "Mumbai")', () => {
     for ( const html of scanned ) {
         assert.doesNotMatch(text(html), honestyBans);
         assert.doesNotMatch(text(html), /ap-south-1/i);
-        // The standing banners name no city; the header's location line (D6: "AWS · Mumbai") is not standing copy.
-        for ( const [banner] of html.matchAll(/<div class="ezil-computer-switch[^"]*" data-role="(?:payment-grace|plan-ending|files-held)"[\s\S]*?<\/div>/g) ) {
-            assert.doesNotMatch(text(banner), /mumbai/i);
-        }
+        assert.doesNotMatch(text(html), /mumbai/i);
     }
 });
 

@@ -320,6 +320,7 @@ const CAP_REASONS = new Set(['billing_user_hours_cap', 'billing_aws_monthly_cap'
 const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
 
 let summary = null;   // billing.summary (v3) or null when it cannot be read
+let usage = null;     // billing.usage of the main computer, read only under the Free hold (round 6), else null
 // computer.progress of the main computer, AS READ DURING THIS ACTIVATION. Follow-up r5
 // (ACCEPT-9a755827 FINDING 2): it is cleared whenever a window or the tab goes away and only
 // rendered when `progressGen` matches the current activation, so a reopen never paints the
@@ -412,11 +413,28 @@ export function refusalCopy (reason, target, data = summary, current = null) {
     }
 }
 
+/** Round 4 D16: the only size the Free hold opens (`HOLD_SIZE` in `app/src/server/billing/v3/admission.ts`). */
+const HOLD_SIZE = 'std-2';
+
+/**
+ * Round 6 (R1-06): "About 5 of 8 hours left this month" from `billing.usage` `period` (Free: one size,
+ * a calendar-month allowance; the same words as Usage and Billing), or null when it is not readable.
+ */
+export function monthLeft (period) {
+    const ok = value => Number.isSafeInteger(value) && value >= 0;
+    if ( ! ok(period?.remainingStandardSeconds) || ! ok(period?.allowanceStandardSeconds) || period.allowanceStandardSeconds === 0 ) return null;
+    const weight = Number.isSafeInteger(period.currentWeight) && period.currentWeight >= 1 ? period.currentWeight : 1;
+    const left = Math.floor(period.remainingStandardSeconds / weight / 3600), of = Math.floor(period.allowanceStandardSeconds / weight / 3600);
+    if ( left === 0 && period.remainingStandardSeconds > 0 ) return 'Less than an hour left this month';
+    return `About ${left} of ${of} hour${of === 1 ? '' : 's'} left this month`;
+}
+
 /**
  * Everything the Computer tab shows, from server data only (plus the one
  * pending click). Pure, so the states are unit-tested without a DOM.
+ * `usage` is `billing.usage` (read only under the hold, for the hours left); `now` dates the deadline.
  */
-export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false, stopping = false }) {
+export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false, stopping = false, usage = null, now = Date.now() }) {
     // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
     // plan-only model. The plan block may still describe a past_due paid subscription after grace.
     const standing = standingOf(data);
@@ -431,7 +449,10 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const stopped = (! free || held) && lifecycle === 'STOPPED';
     const hardware = sizeForInstanceType(prog?.hardware?.instanceType);
     const preference = data?.computer?.size ?? null;
-    const current = held ? flying?.current ?? hardware ?? 'std-2' : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
+    // Before the lifecycle read answers, a held computer is shown at the size the hold opens (the server refuses any other).
+    const current = held ? flying?.current ?? hardware ?? HOLD_SIZE : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
+    // Round 6 (R4-02): the hold opens only HOLD_SIZE and never resizes, so a held 4 or 8 vCPU computer cannot open on Free.
+    const heldClosed = held && current !== HOLD_SIZE;
     const choice = new Set((data?.computer?.machineChoice ?? []).map(m => m.size));
     const switching = pending ? { current: pending.current, target: pending.target, phase: 'requested', acknowledged: false }
         : flying && flying.kind !== 'restart' ? { current: flying.current, target: flying.target, phase: flying.phase, acknowledged: true } : null;
@@ -446,11 +467,13 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     else if ( prog?.operation === 'opening' ) chip = { state: 'starting', text: 'Starting…' };
     else if ( prog?.operation === 'stopping' ) chip = { state: 'stopping', text: 'Stopping…' };
     else if ( stopped ) chip = { state: 'stopped', text: 'Stopped' };
-    // Held on AWS: no Cloudflare card (the files are not there) and every AWS configuration is locked.
+    // Held on AWS: no Cloudflare card (the files are not there). Round 6 (R1-08): the size the computer is
+    // is CURRENT (it opens there under Free limits, or for R4-02 not at all); only the other sizes are locked.
     const sizes = free && ! held ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
     const cards = data ? sizes.map(size => {
         const info = sizeInfo(size, data);
-        let state = held || (dropped && size !== 'free-cf') ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
+        let state = held ? size === current ? 'current' : 'locked'
+            : dropped && size !== 'free-cf' ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
         if ( switching && size === switching.target ) state = 'switching';
         // D6: during a switch only the target is highlighted; the size it leaves is just "from".
         else if ( switching && size === switching.current ) state = 'from';
@@ -464,9 +487,19 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
         && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
     const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
-    return { computer, data, free, standing, held, move,
-        provider: data ? held ? 'AWS (India) · files kept' : free ? 'Cloudflare' : 'AWS · Mumbai' : null, chip, current, nextStart, switching,
-        running, stopped, cards, done, failed, disk, busy: !! (switching || flying || stopping || prog?.operation === 'opening' || prog?.operation === 'stopping') };
+    // Round 6 (CR-2): a capped session (Free, and the hold's 1 hour) says when it ends, from the summary's
+    // deadline, only while it runs and only while that time is still ahead.
+    const cap = data?.computer?.sessionMaxSeconds;
+    const deadline = data?.computer?.activeDeadline;
+    const sessionEnds = running && ! stopping && Number.isFinite(cap) && cap > 0 && Number.isFinite(Date.parse(deadline ?? '')) && Date.parse(deadline) > now ? deadline : null;
+    // Round 6 (R1-08): the hold's limits in numbers ("Free sessions last 1 hour · About 5 of 8 hours left this month").
+    const capHours = Number.isFinite(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
+    const holdLine = held && ! heldClosed && capHours ? [`Free sessions last ${capHours} hour${capHours === 1 ? '' : 's'}`, monthLeft(usage?.period)].filter(Boolean).join(' · ') : null;
+    return { computer, data, free, standing, held, heldClosed, move,
+        // Round 6 (R1-11): one provider string everywhere, "AWS (India)" (never a city or a region code).
+        provider: data ? free && ! held ? 'Cloudflare' : 'AWS (India)' : null, chip, current, nextStart, switching,
+        running, stopped, cards, done, failed, disk, sessionEnds, holdLine,
+        busy: !! (switching || flying || stopping || prog?.operation === 'opening' || prog?.operation === 'stopping') };
 }
 
 const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
@@ -496,8 +529,14 @@ export function standingCopy (standing, data) {
         return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
             : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
     }
-    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
     return '';
+}
+
+/** Round 6 (R4-02): a held 4 or 8 vCPU computer. The hold opens only 2 vCPU and never resizes, so it cannot open on Free. */
+export function heldClosedCopy (size, data) {
+    const vcpu = sizeInfo(size, data)?.vcpu;
+    return `Your files are still on your ${vcpu ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
 }
 
 const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Starting your desktop'];
@@ -545,8 +584,23 @@ function standingHtml (model) {
             <a class="ezil-settings-btn" data-action="fix-payment" href="/os?settings=billing">Fix payment</a></div>`;
     }
     if ( model.standing === 'plan_ending' ) return `<div class="ezil-computer-switch" data-role="plan-ending" role="status"><p>${html_encode(copy)}</p></div>`;
-    if ( model.held ) return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p></div>`;
+    // R4-02: no Open desktop for a held computer the hold cannot open; Upgrade is the way back (secondary: D6 keeps one primary).
+    if ( model.heldClosed ) {
+        return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(heldClosedCopy(model.current, model.data))}</p>
+            <a class="ezil-settings-btn" data-action="held-upgrade" href="/os?settings=billing&amp;upgrade=pro">Upgrade</a></div>`;
+    }
+    if ( model.held ) {
+        return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p>
+            ${model.holdLine ? `<p data-role="hold-time">${html_encode(model.holdLine)}</p>` : ''}</div>`;
+    }
     return '';
+}
+
+/** Round 6 (CR-2): "This session ends at 6:42 AM." while a capped session runs (local time, like Usage). */
+function sessionEndsHtml (model) {
+    if ( ! model.sessionEnds ) return '';
+    const at = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(model.sessionEnds));
+    return `<p class="ezil-settings-muted" data-role="session-ends">This session ends at <time datetime="${html_encode(model.sessionEnds)}">${html_encode(at)}</time>.</p>`;
 }
 
 /**
@@ -595,7 +649,12 @@ function cardHtml (card, model) {
     const title = `${card.vcpu} vCPU · ${card.memoryGiB} GB`;
     const weight = card.size === 'free-cf' ? 'Cloudflare · sessions up to 1 hour' : card.weight > 1 ? `Counts ${card.weight}× of your monthly time` : 'Counts 1× of your monthly time';
     let action = '';
-    if ( card.state === 'current' ) action = '<span class="ezil-settings-pill" data-role="config-current">Current</span>';
+    // Round 6 (R1-08): the held computer's size is current, with what Free allows it (or, R4-02, that it can't open).
+    if ( card.state === 'current' && model.held ) {
+        action = `<span class="ezil-settings-pill" data-role="config-current">Current</span>${model.heldClosed
+            ? '<span class="ezil-settings-muted" data-role="config-held-closed">Can\'t open on Free</span>'
+            : '<span class="ezil-settings-pill" data-role="config-free-limits">Free limits</span>'}`;
+    } else if ( card.state === 'current' ) action = '<span class="ezil-settings-pill" data-role="config-current">Current</span>';
     else if ( card.state === 'available' ) action = `<button type="button" class="ezil-settings-btn" data-action="switch-config" data-size="${html_encode(card.size)}"${model.busy || stopBusy ? ' disabled' : ''}>Switch</button>`;
     else if ( card.state === 'switching' ) action = '<span class="ezil-settings-pill" data-role="config-switching">Switching…</span>';
     else if ( card.state === 'next' ) action = '<span class="ezil-settings-pill" data-role="config-next">Next start</span>';
@@ -684,12 +743,16 @@ export function computerHtml (model, prog = progress, older = []) {
     const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
     const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
     const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
-    const planLine = ! data ? '' : model.held ? 'Upgrade to restore full use.' : premiumOnly.length && ! model.free
+    const planLine = ! data ? '' : model.held ? 'Standard and Premium have no session time limit; Premium unlocks 4 and 8 vCPU.' : premiumOnly.length && ! model.free
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
     const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 2 ** 30 : null; // the disk's own unit (GiB), like its size
     const stoppable = model.running && ! model.busy;
+    // Round 6 (R1-08): under the hold nothing can be picked; say what Free opens instead.
+    const configHelp = model.heldClosed ? `On the Free plan a ${size?.vcpu ?? ''} vCPU computer can't open. Upgrade to choose a size.`
+        : model.held ? `On the Free plan your AWS computer opens at ${sizeLabel(HOLD_SIZE, data)}. Upgrade to choose a size.`
+        : model.free ? 'Pick a size for your computer. More sizes come with Standard and Premium.' : 'Pick a size for your computer. Your files stay on your disk when you switch.';
     return `<section class="ezil-computer" data-role="your-computer" data-id="${html_encode(computer.id)}">
         <header class="ezil-computer-header" data-role="computer-header">
             <div class="ezil-computer-identity"><h3>Your computer</h3>
@@ -698,15 +761,16 @@ export function computerHtml (model, prog = progress, older = []) {
                 ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}</p>
                 ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}</div>
             <div class="ezil-settings-row-actions" data-role="computer-actions">
-                <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>
+                ${model.heldClosed ? '' : `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>`}
                 ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
         </header>
         ${statusHtml(model, prog)}
         ${model.switching ? '' : moveHtml(model)}
         ${standingHtml(model)}
+        ${sessionEndsHtml(model)}
         ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
-            <p class="ezil-settings-muted">${model.free ? 'Pick a size for your computer. More sizes come with Standard and Premium.' : 'Pick a size for your computer. Your files stay on your disk when you switch.'}</p>
+            <p class="ezil-settings-muted" data-role="config-help">${html_encode(configHelp)}</p>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
             <p class="ezil-settings-muted" data-role="plan-line">${html_encode(planLine)} <a href="/os?settings=billing&amp;upgrade=pro" data-action="compare-plans">Compare plans</a></p></section>` : ''}
         ${data ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>
@@ -737,7 +801,8 @@ function webModel () {
     if ( t && IN_FLIGHT.has(t.phase) ) seenInFlight.add(t.transitionId);
     return computerModel({ computer, data: summary, prog,
         pending: pendingSwitch?.computerId === computer.id ? pendingSwitch : null,
-        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true, stopping: stopBusy });
+        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true, stopping: stopBusy,
+        usage: usage?.session?.computerId == null || usage.session.computerId === computer.id ? usage : null });
 }
 
 function renderWeb ($list) {
@@ -771,6 +836,17 @@ async function readSummary () {
     summary = res?.ok && res.data?.enabled === true && res.data.version === 3 ? res.data : null;
 }
 
+/**
+ * Round 6 (R1-08): the hours left this month, only under the Free hold (the hold line). `billing.usage`
+ * is a read-only meter (no side effects), scoped to the main computer like the Usage tab's read.
+ */
+async function readUsage () {
+    const computer = mainComputer();
+    if ( ! billingOn() || standingOf(summary) !== 'files_on_aws' || ! computer ) { usage = null; return; }
+    const res = await trpc.query('billing.usage', { computerId: computer.id }).catch(() => ({ ok: false }));
+    usage = res?.ok && res.data?.enabled === true && res.data.period?.unit === 'standard_seconds' ? res.data : null;
+}
+
 async function refreshProgress ($win) {
     // A closed window (a Stop that answered after Settings closed) neither reads into nor
     // repaints the window open now; that window reads on its own activation and poll.
@@ -779,6 +855,7 @@ async function refreshProgress ($win) {
     if ( ! computer || ! paneActive ) { schedulePoll($win); return; }
     const mine = generation;
     const before = transitionOf(currentProgress(computer));
+    const lifeBefore = currentProgress(computer)?.lifecycleState;
     const res = await trpc.query('computer.progress', { computerId: computer.id }).catch(() => ({ ok: false }));
     if ( mine !== generation ) return;
     if ( res?.ok && res.data ) {
@@ -791,6 +868,12 @@ async function refreshProgress ($win) {
         if ( t && ! IN_FLIGHT.has(t.phase) && (t.phase === 'done' || t.phase === 'failed') ) {
             clearSwitchRequestId(computer.id, t.target);
             if ( before && IN_FLIGHT.has(before.phase) && before.transitionId === t.transitionId ) await readSummary();
+        }
+        // Round 6 (CR-2): a held session that started while this pane was open has a new deadline and new
+        // hours left; read them once when this activation sees the computer start running.
+        if ( typeof lifeBefore === 'string' && lifeBefore !== 'RUNNING' && progress.lifecycleState === 'RUNNING' && standingOf(summary) === 'files_on_aws' ) {
+            await readSummary();
+            await readUsage();
         }
     }
     if ( mine !== generation ) return;
@@ -1075,7 +1158,8 @@ async function load ($win) {
     // Follow-up r5 (ACCEPT-9a755827 FINDING 2): asked TOGETHER, so the lifecycle is
     // unknown for one progress request, not for list + the slow summary + progress.
     const mine = ++generation;
-    await Promise.all([readSummary(), refreshProgress($win)]);
+    // Round 6: the hold's hours left (billing.usage) once the summary says the files are held.
+    await Promise.all([readSummary().then(readUsage), refreshProgress($win)]);
     if ( mine !== generation ) return;
     if ( ! editingId ) render($win); // the summary may have answered after progress painted
     if ( ! queuedSwitch ) return;
