@@ -75,7 +75,7 @@ const COMPUTER = '11111111-1111-4111-8111-111111111111';
 // What Next.js's App Router keeps in `history.state` (`/os` is one of its
 // pages). Its popstate handler reloads the page if an entry lacks `__NA`.
 const NEXT_STATE = { __NA: true, __PRIVATE_NEXTJS_INTERNALS_TREE: { tree: ['', { children: ['os', {}] }], renderedSearch: '' } };
-async function boot(entry, { provider = 'cloudflare-guacamole', state = NEXT_STATE } = {}) {
+async function boot(entry, { provider = 'cloudflare-guacamole', state = NEXT_STATE, ready = () => wait(250) } = {}) {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', { url: `https://os.example${entry}`, runScripts: 'outside-only', pretendToBeVisual: true });
     const w = dom.window;
     w.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
@@ -90,7 +90,7 @@ async function boot(entry, { provider = 'cloudflare-guacamole', state = NEXT_STA
     const code = w.ezil.registry.getApp('code');
     const open = code.open;
     code.open = launchCtx => { opens.push(launchCtx); return open(launchCtx); };
-    await wait(250);
+    await ready(w);
     const url = () => `${w.location.pathname}${w.location.search}`;
     const win = id => w.document.querySelector(`.window[data-app="${id}"]`);
     return { w, url, win, opens, pops, ctx: { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState } };
@@ -247,6 +247,99 @@ for (const [entry, canonical] of [
     done(w);
 }
 
+// ── order through the registry: only the latest intent decides ─────────────
+// docs/APP-ROUTES.md §5 "Order". No sleeps: the shell is ready when its dock
+// is, a gated `open` waits for the test to release it, and the two delayed
+// focuses (UIWindow's 80ms `showWindow`, registry's 120ms `ensureOnTop`) are
+// queued and run by hand. Every other timer is the real one.
+const appeared = (w, selector) => new Promise(resolve => {
+    if (w.document.querySelector(selector)) { resolve(); return; }
+    const observer = new w.MutationObserver(() => { if (w.document.querySelector(selector)) { observer.disconnect(); resolve(); } });
+    observer.observe(w.document, { childList: true, subtree: true });
+});
+async function ordered() {
+    const booted = await boot(`/os?computer=${COMPUTER}`, { ready: w => appeared(w, '.taskbar-item[data-app="settings"]') });
+    const { w, ctx } = booted;
+    const delayed = [];
+    const setTimeout = w.setTimeout;
+    w.setTimeout = (fn, ms, ...args) => (ms === 80 || ms === 120 ? delayed.push({ ms, run: () => fn(...args) }) : setTimeout.call(w, fn, ms, ...args));
+    // Every queued callback of that delay, in the order they were queued.
+    const elapse = ms => { for (const timer of delayed.filter(t => t.ms === ms)) { delayed.splice(delayed.indexOf(timer), 1); timer.run(); } };
+    // The next `open` of `id` waits for the returned release().
+    const gate = id => {
+        const app = w.ezil.registry.getApp(id);
+        const open = app.open;
+        let release;
+        const held = new Promise(resolve => { release = resolve; });
+        app.open = async launchCtx => { app.open = open; await held; return open(launchCtx); };
+        return release;
+    };
+    // Resolves on this module's next history write (a route's `commit`).
+    const written = () => new Promise(resolve => {
+        w.history.replaceState = (...args) => { delete w.history.replaceState; w.history.replaceState(...args); resolve(); };
+    });
+    const launch = id => w.ezil.registry.launch(id, ctx);
+    const settle = () => { elapse(80); elapse(120); };
+    return { ...booted, elapse, gate, written, launch, settle };
+}
+{
+    // The coordinator's repro, through the registry: Code's open is slow,
+    // Settings is clicked after it and opens first.
+    const { w, url, win, elapse, gate, launch } = await ordered();
+    const release = gate('code');
+    const older = launch('code');
+    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 2], 'a click on Code pushes before its window exists');
+    await launch('settings');
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'a click on Settings, which opens first');
+    release();
+    ok(await older === win('code'), 'Code opens after it');
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'the older launch, resolving last, does not take the address bar');
+    elapse(80); elapse(120);
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "nor does its ensureOnTop re-focus, once both launches' have run");
+    w.$(win('code')).focusWindow();
+    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'positive control: once it has settled, a focus of Code replaces');
+    done(w);
+}
+{
+    // A click on an open window restores it with `showWindow`, which
+    // focuses it 80ms later; a click on another app lands before that.
+    const { w, url, win, elapse, launch, settle } = await ordered();
+    await launch('code'); settle();
+    await launch('settings'); settle();
+    await launch('code');
+    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 4]);
+    await launch('settings');
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5]);
+    elapse(80);
+    same(url(), `/app/settings?computer=${COMPUTER}`, "Code's late showWindow focus does not take the address bar from the newer click");
+    elapse(120);
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5], '... nor its ensureOnTop');
+    // Positive control: the same late focus with no newer launch, after a
+    // focus elsewhere, names Code.
+    await launch('code');
+    w.$(win('settings')).focusWindow();
+    same(url(), `/app/settings?computer=${COMPUTER}`, 'positive control: focus replaces');
+    elapse(80);
+    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 6], "positive control: the latest launch's late focus names it");
+    done(w);
+}
+{
+    // Back to an open Code restores it (its 80ms focus pending); a click on
+    // Settings lands before that focus.
+    const { w, url, written, launch, settle, elapse } = await ordered();
+    await launch('code'); settle();
+    await launch('settings'); settle();
+    const committed = written();
+    w.history.back();
+    await committed;
+    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'Back to Code commits in place');
+    await launch('settings');
+    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3]);
+    elapse(80);
+    same(url(), `/app/settings?computer=${COMPUTER}`, "the Back launch's late focus does not take the address bar from the newer click");
+    done(w);
+}
+
 // ── hosts that serve only /os: no rewriting ─────────────────────────────────
 for (const provider of ['local-vm', 'native-macos']) {
     const { w, url } = await boot(`/os?app=settings&settings=system`, { provider });
@@ -260,6 +353,6 @@ for (const provider of ['local-vm', 'native-macos']) {
     same(url(), '/os', 'local: the one-shot billing keys are still consumed in place');
     done(w);
 }
-console.log(`PASS ${checks} checks: app allowlist, /app/<id> routes and alias canonicalisation, project params, direct entry, repeated target, relaunch hook, history push/replace/traversal, /os-only hosts`);
+console.log(`PASS ${checks} checks: app allowlist, /app/<id> routes and alias canonicalisation, project params, direct entry, repeated target, relaunch hook, history push/replace/traversal, launch order through the registry (slow open, late showWindow/ensureOnTop focus, Back launch), /os-only hosts`);
 
 process.exit(0);

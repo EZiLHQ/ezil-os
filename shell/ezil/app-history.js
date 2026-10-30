@@ -11,6 +11,11 @@
 //   - Back/Forward (`popstate`) focuses that app's window, or launches it.
 //     It NEVER closes a window, stops a computer or deletes state.
 //
+// 🔴 ONLY THE LATEST INTENT DECIDES. Launches resolve out of order (a click
+// on Code, then on Settings; Settings opens first). A launch, or a
+// Back/Forward launch, that resolves after a newer intent writes nothing —
+// see `generation` below and docs/APP-ROUTES.md §5 "Order".
+//
 // 🔴 EVERY WRITE STARTS FROM `history.state`. `/os` is a Next.js App Router
 // page, and Next keeps its own keys there (`__NA`, its route tree). Its
 // popstate handler RELOADS THE PAGE on a non-null state without `__NA` —
@@ -127,6 +132,23 @@ export function createAppHistory () {
     // Each open app's own parameters (Code's project, Settings' tab), so
     // focusing it again restores the URL it was opened with.
     const params = new Map();
+    // Every intent takes the next number: a click's launch (`begin`),
+    // Back/Forward, the close of an app window, a focus this module writes
+    // for. `launchGeneration` is the number of the latest LAUNCH intent (a
+    // click or Back/Forward) alone. A pending launch compares its own number
+    // with these when it ends (`end`, `commit`).
+    let generation = 0;
+    let launchGeneration = 0;
+    // A Back/Forward launch's ctx -> its number, for `commit`. Keyed by the
+    // object `registry.launch` hands back: a key added to the ctx itself
+    // would reach the app.
+    const routes = new WeakMap();
+    // A launched window -> the launch number it opened under, until
+    // `settled`. Until then its focus events are the launch's own (UIWindow's
+    // 80ms `showWindow` focus, registry's 120ms `ensureOnTop` re-focus), and
+    // they count only while that launch is the latest one.
+    const settling = new WeakMap();
+    const settle = (el, gen) => { if ( el && typeof el === 'object' ) settling.set(el, gen); };
 
     const win = () => deps.win;
     const apps = () => deps.getApps() ?? [];
@@ -145,38 +167,52 @@ export function createAppHistory () {
     // Record what this launch says about the app's own URL parameters:
     // Settings' tab always follows the launch (it reopens at Account without
     // one), Code's project only when one is given. True if they changed.
+    // Always a new object, so a failed launch can tell whether a later one
+    // has set this app's parameters since (`end`).
     const remember = (id, ctx) => {
         const before = JSON.stringify(params.get(id) ?? {});
         if ( id === 'settings' ) params.set(id, ctx.initialTab ? { tab: ctx.initialTab } : {});
         else if ( ctx.project ) params.set(id, linkParams({ id, project: ctx.project }));
-        else if ( ! params.has(id) ) params.set(id, {});
+        else params.set(id, { ...params.get(id) });
         return JSON.stringify(params.get(id)) !== before;
     };
 
     function onPopState () {
+        // The newest intent, whichever entry it lands on (`/os` included): a
+        // click's launch or an earlier traversal's still opening must not
+        // write over it.
+        const gen = launchGeneration = generation += 1;
         const link = parseAppLink(win().location, apps());
         if ( ! link ) return;
         params.set(link.id, linkParams(link));
         const state = win().history.state;
-        void deps.launch(link.id, {
+        const ctx = {
             ...deps.launchContext(),
             ...routeLaunchContext(link, {
                 hasWindow: !! liveWindow(link.id),
                 recordedView: state?.ezilApp === link.id ? state.ezilView : undefined,
             }),
             historyMode: 'replace',
-        });
+        };
+        routes.set(ctx, gen);
+        void deps.launch(link.id, ctx);
     }
 
     function onFocus (event) {
         // A gesture launch in flight has already pushed its entry (`begin`);
         // until it ends, a late focus of some other window must not
-        // overwrite it — `end` puts the launched app back if one did.
+        // overwrite it — `end` puts the launched app back if one did. This
+        // includes the new window's own focus, which UIWindow gives it while
+        // it is built.
         if ( ! enabled || holds > 0 ) return;
         const el = event.detail?.window;
         const id = el?.getAttribute?.('data-app');
         if ( ! known(id) || el.getAttribute('data-closing') === '1' ) return;
+        // A window whose launch has not settled, and a newer launch has
+        // begun since: this is that launch's late focus, not the user's.
+        if ( settling.has(el) && settling.get(el) !== launchGeneration ) return;
         if ( currentApp() === id ) return;
+        generation += 1;
         write('replaceState', urlFor(id), stateFor(id));
     }
 
@@ -198,7 +234,13 @@ export function createAppHistory () {
     function onClosed (event) {
         if ( ! enabled ) return;
         const closed = event.detail?.app;
-        if ( known(closed) && ! liveWindow(closed) ) params.delete(closed);
+        if ( known(closed) ) {
+            // An intent: a launch still opening may not give back, over what
+            // this decides, the URL it replaced (`end(null)`). Not a LAUNCH
+            // intent: a launch whose window opens still names it.
+            generation += 1;
+            if ( ! liveWindow(closed) ) params.delete(closed);
+        }
         const next = frontApp();
         if ( currentApp() === next ) return;
         write('replaceState', urlFor(next), stateFor(next));
@@ -278,17 +320,25 @@ export function createAppHistory () {
          * focuses itself on the way). `end(null)` — the app did not open —
          * puts back the URL and state this replaced; the extra entry stays,
          * as a duplicate of the one before it.
+         *
+         * Out of order (docs/APP-ROUTES.md §5 "Order"): `end(el)` names the
+         * app only while no newer click or Back/Forward has happened;
+         * `end(null)` puts anything back only while no newer intent at all
+         * has (a close included), and the app's parameters only while no
+         * later launch has set them.
          * @returns {{end: (el: Element|null) => void}|null} null when this
          *   module will not write for `id` (an /os-only host, an unknown app).
          */
         begin (id, ctx = {}) {
             if ( ! deps || ! enabled || ! known(id) ) return null;
+            const gen = launchGeneration = generation += 1;
             holds += 1;
             const before = { url: here(), state: win().history.state, params: params.get(id) };
             const pushed = currentApp() !== id;
             if ( remember(id, ctx) || pushed ) {
                 write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: undefined } : stateFor(id));
             }
+            const mine = params.get(id);
             let ended = false;
             return {
                 end (el) {
@@ -298,24 +348,41 @@ export function createAppHistory () {
                     if ( el ) {
                         // Not for a window already gone again (closed, or
                         // destroyed by a rebuild while the launch was open).
-                        if ( el.isConnected !== false && currentApp() !== id ) write('replaceState', urlFor(id), stateFor(id));
+                        if ( el.isConnected === false ) return;
+                        settle(el, gen);
+                        if ( gen === launchGeneration && currentApp() !== id ) write('replaceState', urlFor(id), stateFor(id));
                         return;
                     }
-                    if ( before.params === undefined ) params.delete(id);
-                    else params.set(id, before.params);
-                    if ( pushed ) win().history.replaceState(before.state, '', before.url);
+                    if ( params.get(id) === mine ) {
+                        if ( before.params === undefined ) params.delete(id);
+                        else params.set(id, before.params);
+                    }
+                    if ( pushed && gen === generation ) win().history.replaceState(before.state, '', before.url);
                 },
             };
+        },
+
+        /**
+         * The launch that opened `el` has settled (registry's `ensureOnTop`
+         * has run): its focus events are the user's from now on.
+         */
+        settled (el) {
+            if ( el && typeof el === 'object' ) settling.delete(el);
         },
 
         /**
          * A ROUTE's launch (`historyMode` 'replace': the boot's link,
          * Back/Forward) resolved with a window: never adds an entry. The
          * entry's URL is kept as it is when it already names `id`, unless the
-         * launch changed the app's own parameters. 'none' writes nothing.
+         * launch changed the app's own parameters. 'none' writes nothing,
+         * and so does a Back/Forward launch any intent has overtaken.
+         * @param {Element} [el] the window it resolved with
          */
-        commit (id, ctx = {}) {
+        commit (id, ctx = {}, el = null) {
             if ( ! deps || ! enabled || ctx.historyMode === 'none' || ! known(id) ) return;
+            const gen = routes.get(ctx) ?? launchGeneration;
+            settle(el, gen);
+            if ( routes.has(ctx) && gen !== generation ) return;
             const changed = remember(id, ctx);
             const same = currentApp() === id;
             write('replaceState', same && ! changed ? here() : urlFor(id), stateFor(id));

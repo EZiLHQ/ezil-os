@@ -60,7 +60,10 @@ same(routeLaunchContext({ id: 'settings', initialTab: 'billing' }), { initialTab
 same(routeLaunchContext({ id: 'desktop' }), {}, 'only Code gets a view');
 
 // ── the controller, against a bare window ───────────────────────────────────
-function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: true } } = {}) {
+// `routes`: Back/Forward launches wait in it until the test resolves one
+// with a window (or null), which commits it then and there, as
+// `registry.launch` does when its open resolves.
+function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: true }, routes = null } = {}) {
     const dom = new JSDOM('<!doctype html><body></body>', { url: `https://os.example${entry}` });
     const w = dom.window;
     w.history.replaceState(state, '', w.location.href);
@@ -69,7 +72,11 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     controller.install({
         win: w, payload: { desktopState: { provider } },
         getApps: () => ['desktop', 'code', 'settings'].map(id => ({ id })),
-        launch: async (id, ctx) => { launches.push([id, ctx]); return null; },
+        launch: (id, ctx) => {
+            launches.push([id, ctx]);
+            if ( ! routes ) return Promise.resolve(null);
+            return new Promise(done => routes.push({ id, resolve: el => { if ( el ) controller.commit(id, ctx, el); done(el); } }));
+        },
         launchContext: () => ({ computer: { id: C } }),
     });
     const open = (id, z) => {
@@ -86,7 +93,9 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     };
     const close = el => { el.remove(); w.dispatchEvent(new w.CustomEvent('ezil:window-closed', { detail: { window: el, app: el.getAttribute('data-app') } })); };
     const url = () => `${w.location.pathname}${w.location.search}${w.location.hash}`;
-    return { w, controller, launches, open, focus, close, url };
+    // Back/Forward by `delta`, resolved by the popstate itself (no timer).
+    const traverse = delta => new Promise(resolve => { w.addEventListener('popstate', resolve, { once: true }); w.history.go(delta); });
+    return { w, controller, launches, open, focus, close, url, traverse };
 }
 {
     const { w, controller, open, focus, close, url } = harness(`/os?computer=${C}`);
@@ -103,6 +112,7 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 'a focus during the launch writes nothing');
     launching.end(code); launching.end(null);
     same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3], 'end() runs once; the opened app keeps the entry');
+    controller.settled(code); // registry's `ensureOnTop`, 120ms after the open
     focus(code);
     same(w.history.length, 3);
     focus(settings);
@@ -201,6 +211,7 @@ for (const [recorded, later] of [['full', 'window'], ['window', 'full']]) for (c
     const { w, controller, launches, open, focus, url } = harness('/os');
     const code = open('code', 1);
     controller.begin('code').end(code);
+    controller.settled(code);
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: recorded } }));
     controller.begin('settings').end(open('settings', 2));
     focus(code);
@@ -245,4 +256,207 @@ for (const provider of ['native-macos', 'local-vm']) {
     w.dispatchEvent(new w.PopStateEvent('popstate'));
     same(launches.length, 1, 'one listener, using the latest getters');
 }
-console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install`);
+
+// ── order: only the latest intent decides (docs/APP-ROUTES.md §5 "Order") ──
+// Every case below is driven by explicit calls and the popstate event alone.
+const settledLaunch = (controller, id, el) => { controller.begin(id).end(el); controller.settled(el); };
+for (const fail of [false, true]) {
+    // The coordinator's repro (2026-10-30): a click on Code, then on
+    // Settings; Settings opens first, Code's launch resolves after it.
+    const { w, controller, open, url } = harness('/os');
+    const older = controller.begin('code');
+    const code = open('code', 10);
+    const newer = controller.begin('settings');
+    newer.end(open('settings', 20));
+    same([url(), w.history.length, w.history.state.ezilApp], ['/app/settings', 3, 'settings']);
+    older.end(fail ? null : code);
+    same([url(), w.history.length, w.history.state], ['/app/settings', 3, { __NA: true, ezilApp: 'settings' }],
+        fail ? 'an older launch that failed does not roll back over the newer one' : 'an older launch that opened does not name itself over the newer one');
+}
+for (const fail of [false, true]) {
+    // Positive control: the same end() with no newer intent still decides.
+    const { w, controller, open, url } = harness('/os');
+    settledLaunch(controller, 'settings', open('settings', 20));
+    const launch = controller.begin('code');
+    same([url(), w.history.length], ['/app/code', 3], 'positive control: a single click pushes exactly one entry');
+    launch.end(fail ? null : open('code', 10));
+    same([url(), w.history.length, w.history.state.ezilApp], fail ? ['/app/settings', 3, 'settings'] : ['/app/code', 3, 'code'],
+        fail ? 'positive control: the latest launch that failed rolls back' : 'positive control: the latest launch keeps its entry');
+}
+{
+    // Three clicks before anything opens, ending in every order, each one
+    // opening or failing: 6 x 8 cases. The newest click (Settings) owns the
+    // address bar from its begin(); if it fails it gives back the URL it
+    // replaced, Code's, whatever became of Code.
+    const ids = ['desktop', 'code', 'settings'];
+    const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    let cases = 0;
+    for (const order of orders) for (let failing = 0; failing < 8; failing += 1) {
+        const { w, controller, open, url } = harness('/os');
+        const launches = ids.map(id => controller.begin(id));
+        const opened = ids.map((id, i) => ((failing >> i) & 1 ? null : open(id, 10 + i)));
+        const final = opened[2] ? ['/app/settings', 4, 'settings'] : ['/app/code', 4, 'code'];
+        const label = order.map(i => `${ids[i]} ${opened[i] ? 'opens' : 'fails'}`).join(', then ');
+        for (const i of order) {
+            launches[i].end(opened[i]);
+            same([url(), w.history.length, w.history.state.ezilApp], order.indexOf(2) <= order.indexOf(i) ? final : ['/app/settings', 4, 'settings'],
+                `${label}: after ${ids[i]} ends`);
+        }
+        cases += 1;
+    }
+    same(cases, 48, 'every order x every outcome');
+}
+{
+    // The late focus: UIWindow focuses a restored window 80ms after
+    // `showWindow`, and registry's `ensureOnTop` re-focuses a launched one at
+    // 120ms. Landing after a newer click, neither is the user's.
+    const { w, controller, open, focus, url } = harness('/os');
+    const code = open('code', 10);
+    controller.begin('code').end(code);
+    const newer = controller.begin('settings');
+    focus(code);
+    same(url(), '/app/settings', 'during the newer launch: nothing');
+    const settings = open('settings', 20);
+    newer.end(settings);
+    focus(code);
+    same([url(), w.history.length], ['/app/settings', 3], "after it: the older launch's late focus does not take the address bar");
+    focus(settings);
+    same(url(), '/app/settings', "the newer launch's own late focus is accepted");
+    controller.settled(code);
+    focus(code);
+    same([url(), w.history.length], ['/app/code', 3], 'positive control: once its launch has settled, a focus of it replaces');
+}
+{
+    // Positive control: a window still settling, with no newer launch, is
+    // named by its late focus (a focus elsewhere in between is not a launch).
+    const { w, controller, open, focus, url } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    const code = open('code', 10);
+    controller.begin('code').end(code);
+    focus(settings);
+    same(url(), '/app/settings', 'positive control: focus replaces');
+    focus(code);
+    same([url(), w.history.length], ['/app/code', 3], 'the latest launch\'s late focus still names it');
+}
+for (const order of ['older first', 'newer first']) for (const olderOpened of [true, false]) {
+    // Close, then reopen, while the first launch is still pending.
+    const { w, controller, open, close, url } = harness('/os');
+    settledLaunch(controller, 'settings', open('settings', 5));
+    const older = controller.begin('code', { project: { projectId: P, repoId: R } });
+    const first = open('code', 10);
+    close(first);
+    same([url(), w.history.length], ['/app/settings', 3], 'positive control: a close moves the entry to the front app');
+    const newer = controller.begin('code');
+    const second = open('code', 20);
+    const ends = [() => older.end(olderOpened ? first : null), () => newer.end(second)];
+    for (const end of order === 'older first' ? ends : ends.reverse()) end();
+    same([url(), w.history.length], ['/app/code', 4], `${order}, the first ${olderOpened ? 'resolving with its closed window' : 'failing'}: the reopen decides`);
+}
+for (const opened of [true, false]) {
+    // Closing ANOTHER window while a click's launch is pending.
+    const { w, controller, open, focus, close, url } = harness('/os');
+    const desktop = open('desktop', 5);
+    settledLaunch(controller, 'desktop', desktop);
+    const settings = open('settings', 6);
+    settledLaunch(controller, 'settings', settings);
+    focus(settings);
+    const launch = controller.begin('code');
+    close(settings);
+    same([url(), w.history.length], ['/app/desktop', 4], 'the close names the front app');
+    launch.end(opened ? open('code', 30) : null);
+    same([url(), w.history.length], [opened ? '/app/code' : '/app/desktop', 4], opened
+        ? 'a close is not a launch: the window that opened still names itself'
+        : "a failed launch does not give back, over the close, a closed app's URL");
+}
+for (const [delta, landing] of [[-2, '/os'], [-1, '/app/settings']]) for (const opened of [true, false]) {
+    // Back while a click's launch is pending.
+    const { w, controller, open, url, traverse } = harness('/os');
+    settledLaunch(controller, 'settings', open('settings', 5));
+    const launch = controller.begin('code');
+    await traverse(delta);
+    same([url(), w.history.length], [landing, 3], `Back ${-delta}`);
+    launch.end(opened ? open('code', 10) : null);
+    same([url(), w.history.length], [landing, 3], `Back ${-delta}, then the launch ${opened ? 'opens: it does not name itself' : 'fails: it does not roll back'}`);
+}
+{
+    // Forward while a launch that did not push (Settings, at another tab) is
+    // pending: the forward entry is not relabelled.
+    const { w, controller, open, url, traverse } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    settledLaunch(controller, 'code', open('code', 6));
+    await traverse(-1);
+    same(url(), '/app/settings');
+    const launch = controller.begin('settings', { initialTab: 'usage' });
+    same([url(), w.history.length], ['/app/settings?tab=usage', 3], 'no push: Settings is already named');
+    await traverse(1);
+    launch.end(settings);
+    same([url(), w.history.length], ['/app/code', 3], 'Forward: the launch does not write over it');
+}
+{
+    // A Back/Forward launch that resolves after a newer intent: a click...
+    const routes = [];
+    const { w, controller, open, url, traverse } = harness('/os', { routes });
+    w.history.pushState({ __NA: true }, '', '/app/code');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    await traverse(-1);
+    same([url(), routes.map(route => route.id)], ['/app/code', ['code']], 'Back to a closed Code launches it');
+    controller.begin('settings').end(settings);
+    same([url(), w.history.length], ['/app/settings', 3], 'a click while it opens');
+    routes.shift().resolve(open('code', 10));
+    same([url(), w.history.length], ['/app/settings', 3], 'the Back launch, resolving after the click, does not write over it');
+}
+{
+    // ... or a focus.
+    const routes = [];
+    const { w, controller, open, focus, url, traverse } = harness('/os', { routes });
+    w.history.pushState({ __NA: true }, '', '/app/code');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    await traverse(-1);
+    focus(settings);
+    same(url(), '/app/settings', 'a focus while the Back launch opens');
+    routes.shift().resolve(open('code', 10));
+    same(url(), '/app/settings', '... is not overwritten by it either');
+}
+{
+    // Positive control: with no newer intent the Back launch commits
+    // (stamping the entry's app), and its window settles like a click's.
+    const routes = [];
+    const { w, controller, open, focus, url, traverse } = harness('/os', { routes });
+    w.history.pushState({ __NA: true }, '', '/app/code');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    await traverse(-1);
+    const code = open('code', 10);
+    routes.shift().resolve(code);
+    same([url(), w.history.state], ['/app/code', { __NA: true, ezilApp: 'code' }], 'positive control: the Back launch commits');
+    controller.begin('settings').end(settings);
+    focus(code);
+    same(url(), '/app/settings', "the Back launch's late focus, after a newer click, does not take the address bar");
+}
+{
+    // Parameters: an older failed launch leaves a newer launch's alone...
+    const { controller, open, focus, url } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    const first = controller.begin('code', { project: { projectId: P, repoId: R } });
+    const second = controller.begin('code', { project: { projectId: R, repoId: P } });
+    const code = open('code', 10);
+    first.end(null);
+    second.end(code); controller.settled(code);
+    focus(settings); focus(code);
+    same(url(), `/app/code?project=${R}&repo=${P}`, "an older failed launch leaves the newer launch's parameters");
+}
+{
+    // ... and still takes back its own when nothing newer set them.
+    const { controller, open, url } = harness('/os');
+    const older = controller.begin('code', { project: { projectId: P, repoId: R } });
+    controller.begin('settings').end(open('settings', 5));
+    older.end(null);
+    controller.begin('code');
+    same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
+}
+console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (latest intent decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, parameters)`);

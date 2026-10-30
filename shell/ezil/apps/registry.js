@@ -603,13 +603,18 @@ export function resolve (payload) {
  * an unconditional re-focus: stealing focus back from a window the user
  * legitimately moved to afterwards would be a worse bug than the one being
  * fixed.
+ *
+ * It is also when this launch SETTLES for the address bar: until then the
+ * window's focus events (the 80ms one, this re-focus) are the launch's own,
+ * and `../app-history.js` lets them name the app only while no newer launch
+ * has begun. Every path through here reports it, early returns included.
  */
 function ensureOnTop (el_window) {
-    if ( ! el_window || typeof el_window.getBoundingClientRect !== 'function' ) return;
+    if ( ! el_window ) return;
     const zOf = (el) => Number.parseInt(getComputedStyle(el).zIndex, 10) || 0;
     const assertTop = () => {
         try {
-            if ( ! el_window.isConnected ) return;
+            if ( typeof el_window.getBoundingClientRect !== 'function' || ! el_window.isConnected ) return;
             // Only if something is genuinely ABOVE it.
             let above = false;
             for ( const el_other of document.querySelectorAll('.window') ) {
@@ -622,6 +627,8 @@ function ensureOnTop (el_window) {
         } catch ( err ) {
             // Never let a stacking nicety take down an app open.
             console.warn(`[${PHASE}] ensureOnTop threw`, err);
+        } finally {
+            appHistory.settled(el_window);
         }
     };
     // 120ms > the 80ms `showWindow` delay, so a focus already in flight has
@@ -679,7 +686,7 @@ export async function launch (id, ctx = {}) {
     } finally {
         entry?.end(el);
     }
-    if ( el && ! entry ) appHistory.commit(id, ctx);
+    if ( el && ! entry ) appHistory.commit(id, ctx, el);
     return el;
 }
 
