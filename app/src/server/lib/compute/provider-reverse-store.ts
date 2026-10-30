@@ -337,6 +337,12 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
                 aws_snapshot_id = ${retained.awsSnapshotId}, retain_until = clock_timestamp() + make_interval(days => ${REVERSE_MOVE_RETENTION_DAYS}::int),
                 attempts = 0, last_error = NULL`);
         },
+        /** D21 snapshot of the retained volume, taken after the flip (lane O). Committed rows only; set once. */
+        async recordSnapshot(expected: ComputeReverseMove, awsSnapshotId: string): Promise<ComputeReverseMove> {
+            if (expected.state !== 'committed' || expected.awsSnapshotId !== null) refuse('illegal_transition');
+            if (!SNAPSHOT.test(awsSnapshotId)) refuse('invalid_input');
+            return cas(expected, 'committed', sql`aws_snapshot_id = ${awsSnapshotId}`);
+        },
         /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` (the caller re-reads). */
         async claimStale(limit: number): Promise<ComputeReverseMove[]> {
             const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;

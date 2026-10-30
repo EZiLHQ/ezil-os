@@ -246,6 +246,18 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect((await forward.createOrGetActive({ computerId: C, userId: U, toSize: 'standard' })).state).toBe('requested');
     });
 
+    it('recordSnapshot sets the D21 snapshot once, on committed rows only', async () => {
+        const f = await toFlipping();
+        await expect(reverse.recordSnapshot(f, 'snap-02639db95fe545d4f')).rejects.toEqual(conflict('illegal_transition'));
+        const done = await reverse.finish(f, { awsVolumeId: 'vol-0b1ffbc8f8cfa6384', awsFsUuid: null, awsSnapshotId: null });
+        await expect(reverse.recordSnapshot(done, 'vol-0b1ffbc8f8cfa6384')).rejects.toEqual(conflict('invalid_input'));
+        const snapped = await reverse.recordSnapshot(done, 'snap-02639db95fe545d4f');
+        expect(snapped).toMatchObject({ state: 'committed', awsSnapshotId: 'snap-02639db95fe545d4f', retainUntil: done.retainUntil });
+        await expect(reverse.recordSnapshot(snapped, 'snap-053333a158f9cc895')).rejects.toEqual(conflict('illegal_transition'));
+        await expect(reverse.recordSnapshot(done, 'snap-053333a158f9cc895')).rejects.toEqual(conflict('lost_race'));
+        expect((await reverse.readById(done.id))!.awsSnapshotId).toBe('snap-02639db95fe545d4f');
+    });
+
     it('claimStale takes only in-flight rows idle for 30 s and bumps them', async () => {
         const a = await create();
         const b = await reverse.fail(await create(C2), 'failed_needs_operator', 'stuck');
