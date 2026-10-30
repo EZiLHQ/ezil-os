@@ -130,6 +130,84 @@ describe('safeReturnUrl — the OS routes (docs/APP-ROUTES.md)', () => {
     });
 });
 
+/**
+ * One test per numbered case in `safeReturnUrl` (docs/APP-ROUTES.md §6). Each
+ * negative group sits next to a positive control that differs from it in the
+ * one thing the case decides.
+ */
+describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', () => {
+    it('case 1: nothing supplied lands on /os; a repeat counts by its first value', () => {
+        for (const value of [undefined, null, '', [], ['']]) expect(safeReturnUrl(value), JSON.stringify(value)).toBe(Routes.OS);
+        expect(safeReturnUrl(['/app/code', 'https://evil.example'])).toBe('/app/code');
+        expect(safeReturnUrl(['https://evil.example', '/app/code'])).toBe(Routes.COMPUTERS);
+    });
+
+    it('case 2: hostile shapes land on /computers, decided BEFORE the /app fallback', () => {
+        // Positive control: the same /app pages, clean, are kept.
+        expect(safeReturnUrl('/app/code')).toBe('/app/code');
+        expect(safeReturnUrl('/app/code?path=src')).toBe('/app/code?path=src');
+        for (const url of [
+            // Schemes and non-paths.
+            'https://evil.example', 'https://evil.example/app/code', 'javascript:alert(1)', 'data:text/html,x', 'app/code', '.',
+            // Protocol-relative and backslash, path or query.
+            '//evil.example', '//evil.example/app/code', '/\\evil.example', '/app\\..\\admin', '/app/code\\x', '/app/code?path=\\x', '/os?x=\\y',
+            // Control characters and whitespace, including inside an /app path.
+            '/app/code\t', '/app/code\n', '/app/\u0000code', '/app/ code', '/app/code\u007f', '/app/code?x=a b', ' /app/code',
+        ]) {
+            expect(safeReturnUrl(url), JSON.stringify(url)).toBe(Routes.COMPUTERS);
+        }
+    });
+
+    it('case 3: every return page is kept byte for byte, query and hash included', () => {
+        for (const url of [
+            '/os', '/os?app=code', '/os?settings=billing&upgrade=pro#x',
+            ...[...SHELL_APP_IDS, ...Object.keys(SHELL_APP_ALIASES)].map(id => `/app/${id}`),
+            // `/` in a query value stays unencoded (what `returnUrlFor` writes); `%2F` there is data.
+            `/app/code?project=${P}&repo=${R}&path=src/main.ts`, `/app/code?project=${P}&repo=${R}&path=src%2Fmain.ts`,
+            '/app/desktop?computer=11111111-1111-4111-8111-111111111111', '/app/settings?tab=billing&section=ai-credits',
+            '/computers', '/computers?created=1#top',
+            '/computer/9d5b0a1e-0000-4000-8000-000000000000', '/computer/9D5B0A1E-0000-4000-8000-000000000000',
+            '/billing/return', '/billing/return?session_id=cs_test_1',
+        ]) {
+            expect(safeReturnUrl(url), url).toBe(url);
+        }
+    });
+
+    it('case 4: a rejected /app path lands on /os', () => {
+        for (const url of [
+            '/app', '/app/', '/app?x=1', '/app/unknown', '/app/launcher', '/app/Code', '/app/CODE', '/app/code/', '/app/code/x',
+            '/app/../x', '/app/../os', '/app/./code', '/app/%2e%2e/x', '/app/%2E%2E/x', '/app/code%2fx', '/app/code%2F..%2Fadmin', '/app/code%5cx', '/app/%63ode',
+            '/app/__proto__', '/app/constructor', '/app/hasOwnProperty',
+        ]) {
+            expect(safeReturnUrl(url), url).toBe(Routes.OS);
+        }
+        // Not under /app: a prefix match on the string would get these wrong.
+        for (const url of ['/apps', '/application', '/app%2fcode', '/appcode']) expect(safeReturnUrl(url), url).toBe(Routes.COMPUTERS);
+    });
+
+    /**
+     * Case 5. Base (before `/app/<id>`) kept every path that passed the shape
+     * checks; these pages now land on /computers. No producer in this
+     * repository sends them (docs/APP-ROUTES.md §6). Rejected input landing on
+     * /computers is also asserted, unchanged, by:
+     *   app/src/app/login/page.test.ts                  ("rejects a foreign return URL")
+     *   app/src/app/auth/auth0/callback/route.test.ts   (signed-cookie and query destinations)
+     *   app/src/server/auth/auth0.test.ts               ("sanitises returnUrl")
+     *   app/src/app/auth/confirm/confirm-route.test.ts  (hostile `next`)
+     */
+    it('case 5: any other rejected path lands on /computers, including pages base used to keep', () => {
+        for (const url of [
+            // Kept by base, refused now (the compatibility table).
+            '/', '/?x=1', '/pricing', '/login', '/admin', '/admin/users', '/os/', '/os/x', '/computers/', '/billing/return/',
+            // Never return pages.
+            '/os%2fadmin', '/os/../admin', '/os/%2e%2e/admin', '/osx', '/computers/../admin', '/computer/not-a-uuid', '/computer/../os',
+            '/computer/9d5b0a1e-0000-4000-8000-000000000000/x', '/api/trpc/x', '/auth/callback', '/os/bundle.min.js',
+        ]) {
+            expect(safeReturnUrl(url), url).toBe(Routes.COMPUTERS);
+        }
+    });
+});
+
 describe('the /app/<id> allowlist', () => {
     it('accepts exactly the registry ids and aliases', () => {
         for (const id of [...SHELL_APP_IDS, 'browser']) {

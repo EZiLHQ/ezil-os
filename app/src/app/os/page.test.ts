@@ -17,6 +17,7 @@ import AppPage from '../app/[appId]/page';
 import { safeReturnUrl } from '@/utils/constants';
 // The shell's own parser, so the sign-in round trip is proved end to end.
 import { parseAppLink } from '../../../../shell/ezil/app-link.js';
+import { routeLaunchContext } from '../../../../shell/ezil/app-history.js';
 const id = '11111111-1111-4111-8111-111111111111';
 beforeEach(() => {
     vi.clearAllMocks();
@@ -106,13 +107,35 @@ describe('/app/<appId> (docs/APP-ROUTES.md)', () => {
     });
 
     it.each([
+        ['code', {}, '/app/code'],
         ['settings', { tab: 'billing' }, '/app/settings?tab=billing'],
         ['browser', { computer: id }, `/app/browser?computer=${id}`],
         ['desktop', {}, '/app/desktop'],
+        ['desktop', { computer: id }, `/app/desktop?computer=${id}`],
     ] as const)('sign-in for /app/%s returns to it', async (appId, query, expected) => {
         const returnUrl = await signInDestination(() => app(appId, query));
         expect(returnUrl).toBe(expected);
         expect(safeReturnUrl(returnUrl)).toBe(expected);
+    });
+
+    /**
+     * What the shell does with that return (docs/APP-ROUTES.md §6, "After
+     * sign-in"): its boot opens the linked app from the URL, with no click.
+     * Code opens in full view; the Browser (`desktop`, alias `browser`) gets
+     * no view. Each window's own open then mints through the server's
+     * `ensure()`, which starts a stopped computer; that is not tested here.
+     */
+    it('🔴 /app/code and /app/desktop come back as the same app: Code in full view, the Browser with no view', async () => {
+        const apps = [{ id: 'code' }, { id: 'desktop' }];
+        for (const [appId, opened, launch] of [
+            ['code', 'code', { view: 'full' }], ['desktop', 'desktop', {}], ['browser', 'desktop', {}],
+        ] as const) {
+            const returnUrl = safeReturnUrl(await signInDestination(() => app(appId, { computer: id })));
+            expect(returnUrl, appId).toBe(`/app/${appId}?computer=${id}`);
+            const link = parseAppLink(returnUrl, apps);
+            expect(link, appId).toEqual({ id: opened });
+            expect(routeLaunchContext(link, { hasWindow: false }), appId).toEqual(launch);
+        }
     });
 
     it('🔴 an id the shell registry does not know is a 404, before any session lookup', async () => {

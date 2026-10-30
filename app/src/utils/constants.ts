@@ -113,10 +113,25 @@ export function getReturnUrlQueryParam(pathname: string): string {
  *     followed a bad link — but it also does not get the benefit of the
  *     doubt that a plain sign-in gets: it lands on `Routes.COMPUTERS`, the
  *     plain list view, rather than on the shell.
+ *
+ * Compatibility (docs/APP-ROUTES.md §6 has the table). Before `/app/<id>`
+ * existed, any path that passed the shape checks was kept, so a few paths
+ * that used to come back now land on `/computers`: `/`, `/pricing`,
+ * `/login`, `/admin/*`, `/os/`, `/computers/`. No producer in this repository
+ * sends any of them. The cases below are numbered as the tests name them
+ * (`constants.test.ts`, "compatibility decisions"); their ORDER is part of
+ * the rule.
  */
 export function safeReturnUrl(value: string | string[] | undefined | null): string {
+    // Case 1 — nothing supplied. A repeated parameter counts by its first
+    // value only, so `?returnUrl=/os&returnUrl=https://evil` cannot widen.
     const raw = Array.isArray(value) ? value[0] : value;
     if (typeof raw !== 'string' || raw.length === 0) return Routes.OS;
+    // Case 2 — hostile shapes, refused before the path is read at all, and so
+    // BEFORE case 4: `/app\..\admin` or `/app/code<TAB>` is not "an /app path
+    // we cannot vouch for", it is a smuggling attempt, and lands on
+    // `/computers`. Not a path (a scheme, a relative path); protocol-relative
+    // `//` and `/\`; a backslash anywhere, query included.
     if (!raw.startsWith('/')) return Routes.COMPUTERS;
     if (raw.startsWith('//') || raw.startsWith('/\\') || raw.includes('\\')) return Routes.COMPUTERS;
     // Control characters and whitespace, checked by codepoint rather than
@@ -127,17 +142,36 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     }
     const end = raw.search(/[?#]/);
     const path = end === -1 ? raw : raw.slice(0, end);
+    // Case 3 — one of this app's return pages: kept byte for byte, query and
+    // hash included. The query is data: `path=src/main.ts` keeps its `/`
+    // (see `returnUrlFor`) and `%2F` there is ordinary encoding.
     if (isReturnPath(path)) return raw;
-    return path === Routes.APP || path.startsWith(`${Routes.APP}/`) ? Routes.OS : Routes.COMPUTERS;
+    // Case 4 — a rejected `/app` path (`/app`, `/app/`, `/app/unknown`,
+    // `/app/Code`, `/app/../x`, `/app/%2e%2e/x`, `/app/code%2fx`,
+    // `/app/code/x`): the person was on their way into the OS.
+    if (path === Routes.APP || path.startsWith(`${Routes.APP}/`)) return Routes.OS;
+    // Case 5 — any other rejected path, including every page base accepted
+    // and this list does not (see "Compatibility" above). Unchanged from
+    // before `/app/<id>` for rejected input; the login page, the Auth0 flow
+    // and `/auth/confirm` each have a test that asserts it.
+    return Routes.COMPUTERS;
 }
 
 const UUID_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** The pages a sign-in may return to. Producers: `/os` and `/app/[appId]`
- * pages, `computers/layout.tsx`, `computer/layout.tsx`, `billing/return`. */
+/** The pages a sign-in may return to, matched as whole paths (so no dot
+ * segment, encoded separator, trailing slash or extra segment can pass). */
 function isReturnPath(path: string): boolean {
+    // `/os`: the shell; `?app=` / `?settings=` live in its query. Produced by
+    // the `/os` page, the pricing CTA and `EZIL_ID_SIGN_IN_URL`.
+    // `/computers`: `computers/layout.tsx`. `/billing/return`: its own page.
     if (path === Routes.OS || path === Routes.COMPUTERS || path === '/billing/return') return true;
+    // `/app/<id>`: one segment, an allowlisted registry id or alias,
+    // case-sensitive (`isShellAppId`: an exact entry of `SHELL_APP_IDS` or an
+    // own key of `SHELL_APP_ALIASES`, so `__proto__` and friends fail).
+    // Produced by the `/app/[appId]` page.
     if (path.startsWith(`${Routes.APP}/`)) return isShellAppId(path.slice(Routes.APP.length + 1));
+    // `/computer/<uuid>`: `computer/layout.tsx` (`x-pathname`); either case.
     if (path.startsWith(`${Routes.COMPUTER}/`)) return UUID_PATH.test(path.slice(Routes.COMPUTER.length + 1));
     return false;
 }
