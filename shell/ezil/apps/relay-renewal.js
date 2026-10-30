@@ -1,8 +1,9 @@
 /**
  * One serialized renewal loop per viewer; short-lived credentials stay server-side.
  * A `relay_runtime_changed` refusal is not a failure to count: the desktop was
- * restarted under this viewer (Restart desktop, a switch, a computer restart), so
- * the loop stops and hands over to `onRuntimeChanged`, which re-opens the desktop.
+ * restarted under this viewer (Restart computer, a switch, or any other restart
+ * of the desktop stack), so the loop stops and hands over to `onRuntimeChanged`,
+ * which re-opens the desktop.
  */
 export function createRelayRenewal({ state, refresh, onState, onRuntimeChanged, now = Date.now,
     schedule = setTimeout, cancel = clearTimeout }) {

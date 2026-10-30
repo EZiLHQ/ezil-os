@@ -16,6 +16,12 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  * is what turns the control on; neither alone does anything, and the key must
  * be removed the moment this file is.
  *
+ * Callers today (app-code lane A2, 2026-10-30): Troubleshoot's "Restart
+ * desktop" is gone, and troubleshoot.js posts only `scope: 'computer'`
+ * (Restart computer). `scope: 'desktop'`, the default when `scope` is absent,
+ * is still accepted here with no UI caller: `session.restartDesktop()` (which
+ * sends no scope) is kept, and nothing in the shell calls it.
+ *
  * 🔴 `maxDuration = 300`, matching `../desktop/route.ts` rather than
  * `../focus/route.ts`, and that is the point of difference between them. A
  * focus switch is one 150-400ms `exec`. A restart is a SIGTERM the Worker will

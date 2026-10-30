@@ -40,6 +40,6 @@ Forbidden in every case:
 - the user's files from before the rebase are still present (persistence);
 - chat send, abort and retry;
 - clipboard both ways (Code and Browser);
-- restart desktop;
+- restart computer (Settings → Troubleshoot; "Restart desktop" was removed on 2026-10-30);
 - Mumbai placement compared with egress.
 Then the snapshot hold follows the normal retention rules. Nothing is deleted manually.

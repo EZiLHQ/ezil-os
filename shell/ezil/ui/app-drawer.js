@@ -20,8 +20,9 @@
 //   MODIFIED: the fixed icon/title/minimise/close row -> a declarative
 //     `actions` array, so Settings can be added without touching this file.
 //   MODIFIED: `push/pop_dashboard_app_url` and the
-//     `dashboard-app-windows-changed` event are gone. EZiL's shell does not
-//     own the address bar; `/os` is one URL.
+//     `dashboard-app-windows-changed` event are gone. The address bar
+//     (`/app/<id>`, docs/APP-ROUTES.md) belongs to `../app-history.js`, which
+//     follows window focus and close events; this drawer never writes it.
 //
 // ── 🔴 Why this tray is not optional ──────────────────────────────────────
 // `window.enter_fullpage_mode` (shell/src/UI/UIDesktopFullpage.js) does
