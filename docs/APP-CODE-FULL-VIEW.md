@@ -80,7 +80,11 @@ The title is 15px / 600 and the body is 13px at opacity 0.75. The Start button
 uses the accent style of the existing "Try again" button.
 
 - **Start is the existing safe wake.** `start_boot()` runs the window's own mint: `mintCodePreviewUrl` → `session.cancellableWake`, whose server-side `ensure()` starts a stopped computer. "Try again" already uses it, and Stop can cancel it through `session.cancelComputerOpens`. Every exit re-mints the same Code URL through that path and never navigates anywhere else.
-- **Behaviour change.** Before this lane, the return-from-away check called `start_boot()` directly. That started a stopped computer, including one its owner had stopped from another tab or device, just because the tab regained focus. Now only an explicit Start, or the computer already running again, re-mints. This is the same rule as hotfix r5's hover-warm hold.
+- **Behaviour change (Code only; needs owner sign-off).** Before this lane, Code's return-from-away check called `start_boot()` directly. That started a stopped computer, including one its owner had stopped from another tab or device, just because the tab regained focus. Now the Code window re-mints only on an explicit Start, or once the computer is already running again. This is not a tab-wide rule. The Browser window's own return check (`desktop-window.js`, `reboot: () => { void start_boot(); }`) is unchanged, because this lane does not change Browser behaviour. In practice:
+  - **Code alone:** "Computer stopped" stays up until the user presses Start.
+  - **Code with the Browser open:** the Browser starts the computer on return, and Code's stopped-state probe then sees it running and re-mints by itself.
+  - **Owner decision.** One option is to keep this and align the Browser in a later lane. The other is to revert Code to `reboot: () => { void start_boot(); }`, which turns red the code-test 7k checks that pin the current behaviour (mutant b gives 125/130, with 5 checks failing).
+  - **Hand-off.** The header of `shell/ezil/runtime-recheck.js` (lines 21-22) still says that a live window "reboots, through its own `start_boot()`". It should say that each window's `reboot` callback decides what happens: the Browser calls `start_boot()`, and Code shows "Computer stopped".
 - **Not reachable from Stop in this tab.** Settings → Computers → Stop closes every sandbox window, Code included, before it posts `/api/shell/stop` (`closeSandboxWindows`). The stopped state therefore covers stops this tab did not make: idle-stop, or another tab or device.
 
 ## 5. Not done here (deferred)
@@ -88,3 +92,25 @@ uses the accent style of the existing "Try again" button.
 - Pixel review of every value above.
 - With `desktopState.ui.floatingControls === true`, the fenced Feedback sync hides the icon in every full-bleed window, so Code's full view would have no Feedback icon. Today that flag is always false.
 - A Settings button in Code's drawer (Browser "Guarantee #1") needs `wants_settings_in_drawer: true` on the `code` registry entry (registry.js, not this lane's). Today the top bar's Restore and Minimise bring the taskbar, and its Settings icon, back in one click.
+
+## 6. Hand-offs outside this lane (from the removal of "Restart desktop")
+
+These files are not this lane's to edit.
+
+- **Merge blocker: `shell/ezil/ui/Settings/troubleshoot-test.mjs` check 4 (lines 48-61).** CI runs this file (ci.yml node-suite list). Check 4 still requires `RESTART_DESKTOP_TIME` and the Restart desktop copy, so it fails as soon as this lane lands. Rewrite it to test both sides:
+  - Present: the Restart computer heading, copy and `data-action="restart-computer"`, and that copy passes `scanCopy`.
+  - Absent: `RESTART_DESKTOP_TIME`, "Restarts the desktop and its apps", `<h3>Restart desktop</h3>`, `data-action="restart"` and `sheet: 'confirm-restart'`.
+  - The integrator must apply this in the same merge.
+- **`e2e/billing-staging-journey.mjs` persistence step (lines 576, 614-630, 643; fixture `billing-staging-journey.test.mjs:226`).** The step drives `[data-action="restart"]`, so it would time out and FAIL. It is not a SKIP, because `restartUnavailableReason('')` is null.
+  - **Minimal fix:** pass the skip reason `'restart_desktop_removed'` to `record('persistence', …)` at line 783.
+  - **Full fix:** rewrite the step for Restart computer, which needs all of these:
+    - selector `[data-action="restart-computer"]`;
+    - confirm through `[role="dialog"][data-sheet="confirm-restart-computer"]`, using the button "Restart computer" scoped to that sheet, because the pane's own button has the same name;
+    - success copy "Your computer restarted.";
+    - a wait of at least 300 s;
+    - assert the `/workspace/.e2e-persist.txt` marker, not `~/e2e-persist.txt`, because a computer restart stops the machine.
+- **Stale wording:**
+  - `docs/aws-computers/LEGACY-REBASE-OPERATOR-PRESERVATION.md:43` lists "restart desktop" as an acceptance step. It should be "restart computer".
+  - `shell/ezil/apps/relay-renewal.js:4` names "Restart desktop" as a cause. Only Restart computer and a switch remain.
+  - The header of `app/src/app/api/shell/restart/route.ts:12` names troubleshoot.js plus `session.restartDesktop()` as the caller. Troubleshoot now posts only `scope: 'computer'`.
+- **`shell/ezil/runtime-recheck.js:21-22`**: see §4, "Behaviour change".

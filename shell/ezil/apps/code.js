@@ -799,13 +799,16 @@ export async function openCodeWindow (ctx = {}) {
     // stale frame is used (`../runtime-recheck.js`).
     //
     // MODIFIED 2026-10-30 (lane A2): a computer found STOPPED is no longer
-    // started again just because this tab regained focus. It used to
-    // `start_boot()` here, and that mint's ensure() starts a stopped computer —
-    // including one its owner stopped from another tab or device. Now the frame
-    // is covered by "Computer stopped" with an explicit Start, and the state
-    // re-mints on its own as soon as the computer is running again (see
-    // `show_state`). Same rule as hotfix r5's hover-warm hold: only an
-    // explicit open starts a stopped computer.
+    // started again by THIS window just because the tab regained focus. It
+    // used to `start_boot()` here, and that mint's ensure() starts a stopped
+    // computer — including one its owner stopped from another tab or device.
+    // Now the frame is covered by "Computer stopped" with an explicit Start,
+    // and the state re-mints on its own as soon as the computer is running
+    // again (see `show_state`). This is Code's rule only: the Browser window's
+    // own return check (`desktop-window.js`, unchanged) still `start_boot()`s,
+    // so with the Browser open the computer still starts on return and this
+    // cover then re-mints by itself. Pending owner sign-off
+    // (docs/APP-CODE-FULL-VIEW.md §4); the revert is `void start_boot()` here.
     const stop_runtime_recheck = heartbeat_timer === null ? null : watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
