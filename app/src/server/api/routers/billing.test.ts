@@ -1415,6 +1415,33 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', awsSize: null } });
     });
 
+    it('round 6 review (dunning into the hold): after grace both read epochs from Free\'s month and rate the computer as Free', async () => {
+        // A Premium renewal on 10-03 failed at once; grace ended 10-10; on 10-11 the computer runs as Free (Oct 1 - Nov 1).
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'past_due',
+            currentPeriodStart: new Date('2026-10-03T00:00:00Z'), currentPeriodEnd: new Date('2026-11-03T00:00:00Z') })]);
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in_fail', userId, subscriptionId: 'sub_fixture', invoiceKind: 'subscription',
+            issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-10-03T00:00:00Z'), resolvedAt: null, updatedAt: now }]);
+        f.store.grantsForPeriod.mockResolvedValue([]);
+        f.store.epochsFor.mockResolvedValue([{ id: 'hold', userId, computerId: C1, size: 'std-2', weight: 1, readyAt: '2026-10-11T11:30:00Z',
+            endedAt: null, endReason: null, overheadSeconds: 0, deadlineAt: '2026-10-11T12:29:59Z', lastHeartbeatAt: null }]);
+        const free = { start: new Date('2026-10-01T00:00:00Z'), periodStart: new Date('2026-10-03T00:00:00Z') };
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'premium_monthly_v3', status: 'past_due' },
+            computer: { standing: 'files_on_aws', sessionMaxSeconds: 3600, activeDeadline: '2026-10-11T12:29:59Z' }, fairUse: { status: 'ok' } });
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString(), free.start.toISOString()]);
+        f.store.epochsFor.mockClear();
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ period: { startsAt: '2026-10-01T00:00:00Z',
+            allowanceStandardSeconds: 8 * 3600, usedStandardSeconds: 1800, currentSize: 'std-2' } });
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString(), free.start.toISOString()]);
+        // Paid access (no issue): one read from the paid period's start, as before.
+        f.store.openPaymentIssues.mockResolvedValue([]);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3',
+            currentPeriodStart: new Date('2026-10-03T00:00:00Z'), currentPeriodEnd: new Date('2026-11-03T00:00:00Z') })]);
+        f.store.epochsFor.mockClear();
+        await f.caller.summary();
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString()]);
+    });
+
     it('an unreadable volume (error, missing, no AWS placement) shows 50 and never fails the summary or usage', async () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         for (const f of [withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: new Error('AccessDenied') }),

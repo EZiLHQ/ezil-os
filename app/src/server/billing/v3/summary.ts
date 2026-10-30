@@ -9,8 +9,8 @@ import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf, HOLD_SIZE } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
-import { CATALOG_V3_VERSION, type BillingSummaryV3, type SellableSkuV3 } from './contract';
-import { deriveStanding } from './standing';
+import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
+import { deriveStanding, paidAccess } from './standing';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
 import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
@@ -51,6 +51,18 @@ export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow
     if (options.grace && rows.length === 0) return plan.offer.fairUseSeconds;
     const amount = rows.reduce((sum, grant) => sum + grant.amount, BigInt(0));
     return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
+}
+
+/**
+ * Round 6 review (dunning into the hold): the plan the COMPUTER runs under. A paid subscription without paid
+ * access (grace over, raw unpaid, never paid; STANDING-CONTRACT) runs the computer as Free, with Free's
+ * calendar month, session cap and allowance, exactly as the start gate does (compute-access.ts
+ * loadComputeBillingState). The plan block still names the subscription and its payment issue.
+ */
+export function computePlanV3(plan: ResolvedPlanV3, standing: ComputeStandingV3,
+    input: Parameters<typeof planFromSubscriptions>[0]): ResolvedPlanV3 {
+    if (plan.sku !== 'standard_monthly_v3' && plan.sku !== 'premium_monthly_v3') return plan;
+    return paidAccess(standing) ? plan : planFromSubscriptions({ ...input, subs: [] });
 }
 
 type AiBucket = 'included' | 'previous' | 'purchased' | 'starter';
@@ -222,32 +234,34 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         && issue.resolvedAt === null && issue.issue !== 'voided' && issue.invoiceKind === 'subscription');
     const paymentIssue = issues.some(issue => issue.issue === 'requires_action') ? 'requires_action'
         : issues.length || plan.status === 'past_due' || plan.status === 'incomplete' ? 'payment_failed' : null;
-    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants, { grace: standing.standing === 'grace' });
-    const bounds = { sessionMaxSeconds: plan.sessionMaxSeconds, allowanceStdSeconds: allowance };
-    const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now, bounds);
+    // Round 6 review: after a dunning cancel the computer runs as Free (window, session cap, allowance).
+    const rated = computePlanV3(plan, standing.standing, input);
+    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(rated, input.grants, { grace: standing.standing === 'grace' });
+    const bounds = { sessionMaxSeconds: rated.sessionMaxSeconds, allowanceStdSeconds: allowance };
+    const usedSeconds = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, rated.window, input.now, bounds);
     // Round 4 D16: under the hold the computer that opens is the held AWS computer at HOLD_SIZE, not the
     // Free offer's Cloudflare size, so Billing agrees with the Computer and System tabs (2 vCPU / 8 GB).
-    const size = legacy ? SIZES[legacy.compute.selectedSize] : plan.sku === 'legacy' ? SIZES[plan.offer.defaultSize]
+    const size = legacy ? SIZES[legacy.compute.selectedSize] : rated.sku === 'legacy' ? SIZES[rated.offer.defaultSize]
         : standing.standing === 'files_on_aws' ? SIZES[HOLD_SIZE]
-        : SIZES[input.sizePreference !== null && plan.offer.machineChoice.includes(input.sizePreference)
-            ? input.sizePreference : plan.offer.size];
+        : SIZES[input.sizePreference !== null && rated.offer.machineChoice.includes(input.sizePreference)
+            ? input.sizePreference : rated.offer.size];
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
     // Recompute uncapped deadlines from period usage before this epoch. Old paid
     // epochs may still carry a 2/6-hour session deadline; it is no longer a limit.
-    const priorUsage = latest && plan.sessionMaxSeconds === null ? usedSecondsInWindow(
-        input.epochs.filter(epoch => epoch.id !== latest.id), plan.window, new Date(latest.readyAt), bounds) : 0;
-    const fairDeadline = latest && plan.sessionMaxSeconds === null
+    const priorUsage = latest && rated.sessionMaxSeconds === null ? usedSecondsInWindow(
+        input.epochs.filter(epoch => epoch.id !== latest.id), rated.window, new Date(latest.readyAt), bounds) : 0;
+    const fairDeadline = latest && rated.sessionMaxSeconds === null
         ? allowance <= priorUsage ? epochSeconds(input.now)
-            : Math.max(epochSeconds(latest.readyAt, 'ceil'), epochSeconds(plan.window.start))
+            : Math.max(epochSeconds(latest.readyAt, 'ceil'), epochSeconds(rated.window.start))
                 + Math.floor((allowance - priorUsage) / latest.weight)
         : latest ? epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight) : Infinity;
     const activeDeadline = legacy ? legacy.compute.session.activeDeadline : latest ? isoSeconds(Math.min(
-        epochSeconds(latest.readyAt, 'ceil') + (plan.sessionMaxSeconds ?? Infinity),
-        plan.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
+        epochSeconds(latest.readyAt, 'ceil') + (rated.sessionMaxSeconds ?? Infinity),
+        rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     )) : null;
-    const disk = storageDisk(plan, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
+    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
@@ -257,9 +271,9 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         status: pendingUpgrade && plan.planActive ? 'upgrade_pending' : plan.status,
         renewal: plan.renewsAt !== null ? input.renewal ?? null : null, cancelsAt: plan.cancelsAt,
         scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt },
-        computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: plan.sessionMaxSeconds,
-            opening: plan.sku === 'legacy' ? 'standard' : plan.offer.opening, activeDeadline,
-            machineChoice: (plan.sku === 'legacy' ? [size.code] : plan.offer.machineChoice).map(code => ({
+        computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
+            opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
+            machineChoice: (rated.sku === 'legacy' ? [size.code] : rated.offer.machineChoice).map(code => ({
                 size: code, vcpu: SIZES[code].vcpu, memoryGiB: SIZES[code].memoryGiB, weight: SIZES[code].weight, arch: 'x86_64' as const,
                 // D3 + the W0 pin: no per-configuration disk figure until a grow path exists (a switch keeps
                 // the computer's volume); the plan disk is on the plan card (offer storageGiB) only.
@@ -273,7 +287,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
-        fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: plan.window.end },
+        fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.

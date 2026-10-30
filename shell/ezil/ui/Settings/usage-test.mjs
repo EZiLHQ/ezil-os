@@ -304,6 +304,18 @@ check('round 6 review (R4-02): a held 4 or 8 vCPU computer says it can\'t open o
     assert.match(meter(open, 'compute').textContent, /Free sessions last up to 1 hour\./);
     assert.doesNotMatch(open.textContent, /can't open/);
 });
+check('round 6 review (dunning into the hold): a paid plan past its grace says Free\'s month and session, with Fix payment', () => {
+    const lapsed = { ...heldSummary, plan: { sku: 'premium_monthly_v3', name: 'Premium', status: 'past_due', renewal: null, cancelsAt: null,
+        scheduledChange: null, pendingUpgrade: null, paymentIssue: 'payment_failed' }, actions: { ...summary.actions, portal: true, checkout: false } };
+    const el = rendered({ ...heldUsage, period: { ...heldUsage.period, usedStandardSeconds: 1800, remainingStandardSeconds: 27000, remainingHoursAtCurrent: 7,
+        equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] } }, lapsed);
+    assert.match(meter(el, 'compute').querySelector('.usage-value').textContent, /^About 7 of 8 hours left this month$/);
+    assert.match(meter(el, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.match(el.textContent, /Fix payment/);
+    assert.doesNotMatch(el.textContent, /Computer time is used up|at 2 vCPU/);
+    assert.deepEqual(scanCopy(el.textContent), []);
+    assert.doesNotMatch(el.textContent, /mumbai|ap-south-1/i);
+});
 check('round 6: AI credits on Free after a cancel — no full bar, the 100 said once, the 663 named with their expiry', () => {
     const el = rendered(heldUsage, heldSummary);
     const ai = meter(el, 'ai');

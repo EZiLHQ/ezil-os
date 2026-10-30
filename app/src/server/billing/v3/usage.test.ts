@@ -146,6 +146,22 @@ describe('round 6 settings truth: Free, and Free held on AWS (D16)', () => {
             expect(result.storage.disk.provisionedGiB).toBeNull();
         }
     });
+    it('round 6 review (dunning into the hold): after grace the period is Free\'s month and legacy 8 h, as the start gate rates it', () => {
+        // A Premium renewal failed on 11-01, grace ended 11-08, the files are on AWS; a std-2 hold session runs at 11-12 12:00.
+        const lapsed = held(); lapsed.now = new Date('2026-11-12T12:00:00Z');
+        lapsed.subs = [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'past_due',
+            currentPeriodStart: new Date('2026-11-01Z'), currentPeriodEnd: new Date('2026-12-01Z'), cancelAtPeriodEnd: false }];
+        lapsed.paymentIssues = [{ subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed', resolvedAt: null,
+            stripeEventCreated: new Date('2026-11-01T01:00:00Z') } as Input['paymentIssues'][number]];
+        lapsed.epochs = [{ ...epoch, size: 'std-2', weight: 1, readyAt: '2026-11-12T11:30:00Z', deadlineAt: '2026-11-12T12:29:59Z',
+            lastHeartbeatAt: '2026-11-12T11:59:30Z' } as StoredComputeEpoch];
+        expect(buildUsageV3(lapsed).period).toMatchObject({ startsAt: '2026-11-01T00:00:00Z', resetsAt: '2026-12-01T00:00:00Z',
+            allowanceStandardSeconds: 8 * 3600, usedStandardSeconds: 1800, remainingHoursAtCurrent: 7, currentSize: 'std-2',
+            equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] });
+        // In grace (11-05) with the renewal unpaid: the plan's fair use, as the summary (never 0 = "used up").
+        const grace = { ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] };
+        expect(buildUsageV3(grace).period.allowanceStandardSeconds).toBe(500 * 3600);
+    });
     it('a paid account in its payment grace is not held, even with an AWS placement', () => {
         const grace = input(); grace.placementProvider = 'aws-ec2';
         grace.subs = [{ ...grace.subs[0]!, status: 'past_due' }];

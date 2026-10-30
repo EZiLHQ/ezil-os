@@ -71,7 +71,8 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const hoursPeriod = Number.isSafeInteger(period.remainingHoursAtCurrent) ? { ...period, currentSize }
         : count(period.remainingStandardSeconds) ? { ...period, currentSize, remainingHoursAtCurrent: Math.floor(period.remainingStandardSeconds / weight / 3600) } : null;
     // Round 6 (R1-06): Free (also held on AWS) has one size and a calendar-month allowance: "About 5 of 8 hours left this month".
-    const free = plan?.sku === 'free_v3';
+    // Review: a paid plan past its payment grace runs the computer as Free too (the standing says so, not the SKU).
+    const free = plan?.sku === 'free_v3' || ['files_on_aws', 'free'].includes(summary?.computer?.standing);
     const lines = hoursLeftLines(hoursPeriod, choices, { monthly: free });
     const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
     const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;

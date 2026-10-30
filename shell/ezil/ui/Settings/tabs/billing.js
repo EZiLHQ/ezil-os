@@ -269,8 +269,9 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
 export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
-    // Round 6 (R1-06): Free (also held on AWS) says the month's allowance, "About 5 of 8 hours left this month".
-    const lines = hoursLeftLines(period, computer.machineChoice, { monthly: plan?.sku === 'free_v3' });
+    // Round 6 (R1-06): Free (also held on AWS) says the month's allowance, "About 5 of 8 hours left this month";
+    // review: so does a paid plan past its payment grace (the standing runs the computer as Free).
+    const lines = hoursLeftLines(period, computer.machineChoice, { monthly: plan?.sku === 'free_v3' || ['files_on_aws', 'free'].includes(computer.standing) });
     const hours = lines ? period.remainingHoursAtCurrent : null;
     const value = hours === null ? usage === null ? 'Checking…' : 'Not measured yet' : hours === 0 && period.remainingStandardSeconds > 0 ? 'Less than 1 h left' : `${whole(hours)} h left`;
     const percent = lines && safeCount(period.remainingStandardSeconds) && safeCount(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0

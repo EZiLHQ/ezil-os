@@ -436,6 +436,14 @@ check('Round 4: after grace the plan block may still describe the past_due paid 
     // Round 6: the held std-2 is current; only the sizes the hold cannot open are locked.
     assert.deepEqual(states(held), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
     assert.ok(! /data-action="switch-config"/.test(computerHtml(held, stoppedAws(), [])));
+    // Round 6 review: the server rates a lapsed plan's computer as Free (1-hour sessions, Free's month), so the hold
+    // line and the session end show for a dunning hold exactly as for an immediate cancel.
+    const lapsedRunning = withStanding({ ...premium(), computer: { ...premium().computer, sessionMaxSeconds: 3600, activeDeadline: '2026-10-30T06:42:00Z' } },
+        'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
+    const dunning = computerModel({ computer: me, data: lapsedRunning, prog: running(), usage: heldUsage, now: HELD_NOW });
+    assert.equal(dunning.holdLine, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+    assert.equal(dunning.sessionEnds, '2026-10-30T06:42:00Z');
+    assert.match(scan(computerHtml(dunning, running(), [])), /data-role="session-ends"/);
     const onCf = computerModel({ computer: me, data: withStanding(premium(), 'free', { filesOn: 'cloudflare' }, { status: 'past_due', paymentIssue: 'payment_failed' }),
         prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true });
     assert.deepEqual(states(onCf), { 'free-cf': 'current', 'std-2': 'locked', 'cmp-4': 'locked', 'cmp-8': 'locked' });

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
+import { planFromSubscriptions } from './catalog';
 import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
@@ -295,6 +296,33 @@ describe('round 4: standing fields (additive)', () => {
             computer: { standing: 'grace' }, fairUse: { status: 'ok' } });
         expect(buildSummaryV3({ ...args, grants: [{ ...input('premium_monthly_v3').grants[0]!, amount: BigInt(0) }] }).fairUse.status).toBe('paused');
         expect(buildSummaryV3({ ...args, now: new Date('2026-10-22T00:00:00Z') }).computer).toMatchObject({ standing: 'files_on_aws', heldSince: '2026-10-22T00:00:00Z' });
+    });
+    it('round 6 review (dunning into the hold): after grace the computer is rated as Free, as the start gate rates it', () => {
+        // A Premium renewal failed on 11-01, grace ended 11-08, the files are on AWS; a std-2 hold session runs at 11-12 12:00.
+        const at = new Date('2026-11-12T12:00:00Z');
+        const lapsed: Input = { ...input('premium_monthly_v3'), now: at, userCreatedAt: new Date('2026-09-01T00:00:00Z'), grants: [],
+            placementProvider: 'aws-ec2', volumeGiB: 50,
+            subs: [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'past_due', currentPeriodStart: new Date('2026-11-01T00:00:00Z'),
+                currentPeriodEnd: new Date('2026-12-01T00:00:00Z'), cancelAtPeriodEnd: false }],
+            paymentIssues: [{ stripeInvoiceId: 'in', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed',
+                hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-11-01T01:00:00Z'), resolvedAt: null, updatedAt: at }],
+            epochs: [epoch({ size: 'std-2', weight: 1, readyAt: '2026-11-12T11:30:00Z', deadlineAt: '2026-11-12T12:29:59Z' })] };
+        const free = planFromSubscriptions({ subs: [], now: at, userCreatedAt: lapsed.userCreatedAt });
+        const summary = buildSummaryV3(lapsed);
+        // The plan block still names the unpaid subscription; the computer runs under Free's limits and month.
+        expect(summary.plan).toMatchObject({ sku: 'premium_monthly_v3', status: 'past_due', paymentIssue: 'payment_failed' });
+        expect(summary.computer).toMatchObject({ standing: 'files_on_aws', size: 'std-2', sessionMaxSeconds: 3600,
+            activeDeadline: '2026-11-12T12:29:59Z', machineChoice: [{ size: 'free-cf' }] });
+        expect(summary.fairUse).toEqual({ status: 'ok', resetsAt: free.window.end });
+        // Without an AWS placement (standing free) it is still Free's limits, at Free's size.
+        expect(buildSummaryV3({ ...lapsed, placementProvider: null, epochs: [] }).computer).toMatchObject({ standing: 'free', size: 'free-cf', sessionMaxSeconds: 3600 });
+        // Still in grace (11-05): the paid plan's limits stand (no session cap, the paid period).
+        const grace = buildSummaryV3({ ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] });
+        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: null });
+        expect(grace.fairUse).toMatchObject({ status: 'ok', resetsAt: '2026-12-01T00:00:00Z' });
+        // A never-paid (incomplete) subscription is Free too.
+        expect(buildSummaryV3({ ...lapsed, subs: [{ ...lapsed.subs[0]!, status: 'incomplete' }], paymentIssues: [] }).computer)
+            .toMatchObject({ sessionMaxSeconds: 3600 });
     });
     it('round 6 (R1-06): the Free offer in the summary says the hours THIS account gets on Free; paid offers and publicOffers() are unchanged', () => {
         // FREE_V2_EFFECTIVE_AT is null: every account keeps the legacy 8 hours.

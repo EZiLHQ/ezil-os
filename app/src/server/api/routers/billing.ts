@@ -9,13 +9,15 @@ import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credi
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
-import type { BillingDeps, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
+import type { SubscriptionRow } from '@/server/billing/meters';
+import type { BillingDeps, PaymentIssueRow, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
+import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
+import { deriveStanding } from '@/server/billing/v3/standing';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -282,6 +284,21 @@ async function readVolumeGiB(volumes: readonly AwsVolumeRef[], read: (volume: Aw
     return Math.min(...sizes.map(size => typeof size === 'number' ? size : DISK_FALLBACK_GIB));
 }
 
+type StoredEpochs = Awaited<ReturnType<BillingDeps['store']['epochsFor']>>;
+
+/**
+ * Round 6 review (dunning into the hold): a paid subscription without paid access rates the computer on Free's
+ * calendar month (summary.ts `computePlanV3`), which can start before the unpaid period; the epochs are then
+ * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState).
+ */
+async function computeWindowEpochs(deps: BillingDeps, userId: string, epochs: StoredEpochs, input: {
+    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null }): Promise<StoredEpochs> {
+    const plan = planFromSubscriptions(input);
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
+    const rated = computePlanV3(plan, standing, input);
+    return Date.parse(rated.window.start) < Date.parse(plan.window.start) ? deps.store.epochsFor(userId, new Date(rated.window.start)) : epochs;
+}
+
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 /** The operator gate reuses the `/admin/telemetry` allow-list (`TELEMETRY_ADMIN_EMAILS`, fail-closed); no new env. */
 async function telemetryOperator(email: string | null | undefined): Promise<boolean> {
@@ -333,7 +350,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
             // Round 6 (R1-07/R1-09): the placement provider and open payment issues give usage the summary's
             // standing, so under the D16 hold both show the held AWS computer and its disk.
-            const [epochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
+            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
@@ -343,6 +360,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
                 deps.store.openPaymentIssues(ctx.user.id),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
                 hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider });
@@ -359,7 +377,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
+            const [periodEpochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
                 enrollmentState, ezilIdUrl] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
@@ -374,6 +392,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 aiEnrollmentOf(aiMember, ctx.db, ctx.user),
                 ezilIdSignInUrl(),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
                 try {

@@ -1033,6 +1033,13 @@ try {
         Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
         has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
+        // Round 6 review: past its grace the computer runs as Free, so the time meter says Free's month, not a size.
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 27000,
+            allowanceStandardSeconds: 28800, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 7, equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] } });
+        await refresh();
+        contains('[data-role="meter-time"]', 'About 7 of 8 hours left this month');
+        assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /left at 2 vCPU|Same as/);
+        getUsage = () => failure('unavailable');
         assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
         // Unknown or missing standing: no standing banner.
         for ( const standing of [undefined, 'moved'] ) {

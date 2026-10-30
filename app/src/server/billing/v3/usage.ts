@@ -6,7 +6,7 @@ import { HOLD_SIZE } from './admission';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
 import { deriveStanding } from './standing';
-import { fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow } from './summary';
+import { computePlanV3, fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow } from './summary';
 
 type Input = Parameters<typeof buildSummaryV2>[0] & {
     computerId?: string;
@@ -22,9 +22,14 @@ type Input = Parameters<typeof buildSummaryV2>[0] & {
 export function buildUsageV3(input: Input) {
     const plan = planFromSubscriptions(input);
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
-    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(plan, input.grants);
-    const used = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, plan.window, input.now,
-        { sessionMaxSeconds: plan.sessionMaxSeconds, allowanceStdSeconds: allowance });
+    // The summary's standing (round 6): the D16 hold, and (review) a dunning cancel rated as Free, with Free's
+    // month, session cap and allowance as the start gate rates it; in grace the plan's fair use, as the summary.
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        placementProvider: input.placementProvider ?? null, now: input.now });
+    const rated = computePlanV3(plan, standing, input);
+    const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(rated, input.grants, { grace: standing === 'grace' });
+    const used = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, rated.window, input.now,
+        { sessionMaxSeconds: rated.sessionMaxSeconds, allowanceStdSeconds: allowance });
     const now = epochSeconds(input.now);
     const epoch = input.epochs.filter(e => (!input.computerId || e.computerId === input.computerId)
         && epochSeconds(e.readyAt) <= now)
@@ -43,9 +48,8 @@ export function buildUsageV3(input: Input) {
     // validated next-open choice, else the plan default), plus the same time at every allowed size.
     // Round 6 (R1-07/R1-09): under the D16 hold the computer that opens is the held AWS computer at
     // HOLD_SIZE (as billing.summary), so its disk is the AWS volume and there is no Cloudflare equivalent.
-    const held = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
-        placementProvider: input.placementProvider ?? null, now: input.now }).standing === 'files_on_aws';
-    const choices: readonly SizeCode[] = held ? [HOLD_SIZE] : plan.sku === 'legacy' ? [plan.offer.defaultSize] : plan.offer.machineChoice;
+    const held = standing === 'files_on_aws';
+    const choices: readonly SizeCode[] = held ? [HOLD_SIZE] : rated.sku === 'legacy' ? [rated.offer.defaultSize] : rated.offer.machineChoice;
     const preferred = input.sizePreference !== null && choices.includes(input.sizePreference) ? input.sizePreference : choices[0]!;
     const running = epoch && epoch.endedAt === null ? epoch : undefined;
     const currentSize = running?.size ?? preferred;
@@ -61,14 +65,14 @@ export function buildUsageV3(input: Input) {
     // scopes the volume the same way); without a computer, every computer's latest sample, as before.
     const scopedId = input.computerId?.toLowerCase();
     const scopedStorage = scopedId ? input.storage.filter(sample => sample.computerId.toLowerCase() === scopedId) : input.storage;
-    const disk = storageDisk(plan, preferred, scopedStorage, input.config.largeStorageEnabled, input.volumeGiB);
+    const disk = storageDisk(rated, preferred, scopedStorage, input.config.largeStorageEnabled, input.volumeGiB);
     return {
         enabled: true as const, version: 1 as const, asOf: isoSeconds(now),
         session: { computerId: epoch?.computerId ?? input.computerId ?? null, state,
             startedAt: epoch?.readyAt ?? null, endedAt: epoch?.endedAt ?? null,
             observedAt: observed === null ? null : isoSeconds(observed),
             elapsedSeconds: ready === null || observed === null ? null : Math.max(0, (fresh && ended === null ? now : observed) - ready) },
-        period: { startsAt: plan.window.start, resetsAt: plan.window.end,
+        period: { startsAt: rated.window.start, resetsAt: rated.window.end,
             usedStandardSeconds: used, allowanceStandardSeconds: allowance,
             remainingStandardSeconds: remaining, unit: 'standard_seconds' as const,
             currentSize, currentWeight, remainingHoursAtCurrent: hoursLeftAtWeight(remaining, currentWeight),
