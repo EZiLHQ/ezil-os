@@ -15,6 +15,8 @@ import {
     type Placement, type PlacementDb, type PlacementExecutor,
 } from './placement';
 import { createProviderReverseStore, EXPORT_CHUNK_BYTES, type ComputeReverseMove } from './provider-reverse-store';
+import { readComputerProgress } from './progress';
+import { reverseMoveView, reversePlacementView } from './provider-reverse';
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const schema = `placement_reverse_test_${randomUUID().replaceAll('-', '')}`;
@@ -171,6 +173,41 @@ describe.skipIf(!PG)('reverse-move placement writers on production Drizzle Postg
             expect(cf).toMatchObject({ provider: 'cloudflare', generation: 1, leaseEpoch: 0 });
             expect(done).toMatchObject({ state: 'committed', awsVolumeId: volumeId, awsFsUuid: fsUuid, awsSnapshotId: null });
             expect((await reverse.readById(m.id))!).toMatchObject({ state: 'committed', retainUntil: expect.any(Date) });
+        });
+    });
+    /**
+     * §5.10 / §6.1 over real rows: the DTOs read the store's PostgreSQL timestamp text (`::text`, e.g. `… 07:49:50.123456+00`)
+     * and its DB-clock ages; every time they send is ISO 8601 and is the row's own (never the app clock, never null).
+     */
+    describe('the move\'s DTOs over real rows (§5.10, §6.1)', () => {
+        const ENV = { EZIL_COMPUTE_PLACEMENT_READS: '1', EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '0' };
+        const iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+        it('an in-flight row: the moving view\'s times are the row\'s, as ISO; percent and bytes from the stored progress', async () => {
+            await seed('MOUNTING');
+            const reverse = createProviderReverseStore(db);
+            const m = await reverse.createOrGetActive({ computerId, userId: ownerUserId, startedBy: 'open' });
+            const dbNow = new Date(String((await q(`SELECT clock_timestamp()::text AS t`))[0]!.t).replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00'));
+            const out = await readComputerProgress(db, { computerId, userId: ownerUserId }, ENV) as Record<string, unknown> & { move: Record<string, unknown> };
+            expect(out).toMatchObject({ operation: 'moving', stage: 'moving', recordedStage: 'requested', lifecycleState: null, needsOperator: false,
+                move: { moveId: m.id, phase: 'export_boot', step: 0, placementState: 'MOUNTING', outcome: null } });
+            for (const key of ['startedAt', 'updatedAt'] as const) expect(out[key], key).toMatch(iso);
+            for (const key of ['startedAt', 'phaseStartedAt'] as const) expect(out.move[key], key).toMatch(iso);
+            expect(Math.abs(Date.parse(out.startedAt as string) - dbNow.getTime())).toBeLessThan(60_000);
+            expect(out.startedAt).toBe(out.move.startedAt);
+        });
+        it('a committed row: retainUntil is the DB clock + 14 days as ISO; the reason stays null with a spent snapshot reason', async () => {
+            await seed('STOPPED');
+            const reverse = createProviderReverseStore(db);
+            const m = await reverse.createOrGetActive({ computerId, userId: ownerUserId, startedBy: 'user' });
+            await q(`UPDATE $S.ezil_compute_reverse_moves SET state = 'committed', commit_sent_at = clock_timestamp(),
+                retain_until = clock_timestamp() + interval '14 days', last_error = 'snapshot_failed', state_entered_at = clock_timestamp() WHERE id = '${m.id}'`);
+            const row = (await reverse.readById(m.id))!;
+            const view = reverseMoveView(row, reversePlacementView((await current())!));
+            expect(view).toMatchObject({ stage: 'committed', reason: null, retry: null, holdOpenable: null, openBlocked: false });
+            expect(view.retainUntil).toMatch(iso);
+            const days = (Date.parse(view.retainUntil!) - Date.now()) / 86_400_000;
+            expect(days).toBeGreaterThan(13.9);
+            expect(days).toBeLessThan(14.1);
         });
     });
 });

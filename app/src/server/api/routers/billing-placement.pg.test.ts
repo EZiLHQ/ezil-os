@@ -82,13 +82,22 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('userPlacementProvider w
         await createTable();
         await place(ids.a, user, 'cloudflare');
         await place(ids.foreign, other, 'aws-ec2', 'vol-0ffffffffffffffff');
-        await expect(userPlacement(db, user)).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
+        // Phase B (§6.1.1): `computers` lists the live computers and the records already read; asserted below.
+        const volumes = async () => { const rest: Partial<Awaited<ReturnType<typeof userPlacement>>> = { ...await userPlacement(db, user) };
+            delete rest.computers; return rest; };
+        await expect(volumes()).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
         await place(ids.b, user, 'aws-ec2', null);
-        await expect(userPlacement(db, user)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
+        await expect(volumes()).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
         await client`update public.ezil_computer_placements set volume_id = 'vol-0bbbbbbbbbbbbbbbb' where computer_id = ${ids.b}::uuid`;
-        await expect(userPlacement(db, user)).resolves.toEqual({ provider: 'aws-ec2',
+        await expect(volumes()).resolves.toEqual({ provider: 'aws-ec2',
             awsVolumes: [{ computerId: ids.b, region: 'ap-south-1', volumeId: 'vol-0bbbbbbbbbbbbbbbb' }] });
+        // The move computer's reads: only live, owned computers, each with its provider and (aws-ec2) placement record.
+        const listed = (await userPlacement(db, user)).computers!;
+        expect(listed.map(c => c.computerId).sort()).toEqual([ids.a, ids.b].map(id => id.toLowerCase()).sort());
+        expect(listed.find(c => c.computerId === ids.b.toLowerCase())).toMatchObject({ provider: 'aws-ec2', placement: { provider: 'aws-ec2' } });
+        expect(listed.find(c => c.computerId === ids.a.toLowerCase())).toMatchObject({ provider: 'cloudflare', placement: { provider: 'cloudflare', state: null } });
         await client`update ezil_computers set deleted_at = now() where id = ${ids.b}::uuid`;
-        await expect(userPlacement(db, user)).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
+        await expect(volumes()).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
+        expect((await userPlacement(db, user)).computers!.map(c => c.computerId)).toEqual([ids.a.toLowerCase()]);
     });
 });
