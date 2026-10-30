@@ -3,7 +3,7 @@ import 'server-only';
 import { createClient } from '@/utils/supabase/server';
 
 import { Auth0Error, type Auth0Identity } from './auth0';
-import { enrollStagingAiMember } from './staging-ai-enrollment';
+import { enrollAiMember } from './ai-enrollment';
 import { createAdminClient } from './supabase-admin';
 
 /** The caller must first verify the Auth0 ID token, including verified email. */
@@ -35,7 +35,7 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
     }
     // The guarded SQL updates JWT app metadata before GoTrue mints the session.
     // Enrollment is best effort; it never replaces the link or OTP checks below.
-    await enrollStagingAiMember(user.id, identity.sub);
+    await enrollAiMember(user.id, identity.sub);
     const { data, error } = await admin.generateLink({ type: 'magiclink', email });
     if (error || !data?.properties?.hashed_token || data.user?.id !== user.id
         || data.user.app_metadata.auth0_sub !== identity.sub) throw new Auth0Error('session_failed');

@@ -4,6 +4,7 @@ import { Socket } from 'node:net';
 import postgres from 'postgres';
 
 import { aiCreditEntitlement, aiCreditOutboxItem } from '@/server/billing/ai-credits';
+import { aiMemberContract } from '@/server/billing/ai-member-contract';
 import { readBillingConfig } from '@/server/billing/config';
 
 const WORK_MS = 5_000;
@@ -11,26 +12,33 @@ const CLOSE_MS = 1_000;
 const CONNECT_MS = 2_000;
 
 /**
- * The only Gateway funding origins that may enroll: staging and production. Compared with the parsed
- * origin of the configured BILLING_FUNDING_URL, exactly (render-env pins production to ai.ezil.work).
+ * Each Gateway's enrollment routine: the regprocedure its ACL probe names, and its call. Only the
+ * staging (ai-staging.ezil.work) and production (ai.ezil.work) funding origins may enroll.
  */
-const ENROLLMENT_FUNDING_ORIGINS: ReadonlySet<string> = new Set(['https://ai-staging.ezil.work', 'https://ai.ezil.work']);
+const ENROLLMENT = {
+    staging: {
+        procedure: 'ezil_works.enroll_ai_member(uuid,text)',
+        call: 'select ezil_works.enroll_ai_member($1::uuid, $2::text) as enrollment',
+    },
+    production: {
+        procedure: 'ezil_ai.enroll_os_member(uuid,text)',
+        call: 'select ezil_ai.enroll_os_member($1::uuid, $2::text) as enrollment',
+    },
+} as const;
 /**
- * The fixed refusal vocabulary of `ezil_works.enroll_ai_member(uuid,text)` (gw-ui
- * 20_enroll_members.sql returns `{ok:false, error}` with exactly these codes). Any other
- * result is logged as `unknown_refusal`; result text is never echoed.
+ * The fixed refusal vocabulary: `{ok:false, error}` codes of `ezil_works.enroll_ai_member` (gw-ui
+ * 20_enroll_members.sql) and `ezil_ai.enroll_os_member` (Gateway 0030, which adds `invalid_identity`
+ * and `source_conflict` and raises on a public-id collision). Any other result is logged as
+ * `unknown_refusal`; result text is never echoed.
  */
 const SQL_REFUSALS: ReadonlySet<string> = new Set([
     'user_not_found', 'email_unconfirmed', 'subject_mismatch', 'user_banned', 'user_deleted', 'anonymous_user', 'public_id_collision',
+    'invalid_identity', 'source_conflict',
 ]);
 type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'enqueue' | 'done';
 
 class EnrollFailure extends Error {
     constructor(readonly code: string) { super(code); }
-}
-
-function fundingOrigin(fundingUrl: string): string | null {
-    try { return new URL(fundingUrl).origin; } catch { return null; }
 }
 
 type SocketAddress = { host: string[]; port: number[]; path?: string };
@@ -40,7 +48,7 @@ type SocketAddress = { host: string[]; port: number[]; path?: string };
  * throws, and writes exactly one coded `ai-enroll` line per attempt (fixed codes only: never ids,
  * the subject, URLs, database/provider text or credentials).
  */
-export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub: string): Promise<void> {
+export async function enrollAiMember(authUserId: string, verifiedAuth0Sub: string): Promise<void> {
     let client: postgres.Sql | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
@@ -50,7 +58,7 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
     let failedAt: Stage = 'done';
     const sockets = new Set<Socket>();
     const deadline = performance.now() + WORK_MS;
-    const unavailable = () => new Error('staging_enrollment_unavailable');
+    const unavailable = () => new Error('ai_enrollment_unavailable');
     const assertActive = () => {
         if (stopped || performance.now() >= deadline) throw unavailable();
     };
@@ -90,8 +98,9 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
         const { fundingUrl, fundingHmacSecret } = readBillingConfig();
         const databaseUrl = process.env.SUPABASE_DATABASE_URL;
         if (!fundingUrl || !fundingHmacSecret || !databaseUrl) throw new EnrollFailure('disabled');
-        const origin = fundingOrigin(fundingUrl);
-        if (origin === null || !ENROLLMENT_FUNDING_ORIGINS.has(origin)) throw new EnrollFailure('origin_refused');
+        const contract = aiMemberContract(fundingUrl);
+        if (contract === null) throw new EnrollFailure('origin_refused');
+        const { procedure, call } = ENROLLMENT[contract];
         stage = 'connect';
 
         // One invocation, one client, no shared acquisition queue. The socket
@@ -103,7 +112,7 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
         };
         client = postgres(databaseUrl, options);
         const ownedClient = client;
-        async function query<T extends postgres.Row[] = postgres.Row[]>(statement: string, parameters: string[] = []) {
+        async function query<T extends postgres.Row[] = postgres.Row[]>(statement: string, parameters: postgres.ParameterOrJSON<never>[] = []) {
             assertActive();
             const rows = await ownedClient.unsafe<T>(statement, parameters);
             assertActive(); // No continuation may dispatch SQL after the deadline.
@@ -132,7 +141,7 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
                     select exists (
                         select 1 from pg_catalog.pg_roles r
                         join pg_catalog.pg_proc p
-                            on p.oid = pg_catalog.to_regprocedure('ezil_works.enroll_ai_member(uuid,text)')
+                            on p.oid = pg_catalog.to_regprocedure('${procedure}')
                         cross join lateral pg_catalog.aclexplode(p.proacl) a
                         where r.rolname = current_user and r.rolname = 'ezil_os_ai_enroller'
                             and not (r.rolsuper or r.rolbypassrls or r.rolcreaterole or r.rolcreatedb or r.rolreplication or r.rolcanlogin)
@@ -145,8 +154,7 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
                 // G4 owns confirmation, exact subject binding, bans/deletion/
                 // anonymous checks and unchanged member role/public ID/suspension.
                 const rows = await query<{ enrollment: { ok?: unknown; error?: unknown } | null }[]>(
-                    'select ezil_works.enroll_ai_member($1::uuid, $2::text) as enrollment',
-                    [authUserId, verifiedAuth0Sub],
+                    call, [authUserId, verifiedAuth0Sub],
                 );
                 return rows[0]?.enrollment;
             });
@@ -164,10 +172,12 @@ export async function enrollStagingAiMember(authUserId: string, verifiedAuth0Sub
             });
             const item = aiCreditOutboxItem(authUserId, entitlement, 'grant', null);
             await transaction(async () => {
-                // Same unique event_key and conflict policy as BillingStore.
+                // Same unique event_key and conflict policy as BillingStore. Bind the object: this
+                // raw client serializes a jsonb parameter itself, so a JSON string would be stored
+                // as a jsonb string that the outbox never claims (drizzle's pool disables that).
                 await query(`insert into public.ezil_billing_outbox (event_key, user_id, kind, payload)
                     values ($1, $2::uuid, $3, $4::jsonb) on conflict do nothing`,
-                [item.eventKey, item.userId, item.kind, JSON.stringify(item.payload)]);
+                [item.eventKey, item.userId, item.kind, item.payload as postgres.JSONValue]);
             });
         }
 

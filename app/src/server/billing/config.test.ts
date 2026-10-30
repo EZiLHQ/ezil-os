@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { checkoutAvailable, readBillingConfig, stripeMode } from './config';
 
-const factories = vi.hoisted(() => ({ store: vi.fn(), stripe: vi.fn(), usage: vi.fn() }));
+const factories = vi.hoisted(() => ({ store: vi.fn(), stripe: vi.fn(), usage: vi.fn(), aiCredits: vi.fn() }));
 vi.mock('server-only', () => ({}));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('./store', () => ({ createBillingStore: factories.store }));
+vi.mock('./ai-credit-outbox-store', () => ({ createAiCreditOutboxStore: factories.aiCredits }));
 vi.mock('./stripe/client', () => ({ createStripeClient: factories.stripe }));
 vi.mock('./stripe/usage-billing', () => ({ createStripeUsageBilling: factories.usage }));
 
@@ -83,6 +84,7 @@ describe('billing dependency mode guard', () => {
         factories.store.mockReturnValue({});
         factories.stripe.mockReturnValue({});
         factories.usage.mockReturnValue({});
+        factories.aiCredits.mockReturnValue({});
         vi.stubEnv('STRIPE_SECRET', undefined);
         vi.stubEnv('STRIPE_PUBLISHABLE_KEY', undefined);
         vi.stubEnv('STRIPE_KEY', undefined);
@@ -123,6 +125,16 @@ describe('billing dependency mode guard', () => {
         expect(factories.usage).toHaveBeenCalledTimes(1);
         expect(warn).not.toHaveBeenCalled();
     });
+
+    it.each(['https://ai.ezil.work', 'https://ai-staging.ezil.work', undefined])(
+        'hands BILLING_FUNDING_URL %s to the AI credit outbox store (it picks the member contract)', async fundingUrl => {
+            vi.stubEnv('BILLING_FUNDING_URL', fundingUrl);
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const { getBillingDeps } = await import('./deps');
+            const deps = getBillingDeps();
+            expect(factories.aiCredits).toHaveBeenCalledExactlyOnceWith(expect.anything(), fundingUrl);
+            expect(deps.aiCredits).toBe(factories.aiCredits.mock.results[0]?.value);
+        });
 
     it('rechecks swaps on every call without repeating the warning', async () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

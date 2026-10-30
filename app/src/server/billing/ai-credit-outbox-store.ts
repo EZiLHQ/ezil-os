@@ -4,29 +4,65 @@ import { AI_CREDIT_PROTOCOL } from './ai-credits';
 import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, planAiCreditRequeue,
     plannedAiCreditEvent, type AiCreditOutboxRow, type AiCreditOutboxStore, type AiCreditRequeueCandidate,
     type AiCreditRequeueInput, type AiCreditRequeueResult } from './ai-credit-outbox';
+import { aiMemberContract } from './ai-member-contract';
 
 type Database = typeof import('@/server/db').db;
 
-/** Only missing schema/view is an absent account; permission/connectivity failures must retry. */
-export function missingAiAccountView(error: unknown): boolean {
+function hasSqlState(error: unknown, codes: readonly string[]): boolean {
     const seen = new Set<unknown>();
     while (error && typeof error === 'object' && !seen.has(error)) {
         seen.add(error);
         const e = error as { code?: string; cause?: unknown };
-        if (e.code === '42P01' || e.code === '3F000') return true;
+        if (e.code !== undefined && codes.includes(e.code)) return true;
         error = e.cause;
     }
     return false;
 }
 
-export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: string): Promise<string | null> {
+/** Only missing schema/view is an absent account; permission/connectivity failures must retry. */
+export function missingAiAccountView(error: unknown): boolean {
+    return hasSqlState(error, ['42P01', '3F000']);
+}
+
+/** Per production lookup step, the SQLSTATEs that mean Gateway 0030 is not applied yet. */
+const ABSENT_BEFORE_0030 = { role: ['22023'], read: ['42883', '3F000'], drop: [] } as const;
+
+/**
+ * The member's Gateway public id, or null while the account (or its contract) is absent. Production
+ * (Gateway 0030) reads `ezil_ai.os_member_by_auth`, EXECUTE-only for the NOLOGIN enroller: membership
+ * is not assumed to INHERIT, so the role is set explicitly. Before 0030 the role does not exist
+ * (SET ROLE: 22023) and the routine or schema is missing (42883, 3F000): absent, retry later.
+ * Permission (the app role not yet granted the enroller) and connectivity failures throw.
+ */
+export async function lookupAiAccount(db: Pick<Database, 'execute' | 'transaction'>, userId: string,
+    fundingUrl?: string): Promise<string | null> {
+    if (aiMemberContract(fundingUrl) !== 'production') {
+        try {
+            const rows = await db.execute<{ public_id: string | null }>(
+                sql`select public_id from ezil_works.ai_members where auth_user_id = ${userId}::uuid limit 1`,
+            );
+            return rows[0]?.public_id || null;
+        } catch (error) {
+            if (missingAiAccountView(error)) return null;
+            throw error;
+        }
+    }
+    let step: keyof typeof ABSENT_BEFORE_0030 = 'role';
     try {
-        const rows = await db.execute<{ public_id: string | null }>(
-            sql`select public_id from ezil_works.ai_members where auth_user_id = ${userId}::uuid limit 1`,
-        );
-        return rows[0]?.public_id || null;
+        return await db.transaction(async tx => {
+            await tx.execute(sql`set local role ezil_os_ai_enroller`);
+            step = 'read';
+            const rows = await tx.execute<{ public_id: string | null }>(
+                sql`select ezil_ai.os_member_by_auth(${userId}::uuid)->>'public_id' as public_id`,
+            );
+            // Under a caller's transaction this is a savepoint, whose RELEASE keeps SET LOCAL:
+            // drop the role before any later statement can run with it.
+            step = 'drop';
+            await tx.execute(sql`set local role none`);
+            return rows[0]?.public_id || null;
+        });
     } catch (error) {
-        if (missingAiAccountView(error)) return null;
+        if (hasSqlState(error, ABSENT_BEFORE_0030[step])) return null;
         throw error;
     }
 }
@@ -34,8 +70,9 @@ export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: str
 /** Delivery metadata lives under payload.delivery; the six wire fields are immutable.
  * One atomic claim commits before HTTP. A 30 s lease recovers crashed workers;
  * attempt fencing keeps an expired worker from overwriting its successor.
+ * `fundingUrl` selects the member contract `lookupAiAccount` reads.
  */
-export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
+export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): AiCreditOutboxStore {
     return {
         async claim(now) {
             const restoreDisposition = sql`case when pending.kind = 'ai_restore' then case
@@ -100,7 +137,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
                     and payload->>'entitlementId' = ${row.payload.entitlementId as string}
                     and payload->>'accountPublicId' is not null order by created_at, id limit 1
             `);
-            return rows[0]?.account ?? lookupAiAccount(db, row.userId);
+            return rows[0]?.account ?? lookupAiAccount(db, row.userId, fundingUrl);
         },
         async pinAccount(row, account) {
             return db.transaction(async tx => {

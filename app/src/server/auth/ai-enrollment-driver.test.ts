@@ -45,7 +45,7 @@ vi.mock('node:net', async () => {
     } };
 });
 
-import { enrollStagingAiMember } from './staging-ai-enrollment';
+import { enrollAiMember } from './ai-enrollment';
 
 const userId = '3f2f95a1-5420-4a63-94f9-79b85a1ceeb4';
 const subject = 'auth0|offline-driver-fixture';
@@ -74,7 +74,7 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks(); 
 
 async function start() {
     let settled = false;
-    const signingIn = enrollStagingAiMember(userId, subject).then(() => { settled = true; });
+    const signingIn = enrollAiMember(userId, subject).then(() => { settled = true; });
     // postgres.js schedules the first connect through its own reconnect timer.
     await vi.advanceTimersByTimeAsync(1);
     expect(transport.sockets).toHaveLength(1);
