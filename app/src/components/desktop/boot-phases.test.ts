@@ -392,6 +392,8 @@ describe('computeBootUiState — never fabricates progress', () => {
             // error codes still land on `unknown` rather than reaching for it.
             'capacity_unavailable',
             'computer_stopped',
+            'desktop_config_unapplied',
+            'desktop_failed',
             'desktop_unreachable',
             'display_not_streaming',
             'fair_use_paused',

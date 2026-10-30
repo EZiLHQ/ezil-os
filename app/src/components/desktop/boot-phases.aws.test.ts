@@ -52,6 +52,27 @@ describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_
     });
 });
 
+// Round 6 (seam A): the Worker's terminal desktop answers (aws-preview.ts WORKER_TERMINAL). The Worker answers
+// both the same on every re-ask until the host's record changes, so neither is retried silently, and each
+// copy names the Troubleshoot action that changes it instead of promising that trying again helps.
+describe.each([['app', app], ['shell', shell]] as const)('%s terminal desktop copy', (_name, boot) => {
+    it.each([
+        ['desktop_config_unapplied', 'Restart desktop'],
+        ['desktop_failed', 'Restart computer'],
+    ] as const)('%s is never retried automatically and names %s', (code, action) => {
+        expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: code }))
+            .toEqual({ kind: 'failed', reason: code, errorCode: code });
+        expect(boot.isRetryableBootErrorCode(code)).toBe(false);
+        const copy = boot.BOOT_FAILURE_COPY[code];
+        expect(copy.body).toContain(`${action} in Settings → Troubleshoot`);
+        expect(copy.body).toContain('Your files are kept.');
+        expect(`${copy.title} ${copy.body}`).not.toMatch(/retrying usually fixes|try again|something went wrong|instant|faster|unlimited|mumbai|minute/i);
+    });
+    it('the generic AWS preview refusal still gets its one silent re-ask', () => {
+        expect(boot.isRetryableBootErrorCode('aws_preview_unavailable')).toBe(true);
+    });
+});
+
 // Round 4 (D16-D18): the billing gate's refusals. The founder's 10-28 report showed
 // `billing_size_not_allowed` as "Something went wrong" and "Error code: unknown".
 describe.each([['app', app], ['shell', shell]] as const)('%s billing refusal copy', (_name, boot) => {
