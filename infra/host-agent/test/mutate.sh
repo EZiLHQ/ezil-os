@@ -91,6 +91,12 @@ mutate M52 lib/ezil_host/desktop.py '        if r.returncode != 0:
 mutate M53 lib/ezil_host/agent.py '        if not guard.is_mounted(self.cfg.dataMount):' '        if False:' test-units.sh "stop outcome: a killed desktop is never flush=ok; durable record"
 mutate M54 lib/ezil_host/desktop.py '    out = {"lastStop": read_stop_record(cfg), "singletons":' '    out = {"singletons":' test-units.sh "stop outcome: a killed desktop is never flush=ok; durable record"
 mutate M55 lib/ezil_host/desktop.py 'HISTORY_PROMPT = "history -a; shopt -s histappend"' 'HISTORY_PROMPT = "shopt -s histappend"' test-units.sh "history: env + read-only profile.d"
+G9_CHECK="idle/requested flush accepts the guard's full-marker stamp (G9)"
+mutate M56 lib/ezil_host/agent.py 'if not isinstance(stamp, dict) or any(stamp.get(k) != self.lease[k] for k in ("generation", "leaseEpoch")):' 'if stamp != {"generation": self.lease["generation"], "leaseEpoch": self.lease["leaseEpoch"]}:' test-units.sh "$G9_CHECK"
+mutate M57 lib/ezil_host/agent.py 'for k in ("generation", "leaseEpoch")):' 'for k in ("generation",)):' test-units.sh "$G9_CHECK"
+mutate M58 lib/ezil_host/agent.py 'if not isinstance(stamp, dict) or any(' 'if any(' test-units.sh "$G9_CHECK"
+mutate M59 lib/ezil_host/agent.py "            self.log(f\"idle stop blocked: busy_load load1={'unknown' if load1 is None else f'{load1:g}'}\")
+" '' test-units.sh "$G9_CHECK"
 if [ "${1:-}" != --quick ]; then
 mutate M48 lib/ezil_host/desktop.py '    if not kill:
         hangup_shells(cfg)

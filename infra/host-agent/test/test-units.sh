@@ -93,7 +93,7 @@ check "hangup: a shell outside the container pid namespace is never signalled; m
 check "stop outcome: absent/clean/killed from desktop.stop" pyunit test_history_stop.StopOutcome
 check "provision: exactly one non-root EBS data volume by NVMe identity; host-sized container limits" pyunit test_provision_resources
 check "AMI component: every Image Builder command is a YAML string (a bare ': ' parses as a map; live create failed)" python3 -c "import yaml,sys; d=yaml.safe_load(open('$HA/ami/imagebuilder-component.yaml')); sys.exit(any(not isinstance(c,str) for ph in d['phases'] for st in ph['steps'] if isinstance(st.get('inputs'),dict) for c in st['inputs'].get('commands',[])))"
-check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot" pyunit test_history_stop.AgentStopRecord
+check "stop outcome: a killed desktop is never flush=ok; durable record written and reported at boot; idle/requested flush accepts the guard's full-marker stamp (G9), another lease's is stale" pyunit test_history_stop.AgentStopRecord
 check "drift: same rules in another order is drift; netns delete failure is reported" pyunit test_history_stop.DriftOrder
 check "edge: gw1 verifier matches the Worker's shared vectors (valid, invalid, skew, framing)" pyunit test_edge.GwVectors
 check "relay config: TURN-only backend, authenticated TURN, neko /api/relay lifetime, derived neko values only" pyunit test_ice.RelayConfig
