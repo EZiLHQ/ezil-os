@@ -8,7 +8,7 @@ import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
-import { handleBillingSessionSweep } from './handler';
+import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined }));
@@ -21,7 +21,8 @@ vi.mock('@/server/lib/compute/aws-config', () => ({ isPlacementReadEnabled: vi.f
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: vi.fn() }));
 vi.mock('@/server/billing/store', () => ({ runningAwsComputersAfterEpochs: vi.fn() }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation' }));
-vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000 }));
+vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
+    reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
@@ -69,13 +70,17 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(response.status).toBe(200);
         expect(await response.json()).toEqual(counts);
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now, stop: expect.any(Function),
-            isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function) });
+            isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function),
+            reverseMoveInFlight: expect.any(Function) });
         expect(maxDuration).toBe(300);
+        // Phase B (§5.4): the held pass's reverse-move read is built over the app database, once per sweep.
+        expect(reverseMoveInFlightFor).toHaveBeenCalledExactlyOnceWith(db);
     });
 
     it('wires no held bound where placement reads are off (no placement table to read, as sandbox-reap)', async () => {
         vi.mocked(isPlacementReadEnabled).mockReturnValue(false);
         expect(await wiring()).not.toHaveProperty('runningAwsPlacements');
+        expect(await wiring()).not.toHaveProperty('reverseMoveInFlight');
         expect(isPlacementReadEnabled).toHaveBeenCalledWith(process.env);
     });
 

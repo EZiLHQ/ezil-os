@@ -8,7 +8,7 @@ import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
-import { handleBillingSessionSweep, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, reverseMoveInFlightFor, RUNNING_GRACE_MS } from './handler';
 
 export const maxDuration = 300;
 
@@ -66,7 +66,8 @@ export async function GET(req: Request): Promise<Response> {
         awsStopProof,
         // The held bound reads placements (C-2, through placement.ts): only where placement reads are on, as sandbox-reap.
         ...(isPlacementReadEnabled(process.env)
-            ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit) }
+            ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit),
+                reverseMoveInFlight: reverseMoveInFlightFor(db as unknown as PlacementExecutor) }
             : {}),
     });
     return Response.json(counts);

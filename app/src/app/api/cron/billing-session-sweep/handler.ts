@@ -1,5 +1,8 @@
 import { reconcilePaidCloudflareUsers } from '@/server/lib/compute/provider-migrate-reconcile';
 import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
+import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
+import { createProviderReverseStore, REVERSE_MOVE_IN_FLIGHT, reverseMovesTablePresent } from '@/server/lib/compute/provider-reverse-store';
+import type { PlacementExecutor } from '@/server/lib/compute/placement';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
 import type { HeldCandidate } from '@/server/billing/store';
 import { drainAiCreditOutbox } from '@/server/billing/ai-credit-outbox';
@@ -55,7 +58,28 @@ export type AwsStopProof = (computer: ComputerRef) => Promise<{ running: boolean
 export type RunningAwsPlacements = (after: string | null, limit: number) =>
     Promise<{ candidates: readonly HeldCandidate[]; next: string | null }>;
 
-export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, limit = 50 }: {
+/**
+ * Phase B (REVERSE-MOVE-CONTRACT §5.4): whether the computer's NEWEST reverse move is in flight (`requested` … `flipping`).
+ * Its export boot is no held session: it never reaches RUNNING, opens no epoch, and sits UNCONFIRMED after its release.
+ */
+export type ReverseMoveInFlight = (computerId: string) => Promise<boolean>;
+
+/**
+ * Phase B (REVERSE-MOVE-CONTRACT §5.4): the held pass's reverse-move read. The 0012 probe runs once per sweep (no 0012 →
+ * never in flight: production); then the computer's newest row, in flight or not. A read error throws into the held
+ * loop's own catch, which skips the computer (fail closed, never a stop).
+ */
+export function reverseMoveInFlightFor(executor: PlacementExecutor): ReverseMoveInFlight {
+    let present: Promise<boolean> | null = null;
+    return async computerId => {
+        present ??= reverseMovesTablePresent(executor);
+        if (!(await present)) return false;
+        const m = await createProviderReverseStore(executor).readByComputer(computerId);
+        return m !== null && REVERSE_MOVE_IN_FLIGHT.includes(m.state);
+    };
+}
+
+export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, reverseMoveInFlight, limit = 50 }: {
     deps: BillingDeps;
     now: Date;
     stop: (computer: ComputerRef, reason: SweepReason) => Promise<StopOutcome>;
@@ -65,6 +89,8 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     awsStopProof?: AwsStopProof;
     /** The held bound's placement read; omitted = no held pass. */
     runningAwsPlacements?: RunningAwsPlacements;
+    /** Phase B: the held pass skips a computer in a reverse move; omitted (no 0012, tests) = round 6a's held pass exactly. */
+    reverseMoveInFlight?: ReverseMoveInFlight;
     limit?: number;
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
@@ -80,7 +106,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         console.info(JSON.stringify({ event: 'billing-sweep', ...counts }));
         return counts;
     };
-    if (!billingMeteringActive(deps.config)) { await drain(); return finish(); }
+    // Phase B: the reverse pass is the LAST step on both paths (§5.4). Only it enforces a move's deadlines, so it runs with
+    // metering off too; after drain(), because reconcile and the outbox start no work after + 40 s and the pass may take 90 s.
+    if (!billingMeteringActive(deps.config)) { await drain(); await advanceReverseMoves(startedAt); return finish(); }
 
     const epochs = await deps.store.openEpochsForSweep({ limit });
     counts.examined = epochs.length;
@@ -229,6 +257,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
                 const computer = { userId: candidate.userId, computerId: candidate.computerId };
                 if (attempted.has(computer.computerId) || now.getTime() - candidate.since.getTime() < RUNNING_GRACE_MS) continue;
                 try {
+                    // Phase B (§5.4): a computer whose newest reverse move is in flight is the move's, never a held session: no
+                    // held-overrun, no held-unconfirmed, no stop. A throw is the catch below: skipped, never stopped (fail closed).
+                    if (reverseMoveInFlight && await reverseMoveInFlight(computer.computerId)) continue;
                     if (await deps.store.openEpochFor(computer.computerId)) continue;
                     const state = await stateFor(computer.userId);
                     // The gate's hold test (compute-access.ts gateComputerStart): Free-effective with an AWS computer.
@@ -258,5 +289,6 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     await advanceStaleMigrations(startedAt);
     await reconcilePaidCloudflareUsers(startedAt);
     await drain();
+    await advanceReverseMoves(startedAt);
     return finish();
 }
