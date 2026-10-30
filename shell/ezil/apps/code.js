@@ -944,11 +944,13 @@ export async function openCodeWindow (ctx = {}) {
             set_view(full_view.is_full() ? 'window' : 'full', { remember: true });
         };
     }
-    // `minimize_window` consults the return value; truthy = handled here.
-    el_window._ezil_minimise = () => {
-        full_view.minimise();
-        return true;
-    };
+    // Deliberately NO `_ezil_minimise` hook (the Browser has one). Its only
+    // callers, the head's minimise button and the head's context menu
+    // (`minimize_window`, UIWindow.js), are hidden whenever this window is in
+    // full view, so they can only ever minimise a WINDOWED Code — which
+    // upstream's `hideWindow()` already does exactly. In full view the top bar
+    // and the drawer call `full_view.minimise()` themselves.
+    // `seam-minimise-browser-test.mjs` pins one provider of that hook.
     /**
      * Single-instance relaunch (contract item 4): the registry calls this on the
      * existing window, after `showWindow()`, with the launch's ctx. Only
