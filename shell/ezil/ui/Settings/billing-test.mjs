@@ -985,15 +985,80 @@ try {
         has('[data-role="cancels-banner"]', false);
         contains('[data-role="plan-ending"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
         summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
-        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.');
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.');
         assert.equal(qa('[data-role="files-held"]').length, 1, 'the hold is said once');
-        contains('[data-role="your-computer"]', 'AWS (India), with Free limits');
+        // Round 6 (R1-11): one provider string; the limit is the session line, and nothing to configure under the hold.
+        contains('[data-role="your-computer"]', 'AWS (India)');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /with Free limits|Cloudflare/);
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Computer details ›');
         contains('[data-role="plan-actions"] .ezil-settings-btn-primary', 'Upgrade to Standard');
+        // Round 6: the founder's Billing on 10-30 (Free, held std-2, 763 AI credits of which 663 are from the cancelled Premium period).
+        Object.assign(summary.computer, { size: 'std-2', vcpu: 2, memoryGiB: 8, disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } });
+        Object.assign(summary.ai, { grant: { amount: 100, per: 'once' }, balance: 763, state: 'ok', included: null, purchased: null, starter: { remaining: 100 },
+            previous: { remaining: 663, expiresAt: '2026-11-30T12:00:00Z' }, pendingFromRenewal: null });
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 20160,
+            allowanceStandardSeconds: 28800, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 5, equivalents: [{ size: 'free-cf', weight: 1, hours: 5 }] } });
+        await refresh(); audit();
+        contains('[data-role="meter-time"]', '5 h left');
+        contains('[data-role="meter-time"]', 'About 5 of 8 hours left this month');
+        assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /Same as/);
+        contains('[data-role="meter-ai"]', '763 left');
+        has('[data-role="meter-ai"] [role="meter"]', false);
+        contains('[data-role="meter-ai"]', '100 starter credits left');
+        contains('[data-role="meter-ai"]', '663 from your previous plan · expire Nov 30, 2026');
+        assert.equal((q('[data-role="meter-ai"]').textContent.match(/\b100\b/g) ?? []).length, 1, 'the 100 starter credits are said once');
+        // Review: the starter spent beside the previous plan's 663 — "100 credits to start" would explain nothing in this balance.
+        Object.assign(summary.ai, { balance: 663, starter: null }); await refresh();
+        contains('[data-role="meter-ai"]', '663 from your previous plan');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /credits to start|\b100\b/);
+        Object.assign(summary.ai, { balance: 763, starter: { remaining: 100 } }); await refresh();
+        contains('[data-role="meter-storage"]', '50 GB disk for your projects');
+        contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
+        assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        // Round 6 review (R4-02): a held 4 or 8 vCPU computer (placed size `awsSize`) can't open on Free. Billing
+        // says so at its own size, in the Computer tab's words, never "opens on the Free plan" or a 1-hour session.
+        for ( const [size, vcpu, memoryGiB] of [['cmp-4', 4, 16], ['cmp-8', 8, 32]] ) {
+            summary.computer.awsSize = { size, vcpu, memoryGiB }; await refresh(); audit();
+            contains('[data-role="files-held"]', `Your files are still on your ${vcpu} vCPU AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`);
+            assert.equal(q('[data-role="files-held"]').textContent, window.computersTab.heldClosedCopy(size, summary), 'the same words as the Computer tab');
+            contains('[data-role="your-computer"]', `${vcpu} vCPU · ${memoryGiB} GB memory · 50 GB disk · AWS (India)`);
+            contains('[data-role="your-computer"]', "Can't open on the Free plan at this size");
+            for ( const role of ['files-held', 'your-computer'] ) assert.doesNotMatch(q(`[data-role="${role}"]`).textContent, /opens on the Free plan|Sessions up to/);
+            assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        }
+        // A held 2 vCPU placement keeps the hold copy.
+        summary.computer.awsSize = { size: 'std-2', vcpu: 2, memoryGiB: 8 }; await refresh();
+        contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        delete summary.computer.awsSize;
+        getUsage = () => failure('unavailable');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
         Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-11-05T00:00:00Z', move: null }); await refresh();
         has('[data-role="files-held"]'); has('[data-role="payment-grace"]', false);
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Your own computer on AWS/);
+        // Round 6 review: past its grace the server rates the computer as Free (summary.ts computePlanV3): the plan block
+        // is still Premium, the computer carries Free's session cap, machine choice and opening, and fairUse Free's month.
+        const freeComputer = summaryV3('free').computer;
+        Object.assign(summary.computer, { size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: freeComputer.sessionMaxSeconds,
+            opening: freeComputer.opening, machineChoice: freeComputer.machineChoice, disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } });
+        summary.fairUse = { status: 'ok', resetsAt: '2026-12-01T00:00:00Z' };
+        Object.assign(summary.ai, { previous: { remaining: 200, expiresAt: '2026-11-04T00:00:00Z' } });
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 27000,
+            allowanceStandardSeconds: 28800, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 7, equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] } });
+        await refresh(); audit();
+        contains('[data-role="meter-time"]', 'About 7 of 8 hours left this month');
+        assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /left at 2 vCPU|Same as/);
+        contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        contains('[data-role="billing-usage"]', 'Resets Dec 1, 2026');
+        contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
+        // Earlier credits on a paid plan (this plan's tail or a cancelled plan's): one label true for both.
+        contains('[data-role="meter-ai"]', '200 from an earlier billing period');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /previous plan|last billing period/);
+        assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        getUsage = () => failure('unavailable');
         assert.doesNotMatch(text(), /ap-south-1|mumbai|have been moved|were moved|files moved/i);
         // Unknown or missing standing: no standing banner.
         for ( const standing of [undefined, 'moved'] ) {
@@ -1009,6 +1074,9 @@ try {
             ['plan_ending', { plan: { name: 'Standard', planEndsAt: ENDS }, computer: { filesOn: 'aws' } }],
             ['plan_ending', { plan: { name: 'Premium', cancelsAt: ENDS }, computer: { filesOn: 'cloudflare' } }], ['plan_ending', { plan: {}, computer: {} }],
             ['files_on_aws', { plan: {}, computer: {} }], ['paid', { plan: {}, computer: {} }], ['free', { plan: {}, computer: {} }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } } }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } } }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'cmp-4', vcpu: 'four' } } }],
         ];
         for ( const [standing, data] of shapes ) {
             const copy = window.billing.standingCopy(standing, data);
@@ -1042,7 +1110,8 @@ try {
     assert.equal(q('#ai-credits .ezil-billing-meter-value').textContent, '4,000 left');
     // ADV-1: no breakdown from the server, so no invented "plan + extra" split.
     assert.doesNotMatch(q('#ai-credits').textContent, /from your plan|3,800 extra/);
-    assert.equal(q('#ai-credits [role="meter"]').getAttribute('aria-valuenow'), '100');
+    // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).
+    has('#ai-credits [role="meter"]', false);
     has('#ai-credits button', false); has('[data-role="ai-topup"]', false);
     summary.catalog.packs = packs; await refresh(); has('[data-role="ai-topup"]', false);
     summary.actions.topup = false; await refresh(); has('[data-role="ai-topup"]', false);

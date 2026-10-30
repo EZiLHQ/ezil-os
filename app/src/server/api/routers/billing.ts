@@ -9,13 +9,15 @@ import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credi
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
-import type { BillingDeps, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
+import type { SubscriptionRow } from '@/server/billing/meters';
+import type { BillingDeps, PaymentIssueRow, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
+import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
+import { deriveStanding } from '@/server/billing/v3/standing';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -138,8 +140,12 @@ async function ezilIdSignInUrl(): Promise<string | null> {
 
 /** Round 5 D3: one aws-ec2 computer's data volume, for its real size. */
 export interface AwsVolumeRef { computerId: string; region: string; volumeId: string }
-/** Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size). */
-export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[] }
+/**
+ * Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size), plus,
+ * round 6 (R4-02), the metered size every aws-ec2 placement is on; omitted when there is none, any type is
+ * unreadable or unlisted, or they differ.
+ */
+export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[]; awsSize?: SizeCode }
 type DbReader = { execute(query: SQL): Promise<unknown> };
 
 /**
@@ -149,10 +155,11 @@ type DbReader = { execute(query: SQL): Promise<unknown> };
  * table (billing-only databases) or on any read error: the summary never fails on it.
  * Round 5 D3: each aws-ec2 placement's {region, volumeId}, from the placement module's full read
  * (owner-checked). That read is separate: when it fails the provider stands and only the volume is missing.
+ * Round 6 (R4-02): the same read gives each placement's instance type, metered as the start gate meters it.
  */
 export async function userPlacement(db: DbReader, userId: string): Promise<UserPlacement> {
     try {
-        const [{ isPlacementReadEnabled }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
+        const [{ isPlacementReadEnabled, meteredSizeForInstanceType }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
             import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
         if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [] };
         const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
@@ -162,17 +169,21 @@ export async function userPlacement(db: DbReader, userId: string): Promise<UserP
         const providers = await Promise.all(ids.map(id => readPlacementProvider(db, id)));
         const provider = providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(p => p !== null) ? 'cloudflare' : null;
         const awsVolumes: AwsVolumeRef[] = [];
+        const awsSizes: (SizeCode | null)[] = [];
         for (const [index, id] of ids.entries()) {
             if (providers[index] !== 'aws-ec2') continue;
             try {
                 const { record } = await readPlacement(db, id, userId);
                 if (record?.provider === 'aws-ec2' && record.region && record.volumeId)
                     awsVolumes.push({ computerId: record.computerId, region: record.region, volumeId: record.volumeId });
+                awsSizes.push(record?.provider === 'aws-ec2' ? meteredSizeForInstanceType(record.instanceType) : null);
             } catch {
                 console.warn('[billing.summary] volume placement unavailable');
+                awsSizes.push(null);
             }
         }
-        return { provider, awsVolumes };
+        const awsSize = awsSizes[0] ?? null;
+        return { provider, awsVolumes, ...(awsSize !== null && awsSizes.every(size => size === awsSize) ? { awsSize } : {}) };
     } catch {
         console.warn('[billing.summary] placement unavailable');
         return { provider: null, awsVolumes: [] };
@@ -273,6 +284,21 @@ async function readVolumeGiB(volumes: readonly AwsVolumeRef[], read: (volume: Aw
     return Math.min(...sizes.map(size => typeof size === 'number' ? size : DISK_FALLBACK_GIB));
 }
 
+type StoredEpochs = Awaited<ReturnType<BillingDeps['store']['epochsFor']>>;
+
+/**
+ * Round 6 review (dunning into the hold): a paid subscription without paid access rates the computer on Free's
+ * calendar month (summary.ts `computePlanV3`), which can start before the unpaid period; the epochs are then
+ * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState).
+ */
+async function computeWindowEpochs(deps: BillingDeps, userId: string, epochs: StoredEpochs, input: {
+    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null }): Promise<StoredEpochs> {
+    const plan = planFromSubscriptions(input);
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
+    const rated = computePlanV3(plan, standing, input);
+    return Date.parse(rated.window.start) < Date.parse(plan.window.start) ? deps.store.epochsFor(userId, new Date(rated.window.start)) : epochs;
+}
+
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
 /** The operator gate reuses the `/admin/telemetry` allow-list (`TELEMETRY_ADMIN_EMAILS`, fail-closed); no new env. */
 async function telemetryOperator(email: string | null | undefined): Promise<boolean> {
@@ -308,7 +334,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             placement = { provider: null, awsVolumes: [] };
         }
         const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
-        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize) };
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null };
     };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
@@ -322,7 +348,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, userCreatedAt, now });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, storage, consent, overageInvoices, sizePreference, placement] = await Promise.all([
+            // Round 6 (R1-07/R1-09): the placement provider and open payment issues give usage the summary's
+            // standing, so under the D16 hold both show the held AWS computer and its disk.
+            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
@@ -330,10 +358,12 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.overageInvoicesFor(ctx.user.id),
                 deps.store.sizePreference(ctx.user.id),
                 placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
+                deps.store.openPaymentIssues(ctx.user.id),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
-                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference,
-                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB });
+                consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
+                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -347,7 +377,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
+            const [periodEpochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
                 enrollmentState, ezilIdUrl] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
@@ -362,6 +392,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 aiEnrollmentOf(aiMember, ctx.db, ctx.user),
                 ezilIdSignInUrl(),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
                 try {
@@ -379,7 +410,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
                 ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
-                volumeGiB: placement.volumeGiB, enrollment: { state: enrollmentState, ezilIdUrl },
+                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;

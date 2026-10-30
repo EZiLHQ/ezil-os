@@ -12,11 +12,14 @@ export function offerByLookupKey(key: string): PlanOfferV3 | undefined {
     return Object.values(CATALOG_V3).find(offer => offer.stripeLookupKey === key);
 }
 
-export function publicOffers(): PublicOfferV3[] {
+/** Round 6 (R1-06): `legacyFree` = the viewer keeps the legacy Free allowance, so the Free offer says those hours. */
+export function publicOffers(viewer: { legacyFree?: boolean } = {}): PublicOfferV3[] {
     return Object.values(CATALOG_V3).map(offer => ({
         sku: offer.sku, name: offer.name, tagline: offer.tagline, priceCents: offer.priceCents,
         vcpu: offer.vcpu, memoryGiB: offer.memoryGiB, sessionMaxSeconds: offer.sessionMaxSeconds,
-        opening: offer.opening, fairUseHours: offer.fairUseSeconds / 3600, highlighted: offer.highlighted,
+        opening: offer.opening,
+        fairUseHours: (viewer.legacyFree && offer.legacyFairUseSeconds !== null ? offer.legacyFairUseSeconds : offer.fairUseSeconds) / 3600,
+        highlighted: offer.highlighted,
         badge: offer.badge, machineChoice: [...offer.machineChoice], aiCredits: { ...offer.aiCredits }, bullets: [...offer.bullets],
         storageGiB: offer.storageGiB,
     }));

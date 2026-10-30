@@ -204,7 +204,11 @@ export function describePlan (info) {
     const free = standing === 'files_on_aws' || standing === 'free' || (p && (p.name === 'Free' || p.sku === 'free_v3'));
     if ( free ) {
         const onAws = standing === 'files_on_aws' || (p && (p.provider === 'aws' || p.filesOn === 'aws'));
-        if ( onAws ) return { value: 'Plan: Free · files kept on this computer', hint: 'It opens with Free limits. Upgrade to restore full use.' };
+        // Round 6 (R1-08/R4-02): the hold opens only 2 vCPU and never resizes; the same words as Computer and Billing.
+        const vcpu = p && SIZE_LABEL[p.current] ? Number.parseInt(SIZE_LABEL[p.current], 10) : info.machine && Number.isFinite(info.machine.vcpu) ? info.machine.vcpu : null;
+        if ( onAws ) return { value: 'Plan: Free · files kept on this computer', hint: vcpu !== null && vcpu > 2
+            ? "The Free plan can't open it at this size; upgrade to open it again."
+            : 'It opens on the Free plan with Free limits; upgrade for no session time limit.' };
         const size = p && Number.isFinite(p.vcpu) && Number.isFinite(p.memoryGB) ? ` · ${p.vcpu} vCPU / ${p.memoryGB} GB on Cloudflare` : '';
         return { value: `Plan: Free${size}`, hint: '' };
     }

@@ -37,6 +37,11 @@ describe('v3 catalog', () => {
         for (const key of ['toString', '__proto__', 'compute_monthly_v2', 'unknown']) expect(offerBySku(key)).toBeUndefined();
         expect(offerByLookupKey('ezil_compute_monthly_v2')).toBeUndefined();
     });
+    it('round 6 (R1-06): only a legacy-Free viewer sees the legacy 8 hours on the Free offer; the default catalog is unchanged', () => {
+        expect(publicOffers().map(offer => offer.fairUseHours)).toEqual([5, 40, 500]);
+        expect(publicOffers({ legacyFree: false })).toEqual(publicOffers());
+        expect(publicOffers({ legacyFree: true }).map(offer => offer.fairUseHours)).toEqual([8, 40, 500]);
+    });
     it.each(['standard_monthly_v3', 'premium_monthly_v3'])('resolves paid %s with its period', sku => {
         expect(planFromSubscriptions({ subs: [sub(sku)], now, userCreatedAt: null })).toMatchObject({ sku, planActive: true,
             window: { start: '2026-10-10T00:00:00Z', end: '2026-11-10T00:00:00Z' } });
