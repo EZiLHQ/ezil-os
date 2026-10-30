@@ -597,7 +597,11 @@ class Agent:
         now = self.clock()
         if not idle_due(self.last_presence, now, self.cfg.idle["inactivitySeconds"]):
             return "active"
-        if export.holds_idle(self.cfg, now):
+        try:
+            held = export.holds_idle(self.cfg, now)
+        except Exception:  # noqa: BLE001 — as for the terminal hold: a crash must not renew presence
+            held = False
+        if held:
             self.log(f"idle stop held: export idle={int(now - self.last_presence)}s")
             return "held_export"
         if self._terminal_hold(now - self.last_presence):
