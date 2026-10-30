@@ -79,6 +79,12 @@ export interface AwsTunnelRecord {
   /** Worker-generated AI nonce, rotated when the trusted host reports a new boot. */
   aiProxyNonce?: string;
   aiBootId?: string;
+  /**
+   * The last desktop config carrying this boot's AI token that the host ACCEPTED: its host boot,
+   * the config's relay expiry (its identity on the host's status) and when (Unix ms). G12: the
+   * open path does not push the AI config again while the host still holds exactly this one.
+   */
+  aiDelivered?: { bootId: string; expiresAt: number; at: number };
 }
 
 export function isAwsOriginFresh(record: AwsTunnelRecord, nowMs: number): boolean {

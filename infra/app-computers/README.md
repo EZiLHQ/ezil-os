@@ -148,6 +148,10 @@ takes one trust statement per configured OIDC provider, with exact `aud` and `su
   `repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>`.
 - **Vercel.** A separate provider slot. TODO: confirm the team's audience and subject format
   before enabling it.
+- **EC2 app host.** `ec2CallerRoleArns` adds `sts:AssumeRole` from each exact instance role,
+  conditioned on `aws:PrincipalTag/ezil:env` = `ec2CallerEnv` (default `billing-staging`,
+  so existing trusts are unchanged). With `providers: []` the trust is exactly one EC2 role.
+  `ec2CallerEnv: production` (namespace `prd`) admits no OIDC provider at all.
 
 The role's policy allows only:
 - `states:StartExecution` on the exact lifecycle version ARN
@@ -475,7 +479,8 @@ it:
 - the IAM snapshot test would show any new trust statement
 
 **Deploy role.** Its trust is `token.actions.githubusercontent.com` with
-`aud=sts.amazonaws.com` and the immutable-ID subject `...:environment:aws-pilot`. Sessions last
+`aud=sts.amazonaws.com` and the immutable-ID subject `...:environment:aws-<label>`, chosen per
+namespace (`aws-pilot` for pilot and mum, `aws-prd` for prd; a bare `production` is refused). Sessions last
 at most 1 h. It can only:
 - create, describe and execute change sets on `ezil-<ns>-*` stacks, and only with
   `cloudformation:RoleArn` = the execution role

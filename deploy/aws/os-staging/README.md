@@ -191,7 +191,12 @@ Paid plans are on at launch, so set the billing flags (`BILLING_TAB_ENABLED`,
 `PRICING_PAGE_ENABLED`, `CHECKOUT_ENABLED`, `BILLING_ENFORCEMENT`) as the launch
 decision says. Leave every `EZIL_AWS_*`, `AWS_REGIONS` and `AWS_MAX_RUNNING`
 unset until production AWS computers have their own reviewed app-caller role;
-the staging app-caller trusts only `ezil:env=billing-staging` principals.
+the staging app-caller trusts only `ezil:env=billing-staging` principals. The
+production one is the `prd` namespace's
+`arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller` (trust: exactly
+this host's instance role with `ezil:env=production`), the only non-empty
+`AppCallerRoleArn` the production host template accepts; see
+`deploy/aws/mum/README.md` "Production namespace prd".
 
 Rollback is `install PREVIOUS_TAG` with `OS_ENV=production`; keep its three
 `artifacts/production/` files and S3 objects. Production teardown mirrors staging

@@ -17,8 +17,44 @@ repo_root=$(cd -- "$script_dir/../../.." && pwd)
 release_dir=/root/ezil-aws-mum/release/next
 lock_dir=/root/ezil-aws-mum/locks
 apply=false
+# Namespace profile; json-tool.py PROFILES holds the same table (tests compare them).
+# mum (billing staging) is the default and keeps the literals above.
+namespace=mum
+config_dir=/root/ezil-aws-mum/config
+ami_stack=ezil-mum-ami
+foundation_stack=ezil-mum-foundation
+lifecycle_stack=ezil-mum-lifecycle
+launch_template=lt-06f691fc1e4dfe3cc
+app_environment=staging
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# prd (production, founder decisions 2026-10-30): its own stacks, exec role, bucket,
+# operator state and app secret; origin https://os-prod.ezil.work; no rebase tuple.
+# Its ECR repository and launch template are pinned here by a reviewed commit once
+# ezil-prd-foundation exists (README "Production namespace prd"); until then it refuses.
+use_namespace() {
+    case "$1" in
+        mum) ;;
+        prd)
+            namespace=prd
+            bucket=ezil-prd-deploy-assets-452630323510
+            repository=
+            exec_role=arn:aws:iam::452630323510:role/ezil/identity/ezil-prd-cfn-exec
+            machine=arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle
+            config_dir=/root/ezil-aws-prd/config
+            lock_dir=/root/ezil-aws-prd/locks
+            ami_stack=ezil-prd-ami
+            foundation_stack=ezil-prd-foundation
+            lifecycle_stack=ezil-prd-lifecycle
+            launch_template=
+            app_environment=production
+            if [[ "$release_dir" == /root/ezil-aws-mum/release/next ]]; then release_dir=/root/ezil-aws-prd/release/next; fi
+            [[ "$release_dir" != /root/ezil-aws-mum/* ]] || die 'prd never writes mum operator state'
+            [[ -n "$repository" && -n "$launch_template" ]] ||
+                die 'prd ECR repository and launch template are not pinned yet; pin the ezil-prd-foundation outputs by a reviewed commit (README "Production namespace prd")' ;;
+        *) die "unknown namespace: $1 (mum or prd)" ;;
+    esac
+}
 say() { printf '%s\n' "$*"; }
 show() { printf '+' >&2; printf ' %q' "$@" >&2; printf '\n' >&2; }
 aws_read() {
@@ -27,7 +63,7 @@ aws_read() {
 }
 act() { show "$@"; if "$apply"; then "$@"; fi; }
 aws_act() { act aws --profile "$profile" --region "$region" --no-cli-pager "$@"; }
-json() { python3 "$script_dir/json-tool.py" "$@"; }
+json() { python3 "$script_dir/json-tool.py" --namespace "$namespace" "$@"; }
 require_tools() { local tool; for tool in "$@"; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done; }
 require_absolute_release() {
     [[ "$release_dir" == /* && "$release_dir" != / && ! -L "$release_dir" ]] || die 'release directory must be an absolute non-symlink path'

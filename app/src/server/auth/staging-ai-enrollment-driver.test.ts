@@ -59,13 +59,16 @@ function frame(type: string, payload: Buffer) {
 }
 const ready = (status = 'I') => frame('Z', Buffer.from(status));
 const complete = (command: string) => frame('C', Buffer.from(`${command}\0`));
+const coded = (stage: string, code: string) => [[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage, code })]];
+let warn: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
     vi.useFakeTimers();
     transport.sockets = [];
     vi.stubEnv('SUPABASE_DATABASE_URL', 'postgres://fixture:fixture@fixture.invalid:5432/postgres?sslmode=disable');
     vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work');
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubEnv('BILLING_FUNDING_HMAC_SECRET', 'fixture-funding-hmac');
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -93,6 +96,7 @@ describe('installed postgres.js enrollment transport lifetime', () => {
         await vi.advanceTimersByTimeAsync(10_000);
         expect(transport.sockets).toHaveLength(1);
         expect(run.socket.writes).toHaveLength(0);
+        expect(warn.mock.calls).toEqual(coded('connect', 'connect_failed'));
     });
 
     it('closes an established transport whose PostgreSQL startup handshake stalls', async () => {
@@ -143,6 +147,7 @@ describe('installed postgres.js enrollment transport lifetime', () => {
         expect(transport.sockets).toHaveLength(1);
         expect(run.socket.writes).toHaveLength(writesAtReturn);
         expect(run.socket.writes.map(buffer => buffer.toString()).join('')).not.toContain('set local');
+        expect(warn.mock.calls).toEqual(coded('connect', 'timeout'));
     });
 
     it('refuses driver reconnection after losing the physical transaction connection', async () => {

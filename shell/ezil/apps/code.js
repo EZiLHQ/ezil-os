@@ -123,7 +123,7 @@ const FRAME_RECOVERY_ATTEMPTS = 12;
  * @returns {Promise<{ok: true, url: string, expiresAt?: number}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId) {
+async function mintCodePreviewUrl (computerId, signal) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -133,11 +133,24 @@ async function mintCodePreviewUrl (computerId) {
     // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
     // 5460ms). Re-implementing the loop here is how the two surfaces would
     // stop waiting for the same length of time — see `withWakeAndOneRetry`.
-    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl', computerId);
+    //
+    // 🔴 HOTFIX r5 (ACCEPT-11865d06 B6): and it is CANCELLABLE. Every ask runs the
+    // server's ensure(), which starts a STOPPED computer; this loop used to keep
+    // asking after its window closed (Stop closes it first) and re-provisioned the
+    // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
+    // Stop also reaches it through `session.cancelComputerOpens`.
+    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s), { signal });
+}
+
+/** The request's signal: its timeout and, when given, the loop's cancel. */
+function mintSignal (cancel) {
+    const timeout = AbortSignal.timeout(DESKTOP_BOOT_TIMEOUT_MS);
+    if ( ! cancel ) return timeout;
+    return typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout, cancel]) : timeout;
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId) {
+async function mintCodePreviewUrlOnce (computerId, cancel) {
     const started = await session.ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
@@ -150,12 +163,13 @@ async function mintCodePreviewUrlOnce (computerId) {
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ computerId }),
-            signal: AbortSignal.timeout(DESKTOP_BOOT_TIMEOUT_MS),
+            signal: mintSignal(cancel),
         });
     } catch ( err ) {
         // Same distinction session.js's `request()` makes: our own timeout
-        // vs. a genuine transport failure.
+        // vs. a genuine transport failure vs. the caller's cancel.
         const timed_out = err && err.name === 'TimeoutError';
+        if ( ! timed_out && cancel?.aborted ) return { ok: false, errorCode: 'cancelled', message: 'The request was cancelled.' };
         return {
             ok: false,
             errorCode: timed_out ? 'timeout' : 'fetch_failed',
@@ -287,6 +301,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
+    let mint_ctl = null;
     /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
     let last_failure = null;
     /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
@@ -403,7 +419,9 @@ export async function openCodeWindow (ctx = {}) {
         // 🔴 THE MINT. Exactly once per genuine window-open — see the file
         // header for the three structural properties this depends on.
         console.info(`[${PHASE}] minting a code-preview URL for computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id));
+        mint_ctl?.abort();
+        mint_ctl = new AbortController();
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -493,6 +511,8 @@ export async function openCodeWindow (ctx = {}) {
         let awaiting_reload = false;
         let probe_timer = null;
         let deadline_timer = null;
+        // The last answer, so a failure (including the deadline) names the hop that answered.
+        let last_observation = null;
         const frame_url = el_iframe.src;
         const stale = () => settled || disposed || my_attempt !== attempt;
         stop_confirmation = () => {
@@ -527,10 +547,16 @@ export async function openCodeWindow (ctx = {}) {
                 return;
             }
 
+            const reason = last_observation?.reason;
+            const status = last_observation?.status;
+            // The console line keeps its exact text (browser suites allow-list it); the
+            // reason and origin status travel in the telemetry attrs below.
             console.error(`[${PHASE}] the code frame is not answering (confirmFrame -> ${String(seen)})`);
+            // `status` is only ever the ORIGIN's (the probe's `data.status`); our own route's
+            // refusal is `reason: 'route_refused'` with no status.
             telemetry.capture({
                 eventClass: 'display_failure', site: 'ezil-os:apps/code#confirmFrame', code: 'frame_not_answering',
-                attrs: { seen: String(seen) },
+                attrs: { seen: String(seen), ...(reason ? { reason } : {}), ...(Number.isInteger(status) ? { status } : {}) },
             });
             show_panel();
             // A terminal refusal or an exhausted confirmation/recovery budget.
@@ -560,8 +586,9 @@ export async function openCodeWindow (ctx = {}) {
             const seen = observation.confirmed;
             in_flight = false;
             if ( stale() ) return;
+            last_observation = observation;
             // Never apply a positive verdict to a replaced frame URL.
-            if ( el_iframe.src !== frame_url ) { finish(false); return; }
+            if ( el_iframe.src !== frame_url ) { last_observation = { reason: 'frame_replaced' }; finish(false); return; }
             if ( observation.retryable ) {
                 recovering = true;
                 needs_reload = true;
@@ -663,6 +690,8 @@ export async function openCodeWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
+        mint_ctl?.abort();
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
         window.removeEventListener(TRANSITION_EVENT, on_transition);
         transition_watch?.stop();

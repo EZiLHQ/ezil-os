@@ -3,11 +3,11 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 usage() {
-    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--reviewed-base-ami <ami-id>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--maintenance-release <source-manifest>] [--deployed-release <manifest>] [--apply] [--config <path>] [--release-dir <path>]'
+    say 'Usage: rebuild-ami.sh --desktop-image <local-ref> --source-sha <sha> [--recipe-version <x.y.z>] [--reviewed-base-ami <ami-id>] [--previous-desktop-image-ref <immutable-ref> --previous-desktop-image-id <id> --previous-release <manifest>] [--maintenance-release <source-manifest>] [--deployed-release <manifest>] [--apply] [--config <path>] [--release-dir <path>] [--namespace mum|prd]'
 }
 desktop_image= source_sha= recipe_version= previous_ref= previous_id= previous_release= maintenance_release= deployed_release=
-reviewed_base_ami=
-config=/root/ezil-aws-mum/config/ami.mum.json
+reviewed_base_ami= namespace_arg=mum
+config=
 while (($#)); do
     case "$1" in
         --desktop-image) (($# >= 2)) || die 'missing desktop image'; desktop_image=$2; shift 2 ;;
@@ -21,6 +21,7 @@ while (($#)); do
         --deployed-release) (($# >= 2)) || die 'missing deployed release manifest'; deployed_release=$2; shift 2 ;;
         --config) (($# >= 2)) || die 'missing config path'; config=$2; shift 2 ;;
         --release-dir) (($# >= 2)) || die 'missing release directory'; release_dir=$2; shift 2 ;;
+        --namespace) (($# >= 2)) || die 'missing namespace'; namespace_arg=$2; shift 2 ;;
         --apply) apply=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
@@ -30,6 +31,12 @@ done
 [[ -n "$previous_ref" && -n "$previous_id" || -z "$previous_ref" && -z "$previous_id" ]] || die 'previous reference and ID must be supplied together'
 [[ -z "$previous_release" || -n "$previous_ref" ]] || die 'previous release requires previous image pair'
 [[ -z "$maintenance_release" || -z "$previous_ref$previous_id$previous_release" ]] || die 'maintenance bake cannot include a previous lower'
+use_namespace "$namespace_arg"
+config=${config:-$config_dir/ami.$namespace.json}
+if [[ "$namespace" != mum ]]; then
+    [[ -z "$previous_ref$previous_id$previous_release$maintenance_release$deployed_release" ]] || die "$namespace has no rebase tuple; previous/maintenance/deployed release bakes are mum-only"
+    [[ "$config" != /root/ezil-aws-mum/* ]] || die "$namespace never reads mum operator configs"
+fi
 require_tools aws docker git python3 mktemp date timeout
 require_absolute_release
 init_work
@@ -39,7 +46,7 @@ if [[ -n "$recipe_version" ]]; then
     [[ -f "$config" && ! -L "$config" ]] || die 'AMI config must be a regular non-symlink file'
     config=$(realpath -- "$config")
     cp -- "$config" "$work/previous-ami-config.json"
-    json plan-ami "$work/previous-ami-config.json" "$recipe_version" "$work/ami.mum.json"
+    json plan-ami "$work/previous-ami-config.json" "$recipe_version" "$work/ami.$namespace.json"
 fi
 assert_identity
 if [[ -n "$previous_ref$maintenance_release$deployed_release" ]]; then
@@ -81,8 +88,8 @@ tag=host-${full_sha:0:12}-$stamp
 change=ami-${full_sha:0:12}-$stamp
 archive=host-agent-$full_sha.tgz
 source_uri=s3://$bucket/ami/$archive
-aws_read cloudformation describe-stacks --stack-name ezil-mum-ami --output json > "$work/stack.json"
-aws_read cloudformation get-template --stack-name ezil-mum-ami --template-stage Original --output json > "$work/template.json"
+aws_read cloudformation describe-stacks --stack-name "$ami_stack" --output json > "$work/stack.json"
+aws_read cloudformation get-template --stack-name "$ami_stack" --template-stage Original --output json > "$work/template.json"
 if [[ -n "$previous_ref" && -z "$recipe_version" ]]; then
     json previous-parameters "$work/stack.json"
 fi
@@ -91,13 +98,13 @@ digest='<ECR-manifest-digest>'
 json parameters "$work/stack.json" "$digest" "$image_id" "$source_uri" "$work/parameters.json" "${previous_args[@]}"
 template_args=(--use-previous-template)
 template_uri=
-# Follow the stack's own deployment role: ezil-mum-ami was created with caller
+# Follow the stack's own deployment role: ezil-<ns>-ami is created with caller
 # credentials (no RoleARN); passing the exec role would re-associate it with a role
 # that cannot resolve the public Ubuntu SSM parameter.
 stack_role=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Stacks"][0].get("RoleARN") or "")' "$work/stack.json")
 role_args=()
 if [[ -n "$stack_role" ]]; then
-    [[ "$stack_role" == "$exec_role" ]] || die "ezil-mum-ami is bound to an unexpected role: $stack_role"
+    [[ "$stack_role" == "$exec_role" ]] || die "$ami_stack is bound to an unexpected role: $stack_role"
     role_args=(--role-arn "$exec_role")
 fi
 validation_args=()
@@ -105,10 +112,10 @@ if [[ -n "$recipe_version" ]]; then
     # README host-AMI step (d), package.json synth:ami, and bin/ami.ts.
     # synth:ami already pins -o cdk.out/ami; do not pass a second --output.
     prepare_synth ami
-    show env "EZIL_AMI_CONFIG=$work/ami.mum.json" npm --prefix "$synth_project" run synth:ami -- ezil-mum-ami
-    EZIL_AMI_CONFIG="$work/ami.mum.json" npm --prefix "$synth_project" run synth:ami -- ezil-mum-ami
-    candidate_template=$synth_project/cdk.out/ami/ezil-mum-ami.template.json
-    validation_args=("$candidate_template" "$work/previous-ami-config.json" "$work/ami.mum.json")
+    show env "EZIL_AMI_CONFIG=$work/ami.$namespace.json" npm --prefix "$synth_project" run synth:ami -- "$ami_stack"
+    EZIL_AMI_CONFIG="$work/ami.$namespace.json" npm --prefix "$synth_project" run synth:ami -- "$ami_stack"
+    candidate_template=$synth_project/cdk.out/ami/$ami_stack.template.json
+    validation_args=("$candidate_template" "$work/previous-ami-config.json" "$work/ami.$namespace.json")
     json ami-template "$work/template.json" "${validation_args[@]}"
     template_bytes=$(wc -c < "$candidate_template")
     ((template_bytes <= 1048576)) || die 'synthesized template exceeds the 1048576-byte S3 limit'
@@ -129,7 +136,7 @@ if "$apply"; then
     if [[ -n "$recipe_version" ]]; then
         cmp -s "$config" "$work/previous-ami-config.json" || die 'AMI config changed since planning'
         cp "$work/previous-ami-config.json" "$release_dir/previous-ami-config.json"
-        cp "$work/ami.mum.json" "$release_dir/candidate-ami-config.json"
+        cp "$work/ami.$namespace.json" "$release_dir/candidate-ami-config.json"
         cp "$candidate_template" "$release_dir/candidate-ami-template.json"
     fi
     # Docker credentials are temporary; no existing Docker credential file is read.
@@ -162,11 +169,11 @@ aws_act s3 cp "$work/$archive" "$source_uri"
 say 'Exact parameter request (only approved current/previous image and source values change):'
 cat "$work/parameters.json"
 if [[ -n "${template_uri:-}" ]]; then aws_act s3 cp "$candidate_template" "$template_uri"; fi
-aws_act cloudformation create-change-set --stack-name ezil-mum-ami --change-set-name "$change" --change-set-type UPDATE \
+aws_act cloudformation create-change-set --stack-name "$ami_stack" --change-set-name "$change" --change-set-type UPDATE \
     "${template_args[@]}" "${role_args[@]}" --capabilities CAPABILITY_NAMED_IAM --parameters "file://$work/parameters.json"
 if ! "$apply"; then
-    show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name ezil-mum-ami --change-set-name "$change"
-    show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name ezil-mum-ami --change-set-name "$change" --include-property-values --output json
+    show aws --profile "$profile" --region "$region" cloudformation wait change-set-create-complete --stack-name "$ami_stack" --change-set-name "$change"
+    show aws --profile "$profile" --region "$region" cloudformation describe-change-set --stack-name "$ami_stack" --change-set-name "$change" --include-property-values --output json
     say 'Validate every parameter, resolved SSM value and resource change before execution.'
     if [[ -n "$reviewed_base_ami" ]]; then
         say "Accept Ubuntu parent drift only to $reviewed_base_ami after describe-images verifies Canonical ownership, Noble amd64 name, available state and a newer creation date; save base-image-review.json."
@@ -176,10 +183,10 @@ if ! "$apply"; then
     else
         say 'BLOCKER in current template: Components require replacing an immutable recipe without a version bump. Apply refuses this change set. Supply --recipe-version.'
     fi
-    aws_act cloudformation execute-change-set --stack-name ezil-mum-ami --change-set-name "$change"
-    show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name ezil-mum-ami
+    aws_act cloudformation execute-change-set --stack-name "$ami_stack" --change-set-name "$change"
+    show aws --profile "$profile" --region "$region" cloudformation wait stack-update-complete --stack-name "$ami_stack"
     if [[ -n "$recipe_version" ]]; then say "After successful stack update only: persist version $recipe_version to $config; retain previous-ami-config.json in $release_dir."; fi
-    show aws --profile "$profile" --region "$region" cloudformation describe-stacks --stack-name ezil-mum-ami --output json
+    show aws --profile "$profile" --region "$region" cloudformation describe-stacks --stack-name "$ami_stack" --output json
     aws_act imagebuilder start-image-pipeline-execution --image-pipeline-arn '<stack PipelineArn>' --query imageBuildVersionArn --output text
     show aws --profile "$profile" --region "$region" imagebuilder get-image --image-build-version-arn '<build ARN>' --output json
     say "Poll every 30 seconds, at most 90 minutes; persist build ARN immediately, then AVAILABLE AMI and inputs in $release_dir. Never remove an AMI."
@@ -202,7 +209,7 @@ json bake-inputs "$work/parameters.json" "$full_sha" "$recipe_version" "$work/te
 printf '%s\n' "$change" > "$release_dir/ami-changeset.txt"
 printf 'ApplicationImageRepositoryUri=%s\nDesktopImageDigest=%s\nDesktopImageId=%s\nPreviousDesktopImageRef=%s\nPreviousDesktopImageId=%s\nDesktopTag=%s\nSourceImage=%s\nSourceSha=%s\nAgentSrcS3Uri=%s\n' \
     "$repository" "$digest" "$pinned_id" "$previous_ref" "$previous_id" "$tag" "$desktop_image" "$full_sha" "$source_uri" > "$release_dir/desktop.txt"
-wait_changeset ezil-mum-ami "$change"
+wait_changeset "$ami_stack" "$change"
 cp "$work/changeset.json" "$release_dir/ami-changeset.json"
 rm -f -- "$release_dir/base-image-review.json"
 base_review_args=()
@@ -218,13 +225,13 @@ fi
 if [[ -n "$recipe_version" ]]; then
     cmp -s "$config" "$work/previous-ami-config.json" || die 'AMI config changed before execution'
 fi
-execute_changeset ezil-mum-ami "$change"
+execute_changeset "$ami_stack" "$change"
 if [[ -n "$recipe_version" ]]; then
     printf '%s\n' "$change" > "$release_dir/ami-update-complete.txt"
     json persist-ami "$config" "$release_dir/previous-ami-config.json" "$release_dir/candidate-ami-config.json"
     say "AMI config now uses $recipe_version; previous version saved in $release_dir/previous-ami-config.json"
 fi
-aws_read cloudformation describe-stacks --stack-name ezil-mum-ami --output json > "$work/updated-stack.json"
+aws_read cloudformation describe-stacks --stack-name "$ami_stack" --output json > "$work/updated-stack.json"
 pipeline=$(json output "$work/updated-stack.json" PipelineArn)
 [[ "$pipeline" == arn:aws:imagebuilder:ap-south-1:452630323510:image-pipeline/* ]] || die 'invalid stack PipelineArn'
 build=$(aws_read imagebuilder start-image-pipeline-execution --image-pipeline-arn "$pipeline" --query imageBuildVersionArn --output text)

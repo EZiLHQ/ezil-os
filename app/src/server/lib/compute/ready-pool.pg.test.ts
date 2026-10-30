@@ -697,6 +697,29 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             expect((await readPoolDemand(db,{...c,deployment},NOW)).spares).toBe(1);
         } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
     });
+    it('production prd: a real SQL replenish reserves the floor spare bound to the prd release', async () => {
+        vi.useFakeTimers({toFake:['Date']}); vi.setSystemTime(NOW);
+        vi.stubEnv('AWS_REGIONS','ap-south-1'); vi.stubEnv('EZIL_AWS_MAX_RUNNING_AP_SOUTH_1','20');
+        vi.stubEnv('EZIL_AWS_KILL_SWITCH','0');
+        try {
+            await subscriber(1);
+            const pilot = fixtureDeployment('ap-south-1');
+            const deployment = {...pilot,namespace:'prd',stateMachineVersionArn:pilot.stateMachineVersionArn.replace('ezil-pilot-','ezil-prd-')};
+            const starter = {start:vi.fn<LifecycleStarter['start']>(async () => {})};
+            const deps = {db,data:poolData,store:createPoolDispatchStore(db,process.env,{starter}),starter,
+                classes:[{...c,deployment}],deployments:{[c.region]:deployment},now:()=>NOW,
+                withLock:<T>(run:(tx?:PlacementExecutor)=>Promise<T>)=>withPoolReplenishLock(db,run),log:()=>{}};
+            await runPoolReplenish(deps);
+            expect(starter.start).toHaveBeenCalledTimes(1);
+            const [region, work] = starter.start.mock.calls[0]!;
+            expect(region).toBe('ap-south-1');
+            expect(work.stateMachineArn).toBe(deployment.stateMachineVersionArn);
+            expect(JSON.parse(JSON.parse(work.input).document)).toMatchObject({operation:'pool-provision',deployment:{namespace:'prd'}});
+            expect((await readPoolDemand(db,{...c,deployment},NOW)).spares).toBe(1);
+            // The spare is bound to the prd release: another namespace's open can never count or lease it.
+            expect((await readPoolDemand(db,{...c,deployment:pilot},NOW)).spares).toBe(0);
+        } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
+    });
     it('selects the current subscription before evaluating funding or issues',async()=>{
         await subscriber(1);
         await db.execute(sql`INSERT INTO public.ezil_billing_subscriptions VALUES ('sub-later',${uuid(1)}::uuid,'premium_monthly_v3','active',

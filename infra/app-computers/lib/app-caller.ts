@@ -73,7 +73,10 @@ const VERCEL_SUBJECT = /^owner:([a-z0-9][a-z0-9-]{0,99}):project:([a-z0-9][a-z0-
  *   mode; `oidc.vercel.com` in global mode), audience `https://vercel.com/<team>`,
  *   subject `owner:<team>:project:<project>:environment:production`. The IAM
  *   OIDC provider for that issuer is created by the founder (the boundary
- *   denies identity-provider writes to CI). */
+ *   denies identity-provider writes to CI).
+ * - EC2 (the app host's instance role, `sts:AssumeRole` with `ezil:env`
+ *   = `ec2CallerEnv`): with no provider, exactly one role is the whole trust.
+ *   A `production` caller admits no provider at all. */
 export const AppCallerConfigSchema = z.object({
     enabled: z.boolean().default(false),
     roleName: z.string().regex(/^[A-Za-z0-9+=,.@_-]{1,64}$/).optional(),
@@ -81,8 +84,17 @@ export const AppCallerConfigSchema = z.object({
     // Exact IAM role ARNs only; never account root, STS sessions, or wildcards.
     ec2CallerRoleArns: z.array(z.string().regex(/^arn:aws:iam::\d{12}:role\/(?:[A-Za-z0-9+=,.@_-]+\/)*[A-Za-z0-9+=,.@_-]{1,64}$/))
         .max(10).refine(v => new Set(v).size === v.length, { message: 'duplicate_ec2_caller' }).optional(),
+    /** The `ezil:env` tag every EC2 caller role must carry (the app host template's
+     * Environment mapping, deploy/aws/os-staging/app-host.yaml). The default keeps
+     * existing staging trusts byte-identical. */
+    ec2CallerEnv: z.enum(['billing-staging', 'production']).default('billing-staging'),
 }).strict().superRefine((c, ctx) => {
-    if (c.enabled && c.providers.length === 0) ctx.addIssue({ code: 'custom', message: 'enabled_without_provider' });
+    const ec2 = c.ec2CallerRoleArns ?? [];
+    if (c.enabled && c.providers.length === 0 && ec2.length === 0) ctx.addIssue({ code: 'custom', message: 'enabled_without_provider' });
+    // Without an OIDC provider the whole trust is ONE exact EC2 instance role (the app host's).
+    if (c.enabled && c.providers.length === 0 && ec2.length > 1) ctx.addIssue({ code: 'custom', message: 'ec2_only_caller_must_be_one_role' });
+    // The production caller is the production app host alone: no OIDC subject may reach it.
+    if (c.ec2CallerEnv === 'production' && c.providers.length > 0) ctx.addIssue({ code: 'custom', message: 'production_caller_is_ec2_only' });
     if (new Set(c.providers.map(p => p.name)).size !== c.providers.length) ctx.addIssue({ code: 'custom', message: 'duplicate_provider' });
 });
 export type AppCallerConfig = z.infer<typeof AppCallerConfigSchema>;
@@ -140,20 +152,22 @@ export function appCallerTrust(p: z.infer<typeof ProviderSchema>): iam.PolicySta
 
 export class AppCaller extends Construct {
     readonly role: iam.Role;
-    constructor(scope: Construct, id: string, props: { config: AppCallerConfig; region: string; versionArns: string[]; historyKeyArn: string; ec2CallerRoleArns?: string[] }) {
+    constructor(scope: Construct, id: string, props: { config: z.input<typeof AppCallerConfigSchema>; region: string; versionArns: string[]; historyKeyArn: string; ec2CallerRoleArns?: string[] }) {
         super(scope, id);
         const config = AppCallerConfigSchema.parse({ ...props.config,
             ec2CallerRoleArns: props.ec2CallerRoleArns ?? props.config.ec2CallerRoleArns });
         if (!config.enabled) throw new Error('app caller is disabled');
-        const [first, ...rest] = config.providers;
+        const [first, ...rest] = config.providers, ec2 = config.ec2CallerRoleArns ?? [];
+        const ec2Condition = () => ({ StringEquals: { 'aws:PrincipalTag/ezil:env': config.ec2CallerEnv } });
+        // No OIDC provider: the schema admits exactly one EC2 caller, and it is the base trust.
         this.role = new iam.Role(this, 'Role', { ...(config.roleName ? { roleName: config.roleName } : {}),
             description: 'EZiL app: start exact lifecycle versions, read their computer executions, describe EC2',
-            assumedBy: new iam.FederatedPrincipal(first!.providerArn, appCallerTrust(first!).conditions, 'sts:AssumeRoleWithWebIdentity') });
+            assumedBy: first ? new iam.FederatedPrincipal(first.providerArn, appCallerTrust(first).conditions, 'sts:AssumeRoleWithWebIdentity')
+                : new iam.ArnPrincipal(ec2[0]!).withConditions(ec2Condition()) });
         for (const p of rest) this.role.assumeRolePolicy!.addStatements(appCallerTrust(p));
-        for (const arn of config.ec2CallerRoleArns ?? []) {
+        for (const arn of first ? ec2 : []) {
             this.role.assumeRolePolicy!.addStatements(new iam.PolicyStatement({
-                actions: ['sts:AssumeRole'], principals: [new iam.ArnPrincipal(arn)],
-                conditions: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'billing-staging' } },
+                actions: ['sts:AssumeRole'], principals: [new iam.ArnPrincipal(arn)], conditions: ec2Condition(),
             }));
         }
         for (const s of appCallerStatements(props.region, props.versionArns, props.historyKeyArn)) this.role.addToPolicy(s);

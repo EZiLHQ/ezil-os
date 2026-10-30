@@ -147,6 +147,7 @@ function mint (computerId) {
  */
 export function warm (computerId) {
     if ( ! computerId ) return;
+    if ( session.stoppedByUser?.(computerId) ) return; // the owner stopped it: only an explicit open starts it
     if ( current?.computerId === computerId ) return; // in flight, or claim() will judge freshness
     mint(computerId);
 }
@@ -163,6 +164,13 @@ export function warm (computerId) {
  */
 export function claim (computerId) {
     if ( ! computerId ) return session.openDesktop(computerId);
+    // 🔴 HOTFIX r5 review: the desktop window's open is explicit — it starts a computer the owner
+    // stopped, and lifts the hover hold (`session.holdAfterStop`). A warm resolved BEFORE that stop
+    // is never handed back: its desktop URL belongs to the instance that stopped.
+    if ( session.stoppedByUser?.(computerId) ) {
+        session.releaseStopHold?.(computerId);
+        if ( current?.computerId === computerId ) current = null;
+    }
     if ( current?.computerId === computerId
         && (current.resolvedAt === null || isFresh(current)) ) {
         return current.promise;

@@ -408,7 +408,9 @@ class Agent:
         try:
             with open(os.path.join(self.cfg.runDir, "guard-ok")) as f:
                 stamp = json.load(f)
-            if stamp != {"generation": self.lease["generation"], "leaseEpoch": self.lease["leaseEpoch"]}:
+            # The guard stamps the full committed marker (guard.run_guard); like its own
+            # check (guard.committed_digest), bind it to THIS lease by generation and epoch.
+            if not isinstance(stamp, dict) or any(stamp.get(k) != self.lease[k] for k in ("generation", "leaseEpoch")):
                 return "stale"
         except (OSError, ValueError):
             return "stale"
@@ -554,6 +556,7 @@ class Agent:
         except OSError:
             load1 = None
         if load1 is None or load1 >= self.cfg.idle["load1Busy"]:
+            self.log(f"idle stop blocked: busy_load load1={'unknown' if load1 is None else f'{load1:g}'}")
             return "busy_load"
         self._set_marker(desktop.STOPPING)         # the desktop's Restart= must not undo the flush
         res = self.flush(blockable=True)

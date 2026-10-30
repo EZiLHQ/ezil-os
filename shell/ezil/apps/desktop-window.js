@@ -94,7 +94,7 @@ import { bindNativeBrowser } from './native.js';
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
-import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
+import { FRAME_CONFIRM_DEADLINE_MS, applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import BootProgress, { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/boot-progress.js';
@@ -146,14 +146,30 @@ const PHASE_LIST_AFTER_MS = 4_000;
  * same schedule it used to be revealed on — the difference is that it is now
  * settled by an ANSWER rather than by the timer itself.
  *
- * ATTEMPTS/RETRY: how many times to re-ask when OUR OWN request fails to land
- * (offline, a 502 from our host). That is not an observation of the desktop, so
- * it must not be recorded as one in either direction; three tries 1.5s apart is
- * enough to ride out a blip without leaving the user staring at a panel.
+ * RETRY/RETRY_MAX: the re-ask schedule, a bounded backoff (1.5 s, 3 s, 6 s,
+ * then every 8 s), never past the attempt's `boot_deadline`. An unanswered
+ * check (OUR request never landed: offline, a 502 from our host, the 12 s
+ * status timeout) is not an observation of the desktop, and neither is a
+ * negative while the computer is not known to be down; both are re-asked.
+ *
+ * 🔴 G12 (2026-10-30, PROD-COMPUTERS-PLAN §6.3): this used to be "three tries
+ * 1.5 s apart, then give up", counted across every ask of the attempt, so a
+ * single unanswered check after two negatives was final, and a negative whose
+ * `desktopRunning` read timed out (`undefined`) was final too. On AWS a
+ * desktop that the host is still (re)starting answers late, and those were
+ * the `desktop_unreachable` failures of the warm tail. The deadline, not an
+ * ask count, now bounds the wait.
  */
 const FRAME_CONFIRM_FALLBACK_MS = 4_000;
-const FRAME_CONFIRM_ATTEMPTS = 3;
 const FRAME_CONFIRM_RETRY_MS = 1_500;
+const FRAME_CONFIRM_RETRY_MAX_MS = 8_000;
+/**
+ * Frame-check negatives that are OUR refusals, not observations of the desktop:
+ * our own route's 401/403 (`session.observeFrame`'s `route_refused`) and the
+ * server's refusals. Asking again gets the same answer, so they stay terminal
+ * (the same rule Code applies, r5 F9).
+ */
+const FRAME_REFUSALS = new Set(['route_refused', 'not_own_origin', 'provider_not_configured', 'bad_url']);
 /** The least origin-probe grace a desktop URL gets, measured from its handover. */
 const FRAME_ORIGIN_GRACE_MS = 60_000;
 
@@ -1570,8 +1586,17 @@ export async function openDesktopWindow (ctx = {}) {
             // === true`), so this branch genuinely does not know which it has.
             // The honest rendering of not knowing is the `connecting` phase.
             // `settle_frame` below is the only thing that may conclude
-            // `desktop_unreachable`, and `FRAME_CONFIRM_DEADLINE_MS` — measured
-            // from `t_handoff` — ends the boot if it never does.
+            // `desktop_unreachable`.
+            //
+            // 🔴 G12: and THIS TICK NEVER CONCLUDES IT. It used to pass the raw
+            // time since handoff, so at `FRAME_CONFIRM_DEADLINE_MS` (45 s) it
+            // painted the terminal "isn't answering" while `settle_frame` was
+            // still legitimately asking (its `boot_deadline` is at least 60 s
+            // after handover), and a confirm a moment later then revealed the
+            // desktop over a failure. Both gates on this navigation reach their
+            // own verdicts on their own clocks (`settle_frame`: `boot_deadline`;
+            // the display gate: `DISPLAY_BLANK_DEADLINE_MS`), so the tick only
+            // paints progress, with the long-boot copy once it is running long.
             //
             // 🔴 MERGE NOTE (A × W3): renders through `render_both`, not
             // `progress.render`. W3 added the `AppSpinner` surface after this
@@ -1583,7 +1608,7 @@ export async function openDesktopWindow (ctx = {}) {
                 if ( disposed || my_attempt !== attempt ) return;
                 render_both(computeBootUiState({
                     requestStatus: 'success',
-                    elapsedMs: performance.now() - t_handoff,
+                    elapsedMs: Math.min(performance.now() - t_handoff, FRAME_CONFIRM_DEADLINE_MS - 1),
                 }));
             };
             tick_timer = setInterval(paint, TICK_MS);
@@ -1694,42 +1719,74 @@ export async function openDesktopWindow (ctx = {}) {
      *   refuted   — panel STAYS, failure copy + Retry, window stays windowed on
      *               a usable OS. The user is told their display is not
      *               answering rather than handed an error page full-screen.
-     *   no answer — retried a bounded number of times, then treated as refuted.
-     *               "We could not confirm your desktop" is a true statement;
-     *               an indefinite spinner is not more honest, and Retry re-runs
-     *               the whole boot.
+     *   no answer — re-asked (bounded backoff) until `boot_deadline`, then
+     *               treated as refuted. "We could not confirm your desktop" is
+     *               a true statement; an indefinite spinner is not more honest,
+     *               and Retry re-runs the whole boot.
+     *
+     * 🔴 G12: the re-ask rule is the DEADLINE, not an ask count. Until
+     * `boot_deadline` an unanswered check is asked again, and so is a negative
+     * unless `desktopRunning` says the computer is NOT running (`false`); an
+     * unknown status (`undefined`, e.g. its own 12 s timeout) does not refute
+     * the desktop. Our own refusals (`FRAME_REFUSALS`) and a computer known to
+     * be down still fail at once. While this asks, the opening surface keeps
+     * painting progress (see the unconfirmed-handoff `paint`); only this
+     * function's terminal branch below may render `desktop_unreachable`.
      */
     function settle_frame (my_attempt, url, gate, boot_deadline) {
         let settled = false;
         let asks = 0;
         let asking = false;
+        let retries = 0;
+        let retry_timer = null;
+        /** The last `desktopRunning` read ('unasked' until a negative asked it), for telemetry. */
+        let running = 'unasked';
+        const t_start = performance.now();
+        const stale = () => settled || disposed || my_attempt !== attempt;
+
+        /** One re-ask, on a bounded backoff, never scheduled past the deadline (the ask AT it is the last). */
+        const again = () => {
+            const delay = Math.min(FRAME_CONFIRM_RETRY_MS * 2 ** retries, FRAME_CONFIRM_RETRY_MAX_MS);
+            retries++;
+            retry_timer = setTimeout(() => { retry_timer = null; void ask(); },
+                Math.max(0, Math.min(delay, boot_deadline - performance.now())));
+        };
 
         const ask = async () => {
-            if ( asking || settled || disposed || my_attempt !== attempt ) return;
+            if ( asking || stale() ) return;
+            // A `load` arriving while a re-ask is scheduled asks now instead
+            // (the frame just loaded): one chain of asks, never two.
+            clearTimeout(retry_timer); retry_timer = null;
             asking = true;
             try {
                 asks++;
-                const seen = await session.confirmFrame(computer.id, url);
-                if ( settled || disposed || my_attempt !== attempt ) return;
+                const observation = await Promise.resolve(session.observeFrame(computer.id, url))
+                    .catch(() => ({ confirmed: undefined }));
+                const seen = observation?.confirmed;
+                if ( stale() ) return;
 
-                if ( seen === undefined ) {
-                    // OUR request never landed. That is not an observation of the
-                    // desktop, so it decides nothing — ask again, bounded.
-                    if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
-                        setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
-                        return;
+                if ( seen !== true ) {
+                    const refused = FRAME_REFUSALS.has(observation?.reason);
+                    if ( ! refused && performance.now() < boot_deadline ) {
+                        if ( seen === undefined ) {
+                            // OUR request never landed. That is not an observation
+                            // of the desktop, so it decides nothing — ask again.
+                            again();
+                            return;
+                        }
+                        // A negative origin probe during startup is not a display
+                        // verdict unless the computer is known not to be running.
+                        const status = await Promise.resolve(session.desktopRunning(computer.id)).catch(() => undefined);
+                        running = String(status);
+                        if ( stale() ) return;
+                        if ( status !== false && performance.now() < boot_deadline ) {
+                            again();
+                            return;
+                        }
                     }
-                    console.warn(`[${PHASE}] gave up confirming the frame after ${asks} tries`);
-                }
-
-                // A negative origin probe during confirmed startup is not a
-                // display verdict. Retain Opening inside the original boot budget.
-                if ( seen === false && performance.now() < boot_deadline ) {
-                    const starting = await session.desktopRunning(computer.id);
-                    if ( settled || disposed || my_attempt !== attempt ) return;
-                    if ( starting === true && performance.now() < boot_deadline ) {
-                        setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
-                        return;
+                    if ( ! refused && running !== 'false' ) {
+                        console.warn(`[${PHASE}] gave up confirming the frame after ${asks} asks`
+                            + ` (${Math.round(performance.now() - t_start)}ms, boot deadline reached)`);
                     }
                 }
                 settled = true;
@@ -1753,9 +1810,14 @@ export async function openDesktopWindow (ctx = {}) {
                 }
 
                 console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
+                // G12 instrumentation: the last observation's hop (reason, ORIGIN status), how
+                // many asks this took, the last `desktopRunning` read and the time since handover.
+                const reason = typeof observation?.reason === 'string' ? observation.reason : undefined;
+                const status = Number.isInteger(observation?.status) ? observation.status : undefined;
                 telemetry.capture({
                     eventClass: 'display_failure', site: 'ezil-os:apps/desktop#confirmFrame', code: 'frame_not_answering',
-                    attrs: { seen: String(seen) },
+                    attrs: { seen: String(seen), ...(reason ? { reason } : {}), ...(status !== undefined ? { status } : {}),
+                        asks, running, elapsed_ms: Math.round(performance.now() - t_start) },
                 });
                 gate.stop();
                 stop_timers();
@@ -1774,7 +1836,9 @@ export async function openDesktopWindow (ctx = {}) {
         };
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
-        setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
+        // The fallback is for a frame that never fires `load`; once asking has begun
+        // the backoff above owns the schedule.
+        setTimeout(() => { if ( asks === 0 ) void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
     }
 
     // ── the display gate ───────────────────────────────────────────────────

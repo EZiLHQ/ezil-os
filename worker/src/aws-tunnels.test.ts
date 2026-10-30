@@ -887,4 +887,29 @@ describe('AWS AI boot nonce', () => {
     expect((await svc.get())!.aiProxyNonce).toBeUndefined();
     expect(await svc.aiNonce(1, 3, boot)).not.toBe(one);
   });
+
+  it('G12: records an accepted AI push only for this epoch and the boot its nonce was minted for', async () => {
+    const storage = memStorage(); const { api } = fakeApi();
+    let t = 1_000;
+    const svc = createAwsTunnelService({ storage, api, zone: ZONE, nowMs: () => t });
+    const boot = '11111111-1111-4111-8111-111111111111';
+    const exp = 1_800_000_600_000;
+    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(false);
+    await svc.create(claims(), body());
+    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(false); // no nonce minted for this boot yet
+    await svc.aiNonce(1, 2, boot);
+    expect(await svc.aiDelivered(2, 2, boot, exp)).toBe(false);
+    expect(await svc.aiDelivered(1, 3, boot, exp)).toBe(false);
+    expect(await svc.aiDelivered(1, 2, 'container-choice', exp)).toBe(false);
+    expect(await svc.aiDelivered(1, 2, '22222222-2222-4222-8222-222222222222', exp)).toBe(false);
+    expect(await svc.aiDelivered(1, 2, boot, 1.5)).toBe(false);
+    expect((await svc.get())!.aiDelivered).toBeUndefined();
+    t = 2_000;
+    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(true);
+    expect((await svc.get())!.aiDelivered).toEqual({ bootId: boot, expiresAt: exp, at: 2_000 });
+    expect((await svc.get())!.aiBootId).toBe(boot);
+    // A new lease epoch is a new record: nothing delivered to it yet.
+    await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
+    expect((await svc.get())!.aiDelivered).toBeUndefined();
+  });
 });

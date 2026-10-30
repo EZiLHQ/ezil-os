@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { App, BootstraplessSynthesizer, Stack, assertions } from 'aws-cdk-lib';
-import { DeployIdentityStack, GLOBAL_SERVICES, IdentityConfigSchema, boundaryStatements, deployStatements, deployTrust,
+import { DeployIdentityStack, GLOBAL_SERVICES, IdentityConfigSchema, boundaryStatements, deployEnvironment, deployStatements, deployTrust,
     execStatements, identityNames } from '../lib/identity.js';
 import { OpsConfigSchema, OpsStack, killSwitchStatements } from '../lib/ops.js';
 import { AppComputerFoundationStack } from '../lib/foundation.js';
@@ -202,6 +202,20 @@ test('I5 deploy role: exact GitHub OIDC trust and change-set-only rights through
         'repo:org@1/repo@2:environment:aws-pilot:x', 'repo:o:rg@1/repo@2:environment:aws-pilot', 'repo:org@x/repo@2:environment:aws-pilot'])
         assert.equal(IdentityConfigSchema.safeParse({ ...cfg, deploySubject: bad }).success, false, bad);
     assert.equal(IdentityConfigSchema.safeParse({ ...cfg, githubOidcProviderArn: `arn:aws:iam::${A}:oidc-provider/evil.example` }).success, false);
+});
+test('I5 deploy environment is chosen per namespace: only aws-<label>, and the role description names it', () => {
+    const subject = (env: string) => `repo:org@1/repo@2:environment:${env}`;
+    for (const bad of ['production', 'prd', 'aws-', 'aws-PRD', 'aws-prd*', 'aws-prd/x', 'aws-prd x', `aws-${'a'.repeat(41)}`])
+        assert.equal(IdentityConfigSchema.safeParse({ ...cfg, deploySubject: subject(bad) }).success, false, bad);
+    const description = (config: typeof cfg) => (Object.values(assertions.Template.fromStack(new DeployIdentityStack(new App(), 'I',
+        { config, synthesizer: new BootstraplessSynthesizer(), env: { account: A, region: R } })).findResources('AWS::IAM::Role')) as any[])
+        .find(r => r.Properties.RoleName === `ezil-${config.namespace}-deploy`).Properties;
+    const prd = IdentityConfigSchema.parse({ ...cfg, namespace: 'prd', deploySubject: subject('aws-prd'), assetBucketName: `ezil-prd-deploy-assets-${A}` });
+    assert.equal(deployEnvironment(prd), 'aws-prd');
+    assert.equal(description(prd).Description, 'GitHub OIDC deploy (environment aws-prd): change sets via the execution role');
+    assert.deepEqual(description(prd).AssumeRolePolicyDocument.Statement, [deployTrust(prd).toStatementJson()]);
+    // The existing aws-pilot identity keeps its exact description.
+    assert.equal(description(cfg).Description, 'GitHub OIDC deploy (environment aws-pilot): change sets via the execution role');
 });
 
 function identityStack() {

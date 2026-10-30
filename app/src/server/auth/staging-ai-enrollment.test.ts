@@ -7,14 +7,14 @@ import type { OutboxInsert } from '@/server/billing/ports';
 vi.mock('server-only', () => ({}));
 const stub = vi.hoisted(() => ({
     config: vi.fn(), postgres: vi.fn(), socket: vi.fn(), sharedDb: vi.fn(),
-    listUsers: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(),
+    listUsers: vi.fn(), createUser: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(),
 }));
 vi.mock('@/server/billing/config', () => ({ readBillingConfig: stub.config }));
 vi.mock('postgres', () => ({ default: stub.postgres }));
 vi.mock('node:net', () => ({ Socket: class { constructor() { return stub.socket(); } } }));
 vi.mock('@/server/db', () => { stub.sharedDb(); throw new Error('Shared pool must not be imported'); });
 vi.mock('./supabase-admin', () => ({ createAdminClient: () => ({ auth: { admin: {
-    listUsers: stub.listUsers, generateLink: stub.generateLink,
+    listUsers: stub.listUsers, createUser: stub.createUser, generateLink: stub.generateLink,
 } } }) }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { verifyOtp: stub.verifyOtp } }) }));
 
@@ -26,6 +26,9 @@ const sub = 'auth0|verified-subject';
 const firstGrant = new Date('2026-10-26T00:00:00.000Z');
 const narrowRole = 'ezil_os_ai_enroller';
 const fixtureUrl = 'postgres://fixture:fixture@db.example.test:5432/fixture?sslmode=require';
+const STAGING = 'https://ai-staging.ezil.work';
+const PRODUCTION = 'https://ai.ezil.work';
+const fundingHmacSecret = 'fixture-funding-hmac';
 type Stage = 'acquire' | 'role' | 'probe' | 'enroll' | 'outbox' | 'enroll_commit' | 'outbox_commit';
 type ClientOptions = {
     max: number; max_pipeline: number; prepare: boolean; fetch_types: boolean; connect_timeout: number;
@@ -46,6 +49,7 @@ let failStage: Stage | undefined;
 let releaseHeld: () => void;
 let held: Promise<void>;
 let warn: ReturnType<typeof vi.spyOn>;
+let info: ReturnType<typeof vi.spyOn>;
 
 class FakeSocket extends EventEmitter {
     host?: string;
@@ -150,13 +154,14 @@ beforeEach(() => {
     vi.setSystemTime(firstGrant);
     vi.stubEnv('SUPABASE_DATABASE_URL', fixtureUrl);
     warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    info = vi.spyOn(console, 'info').mockImplementation(() => {});
     allowed = true;
     enrollment = { ok: true, public_id: '15fe6bbf-a471-4e1c-a03b-403c503b88fe', role: 'creator', created: true };
     receipts = new Map(); effects = []; sockets = []; clients = [];
     connectMode = 'normal'; closeHangs = false; removeDriverListeners = false;
     holdStage = undefined; failStage = undefined;
     held = new Promise<void>(resolve => { releaseHeld = resolve; });
-    stub.config.mockReturnValue({ fundingUrl: 'https://ai-staging.ezil.work' });
+    stub.config.mockReturnValue({ fundingUrl: STAGING, fundingHmacSecret });
     stub.socket.mockImplementation(() => { const socket = new FakeSocket(); sockets.push(socket); return socket; });
     stub.postgres.mockImplementation((_url: string, options: ClientOptions) => {
         const client = new FakeClient(options); clients.push(client); return client;
@@ -165,6 +170,19 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 function queries() { return clients.flatMap(client => client.queries); }
+/** Every console line this unit wrote, as [level, parsed line]; each must be one fixed-shape JSON string. */
+function logLines() {
+    return [...info.mock.calls.map(call => ['info', call] as const), ...warn.mock.calls.map(call => ['warn', call] as const)].map(([level, call]) => {
+        expect(call).toHaveLength(1);
+        const text = call[0] as string;
+        for (const secret of [userId, sub, fixtureUrl, STAGING, PRODUCTION, 'ai.ezil.work', fundingHmacSecret, 'private']) expect(text).not.toContain(secret);
+        const line = JSON.parse(text);
+        expect(Object.keys(line)).toEqual(['event', 'source', 'stage', 'code']);
+        return [level, line] as const;
+    });
+}
+const enrolled = [['info', { event: 'ai-enroll', source: 'auth0', stage: 'done', code: null }]];
+const refused = (stage: string, code: string) => [['warn', { event: 'ai-enroll', source: 'auth0', stage, code }]];
 async function settleMicrotasks() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
 
 function mockSignIn() {
@@ -176,29 +194,54 @@ function mockSignIn() {
 }
 
 describe('staging AI enrollment with a bounded owned connection', () => {
-    it.each([
-        undefined, '', 'not a url', '/relative', 'https://ai.ezil.work',
-        'http://ai-staging.ezil.work', 'https://ai-staging.ezil.work:444',
-        'https://ai-staging.ezil.work.attacker.test', 'https://ai-staging.ezil.work@attacker.test',
-        'https://os-staging.ezil.work', 'https://ai-staging.ezil.work.',
-    ])('opens no client for funding URL %s', async fundingUrl => {
-        stub.config.mockReturnValue({ fundingUrl });
+    it.each([undefined, ''])('opens no client and logs disabled without a funding URL (%j)', async fundingUrl => {
+        stub.config.mockReturnValue({ fundingUrl, fundingHmacSecret });
         await expect(enrollStagingAiMember(userId, sub)).resolves.toBeUndefined();
         expect(stub.postgres).not.toHaveBeenCalled();
         expect(stub.socket).not.toHaveBeenCalled();
+        expect(logLines()).toEqual(refused('config', 'disabled'));
+    });
+
+    it.each([
+        'not a url', '/relative',
+        'http://ai-staging.ezil.work', 'https://ai-staging.ezil.work:444',
+        'https://ai-staging.ezil.work.attacker.test', 'https://ai-staging.ezil.work@attacker.test',
+        'https://os-staging.ezil.work', 'https://ai-staging.ezil.work.',
+        'http://ai.ezil.work', 'https://ai.ezil.work:444', 'https://ai.ezil.work.attacker.test',
+        'https://ai.ezil.work@attacker.test', 'https://ai.ezil.work.', 'https://ai.ezil.org', 'https://x.ai.ezil.work',
+        'https://os.ezil.work', 'https://ezil.work', 'wss://ai.ezil.work',
+    ])('opens no client and logs origin_refused for funding URL %s', async fundingUrl => {
+        stub.config.mockReturnValue({ fundingUrl, fundingHmacSecret });
+        await expect(enrollStagingAiMember(userId, sub)).resolves.toBeUndefined();
+        expect(stub.postgres).not.toHaveBeenCalled();
+        expect(stub.socket).not.toHaveBeenCalled();
+        expect(logLines()).toEqual(refused('config', 'origin_refused'));
+    });
+
+    it.each([STAGING, PRODUCTION])('opens no client and logs disabled without the funding HMAC secret (%s)', async fundingUrl => {
+        stub.config.mockReturnValue({ fundingUrl, fundingHmacSecret: undefined });
+        await enrollStagingAiMember(userId, sub);
+        expect(stub.postgres).not.toHaveBeenCalled();
+        expect(stub.socket).not.toHaveBeenCalled();
+        expect(logLines()).toEqual(refused('config', 'disabled'));
     });
 
     it('opens no client without the existing database URL', async () => {
         vi.stubEnv('SUPABASE_DATABASE_URL', '');
         await enrollStagingAiMember(userId, sub);
         expect(stub.postgres).not.toHaveBeenCalled();
+        expect(logLines()).toEqual(refused('config', 'disabled'));
     });
 
-    it.each(['https://ai-staging.ezil.work', 'https://ai-staging.ezil.work:443/v1/integrations/entitlements?x=1'])
-    ('accepts the exact parsed staging origin for %s', async fundingUrl => {
-        stub.config.mockReturnValue({ fundingUrl });
+    it.each([
+        STAGING, `${STAGING}:443/v1/integrations/entitlements?x=1`,
+        PRODUCTION, `${PRODUCTION}:443/v1/integrations/entitlements?x=1`, 'https://AI.EZIL.WORK/',
+    ])('accepts the exact parsed staging or production origin for %s', async fundingUrl => {
+        stub.config.mockReturnValue({ fundingUrl, fundingHmacSecret });
         await enrollStagingAiMember(userId, sub);
+        expect(clients[0].enrolled).toBe(true);
         expect(receipts.size).toBe(1);
+        expect(logLines()).toEqual(enrolled);
     });
 
     it('uses only one owned client and bounded options while retaining URL TLS settings and socket address', async () => {
@@ -249,6 +292,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(queries().some(query => query.statement.startsWith('select ezil_works.enroll_ai_member'))).toBe(false);
         expect(receipts.size).toBe(0);
         expect(clients[0].role).toBe('postgres');
+        expect(logLines()).toEqual(refused('probe', 'probe_failed'));
     });
 
     it.each([
@@ -260,12 +304,17 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(receipts.size).toBe(0);
         expect(clients[0].enrolled).toBe(false);
         expect(queries().some(query => /\b(update|delete|insert)\b/i.test(query.statement))).toBe(false);
+        expect(logLines()).toEqual(refused('enroll', error));
     });
 
-    it.each([null, {}, { ok: 'true' }])('refuses an invalid enrollment result %j', async result => {
+    it.each([
+        null, {}, { ok: 'true' }, { ok: false }, { ok: false, error: 'not_in_vocabulary' }, { ok: false, error: 42 },
+        { ok: false, error: 'postgres://private:secret@host private-provider-detail' },
+    ])('refuses an invalid enrollment result %j and never echoes its text', async result => {
         enrollment = result;
         await enrollStagingAiMember(userId, sub);
         expect(receipts.size).toBe(0);
+        expect(logLines()).toEqual(refused('enroll', 'unknown_refusal'));
     });
 
     it('queues the existing Free 100 receipt after both role scope and enrollment transaction end', async () => {
@@ -302,15 +351,26 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect([...receipts.values()]).toEqual([existing]);
     });
 
-    it.each(['role', 'probe', 'enroll', 'enroll_commit', 'outbox', 'outbox_commit'] as const)
-    ('rolls back local role/pending receipt on %s failure and logs only a fixed message', async stage => {
-        failStage = stage;
+    it.each([
+        ['role', 'role', 'set_role_failed'], ['probe', 'probe', 'probe_failed'], ['enroll', 'enroll', 'unknown_refusal'],
+        ['enroll_commit', 'enroll', 'unknown_refusal'], ['outbox', 'enqueue', 'enqueue_failed'], ['outbox_commit', 'enqueue', 'enqueue_failed'],
+    ] as const)('rolls back local role/pending receipt on %s failure and logs only its fixed code', async (failure, stage, code) => {
+        failStage = failure;
         await enrollStagingAiMember(userId, sub);
         expect(queries().at(-1)?.statement).toBe('rollback');
         expect(clients[0].role).toBe('postgres');
         expect(receipts.size).toBe(0);
-        expect(clients[0].enrolled).toBe(stage === 'outbox' || stage === 'outbox_commit');
-        expect(warn.mock.calls).toEqual([['[auth0] staging AI enrollment unavailable']]);
+        expect(clients[0].enrolled).toBe(failure === 'outbox' || failure === 'outbox_commit');
+        expect(logLines()).toEqual(refused(stage, code));
+    });
+
+    it.each(['connect', 'begin'] as const)('logs connect_failed when the owned session cannot start (%s)', async failure => {
+        if (failure === 'connect') connectMode = 'error';
+        else failStage = 'acquire';
+        await enrollStagingAiMember(userId, sub);
+        expect(effects).toEqual([]);
+        expect(queries().some(query => query.statement.startsWith('set local role'))).toBe(false);
+        expect(logLines()).toEqual(refused('connect', 'connect_failed'));
     });
 
     it('retries the same entitlement after an outbox rollback without changing existing membership', async () => {
@@ -335,6 +395,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(sockets[0].destroyed).toBe(true);
         expect(clients[0].end).toHaveBeenCalledWith({ timeout: 0 });
         expect(effects).toEqual([]);
+        expect(logLines()).toEqual(refused('connect', 'connect_failed'));
     });
 
     it('refuses a delayed connect callback when the monotonic deadline passed before its timer runs', async () => {
@@ -369,6 +430,9 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(effects).toEqual(atReturn);
         expect(receipts.size).toBe(0);
         expect(clients[0].role).toBe('postgres');
+        const at = { acquire: 'connect', role: 'role', probe: 'probe', enroll: 'enroll', outbox: 'enqueue',
+            enroll_commit: 'enroll', outbox_commit: 'enqueue' }[stage];
+        expect(logLines()).toEqual(refused(at, 'timeout'));
     });
 
     it('bounds shutdown acknowledgment at six seconds even if client.end and socket close stall', async () => {
@@ -425,6 +489,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(sockets[0].destroyed).toBe(true);
         expect(stub.verifyOtp).toHaveBeenCalledOnce();
         expect(warn).not.toHaveBeenCalled();
+        expect(logLines()).toEqual(enrolled);
     });
 
     it.each(['role', 'probe', 'enroll', 'outbox'] as const)('still mints the normal Supabase session after %s failure', async stage => {
@@ -433,5 +498,24 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect(stub.generateLink).toHaveBeenCalledOnce();
         expect(stub.verifyOtp).toHaveBeenCalledExactlyOnceWith({ type: 'magiclink', token_hash: 'fixture-otp' });
         expect(clients[0].end.mock.invocationCallOrder[0]).toBeLessThan(stub.generateLink.mock.invocationCallOrder[0]);
+    });
+
+    it('enrolls a new password-less EZiL ID (Auth0-only) member on the production origin, then mints the session', async () => {
+        stub.config.mockReturnValue({ fundingUrl: PRODUCTION, fundingHmacSecret });
+        const user = { id: userId, email: 'new-member@example.test', email_confirmed_at: '2026-10-26T00:00:00Z', app_metadata: { auth0_sub: sub } };
+        stub.listUsers.mockResolvedValue({ data: { users: [] }, error: null });
+        stub.createUser.mockResolvedValue({ data: { user }, error: null });
+        stub.generateLink.mockResolvedValue({ data: { user, properties: { hashed_token: 'fixture-otp' } }, error: null });
+        stub.verifyOtp.mockResolvedValue({ data: { user, session: { access_token: 'fixture-supabase-jwt' } }, error: null });
+        await expect(bridgeAuth0Identity({ sub, email: 'New-Member@example.test' })).resolves.toBeUndefined();
+        expect(stub.createUser).toHaveBeenCalledExactlyOnceWith({ email: user.email, email_confirm: true, app_metadata: { auth0_sub: sub } });
+        expect(stub.createUser.mock.calls[0][0]).not.toHaveProperty('password');
+        const enroll = queries().find(query => query.statement.startsWith('select ezil_works.enroll_ai_member'))!;
+        expect(enroll).toMatchObject({ parameters: [userId, sub], role: narrowRole });
+        expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
+        expect(stub.createUser.mock.invocationCallOrder[0]).toBeLessThan(clients[0].unsafe.mock.invocationCallOrder[0]);
+        expect(clients[0].end.mock.invocationCallOrder[0]).toBeLessThan(stub.generateLink.mock.invocationCallOrder[0]);
+        expect(stub.verifyOtp).toHaveBeenCalledExactlyOnceWith({ type: 'magiclink', token_hash: 'fixture-otp' });
+        expect(logLines()).toEqual(enrolled);
     });
 });
