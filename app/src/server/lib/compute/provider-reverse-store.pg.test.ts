@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { getTableConfig, PgDialect } from 'drizzle-orm/pg-core';
 import postgres from 'postgres';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { computeReverseMoves } from '../../db/schema/computers';
 import type { PlacementDb, PlacementExecutor } from './placement';
 import { createProviderMigrationStore, MigrationConflictError } from './provider-migrate-store';
@@ -439,6 +439,34 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect(claimed!.ages.commitSent).toBeGreaterThanOrEqual(1860);
     });
 
+    it('no app clock (r5): with the app clock at 2001, import_progress first/last, commit_sent_at and retain_until are still the DB clock', async () => {
+        // The app and PostgreSQL share one host clock here, so only a faked app clock can tell an app-clock write apart.
+        const m = await toCopying();
+        let progressed: ComputeReverseMove, done: ComputeReverseMove;
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            vi.setSystemTime(new Date('2001-01-01T00:00:00Z'));
+            expect(new Date().getUTCFullYear()).toBe(2001);
+            progressed = await reverse.recordImportProgress(m, [0, 1]);
+            const more = await reverse.recordImportProgress(progressed, [2]);
+            done = await reverse.finish(await reverse.advance(await reverse.advance(more, 'checking'), 'flipping'),
+                { awsVolumeId: VOL, awsFsUuid: null, awsSnapshotId: null });
+        } finally { vi.useRealTimers(); }
+        const near = (value: string) => `('${value}'::timestamptz BETWEEN clock_timestamp() - interval '2 minutes' AND clock_timestamp())`;
+        const [returned] = await q(`SELECT ${near(progressed.importProgress!.first)} AS first, ${near(progressed.importProgress!.last)} AS last,
+            ${near(done.commitSentAt!)} AS commit_sent`);
+        expect(returned).toEqual({ first: true, last: true, commit_sent: true });
+        // The stored row, not just the RETURNING copies.
+        const [stored] = await q(`SELECT ((import_progress->>'first')::timestamptz BETWEEN clock_timestamp() - interval '2 minutes' AND clock_timestamp()) AS first,
+            ((import_progress->>'last')::timestamptz BETWEEN clock_timestamp() - interval '2 minutes' AND clock_timestamp()) AS last,
+            (commit_sent_at BETWEEN clock_timestamp() - interval '2 minutes' AND clock_timestamp()) AS commit_sent,
+            (retain_until BETWEEN clock_timestamp() + interval '14 days' - interval '2 minutes' AND clock_timestamp() + interval '14 days') AS retain_until
+            FROM $S.ezil_compute_reverse_moves WHERE id = '${done.id}'`);
+        expect(stored).toEqual({ first: true, last: true, commit_sent: true, retain_until: true });
+        expect(done.ages.commitSent).toBeGreaterThanOrEqual(0);
+        expect(done.ages.commitSent).toBeLessThan(120);
+    });
+
     it('recordSnapshot is a CAS on aws_snapshot_id IS NULL: one of two ids wins, a replayed id returns the row, the commit time stays', async () => {
         const done = await commit(C);
         const results = await Promise.allSettled([reverse.recordSnapshot(done, 'snap-02639db95fe545d4f'), reverse.recordSnapshot(done, 'snap-053333a158f9cc895')]);
@@ -525,6 +553,8 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '1 day' WHERE id = '${old.id}'`);
         await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '3 days' WHERE id = '${older.id}'`);
         await create(C4);
+        // The boundary (r5): a committed row whose retention ends 1 minute from now is not expired yet.
+        await insertCommitted(1, '1 minute');
         const expired = await reverse.listRetentionExpired(10);
         expect(expired.map(m => m.id)).toEqual([older.id, old.id]);
         expect(expired.map(m => m.id)).not.toContain(live.id);
