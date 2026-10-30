@@ -574,12 +574,15 @@ It does exactly this, in one `withAdmission` transaction (`placement.ts:582-588`
 5. `decideAdmission({config, counters, userId, now, region: {kind:'lease', region: placement.region}, instanceType: placement.instanceType})`
    (`admission.ts:93-143`). Then **remove `user_hours_cap` and `user_egress_cap` from `reasons`**. If any reason is left,
    refuse with the first one left.
+   **[r5] 5b.** Count the reverse rows in `booting`, `exporting`, `copying` or `checking`, fleet-wide, in this transaction
+   (the admission lock serialises every claim). At `REVERSE_MOVE_MAX_ACTIVE = 3` or more, refuse **`move_capacity`**, a
+   wait reason like `max_running`. This keeps every host-bound move inside one driver pass (§5.4 throughput).
 6. `mintAdmissionTicket(tx, lock, {computerId, userId, kind: 'lease'})`.
 7. `leasePlacement(tx, lock, ticket, {computerId, ownerUserId: userId, expected, leaseUntil, replace: true, fields})`, with no
    `resizeInstanceType`. **The export boot keeps the placement's own `instanceType`** (`placement.ts:1394-1397`) and its own region.
 8. `await recordInTx(tx, leased.placement)`. Lane A passes
-   `tx => createProviderReverseStore(tx).recordExportBoot(m, {placementGeneration: N+1, leaseEpoch: E+1, volumeId, jobId, instanceId: null, fsUuid, claimedAt})`.
-   If it throws (for example `lost_race`), the lease rolls back with it.
+   `tx => createProviderReverseStore(tx).recordExportBoot(m, {placementGeneration: N+1, leaseEpoch: E+1, region: placement.region, volumeId, jobId, instanceId: null, fsUuid, claimedAt})`.
+   If it throws (for example `lost_race`), the lease rolls back with it. **[r5]** `region` is required (store r5, §3.1).
 
 A unit test pins the step order (lock statement first, then the computer lock, then the counters, then the CAS, then the
 reverse write) and the cap filter. The repository scan at `placement.test.ts:505-518` stays unchanged and green.
@@ -590,7 +593,7 @@ apply; the user's own allowance does not.
 | `decideAdmission` reason | Applies? | Outcome in `requested` |
 |---|---|---|
 | `aws_disabled`, `aws_config_invalid`, `kill_switch` | yes | `reopen` → `kill_switch` (**try later**) |
-| `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap` | yes | **wait**: stay in `requested` with no `recordRetry`, and claim again on the next pass. At `ages.created ≥ 600` → the deadline rule below. |
+| `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, **[r5]** `move_capacity` (step 5b) | yes | **wait**: stay in `requested` with no `recordRetry`, and claim again on the next pass. At `ages.created ≥ 600` → the deadline rule below. |
 | **[r4]** `duplicate_placement`, `region_not_configured` | yes | **wait**, exactly like the capacity row, and log `[reverse-move] anomaly` once per pass. These come from the whole fleet or the deployment, not from this computer: `findDuplicatePlacements` groups the whole table (`placement.ts:501-508`, read at `:1819`, refused at `admission.ts:123`), and `region_not_configured` is deployment configuration (`admission.ts:136-137`). A final failure would need operator SQL on every move in `requested` during one episode. |
 | `cas_conflict` (the row moved, the lease CAS was lost, or **[r4]** an image-rebase reservation, step 4) | — | **wait**: re-read on the next pass, with no retry count. |
 | `user_hours_cap`, `user_egress_cap` | **no**: removed in step 5 | — |
@@ -602,14 +605,25 @@ apply; the user's own allowance does not.
 waited (waits write no `last_error`), so the outcome is decided **only from the deadline pass itself**, the first pass
 with `ages.created ≥ 600`. That pass runs its ordinary work first (kill switch, entitlement, the placement read, then the
 claim when the read is claimable), then, if the row is still `requested`:
-- the pass's own placement read was **not claimable**: not `aws-ec2` `STOPPED`, a `lifecycleJobId` set, or the read
-  threw `ImageJobConflictError` → `reopen` → **`computer_busy`**;
+- the pass's own placement read was **not claimable**: not `aws-ec2` `STOPPED`, a `lifecycleJobId` set, the read
+  threw `ImageJobConflictError`, or **[r5]** the computer still has an open billing epoch (below) → `reopen` → **`computer_busy`**;
 - otherwise the pass attempted the claim and it was refused (any wait reason above, including `cas_conflict`) →
   `reopen` → **`boot_unavailable`** (**try later**).
 
 The **try-later** outcomes are exactly `kill_switch` and `boot_unavailable`. Both are `failed_reopened` with `retry: 'now'`,
 and the user copy is the §6.3 "try later" row. `computer_busy` is an ordinary `reopen` (§6.3 default row).
 `boot_refused` is now only computer-specific: `user_has_aws_computer`, `computer_not_owned`, `computer_deleted`.
+
+**[r5] No open billing epoch.** A stale epoch from an earlier session, left open after the placement reached `STOPPED`
+(for example a swallowed `meter.stopped` failure, `billing/v2/compute-meter.ts:41-43`), would otherwise be closed by the export
+host's retire receipt (`aws-receipts.ts:416`, `meter.stopped` closes any epoch ready at or before it, `billing/v2/compute-meter.ts:32-40`)
+and bill the whole move as Free hours. The sweep's stale-epoch close cannot help during the move: it needs a stop proof,
+and it treats LEASED, STARTING and MOUNTING as running (`billing-session-sweep/route.ts:34-39`). So, when billing metering
+is active (`billingMeteringActive`, `compute-access.ts:194`), the `requested` pass reads `openEpochFor(computerId)`
+(`compute-access.ts:197`) before the claim. An open epoch makes the placement **not claimable** that pass: wait, so the
+sweep's stale close runs while the placement is still `STOPPED`; at the deadline the outcome is `computer_busy`. The read
+is outside `admitExportBoot` (it is a billing-store read), and that is safe: a `STOPPED` placement under the claim's
+computer lock cannot open a new epoch, which needs `RUNNING` (§5.2).
 
 **Entitlement start-gate admission does not apply**: there is no `admitStart`/`decideStart`, which would refuse a Free
 user's size (`compute-access.ts:210-217`). Free never uses the pool (`aws-ec2.ts:476`), so lane A calls `admitExportBoot`
@@ -634,6 +648,10 @@ Lane A rebuilds the cold replace from the exported builders, with the same value
   lease-lapse stop reads it.
 - **Parity test:** for the same STOPPED placement, lane A's intent equals the intent the provider's wake builds (drive
   `aws-ec2.ts` with a fake starter). Only `jobId`, `fenceToken` and the nonce inside `userData` may differ.
+  **[r5] Fixture:** a `STOPPED` placement with `lastError: INSTANCE_LOST` on a deployment that is not in pool mode. The
+  wake builds a replace only for a resize, `ENROLLMENT_FAILED`, `INSTANCE_LOST`, `POOL_RELEASED`, `wakeMode: 'replace'` or
+  pool mode; otherwise it builds a same-generation `start` (`aws-ec2.ts:671,711-716`), which no replace can equal. A second
+  case uses the plain `STOPPED` placement with `wakeMode: 'replace'`.
 
 **After commit** (never inside the transaction: a Step Functions start issued inside a transaction would be authorized
 against an uncommitted row, `aws-receipts.ts:294-295`):
@@ -642,6 +660,12 @@ against an uncommitted row, `aws-receipts.ts:294-295`):
 - `refused` and `unknown` take the wake's undo for a replace, which is **UNCONFIRMED**, not STOPPED (`aws-ec2.ts:759-767`):
   `markLifecycleStartUnknown`, then `settleUnknownStart` (`aws-receipts.ts:481-517`). The existing recovery settles it, and
   §5.7 waits for STOPPED, bounded by `boot_unsettled`.
+- **[r5] `refused`, exactly as the wake's `launch()` does it** (`aws-ec2.ts:309-313`): first
+  `settleReplacementGeneration(…, startDefinitelyRefused: true)` (`aws-rebase-generation.ts:86`). With the source pair intact
+  it lands `STOPPED` at the **previous generation N**, at lease epoch E+1, through `reconcileReplacementGeneration`
+  (`placement.ts:1009-1025`: `casInTx` bump `{0, 0}`, `confirmedGeneration` N). Only when that does not settle does it take
+  the undo above. A failed execution takes the same settle through the receipts (`aws-receipts.ts:330-332`). §5.7's
+  "settled" therefore accepts generation N **or** N+1.
 
 ### 5.2 Export-boot placement path (receipts mode and release; no new placement edges)
 
@@ -719,11 +743,37 @@ Every read here starts with `reverseMovesTablePresent` (§3.4); no 0012 means no
 | Newest reverse row for the computer | Open / session routing |
 |---|---|
 | in flight (`requested` … `flipping`) | The **reverse waiting provider** (below). Opens wait and the shell shows the move view (§5.10). They never boot or adopt the AWS computer for a session. |
-| `failed_needs_operator` with `openBlocked` (§5.5: `commit_sent_at` set, or reason `already_imported`/`commit_in_progress`) | **[r4]** The **reverse blocked provider** (below): it refuses at once **as a value**, never a thrown tRPC error. Never the waiting provider: the shell shows the needs-attention card, never a spinner. |
-| `failed_needs_operator` without `openBlocked` | Ordinary AWS routing. The files are intact on AWS; only Cloudflare-side cleanup is pending. The row still blocks new moves. |
+| `failed_needs_operator` with `openBlocked` (§5.5: `commit_sent_at` set, or reason `already_imported`/`commit_in_progress`/**[r5]** `boot_unsettled`) | **[r4]** The **reverse blocked provider** (below): it refuses at once **as a value**, never a thrown tRPC error. Never the waiting provider: the shell shows the needs-attention card, never a spinner. |
+| `failed_needs_operator` without `openBlocked` (**[r5]** only `abort_unconfirmed`, whose placement is settled, §5.7) | Ordinary AWS routing. The files are intact on AWS; only Cloudflare-side cleanup is pending. The row still blocks new moves. |
 | `committed`, `failed_reopened`, none | Ordinary routing on the placement. |
 
 The open trigger (§5.9) runs in the open mutation path, never in `select.ts` reads or status polls.
+
+**[r5] Both reverse providers are `kind: 'aws-ec2'`** (the forward waiting provider is too, `provider-migrate-placement.ts:12-19`),
+and `routeComputer` returns them as `{kind: 'aws-ec2', provider, instanceType: <the placement's>, reverse: 'moving' | 'blocked'}`.
+Any other kind is unsafe:
+- `routeComputer` swaps every provider of kind `'cloudflare'` for the real Cloudflare adapter (`compute-dispatch.ts:130`),
+  so an open during a move would start a Cloudflare sandbox;
+- `computer.delete` retires first only for kind `'aws-ec2'` (`computer.ts:342-350`). For any other kind
+  `softDeleteComputer` deletes even after a failed teardown (`computer-store.ts:382-393`), and the flip would later insert
+  a Cloudflare row for a deleted computer (§5.6 step 3).
+- `awsStopProof` treats a non-`aws-ec2` kind as running (`billing-session-sweep/route.ts:34-35`).
+
+The `reverse` marker is set only by `select.ts` for these two providers. Lane A tests the kind and the marker for both.
+
+**[r5] Every open route answers the reverse provider first.** At base each open route calls `routeComputer`, then the
+billing gate `gateComputerStart`, then (two of them) `stopCooldownAnswer`, and only then the provider
+(`cloudflare-guacamole.ts:227-233` previewUrl, `:505-515` appPreviewUrl, `:702-718` codePreviewUrl, and the restart route at
+`:1383-1389`). During a move the routed computer is `aws-ec2` with the placement's `instanceType`, so a held Free user is
+refused by the gate: `files_on_aws` for any size but `HOLD_SIZE` (`compute-access.ts:210-217`, `billing/v3/admission.ts:12`),
+and `decideStart` can refuse a `std-2` one under Free limits. Every re-ask would then answer a `billing_*` refusal, never
+`computeMoving`, and the move overlay would break. So, in all four routes (lane A, `cloudflare-guacamole.ts`):
+- when `routed.reverse` is set, the route returns the provider's own answer through `compute-dispatch.ts` (with
+  `computeMoving` or `computeMoveNeedsAttention`) **immediately after `routeComputer`**, before `gateComputerStart`, before
+  `stopCooldownAnswer`, before `syncAiCredential` and before any Worker call;
+- the open trigger (§5.9) already runs before `routeComputer` and answers the same way.
+- Lane A tests each route with a held Free user whose placement is not `HOLD_SIZE`, and with one whose Free hours are
+  used up: both get the waiting answer during a move, never `billing_*`.
 
 **The reverse waiting answer [G1] (pinned; `provider-reverse-placement.ts`, lane A).** It must not reuse the forward
 answer `computer_migrating`: `compute-dispatch.ts:162-165` turns that into `computeMigrating`, and the shell then
@@ -761,7 +811,8 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`)
 - Every other `routeComputer` caller sees an ordinary refusal value. `computer.delete` gets a `terminate` with `ok: false`
   and refuses with `PRECONDITION_FAILED aws_retire_unavailable: computer_move_needs_attention` (`computer.ts:103-108`; `AWS_RETIREMENT_UNDERWAY` is only the retire outcomes, `aws-ec2.ts:131`),
   as it does today for `computer_migrating`. The same holds during a move (`computer_moving`). A computer with a move
-  in flight or open-blocked is never deleted, and its export boot is never retired by a delete.
+  in flight or open-blocked is never deleted, and its export boot is never retired by a delete. **[r5]** This holds only
+  because both providers are `kind: 'aws-ec2'` (above), so `retireAwsComputerBeforeDelete` runs and refuses.
 
 ### 5.4 Step work, deadlines and throughput
 
@@ -780,16 +831,32 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`)
   fits in what is left of the budget, so the pass ends by its start + 90 s.
 - It does **nothing** when called later than `handlerStartedAt + 150 s`; the next tick takes the rows.
 - Order inside the budget: lane O's snapshot step `advanceReverseSnapshots` first (at most 3 rows and 20 s, §7), then the
-  in-flight rows, at most 3 per pass (`claimStale(3)`).
+  in-flight rows. **[r5]** The pass claims with **`claimStale(10)`** (the store's maximum) and drives the claimed rows
+  **concurrently**, one sequential step chain per row, every call under the same timeout-fit rule against the one pass
+  deadline. Rows do not share bandwidth: each pulls from its own host through its own DO (§4.1).
+- **[r5] `claimStale` order (lane A's one pinned store change, §3.4):** rows in `booting` … `flipping` before `requested`
+  rows, then `updated_at, id` as today. With at most `REVERSE_MOVE_MAX_ACTIVE = 3` rows past `requested` (§5.1.1 step 5b),
+  every host-bound row is driven on every pass, and up to 7 `requested` rows share the rest. A PG test: 9 old `requested`
+  rows and 1 newer `copying` row, then `claimStale(1)` returns the `copying` row.
 - The route's `maxDuration` is 300 s (`billing-session-sweep/route.ts:11`). The worst case is 150 s + 90 s = 240 s.
   Lane A's handler test proves the order and both gates.
 - Within its budget it drives a row step after step. A `copying` row gets back-to-back pulls (`count: 64`).
 - `computer.move.start`, `computer.move.retry` and the open trigger also schedule one immediate 60 s drive with `after()` (pattern `schedulePaidMigration`, `provider-migrate-orchestrator.ts:149-152`), so the first steps do not wait for a cron tick.
 - Two drivers on one row are safe: the Worker serialises per DO (§4.1), and every row write is a CAS.
 
-**Throughput arithmetic (worst case).** A full workspace is 512 chunks of 1 MiB.
-- At the minimum acceptable host → Worker → R2 throughput of **0.5 MiB/s**, one 90 s pass moves about 45 chunks, so 512 chunks take about 12 passes, about 12 min of wall time with a pass every minute.
-- At 3 MiB/s or more, one pass moves its maximum, about 192 chunks, and 512 chunks take 3 passes.
+**Throughput arithmetic (worst case) [r5].** A full workspace is 512 chunks of 1 MiB. r4's "45 chunks per pass" ignored
+the snapshot step, the timeout-fit rule and the rows sharing one budget. Redone:
+- The snapshot step may use the first **20 s**, which leaves **70 s** of the 90 s budget.
+- A `pull` (40 s timeout, §4.1) starts only if 40 s still fits. The Worker starts no new transfer after 20 s of wall time
+  (§4.3), and its at most 4 in-flight chunks finish after that, so one pull ends within about 30 s. A row therefore gets
+  **2 pulls per pass**: at about 20 s, and at about 50 s (50 + 40 ≤ 90); a third never fits.
+- At the floor of **0.5 MiB/s per move**, counting only each pull's 20 s transfer window, a pull stores at least
+  **10 chunks**, so a row stores at least **20 chunks per pass**. 512 chunks take at most **26 passes, about 26 min** with
+  a pass every minute, against the 60 min `copying` deadline: more than 2× margin.
+- This holds per row because rows are driven concurrently, each over its own host and DO, and at most 3 rows are past
+  `requested` (§5.1.1 step 5b), all claimed every pass (`claimStale` order above). r4's shared serial budget gave 3
+  copying rows about 7 chunks per pass each, about 70 min: that would have hit `copy_timeout`.
+- At 3 MiB/s or more, a pull reaches its `count: 64` cap, so a row stores 128 chunks per pass and 512 chunks take 4 passes.
 - Throughput is a live proof (T0 (e2)). If T0 measures below 0.5 MiB/s, this section changes before lane A ships.
 
 **Deadlines [clocks].** Every deadline compares the **DB clock** with a **DB-written** timestamp, through the row's `ages`
@@ -807,7 +874,7 @@ anchor against `Date.now()`. claimStale never moves an anchor.
 
 | State | Work per pass | Done when | Deadline → outcome (compensation first, §5.7) |
 |---|---|---|---|
-| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Read the placement: not `aws-ec2` STOPPED, a job pending, or **[r4]** the read throws `ImageJobConflictError` → wait. Otherwise claim (§5.1.1); a capacity, fleet or deployment refusal, or `cas_conflict` → wait (§5.1.1 table). | claim recorded | **[r4]** 10 min after `created_at` (`ages.created ≥ 600`), decided from **this pass only** (§5.1.1 deadline rule): this pass's placement read was not claimable → `computer_busy`; otherwise this pass's claim was refused → `boot_unavailable`. |
+| `requested` | Kill switch on (`aws-config.ts:274`) → `kill_switch`. Entitlement paid → `entitlement_paid`. Read the placement: not `aws-ec2` STOPPED, a job pending, **[r4]** the read throws `ImageJobConflictError`, or **[r5]** an open billing epoch for the computer (§5.1.1) → wait. Otherwise claim (§5.1.1); a capacity, fleet or deployment refusal, **[r5]** `move_capacity`, or `cas_conflict` → wait (§5.1.1 table). | claim recorded | **[r4]** 10 min after `created_at` (`ages.created ≥ 600`), decided from **this pass only** (§5.1.1 deadline rule): this pass's placement read was not claimable → `computer_busy`; otherwise this pass's claim was refused → `boot_unavailable`. |
 | `booting` | Read the boot receipt and enrollment. | enrolled → `advance('exporting')` | Boot settled as failed (UNCONFIRMED, or STOPPED by an undo) → `boot_failed`. **15 min after `booting`'s `state_entered_at`** (`ages.stateEntered`) → `boot_timeout`. |
 | `exporting` | Worker `begin` (until it succeeds), then `pull{count:0}` on every pass | status `ready` and a valid head → `recordExportHead` | Host `failed` → §5.5. **20 min after `state_entered_at`** → `export_timeout`. |
 | `copying` | `pull{from:next, count:64}` until the budget is spent, then `recordImportProgress(stored)` | bitmap complete → `advance('checking')` | No new chunk for **10 min** (`import_progress.last`, or `state_entered_at` before the first chunk) → `copy_stalled`. **60 min after `state_entered_at`** → `copy_timeout`. |
@@ -823,8 +890,8 @@ anchor against `Date.now()`. claimStale never moves an anchor.
 The classes are:
 - `retry`: `recordRetry(code)`; five in a row → `<state>_retries`.
 - `reopen`: compensate, then `failed_reopened(code)`; Try again is offered.
-- `reopen_after_session`: as `reopen`, but Try again (and any new row) is refused while the placement's `leaseEpoch` still equals the row's `exportBoot.leaseEpoch` (no AWS session since).
-- `reopen_final`: as `reopen`, Try again refused until an operator sets `last_error = 'operator_cleared'`. Open works, and an operator is alerted with a log line `[reverse-move] anomaly`.
+- `reopen_after_session`: as `reopen`, but Try again (and any new row) is refused while the placement's `leaseEpoch` still equals the row's `exportBoot.leaseEpoch` (no AWS session since). **[r5]** A computer the D16 hold cannot open (`holdOpenable` false: its size is not `HOLD_SIZE`, §6.1.1) can never have that session, so its `retry` is `'no'` and its copy offers only Upgrade (§6.3).
+- `reopen_final`: as `reopen`, Try again refused until an operator sets `last_error = 'operator_cleared'`. Open works (under the D16 hold, for a computer the hold can open: `holdOpenable`, §6.1.1), and an operator is alerted with a log line `[reverse-move] anomaly`.
 - `operator`: `failed_needs_operator(code)`.
 
 | Step (state) | Worker / host answer | Class → `last_error` |
@@ -832,8 +899,8 @@ The classes are:
 | any pre-flip | entitlement became paid (re-read at every pass) | `reopen` → `entitlement_paid` (no Try again button needed, §6.3) |
 | `requested` | kill switch on | `reopen` → `kill_switch` |
 | `requested` (claim, §5.1.1) **[G2]** | admission `aws_disabled`, `aws_config_invalid`, `kill_switch` | `reopen` → `kill_switch` (try later) |
-| `requested` (claim) **[G2] [r4]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, `duplicate_placement`, `region_not_configured` (the last two also log `[reverse-move] anomaly`), or `cas_conflict` (including a caught `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `boot_unavailable` (try later) |
-| `requested` (read) **[r4]** | the pass's placement read is not claimable (not `aws-ec2` STOPPED, a job, or `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `computer_busy` |
+| `requested` (claim) **[G2] [r4]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, `duplicate_placement`, `region_not_configured` (the last two also log `[reverse-move] anomaly`), **[r5]** `move_capacity` (§5.1.1 step 5b), or `cas_conflict` (including a caught `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `boot_unavailable` (try later) |
+| `requested` (read) **[r4]** | the pass's placement read is not claimable (not `aws-ec2` STOPPED, a job, `ImageJobConflictError`, or **[r5]** an open billing epoch, §5.1.1) | wait (no `recordRetry`); at the deadline pass → `reopen` → `computer_busy` |
 | `requested` (claim) **[G2] [r4]** | admission `user_has_aws_computer`, `computer_not_owned`, `computer_deleted` | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `begin` (`exporting`) | `container_running`, `export_host_mismatch`, `unavailable` (incl. `export_unreachable`), `not_found` | `retry` |
 | `begin` | `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `other` | `reopen_final` → the code (`other` → `worker_conflict`) |
@@ -848,7 +915,7 @@ The classes are:
 | `commit{verifyOnly}` (`checking`) | `unavailable`, `not_found` | `retry` |
 | `commit{verifyOnly}` | `not_verified` | `reopen` → `import_corrupt` |
 | `commit{verifyOnly}` | `import_not_started` | `reopen` → `import_lost` |
-| `commit{verifyOnly}` | `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `other` | `reopen_final` → the code |
+| `commit{verifyOnly}` | `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `other` | `reopen_final` → the code (**[r5]** `other` → `worker_conflict`, as for `begin` and `pull`) |
 | `commit` (`flipping`) | `200 committed` | continue §5.6 |
 | `commit` (`flipping`) | `unavailable`, `not_found`, `other`, `import_not_started`, `system_head_moved` | keep retrying the same commit (`import_not_started` and `system_head_moved` are never failures here: the Worker reads P first and every step is idempotent) until `flip_stuck` |
 | `commit` (`flipping`) | `head_moved` | `operator` → `import_head_moved` |
@@ -857,7 +924,7 @@ The classes are:
 | `abort` | `unavailable`, `not_found` | retried inside compensation; still failing after 5 → `operator` → `abort_unconfirmed` |
 | `abort` | `already_imported`, `commit_in_progress` | `operator` → that code (impossible before `flipping`) |
 | boot (`booting`) | the boot settles failed / 15 min | `reopen` → `boot_failed` / `boot_timeout` |
-| compensation | the placement does not settle to `STOPPED` with no job by the state's deadline + 30 min (`ages.stateEntered`, §5.4) | `operator` → `boot_unsettled` |
+| compensation | the placement does not settle (§5.7 step 2: **[r5]** `STOPPED`, no job, lease epoch ≥ E+1, generation N or N+1) by the state's deadline + 30 min (`ages.stateEntered`, §5.4) | `operator` → `boot_unsettled` (**[r5]** open blocked, §5.3) |
 
 **Closed `last_error` vocabulary** (U keys copy on it; anything else is a lane A bug):
 - `failed_reopened`:
@@ -866,8 +933,8 @@ The classes are:
   - `reopen_final`: `head_moved`, `head_invalid`, `head_unreadable`, `system_head_moved`, `import_busy`, `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `export_refused`, `workspace_missing`, `worker_conflict`, **`boot_refused`** (r3, §5.1.1; r4: computer-specific refusals only).
   - **Try later** (r3, §5.1.1): `kill_switch` and `boot_unavailable` only. They are `reopen` codes with their own copy (§6.3).
 - `failed_needs_operator`:
-  - Open works: `abort_unconfirmed`, `boot_unsettled`;
-  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`.
+  - Open works: `abort_unconfirmed` only. **[r5]** It is written only after the placement settled (§5.7), so the next open is an ordinary hold replace that never matches `readByExportBoot`;
+  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:652-657`).
 - **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`.
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
 
@@ -886,6 +953,10 @@ contract break.
 
 **Release** a `failed_needs_operator` row whose commit was never sent, after the manual cleanup it names: the Worker
 import aborted (or proven never begun), and the placement `STOPPED` with no job. Try again is offered afterwards.
+**[r5]** For `boot_unsettled` (open blocked until this release), the cleanup is first to settle the export boot's
+placement: the fleet pass retries a failed host retire every 10 min (`aws-receipts.ts:793,813`), or the operator retires
+the export host by hand. Release only once the placement reads `STOPPED` with no `lifecycleJobId`; the computer's next
+open is then an ordinary hold replace.
 
 ```sql
 -- runbook: operator_released
@@ -959,10 +1030,22 @@ There is no AWS call after the point of no return: the export host is retired in
 `failed_reopened` releases the computer, so it is written only after these steps:
 
 1. **Worker `abort`**, only if the row reached `exporting` (a `begin` may have been sent). Retry up to 5 times inside compensation. Outcomes per §5.5.
-2. **Export host**, only if a claim was recorded: wait while a lifecycle job is pending. A MOUNTING boot with no job → `releaseExportBoot` + `retireUnenrolledHost` (§5.2). Wait until the placement is `STOPPED` at N+1/E+1 (or later) with no job: either the host-retire receipt (`INSTANCE_LOST`), or a refused or undone start.
-3. **Write `fail(m, 'failed_reopened', reason)` in a transaction that holds the computer lock and re-reads the placement as settled in the same transaction.** The next Free hold open is a replace at N+2/E+2, which satisfies the guard's epoch rule (`guard.py:250-254`).
+2. **Export host**, only if a claim was recorded, and **[r5] always, even when step 1 could not be confirmed**: wait while a lifecycle job is pending. A MOUNTING boot with no job → `releaseExportBoot` + `retireUnenrolledHost` (§5.2). Wait until the placement is **settled**.
+   **[r5] Settled (pinned):** `provider = 'aws-ec2'`, `state = 'STOPPED'`, `lifecycleJobId` null, the claim's volume,
+   `leaseEpoch ≥ E+1`, and `generation` **N or N+1**. r4's "STOPPED at N+1/E+1 (or later)" missed the generation rollback:
+   a refused or failed export-boot replace is settled by `settleReplacementGeneration` back to **generation N at lease
+   epoch E+1** (`aws-ec2.ts:311-313`, `aws-receipts.ts:330-332` → `reconcileReplacementGeneration`, `placement.ts:1009-1025`;
+   §5.1.2). The host-retire receipt lands N+1/E+1 (`INSTANCE_LOST`, §5.2). Nothing else can move the counters meanwhile:
+   the row still holds the computer, so every open meets the waiting provider. The flip's own precondition (§5.6) stays
+   strict at N+1/E+1, because its path is always the host retire.
+3. **Write `fail(m, 'failed_reopened', reason)` in a transaction that holds the computer lock and re-reads the placement as settled in the same transaction.** **[r5]** The next Free hold open is a replace at the settled generation + 1 and lease epoch E+2 (generation N+1 or N+2). E+2 is above the volume marker's E+1, so it satisfies the guard's epoch rule (`guard.py:250-254`), and `readByExportBoot` (N+1/E+1) never matches it.
 
-If step 1 or step 2 cannot be confirmed within its bound, write `failed_needs_operator(abort_unconfirmed | boot_unsettled)`. Open still works for those (§5.3).
+**[r5] Which operator code.** If step 2 does not settle within its bound, write `failed_needs_operator('boot_unsettled')`,
+whatever step 1 did. It is **open blocked** (§5.3, §5.5): the placement is in a state no open can use. Otherwise, if step 1
+could not be confirmed, write `failed_needs_operator('abort_unconfirmed')`. Its placement is settled, so Open works (§5.3)
+and only the Cloudflare-side cleanup is left. Lane A tests both orders: step 1 failing with step 2 settling gives
+`abort_unconfirmed`; step 2 not settling gives `boot_unsettled`, with or without step 1. A settle at generation N (a refused
+replace) counts as settled.
 
 ### 5.8 Re-subscribe race rule (pinned)
 
