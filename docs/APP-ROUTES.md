@@ -176,6 +176,11 @@ or Back/Forward is also the latest **launch** intent.
   Neither is the user's. Until `ensureOnTop` has run (it calls
   `settled(el)` on every path), a focus of that window counts only while its
   launch is the latest launch intent. Every other focus counts as before.
+- **The front window follows too.** `ensureOnTop` of a launch that a newer
+  click or Back/Forward has superseded (`superseded(el)`) does not re-focus
+  its window, so it cannot take the front back from the newer launch's
+  window. The newest launch's own `ensureOnTop` always runs, and still
+  overrides a late focus that landed on top of it.
 - While any click's launch is pending, focus events write nothing (as
   before: the new window focuses itself while it is built, and a late focus
   of another window cannot be told from a click).
@@ -184,10 +189,13 @@ or Back/Forward is also the latest **launch** intent.
 
 Known limits, not changed here:
 
-- Z-order belongs to `registry.js` and UIWindow. A superseded launch's window
-  can still come to the front (its own focus while it is built, its
-  `ensureOnTop`); the address bar keeps the newer intent until that window's
-  next focus that counts.
+- A superseded launch's window still takes the front with its own focus
+  while it is built (UIWindow). If that happens more than about 120ms after
+  the newer launch opened, after the newer `ensureOnTop` has run, it stays
+  in front while the address bar keeps the newer intent, until the next
+  focus that counts.
+- If the newer launch failed, nothing re-asserts the older launch's window
+  against a late focus of some other window (its `ensureOnTop` stands down).
 - A click on a window that is still settling after a newer launch is
   ignored until it settles (at most 120ms).
 - A launch that never resolves keeps every focus write off, as before.
@@ -203,7 +211,8 @@ launches in every end order with every open/fail outcome, late focus,
 close and reopen, closing another window, Back and Forward while a launch
 is pending, overtaken Back launches, parameters, positive controls) and
 `app-link-test.mjs` (the bundle through `registry.launch`: a slow open, the
-80/120ms focuses run by hand, a Back launch).
+80/120ms focuses run by hand one at a time, a Back launch; the address bar
+and the focused window are checked after each).
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
@@ -390,10 +399,10 @@ Still open:
   was opened at.
 - A page load at a compute app's URL starts a stopped computer with no
   click (§6, "After sign-in"). Owner decision.
-- Launch order (§5, "Order"): the address bar follows the latest intent,
-  but a superseded launch's window can still take the front (z-order is
-  `registry.js`'s and UIWindow's), and a reopen that coalesces with a closed
-  window's launch names an app with no window.
+- Launch order (§5, "Order"): a superseded launch's window that is built
+  more than about 120ms after the newer launch opened still takes the front
+  (UIWindow's own focus) without the address bar, and a reopen that
+  coalesces with a closed window's launch names an app with no window.
 - The committed bundle (`app/public/os/`) does not match the sources
   (`shell/build-shell.sh --check` fails), so CI's shell job stops at
   "Committed bundle matches source". Regenerating it is a separate step.

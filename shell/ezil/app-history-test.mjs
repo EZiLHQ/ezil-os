@@ -318,11 +318,14 @@ for (const fail of [false, true]) {
     same(url(), '/app/settings', 'during the newer launch: nothing');
     const settings = open('settings', 20);
     newer.end(settings);
+    same([controller.superseded(code), controller.superseded(settings), controller.superseded(open('desktop', 1))], [true, false, false],
+        "what registry's ensureOnTop asks: only the older launch's window stands down (a window never launched here does not)");
     focus(code);
     same([url(), w.history.length], ['/app/settings', 3], "after it: the older launch's late focus does not take the address bar");
     focus(settings);
     same(url(), '/app/settings', "the newer launch's own late focus is accepted");
     controller.settled(code);
+    same(controller.superseded(code), false, 'settled: no longer');
     focus(code);
     same([url(), w.history.length], ['/app/code', 3], 'positive control: once its launch has settled, a focus of it replaces');
 }

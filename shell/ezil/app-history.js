@@ -149,6 +149,7 @@ export function createAppHistory () {
     // they count only while that launch is the latest one.
     const settling = new WeakMap();
     const settle = (el, gen) => { if ( el && typeof el === 'object' ) settling.set(el, gen); };
+    const superseded = el => settling.has(el) && settling.get(el) !== launchGeneration;
 
     const win = () => deps.win;
     const apps = () => deps.getApps() ?? [];
@@ -210,7 +211,7 @@ export function createAppHistory () {
         if ( ! known(id) || el.getAttribute('data-closing') === '1' ) return;
         // A window whose launch has not settled, and a newer launch has
         // begun since: this is that launch's late focus, not the user's.
-        if ( settling.has(el) && settling.get(el) !== launchGeneration ) return;
+        if ( superseded(el) ) return;
         if ( currentApp() === id ) return;
         generation += 1;
         write('replaceState', urlFor(id), stateFor(id));
@@ -368,6 +369,15 @@ export function createAppHistory () {
          */
         settled (el) {
             if ( el && typeof el === 'object' ) settling.delete(el);
+        },
+
+        /**
+         * `el`'s launch has not settled and a newer click or Back/Forward
+         * has begun since. False for a window this module never saw launch
+         * (an /os-only host marks nothing).
+         */
+        superseded (el) {
+            return superseded(el);
         },
 
         /**

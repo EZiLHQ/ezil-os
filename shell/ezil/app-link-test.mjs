@@ -284,12 +284,14 @@ async function ordered() {
     });
     const launch = id => w.ezil.registry.launch(id, ctx);
     const settle = () => { elapse(80); elapse(120); };
-    return { ...booted, elapse, gate, written, launch, settle };
+    // The focused window (z-order in this shell is decided by focus).
+    const front = () => [...w.document.querySelectorAll('.window.window-active')].map(el => el.dataset.app).join();
+    return { ...booted, elapse, gate, written, launch, settle, front };
 }
 {
     // The coordinator's repro, through the registry: Code's open is slow,
     // Settings is clicked after it and opens first.
-    const { w, url, win, elapse, gate, launch } = await ordered();
+    const { w, url, win, elapse, gate, launch, front } = await ordered();
     const release = gate('code');
     const older = launch('code');
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 2], 'a click on Code pushes before its window exists');
@@ -299,7 +301,11 @@ async function ordered() {
     ok(await older === win('code'), 'Code opens after it');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'the older launch, resolving last, does not take the address bar');
     const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "nor do the launches' delayed focuses, one by one (Code's ensureOnTop re-focus included)");
-    elapse(80, held); elapse(120, held);
+    elapse(80, held);
+    same(front(), 'code', 'Code took the front as it was built');
+    // Settings' re-focus runs first (positive control: the newest launch's
+    // still overrides a later focus); Code's, superseded, stands down.
+    elapse(120, () => { held(); same(front(), 'settings', 'after each ensureOnTop, Settings is in front'); });
     w.$(win('code')).focusWindow();
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'positive control: once it has settled, a focus of Code replaces');
     done(w);
@@ -307,7 +313,7 @@ async function ordered() {
 {
     // A click on an open window restores it with `showWindow`, which
     // focuses it 80ms later; a click on another app lands before that.
-    const { w, url, win, elapse, launch, settle } = await ordered();
+    const { w, url, win, elapse, launch, settle, front } = await ordered();
     await launch('code'); settle();
     await launch('settings'); settle();
     await launch('code');
@@ -315,7 +321,8 @@ async function ordered() {
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5]);
     const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5], "Code's late showWindow focus, then each ensureOnTop, leave the newer click's URL");
-    elapse(80, held); elapse(120, held);
+    elapse(80, held);
+    elapse(120, () => { held(); same(front(), 'settings', "Code's superseded ensureOnTop does not take the front back"); });
     // Positive control: the same late focus with no newer launch, after a
     // focus elsewhere, names Code.
     await launch('code');
@@ -328,7 +335,7 @@ async function ordered() {
 {
     // Back to an open Code restores it (its 80ms focus pending); a click on
     // Settings lands before that focus.
-    const { w, url, written, launch, settle, elapse } = await ordered();
+    const { w, url, written, launch, settle, elapse, front } = await ordered();
     await launch('code'); settle();
     await launch('settings'); settle();
     const committed = written();
@@ -338,7 +345,8 @@ async function ordered() {
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3]);
     const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "the Back launch's late focus does not take the address bar from the newer click");
-    elapse(80, held); elapse(120, held);
+    elapse(80, held);
+    elapse(120, () => { held(); same(front(), 'settings', "the Back launch's superseded ensureOnTop does not take the front"); });
     done(w);
 }
 

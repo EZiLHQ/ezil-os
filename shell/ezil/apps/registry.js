@@ -602,7 +602,10 @@ export function resolve (payload) {
  * and ONLY if the window has actually been overtaken. It is deliberately not
  * an unconditional re-focus: stealing focus back from a window the user
  * legitimately moved to afterwards would be a worse bug than the one being
- * fixed.
+ * fixed. So would stealing it back from a NEWER launch's window: when a
+ * click or Back/Forward has begun since this launch (`launchGeneration` in
+ * `../app-history.js`, read through `superseded`), this one stands down.
+ * The newest launch's own re-focus always runs.
  *
  * It is also when this launch SETTLES for the address bar: until then the
  * window's focus events (the 80ms one, this re-focus) are the launch's own,
@@ -615,6 +618,7 @@ function ensureOnTop (el_window) {
     const assertTop = () => {
         try {
             if ( typeof el_window.getBoundingClientRect !== 'function' || ! el_window.isConnected ) return;
+            if ( appHistory.superseded(el_window) ) return;
             // Only if something is genuinely ABOVE it.
             let above = false;
             for ( const el_other of document.querySelectorAll('.window') ) {
