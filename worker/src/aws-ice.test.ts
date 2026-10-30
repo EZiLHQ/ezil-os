@@ -594,20 +594,35 @@ describe('ensureAwsDesktop: one config push per host boot while the host applies
     expect(await fresh.ask()).toEqual({ state: 'starting', reason: 'config_pushed' });
     expect(fresh.pushes()).toBe(1);
   });
-  it('a push that never answers is aws_desktop_unreachable after its own timeout', async () => {
-    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false });
+  it('a push whose answer never comes (its own timeout) may have landed: its claim holds the others back for its window, then one push again', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      pushState: 'restart_scheduled' });
+    let now = NOW;
+    let hang = true;
     let signal: AbortSignal | null | undefined;
-    const hung: FetchLike = (url, init) => {
-      if (!new URL(url).pathname.startsWith('/__ezil/control/ice/')) return h.fetch(url, init);
+    const fetch: FetchLike = (url, init) => {
+      if (!hang || !new URL(url).pathname.startsWith('/__ezil/control/ice/')) return h.fetch(url, init);
       signal = init.signal;
       return Promise.reject(new DOMException('The operation timed out.', 'TimeoutError'));
     };
-    const reg = registry({ aiBootId: BOOT }, () => NOW);
-    await expect(ensureAwsDesktopConfig({ record: reg.rec(), zone: ZONE, fetch: hung, nowMs: () => NOW, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
-      restartPush: reg.restartPush })).rejects.toMatchObject({ code: 'aws_desktop_unreachable', status: 503 });
+    const reg = registry({ aiBootId: BOOT }, () => now);
+    const ask = (at: number) => {
+      now = at;
+      h.st.clock = at;
+      return ensureAwsDesktopConfig({ record: reg.rec(), zone: ZONE, fetch, nowMs: () => now, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
+        restartPush: reg.restartPush });
+    };
+    const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
+    await expect(ask(NOW)).rejects.toMatchObject({ code: 'aws_desktop_unreachable', status: 503 });
     expect(signal).toBeInstanceOf(AbortSignal);
-    // Its claim is released: the next ask pushes again.
-    expect(reg.rec().restartPushBootId).toBeUndefined();
+    expect(reg.rec()).toMatchObject({ restartPushBootId: BOOT, restartPushAt: NOW });
+    expect(reg.rec().restartPushExpiresAt).toBeUndefined();
+    hang = false;
+    expect(await ask(NOW + 2_000)).toEqual(pending);
+    expect(await ask(NOW + AWS_DESKTOP_CONFIG_CLAIM_MS - 1)).toEqual(pending);
+    expect(pushes()).toBe(0);
+    expect(await ask(NOW + AWS_DESKTOP_CONFIG_CLAIM_MS)).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect(pushes()).toBe(1);
     expect(AWS_DESKTOP_PUSH_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
   });
 });

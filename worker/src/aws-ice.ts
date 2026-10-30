@@ -485,8 +485,11 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
     try {
       pushed = await pushDesktopConfig(p, status);
     } catch (error) {
-      // A failed mint or push leaves nothing to wait for: the next ask tries again.
-      if (claim !== undefined) await p.restartPush(boot, claim, { release: true }).catch(() => null);
+      // A failed mint or a refused push leaves nothing to wait for: the next ask tries again. A
+      // push whose answer never came may have landed (and armed the restart): keep its claim,
+      // which lapses after AWS_DESKTOP_CONFIG_CLAIM_MS, so a slow host is pushed once per window.
+      const landed = error instanceof RelayFailure && error.code === 'aws_desktop_unreachable';
+      if (claim !== undefined && !landed) await p.restartPush(boot, claim, { release: true }).catch(() => null);
       throw error;
     }
     // A lost record costs at most another push on a later ask (today's behaviour), never this open.
