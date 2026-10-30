@@ -282,9 +282,14 @@ check('round 6: Free held on AWS — "About 5 of 8 hours left this month", no "S
     assert.match(meter(premium, 'compute').textContent, /About 5 hours left at 2 vCPU/);
     assert.match(meter(premium, 'compute').textContent, /Same as 2 hours at 4 vCPU\./);
     // Under an hour, and an account with the 5-hour Free.
-    assert.match(rendered({ ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } }, heldSummary).textContent, /Less than an hour left this month/);
-    assert.match(rendered({ ...heldUsage, period: { ...heldUsage.period, allowanceStandardSeconds: 18000, remainingStandardSeconds: 9360, remainingHoursAtCurrent: 2 } }, heldSummary)
-        .textContent, /About 2 of 5 hours left this month/);
+    const under = rendered({ ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } }, heldSummary);
+    assert.match(under.textContent, /Less than an hour left this month/);
+    const five = rendered({ ...heldUsage, period: { ...heldUsage.period, allowanceStandardSeconds: 18000, remainingStandardSeconds: 9360, remainingHoursAtCurrent: 2 } }, heldSummary);
+    assert.match(five.textContent, /About 2 of 5 hours left this month/);
+    for (const node of [el, older, premium, under, five]) {
+        assert.deepEqual(scanCopy(node.textContent), []);
+        assert.doesNotMatch(node.textContent, /mumbai|ap-south-1/i);
+    }
 });
 check('round 6: AI credits on Free after a cancel — no full bar, the 100 said once, the 663 named with their expiry', () => {
     const el = rendered(heldUsage, heldSummary);
@@ -308,6 +313,10 @@ check('round 6: AI credits on Free after a cancel — no full bar, the 100 said 
     assert.equal(progress(trial, 'ai').getAttribute('aria-valuenow'), '60');
     assert.match(meter(trial, 'ai').textContent, /60 starter credits left/);
     assert.doesNotMatch(meter(trial, 'ai').textContent, /one-time trial credits/);
+    for (const node of [el, paid, trial]) {
+        assert.deepEqual(scanCopy(node.textContent), []);
+        assert.doesNotMatch(node.textContent, /mumbai|ap-south-1/i);
+    }
 });
 check('round 6 (CR-2): a stale hold session still says when it ends; a far-off paid deadline shows no clock time', () => {
     const el = rendered(heldUsage, heldSummary);
