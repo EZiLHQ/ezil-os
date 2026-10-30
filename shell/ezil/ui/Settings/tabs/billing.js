@@ -6,7 +6,7 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -75,7 +75,12 @@ export function standingCopy (standing, data) {
         return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
             : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
     }
-    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+    if ( standing === 'files_on_aws' ) {
+        // Round 6 (R4-02): a held 4 or 8 vCPU computer does not open on Free (the hold never resizes).
+        const closed = heldClosedSize(data?.computer);
+        return closed ? heldClosedText(closed.vcpu)
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+    }
     return '';
 }
 
@@ -434,11 +439,15 @@ function yourComputerV3 (summary) {
     const gb = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
     // Round 6 (R1-11): one provider string, "AWS (India)", on every tab; the Free limits are the session line below.
     const held = standing === 'files_on_aws';
+    // Round 6 (R4-02): a held 4 or 8 vCPU computer is shown at its own size, and says it can't open on Free.
+    const closed = held ? heldClosedSize(computer) : null;
     const where = free && ! held ? 'Cloudflare' : 'AWS (India)';
-    const parts = [`${computer.vcpu} vCPU · ${computer.memoryGiB} GB memory`, gb ? `${gb} GB disk` : 'files saved between sessions', where];
+    const size = ! closed ? `${computer.vcpu} vCPU · ${computer.memoryGiB} GB memory`
+        : `${closed.vcpu} vCPU${Number.isFinite(closed.memoryGiB) && closed.memoryGiB > 0 ? ` · ${closed.memoryGiB} GB memory` : ''}`;
+    const parts = [size, gb ? `${gb} GB disk` : 'files saved between sessions', where];
     return `<div class="ezil-billing-computer" data-role="your-computer">
         <p><span class="ezil-billing-note">Your computer</span> <strong>${encode(parts.join(' · '))}</strong></p>
-        ${paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
+        ${paragraph(closed ? "Can't open on the Free plan at this size" : hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
         ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 

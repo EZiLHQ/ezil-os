@@ -145,6 +145,22 @@ export function planBullets (offer, { existingDisk } = {}) {
 }
 
 /**
+ * Round 6 (R4-02): the user's AWS computer as placed (summary `computer.awsSize`) when it is a 4 or 8 vCPU
+ * one: the D16 hold opens only 2 vCPU and never resizes, so on Free it stays closed. null otherwise (none,
+ * 2 vCPU, unknown or an older server), and the plain hold copy stands.
+ */
+export function heldClosedSize (computer) {
+    const aws = computer?.awsSize;
+    // The same test as `computers.js` `standingCopy` (billing-test pins the two copies equal).
+    return aws && (aws.size === 'cmp-4' || aws.size === 'cmp-8') && Number.isSafeInteger(aws.vcpu) && aws.vcpu > 2 ? aws : null;
+}
+
+/** Round 6 (R4-02): the hold copy for a held 4 or 8 vCPU computer, the same words on Computer, Billing and Usage. */
+export function heldClosedText (vcpu) {
+    return `Your files are still on your ${Number.isSafeInteger(vcpu) && vcpu > 0 ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
+}
+
+/**
  * "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it.
  * Round 6: an equivalent with the current size's vCPU and weight says nothing new, so it is left out
  * (R1-07: "Same as 5 hours at 2 vCPU" under "About 5 hours left at 2 vCPU"). `monthly` (Free: one size,

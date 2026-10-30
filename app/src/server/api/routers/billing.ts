@@ -138,8 +138,12 @@ async function ezilIdSignInUrl(): Promise<string | null> {
 
 /** Round 5 D3: one aws-ec2 computer's data volume, for its real size. */
 export interface AwsVolumeRef { computerId: string; region: string; volumeId: string }
-/** Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size). */
-export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[] }
+/**
+ * Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size), plus,
+ * round 6 (R4-02), the metered size every aws-ec2 placement is on; omitted when there is none, any type is
+ * unreadable or unlisted, or they differ.
+ */
+export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[]; awsSize?: SizeCode }
 type DbReader = { execute(query: SQL): Promise<unknown> };
 
 /**
@@ -149,10 +153,11 @@ type DbReader = { execute(query: SQL): Promise<unknown> };
  * table (billing-only databases) or on any read error: the summary never fails on it.
  * Round 5 D3: each aws-ec2 placement's {region, volumeId}, from the placement module's full read
  * (owner-checked). That read is separate: when it fails the provider stands and only the volume is missing.
+ * Round 6 (R4-02): the same read gives each placement's instance type, metered as the start gate meters it.
  */
 export async function userPlacement(db: DbReader, userId: string): Promise<UserPlacement> {
     try {
-        const [{ isPlacementReadEnabled }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
+        const [{ isPlacementReadEnabled, meteredSizeForInstanceType }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
             import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
         if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [] };
         const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
@@ -162,17 +167,21 @@ export async function userPlacement(db: DbReader, userId: string): Promise<UserP
         const providers = await Promise.all(ids.map(id => readPlacementProvider(db, id)));
         const provider = providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(p => p !== null) ? 'cloudflare' : null;
         const awsVolumes: AwsVolumeRef[] = [];
+        const awsSizes: (SizeCode | null)[] = [];
         for (const [index, id] of ids.entries()) {
             if (providers[index] !== 'aws-ec2') continue;
             try {
                 const { record } = await readPlacement(db, id, userId);
                 if (record?.provider === 'aws-ec2' && record.region && record.volumeId)
                     awsVolumes.push({ computerId: record.computerId, region: record.region, volumeId: record.volumeId });
+                awsSizes.push(record?.provider === 'aws-ec2' ? meteredSizeForInstanceType(record.instanceType) : null);
             } catch {
                 console.warn('[billing.summary] volume placement unavailable');
+                awsSizes.push(null);
             }
         }
-        return { provider, awsVolumes };
+        const awsSize = awsSizes[0] ?? null;
+        return { provider, awsVolumes, ...(awsSize !== null && awsSizes.every(size => size === awsSize) ? { awsSize } : {}) };
     } catch {
         console.warn('[billing.summary] placement unavailable');
         return { provider: null, awsVolumes: [] };
@@ -308,7 +317,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             placement = { provider: null, awsVolumes: [] };
         }
         const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
-        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize) };
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null };
     };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
@@ -382,7 +391,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
                 ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
-                volumeGiB: placement.volumeGiB, enrollment: { state: enrollmentState, ezilIdUrl },
+                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;

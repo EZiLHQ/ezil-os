@@ -291,6 +291,19 @@ check('round 6: Free held on AWS — "About 5 of 8 hours left this month", no "S
         assert.doesNotMatch(node.textContent, /mumbai|ap-south-1/i);
     }
 });
+check('round 6 review (R4-02): a held 4 or 8 vCPU computer says it can\'t open on Free, never "Free sessions last up to 1 hour"', () => {
+    for (const [size, vcpu, memoryGiB] of [['cmp-4', 4, 16], ['cmp-8', 8, 32]]) {
+        const el = rendered(heldUsage, { ...heldSummary, computer: { ...heldSummary.computer, awsSize: { size, vcpu, memoryGiB } } });
+        assert.match(meter(el, 'compute').textContent, new RegExp(`Your files are still on your ${vcpu} vCPU AWS \\(India\\) computer\\. The Free plan can't open it at that size; upgrade to open it again\\.`));
+        assert.doesNotMatch(el.textContent, /Free sessions last/);
+        assert.deepEqual(scanCopy(el.textContent), []);
+        assert.doesNotMatch(el.textContent, /mumbai|ap-south-1/i);
+    }
+    // A held 2 vCPU placement keeps the Free session line.
+    const open = rendered(heldUsage, { ...heldSummary, computer: { ...heldSummary.computer, awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } } });
+    assert.match(meter(open, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.doesNotMatch(open.textContent, /can't open/);
+});
 check('round 6: AI credits on Free after a cancel — no full bar, the 100 said once, the 663 named with their expiry', () => {
     const el = rendered(heldUsage, heldSummary);
     const ai = meter(el, 'ai');

@@ -400,6 +400,27 @@ check('Round 6: a held computer before the lifecycle read shows the size the hol
     assert.match(card(html, 'std-2'), /config-free-limits/);
 });
 
+check('Round 6 review (R4-02): before the lifecycle read a held computer is shown at its placed size (summary awsSize); the live hardware wins', () => {
+    const placed8 = heldData({ awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } });
+    const early = computerModel({ computer: me, data: placed8, prog: null, usage: null, now: HELD_NOW });
+    assert.equal(early.current, 'cmp-8');
+    assert.equal(early.heldClosed, true);
+    const earlyHtml = scan(computerHtml(early, null, []));
+    assert.doesNotMatch(earlyHtml, /data-action="open"/);
+    assert.match(text(earlyHtml), /Your files are still on your 8 vCPU AWS \(India\) computer\. The Free plan can't open it at that size/);
+    // The lifecycle read says 2 vCPU (a fresher answer than the summary's): it opens, with the open hold copy only.
+    const live = computerModel({ computer: me, data: placed8, prog: running(), usage: heldUsage, now: HELD_NOW });
+    assert.equal(live.current, 'std-2');
+    assert.equal(live.heldClosed, false);
+    const liveHtml = scan(computerHtml(live, running(), []));
+    assert.match(liveHtml, /data-action="open"/);
+    assert.match(text(liveHtml), /It opens on the Free plan with Free limits/);
+    assert.doesNotMatch(text(liveHtml), /can't open/);
+    // A malformed or unknown placed size falls back to the size the hold opens.
+    for ( const awsSize of [null, { size: 'm6i.large' }, { size: 'free-cf', vcpu: 2, memoryGiB: 6 }] )
+        assert.equal(computerModel({ computer: me, data: heldData({ awsSize }), prog: null, now: HELD_NOW }).current, 'std-2', JSON.stringify(awsSize));
+});
+
 check('Round 6: a Free session on Cloudflare also says when it ends; a paid session (no cap) never does', () => {
     const cf = { ...free(), computer: { ...free().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
     const model = computerModel({ computer: me, data: cf, prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true, now: HELD_NOW });

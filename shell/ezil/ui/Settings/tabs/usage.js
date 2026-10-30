@@ -1,7 +1,7 @@
 // Authenticated observations. Durations and balances never advance on the client.
 import trpc from '../trpc.js';
 import session from '../../../session.js';
-import { creditsLabel, hoursLeftLines } from '../billing-format.js';
+import { creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
 
 const states = new WeakMap();
 let active = null;
@@ -75,12 +75,15 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const lines = hoursLeftLines(hoursPeriod, choices, { monthly: free });
     const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
     const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
+    const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
     const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
         : lines?.equivalents ? esc(lines.equivalents)
+        // Round 6 (R4-02): a held 4 or 8 vCPU computer has no Free session to describe; it can't open on Free.
+        : closed ? esc(heldClosedText(closed.vcpu))
         : free && sessionHours ? `Free sessions last up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}.` : '';
     const ai = summary?.ai, grant = ai?.grant;
     // Round 5 D1: an account without EZiL ID has its credits parked; the server says so, never "Unavailable".

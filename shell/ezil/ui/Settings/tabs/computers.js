@@ -449,8 +449,10 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const stopped = (! free || held) && lifecycle === 'STOPPED';
     const hardware = sizeForInstanceType(prog?.hardware?.instanceType);
     const preference = data?.computer?.size ?? null;
-    // Before the lifecycle read answers, a held computer is shown at the size the hold opens (the server refuses any other).
-    const current = held ? flying?.current ?? hardware ?? HOLD_SIZE : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
+    // Before the lifecycle read answers, a held computer is shown at its placed size (round 6: summary `awsSize`),
+    // else at the size the hold opens (the server refuses any other).
+    const placed = held && AWS_SIZES.includes(data?.computer?.awsSize?.size) ? data.computer.awsSize.size : null;
+    const current = held ? flying?.current ?? hardware ?? placed ?? HOLD_SIZE : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
     // Round 6 (R4-02): the hold opens only HOLD_SIZE and never resizes, so a held 4 or 8 vCPU computer cannot open on Free.
     const heldClosed = held && current !== HOLD_SIZE;
     const choice = new Set((data?.computer?.machineChoice ?? []).map(m => m.size));
@@ -529,14 +531,24 @@ export function standingCopy (standing, data) {
         return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
             : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
     }
-    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+    if ( standing === 'files_on_aws' ) {
+        // Round 6 (R4-02): a held 4 or 8 vCPU computer (the summary's placed `awsSize`) does not open on Free.
+        const placed = data?.computer?.awsSize;
+        return placed && (placed.size === 'cmp-4' || placed.size === 'cmp-8') && Number.isSafeInteger(placed.vcpu) && placed.vcpu > 2
+            ? heldClosedText(placed.vcpu)
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+    }
     return '';
+}
+
+/** Round 6 (R4-02): the words for a held 4 or 8 vCPU computer; Billing's `heldClosedText` (billing-format.js), pinned equal. */
+function heldClosedText (vcpu) {
+    return `Your files are still on your ${Number.isSafeInteger(vcpu) && vcpu > 0 ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
 }
 
 /** Round 6 (R4-02): a held 4 or 8 vCPU computer. The hold opens only 2 vCPU and never resizes, so it cannot open on Free. */
 export function heldClosedCopy (size, data) {
-    const vcpu = sizeInfo(size, data)?.vcpu;
-    return `Your files are still on your ${vcpu ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
+    return heldClosedText(sizeInfo(size, data)?.vcpu);
 }
 
 const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Starting your desktop'];
@@ -590,7 +602,9 @@ function standingHtml (model) {
             <a class="ezil-settings-btn" data-action="held-upgrade" href="/os?settings=billing&amp;upgrade=pro">Upgrade</a></div>`;
     }
     if ( model.held ) {
-        return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p>
+        // The model decided it opens (the live hardware wins over the summary's placed size): the open copy.
+        const open = standingCopy('files_on_aws', { ...model.data, computer: { ...model.data?.computer, awsSize: null } });
+        return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(open)}</p>
             ${model.holdLine ? `<p data-role="hold-time">${html_encode(model.holdLine)}</p>` : ''}</div>`;
     }
     return '';

@@ -1404,6 +1404,17 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         expect(f.store.openPaymentIssues).toHaveBeenLastCalledWith(userId);
     });
 
+    it('round 6 review (R4-02): the summary carries the PLACED AWS size from the placement read (a held 8 vCPU stays 8)', async () => {
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], awsSize: 'cmp-8' });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', size: 'std-2',
+            awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } } });
+        // No size from the placement read (unknown or mixed): null.
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: [] });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', awsSize: null } });
+    });
+
     it('an unreadable volume (error, missing, no AWS placement) shows 50 and never fails the summary or usage', async () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         for (const f of [withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: new Error('AccessDenied') }),
@@ -1485,6 +1496,21 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         await expect(userPlacementProvider({ execute: execute as never }, userId)).resolves.toBe('aws-ec2');
         // Only the aws-ec2 computer gets the rich read.
         expect(execute.mock.calls.filter(([q]) => dialect.sqlToQuery(q).sql.includes('placement:read')).map(([q]) => dialect.sqlToQuery(q).params[0])).toEqual([C1, C1]);
+        // Round 6 (R4-02): the instance type, metered as the start gate meters it; an unlisted type is no size.
+        for (const [type, size] of [['m6i.2xlarge', 'cmp-8'], ['m6i.xlarge', 'cmp-4'], ['m6i.large', 'std-2']] as const) {
+            rows[C1] = { ...rows[C1], instance_type: type };
+            await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ provider: 'aws-ec2', awsSize: size });
+        }
+        rows[C1] = { ...rows[C1], instance_type: 'p5.48xlarge' };
+        expect(await userPlacement({ execute: execute as never }, userId)).not.toHaveProperty('awsSize');
+        // Two aws-ec2 computers on different sizes: no single placed size.
+        rows[C1] = { ...rows[C1], instance_type: 'm6i.2xlarge' };
+        rows[C2] = placementRow({ computer_id: C2, owner_user_id: userId, provider: 'aws-ec2', region: 'ap-south-1', instance_type: 'm6i.large' });
+        expect(await userPlacement({ execute: execute as never }, userId)).not.toHaveProperty('awsSize');
+        rows[C2] = { ...rows[C2], instance_type: 'm6i.2xlarge' };
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ awsSize: 'cmp-8' });
+        rows[C1] = { ...rows[C1], instance_type: null };
+        rows[C2] = placementRow({ computer_id: C2, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' });
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         richFails = true;
         await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });

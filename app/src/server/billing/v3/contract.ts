@@ -293,6 +293,13 @@ export interface BillingSummaryV3 {
         heldSince?: string | null;
         /** Round 4 (additive): always null until Phase B moves files (D20/D21). */
         move?: ComputerMoveV3 | null;
+        /**
+         * Round 6 (additive; R4-02): the user's AWS computer as placed now (its instance type), whatever `size`
+         * says: under the D16 hold only a 2 vCPU one opens (it is never resized), so a 4 or 8 vCPU one stays
+         * closed. null when there is no AWS computer, its type is unreadable or unlisted, or the user's AWS
+         * computers differ.
+         */
+        awsSize?: { size: SizeCode; vcpu: number; memoryGiB: number } | null;
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {

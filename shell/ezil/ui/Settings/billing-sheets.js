@@ -172,21 +172,21 @@ export function openDowngradeSheet (options) {
     return sheet.handle;
 }
 
-const VCPU = { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8 };
-
 /**
  * Round 6 (R4-13, plan A6): the cancel sheet says what happens to the COMPUTER. Under the D16 hold an AWS
  * computer opens on Free only at 2 vCPU, for Free's session length, and is never resized: a 4 or 8 vCPU
- * computer can't open on Free (R4-02). Files on Cloudflare (or an older server) keep the plain line.
+ * computer can't open on Free (R4-02). The size is the computer's PLACED one (`computer.awsSize`), never
+ * the next-start preference (`computer.size`), which the hold does not apply. Files on Cloudflare keep the
+ * plain line; an unknown placed size (an older server, unreadable) says only that the files stay.
  */
 function cancelCopyV3 (summary) {
     const at = summary.plan.renewal?.at;
     const lead = `Your plan stays active ${at ? `until ${dateLabel(at)}` : 'until the end of your billing period'}, then moves to Free.`;
     if ( summary.computer?.filesOn !== 'aws' ) return `${lead} Your files and installed tools stay.`;
     const after = at ? `After ${dateLabel(at)}` : 'After that';
-    const size = summary.computer.size;
-    const vcpu = summary.computer.machineChoice?.find(m => m.size === size)?.vcpu ?? VCPU[size];
-    if ( size && size !== 'std-2' && vcpu ) return `${lead} ${after} your ${vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer.`;
+    const placed = summary.computer.awsSize;
+    if ( ! placed || ! ['std-2', 'cmp-4', 'cmp-8'].includes(placed.size) ) return `${lead} Your files stay on your AWS computer.`;
+    if ( placed.size !== 'std-2' && Number.isSafeInteger(placed.vcpu) ) return `${lead} ${after} your ${placed.vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer.`;
     const cap = summary.catalog?.offers?.find(offer => offer.sku === 'free_v3')?.sessionMaxSeconds;
     const hours = Number.isSafeInteger(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
     return `${lead} ${after} your computer opens under Free limits${hours ? ` (sessions up to ${hours} hour${hours === 1 ? '' : 's'})` : ''}; your files stay on your AWS computer.`;

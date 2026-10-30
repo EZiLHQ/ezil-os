@@ -202,6 +202,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     enrollment?: { state: BillingSummaryV3['ai']['enrollment']; ezilIdUrl: string | null };
     /** Round 5 D3: the computer's real data-volume size in GiB (EC2 describeVolume); null/omitted = unreadable (fallback 50). */
     volumeGiB?: number | null;
+    /** Round 6 (R4-02): the metered size of the user's AWS computer as placed; null/omitted = none, unreadable or mixed. */
+    awsSize?: SizeCode | null;
 }): BillingSummaryV3 {
     const plan = planFromSubscriptions(input);
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
@@ -263,7 +265,10 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
                 // the computer's volume); the plan disk is on the plan card (offer storageGiB) only.
                 diskGiB: null })),
             disk: { provisionedGiB: disk.provisionedGiB, usedBytes: disk.usedBytes?.toString() ?? null, growsOnSwitch: false },
-            standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null },
+            standing: standing.standing, filesOn: standing.filesOn, heldSince: standing.heldSince, move: null,
+            // Round 6 (R4-02): the placed AWS size, so Billing and Usage can say a held 4/8 vCPU computer stays closed.
+            awsSize: input.awsSize && SIZES[input.awsSize]?.provider === 'aws'
+                ? { size: input.awsSize, vcpu: SIZES[input.awsSize].vcpu, memoryGiB: SIZES[input.awsSize].memoryGiB } : null },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),

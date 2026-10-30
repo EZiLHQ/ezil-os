@@ -1011,6 +1011,22 @@ try {
         contains('[data-role="meter-storage"]', '50 GB disk for your projects');
         contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
         assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        // Round 6 review (R4-02): a held 4 or 8 vCPU computer (placed size `awsSize`) can't open on Free. Billing
+        // says so at its own size, in the Computer tab's words, never "opens on the Free plan" or a 1-hour session.
+        for ( const [size, vcpu, memoryGiB] of [['cmp-4', 4, 16], ['cmp-8', 8, 32]] ) {
+            summary.computer.awsSize = { size, vcpu, memoryGiB }; await refresh(); audit();
+            contains('[data-role="files-held"]', `Your files are still on your ${vcpu} vCPU AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`);
+            assert.equal(q('[data-role="files-held"]').textContent, window.computersTab.heldClosedCopy(size, summary), 'the same words as the Computer tab');
+            contains('[data-role="your-computer"]', `${vcpu} vCPU · ${memoryGiB} GB memory · 50 GB disk · AWS (India)`);
+            contains('[data-role="your-computer"]', "Can't open on the Free plan at this size");
+            for ( const role of ['files-held', 'your-computer'] ) assert.doesNotMatch(q(`[data-role="${role}"]`).textContent, /opens on the Free plan|Sessions up to/);
+            assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);
+        }
+        // A held 2 vCPU placement keeps the hold copy.
+        summary.computer.awsSize = { size: 'std-2', vcpu: 2, memoryGiB: 8 }; await refresh();
+        contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
+        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        delete summary.computer.awsSize;
         getUsage = () => failure('unavailable');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
@@ -1032,6 +1048,9 @@ try {
             ['plan_ending', { plan: { name: 'Standard', planEndsAt: ENDS }, computer: { filesOn: 'aws' } }],
             ['plan_ending', { plan: { name: 'Premium', cancelsAt: ENDS }, computer: { filesOn: 'cloudflare' } }], ['plan_ending', { plan: {}, computer: {} }],
             ['files_on_aws', { plan: {}, computer: {} }], ['paid', { plan: {}, computer: {} }], ['free', { plan: {}, computer: {} }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } } }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } } }],
+            ['files_on_aws', { plan: {}, computer: { awsSize: { size: 'cmp-4', vcpu: 'four' } } }],
         ];
         for ( const [standing, data] of shapes ) {
             const copy = window.billing.standingCopy(standing, data);
