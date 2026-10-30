@@ -510,6 +510,7 @@ import {
   type GcR2BucketLike,
 } from './workspace-persist';
 import { exportedSnapshot, exportedChunk, reopenMigrationHeads, MigrationRequestError } from './workspace-migration-export';
+import { DEFAULT_WORKSPACE_BRANCH, workspaceMountPrefix, workspacePrefixOverride } from './workspace-prefix';
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
@@ -1408,7 +1409,7 @@ const R2_BINDING_NAME = 'SANDBOX_WORKSPACE_R2_BUCKET';
 
 function resolveWorkspaceMountConfig(env: Env): WorkspaceMountConfig | null {
   const mountPath = env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH;
-  const prefix = env.SANDBOX_WORKSPACE_S3_PREFIX?.trim();
+  const prefix = workspacePrefixOverride(env);
 
   // Preferred path: a real R2 binding is wired ([[r2_buckets]] in
   // wrangler.toml). No S3 access keys required — the Sandbox Durable Object
@@ -1510,7 +1511,7 @@ async function ensureWorkspaceMount(
     // separate lever (EZIL_WORKSPACE_S3_KEY_PREFIX).
     const cfg = resolveWorkspaceMountConfig(env);
     const mountPath = cfg?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH);
-    const prefix = cfg?.prefix ?? `/${projectId}/branches/${branch}`;
+    const prefix = workspaceMountPrefix(cfg?.prefix, { projectId, branch });
     return sandbox.hydrateWorkspace({ mountPath, prefix, ...(expectedStore ? { expectedStore } : {}) });
   }
 
@@ -1521,8 +1522,8 @@ async function ensureWorkspaceMount(
   // `s3` fallback branch below) / `seedWorkspaceIfAbsent`'s `mountPrefix`
   // contract (see that module's doc comment) — stripped internally before it
   // ever reaches R2, so the real object-key prefix still matches the write
-  // path exactly.
-  const prefix = config.prefix ?? `/${projectId}/branches/${branch}`;
+  // path exactly. The reverse import derives its prefix with the same helper (./workspace-prefix).
+  const prefix = workspaceMountPrefix(config.prefix, { projectId, branch });
 
   if (config.mode === 'r2-binding') {
     // R2-binding mode NO LONGER MOUNTS ANYTHING: `mountBucket()`'s s3fs mount
@@ -4825,7 +4826,7 @@ async function handlePreview(
   // `?? 'default'` fallback: that fallback was the cross-tenant prefix
   // hazard this change closes.
   const workspaceProjectId = scopeId;
-  const workspaceBranch = body.branch?.trim() || 'main';
+  const workspaceBranch = body.branch?.trim() || DEFAULT_WORKSPACE_BRANCH;
 
   // Neko auto-connect: merge the deterministic per-sandbox regular-user + admin
   // credentials into the existing `iceEnv` object so they naturally reach the
