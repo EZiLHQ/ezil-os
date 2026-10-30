@@ -129,6 +129,10 @@ export const computeReverseMoves = pgTable(
         retainUntil: timestamp('retain_until', { withTimezone: true }),
         attempts: integer('attempts').notNull().default(0),
         lastError: text('last_error'),
+        /** Set on every state change (never by claimStale or a retry): the anchor of every per-state timeout. */
+        stateEnteredAt: timestamp('state_entered_at', { withTimezone: true }).notNull().defaultNow(),
+        /** The point of no return (checking → flipping): the Worker commit may have been sent. */
+        commitSentAt: timestamp('commit_sent_at', { withTimezone: true }),
         createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
         updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     },
@@ -149,6 +153,8 @@ export const computeReverseMoves = pgTable(
         check('ezil_compute_reverse_moves_retain_until_check', sql`retain_until IS NULL OR state = 'committed'`),
         check('ezil_compute_reverse_moves_attempts_check', sql`attempts BETWEEN 0 AND 5`),
         check('ezil_compute_reverse_moves_last_error_check', sql`last_error IS NULL OR length(last_error) <= 200`),
+        check('ezil_compute_reverse_moves_commit_sent_at_check',
+            sql`commit_sent_at IS NULL OR state IN ('flipping', 'committed', 'failed_needs_operator')`),
     ],
 ).enableRLS();
 

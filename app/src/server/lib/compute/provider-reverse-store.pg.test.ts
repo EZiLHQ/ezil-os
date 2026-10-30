@@ -275,6 +275,92 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect((await reverse.recordExportBoot(claimed[0]!, boot)).state).toBe('booting');
     });
 
+    it('point of no return: checking→flipping stamps commit_sent_at; flipping never reopens; operator release follows the marker', async () => {
+        let m = await toCopying();
+        m = await reverse.recordImportProgress(m, m.exportHead!.chunks.map(chunk => chunk.i));
+        const checking = await reverse.advance(m, 'checking');
+        expect(checking.commitSentAt).toBeNull();
+        const flipping = await reverse.advance(checking, 'flipping');
+        expect(flipping.commitSentAt).not.toBeNull();
+        const [stamps] = await q(`SELECT commit_sent_at >= state_entered_at - interval '1 second' AND commit_sent_at <= clock_timestamp() AS ok
+            FROM $S.ezil_compute_reverse_moves WHERE id = '${flipping.id}'`);
+        expect(stamps!.ok).toBe(true);
+        // The commit may have landed: the AWS computer is never reopened, whatever the reason.
+        for (const reason of ['entitlement_paid', 'kill_switch', 'flip_retries'])
+            await expect(reverse.fail(flipping, 'failed_reopened', reason)).rejects.toEqual(conflict('illegal_transition'));
+        // Retries in flipping are bounded by time, not attempts: never exhausted, and they keep both stamps.
+        let f = flipping;
+        for (let i = 0; i < 7; i++) {
+            const r = await reverse.recordRetry(f, 'commit_unavailable');
+            expect(r.exhausted).toBe(false);
+            f = r.move;
+        }
+        expect(f).toMatchObject({ state: 'flipping', attempts: 5, commitSentAt: flipping.commitSentAt, stateEnteredAt: flipping.stateEnteredAt });
+        const stuck = await reverse.fail(f, 'failed_needs_operator', 'flip_stuck');
+        expect(stuck.commitSentAt).toBe(flipping.commitSentAt);
+        await expect(reverse.fail(stuck, 'failed_reopened', 'operator_released')).rejects.toEqual(conflict('illegal_transition'));
+        await expect(q(`UPDATE $S.ezil_compute_reverse_moves SET state = 'failed_reopened' WHERE id = '${stuck.id}'`))
+            .rejects.toThrow(/ezil_compute_reverse_moves_commit_sent_at_check/);
+        // An operator finishes the stuck flip instead (the same flip transaction, contract §5.6).
+        const done = await reverse.finish(stuck, { awsVolumeId: 'vol-0b1ffbc8f8cfa6384', awsFsUuid: null, awsSnapshotId: null });
+        expect(done).toMatchObject({ state: 'committed', commitSentAt: flipping.commitSentAt });
+        // A row that never sent its commit cannot be finished; an operator may reopen it.
+        const other = await reverse.fail(await create(C2), 'failed_needs_operator', 'abort_unconfirmed');
+        expect(other.commitSentAt).toBeNull();
+        await expect(reverse.finish(other, { awsVolumeId: 'vol-0b1ffbc8f8cfa6384', awsFsUuid: null, awsSnapshotId: null }))
+            .rejects.toEqual(conflict('illegal_transition'));
+        expect((await reverse.fail(other, 'failed_reopened', 'operator_released')).state).toBe('failed_reopened');
+        // No other state may carry the marker.
+        const fresh = await create(C2);
+        await expect(q(`UPDATE $S.ezil_compute_reverse_moves SET commit_sent_at = now() WHERE id = '${fresh.id}'`))
+            .rejects.toThrow(/ezil_compute_reverse_moves_commit_sent_at_check/);
+    });
+
+    it('state_entered_at moves on a state change only, never on claimStale, a retry, progress or a claim completion', async () => {
+        const m = await create();
+        expect(m.stateEnteredAt).toBe(m.createdAt);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET updated_at = updated_at - interval '1 minute',
+            state_entered_at = state_entered_at - interval '1 minute' WHERE id = '${m.id}'`);
+        const backdated = (await reverse.readById(m.id))!.stateEnteredAt;
+        const [claimed] = await reverse.claimStale(10);
+        expect(claimed).toMatchObject({ id: m.id, stateEnteredAt: backdated });
+        const b1 = await reverse.recordExportBoot(claimed!, boot);
+        expect(b1.stateEnteredAt).not.toBe(backdated);
+        const entered = async (id: string) => (await q(`SELECT state_entered_at::text AS t FROM $S.ezil_compute_reverse_moves WHERE id = '${id}'`))[0]!.t;
+        const sameState = [
+            (x: ComputeReverseMove) => reverse.recordRetry(x, 'enroll_wait').then(r => r.move),
+            (x: ComputeReverseMove) => reverse.recordExportBoot(x, enrolled),
+        ];
+        let x = b1;
+        for (const write of sameState) {
+            x = await write(x);
+            expect(x.stateEnteredAt).toBe(b1.stateEnteredAt);
+            expect(await entered(x.id)).toBe(b1.stateEnteredAt);
+        }
+        x = await reverse.recordExportHead(await reverse.advance(x, 'exporting'), headFor(x.generation));
+        const copyingEntered = x.stateEnteredAt;
+        x = await reverse.recordImportProgress(x, [0]);
+        expect(x.stateEnteredAt).toBe(copyingEntered);
+        const [later] = await q(`SELECT '${copyingEntered}'::timestamptz > '${b1.stateEnteredAt}'::timestamptz AS ok`);
+        expect(later!.ok).toBe(true);
+    });
+
+    it('readByExportBoot finds the row that claimed a placement generation and lease epoch, in any state', async () => {
+        const m = await reverse.recordExportBoot(await create(), boot);
+        expect((await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch))!.id).toBe(m.id);
+        expect(await reverse.readByExportBoot(C, boot.placementGeneration + 1, boot.leaseEpoch)).toBeNull();
+        expect(await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch + 1)).toBeNull();
+        expect(await reverse.readByExportBoot(C2, boot.placementGeneration, boot.leaseEpoch)).toBeNull();
+        // A released row still owns its boot, so the receipts path keeps that boot out of RUNNING.
+        await reverse.fail(m, 'failed_reopened', 'boot_timeout');
+        expect(await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch)).toMatchObject({ id: m.id, state: 'failed_reopened' });
+        // The next move claims N+2/E+2; each boot maps to its own row.
+        const next = await reverse.recordExportBoot(await create(), { ...boot, placementGeneration: boot.placementGeneration + 2, leaseEpoch: boot.leaseEpoch + 2 });
+        expect((await reverse.readByExportBoot(C, boot.placementGeneration + 2, boot.leaseEpoch + 2))!.id).toBe(next.id);
+        expect((await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch))!.id).toBe(m.id);
+        await expect(reverse.readByExportBoot(C, 1.5, 7)).rejects.toEqual(conflict('invalid_input'));
+    });
+
     it('RLS is enabled with no policy, and no client role keeps any privilege (defaults granted ALL)', async () => {
         await q(`CREATE TABLE $S.grant_probe (id integer)`);
         try {

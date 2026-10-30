@@ -19,6 +19,12 @@ CREATE TABLE public.ezil_compute_reverse_moves (
     retain_until timestamptz CONSTRAINT ezil_compute_reverse_moves_retain_until_check CHECK (retain_until IS NULL OR state = 'committed'),
     attempts integer NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 5),
     last_error text CHECK (last_error IS NULL OR length(last_error) <= 200),
+    -- Set on every state change (never by claimStale or a retry): the anchor of every per-state timeout.
+    state_entered_at timestamptz NOT NULL DEFAULT now(),
+    -- The point of no return: set once, by checking -> flipping, before the Worker commit may be sent.
+    -- A row that carries it can never be failed_reopened (the Cloudflare head may already be committed).
+    commit_sent_at timestamptz CONSTRAINT ezil_compute_reverse_moves_commit_sent_at_check
+        CHECK (commit_sent_at IS NULL OR state IN ('flipping', 'committed', 'failed_needs_operator')),
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );

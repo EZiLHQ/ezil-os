@@ -13,6 +13,11 @@
  *   under READ COMMITTED it sees any creator that committed while this one waited.
  * - **Transitions are compare-and-swap** on `(id, state, updated_at::text)`, like the forward store.
  *   A lost race throws `ReverseMoveConflictError('lost_race')` and writes nothing.
+ * - **The point of no return is in the row.** `checking → flipping` sets `commit_sent_at` (DB clock) before
+ *   the Worker commit may be sent. From then on the row can only end `committed` or `failed_needs_operator`:
+ *   `failed_reopened` is refused by this store and by the 0012 CHECK, because the Cloudflare head may
+ *   already be this move's. `state_entered_at` moves only on a state change (never on claimStale or a
+ *   retry), so every per-state timeout has a durable anchor.
  *
  * Inject the app's drizzle executor; this module never opens a connection. To write inside a
  * placement transaction (export-boot claim, flip), build the store over that transaction.
@@ -31,17 +36,20 @@ export type ReverseMoveStartedBy = 'user' | 'open' | 'cron';
 export type ReverseMoveFailure = 'failed_reopened' | 'failed_needs_operator';
 
 /** Every legal edge. `requested→booting` is `recordExportBoot`, `exporting→copying` is `recordExportHead`,
- * `flipping→committed` is `finish`, `*→failed_*` is `fail`; `advance` takes the rest. */
+ * `flipping→committed` is `finish`, `*→failed_*` is `fail`; `advance` takes the rest.
+ * - `flipping` never reaches `failed_reopened`: the commit may have landed (contract §4.4, §5.5).
+ * - An operator releases `failed_needs_operator`: to `failed_reopened` only while `commit_sent_at` is null,
+ *   or to `committed` (`finish`, finishing a stuck flip) only when it is set. */
 export const REVERSE_MOVE_TRANSITIONS: Readonly<Record<ReverseMoveState, readonly ReverseMoveState[]>> = {
     requested: ['booting', 'failed_reopened', 'failed_needs_operator'],
     booting: ['exporting', 'failed_reopened', 'failed_needs_operator'],
     exporting: ['copying', 'failed_reopened', 'failed_needs_operator'],
     copying: ['checking', 'failed_reopened', 'failed_needs_operator'],
     checking: ['flipping', 'failed_reopened', 'failed_needs_operator'],
-    flipping: ['committed', 'failed_reopened', 'failed_needs_operator'],
+    flipping: ['committed', 'failed_needs_operator'],
     committed: [],
     failed_reopened: [],
-    failed_needs_operator: ['failed_reopened'],
+    failed_needs_operator: ['failed_reopened', 'committed'],
 };
 const ADVANCE: Readonly<Partial<Record<ReverseMoveState, ReverseMoveState>>> = { booting: 'exporting', copying: 'checking', checking: 'flipping' };
 
@@ -106,6 +114,10 @@ export interface ComputeReverseMove {
     retainUntil: Date | null;
     attempts: number;
     lastError: string | null;
+    /** DB-clock text of the last state change; claimStale and retries never move it. */
+    stateEnteredAt: string;
+    /** DB-clock text, set by `checking → flipping`: the Worker commit may have been sent. Never cleared by the app. */
+    commitSentAt: string | null;
     createdAt: string;
     /** Opaque PostgreSQL timestamp text, preserving microseconds for CAS. */
     updatedAt: string;
@@ -127,7 +139,8 @@ const SNAPSHOT = /^snap-[0-9a-f]{8,17}$/;
 const INSTANCE = /^i-[0-9a-f]{8,17}$/;
 const REASON = /^[a-z0-9_.:-]{1,200}$/;
 const BITMAP_HEX = EXPORT_MAX_CHUNKS / 4;
-const COLUMNS = sql.raw('*, created_at::text AS created_at, updated_at::text AS updated_at');
+const COLUMNS = sql.raw('*, state_entered_at::text AS state_entered_at, commit_sent_at::text AS commit_sent_at, '
+    + 'created_at::text AS created_at, updated_at::text AS updated_at');
 const HOLDING = sql.raw(`state NOT IN ('committed', 'failed_reopened')`);
 const STAMP = sql`GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')`;
 const json = (value: unknown) => sql`(${JSON.stringify(value)}::text)::jsonb`;
@@ -147,6 +160,7 @@ function parse(r: Record<string, unknown>): ComputeReverseMove {
         awsSnapshotId: (r.aws_snapshot_id ?? null) as string | null,
         retainUntil: r.retain_until == null ? null : new Date(r.retain_until as string | Date),
         attempts: Number(r.attempts), lastError: (r.last_error ?? null) as string | null,
+        stateEnteredAt: String(r.state_entered_at), commitSentAt: r.commit_sent_at == null ? null : String(r.commit_sent_at),
         createdAt: String(r.created_at), updatedAt: String(r.updated_at),
     };
 }
@@ -237,16 +251,28 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
         WHERE computer_id = ${computerId}::uuid ORDER BY ezil_compute_reverse_moves.created_at DESC, id DESC LIMIT 1`));
     const readActiveByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
         WHERE computer_id = ${computerId}::uuid AND ${HOLDING}`));
+    /** The newest row (ANY state) that claimed this placement generation and lease epoch for its export boot.
+     * The receipts path keys its export-boot mode on this (contract §5.2), so a released row still keeps its
+     * own boot out of RUNNING, and the next boot (N+2/E+2) never matches. */
+    const readByExportBoot = async (computerId: string, placementGeneration: number, leaseEpoch: number) => {
+        if (!Number.isSafeInteger(placementGeneration) || !Number.isSafeInteger(leaseEpoch)) refuse('invalid_input');
+        return one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
+            WHERE computer_id = ${computerId}::uuid
+              AND export_boot @> jsonb_build_object('placementGeneration', ${placementGeneration}::int, 'leaseEpoch', ${leaseEpoch}::int)
+            ORDER BY ezil_compute_reverse_moves.created_at DESC, id DESC LIMIT 1`));
+    };
     const legal = (from: ReverseMoveState, to: ReverseMoveState) => REVERSE_MOVE_TRANSITIONS[from]?.includes(to) ?? false;
     /** One compare-and-swap write; zero rows is a lost race, never retried here. */
     async function cas(expected: ComputeReverseMove, to: ReverseMoveState, set: SQL): Promise<ComputeReverseMove> {
-        const updated = one(await db.execute(sql`UPDATE public.ezil_compute_reverse_moves SET state = ${to}, ${set}, updated_at = ${STAMP}
+        const entered = to === expected.state ? sql`state_entered_at` : sql`clock_timestamp()`;
+        const updated = one(await db.execute(sql`UPDATE public.ezil_compute_reverse_moves SET state = ${to}, ${set},
+            state_entered_at = ${entered}, updated_at = ${STAMP}
             WHERE id = ${expected.id}::uuid AND state = ${expected.state} AND updated_at::text = ${expected.updatedAt}
             RETURNING ${COLUMNS}`));
         return updated ?? refuse('lost_race');
     }
     return {
-        readById, readByComputer, readActiveByComputer,
+        readById, readByComputer, readActiveByComputer, readByExportBoot,
         /**
          * The computer's holding row, or a new `requested` row. Refuses (`forward_active`) while the
          * forward machine has work for the computer, and (`owner_mismatch`) another owner's row.
@@ -285,11 +311,15 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
             }
             return cas(expected, 'booting', sql`export_boot = ${json(boot)}`);
         },
-        /** `booting→exporting` (host enrolled), `copying→checking` (every chunk imported), `checking→flipping`. Resets attempts. */
+        /**
+         * `booting→exporting` (host enrolled), `copying→checking` (every chunk imported), `checking→flipping`. Resets attempts.
+         * `checking→flipping` is the point of no return: it sets `commit_sent_at` from the DB clock, and the caller writes it
+         * in the locked transaction that re-checked the entitlement, BEFORE sending the Worker commit (contract §5.5).
+         */
         async advance(expected: ComputeReverseMove, to: ReverseMoveState): Promise<ComputeReverseMove> {
             if (ADVANCE[expected.state] !== to || !legal(expected.state, to)
                 || (to === 'exporting' && !expected.exportBoot?.instanceId) || (to === 'checking' && !importComplete(expected))) refuse('illegal_transition');
-            return cas(expected, to, sql`attempts = 0, last_error = NULL`);
+            return cas(expected, to, to === 'flipping' ? sql`attempts = 0, last_error = NULL, commit_sent_at = clock_timestamp()` : sql`attempts = 0, last_error = NULL`);
         },
         /** `exporting→copying` with the validated head; import progress starts empty. */
         async recordExportHead(expected: ComputeReverseMove, head: ReverseExportHead): Promise<ComputeReverseMove> {
@@ -315,22 +345,36 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
                 first: previous?.first ?? at, last: previous && previous.last > at ? previous.last : at };
             return cas(expected, 'copying', sql`import_progress = ${json(progress)}, attempts = 0, last_error = NULL`);
         },
-        /** One more bounded retry in the current state; `exhausted` (nothing written) means the caller must `fail`. */
+        /**
+         * One more bounded retry in the current state; `exhausted` (nothing written) means the caller must compensate and `fail`.
+         * In `flipping` it is never exhausted (attempts saturate at 5): that state is bounded by `commit_sent_at` + 30 min, and
+         * its only failure is `failed_needs_operator('flip_stuck')` (contract §5.4).
+         */
         async recordRetry(expected: ComputeReverseMove, reason: string): Promise<{ move: ComputeReverseMove; exhausted: boolean }> {
             if (!REVERSE_MOVE_IN_FLIGHT.includes(expected.state)) refuse('illegal_transition');
             if (!REASON.test(reason)) refuse('invalid_input');
-            if (expected.attempts >= REVERSE_MOVE_MAX_ATTEMPTS) return { move: expected, exhausted: true };
-            return { move: await cas(expected, expected.state, sql`attempts = ${expected.attempts + 1}::int, last_error = ${reason}`), exhausted: false };
+            const flipping = expected.state === 'flipping';
+            if (!flipping && expected.attempts >= REVERSE_MOVE_MAX_ATTEMPTS) return { move: expected, exhausted: true };
+            const attempts = Math.min(expected.attempts + 1, REVERSE_MOVE_MAX_ATTEMPTS);
+            return { move: await cas(expected, expected.state, sql`attempts = ${attempts}::int, last_error = ${reason}`), exhausted: false };
         },
-        /** In-flight → `failed_reopened` | `failed_needs_operator`; an operator releases `failed_needs_operator` → `failed_reopened`. */
+        /**
+         * In-flight → `failed_reopened` | `failed_needs_operator`; an operator releases `failed_needs_operator` → `failed_reopened`.
+         * `failed_reopened` is refused once `commit_sent_at` is set (the 0012 CHECK refuses it too): an operator who proved
+         * the commit never landed clears `commit_sent_at` by hand first (runbook, contract §5.6).
+         */
         async fail(expected: ComputeReverseMove, to: ReverseMoveFailure, reason: string): Promise<ComputeReverseMove> {
-            if (!legal(expected.state, to)) refuse('illegal_transition');
+            if (!legal(expected.state, to) || (to === 'failed_reopened' && expected.commitSentAt !== null)) refuse('illegal_transition');
             if (!REASON.test(reason)) refuse('invalid_input');
             return cas(expected, to, sql`last_error = ${reason}`);
         },
-        /** `flipping→committed`: the AWS volume (and snapshot, when taken) is retained 14 days on this row (D21, R11). */
+        /**
+         * `flipping→committed`, in the placement flip's transaction: the AWS volume is retained 14 days on this row (D21, R11);
+         * the D21 snapshot is recorded after (`recordSnapshot`). An operator may also finish a stuck flip from
+         * `failed_needs_operator`, only when `commit_sent_at` is set.
+         */
         async finish(expected: ComputeReverseMove, retained: { awsVolumeId: string; awsFsUuid: string | null; awsSnapshotId: string | null }): Promise<ComputeReverseMove> {
-            if (!legal(expected.state, 'committed')) refuse('illegal_transition');
+            if (!legal(expected.state, 'committed') || expected.commitSentAt === null) refuse('illegal_transition');
             if (!VOLUME.test(retained.awsVolumeId) || (retained.awsFsUuid !== null && !UUID.test(retained.awsFsUuid))
                 || (retained.awsSnapshotId !== null && !SNAPSHOT.test(retained.awsSnapshotId))) refuse('invalid_input');
             return cas(expected, 'committed', sql`aws_volume_id = ${retained.awsVolumeId}, aws_fs_uuid = ${retained.awsFsUuid}::uuid,
@@ -343,7 +387,7 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
             if (!SNAPSHOT.test(awsSnapshotId)) refuse('invalid_input');
             return cas(expected, 'committed', sql`aws_snapshot_id = ${awsSnapshotId}`);
         },
-        /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` (the caller re-reads). */
+        /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` only (the caller re-reads), never `state_entered_at`. */
         async claimStale(limit: number): Promise<ComputeReverseMove[]> {
             const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
             return rows(await db.execute(sql`WITH stale AS (
@@ -352,7 +396,8 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
                   AND updated_at < clock_timestamp() - interval '30 seconds'
                 ORDER BY updated_at, id LIMIT ${count} FOR UPDATE SKIP LOCKED
             ) UPDATE public.ezil_compute_reverse_moves m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
-              FROM stale WHERE m.id = stale.id RETURNING m.*, m.created_at::text AS created_at, m.updated_at::text AS updated_at`)).map(parse);
+              FROM stale WHERE m.id = stale.id RETURNING m.*, m.state_entered_at::text AS state_entered_at,
+                m.commit_sent_at::text AS commit_sent_at, m.created_at::text AS created_at, m.updated_at::text AS updated_at`)).map(parse);
         },
     };
 }

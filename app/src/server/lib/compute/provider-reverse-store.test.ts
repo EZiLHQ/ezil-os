@@ -17,12 +17,16 @@ const head = (sizes: number[]): ReverseExportHead => ({ generation: G, sha256: '
     bytes: sizes.reduce((a, b) => a + b, 0), chunks: sizes.map((size, i) => ({ i, size, sha256: 'b'.repeat(64) })) });
 
 describe('reverse move states', () => {
-    it('only committed and failed_reopened release the computer; every in-flight state can fail both ways', () => {
+    it('only committed and failed_reopened release the computer; before the point of no return every state can fail both ways', () => {
         expect(REVERSE_MOVE_STATES.filter(s => !REVERSE_MOVE_HOLDING.includes(s))).toEqual(['committed', 'failed_reopened']);
-        for (const s of REVERSE_MOVE_IN_FLIGHT) expect(REVERSE_MOVE_TRANSITIONS[s]).toEqual(expect.arrayContaining(['failed_reopened', 'failed_needs_operator']));
+        for (const s of REVERSE_MOVE_IN_FLIGHT.filter(state => state !== 'flipping')) {
+            expect(REVERSE_MOVE_TRANSITIONS[s]).toEqual(expect.arrayContaining(['failed_reopened', 'failed_needs_operator']));
+        }
+        // flipping = the Worker commit may have been sent: it never reopens the AWS computer.
+        expect(REVERSE_MOVE_TRANSITIONS.flipping).toEqual(['committed', 'failed_needs_operator']);
         expect(REVERSE_MOVE_TRANSITIONS.committed).toEqual([]);
         expect(REVERSE_MOVE_TRANSITIONS.failed_reopened).toEqual([]);
-        expect(REVERSE_MOVE_TRANSITIONS.failed_needs_operator).toEqual(['failed_reopened']);
+        expect(REVERSE_MOVE_TRANSITIONS.failed_needs_operator).toEqual(['failed_reopened', 'committed']);
         // The happy path is a straight line.
         const path = ['requested'];
         for (let s = 'requested'; s !== 'committed';) path.push(s = REVERSE_MOVE_TRANSITIONS[s as 'requested'][0]!);
