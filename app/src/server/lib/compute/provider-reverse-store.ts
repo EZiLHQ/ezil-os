@@ -511,13 +511,18 @@ export function createProviderReverseStore(db: PlacementExecutor) {
                 WHERE state = 'committed' AND retain_until < clock_timestamp()
                 ORDER BY retain_until, id LIMIT ${clamp(limit, REVERSE_RETENTION_LIST_MAX)}`)).map(parse);
         },
-        /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` only (the caller re-reads), never `state_entered_at`. */
+        /**
+         * In-flight rows untouched for 30 s (DB clock); claiming bumps `updated_at` only (the caller re-reads), never
+         * `state_entered_at`. 🔴 Rows past `requested` (`booting` … `flipping`) come first, then `updated_at, id` (contract §5.4,
+         * r5): at most `REVERSE_MOVE_MAX_ACTIVE` rows hold a host, so every claimable one is driven by the pass, and
+         * `requested` rows share the rest. Ordering by `updated_at` alone let old `requested` rows starve a copy.
+         */
         async claimStale(limit: number): Promise<ComputeReverseMove[]> {
             return rows(await db.execute(sql`WITH stale AS (
                 SELECT id FROM public.ezil_compute_reverse_moves
                 WHERE state IN ('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping')
                   AND updated_at < clock_timestamp() - interval '30 seconds'
-                ORDER BY updated_at, id LIMIT ${clamp(limit, 10)} FOR UPDATE SKIP LOCKED
+                ORDER BY (state = 'requested'), updated_at, id LIMIT ${clamp(limit, 10)} FOR UPDATE SKIP LOCKED
             ) UPDATE public.ezil_compute_reverse_moves m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
               FROM stale WHERE m.id = stale.id RETURNING ${columnsOf('m')}`)).map(parse);
         },
