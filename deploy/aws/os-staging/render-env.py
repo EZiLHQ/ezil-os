@@ -30,6 +30,7 @@ STAGING_MARKERS = ("13-203-99-168.sslip.io", "10.61.20.35", "os-staging.ezil.wor
 STAGING_HOST = re.compile(r"[a-z0-9.-]*(?:staging|preview)[a-z0-9.-]*\.(?:ezil\.work|ezil\.org)|[a-z0-9.-]+\.sslip\.io",
                           re.IGNORECASE)
 PRODUCTION_FUNDING_URL = "https://ai.ezil.work"
+STAGING_FUNDING_URL = "https://ai-staging.ezil.work"
 LIVE_STRIPE = ("pk_live_", "sk_live_", "rk_live_")
 REQUIRED = frozenset("""
 NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY
@@ -81,6 +82,8 @@ def validate(values, environment="staging"):
         raise RenderError("Staging refuses production API or database values")
     elif any(value.startswith(LIVE_STRIPE) for value in values.values()):
         raise RenderError("Staging refuses Stripe live-mode keys")
+    elif "BILLING_FUNDING_URL" in values and values["BILLING_FUNDING_URL"] != STAGING_FUNDING_URL:
+        raise RenderError("Staging BILLING_FUNDING_URL must be https://ai-staging.ezil.work")
     return values
 
 

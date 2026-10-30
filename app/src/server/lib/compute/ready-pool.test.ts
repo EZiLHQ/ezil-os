@@ -50,6 +50,26 @@ describe('P1/P2 pool planning', () => {
     ] as [string, Partial<PoolDemand>, number][])('demand-driven: %s', (_, patch, target) => {
         expect(planPool(c, demand(patch), NOW).target).toBe(target);
     });
+    describe('production namespace prd keeps exactly one warm m6i.large spare', () => {
+        const deployment = { namespace: 'prd' } as NonNullable<PoolClass['deployment']>;
+        const prd = (instanceType: PoolClass['instanceType']): PoolClass => ({ ...c, instanceType, deployment });
+        it.each([
+            ['no paid users yet', { activeStandard: 0 }],
+            ['heavy demand never adds a second spare', { opens15m: 1000, activeStandard: 30, activePremium: 10 }],
+            ['waiting opens never add a second spare', { activeStandard: 3, pending: 4 }],
+        ] as [string, Partial<PoolDemand>][])('m6i.large: %s', (_, patch) => {
+            expect(planPool(prd('m6i.large'), demand(patch), NOW).target).toBe(1);
+        });
+        it.each(['m6i.xlarge', 'm6i.2xlarge'] as const)('%s stays cold even when selected and switching', type => {
+            expect(planPool(prd(type), demand({ opens15m: 100, activeStandard: 5, activePremium: 5, pending: 2 }), NOW).target).toBe(0);
+        });
+        it('mum and classes without a deployment keep the mum policy', () => {
+            const mum = { ...c, instanceType: 'm6i.xlarge' as const, deployment: { namespace: 'mum' } as NonNullable<PoolClass['deployment']> };
+            expect(planPool(mum, demand({ activeStandard: 1 }), NOW).target).toBe(1);
+            expect(planPool(c, demand({ opens15m: 15, activeStandard: 3, activePremium: 2 }), NOW).target).toBe(4);
+            expect(POOL_POLICY['ap-south-1:m6i.large']).toEqual({ minSpares: 1, maxSpares: 16 });
+        });
+    });
     it('scale-down retires aged excess spares once paid users leave the class, back to the minimum', () => {
         const idleReady = [40, 50, 60].map(n => ({ poolHostId: String(n), readyAt: ago(n) }));
         expect(planPool(c, demand({ activeStandard: 1, spares: 3, idleReady }), NOW)).toMatchObject({ target: 1, retire: ['40', '50'] });

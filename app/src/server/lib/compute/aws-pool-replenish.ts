@@ -7,7 +7,7 @@ import { withAdmission, type AdmissionLock, type PlacementDb, type PlacementExec
 import { closeExpiredDemands, closeOrphanedDemands, lockRegionDemands, updateDemandCleanup } from './capacity-demand';
 import { instanceVcpu } from './aws-config';
 import { poolGuard } from './aws-pool-errors';
-import type { PoolClass, PoolData, PoolHostRow, PoolReadinessDiagnostic } from './ready-pool';
+import { poolPolicy, type PoolClass, type PoolData, type PoolHostRow, type PoolReadinessDiagnostic } from './ready-pool';
 
 /** Durable launch reservations and job storage are implemented in aws-pool-dispatch.ts; prepare commits BEFORE StartExecution and retains unknown jobs
  * for recovery, with the same jobId, digest and input. Provision reservations must
@@ -79,7 +79,7 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
                 .reduce((sum,p)=>sum+p.demand.spares*instanceVcpu(p.c.instanceType),0);
             const remaining=floorCapacity.get(s.c.region) ?? Math.max(0,s.demand.regionVcpuCap-Math.max(0,s.demand.vcpuInUse-reservedSpares));
             const wanted=!s.demand.killSwitch && s.demand.activeStandard+s.demand.activePremium>0
-                && (deps.data.POOL_POLICY[`${s.c.region}:${s.c.instanceType}`]?.minSpares ?? 0)>0;
+                && poolPolicy(s.c, deps.data.POOL_POLICY).minSpares>0;
             s.minimum=wanted && remaining>=instanceVcpu(s.c.instanceType) ? 1 : 0;
             floorCapacity.set(s.c.region,remaining-s.minimum*instanceVcpu(s.c.instanceType));
         }
@@ -89,7 +89,7 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             const raw = await deps.data.readPoolDemand(db, c, now), demand = withDemand(raw);
             const peers=snapshots.filter(s=>s.c.region===c.region);
             const floorMissing=peers.some(s=>!s.demand.killSwitch && s.demand.activeStandard+s.demand.activePremium>0
-                && (deps.data.POOL_POLICY[`${s.c.region}:${s.c.instanceType}`]?.minSpares ?? 0)>0 && s.demand.spares<1);
+                && poolPolicy(s.c, deps.data.POOL_POLICY).minSpares>0 && s.demand.spares<1);
             const protectedVcpu=peers.filter(s=>s!==snapshot).reduce((sum,s)=>sum+Math.max(0,s.minimum-s.demand.spares)*instanceVcpu(s.c.instanceType),0);
             const capacity=Math.max(0,Math.min(demand.regionVcpuCap-protectedVcpu,
                 floorMissing ? demand.vcpuInUse+(snapshot.minimum-demand.spares)*instanceVcpu(c.instanceType) : demand.regionVcpuCap));
@@ -98,7 +98,7 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             // while surplus is still retiring. That is not permission to remove an
             // eligible shape's last usable ready host; launch capacity stays unchanged.
             if (snapshot.minimum > 0 && !demand.killSwitch && demand.activeStandard+demand.activePremium>0
-                && (deps.data.POOL_POLICY[`${c.region}:${c.instanceType}`]?.minSpares ?? 0)>0) {
+                && poolPolicy(c, deps.data.POOL_POLICY).minSpares>0) {
                 let removableReady=Math.max(0,(demand.ready ?? Math.max(0,demand.spares-demand.booting.length))-1);
                 plan.retire=plan.retire.filter(id=>{
                     const host=demand.idleReady.find(h=>h.poolHostId===id);

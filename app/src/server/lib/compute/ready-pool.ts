@@ -35,6 +35,19 @@ export const POOL_POLICY: Record<string, { minSpares: number; maxSpares: number 
     'ap-south-1:m6i.xlarge': { minSpares: 1, maxSpares: 8 },
     'ap-south-1:m6i.2xlarge': { minSpares: 1, maxSpares: 4 },
 };
+/** Production namespace prd (founder 2026-10-30, "one warm spare"): exactly one ready m6i.large
+ * spare, larger classes always cold. The mum policy above is unchanged. */
+export const PRD_POOL_POLICY: Record<string, { minSpares: number; maxSpares: number }> = {
+    'ap-south-1:m6i.large': { minSpares: 1, maxSpares: 1 },
+    'ap-south-1:m6i.xlarge': { minSpares: 0, maxSpares: 0 },
+    'ap-south-1:m6i.2xlarge': { minSpares: 0, maxSpares: 0 },
+};
+/** The policy follows the class's namespace; a class without a deployment keeps the mum policy. */
+export function poolPolicy(c: Pick<PoolClass, 'region' | 'instanceType' | 'deployment'>,
+    base: Record<string, { minSpares: number; maxSpares: number }> = POOL_POLICY): { minSpares: number; maxSpares: number } {
+    const table = c.deployment?.namespace === 'prd' ? PRD_POOL_POLICY : base;
+    return table[`${c.region}:${c.instanceType}`] ?? { minSpares: 0, maxSpares: 0 };
+}
 const MINUTE = 60_000;
 function rowsOf(result: unknown): Record<string, unknown>[] {
     const rows = Array.isArray(result) ? result : (result as { rows?: unknown } | null)?.rows;
@@ -185,7 +198,7 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     for (const n of [d.opens15m, d.activeStandard, d.activePremium, d.spares, d.vcpuInUse, d.regionVcpuCap]) count(n);
     const boot = d.bootMinutes ?? 4;
     if (!Number.isFinite(boot) || boot <= 0) throw new Error('pool_boot_minutes_invalid');
-    const policy = POOL_POLICY[`${c.region}:${c.instanceType}`] ?? { minSpares: 0, maxSpares: 0 };
+    const policy = poolPolicy(c);
     const recent = Math.ceil(d.opens15m * boot / 15);
     const base = Math.ceil(0.04 * d.activeStandard + 0.10 * d.activePremium);
     const pending = count(d.pending ?? 0);
