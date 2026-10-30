@@ -267,6 +267,18 @@ await check('Billing: "Your computer" row shows the configuration, the REAL disk
     const free = fragment(summaryV3Html(billingState('free')));
     assert.doesNotMatch(clean(free.querySelector('[data-role="meter-storage"]')), /\d+ GB/);
 });
+await check('Hotfix r5: the Premium card never promises 100 GB to a Standard computer that keeps its 50 GB disk', () => {
+    const el = fragment(summaryV3Html(billingState('standard')));
+    const premium = clean(el.querySelector('[data-role="plan-offer"][data-sku="premium_monthly_v3"]'));
+    assert.match(premium, /100 GB disk for new computers/);
+    assert.doesNotMatch(premium, /100 GB disk(?! for new computers)/);
+    // The footnote stays: the disk this computer keeps.
+    assert.match(clean(el.querySelector('[data-role="plans"]')), /Your computer keeps its 50 GB disk when you change plan\./);
+    // A disk that grows on switch is not an over-promise; no computer disk yet (Free) is a new computer.
+    const grows = billingState('standard'); grows.computer.disk.growsOnSwitch = true;
+    assert.doesNotMatch(clean(fragment(summaryV3Html(grows)).querySelector('[data-role="plan-offer"][data-sku="premium_monthly_v3"]')), /for new computers/);
+    assert.doesNotMatch(clean(fragment(summaryV3Html(billingState('free'))).querySelector('[data-role="plan-offer"][data-sku="premium_monthly_v3"]')), /for new computers/);
+});
 await check('Billing: single column capped at 760 px', () => {
     assert.match(read('settings.css').replace(/\/\*[\s\S]*?\*\//g, ''), /\.ezil-settings-billing\s*\{[^}]*max-width:\s*760px/);
 });

@@ -191,6 +191,8 @@ export async function openPreviewWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
+    let mint_ctl = null;
     /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
     let last_failure = null;
     /** Stable per window, so `session.userRetry` reopens THIS window exactly once. */
@@ -297,7 +299,9 @@ export async function openPreviewWindow (ctx = {}) {
             const savedPort = Number(localStorage.getItem(`ezil:preview-port:${computer.id}`));
             if (Number.isInteger(savedPort) && savedPort >= 1024 && savedPort <= 65535) selectedPort = savedPort;
         }
-        const res = await (nativeSurface ? nativeSurface.open(selectedPort) : session.previewUrl(computer.id));
+        mint_ctl?.abort();
+        mint_ctl = new AbortController();
+        const res = await (nativeSurface ? nativeSurface.open(selectedPort) : session.previewUrl(computer.id, { signal: mint_ctl.signal }));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -495,6 +499,8 @@ export async function openPreviewWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
+        mint_ctl?.abort();
         nativeSurface?.dispose();
         stop_timers();
         window.removeEventListener('ezil:teardown', dispose);

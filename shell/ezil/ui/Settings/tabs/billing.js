@@ -270,7 +270,12 @@ export function timeV3Html ({ computer, fairUse }, usage = null) {
     const percent = lines && safeCount(period.remainingStandardSeconds) && safeCount(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0
         ? percentOf(period.remainingStandardSeconds, period.allowanceStandardSeconds) : null;
     const tone = fairUse.status === 'paused' ? 'danger' : fairUse.status === 'near' ? 'warn' : 'ok';
-    const fair = { ok: 'Within fair use', near: '! Running low. A smaller configuration makes your time last longer.', paused: `■ Used up. You can start your computer again on ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status] ?? '';
+    // Hotfix r5 (ACCEPT #3): advise a smaller configuration only when the plan allows one that counts less time.
+    const currentSize = period?.currentSize ?? computer.size;
+    // A size the plan no longer offers (a downgrade, until the next start) still has its own weight.
+    const currentWeight = (computer.machineChoice.find(machine => machine.size === currentSize) ?? SIZE_INFO[currentSize])?.weight;
+    const smaller = Number.isFinite(currentWeight) && computer.machineChoice.some(machine => machine.weight < currentWeight);
+    const fair = { ok: 'Within fair use', near: smaller ? '! Running low. A smaller configuration makes your time last longer.' : '! Running low.', paused:`■ Used up. You can start your computer again on ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status] ?? '';
     const weighted = computer.machineChoice.filter(machine => machine.weight > 1);
     const why = weighted.length ? `Bigger configurations use your monthly time sooner: ${weighted.map(machine => `${machine.vcpu} vCPU counts ${machine.weight === 2 ? 'double' : machine.weight === 4 ? 'four times' : `${machine.weight} times`}`).join(', ')}.` : '';
     return meterRowV3({ role: 'meter-time', label: 'Computer time', value, percent, tone, notes: [
@@ -470,8 +475,10 @@ function offerCardV3 (summary, offer) {
     }).join('');
     // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
     const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
+    // Hotfix r5 (ACCEPT #4): nor does another card promise a bigger disk to a computer that keeps its own.
+    const keepsOwn = ! current && realDisk !== null && computer.disk?.growsOnSwitch !== true && offer.storageGiB > realDisk;
     const storage = Number.isSafeInteger(offer.storageGiB) && offer.storageGiB > 0
-        ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : ''}` : 'Files saved between sessions';
+        ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : keepsOwn ? ' for new computers' : ''}` : 'Files saved between sessions';
     const credits = offer.aiCredits?.amount ? `${whole(offer.aiCredits.amount)} AI credits ${offer.aiCredits.per === 'once' ? 'to start' : 'every month'}` : '';
     let cta = '';
     if ( current ) cta = '<span class="ezil-billing-current" data-role="current-plan">Current plan</span>';

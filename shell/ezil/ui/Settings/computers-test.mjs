@@ -523,6 +523,35 @@ if ( haveBundle ) {
         assert.equal(window.sessionStorage.getItem('ezil-os:switch.c-1.cmp-4'), null);
     });
 
+    // Hotfix r5 (ACCEPT #5): "Now running on …" is about a running computer; it clears once it is
+    // stopping or stopped, while the server still reports the same done transition.
+    const doneT = progress.transition;
+    for ( const [label, next, chip] of [['Stopping…', { ...running('m6i.xlarge', { transition: doneT }), operation: 'stopping' }, null],
+        ['Stopped', running('m6i.xlarge', { transition: doneT, lifecycleState: 'STOPPED' }), 'Stopped']] ) {
+        progress = next;
+        click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+        await settle(3);
+        click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+        await settle();
+        check(`🔴 bundle: the "Now running on" banner clears once the computer is ${label}`, () => {
+            if ( chip ) assert.equal(pane().querySelector('[data-role="computer-chip"]')?.textContent.trim(), chip);
+            assert.equal(pane().querySelector('[data-role="switch-done"]'), null);
+            assert.doesNotMatch(pane().textContent, /Now running on/);
+        });
+    }
+    // Review (hotfix r5): cleared means dismissed — a later Start, with the server still reporting the
+    // same done transition, must not bring "Now running on …" back.
+    progress = running('m6i.xlarge', { transition: doneT });
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+    await settle(3);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+    await settle();
+    check('🔴 bundle: after Stop then Start, the same done transition does not bring "Now running on" back', () => {
+        assert.equal(pane().querySelector('[data-role="computer-chip"]')?.textContent.trim(), 'Running');
+        assert.equal(pane().querySelector('[data-role="switch-done"]'), null);
+        assert.doesNotMatch(pane().textContent, /Now running on/);
+    });
+
     // HF3: the placement is not on the pre-switch size (2 vCPU after cmp-4 → cmp-8), so "Back to" is offered.
     progress = running('m6i.large', { transition: { transitionId: 't-2', kind: 'switch', current: 'cmp-4', target: 'cmp-8', phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true } });
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
