@@ -5,7 +5,7 @@ import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { handleBillingSessionSweep, HELD_BUDGET_MS, HELD_PAGE_SIZE, HELD_PAGES, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, HELD_BUDGET_MS, HELD_PAGE_SIZE, HELD_PAGES, HELD_SWEEP_BUDGET_MS, RUNNING_GRACE_MS } from './handler';
 import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
@@ -515,9 +515,9 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
     const lines = (event: string) => [...vi.mocked(console.info).mock.calls, ...vi.mocked(console.warn).mock.calls]
         .map(call => String(call[0])).filter(line => line.startsWith(`{"event":"${event}"`)).map(line => JSON.parse(line));
 
-    it('the grace is two minutes (route.test pins the same), and a pass reads 10 pages of 100 within 10 s', () => {
+    it('the grace is two minutes (route.test pins the same), and a pass reads 10 pages of 100 within 10 s, by 30 s of the sweep', () => {
         expect(RUNNING_GRACE_MS).toBe(120_000);
-        expect([HELD_PAGE_SIZE, HELD_PAGES, HELD_BUDGET_MS]).toEqual([100, 10, 10_000]);
+        expect([HELD_PAGE_SIZE, HELD_PAGES, HELD_BUDGET_MS, HELD_SWEEP_BUDGET_MS]).toEqual([100, 10, 10_000, 30_000]);
     });
 
     it('stops a held RUNNING host whose later open never opened a session, once the grace has passed', async () => {
@@ -639,6 +639,13 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
         await f.run(60);
         // Each clock read is 4 s later: the pass starts at s, reads at s + 4 and s + 8, and stops at s + 12 (≥ 10 s).
         expect(f.runningAwsPlacements).toHaveBeenCalledTimes(2);
+        // A held pass that starts late in the sweep ends by 30 s from the sweep's start, not 10 s after its own: the
+        // sweep starts at 1 ms, the pass at 27 s, reads at 28, 29 and 30 s, and stops at 31 s (its own 10 s: 37 s).
+        let late = 0;
+        clock.mockImplementation(() => (late += late === 0 ? 1 : late < 27_000 ? 26_999 : 1_000));
+        f.runningAwsPlacements.mockClear();
+        await f.run(120);
+        expect(f.runningAwsPlacements).toHaveBeenCalledTimes(3);
         expect(console.warn).toHaveBeenCalledWith('[billing.sweep] held pass out of time', expect.objectContaining({ page: expect.any(Number) }));
     });
 

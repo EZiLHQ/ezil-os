@@ -19,8 +19,12 @@ export const RUNNING_GRACE_MS = 2 * 60 * 1000;
 /** Round 6 R1-01: ledger rows (AWS computers with a closed newest session) one held page reads, and pages per pass. */
 export const HELD_PAGE_SIZE = 100;
 export const HELD_PAGES = 10;
-/** Round 6 R1-01: the held pass's own time, so it never starves the migration, reconcile and AI outbox steps after it. */
+/**
+ * Round 6 R1-01: the held pass's own time, and the latest it may run into the sweep (from its start), so the
+ * migration, reconcile and AI outbox steps after it keep their shared budget (the outbox drain ends at 40 s).
+ */
 export const HELD_BUDGET_MS = 10_000;
+export const HELD_SWEEP_BUDGET_MS = 30_000;
 
 export interface BillingSessionSweepCounts {
     examined: number;
@@ -215,10 +219,10 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     // HELD_BUDGET_MS; a computer that never had an epoch needs a placement-side lister (placement.ts, C-2). Paid hosts
     // are not touched here: no lapsed-lease stop (ROOT-FLEET-LEASE-INCIDENT-118); their policy closes keep the window.
     if (runningAwsPlacements) {
-        const heldStartedAt = Date.now();
+        const heldDeadline = Math.min(Date.now() + HELD_BUDGET_MS, startedAt + HELD_SWEEP_BUDGET_MS);
         let after: string | null = null;
         for (let page = 0; page < HELD_PAGES; page++) {
-            if (Date.now() - heldStartedAt >= HELD_BUDGET_MS) { console.warn('[billing.sweep] held pass out of time', { page }); break; }
+            if (Date.now() >= heldDeadline) { console.warn('[billing.sweep] held pass out of time', { page }); break; }
             let read: Awaited<ReturnType<RunningAwsPlacements>>;
             try { read = await runningAwsPlacements(after, HELD_PAGE_SIZE); } catch { console.warn('[billing.sweep] held scan unavailable'); break; }
             for (const candidate of read.candidates) {
