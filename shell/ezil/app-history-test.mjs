@@ -126,6 +126,9 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     controller.commit('code', { historyMode: 'replace' });
     same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 5]);
     same([controller.begin('unknown'), w.history.length], [null, 5], 'an app the registry does not list is ignored');
+    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'settings', view: 'window' } }));
+    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'huge' } }));
+    same(w.history.state.ezilView, undefined, "another app's view, or an unknown one, is not recorded on Code's entry");
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'window' } }));
     same([w.history.state.ezilView, controller.recordedView('code'), controller.recordedView('settings')], ['window', 'window', undefined]);
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'full' } }));
