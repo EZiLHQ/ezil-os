@@ -102,13 +102,16 @@ export function canonicalUrl (location, link, { search } = {}) {
 }
 
 /**
- * The launch context a ROUTE contributes (contract item 3). Code opened from
- * its route is full-screen, unless this history entry recorded the user's
- * own choice, or Code is already open (Back must not resize a window).
+ * The launch context a ROUTE contributes (contract item 3). An app that is
+ * already open gets NO view: Back/Forward focuses it and must not resize it
+ * (contract item 5), and an entry's recorded view can be older than the
+ * user's latest choice, which lives on whichever entry was current then.
+ * Otherwise the view this entry recorded, else full-screen for Code.
  */
 export function routeLaunchContext (link, { hasWindow = false, recordedView } = {}) {
-    const view = VIEWS.has(recordedView) ? recordedView
-        : link.id === 'code' && ! hasWindow ? 'full' : undefined;
+    const view = hasWindow ? undefined
+        : VIEWS.has(recordedView) ? recordedView
+            : link.id === 'code' ? 'full' : undefined;
     return {
         ...(link.initialTab ? { initialTab: link.initialTab } : {}),
         ...(link.project ? { project: link.project } : {}),

@@ -102,11 +102,15 @@ The router calls `registry.launch(id, { ...registry.launchContext(ctx), initialT
 
 - **`view`** is passed only for Code launched from a route (the boot's link,
   including a canonicalised `/os?app=code`, and Back/Forward):
-  1. the view this history entry recorded (`history.state.ezilView`, when
+  1. nothing if a Code window is already open: Back/Forward only focuses it
+     and never resizes it. Its relaunch hook (`_ezil_relaunch`) still runs,
+     with no `view`. An entry's recorded view can be older than the user's
+     latest choice, which was recorded on whichever entry was current then;
+     else
+  2. the view this history entry recorded (`history.state.ezilView`, when
      `history.state.ezilApp === 'code'`), else
-  2. `'full'` if no Code window exists yet, else
-  3. nothing (Back/Forward to an already-open Code does not resize it).
-  Rule 1 also applies to a reload, since `history.state` survives one: a
+  3. `'full'`.
+  Rule 2 also applies to a reload, since `history.state` survives one: a
   Code entry the user switched to windowed reloads windowed. This is this
   lane's reading of contract item 3 + 5.
 - Dock, Start menu, App Store and Settings-drawer launches pass no `view`,
@@ -137,7 +141,7 @@ nothing sets.)
 | Focus moves to another app's window | **replace** with that app's URL |
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
-| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'`. Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) does nothing. |
+| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) does nothing. |
 | Boot with a link | **replace** (canonicalise) before launching |
 
 Why the push happens first: in Chromium a frame navigation is filed under

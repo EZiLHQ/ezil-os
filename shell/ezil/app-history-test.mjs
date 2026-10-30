@@ -51,7 +51,8 @@ same(canonicalUrl(loc('?app%3D=1&%61pp=code'), { id: 'code' }), '/app/code?app%3
 // The launch context a route gives an app (contract item 3).
 same(routeLaunchContext({ id: 'code' }), { view: 'full' });
 same(routeLaunchContext({ id: 'code' }, { hasWindow: true }), {}, 'Back to an open Code does not resize it');
-same(routeLaunchContext({ id: 'code' }, { hasWindow: true, recordedView: 'full' }), { view: 'full' });
+same(routeLaunchContext({ id: 'code' }, { hasWindow: true, recordedView: 'full' }), {}, "... not even with the entry's recorded view");
+same(routeLaunchContext({ id: 'code', project: { projectId: P, repoId: R } }, { hasWindow: true, recordedView: 'window' }), { project: { projectId: P, repoId: R } }, 'an open Code still gets the entry\'s project');
 same(routeLaunchContext({ id: 'code' }, { recordedView: 'window' }), { view: 'window' }, "the entry's own choice wins");
 same(routeLaunchContext({ id: 'code' }, { recordedView: 'huge' }), { view: 'full' });
 same(routeLaunchContext({ id: 'code', project: { projectId: P, repoId: R } }), { project: { projectId: P, repoId: R }, view: 'full' });
@@ -191,6 +192,24 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
         ['settings', { computer: { id: C }, initialTab: 'billing', historyMode: 'replace' }],
     ], 'an unusable entry launches nothing');
     same(w.history.length, 4);
+}
+for (const codeOpen of [true, false]) {
+    // A stale recorded view: E1 recorded full; the user later chose windowed
+    // on E2 (relabelled Code by a focus). Back to E1 must not resize an open
+    // Code back to full; a closed one reopens with E1's own view.
+    const { w, controller, launches, open, focus, url } = harness('/os');
+    const code = open('code', 1);
+    controller.begin('code').end(code);
+    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'full' } }));
+    controller.begin('settings').end(open('settings', 2));
+    focus(code);
+    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'window' } }));
+    same([url(), w.history.length, w.history.state.ezilView], ['/app/code', 3, 'window'], 'E2 names Code, windowed');
+    if ( ! codeOpen ) code.remove();
+    w.history.back(); await new Promise(resolve => setTimeout(resolve, 30));
+    same([url(), w.history.state.ezilView], ['/app/code', 'full'], 'Back lands on E1, which recorded full');
+    same(launches, [['code', { computer: { id: C }, ...(codeOpen ? {} : { view: 'full' }), historyMode: 'replace' }]],
+        codeOpen ? 'Back to an open Code passes no view' : "positive control: a closed Code reopens with E1's view");
 }
 {
     // Adopt: the boot's link is canonicalised in place, once, without pushing.

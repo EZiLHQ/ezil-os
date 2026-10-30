@@ -230,7 +230,7 @@ for (const [entry, canonical] of [
     w.history.forward(); await wait(200);
     same(url(), `/app/code?computer=${COMPUTER}`);
     ok(win('code').classList.contains('window-active'), 'Forward re-focuses Code');
-    same(views, ['window'], 'with the view its entry recorded');
+    same(views, [undefined], 'through its relaunch hook, with no view: traversal never resizes an open window');
     same([w.document.querySelectorAll('.window').length, w.history.length], [2, 3], 'traversal opens, closes and pushes nothing');
     await w.$(win('code')).close(); await wait(50);
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'closing replaces with the next focused app');
