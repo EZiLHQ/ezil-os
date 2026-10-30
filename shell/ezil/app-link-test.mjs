@@ -258,6 +258,9 @@ for (const [entry, canonical] of [
 // is, a gated `open` waits for the test to release it, and the two delayed
 // focuses (UIWindow's 80ms `showWindow`, registry's 120ms `ensureOnTop`) are
 // queued and run by hand. Every other timer is the real one.
+// One turn of the event loop, no delay: every microtask queued before it
+// has run.
+const turn = () => new Promise(resolve => setImmediate(resolve));
 const appeared = (w, selector) => new Promise(resolve => {
     if (w.document.querySelector(selector)) { resolve(); return; }
     const observer = new w.MutationObserver(() => { if (w.document.querySelector(selector)) { observer.disconnect(); resolve(); } });
@@ -284,20 +287,11 @@ async function ordered() {
         app.open = async launchCtx => { app.open = open; await held; return open(launchCtx); };
         return release;
     };
-    // Resolves on this module's `count`-th history write from now (a route's
-    // `commit` is the last one a Back launch makes).
-    const written = (count = 1) => new Promise(resolve => {
-        const replace = w.history.replaceState;
-        w.history.replaceState = (...args) => {
-            replace.apply(w.history, args);
-            if ( (count -= 1) === 0 ) { delete w.history.replaceState; resolve(); }
-        };
-    });
     const launch = id => w.ezil.registry.launch(id, ctx);
     const settle = () => { elapse(80); elapse(120); };
     // The focused window (z-order in this shell is decided by focus).
     const front = () => [...w.document.querySelectorAll('.window.window-active')].map(el => el.dataset.app).join();
-    return { ...booted, elapse, gate, written, launch, settle, front };
+    return { ...booted, elapse, gate, launch, settle, front };
 }
 {
     // The coordinator's repro, through the registry: Code's open is slow,
@@ -346,15 +340,15 @@ async function ordered() {
 {
     // Back to an open Code restores it (its 80ms focus pending); a click on
     // Settings lands before that focus.
-    const { w, url, written, launch, settle, elapse, front } = await ordered();
+    const { w, url, launch, settle, elapse, front } = await ordered();
     await launch('code'); settle();
     await launch('settings'); settle();
-    // Two writes: the entry takes the view the open Code shows (Code's own
-    // entry was pushed before its window existed, with none), then the
-    // launch commits.
-    const committed = written(2);
+    // The popstate, then one turn: the launch has committed (the 80/120ms
+    // focuses wait). Before it, the entry took the view the open Code shows
+    // (Code's own entry was pushed before its window existed, with none).
+    const popped = new Promise(resolve => w.addEventListener('popstate', resolve, { once: true }));
     w.history.back();
-    await committed;
+    await popped; await turn();
     same([url(), w.history.length, w.history.state.ezilView], [`/app/code?computer=${COMPUTER}`, 3, 'window'], 'Back to Code commits in place');
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3]);
@@ -415,7 +409,6 @@ for (const [entry, id, click, canonical] of [
 // coalesced click's end, the boot's adopt). `focuses` runs the queued
 // 80/120ms focuses by hand. `opens`: what each `open` of Settings received,
 // and the address bar at that moment.
-const turn = () => new Promise(resolve => setImmediate(resolve));
 async function settingsHeld(entry, { features } = {}) {
     let release, started, opened;
     const opening = new Promise(resolve => { started = resolve; });
