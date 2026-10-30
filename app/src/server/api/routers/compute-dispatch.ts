@@ -163,6 +163,32 @@ function awsMigrationAnswer(result: ComputeStatus) {
         ? { computeMigrating: true as const } : {};
 }
 
+/** Hotfix r5: how long a just-STOPPED AWS computer is not auto-started by a hosted-app poll. */
+export const STOP_COOLDOWN_MS = 60_000;
+
+/**
+ * Hotfix r5 (ACCEPT-11865d06 B6), defence in depth: a hosted-app route (`codePreviewUrl`,
+ * `appPreviewUrl`) asked while the AWS placement settled STOPPED less than `STOP_COOLDOWN_MS` ago
+ * answers this refusal VALUE instead of running `ensure()`, which would start (replace) the computer
+ * the owner just stopped — an app window's leftover poll (another tab, an older client) re-provisioned
+ * one 0.23 s after its stop. The key is the placement's own `updated_at` with state STOPPED (no stop
+ * reason is recorded, so any settled stop holds). Not `sandbox_starting`: the client's wake loop re-asks
+ * that for 215 s and would start it once the hold ended. The desktop open is never held, so Settings →
+ * Open desktop still starts it. Any read failure answers null: the existing path runs unchanged.
+ */
+export async function stopCooldownAnswer(db: PlacementExecutor, computer: ComputerRef, now: number = Date.now()) {
+    try {
+        const { record } = await readPlacement(db, computer.computerId, computer.userId);
+        if (record?.provider !== 'aws-ec2' || record.state !== 'STOPPED') return null;
+        const age = now - record.updatedAt.getTime();
+        if (!(age > -STOP_COOLDOWN_MS && age < STOP_COOLDOWN_MS)) return null;
+    } catch {
+        return null;
+    }
+    return { ok: false as const, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: true,
+        provider: 'cloudflare-guacamole' as const, computeProvider: 'aws-ec2' as const };
+}
+
 /**
  * The preview answer for an AWS computer. Not-ready → a VALUE (never a throw:
  * a thrown error is what TanStack retries, and the wake loop already re-asks).
