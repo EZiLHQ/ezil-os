@@ -1,5 +1,6 @@
 // troubleshoot-test.mjs — EZiL-authored. Settings → Troubleshoot, round 3
-// (plan §6.6): two different restarts, each with its own reason copy.
+// (plan §6.6): every restart reason has its own copy, and the tab offers only
+// Restart computer (Restart desktop was removed by app-code lane A2).
 //
 // Run:  node shell/ezil/ui/Settings/troubleshoot-test.mjs
 // Imports the SOURCE tab with its imports stubbed; no bundle, no browser.
@@ -45,18 +46,24 @@ check('D11: the AWS monthly cap has its own copy, distinct from plan time, and n
 check('unknown codes stay honest and never echo the server string', () => {
     assert.equal(reasonCopy('<img src=x>'), 'Something went wrong. Please try again.');
 });
-check('the restart copy passes scanCopy', () => {
+check('the restart copy passes scanCopy; Troubleshoot offers Restart computer and no Restart desktop', () => {
     const all = [...codes, 'unsupported', 'timeout', 'fetch_failed', 'unauthorized', 'bad_request', 'stop_timed_out', 'boot_failed', 'user_hours_cap'].map(reasonCopy).join(' ');
     assert.deepEqual(scanCopy(all), []);
     const tab = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'utf8');
-    // Round 5 (D6): one Restart duration, quoted in the description and while it runs.
-    const restartTime = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
-    assert.ok(tab.includes(`const RESTART_DESKTOP_TIME = '${restartTime}';`));
-    assert.ok(tab.includes('Restarts the desktop and its apps on this machine. Files stay. ${RESTART_DESKTOP_TIME}'));
+    // App-code lane A2 (2026-10-30): "Restart desktop" was removed. Positive
+    // control first: Restart computer's heading, copy and control are present.
+    const computerCopy = 'Stops your computer and starts it again. Files stay. 1–4 minutes.';
+    assert.ok(tab.includes(`<h3>Restart computer</h3><p class="ezil-settings-muted">${computerCopy}</p>`), 'Restart computer heading + copy');
+    assert.match(tab, /<button [^>]*data-action="restart-computer"/, 'Restart computer button');
+    assert.ok(tab.includes(`.on('click', '[data-action="restart-computer"]'`), 'Restart computer click binding');
+    assert.deepEqual(scanCopy(computerCopy), []);
+    // ...and nothing of Restart desktop: no duration constant, copy, heading, control or sheet.
+    assert.doesNotMatch(tab, /RESTART_DESKTOP_TIME/);
+    assert.ok(! tab.includes('Restarts the desktop and its apps'), 'no Restart desktop copy');
+    assert.doesNotMatch(tab, /<h3>Restart desktop<\/h3>/);
+    assert.doesNotMatch(tab, /data-action="restart"/);
+    // The closing quote is what keeps 'confirm-restart-computer' (present) out of this.
+    assert.doesNotMatch(tab, /sheet: ['"]confirm-restart['"]/);
     assert.doesNotMatch(tab, /About 20 seconds/);
-    for ( const copy of [`Restarts the desktop and its apps on this machine. Files stay. ${restartTime}`, 'Stops your computer and starts it again. Files stay. 1–4 minutes.'] ) {
-        assert.ok(tab.includes(copy) || copy.endsWith(restartTime), copy);
-        assert.deepEqual(scanCopy(copy), []);
-    }
 });
 console.log(`\n${passed}/4 Troubleshoot checks passed`);
