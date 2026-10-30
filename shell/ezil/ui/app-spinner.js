@@ -29,7 +29,8 @@ import {
     TYPICAL_BOOT_MS,
 } from '../boot-phases.js';
 
-import { observeComputerProgress, OPENING_COPY, OPENING_MILESTONES, formatElapsed, prefersReducedMotion } from './computer-progress.js';
+import { observeComputerProgress, OPENING_COPY, OPENING_MILESTONES, formatElapsed, prefersReducedMotion, openingAt, moveOutcomeCopy,
+    MOVE_COPY } from './computer-progress.js';
 import { isNative } from '../native-runtime.js';
 
 import { LAUNCH_COPY } from '../launch-copy.js';
@@ -126,10 +127,12 @@ function viewComputerStatus () {
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
  * @param {() => boolean} [opts.isPreparing] Round 6 (seam C): the server said this computer's desktop is taking its
  *   config (or code-server is starting after it). Seen once, the open shows that wait to its end.
+ * @param {() => boolean} [opts.isMoving] Phase B: the server answered this open `computeMoving` (its files are moving
+ *   to the Free computer), before any `computer.progress` read says how far the move is.
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
 export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
-    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false } = {}) {
+    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
@@ -164,8 +167,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
     let failureCode;
     const swallow = e => { e.preventDefault(); e.stopPropagation(); };
-    // Try again releases a ten-minute hold: the next progress paint may start a fresh open.
-    el_retry.addEventListener('click', e => { swallow(e); if (open) open.hold = false; if (typeof onRetry === 'function') onRetry(); });
+    // Try again releases a ten-minute hold: the next progress paint may start a fresh open. Phase B: after a move's
+    // outcome the one action is [Open my AWS computer], an ordinary open: it starts fresh, not as the move's.
+    el_retry.addEventListener('click', e => { swallow(e); if (open) open.hold = false; if (open?.moving) endOpen(); if (typeof onRetry === 'function') onRetry(); });
     el_view.addEventListener('click', e => { swallow(e); (typeof onViewStatus === 'function' ? onViewStatus : viewComputerStatus)(); });
     el_feedback.addEventListener('click', e => {
         swallow(e);
@@ -176,12 +180,20 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
     let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
     /**
+     * Phase B: this computer's reverse move as the last answered poll read it (`moveOf`: null = no move, undefined =
+     * not read). Kept apart from `observation`: a committed move's row is the Cloudflare placement's, which has no view.
+     */
+    let observedMove;
+    /**
      * This open, from the client's first sight of it to ready / failure. `t0` anchors the elapsed
      * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display
      * (`T`: the last OPENING expectation; a connect answer carries none); `connect`: this open is a
      * connect, set by its first opening-or-connect observation and cleared for good by an opening
      * (or a move) seen inside it (round 6, R3-4). `prepare`: round 6 seam C, `{at, from}` (this open's
      * elapsed seconds and its bar) when the server first said the computer is preparing; never cleared.
+     * Phase B: `moving`: this open has itself seen the computer's files moving (the `seenInFlight` rule of
+     * `watchComputerTransition`: a move's outcome is shown only to an open that watched it); `moveView`: the last
+     * in-flight moving view; `moveHigh`: the move bar's high-water.
      */
     let open = null;
     let aria = { at: -Infinity, key: null };
@@ -189,8 +201,9 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     // Rendered as `progress` = this window's open is in flight: a not-yet-recorded opening never reads "stopped".
     // A fresh open after a concluded one gets a fresh observer, so no first-sight clock carries over.
     const makeObserver = () => computerId && !isNative() ? observeComputerProgress({ computerId, element: root, appName: name,
-        openRequested: () => latestState?.kind === 'progress', onChange: value => {
+        openRequested: () => latestState?.kind === 'progress', onChange: (value, move) => {
             observation = value; progressChecked = true;
+            if (move !== undefined) observedMove = move;
             if (latestState) render(latestState, latestExtra);
             onProgressChange?.();
         } }) : null;
@@ -201,7 +214,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     /**
      * Write the DOM. textContent only; nothing is rebuilt.
      * @param {{state: string, title: string, status?: string, meta?: string, bar: null | 'indeterminate' | number,
-     *   retry?: boolean, view?: boolean, feedback?: boolean, details?: string|null}} m
+     *   retry?: boolean, retryLabel?: string, view?: boolean, feedback?: boolean, details?: string|null}} m
+     *   `retryLabel`: the one action's words when it is not Try again (Phase B: [Open my AWS computer]).
      */
     function paint (m) {
         const now = Date.now();
@@ -233,6 +247,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             }
         }
         el_retry.hidden = !m.retry;
+        const retryLabel = m.retryLabel ?? OPEN_COPY.retry;
+        if (el_retry.textContent !== retryLabel) el_retry.textContent = retryLabel;
         el_view.hidden = !m.view;
         // Its words exist only while it is offered: a hidden control adds no copy to the surface.
         el_view.textContent = m.view ? OPEN_COPY.viewStatus : '';
@@ -273,14 +289,84 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     }
 
     /**
+     * 🔴 PHASE B (reverse move contract §6.4): THE OPEN MET A MOVE. Painted before the prepare latch, the holds and
+     * the failure copy, because none of them is true of a move: it has its own steps and its own clock (no opening
+     * budget, no ten-minute stop), and only the server's outcome ends it. The outcome is keyed on `move.outcome` +
+     * `move.openBlocked` only, never on `stage` (a terminal row carries the placement's own stage), and is shown only
+     * to an open that watched the move (`open.moving`) or was answered `computeMoveNeedsAttention` (the caller's
+     * `state.move`). Code and Preview cannot say so (their files are not this lane's), so a failure they render after
+     * a moving answer is recognised by its shape. An ordinary failure during a move (signed out, ...) keeps its copy.
+     * Returns false when this is not a move.
+     */
+    function paintMove (state, details) {
+        const live = observation?.moving === true ? observation : null;
+        const failed = state.kind === 'failed';
+        const blockedAnswer = failed && state.move === 'needs_attention';
+        if (open && (live || state.move || (state.kind === 'progress' && isMoving() === true))) open.moving = true;
+        if (open && live?.stage === 'moving') open.moveView = live;
+        if (!open?.moving && !blockedAnswer) return false;
+        if (failed && !state.move && !['sandbox_starting', 'preconditions_unmet', 'timeout'].includes(state.errorCode) && state.reason !== 'timeout') return false;
+        const move = live?.move ?? observedMove ?? open?.moveView?.move ?? null;
+        const outcome = moveOutcomeCopy(move, { needsAttention: blockedAnswer });
+        // After a commit the open is the Free computer's: a failure of THAT open keeps its own copy.
+        if (outcome?.committed && failed && state.move !== 'moving') return false;
+        root.setAttribute('data-kind', outcome && !outcome.committed ? 'failed' : 'progress');
+        root.classList.remove('ezil-app-spinner-running-long');
+        if (outcome?.committed) {
+            // Full, then the ordinary Cloudflare open: the open's loop asked again the moment it read the commit.
+            paint({ state: 'opening', title: outcome.status, status: outcome.body, bar: 1, details });
+            return true;
+        }
+        if (outcome) {
+            // Never auto-open the AWS computer (under the Free hold that boot uses Free hours): the user chooses it.
+            // The open stays this move's (the caller's paint tick keeps rendering progress until its loop returns);
+            // [Open my AWS computer] ends it, so the hold's open is a fresh one.
+            failureCode = move?.reason ?? (outcome.blocked ? 'computer_move_needs_attention' : 'computer_moving');
+            paint({ state: outcome.blocked || move?.outcome === 'failed_needs_operator' ? 'attention' : 'failed', title: outcome.status,
+                status: outcome.body, bar: null, retry: outcome.openAws, retryLabel: outcome.openAws ? MOVE_COPY.openAws : undefined,
+                feedback: outcome.feedback, details });
+            return true;
+        }
+        const view = live ?? open?.moveView ?? null;
+        const now = Date.now();
+        // Rule 5: past the move's own watch (startedAt + budgetSeconds + 300 s), or once the open's loop handed the
+        // move back, "still working on it" and Send feedback. Never a failure claim, never Try again.
+        const watch = Number.isFinite(view?.move?.startedAtMs) ? view.move.startedAtMs + (view.move.budgetSeconds + 300) * 1000 : null;
+        if (failed || (watch !== null && now >= watch)) {
+            failureCode = 'computer_moving';
+            root.classList.add('ezil-app-spinner-running-long');
+            paint({ state: 'attention', title: MOVE_COPY.moving, status: OPENING_COPY.runningLong, bar: open?.moveHigh > 0 ? open.moveHigh : null,
+                feedback: true, details });
+            return true;
+        }
+        if (!view) {
+            // Answered "moving" before any read says how far: the move's own words, no position yet.
+            const t = elapsedOf();
+            paint({ state: 'opening', title: MOVE_COPY.moving, status: '', meta: t >= META_AFTER_S ? formatElapsed(t) : '', bar: 'indeterminate', details });
+            return true;
+        }
+        // Four equal steps eased by the move's expectation from its start; a copy fills step 2. Never backwards.
+        const at = openingAt(view, now, { reducedMotion: reduced() });
+        if (open.moveKey !== view.openingKey) { open.moveKey = view.openingKey; open.moveHigh = 0; }
+        open.moveHigh = Math.max(open.moveHigh, at.percent / 100);
+        const t = Math.max(0, (now - view.bar.startedAtMs) / 1000);
+        // No countdown and no "usually about": the elapsed time only, then the long note past the expectation.
+        paint({ state: at.long ? 'long' : 'opening', title: MOVE_COPY.moving, status: view.body,
+            meta: at.long ? OPENING_COPY.long : t >= META_AFTER_S ? formatElapsed(t) : '', bar: open.moveHigh, details });
+        return true;
+    }
+
+    /**
      * @param {import('../boot-phases.js').BootUiState} state
      * @param {{elapsedMs?: number, reopening?: boolean}} [extra] `reopening`: the desktop window is
      *   re-asking because the AWS observation said the computer is still opening.
+     *   `state.move` (Phase B, the desktop window): 'moving' (its open handed back a moving answer) or
+     *   'needs_attention' (the open was answered `computeMoveNeedsAttention`).
      */
     function render (state, extra = {}) {
         latestState = state; latestExtra = extra ?? {};
         const pending = state.kind === 'progress' || state.kind === 'failed';
-        if (!pending) { observer?.stop(); observation = null; progressChecked = false; }
+        if (!pending) { observer?.stop(); observation = null; observedMove = undefined; progressChecked = false; }
         // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
         failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
         const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
@@ -301,7 +387,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // The open: started by the first progress paint after a concluded one, never by a re-open.
         if (progressing && !runningLong && (!open || open.ended)) {
             if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; progressChecked = false; }
-            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null };
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null,
+                moving: false, moveView: null, moveHigh: 0, moveKey: null };
             client = 0;
         }
         // Seam C: latched for the rest of this open, so a later answer without the flag (the desktop's container
@@ -318,6 +405,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             // Holds (no bar) neither make nor break a connect; an opening seen inside one makes it an opening to the end.
             if (observation.bar) open.connect = (open.connect ?? true) && observation.connect === true;
         }
+        // Phase B: a move first (§6.4).
+        if (pending && paintMove(state, observation?.updated ? `Last recorded update: ${observation.updated}` : null)) return;
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
 
@@ -433,6 +522,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     }
 
     return { el: root, render, stamp, hasComputerProgress: () => observation !== null, computerProgress: () => observation,
+        // Phase B: the reverse move the last answered poll read (null: none, or not read).
+        computerMove: () => observedMove ?? null,
         dispose: () => observer?.stop() };
 }
 
