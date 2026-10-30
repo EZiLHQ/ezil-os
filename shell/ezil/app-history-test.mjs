@@ -451,6 +451,20 @@ for (const [delta, landing] of [[-2, '/os'], [-1, '/app/settings']]) for (const 
     same(url(), `/app/code?project=${R}&repo=${P}`, "an older failed launch leaves the newer launch's parameters");
 }
 {
+    // ... including ones a newer launch kept without restating them (a
+    // plain click on Code while its project launch is in flight).
+    const { controller, open, focus, url } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    const first = controller.begin('code', { project: { projectId: P, repoId: R } });
+    const second = controller.begin('code');
+    const code = open('code', 10);
+    first.end(null);
+    second.end(code); controller.settled(code);
+    focus(settings); focus(code);
+    same(url(), `/app/code?project=${P}&repo=${R}`, 'an older failed launch leaves the parameters a newer launch kept');
+}
+{
     // ... and still takes back its own when nothing newer set them.
     const { controller, open, url } = harness('/os');
     const older = controller.begin('code', { project: { projectId: P, repoId: R } });
