@@ -524,7 +524,7 @@ class Job:
                     record.update(state=state, error=error, head=head, finishedAt=iso(self.clock()))
                     _write_state(self.cfg, record)
                 return
-            except OSError as e:
+            except (OSError, Refused) as e:   # Refused: the export dir itself refused (ensure_root)
                 self.log(f"export: {state} not recorded (attempt {attempt}): {type(e).__name__}")
                 if attempt == 1:
                     time.sleep(1)

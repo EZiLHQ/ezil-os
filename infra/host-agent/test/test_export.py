@@ -696,6 +696,13 @@ class Jobs(unittest.TestCase):
         with mock.patch.object(export, "ensure_root", side_effect=flaky):
             record = self.run_with(CodecRunner(self))
         self.assertEqual((record["state"], record["error"]), ("failed", "capture_failed"))
+        # An export dir that refuses every time (it resolves onto the data volume): the job
+        # cannot record anything, and still never raises out of its thread.
+        write_record(self.cfg)
+        with mock.patch.object(export, "ensure_root", side_effect=Refused("export_dir_on_data_volume")), \
+                mock.patch.object(export.time, "sleep"):
+            self.job().run()
+        self.assertEqual(export.read_state(self.cfg)["state"], "capturing")
 
     def test_a_failed_final_write_is_retried_once_then_left_to_the_app_deadline(self):
         real = export._write_state
