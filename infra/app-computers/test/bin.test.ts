@@ -122,3 +122,30 @@ test('bin/lifecycle passes the optional exact EC2 caller list from deployment co
             Condition: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'billing-staging' } } });
     } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('bin/lifecycle prd: the production host alone trusts ezil-prd-app-caller at the fixed /ezil/prd/ ARN', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ezil-prd-caller-config-'));
+    try {
+        // The founder's prd shape (PROD-COMPUTERS-PLAN P7) on the example's placeholder account.
+        const text = readFileSync(join(root, 'config/lifecycle.example.json'), 'utf8').replace(/pilot/g, 'prd');
+        const config = JSON.parse(text), host = 'arn:aws:iam::123456789012:role/ezil-os-prod-host-InstanceRole-example';
+        config.settings.authorityOrigin = 'https://os-prod.ezil.work';
+        config.appCaller = { enabled: true, roleName: 'ezil-prd-app-caller', providers: [], ec2CallerRoleArns: [host], ec2CallerEnv: 'production' };
+        const path = join(dir, 'lifecycle.json');
+        writeFileSync(path, JSON.stringify(config));
+        const stacks = synth('bin/lifecycle.ts', { EZIL_LIFECYCLE_CONFIG: path });
+        assert.deepEqual(Object.keys(stacks), ['ezil-prd-lifecycle']);
+        const { template } = stacks['ezil-prd-lifecycle']!;
+        const caller = roles(template).filter(r => r.Properties.RoleName === 'ezil-prd-app-caller');
+        assert.equal(caller.length, 1);
+        // Path + name are what deploy/aws/os-staging/app-host.yaml pins for production:
+        // arn:aws:iam::<account>:role/ezil/prd/ezil-prd-app-caller.
+        assert.equal(caller[0].Properties.Path, '/ezil/prd/');
+        assert.equal(caller[0].Properties.PermissionsBoundary, 'arn:aws:iam::123456789012:policy/ezil/identity/ezil-prd-boundary');
+        assert.deepEqual(caller[0].Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRole',
+            Principal: { AWS: host }, Condition: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'production' } } }]);
+        for (const r of roles(template)) assert.equal(r.Properties.Path, '/ezil/prd/');
+        assert.ok(JSON.stringify(template).includes('https://os-prod.ezil.work'), 'authority origin baked into the lifecycle');
+        assert.ok(!/billing-staging|os-staging|ezil-mum|ezil-pilot/.test(JSON.stringify(template)));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+});

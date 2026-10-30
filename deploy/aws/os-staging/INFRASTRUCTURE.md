@@ -174,10 +174,15 @@ the Gateway: these steps never touch it, its volumes or the SG's other rules.
      --tags Key=ezil:env,Value=production Key=ezil:purpose,Value=os
    ```
    AppCallerRoleArn keeps its default `''`. The template's Rules refuse
-   production with any other VPC, subnet or bucket, or a non-empty
-   AppCallerRoleArn, and refuse staging with any of these prod values. Review, execute, then record `InstanceId` (`OS_PRODUCTION_INSTANCE_ID`),
+   production with any other VPC, subnet or bucket, or an AppCallerRoleArn
+   other than `''` or exactly `arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller`,
+   and refuse staging with any of these prod values (including that caller). Review, execute, then record `InstanceId` (`OS_PRODUCTION_INSTANCE_ID`),
    `PublicIp` and `AppSecurityGroupId`. Do **not** add `InstanceRoleArn` to the
-   staging app-caller trust. Termination protection stays off, as for staging.
+   staging app-caller trust; it belongs only in the `prd` lifecycle's
+   `appCaller.ec2CallerRoleArns` (with `ec2CallerEnv: production`). After the `prd`
+   lifecycle exists, a change set on this stack sets `AppCallerRoleArn` to that ARN
+   with every other parameter `UsePreviousValue`; expect one `InstanceRole` Modify.
+   Termination protection stays off, as for staging.
 2. Create `ezil-os-prod-db-access` from `db-access.yaml` the same way with
    `Environment=production`, `DbSecurityGroupId=sg-0f3151c94e0ed4ee6`,
    `AppSecurityGroupId=<step 1 output>` and the same two stack tags. Its only
