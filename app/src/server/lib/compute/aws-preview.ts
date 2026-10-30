@@ -20,17 +20,41 @@ type UnavailableReason = 'config_missing' | 'zone_invalid' | 'endpoint_invalid' 
     | 'placement_integrity' | 'placement_reserved' | 'placement_read_failed' | 'enrollment_failed'
     | 'sign_failed' | 'parse_failed' | `worker_status_${number}`;
 
-const unavailable = (reason: UnavailableReason) => {
+/** The Worker's explicit transient codes by HTTP status, never an arbitrary 409/5xx (see `workerStarting`). */
+const WORKER_STARTING = {
+    503: ['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'],
+    502: ['aws_origin_unavailable'],
+    409: ['relay_busy', 'relay_runtime_changed', 'relay_negotiation_busy'],
+    504: ['relay_timeout'],
+} as const;
+type WorkerStartingCode = typeof WORKER_STARTING[keyof typeof WORKER_STARTING][number];
+type StartingReason = 'placement_opening' | 'pool_session_pending' | 'enrollment_pending' | 'lifecycle_pending'
+    | 'transport_failed' | 'epoch_moved' | WorkerStartingCode;
+
+/**
+ * Round 6 (R3-2/R3-8): why an answer was not ok — one bounded code (a category below or an allow-listed
+ * Worker code) and the Worker's HTTP status when it answered — for the router's one `aws-preview` log line.
+ * Kept beside the answer object, never on it: the wire answer is unchanged. Nothing logs here (the hold reads
+ * placements up to 33 times per wait, and pool relay preparation has no user surface).
+ */
+export interface AwsPreviewRefusal { reason: string; status: number | null }
+const refusals = new WeakMap<object, AwsPreviewRefusal>();
+const tagged = <T extends object>(answer: T, reason: string, status: number | null): T => { refusals.set(answer, { reason, status }); return answer; };
+/** The reason `requestAwsPreview` refused with; undefined for an ok answer or any other object. */
+export const awsPreviewRefusal = (answer: object): AwsPreviewRefusal | undefined => refusals.get(answer);
+
+const unavailable = (reason: UnavailableReason, status: number | null = null) => {
     // One bounded category per refusal. Never log bodies, URLs, tokens, IDs or exceptions.
     console.warn(`[aws-preview] unavailable reason=${reason}`);
-    return {
+    return tagged({
         ok: false as const,
         error: 'aws_preview_unavailable',
         errorCode: 'aws_preview_unavailable',
-    };
+    }, reason, status);
 };
 
-const starting = () => ({ ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting' });
+const starting = (reason: StartingReason, status: number | null = null) =>
+    tagged({ ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting' }, reason, status);
 
 function placementRefusal(p: Placement | null, preparePool = false) {
     if (!p) return unavailable('placement_missing');
@@ -38,12 +62,13 @@ function placementRefusal(p: Placement | null, preparePool = false) {
     if (p.generation < 1 || p.leaseEpoch < 1) return unavailable('placement_epoch_invalid');
     if (preparePool) return p.lastError === POOL_SESSION_PENDING && p.enrollNonceHash === null && p.enrollConsumedHash !== null
         && p.instanceId !== null && p.volumeId !== null && p.lifecycleJobId !== null && p.lifecycleDigest !== null
-        && ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state) ? null : starting();
+        && ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state) ? null : starting('pool_session_pending');
     if (p.lastError === ENROLLMENT_FAILED) return unavailable('enrollment_failed');
-    if (['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state)) return starting();
+    if (['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state)) return starting('placement_opening');
     if (p.state !== 'RUNNING') return unavailable('placement_not_running');
     // Do not sign an epoch whose enrollment or receipt is still being settled.
-    if (p.enrollNonceHash || p.lastError === ENROLLMENT_PENDING || p.lifecycleJobId || p.lifecycleDigest) return starting();
+    if (p.enrollNonceHash || p.lastError === ENROLLMENT_PENDING) return starting('enrollment_pending');
+    if (p.lifecycleJobId || p.lifecycleDigest) return starting('lifecycle_pending');
     return null;
 }
 
@@ -77,17 +102,16 @@ export async function waitForAwsPreviewPlacement(db: PlacementExecutor, computer
     return false;
 }
 
-function workerStarting(status: number, data: unknown): boolean {
+/** The Worker's transient code (from `WORKER_STARTING` only), or null. */
+function workerStarting(status: number, data: unknown): WorkerStartingCode | null {
     const parsed = z.object({ ok: z.literal(false).optional(), error: z.string() }).safeParse(data);
-    if (!parsed.success) return false;
+    if (!parsed.success) return null;
     const error = parsed.data.error;
     // Pin to the Worker's explicit transient codes, never an arbitrary 409/5xx.
     // aws-origin.ts uses 502 aws_origin_unavailable for an absent or mismatched tunnel.
     // aws-ice.ts uses 503 aws_desktop_unreachable while the host control service boots.
-    return (status === 503 && ['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'].includes(error))
-        || (status === 502 && error === 'aws_origin_unavailable')
-        || (status === 409 && ['relay_busy', 'relay_runtime_changed', 'relay_negotiation_busy'].includes(error))
-        || (status === 504 && error === 'relay_timeout');
+    const codes: readonly WorkerStartingCode[] | undefined = (WORKER_STARTING as Partial<Record<number, readonly WorkerStartingCode[]>>)[status];
+    return codes?.find(code => code === error) ?? null;
 }
 
 /**
@@ -174,11 +198,11 @@ export async function requestAwsPreview(
         }).catch(() => null);
         // A transport loss says nothing about the origin's readiness; let the bounded
         // shell wake loop re-ask. No inline retry with potentially stale signed claims.
-        if (!response) return starting();
+        if (!response) return starting('transport_failed');
         failureReason = 'parse_failed';
         const data: unknown = await response.json();
         const retryable = workerStarting(response.status, data);
-        if (response.status !== 200 && !retryable) return unavailable(`worker_status_${response.status}`);
+        if (response.status !== 200 && !retryable) return unavailable(`worker_status_${response.status}`, response.status);
         // Enrollment/receipt, stop or replacement may win while the Worker is answering.
         // Discard the old handoff and let the next request sign the newly confirmed pair.
         failureReason = 'placement_read_failed';
@@ -186,8 +210,8 @@ export async function requestAwsPreview(
         const currentRefusal = placementRefusal(current);
         if (currentRefusal) return currentRefusal;
         if (!current) return unavailable('placement_missing');
-        if (current.generation !== placement.generation || current.leaseEpoch !== placement.leaseEpoch) return starting();
-        if (retryable) return starting();
+        if (current.generation !== placement.generation || current.leaseEpoch !== placement.leaseEpoch) return starting('epoch_moved', response.status);
+        if (retryable) return starting(retryable, response.status);
         failureReason = 'parse_failed';
         // Allowlist the response, including only public relay metadata.
         const parsed = z.object({
