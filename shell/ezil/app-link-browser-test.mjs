@@ -73,6 +73,12 @@ try {
     assert.equal(await windows(page).count(), 1);
     await page.reload(); await page.locator('.window[data-app="code"]').waitFor();
     assert.equal(await windows(page).count(), 1);
+    // The route opens Code in full view (APP-ROUTES §3), which hides the
+    // dock; Code's own "Restore window" control gives it back.
+    await page.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
+    assert.equal(await page.locator('.taskbar').isVisible(), false, 'the Code link opens in full view, without the dock');
+    await page.locator('.window[data-app="code"] > .ezil-full-view-bar [data-action="restore"]').click();
+    await page.locator('.taskbar-item[data-app="settings"]').waitFor({ state: 'visible' });
     await page.locator('.taskbar-item[data-app="settings"]').click();
     await page.locator('[data-pane="account"].active').waitFor();
     await page.locator('.ezil-settings-tab[data-tab="appearance"]').click();
