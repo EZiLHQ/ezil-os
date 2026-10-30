@@ -248,7 +248,7 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  * request cannot fail this way. See `applyDisplayEvidence`.
  *
  * @typedef {'worker_unreachable' | 'sandbox_crashed' | 'desktop_unreachable'
- *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
+ *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'computer_stopped' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
  *   | 'payment_issue' | 'plan_required' | 'fair_use_paused' | 'files_on_aws' | 'unknown'} BootFailureReason
  */
 
@@ -304,7 +304,7 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
  *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'capacity_attempt_expired' | 'region_capacity'
- *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | BillingBootErrorCode | 'unknown'} BootErrorCode
+ *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'computer_stopped' | BillingBootErrorCode | 'unknown'} BootErrorCode
  */
 
 /**
@@ -351,6 +351,8 @@ const AWS_REFUSAL_ERROR_CODES = [
     'max_running',
     'user_hours_cap',
     'global_hours_cap',
+    // Hotfix r5 review: the stop hold answers the same until it lapses (60 s); re-asking at once is waste.
+    'computer_stopped',
 ];
 
 /**
@@ -415,6 +417,8 @@ function classifyFailure(errorCode) {
         case 'user_hours_cap':
         case 'global_hours_cap':
             return errorCode;
+        case 'computer_stopped':
+            return 'computer_stopped';
         case 'connection_refused':
         case 'fetch_failed':
             return 'worker_unreachable';
@@ -661,6 +665,12 @@ export const BOOT_PROGRESS_LONG_SUBTEXT =
 
 /** @type {Record<BootFailureReason, BootFailureCopy>} */
 export const BOOT_FAILURE_COPY = {
+    // Hotfix r5 review: the server's stop hold (`stopCooldownAnswer`) refuses a hosted-app open for 60 s
+    // after the computer stopped, so a leftover poll cannot restart it. An explicit desktop open is not held.
+    computer_stopped: {
+        title: 'Your computer was just stopped',
+        body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the desktop from Settings → Computer, or try again in a minute.",
+    },
     operations_paused: {
         title: 'Your AWS computer is paused by operations',
         body: 'Your files are kept. Only operations can resume this computer. Try again only checks whether the pause has been lifted.',

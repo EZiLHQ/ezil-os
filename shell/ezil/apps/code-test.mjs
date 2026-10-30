@@ -108,6 +108,12 @@ let mintSeq = 0;
 let confirmAnswer; // Unknown until Direction A supplies an authenticated verdict.
 /** What `/api/shell/code-preview-url` should answer next. */
 let codePreviewUrlMode = 'ok';
+/**
+ * Scripted `confirm=frame` answers, consumed one per ask before `confirmAnswer`
+ * applies: `{ status, body }` is the APP ROUTE's HTTP status and its JSON body
+ * (whose own `status` is the ORIGIN's, as the server reports it).
+ */
+const confirmScript = [];
 
 const mintedUrls = [];
 
@@ -145,6 +151,8 @@ window.fetch = async (url, opts = {}) => {
 
     if ( u.startsWith(ENDPOINTS.desktop) ) {
         if ( u.includes('confirm=frame') ) {
+            const scripted = confirmScript.shift();
+            if ( scripted ) return json(scripted.body, scripted.status ?? 200);
             if ( confirmAnswer === undefined ) return json({ ok: false });
             return json({ ok: true, confirmed: confirmAnswer, status: confirmAnswer ? 200 : 500 });
         }
@@ -430,6 +438,89 @@ push('...and the boot panel underneath is TRULY hidden — no double-overlay',
 codePreviewUrlMode = 'ok';
 await window.$(win4).close();
 await settle(4);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5a. 🔴 FOLLOW-UP r5 (ACCEPT-9a755827 e2e-standard A3). Code failed with "Your
+//     desktop isn't answering" 0.8 s after the mint resolved: the first
+//     `confirm=frame` answered an ORIGIN-side http_error (an auth/edge/tunnel hop
+//     answering fast and wrong during the boot transition), and Code treated it
+//     as terminal with ~44 s of its 45 s budget unused. Any origin http_error is
+//     now recovered inside the budget; OUR refusals (the app route's own 401/403,
+//     not_own_origin, provider_not_configured, bad_url) stay terminal, asked once.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const infos = [], errors = [];
+    const realInfo = window.console.info.bind(window.console), realError = window.console.error.bind(window.console);
+    window.console.info = (...a) => { infos.push(a.join(' ')); realInfo(...a); };
+    window.console.error = (...a) => { errors.push(a.join(' ')); realError(...a); };
+    const confirmAsks = (from) => calls.slice(from).filter(c => c.url.includes('confirm=frame')).length;
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    /** Open Code with a scripted confirmation sequence; every navigation loads at once, as a browser's does. */
+    const openScripted = async (script) => {
+        confirmScript.splice(0, confirmScript.length, ...script);
+        const from = calls.length, infoFrom = infos.length, errorFrom = errors.length;
+        const mintsBefore = mintedUrls.length;
+        await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+        const w = q('.window[data-app="code"]');
+        const frame = w?.querySelector('.window-app-iframe');
+        await waitFor(() => mintedUrls.length > mintsBefore && frame?.getAttribute('src') === mintedUrls.at(-1), 3000);
+        let navigations = 0;
+        const mo = new window.MutationObserver(records => {
+            const n = records.filter(r => r.attributeName === 'src').length;
+            if ( n ) { navigations += n; window.setTimeout(() => fireLoad(frame), 0); }
+        });
+        mo.observe(frame, { attributes: true });
+        fireLoad(frame); // the first (error) document loads
+        return { w, frame, from, get navigations () { return navigations; }, stop: () => mo.disconnect(),
+            confirmed: () => infos.slice(infoFrom).some(l => /code frame confirmed/.test(l)),
+            notAnswering: () => errors.slice(errorFrom).filter(l => /code frame is not answering/.test(l)) };
+    };
+    const ORIGIN = status => ({ body: { ok: true, confirmed: false, reason: 'http_error', status } });
+    const HEALTHY = { body: { ok: true, confirmed: true, status: 200 } };
+
+    for ( const status of [401, 530, 404] ) {
+        const h = await openScripted([ORIGIN(status), HEALTHY, HEALTHY]);
+        const ok = await waitFor(h.confirmed, 8000);
+        await settle(6);
+        const panel = h.w?.querySelector('[data-kind]');
+        push(`🔴 A3: origin http_error ${status} on the first ask, then healthy -> 'code frame confirmed'`,
+            ok, `asks=${confirmAsks(h.from)} errors=${JSON.stringify(h.notAnswering())}`);
+        push(`🔴 A3 (${status}): the iframe is re-navigated exactly once and the replacement reconfirmed`,
+            h.navigations === 1 && confirmAsks(h.from) === 3, `navigations=${h.navigations} asks=${confirmAsks(h.from)}`);
+        push(`🔴 A3 (${status}): no failed panel and no frame_not_answering`,
+            !! panel && panel.hidden === true && panel.getAttribute('data-kind') !== 'failed' && h.notAnswering().length === 0,
+            `hidden=${panel?.hidden} kind=${panel?.getAttribute('data-kind')} errors=${h.notAnswering().length}`);
+        h.stop();
+        confirmScript.length = 0;
+        await window.$(h.w).close();
+        await settle(4);
+    }
+
+    // Terminal, asked exactly once: our own app route refused (401/403), or the server's own refusals.
+    const terminal = [
+        ['app-route 401', { status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Sign in' } } }],
+        ['app-route 403', { status: 403, body: { error: { code: 'FORBIDDEN', message: 'No' } } }],
+        ['not_own_origin', { body: { ok: true, confirmed: false, reason: 'not_own_origin' } }],
+        ['provider_not_configured', { body: { ok: true, confirmed: false, reason: 'provider_not_configured' } }],
+        ['bad_url', { body: { ok: true, confirmed: false, reason: 'bad_url' } }],
+    ];
+    for ( const [name, answer] of terminal ) {
+        const h = await openScripted([answer, HEALTHY, HEALTHY]);
+        await waitFor(() => h.notAnswering().length > 0, 3000);
+        await tick(2500); // longer than the first recovery backoffs: a retry would have asked by now
+        const panel = h.w?.querySelector('[data-kind]');
+        push(`${name} on /api/shell/desktop?confirm=frame stays terminal: "isn't answering", asked exactly once`,
+            panel?.getAttribute('data-kind') === 'failed' && panel.hidden === false
+            && confirmAsks(h.from) === 1 && h.navigations === 0 && ! h.confirmed(),
+            `kind=${panel?.getAttribute('data-kind')} asks=${confirmAsks(h.from)} navigations=${h.navigations}`);
+        h.stop();
+        confirmScript.length = 0;
+        await window.$(h.w).close();
+        await settle(4);
+    }
+    window.console.info = realInfo;
+    window.console.error = realError;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5b. 🔴 THE CODE WINDOW KEEPS ITS COMPUTER AWAKE WHILE SOMEONE IS WORKING IN IT.

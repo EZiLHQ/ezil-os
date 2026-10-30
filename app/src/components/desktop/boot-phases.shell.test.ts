@@ -239,6 +239,7 @@ describe('computeBootUiState — never fabricates progress', () => {
             // then no picture arrives. The sweep above proves the deterministic
             // error codes still land on `unknown` rather than reaching for it.
             'capacity_unavailable',
+            'computer_stopped',
             'desktop_unreachable',
             'display_not_streaming',
             'fair_use_paused',

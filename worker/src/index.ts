@@ -4381,6 +4381,19 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
   };
 }
 
+/**
+ * G12: record that the host accepted a desktop config carrying this boot's AI token, so the open
+ * path does not push it again while the host still holds that config (`aiPushPending`).
+ */
+function awsDesktopAiDelivered(env: Env, record: AwsTunnelRecord) {
+  const registry = awsRegistryFor(env);
+  return async (bootId: string, expiresAt: number) => {
+    await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.aiDelivered}`, {
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId, expiresAt }),
+    }));
+  };
+}
+
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
   return async (signal) => {
@@ -4767,7 +4780,7 @@ async function handlePreview(
             const zone = resolveAwsOriginZone(env);
             if (!zone) throw new RelayFailure('aws_origin_unavailable');
             return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
-              aiConfig: awsDesktopAiConfig(env, record),
+              aiConfig: awsDesktopAiConfig(env, record), aiDelivered: awsDesktopAiDelivered(env, record),
               neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
           },
           nowMs: Date.now,

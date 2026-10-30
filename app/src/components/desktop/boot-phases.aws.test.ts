@@ -35,6 +35,23 @@ describe.each([['app', app], ['shell', shell]] as const)('%s AWS refusal copy', 
     });
 });
 
+// Hotfix r5 review: the server's stop hold (`stopCooldownAnswer`, compute-dispatch.ts) answers a
+// hosted-app open within 60 s of a stop with `computer_stopped`. It is not a failure to re-ask
+// silently (the same answer comes back) and not "Something went wrong": it says what happened.
+describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_name, boot) => {
+    it('computer_stopped is never retried automatically and says how to start the computer now', () => {
+        expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'computer_stopped' }))
+            .toEqual({ kind: 'failed', reason: 'computer_stopped', errorCode: 'computer_stopped' });
+        expect(boot.isRetryableBootErrorCode('computer_stopped')).toBe(false);
+        const copy = boot.BOOT_FAILURE_COPY.computer_stopped;
+        expect(copy.title).toBe('Your computer was just stopped');
+        expect(copy.body).toContain('Your files are kept.');
+        expect(copy.body).toContain('Settings → Computer');
+        expect(copy.body).toContain('try again in a minute');
+        expect(copy.body).not.toMatch(/retrying usually fixes|upgrade|buy more|something went wrong/i);
+    });
+});
+
 // Round 4 (D16-D18): the billing gate's refusals. The founder's 10-28 report showed
 // `billing_size_not_allowed` as "Something went wrong" and "Error code: unknown".
 describe.each([['app', app], ['shell', shell]] as const)('%s billing refusal copy', (_name, boot) => {

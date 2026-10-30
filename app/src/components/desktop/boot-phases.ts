@@ -235,6 +235,7 @@ export interface BootNotConfiguredState {
  */
 export type BootFailureReason =
     | 'operations_paused'
+    | 'computer_stopped'
     | 'capacity_unavailable'
     | 'user_hours_cap'
     | 'global_hours_cap'
@@ -311,6 +312,7 @@ export type BootErrorCode =
     | 'max_running'
     | 'user_hours_cap'
     | 'global_hours_cap'
+    | 'computer_stopped'
     | 'bad_request'
     | 'unauthorized'
     | 'preconditions_unmet'
@@ -376,6 +378,8 @@ const AWS_REFUSAL_ERROR_CODES: readonly string[] = [
     'max_running',
     'user_hours_cap',
     'global_hours_cap',
+    // Hotfix r5 review: the stop hold answers the same until it lapses (60 s); re-asking at once is waste.
+    'computer_stopped',
 ];
 
 /**
@@ -451,6 +455,8 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
         case 'user_hours_cap':
         case 'global_hours_cap':
             return errorCode;
+        case 'computer_stopped':
+            return 'computer_stopped';
         case 'connection_refused':
         case 'fetch_failed':
             return 'worker_unreachable';
@@ -684,6 +690,12 @@ export interface BootFailureCopy {
 }
 
 export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
+    // Hotfix r5 review: the server's stop hold (`stopCooldownAnswer`) refuses a hosted-app open for 60 s
+    // after the computer stopped, so a leftover poll cannot restart it. An explicit desktop open is not held.
+    computer_stopped: {
+        title: 'Your computer was just stopped',
+        body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the desktop from Settings → Computer, or try again in a minute.",
+    },
     operations_paused: {
         title: 'Your AWS computer is paused by operations',
         body: 'Your files are kept. Only operations can resume this computer. Try again only checks whether the pause has been lifted.',

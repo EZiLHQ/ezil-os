@@ -542,25 +542,50 @@ export async function openDesktop (computerId, screen, { signal } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    // Every open is cancellable two ways: by the caller's own `signal`, and by
+    // Every open is cancellable three ways: by the caller's own `signal`, by
     // `cancelOpenDesktop(computerId)` — which also reaches an open the caller
-    // did not start itself (the paint-time warm, via `warm.js`).
+    // did not start itself (the paint-time warm, via `warm.js`) — and by
+    // `cancelComputerOpens` (Stop/Delete, after the windows close).
+    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s), { signal });
+}
+
+/**
+ * In-flight wake loops that can reach the server's `ensure()` — `openDesktop`,
+ * `previewUrl` and the Code window's mint — so a caller can stop every one for a
+ * computer. Each entry: `{computerId, what, cancel, done}`.
+ */
+const openCancels = new Map();
+
+/**
+ * 🔴 HOTFIX r5 (ACCEPT-11865d06 B6): `withWakeAndOneRetry`, registered and
+ * cancellable. Every ask of these routes runs the server's `ensure()`, which on a
+ * STOPPED computer STARTS it. A loop that outlives its window (closed by Stop)
+ * kept asking every 1.5 s and re-provisioned the computer 0.23 s after the stop
+ * confirmed. `issue(signal)` sends one request with that signal; the loop stops
+ * at once when the caller's `signal` aborts or `cancelComputerOpens` reaches it.
+ *
+ * @param {string} computerId
+ * @param {string} what The loop's name ('openDesktop' | 'previewUrl' | 'codePreviewUrl').
+ * @param {(signal: AbortSignal) => Promise<any>} issue One request. Must never throw.
+ * @param {{signal?: AbortSignal}} [opts]
+ */
+export function cancellableWake (computerId, what, issue, { signal } = {}) {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     if ( signal?.aborted ) cancel(); else signal?.addEventListener?.('abort', cancel, { once: true });
     const key = Symbol();
-    openCancels.set(key, { computerId, cancel });
-    try {
-        return await withWakeAndOneRetry(() => openDesktopOnce(computerId, screen, controller.signal),
-            'openDesktop', computerId, controller.signal);
-    } finally {
-        openCancels.delete(key);
-        signal?.removeEventListener?.('abort', cancel);
-    }
+    const entry = { computerId, what, cancel, done: null };
+    openCancels.set(key, entry);
+    entry.done = (async () => {
+        try {
+            return await withWakeAndOneRetry(() => issue(controller.signal), what, computerId, controller.signal);
+        } finally {
+            openCancels.delete(key);
+            signal?.removeEventListener?.('abort', cancel);
+        }
+    })();
+    return entry.done;
 }
-
-/** In-flight `openDesktop` loops, so a caller can stop every one for a computer. */
-const openCancels = new Map();
 
 /**
  * Stop every in-flight `openDesktop` for `computerId`: each stops asking at once
@@ -573,9 +598,58 @@ const openCancels = new Map();
 export function cancelOpenDesktop (computerId) {
     let n = 0;
     for ( const entry of openCancels.values() ) {
-        if ( entry.computerId === computerId ) { entry.cancel(); n++; }
+        if ( entry.what === 'openDesktop' && entry.computerId === computerId ) { entry.cancel(); n++; }
     }
     return n;
+}
+
+/**
+ * Stop/Delete: cancel EVERY wake loop (desktop, Preview, Code) for `computerId`
+ * — or, with no id, for every computer except `keep` — and resolve once each has
+ * returned, so no further ask can reach `ensure()` after this settles. A loop
+ * whose request is already on the wire returns when that request is aborted (or,
+ * on an engine without `AbortSignal.any`, answers); callers bound the wait.
+ *
+ * @param {string} [computerId]
+ * @param {{keep?: string}} [opts]
+ * @returns {Promise<number>} how many loops were cancelled
+ */
+export async function cancelComputerOpens (computerId, { keep } = {}) {
+    const hit = [...openCancels.values()].filter(entry => computerId !== undefined
+        ? entry.computerId === computerId
+        : keep === undefined || entry.computerId !== keep);
+    for ( const entry of hit ) entry.cancel();
+    await Promise.allSettled(hit.map(entry => entry.done));
+    return hit.length;
+}
+
+/**
+ * Computers the owner stopped from Settings in this page.
+ *
+ * 🔴 HOTFIX r5 (review of ACCEPT-11865d06 B6): every hover-warm (`warm.js`) is a
+ * `POST /api/shell/desktop`, which runs the server's `ensure()` — and on a
+ * STOPPED computer that STARTS it. After Settings → Stop, merely moving the
+ * pointer over the Browser dock icon (or its Start-menu entry) restarted the
+ * computer the owner had just stopped. So a stopped computer is never warmed
+ * until the owner opens it on purpose (the desktop window's `claim()`, which
+ * calls `releaseStopHold`). No timer: a hover a minute later would be the same
+ * restart, only later. A reload forgets it; the page then starts cold anyway.
+ */
+const stoppedHolds = new Set();
+
+/** Settings → Stop, confirmed: no hover-warm may start `computerId` again until an explicit open. */
+export function holdAfterStop (computerId) {
+    if ( computerId ) stoppedHolds.add(computerId);
+}
+
+/** An explicit open of `computerId` (Browser window, Settings → Open desktop): hover may warm it again. */
+export function releaseStopHold (computerId) {
+    stoppedHolds.delete(computerId);
+}
+
+/** True while `computerId` is held by `holdAfterStop`. */
+export function stoppedByUser (computerId) {
+    return stoppedHolds.has(computerId);
 }
 
 // Local preview routes currently only mint URLs for a running container. Code
@@ -724,24 +798,27 @@ function capacityAttemptOf (data) {
         && data.capacityAttemptId !== '' ? { capacityAttemptId: data.capacityAttemptId } : {};
 }
 
-export async function previewUrl (computerId) {
+export async function previewUrl (computerId, { signal } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
-    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl', computerId);
+    // Cancellable: the Preview window's close and Stop (`cancelComputerOpens`) end it.
+    return cancellableWake(computerId, 'previewUrl', (s) => previewUrlOnce(computerId, s), { signal });
 }
 
 /** One `POST /api/shell/preview-url`. The loop that may call it more than once is above. */
-async function previewUrlOnce (computerId) {
+async function previewUrlOnce (computerId, signal) {
     const started = await ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const res = await request(endpoint('previewUrl'), {
         method: 'POST',
         body: { computerId },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
+        signal,
     });
 
     if ( ! res.ok ) {
+        if ( res.code === 'CANCELLED' ) return { ok: false, errorCode: 'cancelled', message: res.message };
         if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
         if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
         if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
@@ -816,11 +893,26 @@ export async function confirmFrame (computerId, frameUrl, surface = 'desktop') {
 /**
  * Keep the authenticated probe's transient failure evidence for Code's bounded
  * recovery. The boolean API above still exposes just the health verdict.
- * A retryable negative is still unconfirmed; auth/origin refusals never qualify.
+ * A retryable negative is still unconfirmed; OUR refusals never qualify.
+ *
+ * Two different HTTP statuses meet here and are never mixed:
+ *   - `routeStatus` is OUR app route's (`/api/shell/desktop`) status. A 401/403
+ *     there is our own auth refusing — terminal, reported as `route_refused`.
+ *   - `status` is the ORIGIN's, as the server's probe read it (`data.status`).
+ *
+ * 🔴 Follow-up r5 (ACCEPT-9a755827 e2e-standard A3): on the code surface ANY
+ * origin `http_error` is retryable, not just 500-504. The hops in front of a
+ * booting code-server answer fast and wrong during the transition — the
+ * Worker's AWS preview auth (401), the host edge (401 on a gw1 binding or clock
+ * skew, 404 on an unknown path), a stale route (410), the tunnel (52x/530) —
+ * and Code used to stop on the first such answer with ~44 s of its 45 s budget
+ * unused. The recovery stays bounded by Code's ask cap and deadline. The
+ * server's own refusals (`not_own_origin`, `provider_not_configured`,
+ * `bad_url`) and a reason-less negative stay terminal: asking again would get
+ * the same answer. Desktop/Preview keep the original 500-504 rule.
  */
 export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
     const unknown = { confirmed: undefined, retryable: false };
-    const refused = { confirmed: false, retryable: false };
     if ( ! computerId || ! frameUrl ) return unknown;
     const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
         + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`
@@ -828,21 +920,30 @@ export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
     const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
     // An HTTP authentication/authorization refusal is an answer, even if the
     // response body is absent, non-JSON, or claims success. Never retry it.
-    if ( ! res.ok ) return res.status === 401 || res.status === 403 ? refused : unknown;
+    if ( ! res.ok ) {
+        return res.status === 401 || res.status === 403
+            ? { confirmed: false, retryable: false, reason: 'route_refused', routeStatus: res.status }
+            : unknown;
+    }
     const data = res.data;
+    const status = Number.isInteger(data?.status) ? data.status : undefined;
+    const reason = typeof data?.reason === 'string' ? data.reason : undefined;
     if ( surface === 'code' && data?.confirmed === true ) {
         // Both hosted/local HTTP probes return a successful status and omit
         // reason on success. A malformed or contradictory positive must not
         // release Code's overlay, including after its recovery navigation.
         const confirmed = data.ok === true && Number.isInteger(data.status)
             && data.status >= 200 && data.status < 400 && !Object.hasOwn(data, 'reason');
-        return { confirmed, retryable: false };
+        return { confirmed, retryable: false, reason, status };
     }
     if ( data?.ok !== true ) return unknown;
+    const transient = reason === 'unreachable' || (reason === 'http_error'
+        && (surface === 'code' || [500, 502, 503, 504].includes(data.status)));
     return {
         confirmed: data.confirmed === true,
-        retryable: data.confirmed === false && (data.reason === 'unreachable'
-            || (data.reason === 'http_error' && [500, 502, 503, 504].includes(data.status))),
+        retryable: data.confirmed === false && transient,
+        reason,
+        status,
     };
 }
 
@@ -1393,7 +1494,7 @@ export default {
     get, set, del,
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
-    openDesktop, cancelOpenDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
+    openDesktop, cancelOpenDesktop, cancellableWake, cancelComputerOpens, holdAfterStop, releaseStopHold, stoppedByUser, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
     previewUrl, pendingOrRefused, focusApp,
     restartEndpoint, restartDesktop,
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,

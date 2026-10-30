@@ -266,18 +266,25 @@ async function closeSandboxWindows (id, keepId) {
             && (keepId === undefined || windowStreams(el, keepId) !== true));
 
     const $wins = $(targets());
-    if ( $wins.length === 0 ) {
-        if ( openDesktopComputerId() === null ) activeComputerId = null;
-        return;
+    if ( $wins.length > 0 ) {
+        await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
+        const deadline = Date.now() + 3000;
+        while ( targets().length > 0 && Date.now() < deadline ) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+        if ( targets().length > 0 ) {
+            console.warn(`[${PHASE}] a sandbox window did not close within the wait budget`);
+        }
     }
-    await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
-    const deadline = Date.now() + 3000;
-    while ( targets().length > 0 && Date.now() < deadline ) {
-        await new Promise(r => setTimeout(r, 50));
-    }
-    if ( targets().length > 0 ) {
-        console.warn(`[${PHASE}] a sandbox window did not close within the wait budget`);
-    }
+    // 🔴 HOTFIX r5 (ACCEPT-11865d06 B6): a closed window is not a stopped loop.
+    // Every desktop/Preview/Code wake loop for this computer (including one whose
+    // window is already gone, and the paint-time warm) is cancelled and AWAITED,
+    // so no ask can reach the server's ensure() — which starts a STOPPED
+    // computer — after the Stop/Delete this precedes. Bounded like the close.
+    const cancelled = Promise.resolve(session.cancelComputerOpens?.(id, { keep: keepId }));
+    let budget;
+    await Promise.race([cancelled, new Promise(r => { budget = setTimeout(r, 3000); })]);
+    clearTimeout(budget);
     // The desktop specifically drives `activeComputerId` (see its own
     // comment): re-check it directly rather than assume it was among the
     // windows this call targeted.
@@ -443,7 +450,10 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
             plan: state === 'locked' ? planFor(size, data) : null };
     }) : [];
     const disk = data?.computer?.disk ?? null;
-    const done = ! switching && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
+    // Hotfix r5 (ACCEPT #5): "Now running on …" only while it is running — never beside Stopping…/Stopped.
+    // (Main's model has no `stopping` input: Settings' own Stop dismisses the transition on confirm.)
+    const done = ! switching && running && prog?.operation !== 'stopping'
+        && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
     const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
     return { computer, data, free, standing, held, move,
@@ -734,6 +744,9 @@ async function refreshProgress ($win) {
     if ( res?.ok && res.data ) {
         progress = { ...res.data, computerId: res.data.computerId ?? computer.id };
         const t = transitionOf(progress);
+        // Hotfix r5 review: a stop (here or in another tab) ends the run "Now running on …" was about —
+        // dismissed, not just hidden, so the next Start does not bring the same done transition back.
+        if ( t?.phase === 'done' && (progress.lifecycleState === 'STOPPED' || progress.operation === 'stopping') ) dismissed.add(t.transitionId);
         if ( t && ! IN_FLIGHT.has(t.phase) && (t.phase === 'done' || t.phase === 'failed') ) {
             clearSwitchRequestId(computer.id, t.target);
             if ( before && IN_FLIGHT.has(before.phase) && before.transitionId === t.transitionId ) await readSummary();
@@ -822,6 +835,13 @@ async function handleStop ($win) {
     if ( ! await confirmAlert('Stop your computer?', 'Open apps close and your files stay. Start it again with Open desktop.', 'Stop') ) return;
     stopBusy = true;
     notice = null;
+    // Hotfix r5 review: from the confirm on, no hover over the Browser dock icon may warm (= start)
+    // it again — set BEFORE the windows close, so a warm begun meanwhile cannot slip past the cancel.
+    session.holdAfterStop?.(computer.id);
+    // "Now running on …" belongs to the run that is ending: dismissed (before this render, so it
+    // clears as the user confirms), and the next Start does not repeat it.
+    const doneT = transitionOf(progress);
+    if ( doneT?.phase === 'done' ) dismissed.add(doneT.transitionId);
     render($win);
     try {
         // Same guarantee as Delete: every window on this computer closes first.
