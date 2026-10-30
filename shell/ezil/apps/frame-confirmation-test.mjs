@@ -56,10 +56,15 @@ async function open(app, answer) {
     }
     const calls = [];
     const mints = [];
+    const telemetry = [];
     const json = data => ({ ok: true, status: 200, json: async () => data });
     const frameUrl = `https://${app === 'code' ? '8443-code' : '3002-app'}.example/preview-bootstrap?token=test`;
     w.fetch = async (url, opts = {}) => {
         const u = new URL(String(url), w.location.href);
+        if (u.pathname === '/api/shell/telemetry') {
+            telemetry.push(...(JSON.parse(opts.body ?? '{}').events ?? []));
+            return json({ ok: true });
+        }
         if (u.searchParams.get('confirm') === 'frame') {
             calls.push({ at: now, url: u, opts });
             const confirmed = await answer({ now, count: calls.length, window: w });
@@ -80,7 +85,8 @@ async function open(app, answer) {
         user: { id: 'u-1', email: 'test@example.com' },
         computer: { id: 'c-1', name: 'Computer', slot: 1 },
         apps: [{ id: 'desktop', name: 'Browser', kind: 'desktop' }],
-        desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle' },
+        desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
+            endpoints: { telemetry: '/api/shell/telemetry' } },
     };
     w.__EZIL_BOOT__ = payload;
     w.eval(icons);
@@ -99,7 +105,9 @@ async function open(app, answer) {
     new w.MutationObserver(records => {
         navigations += records.filter(r => r.attributeName === 'src').length;
     }).observe(frame, { attributes: true });
-    return { w, win, frame, panel, calls, mints, advance, frameUrl, get navigations() { return navigations; }, close: () => {
+    /** Every telemetry event the page sent so far (`pagehide` is telemetry.js's own flush trigger). */
+    const events = async () => { w.dispatchEvent(new w.Event('pagehide')); await advance(0); return telemetry; };
+    return { w, win, frame, panel, calls, mints, advance, frameUrl, events, get navigations() { return navigations; }, close: () => {
         w.dispatchEvent(new w.Event('ezil:teardown'));
         for (const observer of observers) observer.disconnect();
         dom.window.close();
@@ -203,7 +211,12 @@ test('code: a cold backend recovers automatically, reloads the error document an
     } finally { observer.disconnect(); h.close(); }
 });
 
-for (const reply of [starting(500), starting(502), starting(503), starting(504),
+// Follow-up r5 (ACCEPT-9a755827 e2e-standard A3): ANY origin http_error is a boot transition
+// on the code surface — the AWS preview-auth hop (401), the host edge (401 gw1 binding/clock,
+// 404 unknown path), a stale route (410) and the tunnel (52x/530) all answer fast and wrong
+// while the host comes up. Before, 401/403/410/52x were terminal on the first ask.
+for (const reply of [starting(401), starting(403), starting(404), starting(410),
+    starting(500), starting(502), starting(503), starting(504), starting(520), starting(530),
     { confirmed: false, reason: 'unreachable' }]) {
     test(`code: ${JSON.stringify(reply)} retries but stays bounded`, async () => {
         const h = await open('code', () => reply);
@@ -221,9 +234,12 @@ for (const reply of [starting(500), starting(502), starting(503), starting(504),
     });
 }
 
-for (const reply of [starting(401), starting(403), starting(410),
+// Our own refusals stay terminal: the server will answer the same thing again.
+for (const reply of [
     { confirmed: false, reason: 'not_own_origin', status: 503 },
+    { confirmed: false, reason: 'not_own_origin' },
     { confirmed: false, reason: 'provider_not_configured' },
+    { confirmed: false, reason: 'bad_url' },
     { confirmed: false }]) {
     test(`code: refusal ${JSON.stringify(reply)} never retries or reloads`, async () => {
         const h = await open('code', () => reply);
@@ -235,6 +251,100 @@ for (const reply of [starting(401), starting(403), starting(410),
         } finally { h.close(); }
     });
 }
+
+// 🔴 THE A3 SEQUENCE. First ask: an origin http_error (401 as observed class; 404 and 530 for
+// the edge and the tunnel); the next ask: healthy. Code must recover inside its budget: the
+// iframe is re-navigated exactly once (the stale error document is replaced), the replacement
+// is reconfirmed, the panel comes down, and no frame_not_answering is reported.
+for (const status of [401, 404, 530]) {
+    test(`code: origin http_error ${status} then healthy recovers (one re-navigation, no failure telemetry)`, async () => {
+        const h = await open('code', ({ count }) => count === 1 ? starting(status) : Response.json({ ok: true, confirmed: true, status: 200 }));
+        try {
+            h.frame.dispatchEvent(new h.w.Event('load')); // the first (error) document loads
+            await h.advance(400);
+            assert.equal(h.calls.length, 1);
+            assert.equal(h.panel.dataset.kind, 'progress', 'not terminal on the first ask');
+            await h.advance(2000);
+            assert.equal(h.calls.length, 2, 'asked again inside the recovery backoff');
+            assert.equal(h.navigations, 1, 'the error document is replaced once');
+            assert.equal(h.panel.hidden, false, 'health alone cannot reveal the stale document');
+            h.frame.dispatchEvent(new h.w.Event('load'));
+            await h.advance(0);
+            assert.equal(h.calls.length, 3, 'the replacement is reconfirmed');
+            assert.equal(h.panel.hidden, true);
+            await h.advance(60000);
+            assert.equal(h.calls.length, 3);
+            assert.equal(h.navigations, 1);
+            assert.equal(h.mints.length, 1, 'no extra provider open');
+            const failures = (await h.events()).filter(e => e.code === 'frame_not_answering');
+            assert.deepEqual(failures, []);
+        } finally { h.close(); }
+    });
+}
+
+test('code: a persisting origin 401 ends terminal within the ask cap and the 45 s deadline, and names the hop', async () => {
+    const h = await open('code', () => starting(401));
+    const observer = new h.w.MutationObserver(records => {
+        if (records.some(r => r.attributeName === 'src')) h.frame.dispatchEvent(new h.w.Event('load'));
+    });
+    observer.observe(h.frame, { attributes: true });
+    try {
+        await h.advance(40000);
+        assert.equal(h.panel.dataset.kind, 'progress', 'still recovering well past the first ask');
+        await h.advance(5000);
+        assert.equal(h.panel.hidden, false);
+        assert.equal(h.panel.dataset.kind, 'failed');
+        assert.ok(h.calls.length > 1 && h.calls.length <= 12, `${h.calls.length} asks`);
+        const count = h.calls.length;
+        await h.advance(120000);
+        assert.equal(h.calls.length, count, 'no unbounded loop');
+        assert.equal(h.navigations, 0, 'never re-navigated without a healthy answer');
+        const failures = (await h.events()).filter(e => e.code === 'frame_not_answering');
+        assert.equal(failures.length, 1);
+        assert.equal(failures[0].attrs?.reason, 'http_error', 'telemetry names the reason');
+        assert.equal(failures[0].attrs?.status, 401, 'and the ORIGIN status');
+    } finally { observer.disconnect(); h.close(); }
+});
+
+test('code: a terminal refusal reports its reason; an app-route 401 reports no origin status', async () => {
+    const a = await open('code', () => ({ confirmed: false, reason: 'not_own_origin' }));
+    try {
+        await a.advance(1000);
+        const [failure] = (await a.events()).filter(e => e.code === 'frame_not_answering');
+        assert.equal(failure?.attrs?.seen, 'false');
+        assert.equal(failure?.attrs?.reason, 'not_own_origin');
+        assert.equal(failure?.attrs?.status, undefined);
+    } finally { a.close(); }
+    const b = await open('code', () => Response.json({ ok: true, confirmed: false, reason: 'http_error', status: 503 }, { status: 401 }));
+    try {
+        await b.advance(1000);
+        assert.equal(b.calls.length, 1);
+        const [failure] = (await b.events()).filter(e => e.code === 'frame_not_answering');
+        assert.equal(failure?.attrs?.reason, 'route_refused');
+        assert.equal(failure?.attrs?.status, undefined, "our route's 401 is never reported as the origin's status");
+    } finally { b.close(); }
+});
+
+test('code: a stale attempt (a re-mint replaced it) never finishes the current one as failed', async () => {
+    let resolveOld;
+    const h = await open('code', ({ count }) => count === 1 ? new Promise(r => { resolveOld = r; })
+        : Response.json({ ok: true, confirmed: true, status: 200 }));
+    try {
+        await h.advance(400);
+        assert.equal(h.calls.length, 1, 'the first attempt is asking');
+        // A restart of this computer re-mints Code: a new attempt starts, the old one is stale.
+        h.w.dispatchEvent(new h.w.CustomEvent('ezil:desktop-restarted', { detail: { computerId: 'c-1' } }));
+        await h.advance(0);
+        assert.equal(h.mints.length, 2, 'the new attempt minted');
+        // The old ask now answers with a terminal refusal: it must be dropped silently.
+        resolveOld({ confirmed: false, reason: 'not_own_origin' });
+        await h.advance(0);
+        assert.notEqual(h.panel.dataset.kind, 'failed');
+        await h.advance(2000);
+        assert.equal(h.panel.hidden, true, 'the current attempt confirms');
+        assert.deepEqual((await h.events()).filter(e => e.code === 'frame_not_answering'), []);
+    } finally { h.close(); }
+});
 
 test('code: recovered health without a replacement load never removes the panel', async () => {
     const h = await open('code', ({ count }) => count === 1 ? starting() : true);

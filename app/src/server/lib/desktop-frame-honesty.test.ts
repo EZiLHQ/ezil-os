@@ -159,9 +159,11 @@ describe('a desktop host that returns 500 cannot be reported ready', () => {
             expect(confirmed).toBe(false);
             // Code can retry the observed HTTP 500 without laundering it into
             // health; other views retain the boolean failure contract above.
+            // The observation also names the failing hop (reason + origin
+            // status) so the next "not answering" is attributable.
             expect(await shellSession.observeFrame(
                 '00000000-0000-4000-8000-000000000002', `${brokenUrl}/`, 'code',
-            )).toEqual({ confirmed: false, retryable: true });
+            )).toEqual({ confirmed: false, retryable: true, reason: 'http_error', status: 500 });
 
             // And what the boot panel renders from it. THIS is the assertion the
             // whole change exists for.
@@ -181,9 +183,12 @@ describe('a desktop host that returns 500 cannot be reported ready', () => {
                 `${workingUrl}/`,
             );
             expect(okConfirmed).toBe(true);
-            expect(await shellSession.observeFrame(
+            const okObserved = await shellSession.observeFrame(
                 '00000000-0000-4000-8000-000000000002', `${workingUrl}/`, 'code',
-            )).toEqual({ confirmed: true, retryable: false });
+            );
+            expect(okObserved).toEqual({ confirmed: true, retryable: false, status: 200 });
+            // A positive carries no reason (the server omits it on success).
+            expect((okObserved as { reason?: string }).reason).toBeUndefined();
             expect(
                 computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: okConfirmed }),
             ).toEqual({ kind: 'ready' });

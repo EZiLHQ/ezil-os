@@ -511,6 +511,8 @@ export async function openCodeWindow (ctx = {}) {
         let awaiting_reload = false;
         let probe_timer = null;
         let deadline_timer = null;
+        // The last answer, so a failure (including the deadline) names the hop that answered.
+        let last_observation = null;
         const frame_url = el_iframe.src;
         const stale = () => settled || disposed || my_attempt !== attempt;
         stop_confirmation = () => {
@@ -545,10 +547,16 @@ export async function openCodeWindow (ctx = {}) {
                 return;
             }
 
+            const reason = last_observation?.reason;
+            const status = last_observation?.status;
+            // The console line keeps its exact text (browser suites allow-list it); the
+            // reason and origin status travel in the telemetry attrs below.
             console.error(`[${PHASE}] the code frame is not answering (confirmFrame -> ${String(seen)})`);
+            // `status` is only ever the ORIGIN's (the probe's `data.status`); our own route's
+            // refusal is `reason: 'route_refused'` with no status.
             telemetry.capture({
                 eventClass: 'display_failure', site: 'ezil-os:apps/code#confirmFrame', code: 'frame_not_answering',
-                attrs: { seen: String(seen) },
+                attrs: { seen: String(seen), ...(reason ? { reason } : {}), ...(Number.isInteger(status) ? { status } : {}) },
             });
             show_panel();
             // A terminal refusal or an exhausted confirmation/recovery budget.
@@ -578,8 +586,9 @@ export async function openCodeWindow (ctx = {}) {
             const seen = observation.confirmed;
             in_flight = false;
             if ( stale() ) return;
+            last_observation = observation;
             // Never apply a positive verdict to a replaced frame URL.
-            if ( el_iframe.src !== frame_url ) { finish(false); return; }
+            if ( el_iframe.src !== frame_url ) { last_observation = { reason: 'frame_replaced' }; finish(false); return; }
             if ( observation.retryable ) {
                 recovering = true;
                 needs_reload = true;

@@ -918,6 +918,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             if (frame.alive) {
                 return { confirmed: true as const, status: frame.status };
             }
+            // Follow-up r5 (ACCEPT-9a755827 A3): name the hop that answered. One line, the
+            // computer's prefix, the reason and the ORIGIN status only — never the frameUrl
+            // (its bootstrap query is a credential) and never `detail` (it can quote the URL).
+            console.info(JSON.stringify({ event: 'frame-confirm', computer: input.computerId.slice(0, 8),
+                reason: frame.reason, status: frame.status ?? null }));
             return { confirmed: false as const, reason: frame.reason, status: frame.status };
         }),
 
