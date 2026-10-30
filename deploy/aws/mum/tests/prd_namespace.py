@@ -137,8 +137,20 @@ REFUSED = {
 }
 
 
-def run(*args):
-    return subprocess.run([sys.executable, "-B", str(TOOLS / "json-tool.py"), *args], capture_output=True, text=True, timeout=60)
+def run(*args, tools=TOOLS):
+    return subprocess.run([sys.executable, "-B", str(tools / "json-tool.py"), *args], capture_output=True, text=True, timeout=60)
+
+
+def redirected_tools(folder):
+    """A copy of the tooling whose lock paths point into `folder`, as fixture.py does:
+    a test must never flock the host's real operator locks."""
+    tools = Path(folder) / "tools"
+    tools.mkdir()
+    for item in TOOLS.iterdir():
+        if item.suffix in (".py", ".sh", ".json"):
+            (tools / item.name).write_text(item.read_text().replace("/root/ezil-aws-mum/locks", str(Path(folder) / "locks"))
+                                           .replace("/root/ezil-aws-prd/locks", str(Path(folder) / "locks")))
+    return tools
 
 
 class NamespaceConfigTests(unittest.TestCase):
@@ -234,10 +246,14 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("never writes mum operator state", shell.stderr)
 
     def test_secret_errors_stay_redacted_under_namespace(self):
-        for namespace in ("mum", "prd"):
-            result = run("--namespace", namespace, "secret-update", "/nonexistent/before.json", "/nonexistent/after.json")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(result.stderr.strip(), "ERROR: secret operation refused; inspect deployment alignment and AWS access")
+        with tempfile.TemporaryDirectory() as folder:
+            tools = redirected_tools(folder)
+            for namespace in ("mum", "prd"):
+                result = run("--namespace", namespace, "secret-update", "/nonexistent/before.json", "/nonexistent/after.json", tools=tools)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.strip(), "ERROR: secret operation refused; inspect deployment alignment and AWS access")
+            # mum reached its (redirected) app-secret lock before failing; unpinned prd never got that far.
+            self.assertTrue((Path(folder) / "locks/app-secret.lock").exists())
 
     def test_pinned_prd_still_refuses_rebase_operations_and_tuples(self):
         pinned = {**tool.PROFILES["prd"], "repository": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-x", "launchTemplate": "lt-0123456789abcdef0"}

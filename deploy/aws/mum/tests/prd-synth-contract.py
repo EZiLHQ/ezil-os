@@ -40,7 +40,8 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
     tools.mkdir()
     for item in (repo / "deploy/aws/mum").iterdir():
         if item.suffix in (".py", ".sh", ".json"):
-            text = item.read_text()
+            # Never the host's real operator locks (as fixture.py does).
+            text = item.read_text().replace("/root/ezil-aws-mum/locks", str(root / "locks")).replace("/root/ezil-aws-prd/locks", str(root / "locks"))
             for unpinned, pinned in namespaces.PINS:
                 text = text.replace(unpinned, pinned)
             (tools / item.name).write_text(text)
