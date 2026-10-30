@@ -60,7 +60,9 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const OS = path.resolve(here, '../app/public/os');
+// Same override as the sibling suites: point at a build without touching the
+// committed `app/public/os`.
+const OS = process.env.EZIL_SHELL_OUT_DIR || process.env.EZIL_OS_DIR || path.resolve(here, '../app/public/os');
 
 for ( const f of ['icons.js', 'bundle.min.js', 'bundle.min.css'] ) {
     if ( ! fs.existsSync(path.join(OS, f)) ) {
@@ -129,6 +131,12 @@ const PAYLOAD = {
 // head, taskbar present) instead of racing the real go_fullbleed flow this
 // file is not testing.
 function stub (url, method) {
+    // GROUP 6's Code window: a real minted URL and a confirmed frame, so the
+    // window settles quietly (the desktop's own boot still fails, below).
+    if ( url.includes('/api/shell/code-preview-url') ) {
+        return { ok: true, codePreviewUrl: `${HOST}/frame?code=1`, expiresAt: Date.now() + 300_000 };
+    }
+    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true, status: 200 };
     if ( url.includes('/api/shell/desktop') && method === 'POST' ) {
         return { ok: false, errorCode: 'connection_refused' };
     }
@@ -159,6 +167,10 @@ await page.route('**/*', async (route) => {
     const url = req.url();
     if ( url === `${HOST}/os` ) {
         await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+        return;
+    }
+    if ( url.startsWith(`${HOST}/frame?`) ) {
+        await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><body style="margin:0;background:#1e1e1e"></body>' });
         return;
     }
     if ( url.includes('/api/') ) {
@@ -422,6 +434,114 @@ const afterClose = await page.evaluate(() => ({
 push('GROUP 5: the window is actually gone once the shrink completes', ! afterClose.stillInDom, JSON.stringify(afterClose));
 push('GROUP 5 ACCEPTANCE (d), part 3: taskbar remains visible after the close fully completes',
     afterClose.taskbarDisplay !== 'none', `display=${afterClose.taskbarDisplay}`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP 6 — the Code window's full view (app-code lane A2, 2026-10-30)
+// ═══════════════════════════════════════════════════════════════════════════
+// The same seams GROUP 2 pins for minimise (`_ezil_minimise`) and the expand
+// hook (`_ezil_maximise`, `scale_window`), now driven by REAL clicks on the
+// Code window's own head, its context menu and its full-view top bar
+// (`../ezil/ui/full-view.js` + `../ezil/apps/code.js`). Restoring must land on
+// the window's exact previous box, measured by the browser.
+const codeItem = await page.evaluate(() => {
+    const r = document.querySelector('.taskbar-item[data-app="code"]')?.getBoundingClientRect();
+    return r ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2 } : null;
+});
+push('GROUP 6 setup: Code is in the dock', !! codeItem);
+await page.mouse.click(codeItem.cx, codeItem.cy);
+await page.waitForSelector('.window[data-app="code"]', { timeout: 5000 });
+await sleep(400);
+const CODE = '.window[data-app="code"]';
+const codeState = () => page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    const r = el.getBoundingClientRect();
+    const bar = el.querySelector(':scope > .ezil-full-view-bar');
+    return {
+        rect: [r.left, r.top, r.width, r.height].map(Math.round),
+        full: el.classList.contains('ezil-fullbleed'),
+        head: getComputedStyle(el.querySelector(':scope > .window-head')).display,
+        bar: bar ? getComputedStyle(bar).display : 'MISSING',
+        taskbar: getComputedStyle(document.querySelector('.taskbar')).display,
+        minimized: el.getAttribute('data-is_minimized'),
+    };
+}, CODE);
+const centre = async (sel) => {
+    const r = await rectOf(sel);
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+};
+const vp = page.viewportSize();
+const isFullView = (s) => s.full && s.head === 'none' && s.bar === 'flex' && s.taskbar === 'none'
+    && s.rect[0] === 0 && s.rect[1] === 0 && s.rect[2] === vp.width && s.rect[3] === vp.height;
+const windowedBox = await codeState();
+push('GROUP 6 setup: a dock click opens Code WINDOWED (head, taskbar, no top bar)',
+    ! windowedBox.full && windowedBox.head !== 'none' && windowedBox.bar === 'none' && windowedBox.taskbar !== 'none', JSON.stringify(windowedBox));
+
+let at = await centre(`${CODE} > .window-head .window-scale-btn`);
+await page.mouse.click(at.x, at.y);
+await sleep(300);
+push('🔴 GROUP 6: a real click on the green button takes the whole viewport (no head, no taskbar, top bar shown)',
+    isFullView(await codeState()), JSON.stringify(await codeState()));
+const restoreHit = await page.evaluate((sel) => {
+    const b = document.querySelector(`${sel} > .ezil-full-view-bar [data-action="restore"]`).getBoundingClientRect();
+    return document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2)?.closest('button')?.dataset.action ?? null;
+}, CODE);
+push('GROUP 6: the top bar\'s restore button is what a click at its centre hits', restoreHit === 'restore', String(restoreHit));
+at = await centre(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
+await page.mouse.click(at.x, at.y);
+await sleep(300);
+let now = await codeState();
+push('🔴 GROUP 6: restore lands on the EXACT previous box, with head and taskbar back',
+    ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect) && now.head !== 'none' && now.taskbar !== 'none',
+    JSON.stringify({ now, before: windowedBox }));
+
+at = await centre(`${CODE} > .window-head .window-head-title`);
+await page.mouse.dblclick(at.x, at.y);
+await sleep(300);
+push('GROUP 6: a real double-click on the title enters full view', isFullView(await codeState()), JSON.stringify(await codeState()));
+at = await centre(`${CODE} .ezil-full-view-title`);
+await page.mouse.dblclick(at.x, at.y);
+await sleep(300);
+now = await codeState();
+push('GROUP 6: a real double-click on the top bar returns to the previous box',
+    ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect), JSON.stringify(now));
+
+at = await centre(`${CODE} > .window-head .window-head-title`);
+await page.mouse.click(at.x, at.y, { button: 'right' });
+await sleep(250);
+const maximiseItem = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('.context-menu .context-menu-item')]
+        .find((i) => i.querySelector('.contextmenu-label')?.textContent.trim() === 'Maximize');
+    const r = el?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+});
+push('GROUP 6 setup: the head\'s context menu offers Maximize', !! maximiseItem);
+if ( maximiseItem ) await page.mouse.click(maximiseItem.x, maximiseItem.y);
+await sleep(300);
+push('GROUP 6: the context menu\'s Maximize reaches the same hook (full view)', isFullView(await codeState()), JSON.stringify(await codeState()));
+
+at = await centre(`${CODE} > .ezil-full-view-bar [data-action="minimize"]`);
+await page.mouse.click(at.x, at.y);
+await sleep(400);
+now = await codeState();
+push('🔴 GROUP 6: the top bar\'s minimise gives the taskbar back before the window goes',
+    ['true', '1'].includes(now.minimized) && now.taskbar !== 'none' && ! now.full, JSON.stringify(now));
+await page.mouse.click(codeItem.cx, codeItem.cy);
+await sleep(700);
+push('GROUP 6: back from the dock it is in full view again', isFullView(await codeState()), JSON.stringify(await codeState()));
+
+// Keyboard modality, so `:focus-visible` applies: Tab from minimise to restore.
+await page.focus(`${CODE} > .ezil-full-view-bar [data-action="minimize"]`);
+await page.keyboard.press('Tab');
+const ring = await page.evaluate(() => {
+    const el = document.activeElement;
+    return el?.dataset.action === 'restore' ? getComputedStyle(el).outlineStyle : `focus on ${el?.dataset.action ?? el?.tagName}`;
+});
+await page.keyboard.press('Enter');
+await sleep(300);
+now = await codeState();
+push('GROUP 6: the restore button works from the keyboard (Enter) and shows a focus ring',
+    ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect) && ring !== 'none', JSON.stringify({ now, ring }));
+push('GROUP 6: no Fullscreen API element at any point', await page.evaluate(() => document.fullscreenElement === null));
 
 push('no uncaught page errors during the whole run', page_errors.length === 0, JSON.stringify(page_errors));
 
