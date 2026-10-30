@@ -779,6 +779,25 @@ and `decideStart` can refuse a `std-2` one under Free limits. Every re-ask would
 - Lane A tests each route with a held Free user whose placement is not `HOLD_SIZE`, and with one whose Free hours are
   used up: both get the waiting answer during a move, never `billing_*`.
 
+**[r6] With round 6a's surface seam.** At `7a1f2ed1` each open route stamps `const startedAt = Date.now()` first
+(`cloudflare-guacamole.ts:213,511,715`) and wraps every non-ok AWS answer in `awsAnswered` (`:130-150`): one `aws-preview`
+log line per ask, naming the surface. The Code and app routes send `surface: 'code' | 'app'` to `requestAwsPreview`
+(`:547,759`; `aws-preview.ts:245`), and the Worker then answers once the desktop config is applied (Code: once code-server
+answers too), pushing that config once per host boot (`ensureAwsDesktopConfig`, `aws-ice.ts:453`; the tunnel record's
+`restartPush*` claim, `aws-tunnels.ts:351`). The reverse answer is returned right after `routeComputer`, before all of it:
+- It goes out as `return awsAnswered(routed.kind, '<surface>', input.computerId, <answer>, startedAt)`, with surface
+  `desktop`, `app` or `code` and **no** `preview` argument, so a move's waits are in the web log as `error: 'sandbox_starting',
+  reason: 'computer_moving'` (blocked: `preconditions_unmet`, `computer_move_needs_attention`). The restart route has no
+  `awsAnswered` and returns the answer bare. Lane A tests the line for each surface.
+- No `surface` ever reaches the Worker for a computer in a move, `requestAwsPreview` never runs for it, and no desktop
+  config push is claimed for its export boot: that boot's tunnel record never gets `restartPushBootId`. Lane W's import
+  routes call neither `ensureAwsDesktop` nor `ensureAwsDesktopConfig` (`aws-ice.ts:453,513`; §4.1).
+- A reverse answer carries `computeMoving` or `computeMoveNeedsAttention` and **never** `computePreparing`,
+  `computeLaunching` or `computeMigrating` (those come only from `requestAwsPreview` and the providers' own ensure). Lane A
+  tests their absence on every route.
+- The Worker's terminal desktop answers that 6a added (`desktop_config_unapplied`, `desktop_failed`, `aws-preview.ts:55-58,284`)
+  therefore never answer an open during a move (§6.4).
+
 **The reverse waiting answer [G1] (pinned; `provider-reverse-placement.ts`, lane A).** It must not reuse the forward
 answer `computer_migrating`: `compute-dispatch.ts:162-165` turns that into `computeMigrating`, and the shell then
 applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,464-474`) and the 600 s boot hard stop
@@ -822,14 +841,41 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:738-750`)
 
 **Driver [minor: sweep position].** A new `advanceReverseMoves(handlerStartedAt)` runs in `billing-session-sweep`
 **after `drain()`**, as the handler's last step:
-- **Main path:** `advanceStaleMigrations` → `reconcilePaidCloudflareUsers` → `drain()` → **`advanceReverseMoves`**
-  (`billing-session-sweep/handler.ts:258-260`).
+- **Main path [r6]:** the policy pass → the retry pass → **round 6a's held pass** (`billing-session-sweep/handler.ts:212-257`)
+  → `advanceStaleMigrations` → `reconcilePaidCloudflareUsers` → `drain()` → **`advanceReverseMoves`** (`handler.ts:258-260`).
+  The driver stays last, after the held pass: that pass ends by its own start + 10 s and by handler start + 30 s
+  (`HELD_BUDGET_MS`, `HELD_SWEEP_BUDGET_MS`, `handler.ts:27-28,222`), so it adds no wait beyond the 40 s bound below.
 - **Metering-inactive early return:** `drain()` → **`advanceReverseMoves`** → `finish()` (`handler.ts:83`). Forward moves do not
   run there at base. Reverse moves must, because only the driver enforces their deadlines (§5.4 table), and a held row with
   no driver would hold the computer indefinitely.
 - **Why after `drain()`:** `reconcilePaidCloudflareUsers` and `drain()` each start no work later than handler start + 40 s
   (`provider-migrate-reconcile.ts:59`, `handler.ts:75`). A 90 s reverse pass placed before them would starve both on every
-  tick with a move in flight.
+  tick with a move in flight. The held pass is before them for the same reason (its own comment, `handler.ts:23-26`).
+- **[r6] The held pass never stops, bills or reports the export boot (lane A: `handler.ts`, `route.ts`).** 6a's held pass
+  bounds a held (Free, files on AWS) host by its session alone. Its candidates are AWS computers whose newest epoch is
+  closed and whose placement is RUNNING with no job, or UNCONFIRMED (`runningAwsComputersAfterEpochs`, `store.ts:655-704`).
+  It stops a RUNNING one with no open epoch (`tryStop(computer, 'session_max')`, `handler.ts:249`) and logs an UNCONFIRMED
+  one as `held-unconfirmed` (`:237-240`). It never opens, closes or rates an epoch. An export boot is not a held session:
+  - it never reaches RUNNING (§5.2), so it is never a stop candidate there; it opens no epoch, so it is never a policy
+    candidate; the retry pass's `isStillRunningAt` requires RUNNING (`route.ts:22-41`);
+  - but `releaseExportBoot` leaves it UNCONFIRMED/`ENROLLMENT_FAILED` in every successful `checking`, and a failed boot
+    settles through UNCONFIRMED (§5.2). A held computer has an earlier closed epoch, so the held pass would log a false
+    `held-unconfirmed` for it every minute.
+  - **Rule.** `handleBillingSessionSweep` takes one more optional dependency, `reverseMoveInFlight: (computerId: string) =>
+    Promise<boolean>`. The route wires it as `reverseMovesTablePresent(db)`, then `readByComputer(computerId)` with its
+    `state` in `REVERSE_MOVE_IN_FLIGHT` (`requested` … `flipping`, `provider-reverse-store.ts:33`). The held loop calls it
+    right after the `attempted`/grace check (`handler.ts:230`) and before `openEpochFor` (`:232`). `true` → `continue`:
+    no `heldOverrun`, no `held-overrun` or `held-unconfirmed` line, no `tryStop`. A throw lands in the loop's own catch
+    (`held check failed`, `:250-252`), which skips too: fail closed, never a stop. Without the dependency (no 0012, or
+    tests that omit it) the held pass is exactly 6a's.
+  - It keys on the newest row being **in flight**, never on a holding row. A `failed_needs_operator('abort_unconfirmed')`
+    row holds the computer while Open works (§5.3), and the hold sessions that then run must stay bounded by the held
+    pass. While a row is in flight no held session can run: every open meets the reverse waiting provider.
+  - `tryStop` needs no change: `stopComputerForPolicy` routes with `routeComputer` (`stop-policy.ts:12-18`), so a stop of a
+    computer in a move meets the waiting provider's `stop` (`computer_moving`) and counts `stopFailed`; nothing reaches AWS.
+  - Lane A tests: an in-flight row with its export boot UNCONFIRMED gives no `held-unconfirmed` and no stop; the same
+    computer after `failed_needs_operator('abort_unconfirmed')`, RUNNING past `RUNNING_GRACE_MS` with no open epoch, is
+    stopped (`heldOverrun` 1); without 0012 the counts are 6a's.
 - It has its **own 90 s budget**, measured from its own start, not the 40 s left over from the handler start that forward
   moves get (`provider-migrate-orchestrator.ts:136-147`). A Worker or AWS call starts only if its own timeout (§4.1)
   fits in what is left of the budget, so the pass ends by its start + 90 s.
@@ -1214,6 +1260,9 @@ move?: null | {
 - **`budgetSeconds = 9300`**, the sum of the §5.4 deadlines: 600 (`requested`) + 900 (`booting`) + 1200 (`exporting`) +
   3600 (`copying`) + 1200 (`checking`) + 1800 (`flipping`). With the driver running (§5.4), every row is terminal by then.
   The shell never fails a move on its own clock before `startedAt + budgetSeconds + 300 s` (§6.4).
+- **[r6] 6a's connect expectation never applies.** The server sends `APP_CONNECT_EXPECTED_SECONDS` (30 s) only for
+  `operation: 'none'` on a RUNNING computer (`progress.ts:56,125,142`), and the shell marks a connect only for
+  `operation: 'none'` (`computer-progress.js:157`). The moving view has `operation: 'moving'` and `expectedSeconds: null`.
 - **Old cached shells:** `progressView` returns null for the unknown stage `moving` (`computer-progress.js:131-133`), so they
   show no opening bar, no `needs_operator` and no wrong copy. Their open loop sees an ordinary `sandbox_starting` (§5.3).
 - **[r4] Why `lifecycleState` is null.** The Computer tab derives `running`, `stopped`, its chip and the Stop button from
@@ -1454,10 +1503,51 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
   (`session.js:239`), the wake deadline and the 600 s `AWS_BOOT_HARD_STOP_MS` (`boot-progress.js:23`) do not apply to it, and
   `awsBootTimeoutVerdict`/`awsBootWaitVerdict` never return `budget_spent` or `fail` for it.
 - The overlay watches `computer.progress` (5 s polls, as today) and re-asks the open **at most every 30 s**. Each ask is
-  harmless: the reverse waiting provider never boots anything.
+  harmless while the move is in flight: the reverse waiting provider never boots anything.
+- **[r6] The wake loop's clocks (`session.js`; lane U makes this change).** `withWakeAndOneRetry` (`session.js:412-557`) is
+  the one loop behind `openDesktop`, `previewUrl` and `code.js`'s own mint (`code.js:219`). `code.js` and `preview.js` are
+  read-only (§1.1), so the move wait lives **inside** this loop; a loop that handed a moving answer back to its caller
+  would show Code's failure copy. Round 6a extended the loop: the first `computePreparing` answer raises the deadline to
+  `min(that answer + PREPARE_DEADLINE_MS (180 s), t0 + LAUNCH_DEADLINE_MS (600 s))` and raises `maxIssues`, never
+  lowering either (`session.js:263-264,498-508`), and `pendingOrRefused` passes `computePreparing` through (`:839-845`).
+  None of this may cap a move:
+  1. `pendingOrRefused` also passes `computeMoving: true` and `computeMoveNeedsAttention: true` through, in the same form.
+  2. The loop tests `res.computeMoving === true` **first**: before the migrating, launching and preparing branches
+     (`:465-508`) and before the `sandbox_starting` deadline check (`:510-530`). A moving answer deletes this loop's
+     migrating, launching and preparing entries (so `isComputeMigrating`, `isComputeLaunching` and `isComputePreparing`
+     read false for it), never sets `prepareStartedAt`, and **replaces** `deadline` and `maxIssues` with the move's own:
+     `deadline = firstMovingAt + MOVE_WATCH_MS`, `MOVE_WATCH_MS = (budgetSeconds + 300) s` (§5.10), and
+     `maxIssues = asks − 1 + ceil(MOVE_WATCH_MS / MOVE_REASK_MS) + 2`, `MOVE_REASK_MS = 30 s`. It pauses `MOVE_REASK_MS`, not
+     `WAKE_REASK_MS`. So `WAKE_DEADLINE_MS`, `MIGRATION_DEADLINE_MS`, `PREPARE_DEADLINE_MS`, the `t0 + LAUNCH_DEADLINE_MS`
+     clamp and `MAX_ISSUES` (40, `:233`) never end a moving loop.
+  3. **It re-asks only while the move is in flight or committed.** After each pause the loop reads `computer.progress`
+     once, then: `operation: 'moving'` with no `move.outcome` → ask; `move.outcome: 'committed'` → ask (it now opens the
+     Free computer); `failed_reopened` or `failed_needs_operator` → no ask: it returns the last moving answer and the
+     caller shows the outcome (below). r5's "the open stops answering `computeMoving` → re-ask" is withdrawn: an answer
+     without `computeMoving` means the server already ran an ordinary open, which after a failure is a D16 hold boot of
+     the AWS computer. **Disclosed:** a failure that lands between that progress read and the server routing the ask
+     still boots the AWS computer under the hold. Closing it would need a new `previewUrl` input, which `code.js` cannot
+     send.
+  4. The first answer without `computeMoving` after a moving one re-anchors the loop, as `wakeResumed` does after a forward
+     migration (`:476-480`): `t0 = now`, `deadline = now + WAKE_DEADLINE_MS`, `maxIssues = asks − 1 + AWS_MAX_ISSUES`,
+     `prepareStartedAt = launchStartedAt = null`. A later preparing answer clamps at the new `t0 + LAUNCH_DEADLINE_MS`.
+  5. `MOVE_WATCH_MS` spent with the move still in flight → the loop returns the last moving answer and the caller shows
+     `OPENING_COPY.runningLong` and Send feedback (below), never a failure.
+  6. A `computeMoveNeedsAttention` answer is deterministic (`preconditions_unmet`): the loop returns it at once, with no
+     silent re-ask, and the caller shows the open-blocked card before `classifyFailure`.
+  - Lane U's shell tests (the `session-preparing-test.mjs` pattern): a moving answer after a preparing one is not ended
+    at `t0 + 600 s`; a moving loop outlives 40 asks; a failed outcome read after a pause sends no further ask; a committed
+    outcome re-asks with fresh wake clocks.
+- **[r6] 6a's other open answers.** `computePreparing` and the Worker's terminal desktop codes (`desktop_config_unapplied`,
+  `desktop_failed`: `aws-preview.ts:55-58,284`; deterministic in `boot-phases.shell.js:359-360,427-429`, with 6a's
+  "Restart computer" copy at `:676-689`) come only from `requestAwsPreview`, which a computer in a move never reaches
+  (§5.3). After a move they behave exactly as in 6a: a `failed_reopened` user who picks [Open my AWS computer] gets an
+  ordinary hold open, with 6a's preparing wait and copy. `app-spinner.js` checks the moving view before its preparing
+  latch (`open.prepare`, `app-spinner.js:309-311,347,383`), so an observation with `operation: 'moving'` is always painted
+  as the move. During a move, Troubleshoot's Restart computer meets the reverse provider (§5.3) and changes nothing.
 - The watch ends when, after this open has itself seen `operation: 'moving'` (the `seenInFlight` rule of
   `watchComputerTransition`, `computer-progress.js:359-376`):
-  - `move.outcome` is `committed`, or the open stops answering `computeMoving` → re-ask the open (it now opens the Free computer);
+  - `move.outcome` is `committed` → re-ask the open (it now opens the Free computer; **[r6]** item 3 above);
   - `move.outcome` is `failed_reopened` or `failed_needs_operator` → show the outcome below. **Never auto-open the AWS
     computer**: under the D16 hold that boot uses Free hours at the AWS size, so the user chooses it;
   - `startedAt + budgetSeconds + 300 s` passes with no outcome → `OPENING_COPY.runningLong` and Send feedback. That is
@@ -1501,7 +1591,10 @@ in a non-terminal stage):
   §5.10).
 - **Actions:** no Open desktop, no Stop and no Start now (`:790-792,728-731`). Rename stays; Delete is disabled (a delete
   is refused during a move, §5.3). Configuration cards stay locked (held).
-- **Body:** the move card only (`moveHtml`, §6.3 copy). No transition, "Now running" or switch-failed card.
+- **Body:** the move card only (`moveHtml`, §6.3 copy). No transition, "Now running" or switch-failed card. **[r6]** Nor
+  6a's files-held card (`standingHtml`, `computers.js:605-624`, including the held-closed [Upgrade]), its hold line
+  (`holdLine`, `:512`) or its "This session ends at" line (`sessionEndsHtml`, `:627`): the move card replaces them until
+  the outcome.
 - If `computer.progress` shows `operation: 'moving'` while the summary's `reverseMove` is still null (a move started from an open
   in another window), the tab re-reads `billing.summary` once per poll until `reverseMove` appears, at most 6 times.
 - `openBlocked` true: chip `{state: 'attention', text: 'Needs attention'}`, no Open, and the needs-attention card.
