@@ -114,6 +114,16 @@ const FRAME_CONFIRM_ATTEMPTS = FRAME_CONFIRM_DELAYS_MS.length;
 const FRAME_RECOVERY_ATTEMPTS = 12;
 
 /**
+ * Round 6 (R3-1/R3-2, live 10-30 05:42-05:44Z): the mint gave up (its existing wake deadline) while the
+ * computer was observed RUNNING with nothing opening. The generic `timeout` copy ("Starting your computer is
+ * taking longer than it should") is false there: the computer is up and Code did not answer. Same Try again.
+ */
+const CODE_UNREACHABLE_COPY = {
+    title: "Code isn't reachable right now",
+    body: "Your computer is running, but Code didn't answer in time. It may still be starting up — try again.",
+};
+
+/**
  * Mint a fresh code-server window URL. Mirrors `session.js`'s `previewUrl()`
  * exactly (same request shape, same error-code taxonomy) against
  * `/api/shell/code-preview-url` instead of `/api/shell/preview-url` — see
@@ -448,11 +458,14 @@ export async function openCodeWindow (ctx = {}) {
                 eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
             });
-            progress.render(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            // A give-up over a computer the server says is running (and opening nothing) is Code's, not the computer's.
+            const running = progress.computerProgress()?.connect === true;
+            progress.render(failed.kind === 'failed' && failed.reason === 'timeout' && running ? { ...failed, copy: CODE_UNREACHABLE_COPY } : failed);
             // Terminal: the mint failed for real.
             trace.step('mint_error');
             trace.end('error');
