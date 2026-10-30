@@ -244,6 +244,24 @@ export { LAUNCH_COPY } from './launch-copy.js';
 
 const LAUNCH_MAX_ISSUES = Math.ceil(LAUNCH_DEADLINE_MS / WAKE_REASK_MS) + 2;
 const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 2;
+/**
+ * Round 6a (C2): how long a loop waits from the FIRST preparing answer it sees (`computePreparing`: the
+ * computer's desktop is taking this host boot's config, or code-server is starting after it). Without it an
+ * open that carries no launch flag (a stopped computer starting in place, a warm pool adopt) and first sees
+ * preparing at ~70 s gave up at 216 s, before the Worker's own verdict at ~222 s, and read "Code isn't
+ * reachable" over a wait that was still bounded.
+ *
+ * 180 s = the Worker's 150 s bound (worker/src/aws-ice.ts AWS_DESKTOP_CONFIG_APPLY_MS, counted from its one
+ * push, which the first preparing answer never precedes) + 30 s: the ask that carries the verdict lands up to
+ * one re-ask later (WAKE_REASK_MS, then one ask's answer: the Worker's 8 s status read and 5 s surface probe),
+ * and a config applied at the very end of the window still restarts the desktop's container before code-server
+ * answers (`code_starting`, a preparing reason too). The spinner says "Taking longer than usual" from
+ * PREPARE_EXPECTED_S (150 s, ui/app-spinner.js) after the same first sight, so that always shows first.
+ * Extended once per loop, never past t0 + LAUNCH_DEADLINE_MS (the loader's ten-minute ceiling,
+ * ui/boot-progress.js AWS_BOOT_HARD_STOP_MS); an ordinary wake ends by 215 s + 180 s = 395 s at the latest.
+ */
+export const PREPARE_DEADLINE_MS = 180_000;
+const PREPARE_MAX_ISSUES = Math.ceil(PREPARE_DEADLINE_MS / WAKE_REASK_MS) + 2;
 
 // Per-request observations let a window show a warm request's progress too.
 // Concurrent opens cannot clear one another's still-active migration signal.
@@ -365,7 +383,9 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  *      `app/src/server/lib/cloudflare-guacamole-provider.ts`). The honest
  *      response is to ask again, which is what this does, until
  *      `WAKE_DEADLINE_MS`. A flagged migration first gets its own bounded
- *      deadline, then a fresh wake budget when the flag drops. The caller's boot panel is on a `setInterval` of its
+ *      deadline, then a fresh wake budget when the flag drops; a flagged launch
+ *      gets its own; the first preparing answer extends it once, to the
+ *      Worker's verdict (`PREPARE_DEADLINE_MS`). The caller's boot panel is on a `setInterval` of its
  *      own, so the phase list keeps running the whole time — the user sees
  *      "Waking your machine" for as long as that is the true statement, instead
  *      of a dead socket followed by "We couldn't start your computer."
@@ -397,6 +417,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
     let deadline = t0 + WAKE_DEADLINE_MS;
     let migrationStartedAt = null;
     let launchStartedAt = null;
+    let prepareStartedAt = null;
     let wakeResumed = false;
     const progressKey = Symbol();
     // 🔴 A CANCELLED LOOP NEVER ASKS AGAIN. Every ask runs the server's ensure,
@@ -470,15 +491,25 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
             } else {
                 launchingRequests.delete(progressKey);
             }
-            // Seam C: a qualifier on the wake, never a bound. The wait stays within this loop's deadline.
-            if ( computerId && res.ok !== true && res.errorCode === 'sandbox_starting'
-                 && res.computeProvider === 'aws-ec2' && res.computePreparing === true ) {
-                preparingRequests.set(progressKey, computerId);
+            // Seam C: the computer's desktop is taking this host boot's config (or code-server is starting after
+            // it). Round 6a (C2): the FIRST such answer also bounds the wait by the Worker's own verdict
+            // (PREPARE_DEADLINE_MS from now), once per loop, never shortening it and never past the ten-minute
+            // ceiling. The deadline is the loop's whatever the caller; only the surface's flag needs the id.
+            const preparing = res.ok !== true && res.errorCode === 'sandbox_starting'
+                && res.computeProvider === 'aws-ec2' && res.computePreparing === true;
+            if (preparing) {
+                if (computerId) preparingRequests.set(progressKey, computerId);
+                if (prepareStartedAt === null) {
+                    prepareStartedAt = now;
+                    deadline = Math.max(deadline, Math.min(prepareStartedAt + PREPARE_DEADLINE_MS, t0 + LAUNCH_DEADLINE_MS));
+                    maxIssues = Math.max(maxIssues, asks - 1 + PREPARE_MAX_ISSUES);
+                }
             }
             if ( res.ok === true ) return res;
 
             if ( res.errorCode === 'sandbox_starting' ) {
-                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null && launchStartedAt === null) maxIssues = AWS_MAX_ISSUES;
+                // Never lowers a cap a preparing answer raised (this runs on every starting answer).
+                if (res.computeProvider === 'aws-ec2' && migrationStartedAt === null && launchStartedAt === null) maxIssues = Math.max(maxIssues, AWS_MAX_ISSUES);
                 const waited = now - t0;
                 if ( now >= deadline ) {
                     console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
