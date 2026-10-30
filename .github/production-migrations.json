@@ -65,6 +65,11 @@
       "path": "app/drizzle/0011_feedback.sql",
       "sha256": "22b7a9d5e8842db0d1c8e9d3ee92324c933777b7bf9474fb52ff29f9cc9d51aa",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0012_compute_reverse_moves.sql",
+      "sha256": "d14ce896c0d7f9176ec9956266b44b4a985a1df2a587bc64cea87ef1047bc0c8",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

@@ -3,6 +3,7 @@ import { sql } from 'drizzle-orm';
 import type { PlacementExecutor } from './placement';
 import type { MigrateConflictReason } from '../cloudflare-guacamole-provider';
 import { pendingRecovery, reduceMigration, type MigrationEvent, type MigrationProgress, type SnapshotHead } from './provider-migrate';
+import { inMoveTransaction, reverseMoveHolds } from './provider-reverse-store';
 
 export type MigrationFailureReason = MigrateConflictReason | 'system_head_mismatch';
 export type MigrationStoreEvent = MigrationEvent & { reason?: MigrationFailureReason };
@@ -131,10 +132,16 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
         async createOrGetActive(input: { computerId: string; userId: string; toSize: 'standard' | 'premium' }): Promise<ComputeMigration> {
             // A separate read sees a concurrent creator's committed row under READ COMMITTED.
             for (let attempt = 0; attempt < 5; attempt++) {
-                const inserted = one(await db.execute(sql`INSERT INTO public.ezil_compute_migrations
+                // Cross-direction exclusion (docs/compute/REVERSE-MOVE-CONTRACT.md §3.2): a new row is
+                // kept only if, under the per-computer lock, no reverse move holds the computer.
+                const inserted = await inMoveTransaction(db, async tx => {
+                    const row = one(await tx.execute(sql`INSERT INTO public.ezil_compute_migrations
                     (computer_id, user_id, from_provider, to_provider, to_size)
                     VALUES (${input.computerId}::uuid, ${input.userId}::uuid, 'cloudflare', 'aws-ec2', ${input.toSize})
                     ON CONFLICT (computer_id) WHERE ${ACTIVE} DO NOTHING RETURNING ${COLUMNS}`));
+                    if (row && await reverseMoveHolds(tx, input.computerId)) throw new MigrationConflictError();
+                    return row;
+                });
                 const m = inserted ?? await readActiveByComputer(input.computerId);
                 if (!m) continue;
                 if (m.userId !== input.userId.toLowerCase() || m.toSize !== input.toSize) throw new MigrationConflictError();

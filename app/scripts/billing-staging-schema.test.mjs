@@ -381,7 +381,6 @@ test('restore progress production apply and baseline refuse before connecting', 
 test('feedback follows 0010 and is registered as a production snapshot only', () => {
     const file = 'app/drizzle/0011_feedback.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0010_migration_restore_progress.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     for (const table of ['ezil_feedback_reports', 'ezil_feedback_attachments', 'ezil_feedback_access_log']) {
         assert.match(sql, new RegExp(`CREATE TABLE public\\.${table} \\(`));
@@ -398,6 +397,34 @@ test('feedback follows 0010 and is registered as a production snapshot only', ()
 test('feedback production apply and baseline refuse before connecting', () => {
     for (const mode of [['apply', '--yes'], ['baseline', '0011_feedback.sql', '--yes'],
         ['baseline', './app/drizzle/0011_feedback.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+test('reverse moves follow 0011, are last, and are registered as a production snapshot only', () => {
+    const file = 'app/drizzle/0012_compute_reverse_moves.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0011_feedback.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    // A NEW table: 0006 (the forward table) is never altered or relaxed.
+    assert.match(sql, /CREATE TABLE public\.ezil_compute_reverse_moves \(/);
+    assert.doesNotMatch(sql, /ezil_compute_migrations|ALTER TABLE public\.(?!ezil_compute_reverse_moves )/);
+    assert.match(sql, /state text NOT NULL DEFAULT 'requested' CHECK \(state IN \('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping', 'committed', 'failed_reopened', 'failed_needs_operator'\)\)/);
+    assert.match(sql, /CREATE UNIQUE INDEX ezil_compute_reverse_moves_one_active_per_computer\s+ON public\.ezil_compute_reverse_moves \(computer_id\)\s+WHERE state NOT IN \('committed', 'failed_reopened'\);/);
+    assert.match(sql, /ALTER TABLE public\.ezil_compute_reverse_moves ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /REVOKE ALL ON TABLE public\.ezil_compute_reverse_moves FROM public, anon, authenticated;/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP |TRUNCATE|CREATE (?:OR REPLACE )?(?:FUNCTION|TRIGGER)/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('reverse moves production apply and baseline refuse before connecting', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0012_compute_reverse_moves.sql', '--yes'],
+        ['baseline', './app/drizzle/0012_compute_reverse_moves.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
