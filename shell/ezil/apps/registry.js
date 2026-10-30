@@ -668,16 +668,18 @@ async function launchSingle (id, ctx) {
  *   link, Back/Forward) or `'none'`. See `../app-history.js`.
  */
 export async function launch (id, ctx = {}) {
-    // Held while the window is created: it focuses itself on the way, and
-    // that focus must not overwrite the entry this push is about to follow.
-    const release = (ctx.historyMode ?? 'push') === 'push' ? appHistory.hold() : null;
+    const app = getApp(id);
+    // A click's history entry goes in BEFORE the window is built — see
+    // `begin` in `../app-history.js` for why after is too late in Chromium.
+    const entry = (ctx.historyMode ?? 'push') === 'push' && app && ! (app.native_only && ! isNative(ctx))
+        ? appHistory.begin(id, ctx) : null;
     let el = null;
     try {
         el = await launchSingle(id, ctx);
     } finally {
-        release?.();
+        entry?.end(el);
     }
-    if ( el ) appHistory.commit(id, ctx);
+    if ( el && ! entry ) appHistory.commit(id, ctx);
     return el;
 }
 

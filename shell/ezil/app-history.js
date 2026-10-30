@@ -139,6 +139,16 @@ export function createAppHistory () {
         win().history[method](mergeHistoryState(win().history.state, patch), '', url);
     };
     const liveWindow = id => win().document.querySelector(`.window[data-app="${id}"]:not([data-closing="1"])`);
+    // Record what this launch says about the app's own URL parameters:
+    // Settings' tab always follows the launch (it reopens at Account without
+    // one), Code's project only when one is given. True if they changed.
+    const remember = (id, ctx) => {
+        const before = JSON.stringify(params.get(id) ?? {});
+        if ( id === 'settings' ) params.set(id, ctx.initialTab ? { tab: ctx.initialTab } : {});
+        else if ( ctx.project ) params.set(id, linkParams({ id, project: ctx.project }));
+        else if ( ! params.has(id) ) params.set(id, {});
+        return JSON.stringify(params.get(id)) !== before;
+    };
 
     function onPopState () {
         const link = parseAppLink(win().location, apps());
@@ -241,34 +251,58 @@ export function createAppHistory () {
             return state?.ezilApp === id && VIEWS.has(state.ezilView) ? state.ezilView : undefined;
         },
 
-        /** Suppress focus-driven writes until the returned release is called. */
-        hold () {
+        /**
+         * A user's click is about to launch `id`: add its entry NOW, before
+         * the window exists. 🔴 Not after: Chromium files a frame navigation
+         * under the entry that was current when it STARTED, and the Code and
+         * Browser windows start their iframes' navigations while they are
+         * built — committing after a later push, they prune it (MEASURED:
+         * `history.length` 3 -> 2, Back skipped the app). No entry is added
+         * when the address bar already names `id`.
+         *
+         * Until `end(el)`, focus changes write nothing (the new window
+         * focuses itself on the way). `end(null)` — the app did not open —
+         * puts back the URL and state this replaced; the extra entry stays,
+         * as a duplicate of the one before it.
+         * @returns {{end: (el: Element|null) => void}|null} null when this
+         *   module will not write for `id` (an /os-only host, an unknown app).
+         */
+        begin (id, ctx = {}) {
+            if ( ! deps || ! enabled || ! known(id) ) return null;
             holds += 1;
-            let released = false;
-            return () => { if ( ! released ) { released = true; holds -= 1; } };
+            const before = { url: here(), state: win().history.state, params: params.get(id) };
+            const pushed = currentApp() !== id;
+            if ( remember(id, ctx) || pushed ) {
+                write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: undefined } : stateFor(id));
+            }
+            let ended = false;
+            return {
+                end (el) {
+                    if ( ended ) return;
+                    ended = true;
+                    holds -= 1;
+                    if ( el ) {
+                        if ( currentApp() !== id ) write('replaceState', urlFor(id), stateFor(id));
+                        return;
+                    }
+                    if ( before.params === undefined ) params.delete(id);
+                    else params.set(id, before.params);
+                    if ( pushed ) win().history.replaceState(before.state, '', before.url);
+                },
+            };
         },
 
         /**
-         * A launch resolved with a window. `push` (a user gesture, the
-         * default) adds an entry unless the address bar already names this
-         * app; `replace` (a route: boot, Back/Forward) never adds one; `none`
-         * writes nothing. When the address bar already names this app its
-         * URL is kept as it is, unless the launch changed the app's own
-         * parameters (Settings opened at another tab).
+         * A ROUTE's launch (`historyMode` 'replace': the boot's link,
+         * Back/Forward) resolved with a window: never adds an entry. The
+         * entry's URL is kept as it is when it already names `id`, unless the
+         * launch changed the app's own parameters. 'none' writes nothing.
          */
         commit (id, ctx = {}) {
-            const mode = ctx.historyMode ?? 'push';
-            if ( ! deps || ! enabled || mode === 'none' || ! known(id) ) return;
-            const before = JSON.stringify(params.get(id) ?? {});
-            if ( id === 'settings' ) params.set(id, ctx.initialTab ? { tab: ctx.initialTab } : {});
-            else if ( ctx.project ) params.set(id, linkParams({ id, project: ctx.project }));
-            else if ( ! params.has(id) ) params.set(id, {});
-            const changed = JSON.stringify(params.get(id)) !== before;
-            if ( currentApp() !== id ) {
-                write(mode === 'push' ? 'pushState' : 'replaceState', urlFor(id), { ezilApp: id, ezilView: undefined });
-            } else {
-                write('replaceState', changed ? urlFor(id) : here(), stateFor(id));
-            }
+            if ( ! deps || ! enabled || ctx.historyMode === 'none' || ! known(id) ) return;
+            const changed = remember(id, ctx);
+            const same = currentApp() === id;
+            write('replaceState', same && ! changed ? here() : urlFor(id), stateFor(id));
         },
     };
 }

@@ -90,38 +90,46 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
 {
     const { w, controller, open, focus, close, url } = harness(`/os?computer=${C}`);
     same(controller.enabled, true);
+    // A user's click: `begin` before the window exists, `end` with what opened.
+    const gesture = (id, ctx = {}, opened = {}) => controller.begin(id, ctx)?.end(opened);
     const settings = open('settings', 10);
-    controller.commit('settings', {});
+    gesture('settings');
     same([url(), w.history.length, w.history.state], [`/app/settings?computer=${C}`, 2, { __NA: true, ezilApp: 'settings' }], 'push keeps state keys');
-    const release = controller.hold();
+    const launching = controller.begin('code', { project: { projectId: P, repoId: R, path: 'src' } });
+    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3], 'the entry exists before the window does');
     const code = open('code', 11);
+    focus(settings);
+    same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 'a focus during the launch writes nothing');
+    launching.end(code); launching.end(null);
+    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3], 'end() runs once; the opened app keeps the entry');
     focus(code);
-    same(url(), `/app/settings?computer=${C}`, 'a focus during a held launch writes nothing');
-    release(); release();
-    controller.commit('code', { project: { projectId: P, repoId: R, path: 'src' } });
-    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3]);
-    focus(code);
-    same(w.history.length, 3, 'the hold is released exactly once');
+    same(w.history.length, 3);
     focus(settings);
     same([url(), w.history.length], [`/app/settings?computer=${C}`, 3], 'focus replaces');
     focus(code);
     same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, "focus restores the app's own parameters");
-    controller.commit('code', {});
-    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3], 'a dock click on the named app: no entry, same URL');
-    controller.commit('settings', { initialTab: 'usage' });
+    gesture('code');
+    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 3], 'a click on the named app: no entry, same URL');
+    gesture('settings', { initialTab: 'usage' });
     same([url(), w.history.length], [`/app/settings?tab=usage&computer=${C}`, 4]);
-    controller.commit('settings', {});
+    gesture('settings');
     same([url(), w.history.length], [`/app/settings?computer=${C}`, 4], 'Settings reopened at its default drops the tab, in place');
+    const before = w.history.state;
+    controller.begin('code', {}).end(null);
+    same([url(), w.history.length, w.history.state], [`/app/settings?computer=${C}`, 5, before], 'an app that did not open gives the entry back (as a duplicate)');
+    focus(code);
+    same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, '... and keeps the parameters it had');
     controller.commit('settings', { initialTab: 'usage', historyMode: 'none' });
-    same(url(), `/app/settings?computer=${C}`, "historyMode 'none' writes nothing");
+    same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, "historyMode 'none' writes nothing");
+    controller.commit('settings', { historyMode: 'replace' });
+    same([url(), w.history.length], [`/app/settings?computer=${C}`, 5], 'a route launch never pushes');
     controller.commit('code', { historyMode: 'replace' });
-    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 4], "historyMode 'replace' never pushes");
-    controller.commit('unknown', {});
-    same(w.history.length, 4, 'an app the registry does not list is ignored');
+    same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 5]);
+    same([controller.begin('unknown'), w.history.length], [null, 5], 'an app the registry does not list is ignored');
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'window' } }));
     same([w.history.state.ezilView, controller.recordedView('code'), controller.recordedView('settings')], ['window', 'window', undefined]);
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'full' } }));
-    same([w.history.state.ezilView, w.history.state.__NA, w.history.length], ['full', true, 4]);
+    same([w.history.state.ezilView, w.history.state.__NA, w.history.length], ['full', true, 5]);
     // Close: the front app takes the entry; a background close changes nothing.
     focus(code);
     close(settings);
@@ -137,7 +145,7 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     close(settings2);
     same(url(), `/app/desktop?computer=${C}`, 'a minimised window is not in front');
     close(desktop);
-    same([url(), w.history.length, w.history.state.ezilApp], [`/os?computer=${C}`, 4, undefined], 'the last close returns to /os, in place');
+    same([url(), w.history.length, w.history.state.ezilApp], [`/os?computer=${C}`, 5, undefined], 'the last close returns to /os, in place');
     focus(open('code', 30));
     same(url(), `/app/code?computer=${C}`, "a closed app's parameters are forgotten");
 }
@@ -174,7 +182,8 @@ for (const provider of ['native-macos', 'local-vm']) {
     controller.adopt({ id: 'settings', initialTab: 'billing' });
     same(url(), '/os?x=1', `${provider}: never canonicalised`);
     const el = open('code', 1);
-    controller.commit('code', {});
+    same(controller.begin('code', {}), null, `${provider}: a click writes nothing`);
+    controller.commit('code', { historyMode: 'replace' });
     focus(el); close(el);
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'full' } }));
     same([url(), w.history.length], ['/os?x=1', 1], `${provider}: nothing else writes`);
@@ -190,4 +199,4 @@ for (const provider of ['native-macos', 'local-vm']) {
     w.dispatchEvent(new w.PopStateEvent('popstate'));
     same(launches.length, 1, 'one listener, using the latest getters');
 }
-console.log(`PASS ${checks} checks: app-history helpers, push/replace/hold, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install`);
+console.log(`PASS ${checks} checks: app-history helpers, push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install`);
