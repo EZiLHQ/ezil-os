@@ -26,7 +26,7 @@
  * browser-safe set, like Cloudflare. Credentials are never logged, never put in an error,
  * and never returned to a caller of this module except inside the pushed body.
  */
-import { filterBrowserSafeIceServers, type IceServerEntry } from './desktop-mode';
+import { CODE_PREVIEW_PORT, filterBrowserSafeIceServers, type IceServerEntry } from './desktop-mode';
 import { relayOperation, RelayFailure, type RelayState } from './relay-refresh';
 import {
   AWS_DESKTOP_PORT,
@@ -50,6 +50,10 @@ export const DESKTOP_STATUS_PATH = '/__ezil/control/desktop';
 export const MAX_DESKTOP_CONFIG_BYTES = 16_384;
 /** The host answers its status from the agent within seconds; a hung edge or tunnel must not hold the open. */
 export const AWS_DESKTOP_STATUS_TIMEOUT_MS = 8_000;
+/** code-server's own liveness route (it runs with `--auth none` behind the gateway). */
+export const CODE_HEALTH_PATH = '/healthz';
+/** A Code open asks again within seconds; one probe must not hold it. */
+export const AWS_SURFACE_PROBE_TIMEOUT_MS = 5_000;
 /**
  * How long a config pushed to a RUNNING desktop may stay unapplied. The host applies it only by
  * restarting the desktop (agent.py `_accept_relay`), on its next tick (30 s, config.py `idle`),
@@ -250,6 +254,36 @@ export async function readAwsDesktopStatus(
     restartsExhausted: d.restartsExhausted === true,
     ...(typeof d.bootId === 'string' && /^[0-9a-f-]{36}$/.test(d.bootId) ? { bootId: d.bootId, aiConfigured: d.aiConfigured === true } : {}),
   };
+}
+
+/**
+ * Whether a Code or hosted-app surface answers on this computer's origin, whatever the desktop
+ * (neko, its relay, Chat's AI config) is doing. Code: code-server's own `/healthz` answers a
+ * gw1-signed GET on `/__p/8443/healthz` (the host edge answers 502 `desktop_unreachable` while
+ * nothing listens). The hosted app: the desktop container runs; its dev server is the user's,
+ * so one that is absent is normal and the app's own page says so. Any failure is "not yet".
+ */
+export async function awsSurfaceAnswers(
+  record: AwsTunnelRecord,
+  zone: string,
+  surface: 'code' | 'app',
+  fetchFn: FetchLike,
+  nowMs: () => number,
+  timeoutMs = AWS_SURFACE_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
+  try {
+    const nowSeconds = Math.floor(nowMs() / 1000);
+    if (surface === 'app') return (await readAwsDesktopStatus(record, zone, fetchFn, nowSeconds, timeoutMs)).desktop === 'running';
+    const { host, key } = originFor(record, zone);
+    const path = `/__p/${CODE_PREVIEW_PORT}${CODE_HEALTH_PATH}`;
+    const header = await signGatewayHeader(key, record, 'GET', path, nowSeconds);
+    const res = await fetchFn(`https://${host}${path}`, { method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header },
+      redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    await res.body?.cancel().catch(() => undefined);
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**

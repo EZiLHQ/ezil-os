@@ -62,10 +62,10 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
-import { awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
+import { awsPreviewSurface, awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
 import { AwsTunnelRegistry, lookupAwsTunnel, lookupAwsTunnelForBrowser, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
-import { awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, type RelayMint, type ScreenDesktop } from './aws-ice';
+import { awsRelayRefresh, awsScreenDesktop, awsSurfaceAnswers, ensureAwsDesktop, ensureAwsDesktopConfig, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
@@ -4639,6 +4639,13 @@ interface PreviewBody {
    * default — i.e. exactly today's behaviour.
    */
   screen?: { width?: unknown; height?: unknown };
+  /**
+   * AWS computers only: the window that asks, `code` or `app`; anything else, or absent (an app
+   * that sends none), is the desktop. Code and the hosted app are answered once their own
+   * origin answers, without waiting on the desktop's relay (`awsPreviewSurface`, aws-origin.ts).
+   * Covered by the v2 body digest like every other field.
+   */
+  surface?: unknown;
 }
 
 async function handlePreview(
@@ -4766,22 +4773,36 @@ async function handlePreview(
       const registry = awsRegistryFor(env);
       if (v2.provider === 'aws-ec2' && awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && registry) {
         tl.event('project_authorization', 'sandbox.preview.v2_binding', 'ok', { detail: 'provider=aws-ec2' });
-        return handleAwsPreview(v2, {
-          zone: resolveAwsOriginZone(env),
+        const zone = resolveAwsOriginZone(env);
+        const awsFetch = (input: string, init: RequestInit) => fetch(input, init);
+        // The desktop's TURN relay and config: per-epoch config push, then in-place renewal (./aws-ice).
+        const desktop = async (record: AwsTunnelRecord) => {
+          if (!zone) throw new RelayFailure('aws_origin_unavailable');
+          return { record, zone, fetch: awsFetch, nowMs: Date.now,
+            aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
+            neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) };
+        };
+        const answer = await handleAwsPreview(v2, {
+          zone,
           secrets: resolvePreviewSecrets(env).slice(0, 1),
           zoneRoot: resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT),
           lookup: (sid) => lookupAwsTunnel(registry, sid),
           verifyOrigin: (sid) => verifyAwsTunnelOrigin(registry, sid),
-          // The desktop's TURN relay: per-epoch config push, then in-place renewal (./aws-ice).
-          ensureDesktop: async (record) => {
-            const zone = resolveAwsOriginZone(env);
-            if (!zone) throw new RelayFailure('aws_origin_unavailable');
-            return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
-              aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
-              neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
-          },
+          ensureDesktop: async (record) => ensureAwsDesktop(await desktop(record)),
+          // Code and the hosted app answer from their own origin, never the desktop's relay (aws-origin.ts).
+          surface: awsPreviewSurface(body.surface),
+          surfaceAnswers: async (record, surface) => !!zone && awsSurfaceAnswers(record, zone, surface, awsFetch, Date.now),
+          ensureConfig: async (record) => ensureAwsDesktopConfig(await desktop(record)),
+          background: ctx ? (task) => ctx.waitUntil(task) : undefined,
           nowMs: Date.now,
         });
+        if (answer.status !== 200) {
+          // Codes only: which answer each ask got (10-30's two-minute stall logged a bare 503).
+          const { error, reason } = (await answer.clone().json().catch(() => ({}))) as { error?: unknown; reason?: unknown };
+          tl.event('preview_lifecycle', 'sandbox.preview.aws', 'error', {
+            error: `${typeof error === 'string' ? error : 'aws_preview_failed'}${typeof reason === 'string' ? `:${reason}` : ''}` });
+        }
+        return answer;
       }
       tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'provider_not_routable' });
       return json({ ok: false, error: 'provider_not_routable' }, 401);

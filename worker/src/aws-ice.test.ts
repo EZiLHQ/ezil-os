@@ -12,15 +12,17 @@ import {
   awsRelayContainer,
   awsRelayRefresh,
   buildAwsDesktopConfig,
+  awsSurfaceAnswers,
   desktopConfigBody,
   ensureAwsDesktop,
+  ensureAwsDesktopConfig,
   pushAwsDesktopConfig,
   readAwsDesktopStatus,
   sha256Hex,
   type AwsDesktopConfig,
   type RelayMint,
 } from './aws-ice';
-import { decodeControlKey, handleAwsPreview, verifyGatewayHeader, type AwsTunnelRecord, type FetchLike } from './aws-origin';
+import { awsPreviewSurface, decodeControlKey, handleAwsPreview, verifyGatewayHeader, type AwsPreviewSurface, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import type { IceServerEntry } from './desktop-mode';
 import { RelayFailure } from './relay-refresh';
 import type { PreviewTokenV2Claims } from './hmac';
@@ -485,5 +487,122 @@ describe('handleAwsPreview with the desktop relay', () => {
     expect(await res.json()).toEqual({ ok: false, error: 'turn_unavailable' });
     const odd = await handleAwsPreview(claims(), deps(async () => { throw new Error(`boom ${TURN_PASS}`); }));
     expect(await odd.json()).toEqual({ ok: false, error: 'relay_refresh_failed' });
+  });
+});
+
+describe('handleAwsPreview: the Code and app surfaces never wait on the desktop', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  const claims = (): PreviewTokenV2Claims => ({
+    ts: NOW, sandboxId: SID, computerId: CID, userId: 'u1', provider: 'aws-ec2', store: '', generation: 1, leaseEpoch: 2,
+  });
+  const ai = async () => ({ baseUrl: `https://aws-8443-${SID}-aws.preview.example.org/ai/v1`, proxyToken: 'f'.repeat(64) });
+  /** The index.ts wiring, against one fake host: the desktop path is counted, background work is collected. */
+  function wired(h: ReturnType<typeof fakeHost>, surface?: AwsPreviewSurface, start: Partial<AwsTunnelRecord> = {}) {
+    let rec = record(start);
+    const tasks: Promise<unknown>[] = [];
+    const seen = { desktop: 0, probes: 0 };
+    const params = (r: AwsTunnelRecord) => ({ record: r, zone: ZONE, fetch: h.fetch, nowMs: () => NOW, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
+      restartPush: async (bootId: string) => { rec = { ...rec, restartPushBootId: bootId, restartPushAt: NOW }; } });
+    const deps = {
+      zone: ZONE, secrets: ['s3cr3t'], zoneRoot: 'preview.example.org', lookup: async () => rec,
+      verifyOrigin: async () => 'verified' as const, nowMs: () => NOW, surface,
+      ensureDesktop: (r: AwsTunnelRecord) => { seen.desktop += 1; return ensureAwsDesktop(params(r)); },
+      ensureConfig: (r: AwsTunnelRecord) => ensureAwsDesktopConfig(params(r)),
+      surfaceAnswers: (r: AwsTunnelRecord, s: 'code' | 'app') => { seen.probes += 1; return awsSurfaceAnswers(r, ZONE, s, h.fetch, () => NOW); },
+      background: (t: Promise<unknown>) => { tasks.push(t); },
+    };
+    const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
+    return { deps, tasks, seen, pushes };
+  }
+
+  it('10-30 live: code-server answers while the desktop waits on its AI config -> Code gets its URL now; the config goes out once, after', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+      nekoUp: false, codeUp: true, pushState: 'restart_scheduled' });
+    const w = wired(h, 'code', { aiBootId: BOOT });
+    const res = await handleAwsPreview(claims(), w.deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.preview.example.org/preview-bootstrap?token=`);
+    expect(body.relay).toBeUndefined();
+    expect(body.turnRelay).toBeUndefined();
+    expect(w.seen.desktop).toBe(0);
+    // Chat's AI env (code-server's ezil-models extension) is not dropped: pushed once, in the background.
+    expect(w.tasks.length).toBe(1);
+    await Promise.all(w.tasks);
+    expect(w.pushes()).toBe(1);
+    expect(h.st.config!.ai).toBeDefined();
+    // The next Code ask neither waits nor pushes again.
+    const again = await handleAwsPreview(claims(), w.deps);
+    expect(again.status).toBe(200);
+    await Promise.all(w.tasks);
+    expect(w.pushes()).toBe(1);
+  });
+  it('the desktop surface is unchanged on that same host: it still waits (503 aws_desktop_starting) and never probes Code', async () => {
+    for (const surface of [undefined, 'desktop'] as const) {
+      const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
+        nekoUp: false, codeUp: true, pushState: 'restart_scheduled' });
+      const w = wired(h, surface, { aiBootId: BOOT });
+      const res = await handleAwsPreview(claims(), w.deps);
+      expect([res.status, await res.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'restart_scheduled' }]);
+      expect([w.seen.desktop, w.seen.probes, w.tasks.length]).toEqual([1, 0, 0]);
+      h.st.aiConfigured = true;
+      h.st.nekoUp = true;
+      const ready = await handleAwsPreview(claims(), w.deps);
+      expect(ready.status).toBe(200);
+      expect(((await ready.json()) as Record<string, unknown>).turnRelay).toBe(true);
+    }
+  });
+  it('a cold host (no config, Code not up): the Code ask still pushes the config inline and answers starting', async () => {
+    const h = fakeHost({ bootId: BOOT, aiConfigured: false });
+    const w = wired(h, 'code');
+    const res = await handleAwsPreview(claims(), w.deps);
+    expect([res.status, await res.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pushed' }]);
+    expect([w.pushes(), w.tasks.length, w.seen.desktop]).toEqual([1, 0, 0]);
+    expect(h.st.config!.ai).toBeDefined();
+  });
+  it('the desktop runs with its config but code-server is not up yet: 503 code_starting, no push', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: true });
+    const w = wired(h, 'code');
+    const res = await handleAwsPreview(claims(), w.deps);
+    expect([res.status, await res.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'code_starting' }]);
+    expect(w.pushes()).toBe(0);
+  });
+  it('a config failure while Code is not up answers its code; a background failure never touches Code\'s answer', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 600_000, desktop: 'absent', unit: 'failed', restartsExhausted: true });
+    const w = wired(h, 'code');
+    const res = await handleAwsPreview(claims(), w.deps);
+    expect([res.status, await res.json()]).toEqual([502, { ok: false, error: 'aws_desktop_failed' }]);
+    const up = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', codeUp: true });
+    const v = wired(up, 'code');
+    v.deps.ensureConfig = async () => { throw new RelayFailure('turn_unavailable'); };
+    expect((await handleAwsPreview(claims(), v.deps)).status).toBe(200);
+    await Promise.all(v.tasks);
+  });
+  it('the hosted app surface is served once the desktop container runs, without waiting on neko or the AI config', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false, nekoUp: false });
+    const w = wired(h, 'app', { aiBootId: BOOT });
+    const res = await handleAwsPreview(claims(), w.deps);
+    expect(res.status).toBe(200);
+    expect(String(((await res.json()) as Record<string, unknown>).appPreviewUrl)).toContain('https://aws-3002-');
+    expect(w.seen.desktop).toBe(0);
+    const down = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'absent', unit: 'activating' });
+    const res2 = await handleAwsPreview(claims(), wired(down, 'app').deps);
+    expect([res2.status, await res2.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'desktop_starting' }]);
+  });
+  it('awsSurfaceAnswers: a gw1-signed GET of code-server\'s /healthz; an edge 502, a throw or a hang is not up', async () => {
+    const h = fakeHost({ codeUp: true });
+    expect(await awsSurfaceAnswers(record(), ZONE, 'code', h.fetch, () => NOW)).toBe(true);
+    expect(h.calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /__p/8443/healthz']);
+    expect(h.bad).toEqual([]);
+    h.st.codeUp = false;
+    expect(await awsSurfaceAnswers(record(), ZONE, 'code', h.fetch, () => NOW)).toBe(false);
+    expect(await awsSurfaceAnswers(record(), ZONE, 'code', async () => { throw new Error('reset'); }, () => NOW)).toBe(false);
+    const hung: FetchLike = (_u, init) => new Promise((_r, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
+    expect(await awsSurfaceAnswers(record(), ZONE, 'code', hung, () => NOW, 25)).toBe(false);
+    expect(await awsSurfaceAnswers(record({ controlKey: 'nope' }), ZONE, 'code', h.fetch, () => NOW)).toBe(false);
+  });
+  it('the surface comes only from the exact signed body values; anything else is the desktop', () => {
+    expect(['code', 'app', 'desktop', undefined, 'CODE', 'neko', 1, {}].map(awsPreviewSurface))
+      .toEqual(['code', 'app', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop']);
   });
 });

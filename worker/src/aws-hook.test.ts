@@ -93,6 +93,8 @@ afterEach(() => { globalThis.fetch = realFetch; });
 interface FakeHost {
   bootId?: string; aiConfigured?: boolean;
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
+  /** code-server answers its /healthz on 8443; otherwise the edge's 502. */
+  codeUp?: boolean;
   pushed?: { ai?: { baseUrl: string; proxyToken: string }; expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; turnStatus?: number; bad: string[]; paths: string[];
 }
@@ -118,6 +120,7 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
     if (url.pathname.startsWith('/__ezil/control/restart-desktop/')) return j({ ok: true, state: 'restart_requested' });
+    if (url.pathname === '/__p/8443/healthz') return h.codeUp ? j({ status: 'alive' }) : j({ ok: false, error: 'desktop_unreachable' }, 502);
     if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
@@ -665,6 +668,48 @@ describe('AWS AI signed boot delivery', () => {
   });
 });
 
+describe('AWS Code surface through the hook', () => {
+  it('Code answers at once while the desktop waits on its AI config; the config goes out once (waitUntil); the desktop still waits', async () => {
+    const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+    await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied',
+      aiConfigured: false, codeUp: true });
+    const tasks: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (t: Promise<unknown>) => { tasks.push(t); }, passThroughOnException() {} } as never;
+    const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+    const logs: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation((line: unknown) => { logs.push(String(line)); });
+    try {
+      const codeBody = JSON.stringify({ userId: USER, projectId: CID, surface: 'code' });
+      const code = await worker.fetch(await signed('POST', '/sandbox/preview', codeBody), e, ctx);
+      expect(code.status).toBe(200);
+      const body = await code.json() as Record<string, unknown>;
+      expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.ezil.work/preview-bootstrap?token=`);
+      expect(body.relay).toBeUndefined();
+      expect(host.paths.slice(0, 1)).toEqual(['GET /__p/8443/healthz']);
+      await Promise.all(tasks);
+      expect(pushes()).toBe(1);
+      expect(host.pushed!.ai!.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+      // The desktop (no surface: today's app) still waits for the restart that applies it; nothing more is pushed.
+      const desk = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e, ctx);
+      expect([desk.status, await desk.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }]);
+      expect(pushes()).toBe(1);
+      // Each non-200 answer is logged with its code and reason (never a URL or token).
+      const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+        .find((ev) => ev?.event === 'sandbox.preview.aws');
+      expect(line).toMatchObject({ outcome: 'error', errorCode: 'aws_desktop_starting', detail: 'aws_desktop_starting:config_pending' });
+      // The surface is part of the signed body: a body changed after signing is refused.
+      const forged = await signed('POST', '/sandbox/preview', previewBody);
+      const tampered = new Request(forged.url, { method: 'POST', body: codeBody, headers: forged.headers });
+      expect((await worker.fetch(tampered, e, ctx)).status).toBe(401);
+      // No ExecutionContext (tests, older callers): Code still answers.
+      expect((await worker.fetch(await signed('POST', '/sandbox/preview', codeBody), e)).status).toBe(200);
+    } finally {
+      log.mockRestore();
+    }
+    expect(host.bad).toEqual([]);
+  });
+});
 
 describe('AWS restart route registration', () => {
   it('routes signed retries to the host and refuses unsigned, foreign and fenced requests', async () => {
