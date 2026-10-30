@@ -17,21 +17,50 @@ import rebase_manifest as release
 
 ACCOUNT = "452630323510"
 REGION = "ap-south-1"
-MACHINE = f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-mum-lifecycle"
 KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
-SECRET = "ezil-os/billing-staging/app"
 BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
 ALLOWED = BASE_ALLOWED | PREVIOUS
-REPOSITORY = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6"
-ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-mum-cfn-exec"
-LAUNCH_TEMPLATE = "lt-06f691fc1e4dfe3cc"
-APP_SECRET_LOCK = "/root/ezil-aws-mum/locks/app-secret.lock"
+# Operator namespaces (common.sh use_namespace keeps the same table; tests compare them).
+# mum (billing staging) is the default. prd (production) pins its foundation's ECR
+# repository and launch template only by a reviewed commit after its foundation stack
+# exists (README "Production namespace prd"); until then every prd command refuses.
+PROFILES = {
+    "mum": {"secret": "ezil-os/billing-staging/app", "origin": "https://os-staging.ezil.work",
+            "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6",
+            "launchTemplate": "lt-06f691fc1e4dfe3cc", "appSecretLock": "/root/ezil-aws-mum/locks/app-secret.lock",
+            "deployEnvironment": "aws-pilot", "poolLifecycle": True, "rebase": True, "appCaller": None},
+    "prd": {"secret": "ezil-os/production/app", "origin": "https://os-prod.ezil.work",
+            "repository": None, "launchTemplate": None, "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
+            # Founder decisions 2026-10-30: pool mode, no rebase tuple at launch, the prod host's role only.
+            "deployEnvironment": "aws-prd", "poolLifecycle": True, "rebase": False,
+            "appCaller": {"enabled": True, "roleName": "ezil-prd-app-caller", "providers": [], "ec2CallerEnv": "production",
+                          "ec2CallerRoleArns": [f"arn:aws:iam::{ACCOUNT}:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr"]}},
+}
+# Operations that run before a namespace's foundation pins exist.
+PIN_FREE = {"namespace-config", "with-app-secret-lock"}
+# Image-rebase operations; a namespace without a release tuple never runs them.
+REBASE_OPS = {"previous-parameters", "previous-release", "secret-predecessor", "secret-retained", "maintenance-agent", "maintenance-lower"}
+
+
+def use_namespace(name):
+    """Select an operator profile; names derive as identity.ts/workload-identity.ts derive them."""
+    global NAMESPACE, PROFILE, MACHINE, SECRET, ORIGIN, REPOSITORY, ROLE, LAUNCH_TEMPLATE, APP_SECRET_LOCK, BUCKET
+    need(name in PROFILES, "unknown operator namespace")
+    NAMESPACE, PROFILE = name, PROFILES[name]
+    MACHINE = f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-{name}-lifecycle"
+    ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-{name}-cfn-exec"
+    BUCKET = f"ezil-{name}-deploy-assets-{ACCOUNT}"
+    SECRET, ORIGIN, REPOSITORY = PROFILE["secret"], PROFILE["origin"], PROFILE["repository"]
+    LAUNCH_TEMPLATE, APP_SECRET_LOCK = PROFILE["launchTemplate"], PROFILE["appSecretLock"]
 
 
 def need(ok, message):
     if not ok:
         raise ValueError(message)
+
+
+use_namespace("mum")
 
 
 def read(path):
@@ -85,13 +114,19 @@ def template(path):
 
 def pair(config):
     d = config["settings"]["deployment"]
-    need(d["accountId"] == ACCOUNT and d["region"] == REGION and d["namespace"] == "mum", "config account/region/namespace mismatch")
+    need(d["accountId"] == ACCOUNT and d["region"] == REGION and d["namespace"] == NAMESPACE, "config account/region/namespace mismatch")
+    # The lifecycle callback origin is the namespace's app (computer-lifecycle.ts authorityOrigin).
+    need(config["settings"].get("authorityOrigin", ORIGIN) == ORIGIN, "lifecycle authority origin mismatch")
+    need(PROFILE["rebase"] or not ((set(release.TUPLE) | {"releases"}) & d.keys()), "namespace has no rebase tuple or release registry")
     need(re.fullmatch(r"ami-[0-9a-f]{17}", d["amiId"]), "invalid AMI")
     need(re.fullmatch(re.escape(MACHINE) + r":[1-9][0-9]*", d["stateMachineVersionArn"]), "invalid lifecycle version")
     need(isinstance(d.get("launchTemplateVersion"), str) and re.fullmatch(r"[1-9][0-9]{0,9}", d["launchTemplateVersion"]), "invalid launch-template version")
     release.deployment_tuple(d)
     if "recoveryVersionArn" in config:
-        need(config["recoveryVersionArn"] == d.get("recoveryStateMachineVersionArn"), "recovery version config mismatch")
+        # Without a release tuple, recovery is pinned by its namespace machine name instead.
+        need(config["recoveryVersionArn"] == d.get("recoveryStateMachineVersionArn") if PROFILE["rebase"] else
+             re.fullmatch(re.escape(f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-{NAMESPACE}-recovery:") + r"[1-9][0-9]*",
+                          config["recoveryVersionArn"]), "recovery version config mismatch")
     return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion", *release.TUPLE) if k in d}
 
 
@@ -214,7 +249,7 @@ def recipe_version(value):
 def ami_config(path):
     value = read(path)
     need(set(value) == {"namespace", "accountId", "region", "version"}, "unexpected AMI config fields")
-    need(value["namespace"] == "mum" and value["accountId"] == ACCOUNT and value["region"] == REGION, "AMI config account/region/namespace mismatch")
+    need(value["namespace"] == NAMESPACE and value["accountId"] == ACCOUNT and value["region"] == REGION, "AMI config account/region/namespace mismatch")
     recipe_version(value["version"])
     return value
 
@@ -525,19 +560,23 @@ def promotion_substitution(value, old_pair, new_pair, version_ids=None):
             settings = json.loads(value)
         except (ValueError, TypeError):
             settings = None
-        if isinstance(settings, dict) and isinstance(settings.get("deployment"), dict) and all(
-                settings["deployment"].get(k) == v for k, v in old_pair.items()):
+        # The lifecycle Lambda holds the settings; recovery Lambdas nest them under "lifecycle".
+        nested = isinstance(settings, dict) and "deployment" not in settings and isinstance(settings.get("lifecycle"), dict)
+        holder = settings["lifecycle"] if nested else settings
+        if isinstance(holder, dict) and isinstance(holder.get("deployment"), dict) and all(
+                holder["deployment"].get(k) == v for k, v in old_pair.items()):
             expected = copy.deepcopy(settings)
+            target = expected["lifecycle"] if nested else expected
             for key in release.PROMOTION:
                 if key not in new_pair:
-                    expected["deployment"].pop(key, None)
-            expected["deployment"].update(new_pair)
+                    target["deployment"].pop(key, None)
+            target["deployment"].update(new_pair)
             match = re.search(r'"deployment"\s*:\s*', value)
             if match:
                 _, length = json.JSONDecoder().raw_decode(value[match.end():])
                 original = value[match.end():match.end() + length]
                 separators = (", ", ": ") if '": ' in original else (",", ":")
-                adjusted = value[:match.end()] + json.dumps(expected["deployment"], separators=separators) + value[match.end() + length:]
+                adjusted = value[:match.end()] + json.dumps(target["deployment"], separators=separators) + value[match.end() + length:]
                 if same_json(json.loads(adjusted), expected):
                     value = adjusted
         replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn", "preparationStateMachineVersionArn", "recoveryStateMachineVersionArn") if key in old_pair and key in new_pair}
@@ -977,14 +1016,70 @@ def _secret_update(before_path, after_path, apply, lock_fd):
     print("App deployment fields verified" if not apply else "App deployment fields updated and verified")
 
 
+def namespace_config(kind, path):
+    """Reviewed inputs for the founder's stack creates (README "Production namespace prd")."""
+    value = read(path)
+    need(isinstance(value, list if kind == "ami-parameters" else dict), "unexpected config shape")
+    scope = {"namespace": NAMESPACE, "accountId": ACCOUNT, "region": REGION}
+    if kind in ("keys", "ops", "identity"):
+        need(all(value.get(k) == v for k, v in scope.items()), f"{kind} config account/region/namespace mismatch")
+    if kind == "keys":
+        need(set(value) == set(scope), "unexpected keys config fields")
+    elif kind == "ops":
+        pass  # Account-wide alarms and budget figures are the founder's (PROD-COMPUTERS-PLAN P3).
+    elif kind == "identity":
+        subject = value.get("deploySubject", "")
+        need(isinstance(subject, str) and subject.endswith(":environment:" + PROFILE["deployEnvironment"]), "identity deploy environment mismatch")
+        need(value.get("assetBucketName") == BUCKET, "identity asset bucket mismatch")
+        need(value.get("poolLifecycle", False) is PROFILE["poolLifecycle"], "identity pool lifecycle mismatch")
+        need(value.get("killSwitch", False) is False, "identity kill switch must be off for stack creation")
+        need(PROFILE["rebase"] or "imageJobDeployment" not in value, "namespace has no rebase tuple: omit imageJobDeployment")
+    elif kind == "foundation":
+        need(value.get("stage") == NAMESPACE and value.get("region") == REGION, "foundation stage/region mismatch")
+    elif kind == "ami":
+        ami_config(path)
+    elif kind == "ami-parameters":
+        params = {k: v.get("ParameterValue") for k, v in mapping(value).items()}
+        need(params.get("AssetBucketName") == BUCKET, "AMI asset bucket mismatch")
+        need(params.get("EnrollUrl") == ORIGIN + "/api/compute/aws/enroll", "AMI enroll URL mismatch")
+        need(re.fullmatch(re.escape(f"s3://{BUCKET}/ami/host-agent-") + r"[0-9a-f]{40}\.tgz", params.get("AgentSrcS3Uri") or ""), "AMI agent archive must be in the namespace bucket")
+        need(re.fullmatch(re.escape(f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-{NAMESPACE}-foundation-") + r"[a-z0-9-]+",
+                          params.get("ApplicationImageRepositoryUri") or ""), "AMI repository is not the namespace foundation's")
+        need(REPOSITORY is None or params["ApplicationImageRepositoryUri"] == REPOSITORY, "ECR repository mismatch")
+        need(PROFILE["rebase"] or not any(params.get(k) for k in PREVIOUS), "namespace has no rebase tuple: no previous image pair")
+    elif kind == "lifecycle":
+        need(value.get("deploy", {}).get("assetBucketName") == BUCKET, "lifecycle asset bucket mismatch")
+        pair(value)
+        need(value["settings"].get("authorityOrigin") == ORIGIN, "lifecycle authority origin mismatch")
+        need(LAUNCH_TEMPLATE is None or value["settings"]["deployment"].get("launchTemplateId") == LAUNCH_TEMPLATE, "configured launch-template identity mismatch")
+        need(re.fullmatch(re.escape(f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-{NAMESPACE}-recovery:") + r"[1-9][0-9]*",
+                          value.get("recoveryVersionArn", "")), "lifecycle recovery version is not the namespace's")
+        if PROFILE["appCaller"] is not None:
+            need(value.get("appCaller") == PROFILE["appCaller"], "lifecycle app caller differs from the namespace's reviewed caller")
+    else:
+        raise ValueError("unknown namespace config kind")
+    print(f"{kind} config matches namespace {NAMESPACE}")
+
+
 def main(args):
+    if args[:1] == ["--namespace"]:
+        need(len(args) >= 3, "Usage: json-tool.py [--namespace <ns>] <operation> ...")
+        use_namespace(args[1])
+        args = args[2:]
     op, *a = args
-    if op == "parameters":
+    need(op in PIN_FREE or bool(REPOSITORY and LAUNCH_TEMPLATE),
+         f"namespace {NAMESPACE} has no pinned ECR repository/launch template; pin them by a reviewed commit (README)")
+    need(op not in REBASE_OPS or PROFILE["rebase"], f"namespace {NAMESPACE} has no rebase tuple; image-rebase operations are refused")
+    if op == "namespace-config":
+        namespace_config(*a)
+    elif op == "parameters":
         current = stack(a[0])
         old = mapping(current["Parameters"])
         need(BASE_ALLOWED <= old.keys(), "required AMI parameters missing")
-        need(old["AssetBucketName"]["ParameterValue"] == "ezil-mum-deploy-assets-452630323510", "asset bucket mismatch")
-        need(old["ApplicationImageRepositoryUri"]["ParameterValue"] == f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6", "ECR repository mismatch")
+        need(old["AssetBucketName"]["ParameterValue"] == BUCKET, "asset bucket mismatch")
+        need(old["ApplicationImageRepositoryUri"]["ParameterValue"] == REPOSITORY, "ECR repository mismatch")
+        # The host enrolls only at the AMI-baked URL (host-agent enroll.py): the namespace's own app.
+        need(old.get("EnrollUrl", {}).get("ParameterValue") == ORIGIN + "/api/compute/aws/enroll", "AMI enroll URL mismatch")
         values = dict(zip(("DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"), a[1:4]))
         if len(a) > 5:
             need(len(a) == 7, "previous parameters require both values")
@@ -1004,7 +1099,7 @@ def main(args):
         need(PREVIOUS <= mapping(stack(a[0])["Parameters"]).keys(), "previous pair requires a recipe version bump")
     elif op in ("previous-release", "secret-predecessor", "secret-retained"):
         manifest = release.load(a[0], source=True, repository=REPOSITORY)
-        need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == "mum", "previous release identity mismatch")
+        need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == NAMESPACE, "previous release identity mismatch")
         if op == "previous-release":
             need((manifest["lowerImageRef"], manifest["lowerImageDigest"]) == tuple(a[1:3]), "previous release lower mismatch")
         else:
@@ -1033,7 +1128,7 @@ def main(args):
             need(len(recipes) == 1, "recipe version evidence missing")
             version = recipes[0]
         recipe_version(version)
-        write(a[4], {"schemaVersion": 1, "accountId": ACCOUNT, "region": REGION, "namespace": "mum",
+        write(a[4], {"schemaVersion": 1, "accountId": ACCOUNT, "region": REGION, "namespace": NAMESPACE,
             "recipeVersion": version, "lowerImageDigest": value("DesktopImageId"),
             "lowerImageRef": REPOSITORY + "@" + value("DesktopImageDigest"),
             "previousLowerImageDigest": value("PreviousDesktopImageId") or None,
@@ -1213,6 +1308,7 @@ if __name__ == "__main__":
         main(sys.argv[1:])
     except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
         # Never include data/exception values on the secret path.
-        secret_op = len(sys.argv) > 1 and sys.argv[1].startswith("secret-")
+        operation = sys.argv[3:4] if sys.argv[1:2] == ["--namespace"] else sys.argv[1:2]
+        secret_op = bool(operation) and operation[0].startswith("secret-")
         print("ERROR: secret operation refused; inspect deployment alignment and AWS access" if secret_op else f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)

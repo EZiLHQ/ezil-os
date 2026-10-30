@@ -31,6 +31,8 @@ with tempfile.TemporaryDirectory(prefix="ezil-mum-real-synth.") as folder:
     config = json.loads((source / "config/lifecycle.example.json").read_text()
                         .replace("123456789012", "452630323510").replace("pilot", "mum"))
     config.pop("recoveryVersionArn", None)
+    # json-tool pins each namespace's lifecycle callback origin (mum: billing staging).
+    config["settings"]["authorityOrigin"] = "https://os-staging.ezil.work"
     baseline = copy.deepcopy(config)
     config["settings"]["deployment"].update(amiId="ami-22222222222222222", launchTemplateVersion="2",
         stateMachineVersionArn="arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:2")

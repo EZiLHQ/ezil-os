@@ -10,6 +10,9 @@ runs the offline AMI synth. Promotion always synthesizes both its baseline and
 candidate, including in dry-run. Temporary files are removed on exit. Run locally
 with fake commands for an entirely offline check.
 
+The default namespace is `mum` (billing staging), unchanged. `--namespace prd`
+selects production instead; see [Production namespace prd](#production-namespace-prd).
+
 ## Recipe version updates
 
 Use `rebuild-ami.sh --recipe-version <x.y.z>` for changed desktop/agent inputs.
@@ -176,6 +179,7 @@ with the live stack and use a fresh release directory for each successful update
    for script in deploy/aws/mum/*.sh deploy/aws/mum/tests/*.sh; do bash -n "$script" || exit 1; done
    npm --prefix infra/app-computers ci
    python3 deploy/aws/mum/tests/synth-contract.py
+   python3 deploy/aws/mum/tests/prd-synth-contract.py
    ```
 
 2. Obtain the reviewed desktop build from the desktop lane. Choose its local
@@ -431,6 +435,98 @@ It synthesizes two isolated assemblies, validates the real promotion and rollbac
 IAM/environment/workflow/Version differences, checks exact change-set coverage,
 and rejects unauthorized template and change-set mutations. It uses synthetic
 references and does not validate the live Mumbai configuration or AWS responses.
+`tests/prd-synth-contract.py` does the same for the prd lifecycle shape below
+(recovery on, no release tuple, EC2-only app caller).
+
+## Production namespace prd
+
+Founder decisions (2026-10-30; `docs/status/slot2-main-20261029/PROD-COMPUTERS-PLAN.md`):
+a separate namespace `prd` in this account and region, **pool mode** (one warm
+spare), origin `https://os-prod.ezil.work` for both the AMI-baked enroll URL and
+the lifecycle callback, **no image-rebase tuple at launch**, the existing AWS
+tunnel Cloudflare token, the app kill switch default on (`EZIL_AWS_KILL_SWITCH=1`),
+and paid plans at launch. Every AWS write below needs founder authorization at the
+time it runs.
+
+| Item | `mum` (default) | `prd` |
+| --- | --- | --- |
+| Stacks | `ezil-identity-mum`, `ezil-mum-{keys,ops,foundation,ami,lifecycle}` | `ezil-identity-prd`, `ezil-prd-{keys,ops,foundation,ami,lifecycle}` |
+| CloudFormation role | `…/ezil/identity/ezil-mum-cfn-exec` | `…/ezil/identity/ezil-prd-cfn-exec` |
+| Asset bucket | `ezil-mum-deploy-assets-452630323510` | `ezil-prd-deploy-assets-452630323510` |
+| ECR repository, launch template | pinned literals | **pinned after P4** (below) |
+| App secret | `ezil-os/billing-staging/app` | `ezil-os/production/app` |
+| Enroll URL / authority origin | `https://os-staging.ezil.work` | `https://os-prod.ezil.work` |
+| Operator state | `/root/ezil-aws-mum/{config,release/next,locks}` | `/root/ezil-aws-prd/{config,release/next,locks}` |
+| GitHub deploy environment | `aws-pilot` | `aws-prd` (never created, so CI cannot assume the deploy role) |
+| App caller | staging host role, `ezil:env=billing-staging` | exactly the prod host role, `ezil:env=production`, no OIDC |
+
+`common.sh` (`use_namespace`) and `json-tool.py` (`PROFILES`) hold this table;
+`tests/prd_namespace.py` checks they agree. `rebuild-ami.sh`, `promote-ami.sh`,
+`with-app-secret-lock.sh` and `json-tool.py` take `--namespace prd`. Under prd
+they refuse mum stacks, roles, buckets and operator paths, the staging enroll URL
+or origin, any rebase tuple or release registry, manifest (rebase) promotion, and
+previous/maintenance/deployed-release bakes. The rebase and registry tools
+(`rebase-*.sh`, `rebase_*.py`, `registry_gc*`) remain mum-only.
+
+**Creating the namespace** (plan §4 P1–P7). Keep configs under `/root/ezil-aws-prd/config/`
+(ARNs only) and synth only in a scratch copy, as `prepare_synth` does. Before each
+synth, validate the reviewed input; this works before any pin exists:
+
+```bash
+for kind in identity keys ops foundation ami; do
+  python3 deploy/aws/mum/json-tool.py --namespace prd namespace-config "$kind" "/root/ezil-aws-prd/config/$kind.prd.json"
+done
+python3 deploy/aws/mum/json-tool.py --namespace prd namespace-config ami-parameters /root/ezil-aws-prd/config/ami-parameters.json
+python3 deploy/aws/mum/json-tool.py --namespace prd namespace-config lifecycle /root/ezil-aws-prd/config/lifecycle.prd.json
+```
+
+- `identity`: `deploySubject` ends `:environment:aws-prd`, the prd bucket,
+  `poolLifecycle: true` (pool mode), `killSwitch: false`, no `imageJobDeployment`.
+- `ami-parameters`: the P5 CREATE `--parameters` file. `EnrollUrl` is exactly
+  `https://os-prod.ezil.work/api/compute/aws/enroll`; the agent archive and
+  bucket are prd's; the previous image pair is empty. Bake from the reviewed commit
+  that carries the G9 idle-stop fix.
+- `lifecycle`: `authorityOrigin` `https://os-prod.ezil.work`, `ezil-prd-lifecycle`
+  and `ezil-prd-recovery` versions, no tuple, the prd deploy bucket, and exactly
+  this caller, which yields `arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller`,
+  the only non-empty `AppCallerRoleArn` that `deploy/aws/os-staging/app-host.yaml`
+  admits for production:
+
+  ```json
+  "appCaller": { "enabled": true, "roleName": "ezil-prd-app-caller", "providers": [],
+    "ec2CallerRoleArns": ["arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr"],
+    "ec2CallerEnv": "production" }
+  ```
+
+  If `ezil-os-prod-host` is ever recreated, its role suffix changes. Update this
+  profile and the lifecycle config together, then redeploy the lifecycle.
+
+Stack order and roles are as for mum: identity, keys, ops (founder credentials),
+foundation (`--role-arn …/ezil-prd-cfn-exec`), AMI (founder credentials) and first bake,
+the foundation `HostAmiId` update, then the lifecycle (exec role; assets with
+founder credentials). Enable termination protection on each stack.
+
+**Pin step, after P4.** Copy the `ezil-prd-foundation` outputs `ApplicationImageRepositoryUri`
+and `LaunchTemplateId` into the prd branch of `use_namespace` (`repository=`,
+`launch_template=`) and into `PROFILES["prd"]` in a reviewed commit. Until that
+commit lands, every prd rebuild and promotion refuses before any AWS call.
+
+**App wiring (P8).** Update `ezil-os-prod-host` with `AppCallerRoleArn` set to the
+prd caller (one `InstanceRole` Modify). Edit `ezil-os/production/app` only under
+`bash deploy/aws/mum/with-app-secret-lock.sh --namespace prd …`, keeping
+`EZIL_AWS_KILL_SWITCH=1` until the canary, then run
+`OS_ENV=production bash deploy/aws/os-staging/deploy.sh install <tag>`.
+
+**Later AMI updates** (dry run first, then `--apply`):
+
+```bash
+bash deploy/aws/mum/rebuild-ami.sh --namespace prd --desktop-image "$desktop_image" --source-sha "$source_sha" --recipe-version "$recipe_version"
+bash deploy/aws/mum/promote-ami.sh --namespace prd --ami "$(cat /root/ezil-aws-prd/release/next/ami-id.txt)"
+```
+
+Promotion updates only `amiId`, `launchTemplateVersion` and `stateMachineVersionArn`
+in `ezil-os/production/app`. It is the plain path; prd has no manifest promotion
+until the rebase tooling is parameterized.
 
 ## Rebase release tooling (contract v1, lane E increment)
 
