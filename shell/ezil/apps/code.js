@@ -555,8 +555,9 @@ export async function openCodeWindow (ctx = {}) {
 
             const reason = last_observation?.reason;
             const status = last_observation?.status;
-            console.error(`[${PHASE}] the code frame is not answering (confirmFrame -> ${String(seen)}`
-                + `${reason ? `, ${reason}` : ''}${Number.isInteger(status) ? ` ${status}` : ''})`);
+            // The console line keeps its exact text (browser suites allow-list it); the
+            // reason and origin status travel in the telemetry attrs below.
+            console.error(`[${PHASE}] the code frame is not answering (confirmFrame -> ${String(seen)})`);
             // `status` is only ever the ORIGIN's (the probe's `data.status`); our own route's
             // refusal is `reason: 'route_refused'` with no status.
             telemetry.capture({
