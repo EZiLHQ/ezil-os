@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
@@ -44,13 +44,18 @@ function fakeBucket() {
   let revision = 0;
   const writes: string[] = [];
   const faults = { put: (_key: string) => false, get: (_key: string) => false };
+  /** Store latency per call, so concurrent operations really interleave at their await points. */
+  const timing = { latencyMs: 0 };
+  const wait = () => timing.latencyMs ? new Promise(resolve => setTimeout(resolve, timing.latencyMs)) : Promise.resolve();
   const bucket = {
     get: async (key: string) => {
+      await wait();
       if (faults.get(key)) throw new Error('r2 get failed');
       const object = objects.get(key);
       return object ? { etag: object.etag, size: object.bytes.length, arrayBuffer: async () => object.bytes.slice().buffer } : null;
     },
     put: async (key: string, value: Uint8Array | string, opts?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
+      await wait();
       if (faults.put(key)) throw new Error('r2 put failed');
       if (opts?.onlyIf?.etagMatches !== undefined && objects.get(key)?.etag !== opts.onlyIf.etagMatches) return null;
       if (opts?.onlyIf?.etagDoesNotMatch === '*' && objects.has(key)) return null;
@@ -60,6 +65,7 @@ function fakeBucket() {
       return { key, etag };
     },
     list: async ({ prefix, cursor, limit = 1000 }: { prefix: string; cursor?: string; limit?: number }) => {
+      await wait();
       const keys = [...objects.keys()].filter(key => key.startsWith(prefix)).sort();
       const start = cursor ? Number(cursor) : 0;
       const page = keys.slice(start, start + Math.min(limit, 2));
@@ -70,7 +76,7 @@ function fakeBucket() {
     delete: async (keys: string | string[]) => { for (const key of typeof keys === 'string' ? [keys] : keys) objects.delete(key); },
   };
   const json = (key: string) => JSON.parse(new TextDecoder().decode(objects.get(key)!.bytes));
-  return { objects, bucket, writes, faults, json, put: (key: string, value: unknown) => bucket.put(key, encode(value)) };
+  return { objects, bucket, writes, faults, timing, json, put: (key: string, value: unknown) => bucket.put(key, encode(value)) };
 }
 
 function fakeStorage(initial: Record<string, unknown> = {}) {
@@ -782,7 +788,9 @@ describe('reverse import: pull throughput bounds (unit, fake clock)', () => {
     f.host.chunkDelay = 5;
     const r = await run({ op: 'pull', ...beginBody, from: 0, count: 10 });
     expect(r.body.stored).toEqual([...Array(10).keys()]);
-    expect(f.host.maxInFlight).toBe(PULL_CONCURRENCY);
+    // The contract's number, not the module's constant: a changed constant must fail here.
+    expect(f.host.maxInFlight).toBe(4);
+    expect(PULL_CONCURRENCY).toBe(4);
   });
 
   it('starts no new transfer after 20 s of wall time counted from the request\'s arrival', async () => {
@@ -792,10 +800,55 @@ describe('reverse import: pull throughput bounds (unit, fake clock)', () => {
     const r = await run({ op: 'pull', ...beginBody, from: 0, count: 20 }, arrival);
     expect(r.status).toBe(200);
     const stored = r.body.stored as number[];
-    expect(stored.length).toBeGreaterThan(0);
-    expect(stored.length).toBeLessThan(20);
+    // 9 s gone before the first chunk (5 s queued, the status and head reads): transfers start
+    // at 9, 11, … 19 s, plus at most the 3 other workers that passed the check together.
+    expect(stored.length).toBeGreaterThanOrEqual(6);
+    expect(stored.length).toBeLessThanOrEqual(9);
     expect(r.body.next).toBe(stored.length);
-    expect(now() - arrival).toBeLessThan(PULL_TRANSFER_WINDOW_MS + PULL_CONCURRENCY * 2_000 + 1);
+    expect(PULL_TRANSFER_WINDOW_MS).toBe(20_000);
+  });
+});
+
+describe('reverse import: one queue per Durable Object (§4.1)', () => {
+  it('a pull that waited behind another op counts the wait against its 20 s window', async () => {
+    const f = await fixture();
+    await f.begin();
+    f.host.state = 'ready';
+    const base = Date.now();
+    let offset = 0;
+    const clock = spyOn(Date, 'now').mockImplementation(() => base + offset);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const hostFetch = globalThis.fetch;
+      let held = false;
+      // The first op's first host read hangs until released: the second op waits in the queue.
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (!held) { held = true; await gate; }
+        return hostFetch(input, init);
+      }) as typeof fetch;
+      const first = f.fake.reverseImport(parseImportRequest('pull', { ...beginBody, from: 0, count: 0 }, NAME), NAME);
+      const second = f.fake.reverseImport(parseImportRequest('pull', { ...beginBody, from: 0, count: 3 }, NAME), NAME);
+      offset = 25_000;
+      release();
+      expect((await first).status).toBe(200);
+      expect((await second).body).toMatchObject({ ok: true, stored: [], next: 0 });
+      expect(f.host.requests.filter(r => r.path.includes('/chunk/'))).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('commit and abort never interleave: an abort queued behind a commit sees the committed head', async () => {
+    const f = await fixture();
+    await f.copied();
+    await f.verify();
+    f.r2.timing.latencyMs = 2;
+    const commit = f.commit();
+    const abort = f.abort();
+    expect((await commit).status).toBe(200);
+    expect(await abort).toEqual({ status: 409, body: { ok: false, error: 'already_imported' } });
+    expect(f.r2.json(HEAD).generation).toBe(GEN);
   });
 });
 
