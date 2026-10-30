@@ -225,12 +225,15 @@ The rule is five numbered cases, in this order, each commented in
 
 Case 2 is decided before case 4 on purpose: `/app\..\admin` or `/app/code`
 followed by a tab is a smuggling attempt, not an `/app` path the list could
-not vouch for, so it lands on `/computers`. Rejected input landing on
-`/computers` (case 5, and case 2) is asserted, unchanged, by four other
-suites: `app/src/app/login/page.test.ts`,
+not vouch for, so it lands on `/computers`. Case 2's `/computers` is also
+asserted by four other suites, each with hostile or foreign input only:
+`app/src/app/login/page.test.ts`,
 `app/src/app/auth/auth0/callback/route.test.ts`,
 `app/src/server/auth/auth0.test.ts` and
-`app/src/app/auth/confirm/confirm-route.test.ts`.
+`app/src/app/auth/confirm/confirm-route.test.ts` (measured: case 2 → `/os`
+turns all four red). None of them feeds a well-formed path that is not a
+return page, so case 5, the new rejection, is pinned by `constants.test.ts`
+alone (case 5 → `/os` leaves all four green).
 
 **Compatibility with the rule before `/app/<id>`** (base `74ed2c92`: any
 value starting with `/`, except `//` and `/\`, with no control character or

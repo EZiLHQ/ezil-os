@@ -131,7 +131,9 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     // BEFORE case 4: `/app\..\admin` or `/app/code<TAB>` is not "an /app path
     // we cannot vouch for", it is a smuggling attempt, and lands on
     // `/computers`. Not a path (a scheme, a relative path); protocol-relative
-    // `//` and `/\`; a backslash anywhere, query included.
+    // `//` and `/\`; a backslash anywhere, query included. Besides
+    // `constants.test.ts`, the login page, the Auth0 flow and `/auth/confirm`
+    // each have a test that asserts this case's `/computers`.
     if (!raw.startsWith('/')) return Routes.COMPUTERS;
     if (raw.startsWith('//') || raw.startsWith('/\\') || raw.includes('\\')) return Routes.COMPUTERS;
     // Control characters and whitespace, checked by codepoint rather than
@@ -151,9 +153,9 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     // `/app/code/x`): the person was on their way into the OS.
     if (path === Routes.APP || path.startsWith(`${Routes.APP}/`)) return Routes.OS;
     // Case 5 — any other rejected path, including every page base accepted
-    // and this list does not (see "Compatibility" above). Unchanged from
-    // before `/app/<id>` for rejected input; the login page, the Auth0 flow
-    // and `/auth/confirm` each have a test that asserts it.
+    // and this list does not (see "Compatibility" above). The destination
+    // is the one base gave rejected input; the rejection itself is new, and
+    // only `constants.test.ts` pins it.
     return Routes.COMPUTERS;
 }
 

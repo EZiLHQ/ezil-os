@@ -142,6 +142,16 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
         expect(safeReturnUrl(['https://evil.example', '/app/code'])).toBe(Routes.COMPUTERS);
     });
 
+    /**
+     * Case 2 is also what four other suites pin, each with hostile or foreign
+     * input only (scheme, `//`, `/\`, a control character):
+     *   app/src/app/login/page.test.ts                  ("rejects a foreign return URL")
+     *   app/src/app/auth/auth0/callback/route.test.ts   (signed-cookie and query destinations)
+     *   app/src/server/auth/auth0.test.ts               ("sanitises returnUrl")
+     *   app/src/app/auth/confirm/confirm-route.test.ts  (hostile `next`)
+     * Measured: case 2 -> /os turns all four red; case 5 -> /os leaves all
+     * four green.
+     */
     it('case 2: hostile shapes land on /computers, decided BEFORE the /app fallback', () => {
         // Positive control: the same /app pages, clean, are kept.
         expect(safeReturnUrl('/app/code')).toBe('/app/code');
@@ -188,14 +198,14 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
     /**
      * Case 5. Base (before `/app/<id>`) kept every path that passed the shape
      * checks; these pages now land on /computers. No producer in this
-     * repository sends them (docs/APP-ROUTES.md §6). Rejected input landing on
-     * /computers is also asserted, unchanged, by:
-     *   app/src/app/login/page.test.ts                  ("rejects a foreign return URL")
-     *   app/src/app/auth/auth0/callback/route.test.ts   (signed-cookie and query destinations)
-     *   app/src/server/auth/auth0.test.ts               ("sanitises returnUrl")
-     *   app/src/app/auth/confirm/confirm-route.test.ts  (hostile `next`)
+     * repository sends them (docs/APP-ROUTES.md §6). Only this test pins
+     * case 5: the four suites named at case 2 feed hostile shapes only.
      */
     it('case 5: any other rejected path lands on /computers, including pages base used to keep', () => {
+        // Positive controls: the exact pages next to the refused shapes below.
+        for (const url of ['/os', '/computers', '/billing/return', '/computer/9d5b0a1e-0000-4000-8000-000000000000']) {
+            expect(safeReturnUrl(url), url).toBe(url);
+        }
         for (const url of [
             // Kept by base, refused now (the compatibility table).
             '/', '/?x=1', '/pricing', '/login', '/admin', '/admin/users', '/os/', '/os/x', '/computers/', '/billing/return/',
