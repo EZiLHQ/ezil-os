@@ -893,11 +893,26 @@ export async function confirmFrame (computerId, frameUrl, surface = 'desktop') {
 /**
  * Keep the authenticated probe's transient failure evidence for Code's bounded
  * recovery. The boolean API above still exposes just the health verdict.
- * A retryable negative is still unconfirmed; auth/origin refusals never qualify.
+ * A retryable negative is still unconfirmed; OUR refusals never qualify.
+ *
+ * Two different HTTP statuses meet here and are never mixed:
+ *   - `routeStatus` is OUR app route's (`/api/shell/desktop`) status. A 401/403
+ *     there is our own auth refusing — terminal, reported as `route_refused`.
+ *   - `status` is the ORIGIN's, as the server's probe read it (`data.status`).
+ *
+ * 🔴 Follow-up r5 (ACCEPT-9a755827 e2e-standard A3): on the code surface ANY
+ * origin `http_error` is retryable, not just 500-504. The hops in front of a
+ * booting code-server answer fast and wrong during the transition — the
+ * Worker's AWS preview auth (401), the host edge (401 on a gw1 binding or clock
+ * skew, 404 on an unknown path), a stale route (410), the tunnel (52x/530) —
+ * and Code used to stop on the first such answer with ~44 s of its 45 s budget
+ * unused. The recovery stays bounded by Code's ask cap and deadline. The
+ * server's own refusals (`not_own_origin`, `provider_not_configured`,
+ * `bad_url`) and a reason-less negative stay terminal: asking again would get
+ * the same answer. Desktop/Preview keep the original 500-504 rule.
  */
 export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
     const unknown = { confirmed: undefined, retryable: false };
-    const refused = { confirmed: false, retryable: false };
     if ( ! computerId || ! frameUrl ) return unknown;
     const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
         + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`
@@ -905,21 +920,30 @@ export async function observeFrame (computerId, frameUrl, surface = 'desktop') {
     const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
     // An HTTP authentication/authorization refusal is an answer, even if the
     // response body is absent, non-JSON, or claims success. Never retry it.
-    if ( ! res.ok ) return res.status === 401 || res.status === 403 ? refused : unknown;
+    if ( ! res.ok ) {
+        return res.status === 401 || res.status === 403
+            ? { confirmed: false, retryable: false, reason: 'route_refused', routeStatus: res.status }
+            : unknown;
+    }
     const data = res.data;
+    const status = Number.isInteger(data?.status) ? data.status : undefined;
+    const reason = typeof data?.reason === 'string' ? data.reason : undefined;
     if ( surface === 'code' && data?.confirmed === true ) {
         // Both hosted/local HTTP probes return a successful status and omit
         // reason on success. A malformed or contradictory positive must not
         // release Code's overlay, including after its recovery navigation.
         const confirmed = data.ok === true && Number.isInteger(data.status)
             && data.status >= 200 && data.status < 400 && !Object.hasOwn(data, 'reason');
-        return { confirmed, retryable: false };
+        return { confirmed, retryable: false, reason, status };
     }
     if ( data?.ok !== true ) return unknown;
+    const transient = reason === 'unreachable' || (reason === 'http_error'
+        && (surface === 'code' || [500, 502, 503, 504].includes(data.status)));
     return {
         confirmed: data.confirmed === true,
-        retryable: data.confirmed === false && (data.reason === 'unreachable'
-            || (data.reason === 'http_error' && [500, 502, 503, 504].includes(data.status))),
+        retryable: data.confirmed === false && transient,
+        reason,
+        status,
     };
 }
 

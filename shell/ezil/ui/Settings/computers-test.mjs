@@ -77,6 +77,35 @@ check('Premium running on 2 vCPU: current + two available, no slot UI', () => {
     assert.doesNotMatch(html, /data-slot|New computer|Empty slot|data-action="create"|Add computer/);
 });
 
+// Follow-up r5 (ACCEPT-9a755827 FINDING 2): until this activation's `computer.progress` answers,
+// the pane renders with `prog` null — and an unknown lifecycle is NEITHER Running nor Stopped.
+check('🔴 AWS with no lifecycle read yet (prog null): no chip, not running, not stopped, no Stop, no "Stopped"', () => {
+    for ( const data of [premium(), standard(), null] ) {
+        const model = computerModel({ computer: me, data, prog: null });
+        assert.equal(model.chip, null);
+        assert.equal(model.running, false);
+        assert.equal(model.stopped, false);
+        assert.equal(model.busy, false);
+        const html = scan(computerHtml(model, null, []));
+        assert.doesNotMatch(html, /data-action="stop"/);
+        assert.doesNotMatch(text(html), /Stopped|Running/);
+    }
+});
+
+check('lifecycle chip follows the read: RUNNING → Running + Stop; STOPPED → Stopped, no Stop; stopping → Stopping…', () => {
+    const run = computerModel({ computer: me, data: premium(), prog: running() });
+    assert.equal(run.chip.text, 'Running');
+    assert.match(computerHtml(run, running(), []), /data-action="stop"/);
+    const stoppedProg = running('m6i.large', { lifecycleState: 'STOPPED' });
+    const stopped = computerModel({ computer: me, data: premium(), prog: stoppedProg });
+    assert.equal(stopped.chip.text, 'Stopped');
+    assert.doesNotMatch(computerHtml(stopped, stoppedProg, []), /data-action="stop"/);
+    const stoppingProg = running('m6i.large', { lifecycleState: 'STOPPING', operation: 'stopping' });
+    const stopping = computerModel({ computer: me, data: premium(), prog: stoppingProg });
+    assert.equal(stopping.chip.text, 'Stopping…');
+    assert.doesNotMatch(computerHtml(stopping, stoppingProg, []), /data-action="stop"/);
+});
+
 check('Standard: 4 and 8 vCPU are locked with the plan that unlocks them, plus Upgrade', () => {
     const model = computerModel({ computer: me, data: standard(), prog: running() });
     assert.deepEqual(states(model), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
