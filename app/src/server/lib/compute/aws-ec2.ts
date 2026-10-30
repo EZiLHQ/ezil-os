@@ -220,7 +220,7 @@ const notReady = (errorCode: string, retryable = false, error = errorCode): Ensu
  * Round 6 R2-2: one line per AWS boot decision, so a cold open beside an idle spare says why. `path` is warm (a pool
  * adopt), cold (a cold provision/replace), wait (no boot on this ask: capacity demand, a pool release first, a grant
  * pending) or none (admission refused). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
- * pool_type, volume_check, no_spare, capacity, volume_attached, grant_pending), or the refusal. No id beyond 8 chars.
+ * release_failed, pool_type, volume_check, no_spare, capacity, volume_attached, grant_pending), or the refusal. No id beyond 8 chars.
  */
 function logAwsOpen(computerId: string, path: 'warm' | 'cold' | 'wait' | 'none', reason: string): void {
     console.info(JSON.stringify({ event: 'aws-open', computer: computerId.slice(0, 8), path, reason }));
@@ -484,7 +484,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
      * delaying it. Nothing about admission, the durable commit or the job identity changes. */
     const admitBoot = async (request: AdmissionRequest, tier: AwsTier | undefined, e: Env,
         workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void },
-        after: { replenish?: () => Promise<void> } = {}) => {
+        after: { replenish?: () => Promise<void> } = {},
+        /** Round 6 R2-2: why there is no pool tier (the caller knows): not STOPPED, or a failed pool-open release. */
+        untiered: 'not_stopped' | 'release_failed' = 'not_stopped') => {
         let own: CapacityDemand | null | undefined;
         // Round 6 R2-2: why this boot is not a warm adopt, for its one `aws-open` line (set where the pool path declines).
         let coldReason = 'unknown';
@@ -493,7 +495,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             async (tx, p) => {
                 const cold = workRef.get()!;
                 const deployment = cold.intent.deployment;
-                coldReason = !isPoolMode(deployment) ? 'not_pool' : !tier ? 'not_stopped' : tier === 'free' ? 'tier_free'
+                coldReason = !isPoolMode(deployment) ? 'not_pool' : !tier ? untiered : tier === 'free' ? 'tier_free'
                     : !POOL_TYPES.includes(p.instanceType as PoolClass['instanceType']) ? 'pool_type' : 'no_spare';
                 if (coldReason !== 'no_spare' || !tier) return null;
                 if (!deps.pool) throw new LifecycleIntentInvalidError();
@@ -779,6 +781,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 },
                             },
                             poolTier, cfg.e, { get: () => work, set: value => { work = value; } }, afterLaunch,
+                            placement.state === 'STOPPED' && placement.lastError === POOL_OPEN_RELEASE_FAILED ? 'release_failed' : 'not_stopped',
                         );
                     } catch (error) {
                         if (error instanceof LifecycleIntentInvalidError) return notReady('aws_intent_invalid');

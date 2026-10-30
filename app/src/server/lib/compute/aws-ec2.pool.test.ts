@@ -760,6 +760,8 @@ describe('round 6 R2-2: aws-open decision lines', () => {
         ['no_spare', () => setup({ rows: [stopped()], host: null })],
         ['tier_free', () => setup({ rows: [stopped()], entitlement: null, grantPending: async () => false })],
         ['not_stopped', () => setup({ rows: [stopped({ state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED })] })],
+        // STOPPED, but its earlier pool-open release failed: the open stays cold, and says that, not not_stopped.
+        ['release_failed', () => setup({ rows: [stopped({ last_error: POOL_OPEN_RELEASE_FAILED })] })],
         ['not_pool', () => setup({ rows: [stopped({ last_error: null })], deployment: { ...D, namespace: 'pilot',
             stateMachineVersionArn: D.stateMachineVersionArn.replace('mum', 'pilot') } })],
     ] as const)('a cold boot says why: %s', async (reason, make) => {
