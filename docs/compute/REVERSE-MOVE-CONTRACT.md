@@ -32,9 +32,9 @@ branch (`r6/phaseb-20261030`).
   - **[0012 probe]** `reverseMovesTablePresent(db)` for every reader outside the machine (§3.4);
   - **[operator]** the operator runbook SQL (§5.5.1), executed verbatim by the store's PG suite.
 - **r4 (store only; 0012 still unchanged):** `markSnapshotSpent` and the spent-row filter of `listUnsnapshotted`, so one
-  failed snapshot execution can never hold the snapshot queue (§3.4, §7.1), with PG tests.
+  failed snapshot execution can never hold the snapshot queue (§3.4, **[r6]** §7.3), with PG tests.
 - **[r5] (store and tests only; 0012 still unchanged, its registered digest stands):**
-  - `export_boot.region`, required and validated, kept while `booting` completes the claim (§3.1, §5.1.1 step 8, §7.1);
+  - `export_boot.region`, required and validated, kept while `booting` completes the claim (§3.1, §5.1.1 step 8, **[r6]** §7);
   - the purge marker: `retain_until = NULL` on a committed row, runbook `operator_purged` (§7); `listUnsnapshotted` skips
     purged rows (§3.4);
   - PG tests that fake the app clock (2001) around `recordImportProgress`, `advance('flipping')` and `finish`, and a
@@ -77,7 +77,7 @@ lane A is the only writer of `provider-reverse-store.ts` and its two test files*
 | **S0** (done, r5) | 0012, the store until r5, the forward exclusion, registry | §3 | 0012 applied on the staging DB before the app deploys: plan, then apply with `--target aws-preview` (schema before code). |
 | **H** host + AMI | §1.1 | §2, **[r5]** §2.8 (the AMI train: C3, F11, `pool_desktop_not_ready`) | T0 (b), (b2), (e), (k); staged files on the root volume only; §2.8's live rows. |
 | **W** Worker import | §1.1 | §4 | T0 (g), (h), (l); heads before and after (T3); the first Cloudflare open hydrates with no `workspace_migrated`. |
-| **A** app machine | §1.1 | §5, §6.1, §5.10 (server side of `computer.progress`) | T0 (c), (d), (f), (j); race T6. |
+| **A** app machine | §1.1 | §5, §6.1, §5.10 (server side of `computer.progress`) | T0 (c), (d), (f), (j), **[r6]** (m); race T6. |
 | **U** shell | §1.1 | §6, §5.10 rendering | Copy matches §6.3 and §6.4 in every state, with screenshots; an open during a move never shows the opening bar, `needs_operator` or a 10-minute failure. |
 | **O** retention, **[r6] held for v1** | §1.1 | **[r6]** §7.2 only: the no-op seam | v1: nothing live (the seam's unit test only). The DLM coverage of the T3 volume is lane A's T3 check (§7.1, §8). Post-v1: §7.3. |
 
@@ -361,7 +361,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - `REVERSE_SNAPSHOT_LIST_MAX = 10`, `REVERSE_RETENTION_LIST_MAX = 100`.
 - **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, **[r4] `markSnapshotSpent`**, `claimStale(limit ≤ 10)`.
   - **[r4] `markSnapshotSpent(m, reason)`**: takes a committed row whose snapshot execution is spent out of the sweep's
-    queue (§7.1). `reason` is `snapshot_failed` (the execution ended FAILED, TIMED_OUT or ABORTED) or
+    queue (**[r6]** §7.3). `reason` is `snapshot_failed` (the execution ended FAILED, TIMED_OUT or ABORTED) or
     `snapshot_receipt_invalid` (it SUCCEEDED, but its receipt fails validation): `REVERSE_SNAPSHOT_SPENT_REASONS`. The CAS
     is on `state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL`, so the first reason wins and a
     replay is free. After a write that matched nothing it re-reads: a committed row that is snapshotted or already
@@ -434,6 +434,10 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - Every request carries `placementGeneration` and `leaseEpoch`. The tunnel record must match both, or the response is `409 export_host_mismatch`. The Worker only ever pulls from the export boot's host.
   - A tunnel or host transport failure is `503 export_unreachable`.
   - The bytes never pass through the app.
+  - **[r6]** The import routes use only `lookupAwsTunnel` and `signGatewayHeader`. They never call round 6a's
+    `ensureAwsDesktop` or `ensureAwsDesktopConfig` (`aws-ice.ts:513,453`) and never claim the tunnel record's
+    `restartPush*` (`aws-tunnels.ts:351`): the export boot's desktop is the agent's to stop (§2.5 step 3), and no preview
+    ever reaches it (§5.3).
 - **DO storage** (values stay under the 128 KiB DO value limit):
   - `ezil:reverseImport` = `{moveId, generation, computerId, placementGeneration, leaseEpoch, store:'r2', prefix:P, headKind:'none'|'migrated', migratedEtag, systemMigratedEtag, startedAt, verified?:{sha256, chunkCount}, committing?:true}`. At most one exists. A different `{moveId, generation}` gets `409 import_busy`.
   - `ezil:reverseImport:head` = the validated export head (≤ 128 KiB, §2.3).
@@ -1024,8 +1028,8 @@ on the staging DB, one row at a time (`<move-id>` is the row's `id`). Each one:
   CAS also checks `state` (`provider-reverse-store.ts`, `cas`), so a careless hand edit that keeps `updated_at` still
   refuses a stale writer; a PG test proves both.
 
-`provider-reverse-store.pg.test.ts` reads every `-- runbook:` block **from this file** (these three and §7.1's
-`operator_snapshot`) and runs them verbatim against 0012. Editing a block here without keeping that test green is a
+`provider-reverse-store.pg.test.ts` reads every `-- runbook:` block **from this file** (these three and **[r6]** §7.3's
+`operator_snapshot` and `operator_purged`) and runs them verbatim against 0012. Editing a block here without keeping that test green is a
 contract break.
 
 **Release** a `failed_needs_operator` row whose commit was never sent, after the manual cleanup it names: the Worker
@@ -1316,7 +1320,7 @@ move?: null | {
   enrollment grace, UNCONFIRMED/`ENROLLMENT_FAILED` from `releaseExportBoot`, RECOVERING, RETIRING, STOPPED/`INSTANCE_LOST`),
   check `operation: 'moving'`, `needsOperator: false`, **[r4] `lifecycleState: null` with the real state in `move.placementState`**,
   `typicalSeconds` equal to the move's, and no opening written. **[r4]** A committed row's `move.reason` is null even when
-  `last_error` is a §7.1 spent reason. Also: a
+  `last_error` is a **[r6]** §7.3 spent reason. Also: a
   database without 0012 gives today's output exactly.
 
 ## 6. Summary DTO and shell (lanes A + U)
@@ -1361,7 +1365,7 @@ interface ComputerReverseMoveV3 {   // summary.computer.reverseMove: ComputerRev
 - **Visibility [clocks]:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
 - Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`.
 - Lane U's new `reverseMove` view accepts `reason` with the same `/^[a-z0-9_:-]{1,64}$/i` the dormant view uses (`computers.js:575`).
-- **[r4]** `reason` is null for `committed` and for in-flight rows. A committed row's `last_error` (a §7.1 spent reason) is
+- **[r4]** `reason` is null for `committed` and for in-flight rows. A committed row's `last_error` (a **[r6]** §7.3 spent reason) is
   never shown.
 
 #### 6.1.1 The summary's move computer and its reads **[r4]**
@@ -1543,7 +1547,8 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 - The overlay watches `computer.progress` (5 s polls, as today) and re-asks the open **at most every 30 s**. Each ask is
   harmless while the move is in flight: the reverse waiting provider never boots anything.
 - **[r6] The wake loop's clocks (`session.js`; lane U makes this change).** `withWakeAndOneRetry` (`session.js:412-557`) is
-  the one loop behind `openDesktop`, `previewUrl` and `code.js`'s own mint (`code.js:219`). `code.js` and `preview.js` are
+  the one loop behind `openDesktop`, `previewUrl` and `code.js`'s own mint, all three through `cancellableWake`
+  (`session.js:597,858`, `code.js:152`), which always passes the loop its `computerId` (`session.js:620-629`). `code.js` and `preview.js` are
   read-only (§1.1), so the move wait lives **inside** this loop; a loop that handed a moving answer back to its caller
   would show Code's failure copy. Round 6a extended the loop: the first `computePreparing` answer raises the deadline to
   `min(that answer + PREPARE_DEADLINE_MS (180 s), t0 + LAUNCH_DEADLINE_MS (600 s))` and raises `maxIssues`, never
@@ -1563,7 +1568,8 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
      Free computer); `failed_reopened` or `failed_needs_operator` → no ask: it returns the last moving answer and the
      caller shows the outcome (below). r5's "the open stops answering `computeMoving` → re-ask" is withdrawn: an answer
      without `computeMoving` means the server already ran an ordinary open, which after a failure is a D16 hold boot of
-     the AWS computer. **Disclosed:** a failure that lands between that progress read and the server routing the ask
+     the AWS computer. The read needs the loop's `computerId`; a loop without one (no caller today) returns a moving
+     answer to its caller and never re-asks it. **Disclosed:** a failure that lands between that progress read and the server routing the ask
      still boots the AWS computer under the hold. Closing it would need a new `previewUrl` input, which `code.js` cannot
      send.
   4. The first answer without `computeMoving` after a moving one re-anchors the loop, as `wakeResumed` does after a forward
@@ -1582,7 +1588,9 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
   (§5.3). After a move they behave exactly as in 6a: a `failed_reopened` user who picks [Open my AWS computer] gets an
   ordinary hold open, with 6a's preparing wait and copy. `app-spinner.js` checks the moving view before its preparing
   latch (`open.prepare`, `app-spinner.js:309-311,347,383`), so an observation with `operation: 'moving'` is always painted
-  as the move. During a move, Troubleshoot's Restart computer meets the reverse provider (§5.3) and changes nothing.
+  as the move. During a move, Troubleshoot's Restart computer (`computer.restartComputer` → `restartWholeComputer`,
+  `compute-dispatch.ts:564-581`) reads the placement directly and answers `busy` or `not_running` (`:579,581`), because an
+  export boot never reaches RUNNING (§5.2); Restart desktop meets the reverse provider (§5.3). Neither changes anything.
 - The watch ends when, after this open has itself seen `operation: 'moving'` (the `seenInFlight` rule of
   `watchComputerTransition`, `computer-progress.js:359-376`):
   - `move.outcome` is `committed` → re-ask the open (it now opens the Free computer; **[r6]** item 3 above);
@@ -1942,6 +1950,10 @@ Numbers are the review's own order (1-based; the first ten are r4's rows above).
 r6 rebased `r6/phaseb-20261030` onto `r6/integ-20261030` at `7a1f2ed1` (round 6a, LIVE on os-staging) with **no
 conflicts**: 6a and this branch touch disjoint files. `0012_compute_reverse_moves.sql` is byte-identical (sha256
 `3adc0297…d340`, the registered digest in `.github/production-migrations.json`).
+
+Section numbers in §10, §11, §12 and §12.1 refer to the revision each table describes. In particular, r5's §7.1 (the
+`reverse_snapshot` machine) and §7.2 (the deployment field) are withdrawn; r6's §7.1 is the DLM policy, §7.2 the seam
+and §7.3 what is held with lane O.
 
 | Item | Section(s) | Resolution |
 |---|---|---|
