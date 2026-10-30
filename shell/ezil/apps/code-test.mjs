@@ -681,6 +681,9 @@ await settle(4);
         w?.classList.contains('ezil-full-view-host') && !! w.querySelector(':scope > .ezil-full-view-bar')
         && !! w.querySelector(':scope > .ezil-app-drawer') && ! shown(w.querySelector(':scope > .ezil-app-drawer')));
     push('7a nothing is announced or remembered by an open', views.length === 0 && store.getItem(VIEW_KEY) === null, JSON.stringify(views));
+    // `_ezil_view()`: the view the router records for this window's entry
+    // (docs/APP-ROUTES.md §5 "State"), read from the full-view state.
+    push('7a _ezil_view() reports the open, unannounced: "window"', w?._ezil_view?.() === 'window', String(w?._ezil_view?.()));
     const windowed = geom(w);
 
     // 7b. The green button -> full view.
@@ -700,6 +703,7 @@ await settle(4);
     push('7b …announced once as {appId:"code", view:"full"} and remembered as the user\'s choice',
         views.length === 1 && views[0].appId === 'code' && views[0].view === 'full' && store.getItem(VIEW_KEY) === 'full', JSON.stringify(views));
     push('7b 🔴 never the browser Fullscreen API (and full view DID engage)', fullscreen_calls === 0 && isFull(w));
+    push('7b _ezil_view() reports "full"', w._ezil_view() === 'full');
     push('7b upstream maximise did not also run', w.getAttribute('data-is_maximized') !== '1');
 
     // 7c. The same control again -> the window, at its previous bounds.
@@ -731,12 +735,15 @@ await settle(4);
     await settle(8);
     push('7e the top bar\'s minimise hides the window and gives the taskbar back',
         ['true', '1'].includes(w.getAttribute('data-is_minimized')) && taskbarShown() && ! w.classList.contains('ezil-fullbleed'));
+    push('7e 🔴 _ezil_view() still reports "full" while minimised from full view (no full-view class: the desire, not the class)',
+        w._ezil_view() === 'full' && ! w.classList.contains('ezil-fullbleed'));
     window.$(w).showWindow();
     await settle(24);
     push('7e 🔴 back from the taskbar it is in full view again (the desire outlived the minimise)', isFull(w));
     click(w.querySelector('.ezil-app-drawer .dashboard-app-drawer-restore'));
     await settle(4);
     push('7e the drawer\'s "Restore window" returns to the window too', isWindowed(w) && geom(w) === windowed);
+    push('7e positive control: _ezil_view() reports "window" once restored to the window', w._ezil_view() === 'window');
     window.scale_window(w);
     await settle(4);
     click(w.querySelector('.ezil-app-drawer .dashboard-app-drawer-minimize'));

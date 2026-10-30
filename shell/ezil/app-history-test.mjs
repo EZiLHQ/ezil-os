@@ -211,24 +211,98 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     same(w.history.length, 4);
 }
 for (const [recorded, later] of [['full', 'window'], ['window', 'full']]) for (const codeOpen of [true, false]) {
-    // A stale recorded view: E1 recorded one view; the user later chose the
-    // other on E2 (relabelled Code by a focus). Back to E1 must not resize an
-    // open Code back; a closed one reopens with E1's own view (and with
-    // 'window', that is not the route's default 'full').
-    const { w, controller, launches, open, focus, url } = harness('/os');
+    // E1 recorded one view; the user later chose the other on E2 (relabelled
+    // Code by a focus). Back to E1 must not resize an open Code back, so E1
+    // takes the view Code shows NOW, at the popstate itself (no launch
+    // commits here): a reload of E1 reopens what is on screen. A closed Code
+    // reopens with E1's own view (and with 'window', that is not the route's
+    // default 'full').
+    const { w, controller, launches, open, focus, url, traverse } = harness('/os');
     const code = open('code', 1);
+    // Code's `_ezil_view`: what the window shows, which its events report.
+    let shows = 'window';
+    code._ezil_view = () => shows;
+    const view = next => { shows = next; w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: next } })); };
     controller.begin('code').end(code);
     controller.settled(code);
-    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: recorded } }));
+    view(recorded);
     controller.begin('settings').end(open('settings', 2));
     focus(code);
-    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: later } }));
+    same([url(), w.history.state.ezilView], ['/app/code', recorded], `a focus names Code on E2 with the view it shows, ${recorded}`);
+    view(later);
     same([url(), w.history.length, w.history.state.ezilView], ['/app/code', 3, later], `E2 names Code, ${later}`);
     if ( ! codeOpen ) code.remove();
-    w.history.back(); await new Promise(resolve => setTimeout(resolve, 30));
-    same([url(), w.history.state.ezilView], ['/app/code', recorded], `Back lands on E1, which recorded ${recorded}`);
+    await traverse(-1);
+    same([url(), w.history.state.ezilView], ['/app/code', codeOpen ? later : recorded], codeOpen
+        ? `Back lands on E1, which takes the view the open Code shows, ${later}` : `positive control: with Code closed, E1 keeps ${recorded}`);
     same(launches, [['code', { computer: { id: C }, ...(codeOpen ? {} : { view: recorded }), historyMode: 'replace' }]],
         codeOpen ? 'Back to an open Code passes no view' : "positive control: a closed Code reopens with E1's view");
+    ok(w.history.state.__NA === true, "Next's key survives the refresh");
+}
+for (const reports of [undefined, 'throws', 'huge', 'window']) {
+    // An open window that reports no view (every app but Code; a value that
+    // is not a view; an accessor that throws): Back to it REMOVES the view its
+    // entry recorded, rather than keep a stale one, and never throws.
+    // Positive control: one that reports a view gets it.
+    const { w, controller, open, url, traverse } = harness('/app/settings', { state: { __NA: true, ezilApp: 'settings', ezilView: 'full', other: 1 } });
+    const settings = open('settings', 1);
+    if ( reports === 'throws' ) settings._ezil_view = () => { throw new Error('no view'); };
+    else if ( reports ) settings._ezil_view = () => reports;
+    controller.begin('code').end(open('code', 2));
+    same([url(), w.history.length], ['/app/code', 2]);
+    await traverse(-1);
+    same([url(), w.history.state], ['/app/settings', { __NA: true, ezilApp: 'settings', other: 1, ...(reports === 'window' ? { ezilView: 'window' } : {}) }],
+        reports === 'window' ? 'positive control: a window that reports a view records it' : `an open window that reports ${String(reports)} leaves its entry with no view`);
+}
+{
+    // Every other write of an entry for an app whose window is open records
+    // the view that window shows then, even when no event said so (`shows`
+    // changes silently here): a focus, a close naming the front app, a click
+    // on the open app (its push), a route's commit, sync, and a failed
+    // click's give-back. Each write is checked against a view it did not
+    // already have.
+    const { w, controller, open, focus, close, url } = harness('/os');
+    const code = open('code', 1);
+    let shows = 'window';
+    code._ezil_view = () => shows;
+    controller.begin('code').end(code); controller.settled(code);
+    same([url(), w.history.state.ezilView], ['/app/code', 'window'], 'a click on a Code already open: its push records the view it shows');
+    const settings = open('settings', 2);
+    controller.begin('settings').end(settings); controller.settled(settings);
+    shows = 'full';
+    focus(code);
+    same([url(), w.history.state.ezilView], ['/app/code', 'full'], 'a focus');
+    focus(settings);
+    same([url(), w.history.state.ezilView], ['/app/settings', undefined], "positive control: Code's view leaves with Code");
+    shows = 'window';
+    close(settings);
+    same([url(), w.history.state.ezilView], ['/app/code', 'window'], 'a close that names the front app');
+    const again = open('settings', 3);
+    controller.begin('settings').end(again); controller.settled(again);
+    shows = 'full';
+    const length = w.history.length;
+    controller.begin('code').end(code);
+    same([url(), w.history.length, w.history.state.ezilView], ['/app/code', length + 1, 'full'], 'a click on the open Code pushes the view it shows');
+    shows = 'window';
+    controller.commit('code', { historyMode: 'replace' }, code);
+    same(w.history.state.ezilView, 'window', "a route's commit");
+    shows = 'full';
+    focus(code);
+    w.history.replaceState(w.history.state, '', '/app/settings');
+    controller.sync();
+    same([url(), w.history.state.ezilView], ['/app/code', 'full'], 'sync, naming the front app');
+    const failing = controller.begin('settings');
+    same([url(), w.history.state.ezilView], ['/app/settings', undefined]);
+    shows = 'window';
+    failing.end(null);
+    same([url(), w.history.state.ezilView, w.history.state.__NA], ['/app/code', 'window', true], "a failed click gives Code's entry back with the view Code shows now");
+}
+{
+    // Positive control: an app with no window keeps the view its entry
+    // recorded (the boot's adopt, before its launch: a reload).
+    const { w, controller } = harness('/app/code', { state: { __NA: true, ezilApp: 'code', ezilView: 'window' } });
+    controller.adopt({ id: 'code' });
+    same([w.history.state, controller.recordedView('code')], [{ __NA: true, ezilApp: 'code', ezilView: 'window' }, 'window'], 'a reload keeps the recorded view');
 }
 {
     // Adopt: the boot's link is canonicalised in place, once, without pushing.
@@ -644,9 +718,9 @@ for (const [tab, order] of [[undefined, 'commit first'], [undefined, 'click firs
 }
 for (const renames of [false, true]) {
     // A close takes the entry only if it renames it. Behind the front window
-    // it renames nothing, and a Back launch still opening still commits
-    // (stamping the entry's app); a close of the front window renames it,
-    // and the Back launch writes nothing (positive control).
+    // it renames nothing, and a Back launch still opening still commits (its
+    // write, counted); a close of the front window renames it, and the Back
+    // launch writes nothing (positive control).
     const routes = [];
     const { w, open, focus, close, url, traverse } = harness('/os', { routes });
     const desktop = open('desktop', 5);
@@ -655,11 +729,15 @@ for (const renames of [false, true]) {
     w.history.pushState({ __NA: true }, '', '/app/settings?tab=usage');
     w.history.pushState({ __NA: true }, '', '/app/code');
     await traverse(-1);
-    same([url(), w.history.state.ezilApp, routes.map(r => r.id)], ['/app/settings?tab=usage', undefined, ['settings']], 'Back to Settings at Usage, still opening');
+    // Settings is open, so the entry names it (and its view) at once.
+    same([url(), w.history.state.ezilApp, routes.map(r => r.id)], ['/app/settings?tab=usage', 'settings', ['settings']], 'Back to Settings at Usage, still opening');
     close(renames ? settings : desktop);
     same(url(), renames ? '/app/desktop' : '/app/settings?tab=usage', renames ? 'the close of the front window renames the entry' : 'a close behind it renames nothing');
+    const writes = [];
+    const replace = w.history.replaceState.bind(w.history);
+    w.history.replaceState = (...args) => { writes.push(args[2]); replace(...args); };
     routes.shift().resolve(renames ? open('settings', 20) : settings);
-    same([url(), w.history.state.ezilApp], renames ? ['/app/desktop', 'desktop'] : ['/app/settings?tab=usage', 'settings'],
+    same([url(), w.history.state.ezilApp, writes], renames ? ['/app/desktop', 'desktop', []] : ['/app/settings?tab=usage', 'settings', ['/app/settings?tab=usage']],
         renames ? 'it took the entry: the Back launch writes nothing over it' : 'it took nothing: the Back launch commits');
 }
 {
@@ -796,4 +874,4 @@ for (const renames of [false, true]) {
     controller.begin('code');
     same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
 }
-console.log(`PASS ${checks} checks: app-history helpers (consume included), push-before-open, rollback, replace, focus, close, view recording, Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);
+console.log(`PASS ${checks} checks: app-history helpers (consume included), push-before-open, rollback, replace, focus, close, view recording, the entry follows the screen (an open window's view on Back/Forward, focus, close, push, commit, sync and give-back; none reported, none kept), Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);

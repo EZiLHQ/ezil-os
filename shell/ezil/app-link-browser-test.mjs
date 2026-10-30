@@ -165,6 +165,48 @@ try {
     }
     await nav.goto(`${origin}/app/browser`); await nav.locator('.window[data-app="desktop"]').waitFor();
     assert.equal((await where())[0], '/app/desktop', 'the browser alias becomes the registry id');
+    // ── the entry follows the screen (docs/APP-ROUTES.md §5 "State") ───────
+    // Back never resizes an open Code, so the entry it lands on takes the
+    // view Code shows now, and a reload of that entry reopens Code that way.
+    // E1: Code from /app/code, full. Minimised from full view (the dock comes
+    // back), Settings from the dock pushes E2, Code's dock icon pushes E3
+    // (Code comes back full). Restore window on E3, then Back, Back to E1,
+    // which still said full. Positive control: no Restore, full throughout.
+    // No timed waits: each step waits for the page or the window it needs.
+    // A launch commits right after its window is built (microtasks), so the
+    // next `evaluate` reads the entry as written.
+    for (const restore of [true, false]) {
+        const tab = await context.newPage();
+        const label = restore ? 'Restore window' : 'positive control, no Restore';
+        const now = () => tab.evaluate(() => [location.pathname, history.length, history.state?.ezilView ?? null,
+            document.querySelector('.window[data-app="code"]')?.classList.contains('ezil-fullbleed') ?? null, window.__reloadingPops]);
+        const fullCode = tab.locator('.window[data-app="code"].ezil-fullbleed');
+        const bar = action => tab.locator(`.window[data-app="code"] > .ezil-full-view-bar [data-action="${action}"]`).click();
+        const at = pathname => tab.waitForFunction(p => location.pathname === p, pathname);
+        await tab.goto(`${origin}/app/code`);
+        await fullCode.waitFor();
+        const base = (await now())[1];
+        assert.deepEqual(await now(), ['/app/code', base, 'full', true, 0], `${label}: E1, Code full from its route, and E1 says so`);
+        await bar('minimize');
+        await tab.locator('.taskbar-item[data-app="settings"]').click();
+        await tab.locator('.window[data-app="settings"].window-active').waitFor(); await at('/app/settings');
+        await tab.locator('.taskbar-item[data-app="code"]').click();
+        await at('/app/code'); await fullCode.waitFor();
+        assert.deepEqual(await now(), ['/app/code', base + 2, 'full', true, 0], `${label}: E3, Code back from the dock in full view`);
+        if ( restore ) {
+            await bar('restore'); await fullCode.waitFor({ state: 'detached' });
+            assert.deepEqual(await now(), ['/app/code', base + 2, 'window', false, 0], 'Restore window, recorded on E3');
+        }
+        await tab.goBack(); await at('/app/settings');
+        await tab.goBack(); await at('/app/code');
+        assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
+            restore ? '🔴 Back to E1: Code stays windowed, and E1 takes its view' : `${label}: Back to E1, full`);
+        await tab.reload();
+        await tab.locator('.window[data-app="code"].ezil-full-view-host').waitFor();
+        assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
+            restore ? '🔴 a reload of E1 opens Code WINDOWED, as it was on screen' : `${label}: a reload of E1 opens Code full`);
+        await tab.close();
+    }
     // 🔴 PRE-EXISTING, NOT A ROUTE ARTIFACT: `bundle.min.css` carries jQuery
     // UI's theme sprites as `url("images/ui-icons_*.png")`, which resolve
     // against the STYLESHEET (`/os/bundle.min.css`), and `build-shell.sh`
@@ -182,5 +224,5 @@ try {
     assert.deepEqual(missing.filter(request => !sprite(request)), [], 'nothing was requested from a path this host does not serve');
     assert.ok(!missing.some(request => request.startsWith('/app/')), 'nothing resolved against /app/');
     assert.deepEqual(errors, []);
-    console.log(`PASS ${checks} checks, local Chromium: fresh Code/Browser, refresh, Settings close/reopen/default/deep section, repeated target, two OS tabs, ordinary entry, invalid target, truthful Usage and failed-refresh recovery, /app/<id> reloads (no route-specific 404; the jQuery UI sprite 404 is the same at /os), alias canonicalisation, gesture-only pushes, Back/Forward focus without closing, invalid links`);
+    console.log(`PASS ${checks} checks, local Chromium: fresh Code/Browser, refresh, Settings close/reopen/default/deep section, repeated target, two OS tabs, ordinary entry, invalid target, truthful Usage and failed-refresh recovery, /app/<id> reloads (no route-specific 404; the jQuery UI sprite 404 is the same at /os), alias canonicalisation, gesture-only pushes, Back/Forward focus without closing, the entry follows the screen (Back, Back, reload: Code windowed as on screen; full as control), invalid links`);
 } finally { await context.close(); await browser.close(); await new Promise(resolve => server.close(resolve)); }

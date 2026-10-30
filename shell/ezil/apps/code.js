@@ -946,6 +946,10 @@ export async function openCodeWindow (ctx = {}) {
     /** The view the router was last told about. The open itself is not announced. */
     let view_now = 'window';
     const current_view = () => (full_view.allowed && full_view.wants ? 'full' : 'window');
+    // Read by the router (`../app-history.js`) each time it writes an entry
+    // for this window: the view NOW, from the full-view state, not the last
+    // one announced. 'full' while minimised from full view (it still wants it).
+    el_window._ezil_view = current_view;
     /**
      * Apply a view. `remember` only for a user's gesture. Announces
      * `ezil:app-view-changed` when the view actually changes — never at open:

@@ -9,7 +9,10 @@
 //   - focus moving to another app's window REPLACES the current entry;
 //   - closing a window REPLACES it with the next focused app, or `/os`;
 //   - Back/Forward (`popstate`) focuses that app's window, or launches it.
-//     It NEVER closes a window, stops a computer or deletes state.
+//     It NEVER closes a window, stops a computer or deletes state;
+//   - an entry written for an app whose window is open records the view
+//     that window shows now (`viewOf`), so a reload reopens what was on
+//     screen. One whose app has no window keeps the view it recorded.
 //
 // 🔴 ONLY THE LATEST INTENT DECIDES. Launches resolve out of order (a click
 // on Code, then on Settings; Settings opens first). A launch, or a
@@ -202,13 +205,31 @@ export function createAppHistory () {
     const here = () => `${win().location.pathname}${win().location.search}${win().location.hash}`;
     const urlFor = id => (id ? appUrl(id, [...Object.entries(params.get(id) ?? {}), ...pageParams])
         : `${OS_PATH}${query(pageParams)}`);
-    // `ezilView` describes the entry's app; it does not survive a change of app.
-    const stateFor = id => ({ ezilApp: id ?? undefined,
-        ...(win().history.state?.ezilApp === id ? {} : { ezilView: undefined }) });
+    const liveWindow = id => win().document.querySelector(`.window[data-app="${id}"]:not([data-closing="1"])`);
+    // 🔴 THE ENTRY FOLLOWS THE SCREEN. The view an open window shows NOW,
+    // asked of the window itself (Code: `_ezil_view`, its full-view state),
+    // never a copy kept here: a copy drifts (an open is not announced, a
+    // minimise is not a change of view). Undefined when it reports none.
+    const viewOf = el => {
+        try { const view = el?._ezil_view?.(); return VIEWS.has(view) ? view : undefined; } catch { return undefined; }
+    };
+    // `ezilView` describes the entry's app: an app with an open window gets
+    // that window's view (or none), and a recorded one never outlives a change
+    // of app. An app with no window keeps what its entry recorded, which is
+    // how a reload, or a Back that launches it, reopens it.
+    const stateFor = id => {
+        const el = id ? liveWindow(id) : null;
+        if ( el ) return { ezilApp: id, ezilView: viewOf(el) };
+        return { ezilApp: id ?? undefined, ...(win().history.state?.ezilApp === id ? {} : { ezilView: undefined }) };
+    };
+    // `state` with its app's view refreshed, if that app has a window open.
+    const withView = state => {
+        const el = known(state?.ezilApp) ? liveWindow(state.ezilApp) : null;
+        return el ? mergeHistoryState(state, { ezilView: viewOf(el) }) : state;
+    };
     const write = (method, url, patch) => {
         win().history[method](mergeHistoryState(win().history.state, patch), '', url);
     };
-    const liveWindow = id => win().document.querySelector(`.window[data-app="${id}"]:not([data-closing="1"])`);
     // Record what this launch says about the app's own URL parameters:
     // Settings' tab always follows the launch (it reopens at Account without
     // one), Code's project only when one is given. True if they changed.
@@ -231,10 +252,16 @@ export function createAppHistory () {
         if ( ! link ) return;
         params.set(link.id, linkParams(link));
         const state = win().history.state;
+        const open = liveWindow(link.id);
+        // An open window is focused, never resized (§3), so the entry it
+        // lands on takes the view that window shows now, here, before the
+        // launch: a launch that stands down (a click before its `commit`)
+        // must not leave the entry's older view for a reload to reopen.
+        if ( open && enabled ) write('replaceState', here(), { ezilApp: link.id, ezilView: viewOf(open) });
         const ctx = {
             ...deps.launchContext(),
             ...routeLaunchContext(link, {
-                hasWindow: !! liveWindow(link.id),
+                hasWindow: !! open,
                 recordedView: state?.ezilApp === link.id ? state.ezilView : undefined,
             }),
             historyMode: 'replace',
@@ -427,15 +454,19 @@ export function createAppHistory () {
             // nothing: it holds the entry under the owner it found.
             if ( remember(id, ctx) || pushed ) {
                 owner = gen;
-                write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: undefined } : stateFor(id));
+                // A new entry records no view, unless the app is open already
+                // (a click on its dock icon): then the one its window shows.
+                write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: viewOf(liveWindow(id)) } : stateFor(id));
             }
             const held = owner;
             const mine = params.get(id);
             // As if this launch never happened: the URL and state it
             // replaced, the owner and the newest launch from before it. If
-            // that launch failed meanwhile, it gives back too.
+            // that launch failed meanwhile, it gives back too. The state goes
+            // back with the view its app's window shows now: the user may
+            // have changed it while this launch was pending.
             const giveBack = () => {
-                if ( pushed ) win().history.replaceState(before.state, '', before.url);
+                if ( pushed ) win().history.replaceState(withView(before.state), '', before.url);
                 ({ owner, launch: launchGeneration } = prior);
                 const older = failed.get(launchGeneration);
                 failed.delete(launchGeneration);

@@ -191,7 +191,9 @@ for (const [entry, canonical] of [
     done(recorded.w);
     const otherApp = await boot('/app/code', { state: { ...NEXT_STATE, ezilApp: 'settings', ezilView: 'window' } });
     same(otherApp.opens.map(c => c.view), ['full'], "another app's recorded view is not Code's");
-    ok(otherApp.w.history.state.ezilView === undefined && otherApp.w.history.state.ezilApp === 'code');
+    // Its launch's commit records the view Code opened in (the open itself
+    // is not announced): the entry follows the screen.
+    same([otherApp.w.history.state.ezilView, otherApp.w.history.state.ezilApp], ['full', 'code']);
     done(otherApp.w);
     const nostate = await boot('/app/code', { state: null });
     same([nostate.opens.map(c => c.view), nostate.w.history.state.ezilApp], [['full'], 'code'], 'no prior state at all');
@@ -216,13 +218,16 @@ for (const [entry, canonical] of [
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'focus replaces');
     w.$(win('code')).focusWindow();
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3]);
+    // The focus wrote the view the open Code shows: windowed (a dock launch).
+    same(w.history.state.ezilView, 'window', 'a focus of the open Code records its view');
     const views = [];
     win('code')._ezil_relaunch = launchCtx => views.push(launchCtx.view);
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'settings', view: 'full' } }));
     w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'huge' } }));
-    same(w.history.state.ezilView, undefined, 'a view for another app, or an unknown view, is not recorded');
-    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'window' } }));
-    same([w.history.state.ezilView, w.history.state.__NA, w.history.length], ['window', true, 3], 'the view is recorded on this entry');
+    same([w.history.state.ezilApp, w.history.state.ezilView], ['code', 'window'], 'a view for another app, or an unknown view, is not recorded');
+    // The event alone, as Code would send it (the window itself stays as it is).
+    w.dispatchEvent(new w.CustomEvent('ezil:app-view-changed', { detail: { appId: 'code', view: 'full' } }));
+    same([w.history.state.ezilView, w.history.state.__NA, w.history.length], ['full', true, 3], 'the view is recorded on this entry');
     w.history.back(); await wait(200);
     same(url(), `/app/settings?computer=${COMPUTER}`);
     ok(win('settings').classList.contains('window-active'), 'Back focuses Settings');
@@ -256,7 +261,7 @@ for (const [entry, canonical] of [
 const appeared = (w, selector) => new Promise(resolve => {
     if (w.document.querySelector(selector)) { resolve(); return; }
     const observer = new w.MutationObserver(() => { if (w.document.querySelector(selector)) { observer.disconnect(); resolve(); } });
-    observer.observe(w.document, { childList: true, subtree: true });
+    observer.observe(w.document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
 });
 async function ordered() {
     const booted = await boot(`/os?computer=${COMPUTER}`, { ready: w => appeared(w, '.taskbar-item[data-app="settings"]') });
@@ -279,9 +284,14 @@ async function ordered() {
         app.open = async launchCtx => { app.open = open; await held; return open(launchCtx); };
         return release;
     };
-    // Resolves on this module's next history write (a route's `commit`).
-    const written = () => new Promise(resolve => {
-        w.history.replaceState = (...args) => { delete w.history.replaceState; w.history.replaceState(...args); resolve(); };
+    // Resolves on this module's `count`-th history write from now (a route's
+    // `commit` is the last one a Back launch makes).
+    const written = (count = 1) => new Promise(resolve => {
+        const replace = w.history.replaceState;
+        w.history.replaceState = (...args) => {
+            replace.apply(w.history, args);
+            if ( (count -= 1) === 0 ) { delete w.history.replaceState; resolve(); }
+        };
     });
     const launch = id => w.ezil.registry.launch(id, ctx);
     const settle = () => { elapse(80); elapse(120); };
@@ -339,10 +349,13 @@ async function ordered() {
     const { w, url, written, launch, settle, elapse, front } = await ordered();
     await launch('code'); settle();
     await launch('settings'); settle();
-    const committed = written();
+    // Two writes: the entry takes the view the open Code shows (Code's own
+    // entry was pushed before its window existed, with none), then the
+    // launch commits.
+    const committed = written(2);
     w.history.back();
     await committed;
-    same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'Back to Code commits in place');
+    same([url(), w.history.length, w.history.state.ezilView], [`/app/code?computer=${COMPUTER}`, 3, 'window'], 'Back to Code commits in place');
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3]);
     const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "the Back launch's late focus does not take the address bar from the newer click");
@@ -512,6 +525,204 @@ for (const [label, entry] of [['the entry a click on Settings left', leftBehind.
     done(reload.w);
 }
 
+// ── the entry follows the screen: Back/Forward, then a reload ───────────────
+// docs/APP-ROUTES.md §5 "State". Back/Forward never resizes an open Code, so
+// the entry it lands on takes the view Code shows NOW, and a reload of that
+// entry (a new document booted from its URL and state) reopens Code as it
+// was on screen. The real bundle throughout: code.js's full view, its top
+// bar, its relaunch hook and its `ezil:app-view-changed`, none stubbed. No
+// sleeps: `viewBoot` is ready once its link's Code window is built (the
+// `ezil-full-view-host` class goes on in the same synchronous run that
+// applies the launch's view) and one turn later, when that launch has
+// committed. The 80/120ms focuses and Code's 220ms restore from the taskbar
+// are queued and run by hand (`timers`).
+const CODE_BUILT = '.window[data-app="code"].ezil-full-view-host';
+async function viewBoot(entry, state = NEXT_STATE) {
+    const delayed = [];
+    const booted = await boot(entry, { state, ready: async w => {
+        const setTimeout = w.setTimeout;
+        w.setTimeout = (fn, ms, ...args) => ([80, 120, 220].includes(ms) ? delayed.push({ ms, run: () => fn(...args) }) : setTimeout.call(w, fn, ms, ...args));
+        await appeared(w, '.taskbar-item[data-app="settings"]');
+        if ( entry.startsWith('/app/code') ) await appeared(w, CODE_BUILT);
+        await turn();
+    } });
+    const { w, win, url, ctx } = booted;
+    const timers = async () => {
+        for (const ms of [80, 120, 220]) for (const timer of delayed.filter(t => t.ms === ms)) { delayed.splice(delayed.indexOf(timer), 1); timer.run(); }
+        await turn();
+    };
+    // A click (a dock icon), then its window's delayed focuses.
+    const click = async id => { await w.ezil.registry.launch(id, ctx); await timers(); };
+    // Code's own top bar: 'restore' (Restore window) or 'minimize'.
+    const bar = action => win('code').querySelector(`:scope > .ezil-full-view-bar [data-action="${action}"]`).click();
+    // Back/Forward, resolved by the popstate itself, then by Code's window
+    // when the entry names it (a closed Code is built anew). `during` runs
+    // right after the shell's own popstate handler, before its launch
+    // resolves.
+    const traverse = async (delta, during) => {
+        const popped = new Promise(resolve => w.addEventListener('popstate', () => { during?.(); resolve(); }, { once: true }));
+        w.history.go(delta);
+        await popped;
+        if ( url().startsWith('/app/code') ) await appeared(w, CODE_BUILT);
+        await turn();
+        await timers();
+    };
+    const view = () => w.history.state?.ezilView;
+    const full = () => win('code')?.classList.contains('ezil-fullbleed') ?? null;
+    // A reload of the current entry: this document goes, a new one boots
+    // from the entry's URL and state.
+    const reload = () => {
+        const [at, kept] = [url(), plain(w.history.state)];
+        done(w);
+        return viewBoot(at, kept);
+    };
+    return { ...booted, timers, click, bar, traverse, view, full, reload };
+}
+for (const [delta, switched] of [[-1, true], [1, true], [-1, false], [1, false]]) {
+    // E1: Code from /app/code, full. A click on Settings pushes E2, and a
+    // focus of Code renames it, both recording full. (Forward: Back to E1
+    // first.) The user restores Code to a window on the entry it is on, or,
+    // the positive control, does not, and goes Back (Forward) to the other
+    // entry, which still says full. Code is not resized; the entry is.
+    const name = `${delta < 0 ? 'Back' : 'Forward'}${switched ? '' : ', no switch'}`;
+    const v = await viewBoot('/app/code');
+    const { w, win } = v;
+    same([v.opens.map(c => c.view), v.full(), v.view()], [['full'], true, 'full'], `${name}: E1, Code opened full from its route, and its commit says so`);
+    await v.click('settings');
+    same([v.url(), w.history.length, w.history.state.ezilApp, v.full()], ['/app/settings', 2, 'settings', true], `${name}: a click on Settings pushes E2`);
+    w.$(win('code')).focusWindow();
+    same([v.url(), v.view()], ['/app/code', 'full'], `${name}: a focus of Code renames E2, with the view Code shows`);
+    if ( delta > 0 ) {
+        await v.traverse(-1);
+        same([v.url(), v.view(), v.full()], ['/app/code', 'full', true], `${name}: Back to E1 first`);
+    }
+    if ( switched ) v.bar('restore');
+    same([v.full(), v.view()], switched ? [false, 'window'] : [true, 'full'], switched ? `${name}: Restore window, recorded on this entry` : `${name}: no switch`);
+    await v.traverse(delta);
+    same([v.url(), w.history.length, v.full(), v.opens.length], ['/app/code', 2, ! switched, 1], `${name}: Code is focused, never resized or reopened`);
+    same(v.view(), switched ? 'window' : 'full', `${name}: 🔴 the entry it lands on takes the view Code shows`);
+    same([w.history.state.__NA, w.history.state.__PRIVATE_NEXTJS_INTERNALS_TREE], [true, NEXT_STATE.__PRIVATE_NEXTJS_INTERNALS_TREE], `${name}: Next's keys survive`);
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full(), r.view()], switched ? [['window'], false, 'window'] : [['full'], true, 'full'],
+        switched ? `${name}: 🔴 a reload of that entry opens Code WINDOWED, as it was on screen` : `${name}: positive control: a reload opens Code full`);
+    done(r.w);
+}
+{
+    // The entry is written at the popstate itself, not only by the Back
+    // launch's commit: a click on Settings made before that launch resolves
+    // takes the entry, and the commit stands down. Code, closed after that,
+    // reopens on a later Back to E1 with the view E1 took when Back landed
+    // on it: windowed, as it was then.
+    const v = await viewBoot('/app/code');
+    const { w, win } = v;
+    await v.click('settings');
+    w.$(win('code')).focusWindow();
+    v.bar('restore');
+    same([v.url(), w.history.length, v.view(), v.full()], ['/app/code', 2, 'window', false], 'E2 names Code, windowed');
+    let clicked = null;
+    await v.traverse(-1, () => { clicked = w.ezil.registry.launch('settings', v.ctx); });
+    ok(await clicked === win('settings'));
+    await v.timers();
+    same([v.url(), w.history.length], ['/app/settings', 2], 'the click right after Back pushed over E2, and the Back launch stood down');
+    await w.$(win('code')).close();
+    same([v.url(), win('code')], ['/app/settings', null], 'Code closed behind Settings');
+    await v.traverse(-1);
+    same([v.url(), v.opens.map(c => c.view), v.full(), v.view()], ['/app/code', ['full', 'window'], false, 'window'],
+        '🔴 Back to E1 reopens Code WINDOWED: E1 took the view Code showed when Back first landed on it');
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full()], [['window'], false], '... and so does a reload of E1');
+    done(r.w);
+}
+for (const recorded of ['full', 'window']) {
+    // Positive control: Back to the entry of an app that is CLOSED launches
+    // it with the view that entry recorded, whatever the user chose since on
+    // another entry. E1 records `recorded`; on E2 Code is switched the other
+    // way, then closed. With 'full', Code reopens full unannounced while the
+    // last view it announced was 'window': the entry asks the window, it
+    // keeps no copy of the events.
+    const v = await viewBoot('/app/code');
+    const { w, win } = v;
+    const other = recorded === 'full' ? 'window' : 'full';
+    if ( recorded === 'window' ) v.bar('restore');
+    same(v.view(), recorded, `E1 records ${recorded}`);
+    await v.click('settings');
+    w.$(win('code')).focusWindow();
+    // Restore window, or the green button's handler (`scale_window`).
+    if ( other === 'window' ) v.bar('restore'); else w.scale_window(win('code'));
+    same([v.url(), v.view(), v.full()], ['/app/code', other, other === 'full'], `E2: Code switched to ${other}`);
+    await w.$(win('code')).close();
+    same([v.url(), v.view(), win('code')], ['/app/settings', undefined, null], 'closing Code renames E2 to Settings');
+    await v.traverse(-1);
+    same([v.url(), v.opens.map(c => c.view), v.full(), v.view()], ['/app/code', ['full', recorded], recorded === 'full', recorded],
+        `Back to E1 with Code closed: it reopens with E1's own view, ${recorded}, and E1 still says so`);
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full(), r.view()], [[recorded], recorded === 'full', recorded], `a reload of E1 opens Code ${recorded} too`);
+    done(r.w);
+}
+{
+    // Minimised from full view, Code still WANTS full view (back from the
+    // taskbar it re-enters it: code.js's 220ms restore, run by hand), though
+    // while hidden it has no `ezil-fullbleed` class. Back to its entry
+    // records 'full': the window's state, not its class.
+    const v = await viewBoot('/app/code');
+    const { w, win } = v;
+    v.bar('minimize');
+    same([v.full(), win('code').getAttribute('data-is_minimized'), v.view()], [false, 'true', 'full'], 'minimised from full view');
+    await v.click('settings');
+    same([v.url(), w.history.length, v.full()], ['/app/settings', 2, false]);
+    await v.traverse(-1);
+    same([v.url(), win('code').getAttribute('data-is_minimized'), v.full(), v.view()], ['/app/code', 'false', true, 'full'],
+        'Back to E1 shows Code again, in full view, and E1 says full');
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full()], [['full'], true], 'a reload of E1 opens Code full');
+    done(r.w);
+}
+for (const switched of [true, false]) {
+    // A click on Settings that fails (its open resolves with nothing) gives
+    // E1 back. While it was pending the user restored Code to a window: that
+    // view change found Settings' entry and recorded nothing, so the
+    // give-back writes the view Code shows now. Positive control: no switch.
+    const v = await viewBoot('/app/code');
+    const { w } = v;
+    const settings = w.ezil.registry.getApp('settings');
+    const open = settings.open;
+    let fail;
+    const failing = new Promise(resolve => { fail = resolve; });
+    settings.open = async () => { settings.open = open; await failing; return null; };
+    const clicked = w.ezil.registry.launch('settings', v.ctx);
+    same([v.url(), w.history.length, v.view()], ['/app/settings', 2, undefined], 'the click pushed E2 before Settings opens');
+    if ( switched ) v.bar('restore');
+    same([v.view(), v.full()], [undefined, ! switched], switched ? "Code's view change finds Settings' entry: nothing recorded" : 'no switch');
+    fail();
+    same(await clicked, null, 'Settings opened nothing');
+    await v.timers();
+    same([v.url(), v.view(), v.full()], ['/app/code', switched ? 'window' : 'full', ! switched],
+        switched ? "🔴 the give-back names Code with the view it shows now" : 'positive control: the give-back, no switch');
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full()], [[switched ? 'window' : 'full'], ! switched], `a reload of the entry given back opens Code ${switched ? 'windowed' : 'full'}`);
+    done(r.w);
+}
+for (const path of ['focus', 'close', 'click']) for (const switched of [true, false]) {
+    // Not only Back/Forward: every write of an entry for an open Code records
+    // the view it shows, with no view change announced on that entry. On E1
+    // the user restores Code to a window (or not); a click on Settings
+    // pushes E2; then a focus of Code renames E2, or the close of Settings
+    // does, or a click on Code's icon pushes E3.
+    const name = `${path}${switched ? '' : ', no switch'}`;
+    const v = await viewBoot('/app/code');
+    const { w, win } = v;
+    if ( switched ) v.bar('restore');
+    await v.click('settings');
+    if ( path === 'focus' ) w.$(win('code')).focusWindow();
+    else if ( path === 'close' ) await w.$(win('settings')).close();
+    else await v.click('code');
+    const shown = switched ? 'window' : 'full';
+    same([v.url(), w.history.length, v.view(), v.full()], ['/app/code', path === 'click' ? 3 : 2, shown, ! switched], `${name}: the entry names Code, ${shown}`);
+    const r = await v.reload();
+    same([r.opens.map(c => c.view), r.full()], [[shown], ! switched], `${name}: a reload opens Code ${shown}`);
+    done(r.w);
+}
+
 // ── hosts that serve only /os: no rewriting ─────────────────────────────────
 for (const provider of ['local-vm', 'native-macos']) {
     const { w, url } = await boot(`/os?app=settings&settings=system`, { provider });
@@ -525,6 +736,6 @@ for (const provider of ['local-vm', 'native-macos']) {
     same(url(), '/os', 'local: the one-shot billing keys are still consumed in place');
     done(w);
 }
-console.log(`PASS ${checks} checks: app allowlist, /app/<id> routes and alias canonicalisation, project params, direct entry, repeated target, relaunch hook, history push/replace/traversal, launch order through the registry (slow open, late showWindow/ensureOnTop focus, Back launch), /os-only hosts`);
+console.log(`PASS ${checks} checks: app allowlist, /app/<id> routes and alias canonicalisation, project params, direct entry, repeated target, relaunch hook, history push/replace/traversal, launch order through the registry (slow open, late showWindow/ensureOnTop focus, Back launch), the entry follows the screen (Back/Forward then a reload, a launch that stands down, a closed Code, minimised, a failed click, focus/close/click), /os-only hosts`);
 
 process.exit(0);
