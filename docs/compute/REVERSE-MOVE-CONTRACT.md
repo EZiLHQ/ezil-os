@@ -1,11 +1,12 @@
 # Reverse move contract: AWS → Cloudflare (Phase B, round 6b)
 
-**Status:** pinned (S0 r4), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
+**Status:** pinned (S0 r5), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
 A change to any wire shape, state, code or limit below changes this file first. Every lane cites the
 section it implements. r2 applied the review of `dc362e53` (§10). r3 closes the S0 verifier's contract gaps
 G1–G4 and the minors (§11 maps each gap to its section). r4 applies the review of r3 (`4abd237a`; §12 maps each
-finding to its section). Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections r4 changed carry
-**[r4]**.
+finding to its section). **r5 dispositions every one of that review's 28 findings (r4 saw only the first 10) and every
+r4 verifier gap (§12.1).** Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections r4 changed carry
+**[r4]**; sections r5 changed carry **[r5]**.
 
 **Base:** citations are `path:line` at `74ed2c92`. They point to the code each rule is based on.
 Citations to `provider-reverse-store.ts`, `0012` and the edited `provider-migrate-store.ts` are to this
@@ -28,8 +29,15 @@ branch (`r6/phaseb-20261030`).
   - **[operator]** the operator runbook SQL (§5.5.1), executed verbatim by the store's PG suite.
 - **r4 (store only; 0012 still unchanged):** `markSnapshotSpent` and the spent-row filter of `listUnsnapshotted`, so one
   failed snapshot execution can never hold the snapshot queue (§3.4, §7.1), with PG tests.
+- **[r5] (store and tests only; 0012 still unchanged, its registered digest stands):**
+  - `export_boot.region`, required and validated, kept while `booting` completes the claim (§3.1, §5.1.1 step 8, §7.1);
+  - the purge marker: `retain_until = NULL` on a committed row, runbook `operator_purged` (§7); `listUnsnapshotted` skips
+    purged rows (§3.4);
+  - PG tests that fake the app clock (2001) around `recordImportProgress`, `advance('flipping')` and `finish`, and a
+    retention boundary row (expires in 1 minute, must not be listed). Mutants C4, C5, C6 (app-clock writes) and R1b
+    (bound loosened by a day) each fail them.
 
-Everything else below is a contract for lanes that have not started. **r4 is the last S0 edit to the store. From r4 on,
+Everything else below is a contract for lanes that have not started. **r5 is the last S0 edit to the store. From r5 on,
 lane A is the only writer of `provider-reverse-store.ts` and its two test files** (§1.1).
 
 ---
@@ -42,7 +50,7 @@ lane A is the only writer of `provider-reverse-store.ts` and its two test files*
 | D-2 | **Reverse moves live in a NEW table.** 0006 is never relaxed. None of the forward readers filter by direction: `provider-migrate-store.ts:107-118,131-144`, `provider-migrate-placement.ts:27-34`, `placement.ts:1897`, `select.ts:120-126`. |
 | D-3 | **The export boot is a normal replace boot on the published placement row**, at placement generation N+1 and lease epoch E+1. It is identified from the reverse row (`export_boot`), never from `lastError`, because enrollment overwrites `lastError` (`placement.ts:1533,1569`). |
 | D-4 | **v1 moves `/workspace` only.** It records the codec's skipped count, and refuses when over the workspace cap (the files stay on AWS). The UI says before and after what is not moved (§6.3): settings and programs added on the AWS computer (HOME dotfiles, installed packages), browser sign-ins (profiles), and rebuildable build folders the codec drops (§2.3). |
-| D-5 | **Triggers (D20).** v1 ships the user action "Move my files to my Free computer" (`startedBy: 'user'`) **and the next open** (`'open'`, §5.9). Cron (`'cron'`) follows after canary2 acceptance. A founder-owned account moves only on that account's own Move click (§5.9.1). |
+| D-5 | **Triggers (D20).** v1 ships the user action "Move my files to my Free computer" (`startedBy: 'user'`) **and the next open** (`'open'`, §5.9). **[r5] There is no cron trigger in v1** (§9): no v1 code writes `startedBy: 'cron'`. A founder-owned account moves only on that account's own Move click (§5.9.1). |
 | D-6 | **Retention (D21).** The AWS volume **and a snapshot** are kept 14 days after commit, on the reverse row. The snapshot is mandatory (§7). Deletion is operator-only (rule R11). |
 | D-7 | **No new env vars or flags.** The existing AWS admission kill switch gates new move work (`aws-config.ts:274`). |
 
@@ -62,12 +70,12 @@ lane A is the only writer of `provider-reverse-store.ts` and its two test files*
 
 | Lane | Owns | Builds | Must prove (live, canary2 only) |
 |---|---|---|---|
-| **S0** (done, r4) | 0012, the store until r4, the forward exclusion, registry | §3 | 0012 applied on the staging DB before the app deploys: plan, then apply with `--target aws-preview` (schema before code). |
-| **H** host + AMI | §1.1 | §2 | T0 (b), (b2), (e), (k); staged files on the root volume only. |
+| **S0** (done, r5) | 0012, the store until r5, the forward exclusion, registry | §3 | 0012 applied on the staging DB before the app deploys: plan, then apply with `--target aws-preview` (schema before code). |
+| **H** host + AMI | §1.1 | §2, **[r5]** §2.8 (the AMI train: C3, F11, `pool_desktop_not_ready`) | T0 (b), (b2), (e), (k); staged files on the root volume only; §2.8's live rows. |
 | **W** Worker import | §1.1 | §4 | T0 (g), (h), (l); heads before and after (T3); the first Cloudflare open hydrates with no `workspace_migrated`. |
 | **A** app machine | §1.1 | §5, §6.1, §5.10 (server side of `computer.progress`) | T0 (c), (d), (f), (j); race T6. |
 | **U** shell | §1.1 | §6, §5.10 rendering | Copy matches §6.3 and §6.4 in every state, with screenshots; an open during a move never shows the opening bar, `needs_operator` or a 10-minute failure. |
-| **O** retention | §1.1 | §7 | `iam get-role` path; a snapshot recorded on the T3 row; listing shows the committed row after 14 days (dry run). |
+| **O** retention | §1.1 | §7, **[r5]** §7.2 (the deployment field, end to end) | `iam get-role` path; a snapshot recorded on the T3 row; listing shows the committed row after 14 days (dry run); §7.2's rollout order held. |
 
 ### 1.1 File ownership (one lane per file) **[G1] [G4]**
 
@@ -76,11 +84,11 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 
 | Lane | Files (new files marked *new*) |
 |---|---|
-| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). |
+| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`, which lane O does not need to change, §7.2**), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
 | **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
-| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r4 on)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
+| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r4 on)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
 | **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the files-held banner, §6.2)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
-| **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack/IAM wiring for that machine (`infra/app-computers/lib/reverse-snapshot.ts` *new* plus its registration in the app-computers stack), the additive optional deployment field `reverseSnapshotStateMachineVersionArn` in `infra/app-computers/lib/lifecycle/release-manifest.ts` and `app/src/server/lib/compute/aws-intent.ts` (§7.1), `infra/app-computers/lib/ops.ts` (DLM role), their tests, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). |
+| **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`, `markSnapshotSpent`, and **[r5]** the per-pass `snapshot_missing` line, §7), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack and IAM wiring for that machine: `infra/app-computers/lib/reverse-snapshot.ts` *new* and **[r5]** its registration in `infra/app-computers/bin/lifecycle.ts` and `infra/app-computers/lib/computer-lifecycle.ts`. **[r5] The deployment field `reverseSnapshotStateMachineVersionArn`, end to end (§7.2):** `app/src/server/lib/compute/aws-intent.ts` (the deployment schema only) with `aws-intent.fixtures.json`, `aws-intent.test-support.ts` and the tests that pin that schema; `infra/app-computers/lib/lifecycle/deployment.ts` (the one strict schema every infra parser imports: `intent.ts`, `contract.ts`, `preparation-contract.ts`, `recovery-contract.ts`, `release-manifest.ts` and `identity.ts` take the change through the import and are not edited); `infra/app-computers/test/app-intent-contract.test.ts` and its fixtures; `infra/app-computers/lib/app-caller.ts` (StartExecution, DescribeExecution, GetExecutionHistory and the KMS `EncryptionContext` machine list) with `test/app-caller.test.ts`, `test/iam-exact.test.ts` and `test/__snapshots__/{app-caller,iam-policies}.json`. Also `infra/app-computers/lib/ops.ts` (DLM role), the tests of all of these, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r5] Not O's:** `release-manifest.ts` and its strict app mirror `aws-rebase-release.ts` stay unchanged, because the field is not a release field (§7.2). |
 
 **[r4] Read-only on purpose:** `app/src/components/desktop/boot-phases.ts` and `boot-phases.shell.js` (drift-guarded
 against each other) belong to no lane. Nothing in this contract needs a new `BootErrorCode`: the move answers reuse
@@ -90,6 +98,10 @@ read-only too; its mint goes through the same answers.
 Shared seams, each owned by one side:
 - `provider-reverse-store.ts` is **A**'s. O only calls `listUnsnapshotted`, `listRetentionExpired`, `recordSnapshot` and
   **[r4] `markSnapshotSpent`**; a new read O needs is added by A.
+- **[r5]** The AMI train (§2.8): host files and the pool/C3 app files are **H**'s; `aws-receipts.ts` and `placement.ts` stay
+  **A**'s, and H's needs there are pinned in §2.8 for A to implement.
+- **[r5]** The deployment field (§7.2) is **O**'s in every file it touches; no other lane edits `aws-intent.ts`,
+  `deployment.ts` or `app-caller.ts`.
 - **[r4]** The summary: the reads (`billing.ts`) and the builder (`summary.ts`) are **A**'s; the rendering (`computers.js`,
   `billing.js`) is **U**'s (§6.1, §6.2).
 - The sweep's call site is **A**'s (`handler.ts`); the snapshot step it calls (`advanceReverseSnapshots`) is **O**'s (§5.4, §7).
@@ -220,6 +232,30 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
   - the idle hold bounds.
 - Live: T0 (b), (b2), (e), (k) in §8.
 
+### 2.8 The AMI train: C3, F11 and `pool_desktop_not_ready` (lane H) **[r5]**
+
+The lead put three pool and upgrade items on lane H's AMI train. They are not part of the move, but their host halves
+need the same kind of bake, so they ship in the §2 bake and promote (release order step 2, §8). Each file below has
+one owner (§1.1). Sources: the round 6 understand phase (R2-1, R2-4) and the round 5 acceptance (F11).
+
+| Item | What is wrong at base | Pinned outcome | Files (lane H) | Acceptance |
+|---|---|---|---|---|
+| **`pool_desktop_not_ready`** (R2-4) | First boot: the pool agent waits 180 s for neko (:8181) and code-server healthz (:8443), else raises `pool_desktop_not_ready` (`pool.py:282-293,355-363`). Each 300 s refresh waits 20 s and tolerates only `pool_retry_exhausted`/`pool_unavailable` (`pool.py:296-316`). `ezil-guard.service` is a oneshot with no `Restart=`, so one miss ends the host's pool agent for good. App side: a dead `booting` host still counts in `spares` (`ready-pool.ts:317`) and is failed only 10 min after `created_at` (`:208`), so no replacement launches meanwhile. | A readiness miss is never fatal. First boot retries `wait_ready` within a bound H pins in the test. A refresh keeps the host on `pool_desktop_not_ready` and tries again next refresh. The unit restarts a failed agent, with a bounded restart rate. App: a `booting` host with `enrolled_at` set and no `ready_at` more than 6 min after `enrolled_at` counts as failed, and not as a spare, so the planner launches its replacement in the same pass. The provision budget (2 per pass) and the region cap are unchanged. | `pool.py`, `ezil-guard.service`, the pool tests under `infra/host-agent/test/`; `ready-pool.ts`, `ready-pool.test.ts`, `ready-pool.pg.test.ts` | Unit: a first-boot miss followed by success ends `ready`; a refresh miss keeps the host; the unit file restarts on failure, rate-bounded; the planner test above. Live: no host's `ezil-guard` journal ends on `pool_desktop_not_ready`, and no spare is retired about 11 min after launch for that cause. |
+| **F11** | After every pool adopt, the **first** refill the planner launches enrolls but never posts ready, and is retired about 10 min later (2/2 at 10-30 01:18Z, 2/2 at 07:14/07:18Z). The second refill is ready in 51–84 s. The pool is one spare short for about 10 min after each adopt. The cause is not known. | **Diagnosis first**, read-only on staging: the refill host's `ezil-guard` journal and its `ezil_compute_pool_hosts` timestamps (`enrolled_at`, `ready_at`, `editor_ready_at`), next to the adopt's own timeline. Then fix the cause in the file the diagnosis names. | Provisional: `pool.py`, `guard.py`, `ezil-guard.service` (host); `ready-pool.ts`, `aws-pool-replenish.ts`, `aws-pool-adopt.ts`, and the replenish-after-adopt call sites in `aws-ec2.ts` (`:519-525,627-629,776-779`) (app). **A cause outside this set changes this table first (lead), before any edit.** | Live: two consecutive adopts on staging, and each one's first refill posts ready. |
+| **C3** (R2-1) | The first Cloudflare → AWS move with a non-empty R2 workspace is always a cold `provision` (`provider-migrate-runtime.ts:66-110`), never the warm spare. The pool agent cannot take a restore: pool user data rejects `restore`, `parse_claim` whitelists the claim keys and `computer_lease` builds a lease without one (`lease.py:153-162`, `pool.py:60-61,221-239`). | A pool-restore adopt. Host: `parse_claim` accepts an optional restore lease (the existing `RestoreLease` shape) and `computer_lease` copies it into the lease, so the guard restores before the marker (`guard.py:347-358`, unchanged unless the restore path needs it). App: `provision` leases a pool host (`leasePoolHost`) in the same `withAdmission` transaction and runs `validateCapacity`. It records an `adopt` intent with `createVolume` and `dataVolumeGiB` in `_awsProvision`, and the pool claim carries the migration's restore lease. **Order:** the app half ships only after the AMI that accepts a restore claim is promoted. Until then `provision` stays cold, which is today's behaviour. | Host: `pool.py`, `lease.py`, `guard.py` (only if the restore path changes), tests. App: `provider-migrate-runtime.ts`, `provider-migrate-provision.ts`, `provider-migrate-store.ts` (only the `_awsProvision` shape), `aws-pool-claim.ts`, `app/src/app/api/compute/aws/pool/claim/route.ts`, `ready-pool.ts`, tests. | Unit: a claim carrying a restore lease; `provision` leases a pool host under admission; enrollment accepts the adopt path. Live: a Free → Standard upgrade with a non-empty workspace adopts a spare (an `ezil_compute_pool_hosts` row for the instance, EC2 tag `ezil:pool=1`) and the restored workspace opens. |
+
+**Seams (one owner each):**
+- **`aws-receipts.ts` stays lane A's.** C3 needs `readMigrationReadyReceipt` (`aws-receipts.ts:1116-1130`) to accept the
+  migration-bound adopt receipt, not only the PROVISIONING path. Lane H writes the exact rule as a sub-row of this table
+  before lane A implements it, and A ships it with (or before) H's app half. Lane A's export-boot mode (§5.2) and this
+  path never overlap: a Free export boot is never a pool adopt (`aws-ec2.ts:476`).
+- **`placement.ts` stays lane A's.** Lane H adds no placement writer; it asks lane A, through this section, for any it needs.
+- **`aws-ec2.ts` is H's.** Lane A's §5.1.2 parity test only drives it. A change to `replaceIntent`'s fields updates
+  that parity fixture in the same integration (H tells A first).
+- **The `pool-replenish` cron route is A's** (an actor of §5.2); `aws-pool-replenish.ts` and `ready-pool.ts`, which it calls,
+  are H's.
+- **`deploy/aws/mum/json-tool.py` is H's**, and lane O's deployment field needs no change in it (§7.2).
+
 ---
 
 ## 3. The reverse row (S0, shipped)
@@ -230,10 +266,10 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 |---|---|---|
 | `id` | uuid PK | `gen_random_uuid()`; this is the `moveId` everywhere. |
 | `user_id`, `computer_id` | uuid NOT NULL | Owner and computer. Create refuses another owner's row. |
-| `started_by` | text | `'user' \| 'open' \| 'cron'` (D-5) |
+| `started_by` | text | `'user' \| 'open'` in v1 (D-5). **[r5]** The 0012 CHECK also admits `'cron'` and stays unchanged (its digest is registered), but no v1 code writes it (§9). |
 | `state` | text, default `requested` | §3.2 |
 | `generation` | uuid NOT NULL, default `gen_random_uuid()` | The import generation. Immutable; a retry is a **new row**. |
-| `export_boot` | jsonb object | `{placementGeneration, leaseEpoch, volumeId, jobId, instanceId, fsUuid, claimedAt}` (§5.1) |
+| `export_boot` | jsonb object | `{placementGeneration, leaseEpoch, region, volumeId, jobId, instanceId, fsUuid, claimedAt}` (§5.1). **[r5]** `region` is the placement's region (`AWS_REGION_PATTERN`, `aws-config.ts:123`), required; the flip deletes the placement row, so this is where §7 finds the retained volume's region. |
 | `export_head` | jsonb object | §2.3 without `v` and `moveId` |
 | `import_progress` | jsonb object | `{bitmap, bytes, archiveSha256, first, last}`. The bitmap is 128 hex chars (512 bits): bit i = byte ⌊i/8⌋, mask `1<<(i%8)`, the same order as forward `restore_progress` (`provider-migrate-store.ts:89-106`). `last` is the time of the last new chunk (the copy-stall clock, §5.4). **[clocks] r3:** `first` and `last` are written by PostgreSQL (`to_jsonb(statement_timestamp())`, ISO 8601 with offset), never by the app; `last` is `GREATEST(previous last, statement time)` so it never moves back; `first` is kept for the same `archiveSha256`. |
 | `bytes_total` | bigint | 0..536,870,912. Set with the export head. |
@@ -241,7 +277,7 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 | `aws_volume_id` | text | `^vol-[0-9a-f]{8,17}$` |
 | `aws_fs_uuid` | uuid | |
 | `aws_snapshot_id` | text | `^snap-[0-9a-f]{8,17}$` |
-| `retain_until` | timestamptz | Only on `committed` (named CHECK). Set to commit + 14 d from the DB clock. |
+| `retain_until` | timestamptz | Only on `committed` (named CHECK). Set to commit + 14 d from the DB clock. **[r5]** `NULL` on a committed row means purged (runbook `operator_purged`, §7). |
 | `attempts` | int 0..5 | Consecutive transient failures in the current state. |
 | `last_error` | text ≤ 200 | Reason code from the closed list in §5.5, `^[a-z0-9_.:-]{1,200}$` |
 | `state_entered_at` | timestamptz NOT NULL | DB clock of the last **state change**. claimStale, retries, progress and claim completion never move it. Every per-state deadline in §5.4 is measured from it. |
@@ -270,8 +306,8 @@ The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:43`). Every 
 
 | Edge | Store call | Written by | Precondition the store enforces |
 |---|---|---|---|
-| — → `requested` | `createOrGetActive({computerId, userId, startedBy})` | trigger mutations (`'user'`), the open path (`'open'`, §5.9), sweep (`'cron'`, later) | No forward work for the computer (§3.3); same owner. |
-| `requested → booting` | `recordExportBoot(m, claim)` | machine, **inside the placement claim transaction** (§5.1) | Valid claim. In `booting`, only `jobId`, `instanceId` and `fsUuid` may be added to the same claim. |
+| — → `requested` | `createOrGetActive({computerId, userId, startedBy})` | trigger mutations (`'user'`) and the open path (`'open'`, §5.9). **[r5]** Nothing else: no cron in v1 (§9). | No forward work for the computer (§3.3); same owner. |
+| `requested → booting` | `recordExportBoot(m, claim)` | machine, **inside the placement claim transaction** (§5.1) | Valid claim, **[r5]** including `region`. In `booting`, only `jobId`, `instanceId` and `fsUuid` may be added to the same claim; `region` and the rest are kept. |
 | `booting → exporting` | `advance(m,'exporting')` | machine, after enrollment | `exportBoot.instanceId` set. |
 | `exporting → copying` | `recordExportHead(m, head)` | machine | The head is valid for `m.generation`; progress resets. |
 | `copying` (self) | `recordImportProgress(m, indices)` | machine, after each Worker `pull` | Indices are within the head. Idempotent per index; resets `attempts`. |
@@ -313,8 +349,10 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
     `recordSnapshot` and `markSnapshotSpent` never move it), and only rows committed at least `committedForSeconds` ago
     **on the DB clock**. **[r4]** Rows marked spent (`last_error IN REVERSE_SNAPSHOT_SPENT_REASONS`) are left out unless
     `includeSpent` is true. The sweep's snapshot step calls `listUnsnapshotted(3)`; the `snapshot_missing` listing calls
-    `listUnsnapshotted(10, 3600, {includeSpent: true})` (§7.1).
+    `listUnsnapshotted(10, 3600, {includeSpent: true})` (§7.1). **[r5]** Purged rows (`retain_until IS NULL`, §7) are left
+    out in both modes.
   - **`listRetentionExpired(limit ≤ 100)`**: `committed` rows with `retain_until < clock_timestamp()`, ordered by `retain_until, id`.
+    **[r5]** A purged row (`retain_until` NULL) is never listed, so already-purged rows never hide newer expired ones.
   - `REVERSE_SNAPSHOT_LIST_MAX = 10`, `REVERSE_RETENTION_LIST_MAX = 100`.
 - **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, **[r4] `markSnapshotSpent`**, `claimStale(limit ≤ 10)`.
   - **[r4] `markSnapshotSpent(m, reason)`**: takes a committed row whose snapshot execution is spent out of the sweep's
@@ -356,8 +394,9 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 - **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`,
   **[r4]** `REVERSE_SNAPSHOT_SPENT_REASONS = ['snapshot_failed', 'snapshot_receipt_invalid']`.
 - To write inside a placement transaction, build the store over that `tx`.
-- **Owner from r4 on: lane A** (§1.1; r4 was the last S0 edit). Lane O consumes the four snapshot/retention calls (`listUnsnapshotted`,
-  `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`) and adds nothing here.
+- **Owner from r5 on: lane A** (§1.1; r5 was the last S0 edit). Lane O consumes the four snapshot/retention calls (`listUnsnapshotted`,
+  `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`) and adds nothing here. **[r5]** Lane A's one pinned change
+  to the store is `claimStale`'s order (§5.4).
 
 ---
 
@@ -630,6 +669,10 @@ Everything else runs unchanged, so a failed export boot fails exactly like a fai
 Lane A lists **every actor that acts on an `aws-ec2` row in LEASED, STARTING or MOUNTING**, and shows with a test that each one leaves an export boot below RUNNING and opens no usage. At least these, under `app/src/app/api/`:
 - crons `aws-reconcile`, `aws-stop-settle`, `sandbox-reap`, `billing-session-sweep`, `pool-replenish`;
 - internal `computers/lifecycle-authority`, `computers/image-rebase`.
+
+**[r5]** Those route and handler files, and their tests, are lane A's (§1.1). If an actor needs a code change to keep an
+export boot below RUNNING, lane A makes it there. The libraries they call keep their own owners (for example
+`aws-pool-replenish.ts` is H's, §2.8); a change needed in one is requested from its owner.
 
 The machine reads the boot's receipt itself (pattern: `readMigrationReadyReceipt`, `aws-receipts.ts:1116-1130`). It records `jobId`, `instanceId` and `fsUuid` with `recordExportBoot`, and advances to `exporting` once enrollment succeeded (`lastError === ENROLLMENT_SUCCEEDED`, the row MOUNTING with no job).
 
@@ -989,7 +1032,8 @@ If step 1 or step 2 cannot be confirmed within its bound, write `failed_needs_op
   - the account is **not founder-owned** (§5.9.1).
   - Otherwise the open proceeds as the D16 hold (a cold Free boot).
   - Lock order (§3.3): create on the same `tx`, or after commit.
-- **Cron (`'cron'`, after canary2 acceptance).** It uses the same conditions as the open trigger, and never retries after any `failed_*` row.
+- **[r5] No cron trigger in v1** (§9). r4's "Cron (after canary2 acceptance)" bullet is withdrawn: a scheduled scan that
+  creates rows needs its own decision and its own contract revision.
 
 #### 5.9.1 Founder-owned accounts (pinned; fail-closed; no new env)
 
@@ -998,7 +1042,7 @@ An account is founder-owned for this contract when ANY of these holds:
 2. its email is on the existing operator allow-list read by `isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS)` (`telemetry/admin.ts:15`). That is the same gate `billing.ts:277-280` already uses as the operator identity.
 3. its email is missing or unreadable.
 
-The rule over-excludes on purpose. A founder-owned account never gets an `'open'` or `'cron'` row; it moves only on the explicit Move click from its own session. The same helper drives the DTO's `moveOnOpen` (§6.1).
+The rule over-excludes on purpose. A founder-owned account never gets an `'open'` row; it moves only on the explicit Move click from its own session. The same helper drives the DTO's `moveOnOpen` (§6.1).
 
 ---
 
@@ -1353,8 +1397,8 @@ in a non-terminal stage):
 
 | Item | Rule |
 |---|---|
-| **Name** | `reverse_snapshot`. It is a **separate** Standard Step Functions state machine, owned, deployed and versioned by lane O like the preparation machine (`infra/app-computers/lib/rebase-preparation.ts`). Its version ARN reaches the app on the deployment as **`reverseSnapshotStateMachineVersionArn`**, next to `preparationStateMachineVersionArn` (`aws-intent.ts`, `release-manifest.ts`; lane O owns both edits, which are additive and optional). It is **not** a new value in `LIFECYCLE_OPERATIONS` (`aws-intent.ts:183`): the placement lifecycle machine and its allowlist are unchanged. |
-| **Intent** | Strict JSON with exactly these keys: `{"schemaVersion": 1, "operation": "reverse_snapshot", "jobId": "<moveId>", "moveId": "<moveId>", "computerId": "<uuid>", "region": "ap-south-1", "accountId": "<12 digits>", "volumeId": "<the row's aws_volume_id>", "fsUuid": "<the row's aws_fs_uuid> \| null", "committedAt": "<ISO of the row's commit, state_entered_at>"}`. The execution input is `{schemaVersion: 1, document, digest}` with `digest = sha256(document)`, as `buildRebasePreparation` builds it (`aws-rebase-preparation.ts:23-32`). |
+| **Name** | `reverse_snapshot`. It is a **separate** Standard Step Functions state machine, owned, deployed and versioned by lane O like the preparation machine (`infra/app-computers/lib/rebase-preparation.ts`). Its version ARN reaches the app on the deployment as **`reverseSnapshotStateMachineVersionArn`**, an optional deployment field. **[r5]** Lane O owns that field end to end, in every file it touches, with a pinned rollout order (§7.2). It is a deployment field, not a release field. It is **not** a new value in `LIFECYCLE_OPERATIONS` (`aws-intent.ts:183`): the placement lifecycle machine and its allowlist are unchanged. |
+| **Intent** | Strict JSON with exactly these keys: `{"schemaVersion": 1, "operation": "reverse_snapshot", "jobId": "<moveId>", "moveId": "<moveId>", "computerId": "<uuid>", "region": "<the row's export_boot.region>", "accountId": "<12 digits>", "volumeId": "<the row's aws_volume_id>", "fsUuid": "<the row's aws_fs_uuid> \| null", "committedAt": "<ISO of the row's commit, state_entered_at>"}`. **[r5]** r4 hard-coded `ap-south-1`, but `AWS_REGIONS` allows up to 4 regions (`aws-config.ts:119-121`) and the flip deletes the placement row. So the region comes from the claim (`export_boot.region`, §3.1), and the deployment (account, ARN) is `cfg.deployments[region]`. A region with no deployment, or a deployment without the ARN, starts nothing: the row is listed as `snapshot_missing`. The execution input is `{schemaVersion: 1, document, digest}` with `digest = sha256(document)`, as `buildRebasePreparation` builds it (`aws-rebase-preparation.ts:23-32`). |
 | **Idempotency key** | **`jobId = moveId`, so the execution name is `computer-<moveId>`** (the `EXECUTION_NAME` grammar, `aws-clients.ts:212`). A start whose name is already used counts as success (`ExecutionAlreadyExists`, `aws-clients.ts:228-247`). A Standard execution's name cannot be reused for 90 days, longer than the 14-day retention. So a lost StartExecution response, a retried start, or two sweeps never run a second execution for one move. Names are scoped to one state machine, so `computer-<moveId>` never collides with a placement job's name. |
 | **EC2 dedupe inside the execution** | EC2 `CreateSnapshot` takes **no client token**. The SDK's `CreateSnapshotRequest` has only `Description`, `OutpostArn`, `VolumeId`, `TagSpecifications`, `Location` and `DryRun` (`app/node_modules/@aws-sdk/client-ec2/dist-types/models/models_2.d.ts:1969`, client-ec2 3.1140.0), and the preparation step passes only `VolumeId`, `Description` and `TagSpecifications` (`preparation-definition.ts:40-42`). So the lead's "client token derived from the move id" is the execution name above, and inside the one execution the helper dedupes as the preparation helper does (`preparation-helper.ts:83-96`): it calls create **at most once** (`createAttempted`), tags the snapshot at creation with `ezil:reverse-move = <moveId>` and `ezil:computer-id = <computerId>`, looks that tag up before creating, and resolves an uncertain create by the tag (`snapshot_ambiguous` when 2 or more exist, `snapshot_create_unconfirmed` when none exists after an attempt). |
 | **Preconditions** | As above, plus `volumeId` equals the row's `aws_volume_id`. Any failure ends the execution failed with a closed code; the helper never mutates the volume. |
@@ -1388,6 +1432,68 @@ UPDATE public.ezil_compute_reverse_moves
 RETURNING id, state, aws_volume_id, aws_snapshot_id, retain_until, updated_at::text AS updated_at;
 ```
 - **DLM.** `dlmRoleArn` pins `role/service-role/…` (`ops.ts:36`). Change it only after `iam get-role` confirms the path. T0 saw a DLM 12-hourly snapshot of the founder's volume (snap-053333a158f9cc895, 10-29 19:38Z), so DLM runs for at least that volume; DLM snapshots never replace the D21 snapshot.
+
+### 7.2 The deployment field `reverseSnapshotStateMachineVersionArn` (lane O, end to end) **[r5]**
+
+**Why it is more than two files.** The lifecycle deployment is strict on both sides, and every lifecycle intent embeds it.
+- App: `LifecycleDeploymentSchema` is `.strict()` (`aws-intent.ts:81-104`). `readLifecycleDeployments` fails the whole read
+  when one configured region's entry fails it (`aws-intent.ts:156-177`), so an unknown key turns AWS off. The parsed
+  deployment is copied into every intent (`replaceIntent`'s `deployment`, `aws-ec2.ts:282`), and `buildLifecycleWork`
+  serializes the whole intent (`aws-intent.ts:328-337`).
+- Infra: one strict `LifecycleDeploymentSchema` (`infra/app-computers/lib/lifecycle/deployment.ts:84-97`) is imported by the
+  lifecycle intent (`intent.ts:27`, parsed by the helper at `helper.ts:57`), the helper settings (`contract.ts:16`), the
+  preparation and recovery contracts (`preparation-contract.ts:12`, `recovery-contract.ts:42`), the release manifest
+  (`release-manifest.ts:24`) and the identity config (`identity.ts:31`). The helper refuses an intent with an unknown key.
+
+**Schema rule (both sides, in the same order; `app-intent-contract.test.ts` pins the parity):**
+- `reverseSnapshotStateMachineVersionArn: z.string().max(300).optional()`.
+- When present it must be `arn:aws:states:<region>:<accountId>:stateMachine:ezil-<namespace>-reverse-snapshot:<version ≥ 1>`.
+- That check is its **own** `superRefine` step, outside the four-key image tuple (`aws-intent.ts:106-117`). Inside the tuple,
+  every deployment without the new key would fail `incomplete_image_deployment`. A deployment with the key and no image
+  tuple parses, and so does one with the tuple and no key. `SourceLifecycleDeploymentSchema` (an `.extend` of the inner
+  type, `aws-intent.ts:134-148`) still parses every pinned source fixture.
+
+**Rollout order (pinned; no strict parser ever sees the key before it accepts it):**
+1. **Infra first** (release step 4, §8). `deployment.ts` accepts the optional key, and every Lambda and stack that parses a
+   deployment is deployed with it: the lifecycle helper, the preparation and recovery helpers, and the stacks that read
+   `EZIL_LIFECYCLE_CONFIG`. If that deploy publishes a new lifecycle state machine version, the version reaches the
+   deployment through the ordinary promote: `stateMachineVersionArn` is already in its tuple (`rebase_manifest.py:9-10`).
+2. **App second** (release step 6). `aws-intent.ts` accepts the key. Until the env carries it, every intent is unchanged
+   byte for byte.
+3. **Env last** (release step 7). The region's entry in `EZIL_AWS_LIFECYCLE_DEPLOYMENTS` (the staging app secret) gains
+   the key. From then on lifecycle intents carry it, and the step-1 helpers accept them.
+- **Rollback.** Remove the key from the env **before** rolling the app back past step 2 or infra back past step 1. An old
+  strict app turns AWS off on the key, and an old helper refuses every intent.
+- **Expected side effect.** Pool hosts match the current deployment by exact JSON (`compatibleDeployment`,
+  `ready-pool.ts:58-60`). Step 3 therefore makes every warm spare launched before it incompatible. The planner retires
+  them as obsolete and refills once, so opens in that window are cold. Run step 3 at a quiet time. It needs no code
+  change (`ready-pool.ts` is lane H's).
+- Until step 3, `advanceReverseSnapshots` starts nothing and committed rows show as `snapshot_missing`. Step 3 comes
+  before canary2 acceptance, so T3's row gets its snapshot.
+
+**What does not change (evidence; lane O edits none of these):**
+- **`deploy/aws/mum/json-tool.py` (lane H).** A promote deep-copies the deployment. It removes only promote-tuple keys
+  that are missing from the new pair, then applies the pair (`json-tool.py:528-534`), so every other key, this one
+  included, is kept as it is. Its literal-replacement list (`:543`) is for version ARNs that change with a release, and
+  this machine's version does not. `deployment_tuple` checks only the four tuple keys (`rebase_manifest.py:69-78`). A
+  promote's deployment comparison covers only the `public_deployment` keys (`rebase_release.py:516-519`,
+  `rebase_app.py:47-50`), which do not include the new key. **So no promote needs to carry it**, and the file stays H's,
+  unchanged.
+- **`release-manifest.ts` and the app's strict mirror `aws-rebase-release.ts`.** The field is not a release field: lane
+  O's own deploy versions the reverse-snapshot machine, not the AMI release. The release schemas
+  (`rebase-release.schema.json`, `rebase-source-release.schema.json`, `additionalProperties: false`) describe release
+  records, not the deployment, and never see the key.
+- `LIFECYCLE_OPERATIONS` and the placement lifecycle machine (§7.1).
+
+**IAM (lane O, `app-caller.ts`).** The app caller gets, for the reverse-snapshot machine, exactly what it has for the
+lifecycle machine (`app-caller.ts:93-131`):
+- `states:StartExecution` on the unqualified machine. The caller enforces the version.
+- `states:DescribeExecution` and `states:GetExecutionHistory` on that machine's `computer-*` executions.
+- The machine and its version in the `kms:EncryptionContext:aws:states:stateMachineArn` list of the history key it
+  encrypts with.
+
+The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28` passes only `stateMachineVersionArn`.
+`iam-exact.test.ts` and the IAM snapshots change in the same commit.
 
 ---
 
@@ -1428,14 +1534,19 @@ RETURNING id, state, aws_volume_id, aws_snapshot_id, retain_until, updated_at::t
 **Release order:**
 
 1. Snapshot.
-2. AMI bake and promote-canary (H).
+2. AMI bake and promote-canary (H): the export op (§2) and **[r5]** the host halves of the AMI train (§2.8).
 3. Worker deploy (W). The routes stay unused until the app calls them.
-4. Lane O snapshot executor and IAM (O, plus a founder IAM step).
+4. Lane O infra (O, plus a founder IAM step): the snapshot executor, the app-caller grants and **[r5]** `deployment.ts`
+   accepting the optional field in every infra parser (§7.2 step 1).
 5. **Apply 0012 on staging** (`billing-staging-schema.mjs plan`, then `apply --yes --target aws-preview --expect-system-id <digits>`).
 6. App deploy with the user and open triggers (A+U). Only held `files_on_aws` placements are affected; founder-owned accounts get no open trigger.
-7. canary2 acceptance.
-8. Cron trigger.
+   **[r5]** This app's `aws-intent.ts` accepts the field (§7.2 step 2). The C3 app half (§2.8) ships here or later, never
+   before step 2's AMI.
+7. **[r5]** The deployment env value gains `reverseSnapshotStateMachineVersionArn`, only once step 6 is live (§7.2 step 3).
+8. canary2 acceptance.
 9. DLM and the retention purge runbook (O).
+
+**[r5]** No cron step: v1 has no cron trigger (§9).
 
 ---
 
@@ -1443,7 +1554,10 @@ RETURNING id, state, aws_volume_id, aws_snapshot_id, retain_until, updated_at::t
 
 - The S3 and migrating workspace stores (`store_unsupported`).
 - Anything outside `/workspace` (D-4).
-- Automatic retries after any failure (the open trigger and cron never re-create after `failed_*`).
+- Automatic retries after any failure (the open trigger never re-creates after `failed_*`).
+- **[r5] A cron trigger.** No scheduled scan creates reverse rows in v1. r4's `'cron'` started-by value, its §5.9 bullet
+  and its release step ("Cron trigger") are withdrawn. The 0012 CHECK still admits `'cron'` (0012 is unchanged), the store
+  still accepts it, and no v1 caller passes it. Lane A's trigger tests assert that only `'user'` and `'open'` are written.
 
 ## 10. Changes in r2 (review of `dc362e53`)
 
