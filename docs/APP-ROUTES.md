@@ -182,8 +182,10 @@ Auth0 flow:
   `/os`, `/app/<allowlisted id>`, `/computers`, `/computer/<uuid>`,
   `/billing/return`;
 - rejects `//`, `/\`, any backslash, schemes, control characters and
-  whitespace, and, in the path only, dot segments and `%2f`/`%5c`/`%2e`
-  (the query is data: `%2F` there is ordinary encoding);
+  whitespace. The path must equal an allowlisted page, which is also what
+  refuses dot segments (`/app/../admin`) and encoded separators or dots
+  (`/app/%2e%2e/x`, `/os%2fadmin`). The query is data (`%2F` there is
+  ordinary encoding);
 - has three outcomes: nothing supplied → `/os`; a failed `/app…` path → `/os`;
   anything else that failed → `/computers` (unchanged from before, and
   asserted by the Auth0, confirm and login tests).
