@@ -467,7 +467,7 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     else if ( prog?.operation === 'opening' ) chip = { state: 'starting', text: 'Starting…' };
     else if ( prog?.operation === 'stopping' ) chip = { state: 'stopping', text: 'Stopping…' };
     else if ( stopped ) chip = { state: 'stopped', text: 'Stopped' };
-    // Held on AWS: no Cloudflare card (the files are not there). Round 6 (R1-08): the size the computer is
+    // Held on AWS: no Cloudflare card (the files are not there). Round 6 (R1-08): the computer's own size
     // is CURRENT (it opens there under Free limits, or for R4-02 not at all); only the other sizes are locked.
     const sizes = free && ! held ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
     const cards = data ? sizes.map(size => {
