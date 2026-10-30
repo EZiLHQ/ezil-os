@@ -292,7 +292,11 @@ Request: `{moveId, generation, computerId, sha256, chunkCount, verifyOnly: boole
   - Build the v1 snapshot `{version:1, generation, chunkGeneration: generation, sha256, entries, chunks:[{size, sha256}]}` and check it with `parseSnapshot` (`workspace-persist.ts:127-140`).
   - Store `verified` in the DO key and return `200 {ok:true, verified:true}`.
   - Integrity rests on per-chunk sha256 checked at pull time, the R2 etag pinned at put, and hydrate re-verifying every chunk on the first open (`workspace-persist.ts:424`). **Do not re-hash 512 MiB in one request.**
-- **`verifyOnly: false`** runs in the `flipping` state. It requires `verified` for the same sha and re-checks the etags with cheap HEADs. Then:
+- **`verifyOnly: false`** runs in the `flipping` state.
+  - **Check order (retry-safe):** first read `P`'s head, **before** any DO-key check. A successful commit deletes the DO key, so a retry after a lost response would otherwise fail with `import_not_started`.
+    - It is this move's own v1 head (`generation` and `chunkGeneration` equal to the request's) and the DO key is gone: every step already ran. Return `200 {ok:true, committed:true}`.
+    - Own v1 head with the DO key still present: run the remaining steps 2–4 below (each is idempotent) with the key's recorded etags, then return the same.
+  - Otherwise it requires the DO key and `verified` for the same sha, and re-checks the etags with cheap HEADs. Then:
   1. **CAS the workspace head:** `put(P/latest.json, v1)` with `onlyIf: {etagMatches: migratedEtag}`, or `{etagDoesNotMatch:'*'}` when `headKind` is `none`. `previousChunkGeneration` is omitted, so the stale pre-move generation is garbage after the 1 h grace (`workspace-persist.ts:570`).
      - If the CAS fails, re-read. This move's own v1 head counts as success (idempotent). Anything else → `409 head_moved`.
   2. **Revert the system head:**
@@ -304,6 +308,7 @@ Request: `{moveId, generation, computerId, sha256, chunkCount, verifyOnly: boole
   3. **DO keys:** `WORKSPACE_FLUSH_CONTEXT_KEY = {prefix: P, mountPath: '/workspace'}` with no `freshProvision`, `WORKSPACE_TOO_LARGE_KEY = false`, `SYSTEM_TOO_LARGE_KEY = false` (`index.ts:1872,2009,2019`). A later re-upgrade's forward export then has its context and known sizes (`index.ts:3507-3523`).
   4. Delete the flag, then the DO key. Return `200 {ok:true, committed:true}`.
 - A repeated commit after success returns `200 {ok:true, committed:true}`. **The workspace-head CAS is the point of no return.**
+- **Lane A:** in `flipping`, a timeout or `unavailable` from commit means "outcome unknown". Retry the same commit; never compensate. `import_not_started` in `flipping` is never a failure: re-read `P` through a commit retry. Only `head_moved` (another writer) leads to `failed_needs_operator('import_head_moved')`.
 
 ### 4.5 `abort`
 
@@ -331,7 +336,9 @@ Request: `{moveId, generation, computerId}`.
 The claim runs under `withAdmission` and then the computer lock (`placement.ts:582-588,542-548`), in one transaction:
 
 1. Read the published row. It must be `aws-ec2`, `STOPPED`, with no lifecycle job pending and the owner equal to the row's user. If it is RUNNING, the machine first requests the ordinary stop and waits; it never takes over a live session.
-2. Start a **cold replace** (`aws-ec2.ts:258-283`): `targetGeneration = N+1`, `leaseEpoch = E+1`, the same `dataVolumeId`, and ordinary user data (no new lease key, `lease.py:45`).
+2. Record a **cold replace** intent on the row (`aws-ec2.ts:258-283`): `targetGeneration = N+1`, `leaseEpoch = E+1`, the same `dataVolumeId`, and ordinary user data (no new lease key, `lease.py:45`).
+   - The transaction only records the placement bump and the job id.
+   - `startLifecycleJob` (`aws-receipts.ts:218`, idempotent) runs **after commit**, never inside the lock transaction. The existing rule: a Step Functions start issued inside a transaction would be authorized against an uncommitted row (`aws-receipts.ts:294-295`).
    - Free never uses the pool (`aws-ec2.ts:476`).
    - Capacity admission (regional vCPU) applies. **Entitlement start-gate admission does not**: no `admitStart`/`decideStart`, which would refuse a Free user's size (`compute-access.ts:210-217`).
 3. In the same `tx`, call `recordExportBoot(m, {placementGeneration: N+1, leaseEpoch: E+1, volumeId, jobId, instanceId: null, fsUuid, claimedAt})`.
@@ -340,7 +347,10 @@ The boot then enrolls as an ordinary `STARTING`/`MOUNTING` row (`ENROLLABLE_STAT
 
 ### 5.2 Receipts: no epoch, no usage, no caps
 
-- Add a second early return in `applyLifecycleReceipt`, next to `aws-receipts.ts:252`. It fires when an active reverse row has `exportBoot.placementGeneration === p.generation && exportBoot.leaseEpoch === p.leaseEpoch` for `p.computerId`.
+- Add the reverse early return as the **first statement** of `applyLifecycleReceipt` (`aws-receipts.ts:247`), before the pool reconcilers at `:248-249` and the forward `migration_pending` skip at `:252`. It fires when an active reverse row has `exportBoot.placementGeneration === p.generation && exportBoot.leaseEpoch === p.leaseEpoch` for `p.computerId`.
+- Lane A lists **every actor that acts on an `aws-ec2` row that stays MOUNTING**, and shows with a test that each one skips the claimed boot. At least these, under `app/src/app/api/`:
+  - crons `aws-reconcile`, `aws-stop-settle`, `sandbox-reap`, `billing-session-sweep`, `pool-replenish`;
+  - internal `computers/lifecycle-authority`, `computers/image-rebase`.
 - The machine reads that boot's execution receipt itself (pattern: `readMigrationReadyReceipt`, `aws-receipts.ts:1116`). It records `jobId`, `instanceId` and `fsUuid` with `recordExportBoot`, and advances to `exporting` once enrollment succeeded.
 - **The row never reaches RUNNING.** So:
   - no `meter.ready` and no epoch (`aws-receipts.ts:265-277`);
@@ -408,7 +418,9 @@ If any step cannot be confirmed, write `failed_needs_operator(<step>_unconfirmed
   - It is the same as start. It exists because the shell's `move-retry` must stop calling `switchTo` (`computers.js:1255-1258`).
   - It is refused while a row holds the computer, which includes `failed_needs_operator`.
 - **D20 `'open'` / `'cron'` (follow-up release):**
-  - They never create a row for a founder-owned account. The identity source is the existing admin allow-list `isTelemetryAdmin(email, TELEMETRY_ADMIN_EMAILS)` (`telemetry/admin.ts:15`); it is not a new env var. Lane A confirms contact@ is on it, reading through the admin path, not `.env`.
+  - They never create a row for a founder-owned account.
+  - **OPEN:** which existing identity marks "founder-owned" is not decided. `TELEMETRY_ADMIN_EMAILS` (`telemetry/admin.ts:15`) is a telemetry allow-list, not ownership, and contact@'s membership is unverified.
+  - v1 ships only the user trigger, so the rule holds trivially until the D20 release. That release must name the source, with no new env var.
   - They never retry after `workspace_too_large`.
 
 ---
