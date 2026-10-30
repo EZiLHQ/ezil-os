@@ -539,6 +539,44 @@ for (const [delta, landing] of [[-2, '/os'], [-1, '/app/settings']]) for (const 
     same(url(), '/app/settings', "the Back launch's late focus, after a newer click, does not take the address bar");
 }
 {
+    // A route the boot starts itself (`route`: its own link, the billing
+    // link) is numbered as a Back/Forward is. Review N5: the boot's link
+    // resolves after a click made while it opened.
+    const { w, controller, open, url } = harness('/os?app=code');
+    controller.adopt({ id: 'code' });
+    const boot = controller.route({ computer: { id: C }, view: 'full', historyMode: 'replace' });
+    same([url(), w.history.length], ['/app/code', 1]);
+    controller.begin('settings').end(open('settings', 20));
+    same([url(), w.history.length], ['/app/settings', 2], 'a click while the boot link opens');
+    const code = open('code', 10);
+    controller.commit('code', boot, code);
+    same([url(), w.history.length, w.history.state.ezilApp], ['/app/settings', 2, 'settings'], "the boot link, resolving after the click, does not relabel the click's entry");
+    same(controller.superseded(code), true, '... and its window stands down');
+}
+{
+    // Positive control: with no newer intent the boot link names its app,
+    // and its window is the latest launch's.
+    const { w, controller, open, url } = harness('/os?app=code');
+    controller.adopt({ id: 'code' });
+    const code = open('code', 10);
+    controller.commit('code', controller.route({ historyMode: 'replace' }), code);
+    same([url(), w.history.length, w.history.state.ezilApp, controller.superseded(code)], ['/app/code', 1, 'code', false], 'positive control: the boot link commits');
+}
+for (const click of [null, 'opens', 'fails']) {
+    // The billing link (review N11): Settings opens, then `adopt` drops the
+    // one-shot keys. A click made meanwhile keeps its entry; one that
+    // failed gave it back (positive controls: no click, a failed click).
+    const { w, controller, open, url } = harness('/os?settings=billing&section=ai-credits&x=1');
+    const route = controller.route({ initialTab: 'billing', historyMode: 'replace' });
+    if ( click ) controller.begin('code').end(click === 'opens' ? open('code', 20) : null);
+    controller.commit('settings', route, open('settings', 10));
+    controller.adopt({ id: 'settings', initialTab: 'billing' }, { search: '?x=1', route });
+    same([url(), w.history.length, w.history.state.ezilApp],
+        click === 'opens' ? ['/app/code', 2, 'code'] : ['/app/settings?tab=billing&x=1', click ? 2 : 1, 'settings'],
+        click === 'opens' ? "a click while the billing link opens keeps its entry: neither commit nor adopt relabels it"
+            : `positive control (${click ? 'a click that failed' : 'no click'}): the billing link is canonicalised`);
+}
+{
     // Parameters: an older failed launch leaves a newer launch's alone...
     const { controller, open, focus, url } = harness('/os');
     const settings = open('settings', 5);

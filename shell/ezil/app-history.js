@@ -133,13 +133,14 @@ export function createAppHistory () {
     // focusing it again restores the URL it was opened with.
     const params = new Map();
     // Every intent takes the next number (`issued`, never reused): a click's
-    // launch (`begin`), Back/Forward, the close of an app window, a focus
-    // this module writes for. `generation` is the number of the intent that
-    // decides the address bar: the latest one, unless the latest launch
-    // failed and gave it back (`end`) to the intent it took it from.
-    // `launchGeneration` is the same for LAUNCH intents (a click or
-    // Back/Forward) alone. A pending launch compares its own number with
-    // these when it ends (`end`, `commit`).
+    // launch (`begin`), Back/Forward, a route launch the boot starts
+    // (`route`), the close of an app window, a focus this module writes
+    // for. `generation` is the number of the intent that decides the
+    // address bar: the latest one, unless the latest launch failed and gave
+    // it back (`end`) to the intent it took it from. `launchGeneration` is
+    // the same for LAUNCH intents (a click, Back/Forward, a boot route)
+    // alone. A pending launch compares its own number with these when it
+    // ends (`end`, `commit`).
     let issued = 0;
     let generation = 0;
     let launchGeneration = 0;
@@ -148,9 +149,10 @@ export function createAppHistory () {
     // failed too). An intent that cannot fail ends every such chain.
     const failed = new Map();
     const intent = () => { failed.clear(); generation = issued += 1; return generation; };
-    // A Back/Forward launch's ctx -> its number, for `commit`. Keyed by the
-    // object `registry.launch` hands back: a key added to the ctx itself
-    // would reach the app.
+    // A route launch's ctx (Back/Forward, or the boot's own through `route`)
+    // -> its number, for `commit` and `adopt`. Keyed by the object
+    // `registry.launch` hands back: a key added to the ctx itself would
+    // reach the app.
     const routes = new WeakMap();
     // A launched window -> the launch number it opened under, until
     // `settled`. Until then its focus events are the launch's own (UIWindow's
@@ -289,17 +291,35 @@ export function createAppHistory () {
 
         /**
          * The boot's own link: rewrite the alias to `/app/<id>` in place.
-         * @param {{search?: string}} [options] the query to keep, when the
-         *   caller has already consumed some of it (the billing deep link).
+         * @param {{search?: string, route?: object}} [options] `search`: the
+         *   query to keep, when the caller has already consumed some of it
+         *   (the billing deep link). `route`: the ctx of the launch this
+         *   adopts after (numbered by `route`); a newer intent since writes
+         *   nothing.
          */
-        adopt (link, { search } = {}) {
+        adopt (link, { search, route } = {}) {
             if ( ! deps || ! link ) return;
             params.set(link.id, linkParams(link));
+            // The click made while it opened has the entry now.
+            if ( routes.has(route) && routes.get(route) !== generation ) return;
             if ( enabled ) {
                 write('replaceState', canonicalUrl(win().location, link, { search }), stateFor(link.id));
             } else if ( search !== undefined ) {
                 write('replaceState', `${win().location.pathname}${search}${win().location.hash}`, {});
             }
+        },
+
+        /**
+         * Number a route launch the boot starts itself (its link, the
+         * billing link) as an intent, as `popstate` does a Back/Forward's: a
+         * click, Back/Forward, close or focus after it decides, and `commit`
+         * (and `adopt`, given it) then write nothing for it.
+         * @param {object} ctx the ctx it will pass to `registry.launch`
+         * @returns {object} `ctx`
+         */
+        route (ctx) {
+            if ( deps && ctx && typeof ctx === 'object' ) routes.set(ctx, launchGeneration = intent());
+            return ctx;
         },
 
         /**
@@ -411,7 +431,8 @@ export function createAppHistory () {
          * Back/Forward) resolved with a window: never adds an entry. The
          * entry's URL is kept as it is when it already names `id`, unless the
          * launch changed the app's own parameters. 'none' writes nothing,
-         * and so does a Back/Forward launch any intent has overtaken.
+         * and so does a numbered route launch (Back/Forward, `route`) any
+         * intent has overtaken.
          * @param {Element} [el] the window it resolved with
          */
         commit (id, ctx = {}, el = null) {

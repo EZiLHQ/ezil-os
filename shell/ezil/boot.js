@@ -954,14 +954,17 @@ async function build (payload) {
     if ( billingLink ) {
         billingDeepLinkHandled = true;
         const { initialTab, openUpgrade, search } = billingLink;
+        // Numbered (`route`): a click made while Settings opens decides.
+        const route = appHistory.route({ ...ctx, initialTab, historyMode: 'replace',
+            openUpgrade: payload.features?.billing === true ? openUpgrade : false });
         try {
-            await registry.launch('settings', { ...ctx, initialTab, historyMode: 'replace',
-                openUpgrade: payload.features?.billing === true ? openUpgrade : false });
+            await registry.launch('settings', route);
         } finally {
             // After the launch, not before: Billing reads `section` from the
             // address bar while it opens. The one-shot `upgrade`/`section`
             // keys go; `/os?settings=billing` becomes `/app/settings?tab=billing`.
-            appHistory.adopt(appLink, { search });
+            // Not over that click's entry, though.
+            appHistory.adopt(appLink, { search, route });
         }
     }
 
@@ -969,15 +972,16 @@ async function build (payload) {
     appLinkHandled = true;
     if (appLink && !billingLink && firstLink) {
         // Canonical first, so the window's own first focus finds `/app/<id>`.
+        // Numbered (`route`): a click made while it opens decides.
         appHistory.adopt(appLink);
-        await registry.launch(appLink.id, {
+        await registry.launch(appLink.id, appHistory.route({
             ...registry.launchContext(ctx),
             ...routeLaunchContext(appLink, {
                 hasWindow: document.querySelector(`.window[data-app="${appLink.id}"]:not([data-closing="1"])`) !== null,
                 recordedView: appHistory.recordedView(appLink.id),
             }),
             historyMode: 'replace',
-        });
+        }));
     }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire

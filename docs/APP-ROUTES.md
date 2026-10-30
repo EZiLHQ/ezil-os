@@ -144,7 +144,7 @@ nothing sets.)
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
 | Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
-| Boot with a link | **replace** (canonicalise) before launching |
+| Boot with a link | **replace** (canonicalise) before launching; the billing link after its launch. Either launch is numbered ("Order" below). |
 
 Why the push happens first: in Chromium a frame navigation is filed under
 the entry that was current when it started. The Code and Browser windows
@@ -158,8 +158,9 @@ Launches resolve out of order: a click on Code, whose window is slow to
 build, then a click on Settings, which opens first. `app-history.js` numbers
 every intent as it happens (one counter per controller, never reset): a
 click's launch (`begin`), Back/Forward (whatever entry it lands on, `/os`
-included), the close of an app window, and a focus it writes for. A click
-or Back/Forward is also the latest **launch** intent. The intent that
+included), a route launch the boot starts (`route`), the close of an app
+window, and a focus it writes for. A click, Back/Forward or boot route is
+also the latest **launch** intent. The intent that
 decides is the latest one, unless the latest launch failed ("gives back",
 below).
 
@@ -197,8 +198,15 @@ below).
 - While any click's launch is pending, focus events write nothing (as
   before: the new window focuses itself while it is built, and a late focus
   of another window cannot be told from a click).
-- The boot's own link launch is not numbered against a click made during
-  the boot.
+- **The boot's own route launches are numbered too** (`route`): its link
+  and the billing link, as Back/Forward is. A click made while either
+  opens decides: the launch's `commit` writes nothing, and nor does the
+  billing link's `adopt` after it (a click that failed gave the address
+  bar back, and then both write). The billing link's one-shot keys
+  (`upgrade`, `section`) then stay on the boot's entry, as they did
+  before: Back to it shows Settings at Billing (a Settings window opened
+  by it scrolls to the AI credits card), never a checkout or upgrade
+  sheet (`openUpgrade` comes from the boot's own launch alone).
 
 Known limits, not changed here:
 
@@ -224,10 +232,12 @@ Tests: `app-history-test.mjs` ("order": the coordinator's two cases, three
 launches in every end order with every open/fail outcome, the failure
 cascade spelled out (with a close ending it), late focus,
 close and reopen, closing another window, Back and Forward while a launch
-is pending, overtaken Back launches, parameters, positive controls) and
+is pending, overtaken Back launches, the boot's link and billing link
+overtaken by a click, parameters, positive controls) and
 `app-link-test.mjs` (the bundle through `registry.launch`: a slow open, the
 80/120ms focuses run by hand one at a time, a Back launch; the address bar
-and the focused window are checked after each).
+and the focused window are checked after each; and through `boot.js`, its
+link and billing link held open while a click lands).
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
