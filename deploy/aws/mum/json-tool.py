@@ -130,6 +130,16 @@ def pair(config):
     return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion", *release.TUPLE) if k in d}
 
 
+def ami_promotable(config):
+    """An --ami promotion moves only the lifecycle pair. With recovery wired (bin/lifecycle.ts
+    builds it whenever recoveryVersionArn is set) and no release tuple, CloudFormation also
+    republishes the recovery workflow, whose observer settings carry the lifecycle version,
+    while recoveryVersionArn stays old: the Reconciler keeps starting the old recovery version,
+    which refuses every interrupted execution of the new lifecycle version (recovery-helper.ts)."""
+    need("recoveryVersionArn" not in config or bool(set(release.TUPLE) & config["settings"]["deployment"].keys()),
+         "namespace without a release tuple cannot promote a lifecycle with recovery")
+
+
 def versions(path):
     arns = [v["stateMachineVersionArn"] for v in read(path)["stateMachineVersions"]]
     need(arns and all(re.fullmatch(re.escape(MACHINE) + r":[1-9][0-9]*", a) for a in arns), "invalid/empty published lifecycle versions")
@@ -684,6 +694,8 @@ def lifecycle_template(live_path, baseline_path, candidate_path, before_path, af
     """Derive exact changes from substitution, with independently proven environment-forced Version pairs."""
     before, after = read(before_path), read(after_path)
     old_pair, new_pair = pair(before), pair(after)
+    ami_promotable(before)
+    ami_promotable(after)
     expected = copy.deepcopy(before)
     for key in release.PROMOTION:
         if key not in new_pair:
@@ -1213,6 +1225,7 @@ def main(args):
     elif op == "plan-promotion":
         config = read(a[0]); previous = pair(config)
         need(not (set(release.TUPLE) & previous.keys()), "rebase deployment requires manifest promotion")
+        ami_promotable(config)
         published = versions(a[1])
         need(previous["stateMachineVersionArn"] in published, "configured lifecycle version is not published")
         need(previous["amiId"] != a[2], "AMI already configured")

@@ -8,8 +8,10 @@
 - prd refuses every pinned operation until its foundation pins are committed, and
   every image-rebase operation; secret errors stay redacted under --namespace.
 """
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -274,6 +276,44 @@ class ProfileTests(unittest.TestCase):
                     tool.pair(edit(LIFECYCLE, ["recoveryVersionArn"], recovery))
             with self.assertRaisesRegex(ValueError, "lifecycle authority origin mismatch"):
                 tool.pair(edit(LIFECYCLE, ["settings", "authorityOrigin"], "https://os-staging.ezil.work"))
+        finally:
+            tool.PROFILES = original
+            tool.use_namespace("mum")
+
+    def test_pinned_prd_refuses_an_ami_promotion_while_recovery_is_wired(self):
+        # The recovery workflow republishes with the promoted observer while recoveryVersionArn
+        # stays old; the machine exists whenever the ARN is set, whatever recoveryEnabled says.
+        pinned = {**tool.PROFILES["prd"], "repository": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-x", "launchTemplate": "lt-0123456789abcdef0"}
+        original = tool.PROFILES
+        tool.PROFILES = {**original, "prd": pinned}
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "versions.json").write_text(json.dumps({"stateMachineVersions": [
+                    {"stateMachineVersionArn": LIFECYCLE["settings"]["deployment"]["stateMachineVersionArn"]}]}))
+                target = edit(LIFECYCLE, ["settings", "deployment"], {**LIFECYCLE["settings"]["deployment"], "amiId": "ami-22222222222222222",
+                              "launchTemplateVersion": "3", "stateMachineVersionArn": f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-lifecycle:2"})
+                for why, before, after in (("recovery enabled", LIFECYCLE, target),
+                                           ("recovery wired but its rules disabled", edit(LIFECYCLE, ["recoveryEnabled"], False),
+                                            edit(target, ["recoveryEnabled"], False))):
+                    with self.subTest(why):
+                        (root / "before.json").write_text(json.dumps(before))
+                        (root / "after.json").write_text(json.dumps(after))
+                        with self.assertRaisesRegex(ValueError, "cannot promote a lifecycle with recovery"):
+                            tool.main(["--namespace", "prd", "plan-promotion", str(root / "before.json"), str(root / "versions.json"),
+                                       "ami-22222222222222222", "3", str(root / "planned.json")])
+                        self.assertFalse((root / "planned.json").exists())
+                        for reverse in ("false", "true"):
+                            with self.assertRaisesRegex(ValueError, "cannot promote a lifecycle with recovery"):
+                                tool.lifecycle_template(*(str(root / n) for n in ("live", "baseline", "candidate", "before.json", "after.json")), reverse)
+                # Without recovery the plain promotion still plans N+1.
+                (root / "before.json").write_text(json.dumps(edit(edit(LIFECYCLE, ["recoveryVersionArn"], DELETE), ["recoveryEnabled"], DELETE)))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tool.main(["--namespace", "prd", "plan-promotion", str(root / "before.json"), str(root / "versions.json"),
+                               "ami-22222222222222222", "3", str(root / "planned.json")])
+                planned = json.loads((root / "planned.json").read_text())["settings"]["deployment"]
+                self.assertEqual((planned["amiId"], planned["stateMachineVersionArn"]),
+                                 ("ami-22222222222222222", f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-lifecycle:2"))
         finally:
             tool.PROFILES = original
             tool.use_namespace("mum")

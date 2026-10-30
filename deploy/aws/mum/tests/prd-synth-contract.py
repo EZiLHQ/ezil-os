@@ -3,8 +3,10 @@
 
 Synthesizes the founder's prd lifecycle (PROD-COMPUTERS-PLAN P7: recovery on, no
 release tuple, EC2-only app caller) before and after an AMI promotion, then runs the
-prd promotion validators of json-tool.py on the real templates. The tooling copy gets
-the test pin stand-ins, exactly as the offline suite does.
+prd promotion validators of json-tool.py on the real templates: they must refuse it,
+because the recovery workflow would republish while recoveryVersionArn stays old. The
+same promotion without recovery must pass. The tooling copy gets the test pin
+stand-ins, exactly as the offline suite does.
 """
 import copy
 import json
@@ -50,8 +52,12 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
     config = copy.deepcopy(baseline)
     config["settings"]["deployment"].update(amiId="ami-22222222222222222", launchTemplateVersion="3",
         stateMachineVersionArn="arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:2")
+    # The same promotion with recovery unwired: the plain --ami path the tooling admits.
+    plain_baseline, plain_config = copy.deepcopy(baseline), copy.deepcopy(config)
+    for value in (plain_baseline, plain_config):
+        del value["recoveryVersionArn"], value["recoveryEnabled"]
     templates = []
-    for phase, value in (("before", baseline), ("target", config)):
+    for phase, value in (("before", baseline), ("target", config), ("plain-before", plain_baseline), ("plain-target", plain_config)):
         project = root / phase / "app-computers"
         project.mkdir(parents=True)
         for name in ("package.json", "package-lock.json", "cdk.json", "tsconfig.json", "bin", "lib"):
@@ -80,6 +86,8 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
               "Principal": {"AWS": fixtures.HOST}}], json.dumps(callers))
     check("recovery workflow synthesized without a release tuple",
           any(r["Type"] == "AWS::StepFunctions::StateMachine" and "ezil-prd-recovery" in json.dumps(r) for r in resources.values()))
+    check("plain shape synthesizes no recovery workflow",
+          not any("ezil-prd-recovery" in json.dumps(r) for t in templates[2:] for r in t["Resources"].values()))
     (root / "stack.json").write_text(json.dumps({"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "RoleARN": role, "Parameters": []}]}))
 
     def changeset(before, after):
@@ -118,7 +126,15 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
         ok = result.returncode == 0 if error is None else result.returncode == 1 and error in result.stderr
         check(label, ok, result.stdout + result.stderr)
 
-    old, new = templates
+    # Founder shape: CloudFormation would republish the recovery workflow while
+    # recoveryVersionArn stays old, so the Reconciler would keep the old observer.
+    old, new = templates[:2]
+    recovery = "cannot promote a lifecycle with recovery"
+    validate("real prd promotion with recovery and no tuple refused", old, new, (baseline, config), error=recovery)
+    validate("exact real prd change set with recovery refused", old, new, (baseline, config), cs=changeset(old, new), error=recovery)
+    validate("real prd rollback with recovery refused", new, old, (config, baseline), reverse=True, error=recovery)
+    old, new = templates[2:]
+    baseline, config = plain_baseline, plain_config
     validate("real prd promotion accepted", old, new, (baseline, config))
     validate("exact real prd change set accepted", old, new, (baseline, config), cs=changeset(old, new))
     validate("real prd rollback accepted", new, old, (config, baseline), reverse=True)

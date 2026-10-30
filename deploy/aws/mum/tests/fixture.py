@@ -114,3 +114,9 @@ if options.get("authority_origin"):
         value = json.loads((root / name).read_text())
         value["settings"]["authorityOrigin"] = options["authority_origin"]
         save(name, value)
+if options.get("recovery"):
+    # Recovery wired without a release tuple (the prd P7 shape).
+    for name in ("config.json", "original-config.json", "live-lifecycle-config.json"):
+        value = json.loads((root / name).read_text())
+        value["recoveryVersionArn"] = f"arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-{'prd' if prd else 'mum'}-recovery:1"
+        save(name, value)

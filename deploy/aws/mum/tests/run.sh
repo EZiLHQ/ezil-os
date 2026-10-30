@@ -38,6 +38,13 @@ if [[ "${1:-}" == --case ]]; then
             run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
             check "$mode"
             check no-secret-write ;;
+        recovery-promote)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check "$mode"
+            check no-secret-write
+            check no-lifecycle-publish
+            cmp "$case_dir/config.json" "$case_dir/original-config.json"
+            [[ ! -e "$case_dir/release/promotion.json" ]] ;;
         manifest)
             run fail promote-ami.sh --manifest "$case_dir/config.json" --apply
             check "$mode" ;;
@@ -248,6 +255,7 @@ test_case 'prd recipe version update proceeds' prd-recipe-allowed "{$P}" pass
 test_case 'prd promotion dry-run and latest published N+1' prd-dry-promote "{$P}" dry-promote
 test_case 'prd promotion edits only the production secret deployment' prd-promote "{$P,\"authority_origin\":\"https://os-prod.ezil.work\"}" promote
 test_case 'prd rollback restores previous AMI/template/workflow' prd-rollback "{$P}" rollback
+test_case 'prd promotion with recovery and no tuple refused before any write' prd-recovery-promote "{$P,\"recovery\":true}" 'refuse-cannot promote a lifecycle with recovery'
 test_case 'prd foundation launch-template identity refused' prd-foundation-identity "{$P,\"foundation_identity\":true}" no-foundation-execute
 test_case 'prd lifecycle Lambda code change refused' prd-lifecycle-template-code "{$P,\"lifecycle_template_change\":\"code\"}" 'refuse-unexpected lifecycle property'
 test_case 'prd unpinned rebuild refused before any AWS call' prd-unpinned '{"namespace":"prd"}' 'refuse-not pinned yet'

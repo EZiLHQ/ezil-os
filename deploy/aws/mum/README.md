@@ -436,7 +436,8 @@ IAM/environment/workflow/Version differences, checks exact change-set coverage,
 and rejects unauthorized template and change-set mutations. It uses synthetic
 references and does not validate the live Mumbai configuration or AWS responses.
 `tests/prd-synth-contract.py` does the same for the prd lifecycle shape below
-(recovery on, no release tuple, EC2-only app caller).
+(recovery on, no release tuple, EC2-only app caller): the promotion must be
+refused while recovery is wired, and accepted with recovery unwired.
 
 ## Production namespace prd
 
@@ -527,6 +528,16 @@ bash deploy/aws/mum/promote-ami.sh --namespace prd --ami "$(cat /root/ezil-aws-p
 Promotion updates only `amiId`, `launchTemplateVersion` and `stateMachineVersionArn`
 in `ezil-os/production/app`. It is the plain path; prd has no manifest promotion
 until the rebase tooling is parameterized.
+
+**`--ami` promotion refuses while recovery is wired** (any `recoveryVersionArn` in the
+lifecycle config, which the P7 config has). Without a release tuple, the promoted
+lifecycle republishes the recovery workflow: its observer's settings carry the
+lifecycle version. `recoveryVersionArn` would stay on the old version, so the
+Reconciler would keep starting a recovery that refuses every interrupted execution
+of the new lifecycle version. The tooling does not yet predict and read back
+`RecoveryVersionArn`. Until it does, a prd AMI change is a reviewed, hand-run
+lifecycle update that pins both new versions. The first prd stacks (P6 foundation
+`HostAmiId` update, P7 lifecycle create) do not use `promote-ami.sh`.
 
 ## Rebase release tooling (contract v1, lane E increment)
 
