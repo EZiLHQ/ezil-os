@@ -511,6 +511,10 @@ import {
 } from './workspace-persist';
 import { exportedSnapshot, exportedChunk, reopenMigrationHeads, MigrationRequestError } from './workspace-migration-export';
 import { DEFAULT_WORKSPACE_BRANCH, workspaceMountPrefix, workspacePrefixOverride } from './workspace-prefix';
+import {
+  parseImportRequest, runReverseImport, REVERSE_IMPORT_KEY,
+  type ImportAnswer, type ImportBucket, type ImportRequest, type ImportStorage,
+} from './workspace-migration-import';
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
@@ -731,23 +735,23 @@ const PUBLIC_ERROR_CODES = [
   'acceptance_stop_failed', 'access_token_expired', 'access_token_malformed',
   'access_token_not_authenticated', 'access_token_wrong_user', 'activity_disabled',
   'ai_credential_signature_expired', 'ai_credential_signature_mismatch', 'ai_credential_signature_missing',
-  'ai_credential_storage_failed', 'ai_proxy_not_configured', 'already_exists', 'already_migrated',
+  'ai_credential_storage_failed', 'ai_proxy_not_configured', 'already_exists', 'already_imported', 'already_migrated',
   'aws_desktop_config_refused', 'aws_desktop_failed', 'aws_desktop_starting', 'aws_desktop_unreachable',
   'aws_origin_starting', 'aws_origin_unavailable', 'aws_preview_auth_required', 'aws_routing_disabled',
   'bad_request', 'body_too_large', 'browser_response_too_large', 'browser_sidecar_disabled',
   'browser_sidecar_unreachable', 'browser_verb_method_mismatch', 'browser_verb_missing',
-  'browser_verb_not_allowed', 'chunk_unavailable', 'container_still_running_after_destroy',
+  'browser_verb_not_allowed', 'capture_failed', 'chunk_mismatch', 'chunk_unavailable', 'commit_in_progress', 'container_running', 'container_still_running_after_destroy',
   'cpu_diag_disabled', 'cpu_diag_read_failed', 'cpu_diag_stat_failed', 'custom_domain_required',
-  'desktop_stack_did_not_stop_within_grace_period', 'diag_fresh_stat_failed', 'diag_invalid_op',
-  'diag_invalid_slot', 'diag_mount_failed', 'diag_stat_failed', 'diag_write_failed', 'export_failed',
+  'desktop_stack_did_not_stop_within_grace_period', 'desktop_stop_failed', 'diag_fresh_stat_failed', 'diag_invalid_op',
+  'diag_invalid_slot', 'diag_mount_failed', 'diag_stat_failed', 'diag_write_failed', 'export_capture_failed', 'export_desktop_stop_failed', 'export_failed', 'export_head_invalid', 'export_host_mismatch', 'export_refused', 'export_staging_space', 'export_unreachable', 'export_workspace_missing',
   'final_checkpoint_failed', 'flag_write_failed', 'focus_app_missing_or_not_a_string', 'focus_disabled',
   'focus_switch_failed', 'focus_unsupported', 'focus_upstream_exception', 'generation_mismatch',
-  'gw_bad_mac', 'gw_invalid_request', 'gw_stale', 'head_moved', 'head_unreadable', 'hmac_malformed_token',
+  'gw_bad_mac', 'gw_invalid_request', 'gw_stale', 'head_invalid', 'head_moved', 'head_unreadable', 'hmac_malformed_token',
   'hmac_required', 'hmac_secret_not_configured', 'hmac_signature_mismatch', 'hmac_token_expired',
   'hmac_v1_token_retired', 'hmac_v2_body_unreadable', 'hmac_v2_identity_mismatch',
   'hmac_v2_invalid_claims', 'hmac_v2_invalid_request', 'hmac_v2_malformed_token',
   'hmac_v2_query_not_allowed', 'hmac_v2_required', 'hmac_v2_sandbox_mismatch', 'hmac_v2_scope_mismatch',
-  'hmac_v2_token_misplaced', 'hmac_v2_token_missing', 'hmac_v2_unverified', 'internal_error', 'invalid',
+  'hmac_v2_token_misplaced', 'hmac_v2_token_missing', 'hmac_v2_unverified', 'import_busy', 'import_mismatch', 'import_not_started', 'internal_error', 'invalid',
   'invalid_body', 'invalid_body_base64', 'invalid_chunk_index', 'invalid_code_port',
   'invalid_content_type', 'invalid_continuation_token', 'invalid_desktop_mode', 'invalid_focus_app',
   'invalid_if_match_version', 'invalid_json_body', 'invalid_key', 'invalid_max_results', 'invalid_prefix',
@@ -755,7 +759,7 @@ const PUBLIC_ERROR_CODES = [
   'method_not_allowed', 'migrating', 'migration_failed', 'migration_not_started', 'missing_project_id',
   'neko_credentials_unavailable', 'neko_logs_disabled', 'neko_logs_read_failed', 'neko_logs_stat_failed',
   'no_checkpoint', 'no_context', 'no_head', 'no_system_snapshot', 'no_workspace', 'not_found',
-  'not_migrated', 'preview_bootstrap_token_expired', 'preview_bootstrap_token_malformed',
+  'not_migrated', 'not_verified', 'prefix_mismatch', 'preview_bootstrap_token_expired', 'preview_bootstrap_token_malformed',
   'preview_bootstrap_token_missing', 'preview_bootstrap_token_signature_mismatch',
   'preview_cookie_missing_or_invalid', 'preview_hostname_outside_zone', 'preview_status_unavailable',
   'previous_head_missing', 'project_files_bucket_not_configured', 'project_files_proxy_disabled',
@@ -766,15 +770,15 @@ const PUBLIC_ERROR_CODES = [
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
   'runtime_running', 'sandbox_runtime_blocked', 'screen_bad_request', 'screen_login_failed_no_token', 'screen_not_a_mode',
-  'screen_starting', 'screen_timeout', 'screen_unreadable', 'screen_upstream_exception', 'stop_failed',
-  'store_unavailable', 'system_auth_not_configured', 'system_checkpoint_failed', 'system_fence_failed',
+  'screen_starting', 'screen_timeout', 'screen_unreadable', 'screen_upstream_exception', 'staging_space_low', 'stop_failed',
+  'store_unavailable', 'store_unsupported', 'system_auth_not_configured', 'system_checkpoint_failed', 'system_fence_failed',
   'system_head_moved', 'system_size_unknown', 'system_too_large', 'telemetry_ack_failed',
   'telemetry_bucket_not_configured', 'telemetry_drain_disabled', 'telemetry_drain_failed',
   'tunnel_claims_mismatch', 'tunnel_origin_mismatch', 'turn_required', 'turn_unavailable', 'twen_disabled',
   'twen_fresh_stat_failed', 'twen_invalid_body', 'twen_invalid_op', 'twen_invalid_operation_id',
   'twen_mount_failed', 'twen_request_too_large', 'twen_stat_failed', 'twen_unknown_field',
   'twen_write_failed', 'version_mismatch', 'workspace_checkpoint_failed',
-  'workspace_checkpoint_unavailable', 'workspace_diag_disabled', 'workspace_git_checkpoint_authoritative',
+  'workspace_checkpoint_unavailable', 'workspace_diag_disabled', 'workspace_git_checkpoint_authoritative', 'workspace_missing',
   'workspace_persistence_unavailable', 'workspace_size_unknown', 'workspace_snapshot_reserved',
   'workspace_too_large', 'workspace_unavailable',
 ] as const;
@@ -891,6 +895,7 @@ interface EzilWorkspacePersistRpc {
   abortMigrationExport: EzilSandboxDO['abortMigrationExport'];
   reopenMigration: EzilSandboxDO['reopenMigration'];
   exportMigration: EzilSandboxDO['exportMigration'];
+  reverseImport: EzilSandboxDO['reverseImport'];
   flushWorkspaceNow(): Promise<FlushOutcome>;
   /**
    * The `POST /sandbox/:name/activity` implementation's DO-side write. See
@@ -2531,6 +2536,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return next;
   }
   private async migrationStartBlocked(): Promise<boolean> {
+    // 🔴 A reverse import (AWS → Cloudflare, ./workspace-migration-import) fences every start
+    // while its key exists. Checked BEFORE the context: a computer created on AWS has no flush
+    // context here, so the flag check below would never run for it.
+    if (await this.ctx.storage.get(REVERSE_IMPORT_KEY) !== undefined) return true;
     const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
     if (!wctx) return false;
     const store = await this.selectWorkspaceStore();
@@ -3670,6 +3679,54 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         return json({ ok: false, error: err instanceof MigrationRequestError ? code : 'export_failed' },
           err instanceof MigrationRequestError ? err.status : 503);
       }
+    });
+  }
+
+  // ── Reverse import (AWS → Cloudflare, docs/compute/REVERSE-MOVE-CONTRACT.md §4). ──
+
+  /** All four import ops of this DO run through one queue: commit and abort never interleave. */
+  private reverseImportTail: Promise<unknown> = Promise.resolve();
+  private withReverseImport<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.reverseImportTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.reverseImportTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  /**
+   * One import op (./workspace-migration-import). `routeName` is the route's sandbox name, the
+   * key of this computer's AWS tunnel record. The arrival time is taken before the queue: a
+   * pull's transfer window counts the wait.
+   */
+  async reverseImport(request: ImportRequest, routeName: string): Promise<ImportAnswer> {
+    const arrivedAt = Date.now();
+    return this.withReverseImport(async () => {
+      const registry = awsRoutingEnabled(this.env.AWS_ROUTING_ENABLED) ? awsRegistryFor(this.env) : null;
+      const zone = registry ? resolveAwsOriginZone(this.env) : null;
+      return runReverseImport(request, {
+        sandboxName: (await this.ctx.storage.get<string>('sandboxName')) ?? routeName,
+        storage: this.ctx.storage as unknown as ImportStorage,
+        selectStore: async () => {
+          const store = await this.selectWorkspaceStore();
+          return store.ok ? { kind: store.kind, bucket: store.store as unknown as ImportBucket | undefined } : null;
+        },
+        prefixOverride: workspacePrefixOverride(this.env),
+        flushContext: () => this.ctx.storage.get<WorkspaceFlushContext & { freshProvision?: boolean }>(WORKSPACE_FLUSH_CONTEXT_KEY),
+        containerRunning: () => this.containerIsRunning(),
+        withStartQueue: (operation) => this.withMigrationStart(operation),
+        adoptImportedWorkspace: async (prefix) => {
+          // The next Cloudflare open hydrates the imported head, and a later forward export
+          // has its context and known sizes.
+          await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix, mountPath: '/workspace' });
+          await this.ctx.storage.put(WORKSPACE_TOO_LARGE_KEY, false);
+          await this.ctx.storage.put(SYSTEM_TOO_LARGE_KEY, false);
+          await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, false);
+          await this.pinWorkspaceStore('r2');
+        },
+        // Tunnel lookup only: never `ensureAwsDesktop*`, never the record's `restartPush*`.
+        host: registry && zone ? { zone, lookup: () => lookupAwsTunnel(registry, routeName),
+          fetch: (input: string, init: RequestInit) => fetch(input, init) } : null,
+        now: Date.now,
+      }, arrivedAt);
     });
   }
 
@@ -7863,6 +7920,23 @@ export default {
       return handleTelemetryAck(request, env);
     }
 
+    // Reverse import (AWS → Cloudflare): the same signed control auth as the forward routes below.
+    const importMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/import\/(begin|pull|commit|abort)$/);
+    if (importMatch && method === 'POST') {
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      let name: string;
+      let parsed: ImportRequest | null;
+      try {
+        name = decodeURIComponent(importMatch[1]);
+        parsed = parseImportRequest(importMatch[2], await request.json(), name);
+      } catch { return json({ ok: false, error: 'invalid_body' }, 400); }
+      if (!parsed) return json({ ok: false, error: 'invalid_body' }, 400);
+      try {
+        const answer = await openSandbox(env, name).reverseImport(parsed, name.toLowerCase());
+        return json(answer.body, answer.status);
+      } catch { return json({ ok: false, error: 'migration_failed' }, 503); }
+    }
     const migrationMatch = path.match(/^\/sandbox\/([^/]+)\/migrate\/(begin|commit|abort|reopen|export\/(?:system\/)?(?:head|chunk\/([^/]+)))$/);
     if (migrationMatch && ((method === 'POST' && !migrationMatch[2].startsWith('export/'))
       || (method === 'GET' && migrationMatch[2].startsWith('export/')))) {
