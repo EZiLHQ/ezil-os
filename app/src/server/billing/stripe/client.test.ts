@@ -365,6 +365,26 @@ describe('Stripe response mapping', () => {
         expect(sent.init?.body).toBeUndefined();
     });
 
+    // Round 6 (R4-04): a cancel scheduled as a DATE (Dashboard "cancel on a custom date", portal or API cancel_at)
+    // arrives with cancel_at_period_end false. At or before the period end it ends the plan, so it reads as a
+    // cancel at period end (plan_ending), never "Active / renews" followed by a silent drop to Free.
+    it.each([
+        { name: 'cancel_at at the period end', shape: { cancel_at: end }, expected: true },
+        { name: 'cancel_at before the period end', shape: { cancel_at: end - 86_400 }, expected: true },
+        { name: 'cancel_at on the item period end (modern shape)', shape: { cancel_at: end, current_period_end: null,
+            items: { data: [{ current_period_start: start, current_period_end: end }] } }, expected: true },
+        { name: 'cancel_at after the period end (a later renewal still bills)', shape: { cancel_at: end + 86_400 }, expected: false },
+        { name: 'no cancel_at', shape: { cancel_at: null }, expected: false },
+        { name: 'cancel_at with no known period end', shape: { cancel_at: end, current_period_end: null }, expected: false },
+    ])('maps $name to cancelAtPeriodEnd=$expected', async ({ shape, expected }) => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: false, current_period_start: start, current_period_end: end, ...shape });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(expected);
+    });
+    it('keeps cancel_at_period_end true whatever cancel_at says', async () => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: true, cancel_at: null, current_period_start: start, current_period_end: end });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(true);
+    });
+
     it('preserves epoch dates and leaves absent subscription periods and SKU null', async () => {
         const { client, fetcher } = fixture({ ...subscription, current_period_start: 0, current_period_end: end });
         expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ ...expectedSubscription, currentPeriodStart: new Date(0) });

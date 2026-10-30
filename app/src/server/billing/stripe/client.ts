@@ -621,13 +621,18 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const sku = itemOffer?.sku ?? (metadataSku && !metadataSku.endsWith('_v3') && offerBySku(metadataSku) ? metadataSku : null);
             const offer = sku ? offerBySku(sku) : undefined;
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
+            const periodEnd = item?.current_period_end ?? subscription.current_period_end;
+            // Round 6 (R4-04): a cancel scheduled as a date (`cancel_at`, e.g. the Dashboard's custom date) at or
+            // before the period end ends the plan, so it is a cancel at period end (plan_ending), not a renewal.
+            // A cancel_at earlier than the period end still shows the period end as the end date (no stored column).
+            const datedCancel = typeof subscription.cancel_at === 'number' && typeof periodEnd === 'number' && subscription.cancel_at <= periodEnd;
             return {
                 id: subscription.id,
                 customer: requiredCustomer(subscription.customer),
                 status: subscription.status,
-                cancelAtPeriodEnd: subscription.cancel_at_period_end,
+                cancelAtPeriodEnd: subscription.cancel_at_period_end || datedCancel,
                 currentPeriodStart: date(item?.current_period_start ?? subscription.current_period_start),
-                currentPeriodEnd: date(item?.current_period_end ?? subscription.current_period_end),
+                currentPeriodEnd: date(periodEnd),
                 sku,
                 items,
                 pendingUpdateExpiresAt: date(subscription.pending_update?.expires_at),
