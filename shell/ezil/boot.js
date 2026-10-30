@@ -951,15 +951,19 @@ async function build (payload) {
     // path form's `tab` is handed to it under that name.
     const billingLink = appLink?.id === 'settings' && ! billingDeepLinkHandled
         && parseBillingDeepLink(settingsAliasSearch(window.location));
+    // `upgrade` (the checkout or upgrade sheet) leaves a Settings link's
+    // address bar NOW, once it has been read, before any launch: the billing
+    // link's `openUpgrade` travels in its ctx below, and however a click
+    // lands while Settings opens, no entry is left with it for a reload to
+    // open the sheet again. Any Settings link, not only the billing one: the
+    // plain link's canonical form keeps every other key, `tab` included, so
+    // `/os?app=settings&tab=billing&upgrade=pro` would reload as a billing
+    // link. `section` stays until the billing link's adopt below
+    // (docs/APP-ROUTES.md §5 "Order").
+    if ( appLink?.id === 'settings' ) appHistory.consume(['upgrade']);
     if ( billingLink ) {
         billingDeepLinkHandled = true;
         const { initialTab, openUpgrade, search } = billingLink;
-        // `upgrade` (the checkout or upgrade sheet) leaves the address bar
-        // NOW, before the launch: `openUpgrade` travels in the ctx below, and
-        // however a click lands while Settings opens, no entry is left with
-        // it for a reload to open the sheet again. `section` stays until the
-        // adopt below (docs/APP-ROUTES.md §5 "Order").
-        appHistory.consume(['upgrade']);
         // Numbered (`route`): a click made while Settings opens that takes
         // the entry decides.
         const route = appHistory.route({ ...ctx, initialTab, historyMode: 'replace',

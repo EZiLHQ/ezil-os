@@ -395,15 +395,15 @@ for (const [entry, id, click, canonical] of [
     done(alone.w);
 }
 
-// The billing link with Settings' `open` held, and no sleeps: the boot is
-// ready when its launch calls `open`; `finish` lets the real `open` run,
+// A boot's Settings link with Settings' `open` held, and no sleeps: the boot
+// is ready when its launch calls `open`; `finish` lets the real `open` run,
 // waits for it, then for one turn of the event loop (`turn`, no delay), after
 // which every microtask queued before it has run (the launch's commit, a
 // coalesced click's end, the boot's adopt). `focuses` runs the queued
 // 80/120ms focuses by hand. `opens`: what each `open` of Settings received,
 // and the address bar at that moment.
 const turn = () => new Promise(resolve => setImmediate(resolve));
-async function billingHeld(entry, { features } = {}) {
+async function settingsHeld(entry, { features } = {}) {
     let release, started, opened;
     const opening = new Promise(resolve => { started = resolve; });
     const held = new Promise(resolve => { release = resolve; });
@@ -445,7 +445,7 @@ for (const click of [null, 'settings', 'code']) {
     // click on Code pushes its entry and keeps it; the boot's entry is left
     // behind it. No click: positive control. Whatever happens, `upgrade` left
     // the address bar before the launch (Billing still finds `section`).
-    const b = await billingHeld(BILLING);
+    const b = await settingsHeld(BILLING);
     const { w, url, win, ctx } = b;
     same(b.opens, [{ initialTab: 'billing', openUpgrade: false, at: STRIPPED }], `${click ?? 'no click'}: Settings opens with upgrade already gone from the address bar, section still on it`);
     let clicked = null;
@@ -481,7 +481,7 @@ for (const click of [null, 'settings', 'code']) {
 for (const [label, entry] of [['the entry a click on Settings left', leftBehind.settings], ['the entry a click on Code left behind', leftBehind.code]]) {
     // A reload of either, billing on, does not open the checkout or upgrade
     // sheet again: Settings opens at Billing with no `openUpgrade`.
-    const b = await billingHeld(entry, { features: { billing: true } });
+    const b = await settingsHeld(entry, { features: { billing: true } });
     await b.finish();
     same(b.opens.map(({ initialTab, openUpgrade }) => [initialTab, openUpgrade]), [['billing', false]], `a reload of ${label} (${entry}) opens no sheet`);
     done(b.w);
@@ -489,11 +489,27 @@ for (const [label, entry] of [['the entry a click on Settings left', leftBehind.
 {
     // Positive control: the link itself, billing on, hands Settings its
     // sheet exactly once, and leaves the address bar without the key.
-    const b = await billingHeld('/os?settings=billing&upgrade=standard', { features: { billing: true } });
+    const b = await settingsHeld('/os?settings=billing&upgrade=standard', { features: { billing: true } });
     await b.finish();
     same([b.opens.map(({ initialTab, openUpgrade, at }) => [initialTab, openUpgrade, at]), b.url()],
         [[['billing', 'standard_monthly_v3', '/os?settings=billing']], '/app/settings?tab=billing'], 'positive control: a fresh billing link opens the sheet once');
     done(b.w);
+}
+{
+    // Not only the billing link: a plain Settings link's canonical form keeps
+    // every other key, `tab` included, so `/os?app=settings&tab=billing&
+    // upgrade=pro` would reload as a billing link with `upgrade=pro` (review
+    // of this lane, 2026-10-30). The key goes before that launch too, and a
+    // reload of the entry, billing on, opens no sheet.
+    const plain = await settingsHeld('/os?app=settings&tab=billing&upgrade=pro');
+    await plain.finish();
+    same([plain.opens.map(({ openUpgrade, at }) => [openUpgrade ?? null, at]), plain.url()], [[[null, '/app/settings?tab=billing']], '/app/settings?tab=billing'],
+        'a plain Settings link: upgrade gone before its launch, and from its canonical entry');
+    done(plain.w);
+    const reload = await settingsHeld(plain.url(), { features: { billing: true } });
+    await reload.finish();
+    same(reload.opens.map(({ initialTab, openUpgrade }) => [initialTab, openUpgrade]), [['billing', false]], `a reload of ${plain.url()}, billing on, opens no sheet`);
+    done(reload.w);
 }
 
 // ── hosts that serve only /os: no rewriting ─────────────────────────────────

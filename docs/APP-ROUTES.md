@@ -45,7 +45,8 @@ registry today.
   `/app/settings?tab=billing&upgrade=<tier>` both open Settings → Billing
   with the upgrade sheet. `upgrade` is dropped before Settings opens and
   `section=ai-credits` after it, and the URL becomes
-  `/app/settings?tab=billing…` (§5 "Order", one-shot keys).
+  `/app/settings?tab=billing…` (§5 "Order", one-shot keys). Any other
+  Settings link loses `upgrade` the same way.
 - **Hosts that serve only `/os` are never rewritten.** The native Mac host
   (`provider: 'native-macos'`, which also refuses any query string) and the
   local runtime (`provider: 'local-vm'`) serve the shell at `/os` alone.
@@ -233,7 +234,11 @@ front, because its window is shown and re-asserted.
   or upgrade sheet. It leaves the address bar before the launch
   (`consume`), whatever happens next. `openUpgrade` travels in the launch
   ctx, so no entry, the boot's included, keeps the key for a reload to
-  open the sheet again. `section` is different: it is a place on the page,
+  open the sheet again. This holds for every Settings link, not only the
+  billing one. A plain link's canonical form keeps every other key,
+  including `tab`, so `/os?app=settings&tab=billing&upgrade=pro` would
+  otherwise reload as a billing link with its sheet. `section` is
+  different: it is a place on the page,
   not an action (Billing focuses the AI credits card; no sheet, no
   request). Billing reads it from the address bar while it opens, in
   either spelling of the link (`settingsAliasSearch`, b5ca3501), so it
@@ -288,7 +293,8 @@ after each; and through `boot.js`, its link and billing link held open
 while a click lands: on Code, on Settings itself, or none. The address bar
 Settings' `open` sees has no `upgrade`. With billing on, a reload of the
 entry each race leaves hands Settings no `openUpgrade`, and a fresh link
-hands it exactly once).
+hands it exactly once; a plain Settings link with `tab=billing&upgrade=pro`
+loses the key before its launch and reloads with no `openUpgrade`).
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
