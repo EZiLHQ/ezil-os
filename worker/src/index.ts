@@ -4381,6 +4381,16 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
   };
 }
 
+/** Records a config push to this epoch's RUNNING desktop for one host boot (aws-ice ensureAwsDesktopConfig). */
+function awsRestartPush(env: Env, record: AwsTunnelRecord) {
+  const registry = awsRegistryFor(env);
+  return async (bootId: string) => {
+    await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.restartPush}`, {
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
+    }));
+  };
+}
+
 /** Cloudflare Realtime TURN for an AWS computer's relay; null (fail closed upstream) without a TURN key. */
 function awsRelayMint(env: Env): RelayMint {
   return async (signal) => {
@@ -4767,7 +4777,7 @@ async function handlePreview(
             const zone = resolveAwsOriginZone(env);
             if (!zone) throw new RelayFailure('aws_origin_unavailable');
             return ensureAwsDesktop({ record, zone, fetch: (input, init) => fetch(input, init), nowMs: Date.now,
-              aiConfig: awsDesktopAiConfig(env, record),
+              aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
               neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) });
           },
           nowMs: Date.now,

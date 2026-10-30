@@ -641,8 +641,19 @@ describe('AWS AI signed boot delivery', () => {
     const ns = (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS;
     const rec = await (await ns.get(SID).fetch(new Request('https://aws-tunnels/get'))).json() as { record: { aiProxyNonce: string } };
     expect(first.proxyToken).toBe(await deriveAiProxyToken(SECRET, SID, rec.record.aiProxyNonce));
+    const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+    // The running desktop applies it only through a restart: later asks wait for it, never push again.
+    for (let i = 0; i < 3; i++) {
+      const again = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+      expect([again.status, await again.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }]);
+    }
+    expect(pushes()).toBe(1);
+    // A retry that does push again for the same boot (its config gone while the desktop is down) keeps the token.
+    host.desktop = 'absent'; host.configured = false;
     await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(pushes()).toBe(2);
     expect(host.pushed!.ai).toEqual(first);
+    host.desktop = 'running'; host.configured = true;
     host.bootId = '22222222-2222-4222-8222-222222222222';
     await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
     expect(host.pushed!.ai!.proxyToken).not.toBe(first.proxyToken);
