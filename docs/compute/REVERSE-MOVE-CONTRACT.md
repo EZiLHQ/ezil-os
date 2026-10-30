@@ -53,7 +53,7 @@ lane A is the only writer of `provider-reverse-store.ts` and its two test files*
 | D-3 | **The export boot is a normal replace boot on the published placement row**, at placement generation N+1 and lease epoch E+1. It is identified from the reverse row (`export_boot`), never from `lastError`, because enrollment overwrites `lastError` (`placement.ts:1533,1569`). |
 | D-4 | **v1 moves `/workspace` only.** It records the codec's skipped count, and refuses when over the workspace cap (the files stay on AWS). The UI says before and after what is not moved (§6.3): settings and programs added on the AWS computer (HOME dotfiles, installed packages), browser sign-ins (profiles), and rebuildable build folders the codec drops (§2.3). |
 | D-5 | **Triggers (D20).** v1 ships the user action "Move my files to my Free computer" (`startedBy: 'user'`) **and the next open** (`'open'`, §5.9). **[r5] There is no cron trigger in v1** (§9): no v1 code writes `startedBy: 'cron'`. A founder-owned account moves only on that account's own Move click (§5.9.1). |
-| D-6 | **Retention (D21).** The AWS volume **and a snapshot** are kept 14 days after commit, on the reverse row. The snapshot is mandatory (§7). Deletion is operator-only (rule R11). |
+| D-6 | **Retention (D21).** The AWS volume **and a snapshot** are kept 14 days after commit, on the reverse row. The snapshot is mandatory (§7). Deletion is operator-only (rule R11). **[r6]** In v1 the snapshot is the existing DLM policy's and no lane deletes the volume (§7.1; DECISION_72). |
 | D-7 | **No new env vars or flags.** The existing AWS admission kill switch gates new move work (`aws-config.ts:274`). |
 
 **Naming rule (all new wire formats):**
@@ -77,7 +77,7 @@ lane A is the only writer of `provider-reverse-store.ts` and its two test files*
 | **W** Worker import | §1.1 | §4 | T0 (g), (h), (l); heads before and after (T3); the first Cloudflare open hydrates with no `workspace_migrated`. |
 | **A** app machine | §1.1 | §5, §6.1, §5.10 (server side of `computer.progress`) | T0 (c), (d), (f), (j); race T6. |
 | **U** shell | §1.1 | §6, §5.10 rendering | Copy matches §6.3 and §6.4 in every state, with screenshots; an open during a move never shows the opening bar, `needs_operator` or a 10-minute failure. |
-| **O** retention | §1.1 | §7, **[r5]** §7.2 (the deployment field, end to end) | `iam get-role` path; a snapshot recorded on the T3 row; listing shows the committed row after 14 days (dry run); §7.2's rollout order held. |
+| **O** retention, **[r6] held for v1** | §1.1 | **[r6]** §7.2 only: the no-op seam | v1: nothing live (the seam's unit test only). The DLM coverage of the T3 volume is lane A's T3 check (§7.1, §8). Post-v1: §7.3. |
 
 ### 1.1 File ownership (one lane per file) **[G1] [G4]**
 
@@ -86,11 +86,11 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 
 | Lane | Files (new files marked *new*) |
 |---|---|
-| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`, which lane O does not need to change, §7.2**), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
+| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`** (**[r6]** v1 adds no deployment field, §7.2)), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
 | **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
 | **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r4 on)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
 | **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the Billing tab during a move, §6.2; [r6] its banner copy is 6a's and is not edited)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
-| **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`, `markSnapshotSpent`, and **[r5]** the per-pass `snapshot_missing` line, §7), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack and IAM wiring for that machine: `infra/app-computers/lib/reverse-snapshot.ts` *new* and **[r5]** its registration in `infra/app-computers/bin/lifecycle.ts` and `infra/app-computers/lib/computer-lifecycle.ts`. **[r5] The deployment field `reverseSnapshotStateMachineVersionArn`, end to end (§7.2):** `app/src/server/lib/compute/aws-intent.ts` (the deployment schema only) with `aws-intent.fixtures.json`, `aws-intent.test-support.ts` and the tests that pin that schema; `infra/app-computers/lib/lifecycle/deployment.ts` (the one strict schema every infra parser imports: `intent.ts`, `contract.ts`, `preparation-contract.ts`, `recovery-contract.ts`, `release-manifest.ts` and `identity.ts` take the change through the import and are not edited); `infra/app-computers/test/app-intent-contract.test.ts` and its fixtures; `infra/app-computers/lib/app-caller.ts` (StartExecution, DescribeExecution, GetExecutionHistory and the KMS `EncryptionContext` machine list) with `test/app-caller.test.ts`, `test/iam-exact.test.ts` and `test/__snapshots__/{app-caller,iam-policies}.json`. Also `infra/app-computers/lib/ops.ts` (DLM role), the tests of all of these, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r5] Not O's:** `release-manifest.ts` and its strict app mirror `aws-rebase-release.ts` stay unchanged, because the field is not a release field (§7.2). |
+| **O** | **[r6] Held for v1 (DECISION_72, §7).** v1: `app/src/server/lib/compute/reverse-snapshot.ts` *new* (the no-op seam, §7.2) and its unit test, nothing else. Post-v1 (each needs its own contract revision first, §7.3): the executor of the chosen §7.2 candidate, `app/src/server/lib/compute/retention.ts` (the listing's caller) and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r6] Withdrawn:** r5's `provider-reverse-snapshot.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts`, `infra/app-computers/lib/reverse-snapshot.ts`, the deployment field in `aws-intent.ts` (and its fixtures and tests) and `infra/app-computers/lib/lifecycle/deployment.ts`, and the edits to `app-caller.ts` (and its tests and snapshots), `bin/lifecycle.ts`, `computer-lifecycle.ts` and `ops.ts`. v1 needs none of them, and those files are read-only for every lane. |
 
 **[r4] Read-only on purpose:** `app/src/components/desktop/boot-phases.ts` and `boot-phases.shell.js` (drift-guarded
 against each other) belong to no lane. Nothing in this contract needs a new `BootErrorCode`: the move answers reuse
@@ -99,14 +99,15 @@ read-only too; its mint goes through the same answers.
 
 Shared seams, each owned by one side:
 - `provider-reverse-store.ts` is **A**'s. O only calls `listUnsnapshotted`, `listRetentionExpired`, `recordSnapshot` and
-  **[r4] `markSnapshotSpent`**; a new read O needs is added by A.
+  **[r4] `markSnapshotSpent`** (**[r6]** post-v1, §7.3); a new read O needs is added by A.
 - **[r5]** The AMI train (§2.8): host files and the pool/C3 app files are **H**'s; `aws-receipts.ts` and `placement.ts` stay
   **A**'s, and H's needs there are pinned in §2.8 for A to implement.
-- **[r5]** The deployment field (§7.2) is **O**'s in every file it touches; no other lane edits `aws-intent.ts`,
-  `deployment.ts` or `app-caller.ts`.
+- **[r6]** There is no deployment field in v1 (§7.2): `aws-intent.ts`, `deployment.ts` and `app-caller.ts` are read-only for
+  every lane.
 - **[r4]** The summary: the reads (`billing.ts`) and the builder (`summary.ts`) are **A**'s; the rendering (`computers.js`,
   `billing.js`) is **U**'s (§6.1, §6.2).
-- The sweep's call site is **A**'s (`handler.ts`); the snapshot step it calls (`advanceReverseSnapshots`) is **O**'s (§5.4, §7).
+- The sweep's call site is **A**'s (`handler.ts`); the snapshot step it calls (`advanceReverseSnapshots`) is **O**'s, in
+  **[r6]** `reverse-snapshot.ts`, a no-op in v1 (§5.4, §7.2).
 - `computer.progress`: the server DTO is **A**'s (`progress.ts`), its rendering is **U**'s (§5.10).
 
 ---
@@ -256,7 +257,7 @@ one owner (§1.1). Sources: the round 6 understand phase (R2-1, R2-4) and the ro
   that parity fixture in the same integration (H tells A first).
 - **The `pool-replenish` cron route is A's** (an actor of §5.2); `aws-pool-replenish.ts` and `ready-pool.ts`, which it calls,
   are H's.
-- **`deploy/aws/mum/json-tool.py` is H's**, and lane O's deployment field needs no change in it (§7.2).
+- **`deploy/aws/mum/json-tool.py` is H's.** **[r6]** v1 adds no deployment field (§7.2), so the move needs no change in it.
 
 ---
 
@@ -321,8 +322,8 @@ The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:44`). Every 
 | `failed_needs_operator → failed_reopened` | runbook SQL `operator_released` (§5.5.1); the store's `fail(m,'failed_reopened', reason)` has the same guard | operator only, after manual cleanup | `commit_sent_at` is null. An operator who proved the commit never landed (P's head is not this move's) runs `clear_commit_sent` first, then releases. |
 | `failed_needs_operator → committed` | `finish(m, …)` | operator only, through the same flip code (§5.6 step 3) | `commit_sent_at` is set. |
 | `failed_reopened` (self) | runbook SQL `operator_cleared` (§5.5.1) | operator only | The computer's newest row, with a `reopen_final` code. Sets `last_error = 'operator_cleared'`, so Try again is offered again (§5.9). No store method sets it. |
-| committed (self) | `recordSnapshot(m, snapId)` | lane O (§7) | **[G4]** Once: a CAS on `aws_snapshot_id IS NULL`. The same id again returns the row (a lost response); a different id never replaces it. |
-| committed (self) | **[r4]** `markSnapshotSpent(m, reason)` | lane O (§7.1 Failure) | `reason` ∈ `REVERSE_SNAPSHOT_SPENT_REASONS`. Once: a CAS on `state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL`. It writes only `last_error` and `updated_at`. A replay, or a row that already left the queue (snapshotted, or spent with another reason), returns the current row. |
+| committed (self) | `recordSnapshot(m, snapId)` | lane O (§7.3; **[r6]** no v1 caller) | **[G4]** Once: a CAS on `aws_snapshot_id IS NULL`. The same id again returns the row (a lost response); a different id never replaces it. |
+| committed (self) | **[r4]** `markSnapshotSpent(m, reason)` | lane O (§7.3; **[r6]** no v1 caller) | `reason` ∈ `REVERSE_SNAPSHOT_SPENT_REASONS`. Once: a CAS on `state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL`. It writes only `last_error` and `updated_at`. A replay, or a row that already left the queue (snapshotted, or spent with another reason), returns the current row. |
 | any in-flight (self) | `recordRetry(m, reason)` | machine | `attempts < 5`, else `{exhausted:true}` and nothing is written; the caller compensates and `fail`s. **In `flipping` it is never exhausted** (attempts saturate at 5): `flipping` is bounded by time (§5.4). |
 
 A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throws `illegal_transition` and writes nothing. The caller re-reads; nothing retries inside the store.
@@ -351,7 +352,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
     `recordSnapshot` and `markSnapshotSpent` never move it), and only rows committed at least `committedForSeconds` ago
     **on the DB clock**. **[r4]** Rows marked spent (`last_error IN REVERSE_SNAPSHOT_SPENT_REASONS`) are left out unless
     `includeSpent` is true. The sweep's snapshot step calls `listUnsnapshotted(3)`; the `snapshot_missing` listing calls
-    `listUnsnapshotted(10, 3600, {includeSpent: true})` (§7.1). **[r5]** Purged rows (`retain_until IS NULL`, §7) are left
+    `listUnsnapshotted(10, 3600, {includeSpent: true})` (§7.3). **[r6]** Both are post-v1: no v1 code calls either listing. **[r5]** Purged rows (`retain_until IS NULL`, §7) are left
     out in both modes.
   - **`listRetentionExpired(limit ≤ 100)`**: `committed` rows with `retain_until < clock_timestamp()`, ordered by `retain_until, id`.
     **[r5]** A purged row (`retain_until` NULL) is never listed, so already-purged rows never hide newer expired ones.
@@ -387,7 +388,8 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   (§6.1) and the open trigger (§5.9). Production has no 0012, and `readComputerProgress` swallows a throw into an empty
   progress (`progress.ts:165-168`), so a missing probe would blank `computer.progress` for every production computer.
 - **[0012 probe] Production (no 0012) is a pinned, tested state, not an error:**
-  - the sweep's `advanceReverseMoves` and lane O's `advanceReverseSnapshots` return at once when the probe is false. Like
+  - the sweep's `advanceReverseMoves` returns at once when the probe is false (**[r6]** lane O's v1 `advanceReverseSnapshots`
+    reads nothing and returns `held` at once, §7.2). Like
     `advanceStaleMigrations` (`provider-migrate-orchestrator.ts:172-179`), neither ever throws out of the billing handler;
   - `computer.move.start`/`retry` answer the refusal value `move_unsupported` (§5.9), never a 500;
   - `summary.computer.moveAvailable` is false (§6.1), so no move action is shown;
@@ -396,7 +398,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 - **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`,
   **[r4]** `REVERSE_SNAPSHOT_SPENT_REASONS = ['snapshot_failed', 'snapshot_receipt_invalid']`.
 - To write inside a placement transaction, build the store over that `tx`.
-- **Owner from r5 on: lane A** (§1.1; r5 was the last S0 edit). Lane O consumes the four snapshot/retention calls (`listUnsnapshotted`,
+- **Owner from r5 on: lane A** (§1.1; r5 was the last S0 edit). Lane O consumes (**[r6]** post-v1, §7.3) the four snapshot/retention calls (`listUnsnapshotted`,
   `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`) and adds nothing here. **[r5]** Lane A's one pinned change
   to the store is `claimStale`'s order (§5.4).
 
@@ -880,8 +882,8 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:738-750`)
   moves get (`provider-migrate-orchestrator.ts:136-147`). A Worker or AWS call starts only if its own timeout (§4.1)
   fits in what is left of the budget, so the pass ends by its start + 90 s.
 - It does **nothing** when called later than `handlerStartedAt + 150 s`; the next tick takes the rows.
-- Order inside the budget: lane O's snapshot step `advanceReverseSnapshots` first (at most 3 rows and 20 s, §7), then the
-  in-flight rows. **[r5]** The pass claims with **`claimStale(10)`** (the store's maximum) and drives the claimed rows
+- Order inside the budget: lane O's snapshot step `advanceReverseSnapshots` first (**[r6]** §7.2: a no-op that returns `held`
+  in v1; at most 20 s once lane O ships, which §5.4 keeps reserved), then the in-flight rows. **[r5]** The pass claims with **`claimStale(10)`** (the store's maximum) and drives the claimed rows
   **concurrently**, one sequential step chain per row, every call under the same timeout-fit rule against the one pass
   deadline. Rows do not share bandwidth: each pulls from its own host through its own DO (§4.1).
 - **[r5] `claimStale` order (lane A's one pinned store change, §3.4):** rows in `booting` … `flipping` before `requested`
@@ -985,7 +987,7 @@ The classes are:
 - `failed_needs_operator`:
   - Open works: `abort_unconfirmed` only. **[r5]** It is written only after the placement settled (§5.7), so the next open is an ordinary hold replace that never matches `readByExportBoot`;
   - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:683-688`).
-- **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`.
+- **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`. **[r6]** No v1 writer (§7.3).
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
 
 #### 5.5.1 Operator runbook SQL (pinned; the only operator writes) **[minor: operator_cleared]**
@@ -1071,7 +1073,7 @@ Finishing a `flip_stuck` row (`failed_needs_operator → committed`) is **not** 
    - **In the same transaction**, call the reverse store over `tx`: `finish(m, {awsVolumeId, awsFsUuid, awsSnapshotId: null})`.
    - So there is never a moment where the placement is Cloudflare while the row is not `committed`.
    - An operator finishing a `flip_stuck` row runs this same transaction from `failed_needs_operator`, after the Worker confirms the commit.
-4. **After commit**, outside any lock: re-read the entitlement. If it is `paidAccess`, call `startPaidMigration(userId, sku)` (`provider-migrate-runtime.ts:173`). That runs a forward move onto a fresh volume; the retained volume is rollback-only. Then lane O's snapshot follows (§7).
+4. **After commit**, outside any lock: re-read the entitlement. If it is `paidAccess`, call `startPaidMigration(userId, sku)` (`provider-migrate-runtime.ts:173`). That runs a forward move onto a fresh volume; the retained volume is rollback-only. **[r6]** In v1 the D21 snapshot is the DLM policy's (§7.1); nothing more runs here.
 
 There is no AWS call after the point of no return: the export host is retired in `checking`, before `commit_sent_at`.
 
@@ -1603,36 +1605,102 @@ in a non-terminal stage):
 
 ---
 
-## 7. Retention and the D21 snapshot (lane O)
+## 7. Retention and the D21 snapshot **[r6: lane O held for v1]**
 
-- After the flip, the placement row no longer exists (`placement.ts:838` deletes rows on flips). So **the committed reverse row is the only DB record of the AWS volume.** It holds `aws_volume_id`, `aws_fs_uuid`, `aws_snapshot_id` and `retain_until` (commit + 14 d, DB clock).
-- **Snapshot (D21, mandatory).**
-  - **Executor:** lane O ships a fenced `reverse_snapshot` lifecycle operation, modelled on the preparation machine's `createSnapshot` step (`preparation-helper.ts:83-96`, `preparation-definition.ts:40-47`). Its preconditions: the volume is `available` and unattached, owned by the account, and tagged with this computer's id.
-  - **Started** by the reverse sweep for every `committed` row with `aws_snapshot_id IS NULL` that is not marked spent (**[r4]**, §7.1 Failure).
-  - **Recorded** with `recordSnapshot` (once) as soon as `CreateSnapshot` returns an id. A pending snapshot is already point-in-time.
-  - **Alert:** a committed row with no snapshot 1 h after commit is listed by `retention.ts` as `snapshot_missing` and logged `[reverse-move] snapshot_missing`. An operator takes it by hand (T1 does so for canary2).
-  - **[r5] Its invoker (pinned).** r4 named the log line but no caller: `retention.ts` has no runtime caller at base,
-    only its unit test. Lane O's `advanceReverseSnapshots` runs the listing (`listUnsnapshotted(10, 3600, {includeSpent:
-    true})`, through `retention.ts`) **once per pass**, after its snapshot step and inside the same 20 s. When the listing
-    is not empty it logs **one** line, `[reverse-move] snapshot_missing {count, moveIds}` (at most 10 ids). The sweep runs
-    every minute, so the line repeats until the row has a snapshot or is purged (§3.4). It runs even when a region's
-    deployment has no ARN, which is exactly when such rows pile up; with no 0012 the step returns at once (§3.4). Lane O's tests: a row committed 61 min ago with no snapshot
-    makes the line fire with its id; a row committed 30 min ago does not; a spent row is still listed; a purged row is not.
-  - Lane O ships before the app deploy (release order, §8), so every committed move gets one.
+**[r6] Lead decision §7.2 (DECISION_72) replaces r5's design.** In v1:
+- no new field in the lifecycle `deployment` object, no new env var and no new state machine;
+- **lane O is held**: its only v1 deliverable is the no-op seam of §7.2;
+- the D21 snapshot is the **existing DLM policy** (§7.1); no lane deletes the AWS volume; committed rows keep
+  `aws_snapshot_id` NULL; the `snapshot_missing` alert never fires.
 
-### 7.1 The `reverse_snapshot` operation (pinned) **[G4]**
+After the flip, the placement row no longer exists (`placement.ts:838` deletes rows on flips). So **the committed reverse
+row is the only DB record of the AWS volume.** It holds `aws_volume_id`, `aws_fs_uuid`, `export_boot.region`,
+`aws_snapshot_id` (NULL in v1) and `retain_until` (commit + 14 d, DB clock: the earliest a later purge may act, §7.3).
 
-| Item | Rule |
-|---|---|
-| **Name** | `reverse_snapshot`. It is a **separate** Standard Step Functions state machine, owned, deployed and versioned by lane O like the preparation machine (`infra/app-computers/lib/rebase-preparation.ts`). Its version ARN reaches the app on the deployment as **`reverseSnapshotStateMachineVersionArn`**, an optional deployment field. **[r5]** Lane O owns that field end to end, in every file it touches, with a pinned rollout order (§7.2). It is a deployment field, not a release field. It is **not** a new value in `LIFECYCLE_OPERATIONS` (`aws-intent.ts:183`): the placement lifecycle machine and its allowlist are unchanged. |
-| **Intent** | Strict JSON with exactly these keys: `{"schemaVersion": 1, "operation": "reverse_snapshot", "jobId": "<moveId>", "moveId": "<moveId>", "computerId": "<uuid>", "region": "<the row's export_boot.region>", "accountId": "<12 digits>", "volumeId": "<the row's aws_volume_id>", "fsUuid": "<the row's aws_fs_uuid> \| null", "committedAt": "<ISO of the row's commit, state_entered_at>"}`. **[r5]** r4 hard-coded `ap-south-1`, but `AWS_REGIONS` allows up to 4 regions (`aws-config.ts:119-121`) and the flip deletes the placement row. So the region comes from the claim (`export_boot.region`, §3.1), and the deployment (account, ARN) is `cfg.deployments[region]`. A region with no deployment, or a deployment without the ARN, starts nothing: the row is listed as `snapshot_missing`. The execution input is `{schemaVersion: 1, document, digest}` with `digest = sha256(document)`, as `buildRebasePreparation` builds it (`aws-rebase-preparation.ts:23-32`). |
-| **Idempotency key** | **`jobId = moveId`, so the execution name is `computer-<moveId>`** (the `EXECUTION_NAME` grammar, `aws-clients.ts:212`). A start whose name is already used counts as success (`ExecutionAlreadyExists`, `aws-clients.ts:228-247`). A Standard execution's name cannot be reused for 90 days, longer than the 14-day retention. So a lost StartExecution response, a retried start, or two sweeps never run a second execution for one move. Names are scoped to one state machine, so `computer-<moveId>` never collides with a placement job's name. |
-| **EC2 dedupe inside the execution** | EC2 `CreateSnapshot` takes **no client token**. The SDK's `CreateSnapshotRequest` has only `Description`, `OutpostArn`, `VolumeId`, `TagSpecifications`, `Location` and `DryRun` (`app/node_modules/@aws-sdk/client-ec2/dist-types/models/models_2.d.ts:1969`, client-ec2 3.1140.0), and the preparation step passes only `VolumeId`, `Description` and `TagSpecifications` (`preparation-definition.ts:40-42`). So the lead's "client token derived from the move id" is the execution name above, and inside the one execution the helper dedupes as the preparation helper does (`preparation-helper.ts:83-96`): it calls create **at most once** (`createAttempted`), tags the snapshot at creation with `ezil:reverse-move = <moveId>` and `ezil:computer-id = <computerId>`, looks that tag up before creating, and resolves an uncertain create by the tag (`snapshot_ambiguous` when 2 or more exist, `snapshot_create_unconfirmed` when none exists after an attempt). |
-| **Preconditions** | As above, plus `volumeId` equals the row's `aws_volume_id`. Any failure ends the execution failed with a closed code; the helper never mutates the volume. |
-| **Success** | As soon as the tagged snapshot is `pending` or `completed`. `error` → failed `snapshot_error`. The output is the receipt `{schemaVersion: 1, jobId, digest, moveId, computerId, volumeId, snapshotId, snapshotState: 'pending' \| 'completed', snapshotStartedAt}`, at most 8 KiB, as the preparation receipt is (`preparation-helper.ts:104`). |
-| **How the id reaches the app** | Lane O's `advanceReverseSnapshots` reads execution `computer-<moveId>` with the existing reader (`createSfnExecutionReader`, `aws-clients.ts:254`). It validates the receipt against the intent it built (digest, `moveId`, `computerId`, `volumeId`; the `validateRebaseSnapshotReceipt` pattern, `aws-rebase-preparation.ts:44-53`), then calls `recordSnapshot(m, snapshotId)`. A replay of the same id returns the row (§3.4). |
-| **Which sweep starts it** | `advanceReverseSnapshots(budget)` (lane O, `provider-reverse-snapshot.ts`). Lane A's `advanceReverseMoves` calls it **first** in its pass (at most 3 rows and 20 s, §5.4), with `listUnsnapshotted(3)`, which **[r4]** leaves out spent rows. Per row: no execution yet → StartExecution; running → nothing; succeeded with a valid receipt → `recordSnapshot`; succeeded with an invalid receipt → `markSnapshotSpent(m, 'snapshot_receipt_invalid')`; FAILED, TIMED_OUT or ABORTED → `markSnapshotSpent(m, 'snapshot_failed')`. The deployment has no `reverseSnapshotStateMachineVersionArn` → nothing (the row then appears under `snapshot_missing`). |
-| **Failure** | A failed, timed-out or aborted execution is **not** retried automatically: its name is spent, and a second name could create a second snapshot. **[r4]** The sweep marks the row spent with `markSnapshotSpent` (§3.4) and logs `[reverse-move] snapshot_failed`. A spent row leaves the sweep's queue, so spent rows never fill `listUnsnapshotted(3)` and starve newer commits. (r3's queue was the oldest 3 unsnapshotted rows with no other filter, so three spent rows stopped every later D21 snapshot.) It stays listed as `snapshot_missing` (`listUnsnapshotted(10, 3600, {includeSpent: true})`) until an operator snapshots by hand and records the id with the runbook statement below. `recordSnapshot` also still accepts it. **PG test (store, r4):** 3 spent rows plus 1 new row → `listUnsnapshotted(3)` returns only the new row; the `snapshot_missing` listing returns all 4 once they are 1 h old. |
+### 7.1 v1: the D21 snapshot is the existing DLM policy **[r6]**
+
+- **The policy.** `DataSnapshots` (`infra/app-computers/lib/ops.ts:74-86`): EBS snapshots every 12 h, the newest 14 kept
+  (`SNAPSHOT_INTERVAL_HOURS`, `SNAPSHOT_RETAIN_COUNT`, `ops.ts:31`), of every volume tagged `ezil:backup = <namespace>`
+  (`BACKUP_TAG`, `ops.ts:81`), with `copyTags` and the tag `ezil:snapshot-policy = <namespace>-12h` on each snapshot. The tag
+  is set when the data volume is created and never removed; the lifecycle evidence refuses a data volume without it
+  (`aws-rebase-evidence.ts:59`, `aws-rebase-generation.ts:124`, `image-recovery-evidence.ts:61`).
+- **Why it covers D21.** A reverse move never creates, re-tags or deletes the volume. The export host is retired in
+  `checking`, before the commit (§5.6), so from then on the volume is detached and unchanged, and every DLM snapshot
+  taken after that retire is a point-in-time copy of exactly what was moved. DLM snapshots detached (`available`)
+  volumes too, and keeps rotating: after 7 days all 14 kept snapshots postdate the retire. Before the first post-retire
+  run (at most 12 h) the volume itself is the copy, and v1 never deletes it.
+- **Live evidence (read-only, 2026-10-30).** Policy `policy-08094db9cbd7f50ce`, "ezil mum data volumes 12-hourly retain 14",
+  is ENABLED. canary2's held volume `vol-0b1ffbc8f8cfa6384` carries `ezil:backup = mum` and has completed `mum-12h`
+  snapshots at 2026-10-29T19:38:34Z and 2026-10-30T07:49:50Z. The policy's role therefore works, so r5's "change
+  `dlmRoleArn` only after `iam get-role`" (`ops.ts:36`) asks nothing of v1.
+- **v1 rules (pinned):**
+  - **No lane deletes the AWS volume in v1.** The purge executor and its runbook trail with lane O (§7.3). `retain_until`
+    is still written (commit + 14 d); no v1 code reads it.
+  - **Committed rows keep `aws_snapshot_id` NULL.** No v1 code calls `recordSnapshot` or `markSnapshotSpent`, and
+    operators do not run `operator_snapshot` in v1. The store calls and the runbook stay pinned and tested for lane O.
+  - **The `snapshot_missing` alert never fires in v1.** Nothing runs its listing: `advanceReverseSnapshots` is a no-op
+    (§7.2) and `retention.ts` keeps no runtime caller, as at base. Lane O turns the alert on when it ships an executor.
+  - **Acceptance (T3, §8).** The moved volume is `available`, retained and tagged `ezil:backup = mum`, and a `mum-12h`
+    snapshot of it completes after the export host's retire (read-only `describe-snapshots`). The row's
+    `aws_snapshot_id` is NULL.
+
+### 7.2 The seam: `advanceReverseSnapshots` (lane O's file, lane A's call) **[r6]**
+
+- **File:** `app/src/server/lib/compute/reverse-snapshot.ts` *new*, owned by **lane O** (§1.1). In v1 it is exactly this,
+  plus its unit test:
+
+```ts
+/** DECISION_72 (REVERSE-MOVE-CONTRACT §7.2): lane O is held for v1; the D21 snapshot is the existing DLM policy (§7.1). */
+export type ReverseSnapshotPass = { status: 'held'; reason: 'v1_dlm' };
+export async function advanceReverseSnapshots(_input: { deadlineMs: number }): Promise<ReverseSnapshotPass> {
+    return { status: 'held', reason: 'v1_dlm' };
+}
+```
+
+  It reads no table, starts nothing, logs nothing and never throws. When lane O ships it widens `ReverseSnapshotPass`
+  (for example a `'ran'` variant with counts); lane A's driver treats any result as informational.
+- **Call (lane A, `advanceReverseMoves`):** first in the pass, awaited, before `claimStale` (§5.4), with
+  `deadlineMs = passStartedAt + 20_000`. The pass's one log line carries `snapshot: result.status`. Lane A's handler test
+  asserts, with a fake, that it is called first.
+- **Order:** the seam file lands in the same integration as lane A's call, or before it, never after.
+- **The partition holds.** Lane A never writes `reverse-snapshot.ts`; lane O never writes the driver. When lane O ships,
+  only its own files change, inside the 20 s that §5.4 already reserves.
+- **Two candidate mechanisms for lane O later (recorded, not chosen):**
+  1. **An operation on the existing lifecycle machine.** EC2 `CreateSnapshot` returns at once with a `pending` snapshot id,
+     so a short fenced operation (preconditions, a tag-deduped create as `preparation-helper.ts:83-96` does, a receipt) fits
+     the existing placement lifecycle machine. It needs a new `LIFECYCLE_OPERATIONS` value (`aws-intent.ts:183`) with its
+     helper and evidence, but no new deployment field and no new state machine.
+  2. **A DLM tag-based selection.** Use DLM's own snapshots: record the committed volume's first `mum-12h` snapshot taken
+     after `commit_sent_at`, found by its tags, or give the committed volume a tag that a dedicated DLM policy with a longer
+     retention selects. No Step Functions work; it depends on DLM's cadence and retention.
+- **Withdrawn from r5:** the separate `reverse_snapshot` Standard state machine and the deployment field
+  `reverseSnapshotStateMachineVersionArn` (r5 §7.1, §7.2, commit `92d84635` on this branch). **Why (the r5 verifier's
+  MAJOR):** every lifecycle intent embeds the parsed deployment (`readLifecycleDeployments` returns `d.data`,
+  `aws-intent.ts:156-178`; `replaceIntent`'s `deployment`, `aws-ec2.ts:297`; every `cfg.deployments[region]` site,
+  `aws-ec2.ts:618,699,845,863,922,929`; the pool classes, `aws-pool-runtime.ts:107`), and the infra helpers require
+  canonical equality with their own configured deployment: `lifecycle/helper.ts:61` (`matchesLifecycleDeployment`,
+  `preparation-evidence.ts:71-73`), `preparation-helper.ts:35`, `recovery-helper.ts:46`, `image-recovery-helper.ts:38`,
+  `maintenance-evidence.ts:27`, all through `equal`, sorted-key JSON (`lifecycle/contract.ts:28`). A key that the env (or
+  the infra settings) carries before the other side does fails every lifecycle intent with `lifecycle_invalid`, in
+  either order and on rollback. No order of r5's three rollout steps was safe.
+
+### 7.3 Held with lane O (post-v1) **[r6]**
+
+- The store calls lane O will use stay as they are, with their PG tests (§3.4): `listUnsnapshotted`,
+  `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`. None has a v1 caller.
+- **Executor and alert.** When lane O ships, its executor (one of the §7.2 candidates) records the snapshot with
+  `recordSnapshot` and spends a failed one with `markSnapshotSpent` (never retried automatically: a second attempt could
+  create a second snapshot). `advanceReverseSnapshots` then also runs the `snapshot_missing` listing
+  (`listUnsnapshotted(10, 3600, {includeSpent: true})`, through `retention.ts`) once per pass and logs one line,
+  `[reverse-move] snapshot_missing {count, moveIds}` (at most 10 ids); `retention.ts` lists `listRetentionExpired(100)`.
+  Each of these needs its own contract revision first, with its files in §1.1 and its §5.4 time re-derived.
+- **Purge.** Deletion is a separate founder-owned principal, never a workflow role; both workflow roles deny `DeleteVolume`
+  and `DeleteSnapshot` (rule R11). After deleting a row's volume and snapshot, the operator runs `operator_purged`: it
+  sets `retain_until = NULL` on that committed row (the 0012 CHECK allows it), so `listRetentionExpired` and
+  `listUnsnapshotted` skip it and the row keeps `aws_volume_id` and `aws_snapshot_id` as history. **Not run in v1**: no
+  volume is deleted.
+- **Hand-taken snapshot.** `operator_snapshot` records a snapshot id once on a committed row. **Not run in v1.**
+- `provider-reverse-store.pg.test.ts` runs both statements verbatim from this file (§5.5.1), so they stay here unchanged.
 
 ```sql
 -- runbook: operator_snapshot
@@ -1642,15 +1710,6 @@ UPDATE public.ezil_compute_reverse_moves
 RETURNING id, state, aws_snapshot_id, updated_at::text AS updated_at;
 ```
 
-- **Purge listing.** `retention.ts` (dry run, `retention.ts:1-13,58-64`) lists `listRetentionExpired(100)` and the
-  `snapshot_missing` rows (`listUnsnapshotted(10, 3600, {includeSpent: true})`, **[r4]** spent rows included). Both are read-only (§3.4).
-- **Purge.** Deletion is a separate founder-owned principal, never a workflow role. Both workflow roles deny `DeleteVolume` and `DeleteSnapshot` (rule R11).
-- **[r5] Purge marker.** After deleting a row's volume and snapshot, the operator runs `operator_purged`. It sets
-  `retain_until = NULL` on that committed row; the 0012 CHECK allows it (`retain_until IS NULL OR state = 'committed'`), so
-  0012 is unchanged. `listRetentionExpired` already skips NULL, so more than 100 expired rows never hide newer ones behind
-  rows already purged. `listUnsnapshotted` skips purged rows in both modes (store r5), so a purged row never re-enters the
-  snapshot queue or the `snapshot_missing` alert. The row keeps `aws_volume_id` and `aws_snapshot_id` as history.
-
 ```sql
 -- runbook: operator_purged
 UPDATE public.ezil_compute_reverse_moves
@@ -1658,69 +1717,6 @@ UPDATE public.ezil_compute_reverse_moves
  WHERE id = '<move-id>'::uuid AND state = 'committed' AND retain_until IS NOT NULL AND retain_until < clock_timestamp()
 RETURNING id, state, aws_volume_id, aws_snapshot_id, retain_until, updated_at::text AS updated_at;
 ```
-- **DLM.** `dlmRoleArn` pins `role/service-role/…` (`ops.ts:36`). Change it only after `iam get-role` confirms the path. T0 saw a DLM 12-hourly snapshot of the founder's volume (snap-053333a158f9cc895, 10-29 19:38Z), so DLM runs for at least that volume; DLM snapshots never replace the D21 snapshot.
-
-### 7.2 The deployment field `reverseSnapshotStateMachineVersionArn` (lane O, end to end) **[r5]**
-
-**Why it is more than two files.** The lifecycle deployment is strict on both sides, and every lifecycle intent embeds it.
-- App: `LifecycleDeploymentSchema` is `.strict()` (`aws-intent.ts:81-104`). `readLifecycleDeployments` fails the whole read
-  when one configured region's entry fails it (`aws-intent.ts:156-177`), so an unknown key turns AWS off. The parsed
-  deployment is copied into every intent (`replaceIntent`'s `deployment`, `aws-ec2.ts:282`), and `buildLifecycleWork`
-  serializes the whole intent (`aws-intent.ts:328-337`).
-- Infra: one strict `LifecycleDeploymentSchema` (`infra/app-computers/lib/lifecycle/deployment.ts:84-97`) is imported by the
-  lifecycle intent (`intent.ts:27`, parsed by the helper at `helper.ts:57`), the helper settings (`contract.ts:16`), the
-  preparation and recovery contracts (`preparation-contract.ts:12`, `recovery-contract.ts:42`), the release manifest
-  (`release-manifest.ts:24`) and the identity config (`identity.ts:31`). The helper refuses an intent with an unknown key.
-
-**Schema rule (both sides, in the same order; `app-intent-contract.test.ts` pins the parity):**
-- `reverseSnapshotStateMachineVersionArn: z.string().max(300).optional()`.
-- When present it must be `arn:aws:states:<region>:<accountId>:stateMachine:ezil-<namespace>-reverse-snapshot:<version ≥ 1>`.
-- That check is its **own** `superRefine` step, outside the four-key image tuple (`aws-intent.ts:106-117`). Inside the tuple,
-  every deployment without the new key would fail `incomplete_image_deployment`. A deployment with the key and no image
-  tuple parses, and so does one with the tuple and no key. `SourceLifecycleDeploymentSchema` (an `.extend` of the inner
-  type, `aws-intent.ts:134-148`) still parses every pinned source fixture.
-
-**Rollout order (pinned; no strict parser ever sees the key before it accepts it):**
-1. **Infra first** (release step 4, §8). `deployment.ts` accepts the optional key, and every Lambda and stack that parses a
-   deployment is deployed with it: the lifecycle helper, the preparation and recovery helpers, and the stacks that read
-   `EZIL_LIFECYCLE_CONFIG`. If that deploy publishes a new lifecycle state machine version, the version reaches the
-   deployment through the ordinary promote: `stateMachineVersionArn` is already in its tuple (`rebase_manifest.py:9-10`).
-2. **App second** (release step 6). `aws-intent.ts` accepts the key. Until the env carries it, every intent is unchanged
-   byte for byte.
-3. **Env last** (release step 7). The region's entry in `EZIL_AWS_LIFECYCLE_DEPLOYMENTS` (the staging app secret) gains
-   the key. From then on lifecycle intents carry it, and the step-1 helpers accept them.
-- **Rollback.** Remove the key from the env **before** rolling the app back past step 2 or infra back past step 1. An old
-  strict app turns AWS off on the key, and an old helper refuses every intent.
-- **Expected side effect.** Pool hosts match the current deployment by exact JSON (`compatibleDeployment`,
-  `ready-pool.ts:58-60`). Step 3 therefore makes every warm spare launched before it incompatible. The planner retires
-  them as obsolete and refills once, so opens in that window are cold. Run step 3 at a quiet time. It needs no code
-  change (`ready-pool.ts` is lane H's).
-- Until step 3, `advanceReverseSnapshots` starts nothing and committed rows show as `snapshot_missing`. Step 3 comes
-  before canary2 acceptance, so T3's row gets its snapshot.
-
-**What does not change (evidence; lane O edits none of these):**
-- **`deploy/aws/mum/json-tool.py` (lane H).** A promote deep-copies the deployment. It removes only promote-tuple keys
-  that are missing from the new pair, then applies the pair (`json-tool.py:528-534`), so every other key, this one
-  included, is kept as it is. Its literal-replacement list (`:543`) is for version ARNs that change with a release, and
-  this machine's version does not. `deployment_tuple` checks only the four tuple keys (`rebase_manifest.py:69-78`). A
-  promote's deployment comparison covers only the `public_deployment` keys (`rebase_release.py:516-519`,
-  `rebase_app.py:47-50`), which do not include the new key. **So no promote needs to carry it**, and the file stays H's,
-  unchanged.
-- **`release-manifest.ts` and the app's strict mirror `aws-rebase-release.ts`.** The field is not a release field: lane
-  O's own deploy versions the reverse-snapshot machine, not the AMI release. The release schemas
-  (`rebase-release.schema.json`, `rebase-source-release.schema.json`, `additionalProperties: false`) describe release
-  records, not the deployment, and never see the key.
-- `LIFECYCLE_OPERATIONS` and the placement lifecycle machine (§7.1).
-
-**IAM (lane O, `app-caller.ts`).** The app caller gets, for the reverse-snapshot machine, exactly what it has for the
-lifecycle machine (`app-caller.ts:93-131`):
-- `states:StartExecution` on the unqualified machine. The caller enforces the version.
-- `states:DescribeExecution` and `states:GetExecutionHistory` on that machine's `computer-*` executions.
-- The machine and its version in the `kms:EncryptionContext:aws:states:stateMachineArn` list of the history key it
-  encrypts with.
-
-The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28` passes only `stateMachineVersionArn`.
-`iam-exact.test.ts` and the IAM snapshots change in the same commit.
 
 ---
 
@@ -1742,6 +1738,7 @@ The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28`
 | j | The staging app's `billing-session-sweep` runs every minute, as `vercel.json:15-17` schedules it in production | open | A: sweep log timestamps on staging |
 | k | The host root volume has ≥ 1.75 GiB free for staging | open | H: `df` on a baked host |
 | l | Founder-owned rule: canary2's email is outside §5.9.1, so the open trigger can be proven on it | open | A: read-only check; if canary2 is founder-owned, the open trigger is unit-proven only and acceptance says so |
+| m | **[r6]** The moved volume is covered by the DLM policy (§7.1): `ezil:backup = mum` on it, the policy ENABLED | **Settled for canary2** (read-only, 2026-10-30: `policy-08094db9cbd7f50ce` ENABLED; `vol-0b1ffbc8f8cfa6384` tagged, `mum-12h` snapshots completed 10-29 19:38:34Z and 10-30 07:49:50Z). Every lifecycle-created data volume carries the tag (§7.1 evidence checks). | A: re-read at T3, after the retire |
 
 **T-sequence (canary2 only; contact@ only on the founder's click):**
 
@@ -1751,7 +1748,8 @@ The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28`
 4. **T3**: the real move, triggered by the open when (l) allows, else by the click. Expect:
    - the §4.4 heads;
    - a Cloudflare STOPPED row, and the instance terminated before `commit_sent_at`;
-   - the volume `available` and retained, and a snapshot recorded;
+   - the volume `available`, retained and tagged `ezil:backup = mum`; **[r6]** a `mum-12h` DLM snapshot of it completes after
+     the export host's retire (read-only), and the row's `aws_snapshot_id` is NULL (§7.1);
    - standing `free`.
 5. **T4**: open on Cloudflare. The marker file is present.
 6. **T5**: resubscribe → forward → cancel → reverse (`none` shape).
@@ -1763,15 +1761,16 @@ The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28`
 1. Snapshot.
 2. AMI bake and promote-canary (H): the export op (§2) and **[r5]** the host halves of the AMI train (§2.8).
 3. Worker deploy (W). The routes stay unused until the app calls them.
-4. Lane O infra (O, plus a founder IAM step): the snapshot executor, the app-caller grants and **[r5]** `deployment.ts`
-   accepting the optional field in every infra parser (§7.2 step 1).
+4. **[r6] Nothing from lane O in v1** (DECISION_72, §7.2). r5's snapshot executor, app-caller grants and `deployment.ts`
+   field are withdrawn; the DLM policy already runs (§7.1).
 5. **Apply 0012 on staging** (`billing-staging-schema.mjs plan`, then `apply --yes --target aws-preview --expect-system-id <digits>`).
 6. App deploy with the user and open triggers (A+U). Only held `files_on_aws` placements are affected; founder-owned accounts get no open trigger.
-   **[r5]** This app's `aws-intent.ts` accepts the field (§7.2 step 2). The C3 app half (§2.8) ships here or later, never
+   **[r6]** It includes lane O's no-op seam (§7.2) and no deployment field. The C3 app half (§2.8) ships here or later, never
    before step 2's AMI.
-7. **[r5]** The deployment env value gains `reverseSnapshotStateMachineVersionArn`, only once step 6 is live (§7.2 step 3).
+7. **[r6] Withdrawn:** no deployment env change (r5's `reverseSnapshotStateMachineVersionArn`, §7.2).
 8. canary2 acceptance.
-9. DLM and the retention purge runbook (O).
+9. **[r6] Held with lane O (post-v1, §7.3):** a snapshot executor, the `snapshot_missing` alert and the retention purge
+   runbook. DLM already runs (§7.1).
 
 **[r5]** No cron step: v1 has no cron trigger (§9).
 
@@ -1901,3 +1900,18 @@ Numbers are the review's own order (1-based; the first ten are r4's rows above).
   diagnostics view, not move copy, and no lane owns it in Phase B; the Computer tab and the overlay carry the move (§6.4).
 - `billing-placement.pg`, `ai-credit-outbox.pg`, `processor-v2.pg`, `compute-access.pg` and the shell, Worker and SDK
   suites are outside this store change; r5's gates are listed in its handoff.
+
+### 12.2 r6: the rebase onto round 6a, the lead's §7.2 decision, and the r5 verifier's gaps **[r6]**
+
+r6 rebased `r6/phaseb-20261030` onto `r6/integ-20261030` at `7a1f2ed1` (round 6a, LIVE on os-staging) with **no
+conflicts**: 6a and this branch touch disjoint files. `0012_compute_reverse_moves.sql` is byte-identical (sha256
+`3adc0297…d340`, the registered digest in `.github/production-migrations.json`).
+
+| Item | Section(s) | Resolution |
+|---|---|---|
+| **DECISION_72** (lead, replaces r5's §7.2; closes the r5 verifier's MAJOR "the §7.2 rollout breaks every AWS lifecycle job") | §0 D-6, §1, §1.1, §2.8, §3.2, §3.4, §5.4, §5.5, §5.6, §7, §7.1, §7.2, §7.3, §8 | No new field in the lifecycle `deployment` object: the helpers require canonical equality with their own configured deployment (`lifecycle/helper.ts:61` → `matchesLifecycleDeployment`, `preparation-evidence.ts:71-73`; `preparation-helper.ts:35`; `recovery-helper.ts:46`; `image-recovery-helper.ts:38`; `maintenance-evidence.ts:27`; `equal` = sorted-key JSON, `lifecycle/contract.ts:28`), and the app copies the parsed deployment into every intent (`aws-intent.ts:156-178`, `aws-ec2.ts:297`). No new env var and no new state machine in v1. **Lane O is held for v1.** The v1 D21 snapshot is the existing DLM policy (`ops.ts:74-86`, `DataSnapshots`: 12-hourly, 14 kept, `ezil:backup = <namespace>` set at volume creation). **Live evidence (read-only, 2026-10-30):** `policy-08094db9cbd7f50ce` "ezil mum data volumes 12-hourly retain 14" ENABLED; canary2's held volume `vol-0b1ffbc8f8cfa6384` carries `ezil:backup = mum` and has completed `mum-12h` snapshots at 2026-10-29T19:38:34Z and 2026-10-30T07:49:50Z. v1 never deletes the AWS volume (the purge trails lane O); committed rows keep `aws_snapshot_id` NULL; `snapshot_missing` never fires in v1 (nothing runs the listing). **Seam:** lane O owns `reverse-snapshot.ts` with a no-op `advanceReverseSnapshots` that returns `{status: 'held', reason: 'v1_dlm'}`; lane A's driver calls it first. Two candidate mechanisms for O later, not chosen: an operation on the existing lifecycle machine (`CreateSnapshot` returns at once), or a DLM tag-based selection. New T0 row (m). |
+| Rebase onto 6a: re-pin every citation into a file 6a changed | header, §2, §4, §5, §6, §7, §8 | Done for `session.js`, `app-spinner.js`, `desktop-window.js` (no citation), `boot-phases.{ts,shell.js}`, `billing-session-sweep/{handler,route}.ts`, `cloudflare-guacamole.ts`, `aws-preview.ts`, `aws-pool-replenish.ts`, `ready-pool.ts`, `worker/src/{index,aws-origin,aws-ice,aws-tunnels}.ts`, `computers.js`, `billing.js`, `usage.js` (no citation), and the other files 6a changed that the contract cites (`aws-ec2.ts`, `progress.ts`, `compute-access.ts`, `computer-progress.js`, `code.js`, `billing.ts`, `summary.ts`). Store citations (this branch) re-pinned too. |
+| Statements 6a made false | §2.8, §5.1.2, §6.1.1, §6.2, §6.3 | 6a shipped the app half of `pool_desktop_not_ready` with its own predicate (created + 6 min **and** enrolled + 5 min); H keeps the host half only. 6a's R1-11 and R4-02 settled the files-held banner ("AWS (India)", the held-closed sentence); r4's region-free banner is withdrawn and lane U edits no banner copy. The provider label is "AWS (India)". `holdOpenable` is 6a's held-closed test for the same computer, and a held-closed computer gets its own pre-move row. The §5.1.2 parity test injects `grantPending` (6a's grant-pending wait answers before any intent is built). |
+| 6a's wake clocks vs a move | §6.4 | Lane U changes `session.js`: `computeMoving` is tested first, with the move's own deadline (`budgetSeconds + 300 s`), its own `maxIssues` and a 30 s re-ask, so neither `PREPARE_DEADLINE_MS`, its `t0 + LAUNCH_DEADLINE_MS` clamp, `MIGRATION_DEADLINE_MS` nor `MAX_ISSUES` ends a move; leaving a move re-anchors the loop like `wakeResumed`; `pendingOrRefused` forwards the move flags. **Fixed with it (an r5 hole):** r5 re-asked when "the open stops answering `computeMoving`", but that answer is already an ordinary open, which after a failure boots the AWS computer under the hold. The loop now re-asks only after a `computer.progress` read shows the move in flight or committed. **Disclosed residual:** a failure between that read and the server routing the ask still boots it; closing that needs a `previewUrl` input `code.js` cannot send. |
+| 6a's held pass vs the export boot | §5.4 | The driver stays last, after the held pass (which ends by handler start + 30 s). The held pass skips a computer whose newest reverse row is **in flight** (`reverseMoveInFlight`, wired by the route; fail closed), so the export boot's UNCONFIRMED states never log `held-unconfirmed` and are never stopped; a `failed_needs_operator('abort_unconfirmed')` computer is **not** skipped, so its hold sessions stay bounded. |
+| 6a's surface seam and terminal desktop codes | §5.3, §5.10, §6.4 | The reverse answer leaves all four routes right after `routeComputer`, through `awsAnswered` (no `preview`), so no `surface` and no config push reaches the export boot, and it never carries `computePreparing`, `computeLaunching` or `computeMigrating`. `desktop_config_unapplied` and `desktop_failed` never answer an open during a move; after a move they keep 6a's copy. The moving view never carries 6a's connect expectation. The Computer tab hides 6a's files-held card, hold line and session-ends line during a move. |
