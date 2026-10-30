@@ -67,6 +67,10 @@ export const EXPORT_MAX_BYTES = EXPORT_MAX_CHUNKS * EXPORT_CHUNK_BYTES;
 export const EXPORT_MAX_ENTRIES = 100_000;
 export const REVERSE_MOVE_MAX_ATTEMPTS = 5;
 export const REVERSE_MOVE_RETENTION_DAYS = 14;
+/** Rows past `requested` (each holds, or is about to hold, an export host), fleet-wide (contract §5.1.1 step 5b). */
+export const REVERSE_MOVE_MAX_ACTIVE = 3;
+/** The states `REVERSE_MOVE_MAX_ACTIVE` counts: a claim moved the row there, and only a terminal state leaves them. */
+export const REVERSE_MOVE_HOST_BOUND: readonly ReverseMoveState[] = ['booting', 'exporting', 'copying', 'checking', 'flipping'];
 
 /** The export boot's claim on the published placement row (contract §5). Integers are the placement's
  * own counters (`placementGeneration`), never the move's uuid `generation`. `region` is the placement's region
@@ -331,8 +335,19 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             RETURNING ${COLUMNS}`));
         return updated ?? refuse('lost_race');
     }
+    /**
+     * Fleet-wide rows in `booting` … `flipping` (contract §5.1.1 step 5b). A plain count: `admitExportBoot` runs it under the
+     * admission lock, which serialises every claim, so two claims never both see a free slot.
+     */
+    const countHostBound = async (): Promise<number> => {
+        const states = sql.join(REVERSE_MOVE_HOST_BOUND.map(s => sql`${s}`), sql`, `);
+        const n = rows(await db.execute(sql`/* reverse:count-host-bound */ SELECT count(*)::int AS n
+            FROM public.ezil_compute_reverse_moves WHERE state IN (${states})`))[0]?.n;
+        if (!Number.isSafeInteger(Number(n))) throw new Error('reverse move count returned no count');
+        return Number(n);
+    };
     return {
-        readById, readByComputer, readActiveByComputer, readByExportBoot,
+        readById, readByComputer, readActiveByComputer, readByExportBoot, countHostBound,
         /**
          * The computer's holding row, or a new `requested` row. Refuses (`forward_active`) while the
          * forward machine has work for the computer, and (`owner_mismatch`) another owner's row.
