@@ -385,7 +385,7 @@ const computersSrc = read('tabs/computers.js')
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };')
     .replace("import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };')
     .replace("import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;')
-    .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';")
+    .replace("import { TRANSITION_EVENT, MOVE_LIMIT_BYTES } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition', MOVE_LIMIT_BYTES = 536870912;")
     + '\nexport const markSeen = id => seenInFlight.add(id);\n';
 assert.ok(! /^import /m.test(computersSrc), 'every import of computers.js is stubbed (opening-progress-browser-test relies on the same nine lines)');
 const tab = await import(moduleUrl(computersSrc));

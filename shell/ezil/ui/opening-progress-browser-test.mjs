@@ -57,7 +57,7 @@ window.AppSpinner = AppSpinner;`);
         ["import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };'],
         ["import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };'],
         ["import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;'],
-        ["import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';"],
+        ["import { TRANSITION_EVENT, MOVE_LIMIT_BYTES } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition', MOVE_LIMIT_BYTES = 536870912;"],
     ]) + '\n// Test only: what the tab records when it renders a transition in flight.\nexport const markSeenInFlight = id => seenInFlight.add(id);\n';
     const system = stub(await fs.readFile(path.join(settings, 'tabs/system.js'), 'utf8'), [
         ["import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../native-runtime.js';", 'const isNative = () => false, NATIVE_CAPABILITIES = {}, selectRuntimeAdapter = () => null;'],
