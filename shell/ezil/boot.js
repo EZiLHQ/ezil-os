@@ -86,13 +86,13 @@ import registry from './apps/registry.js';
 import { watchBillingSessionEnd } from './ui/Settings/session-end.js';
 import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
-import { parseAppLink } from './app-link.js';
+import { parseAppLink, settingsAliasSearch } from './app-link.js';
+import appHistory, { routeLaunchContext } from './app-history.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
 import { mount_feedback_chip } from './ui/feedback/feedback.js';
 import { applyPersistedAppearance } from './ui/Settings/tabs/appearance.js';
 let nativePersistence = null;
 let billingDeepLinkHandled = false;
-let appLinkListenerBound = false;
 let stopBillingSessionEnd = null;
 
 const PHASE = 'ezil-os:boot';
@@ -841,14 +841,17 @@ async function build (payload) {
     const apps = registry.resolve(payload);
     current_apps = apps;
     current_ctx = ctx;
-    const appLink = parseAppLink(window.location.search, apps);
-    if (!appLinkListenerBound) {
-        appLinkListenerBound = true;
-        window.addEventListener('popstate', () => {
-            const link = parseAppLink(window.location.search, current_apps);
-            if (link) void registry.launch(link.id, { ...registry.launchContext(current_ctx), initialTab: link.initialTab });
-        });
-    }
+    // `/app/<id>` or its `/os?app=<id>` alias. The address bar from here on is
+    // `app-history.js`'s: it binds Back/Forward once, and a rebuild only
+    // refreshes what it reads.
+    const appLink = parseAppLink(window.location, apps);
+    appHistory.install({
+        win: window,
+        payload,
+        getApps: () => current_apps,
+        launch: registry.launch,
+        launchContext: () => registry.launchContext(current_ctx),
+    });
 
     // The taskbar. Built BEFORE the window, so it exists for
     // `exit_fullpage_mode` to un-hide rather than have to re-create, and so
@@ -915,7 +918,9 @@ async function build (payload) {
     }
 
     console.info(`[${PHASE}] desktop + taskbar painted in ${(performance.now() - t0).toFixed(1)}ms`);
-    if (nativeDesktop) nativePersistence = await restoreNativeDesktop(nativeDesktop, ctx, registry.launch, { onlyApp: appLink?.id });
+    // Restoring windows is not a user's click: no history entries for it.
+    if (nativeDesktop) nativePersistence = await restoreNativeDesktop(nativeDesktop, ctx,
+        (id, launchCtx) => registry.launch(id, { ...launchCtx, historyMode: 'none' }), { onlyApp: appLink?.id });
 
     // 🔴 LOGIN OPENS NOTHING (W3). The wallpaper and dock above ARE the boot —
     // nobody asked to watch a machine start. The owner, directly: "The moment
@@ -934,20 +939,35 @@ async function build (payload) {
 
     // A return link is explicit launch intent. Reserve it before awaiting the
     // launcher so a shell rebuild cannot open the same checkout twice.
-    const billingLink = appLink?.id === 'settings' && ! billingDeepLinkHandled && parseBillingDeepLink(window.location.search);
+    // `upgrade-sheet.js` reads the alias spelling (`settings=billing`), so the
+    // path form's `tab` is handed to it under that name.
+    const billingLink = appLink?.id === 'settings' && ! billingDeepLinkHandled
+        && parseBillingDeepLink(settingsAliasSearch(window.location));
     if ( billingLink ) {
         billingDeepLinkHandled = true;
         const { initialTab, openUpgrade, search } = billingLink;
         try {
-            await registry.launch('settings', { ...ctx, initialTab,
+            await registry.launch('settings', { ...ctx, initialTab, historyMode: 'replace',
                 openUpgrade: payload.features?.billing === true ? openUpgrade : false });
         } finally {
-            window.history.replaceState(window.history.state, '', `${window.location.pathname}${search}${window.location.hash}`);
+            // After the launch, not before: Billing reads `section` from the
+            // address bar while it opens. The one-shot `upgrade`/`section`
+            // keys go; `/os?settings=billing` becomes `/app/settings?tab=billing`.
+            appHistory.adopt(appLink, { search });
         }
     }
 
     if (appLink && !billingLink) {
-        await registry.launch(appLink.id, { ...registry.launchContext(ctx), initialTab: appLink.initialTab });
+        // Canonical first, so the window's own first focus finds `/app/<id>`.
+        appHistory.adopt(appLink);
+        await registry.launch(appLink.id, {
+            ...registry.launchContext(ctx),
+            ...routeLaunchContext(appLink, {
+                hasWindow: document.querySelector(`.window[data-app="${appLink.id}"]:not([data-closing="1"])`) !== null,
+                recordedView: appHistory.recordedView(appLink.id),
+            }),
+            historyMode: 'replace',
+        });
     }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire

@@ -70,6 +70,7 @@ import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/
 import telemetry from '../telemetry.js';
 import { beginTrace } from '../trace.js';
 import log from '../log.js';
+import appHistory from '../app-history.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -364,7 +365,7 @@ export const APPS = [
             // The store window outlives a Settings Switch (it is not a sandbox
             // window), so resolve the computer at click time, not open time
             // (`launchContext`, below).
-            launchApp: id => launch(id, launchContext(ctx)),
+            launchApp: id => launch(id, gestureContext(launchContext(ctx))),
         }),
     },
     {
@@ -452,8 +453,20 @@ export function settingsDrawerAction (ctx = {}) {
         id: 'settings',
         label: 'Settings',
         svg: SETTINGS_DRAWER_SVG,
-        onClick: () => { void launch('settings', ctx); },
+        onClick: () => { void launch('settings', gestureContext(ctx)); },
     };
+}
+
+/**
+ * `ctx` for a launch a user's click starts, from the ctx of the window the
+ * click lives in. That window may have been opened by a ROUTE (the boot's
+ * link, Back/Forward), and its routing keys must not ride along: a carried
+ * `historyMode: 'replace'` would stop this click from adding its history
+ * entry, and Code's `view`/`project` mean nothing to another app.
+ */
+function gestureContext (ctx = {}) {
+    const { historyMode: _mode, view: _view, project: _project, initialTab: _tab, ...rest } = ctx;
+    return rest;
 }
 
 /** @param {string} id @returns {AppDescriptor|undefined} */
@@ -616,18 +629,56 @@ function ensureOnTop (el_window) {
     setTimeout(assertTop, 120);
 }
 
+/**
+ * Contract item 4 (docs/APP-ROUTES.md): an existing single-instance window
+ * hears about every relaunch, with the SAME ctx object, so it can apply what
+ * the launch asked for (Code: `ctx.view`). A hook that throws must not turn a
+ * focus into a failed launch.
+ */
+function relaunched (el_window, ctx) {
+    try {
+        el_window?._ezil_relaunch?.(ctx);
+    } catch ( err ) {
+        console.warn(`[${PHASE}] _ezil_relaunch threw`, err);
+    }
+}
+
 // Coalesce overlapping opens before UIWindow has appended the first window.
 const opening = new Map();
-export async function launch (id, ctx = {}) {
+async function launchSingle (id, ctx) {
     if (!getApp(id)?.single_instance) return launchOnce(id, ctx);
     if (opening.has(id)) {
         const el = await opening.get(id);
         if (id === 'settings') el?.ezilActivateSettings?.(ctx.initialTab);
+        relaunched(el, ctx);
         return el;
     }
     const pending = launchOnce(id, ctx);
     opening.set(id, pending);
     try { return await pending; } finally { opening.delete(id); }
+}
+
+/**
+ * @param {string} id
+ * @param {object} [ctx] Passed to the app's `open` (or, for a window that is
+ *   already open, to its `_ezil_relaunch`). Routing keys, all optional:
+ *   `initialTab` (Settings), `view` ('full'|'window', Code), `project`
+ *   (Code's parsed link, see `../app-link.js`), and `historyMode`:
+ *   `'push'` (the default — a user's click), `'replace'` (a route: the boot's
+ *   link, Back/Forward) or `'none'`. See `../app-history.js`.
+ */
+export async function launch (id, ctx = {}) {
+    // Held while the window is created: it focuses itself on the way, and
+    // that focus must not overwrite the entry this push is about to follow.
+    const release = (ctx.historyMode ?? 'push') === 'push' ? appHistory.hold() : null;
+    let el = null;
+    try {
+        el = await launchSingle(id, ctx);
+    } finally {
+        release?.();
+    }
+    if ( el ) appHistory.commit(id, ctx);
+    return el;
 }
 
 async function launchOnce (id, ctx = {}) {
@@ -662,13 +713,14 @@ async function launchOnce (id, ctx = {}) {
             $existing.showWindow();
             const el_existing = $existing.get(0);
             if (id === 'settings') el_existing?.ezilActivateSettings?.(ctx.initialTab);
+            relaunched(el_existing, ctx);
             // Belt and braces: the first open already did this, but a window
             // that somehow lost its button (a re-attached drawer, a rebuild)
             // must not stay without one. Idempotent — see drawer-action.js.
             if ( app.wants_settings_in_drawer && el_existing ) {
                 ensureSettingsDrawerButton(
                     el_existing,
-                    () => { void launch('settings', ctx); },
+                    () => { void launch('settings', gestureContext(ctx)); },
                     { expected: true },
                 );
             }
@@ -775,7 +827,7 @@ async function launchOnce (id, ctx = {}) {
         if ( app.wants_settings_in_drawer && el_window ) {
             ensureSettingsDrawerButton(
                 el_window,
-                () => { void launch('settings', ctx); },
+                () => { void launch('settings', gestureContext(ctx)); },
                 { expected: true },
             );
             trace.step('drawer_ready');
