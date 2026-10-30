@@ -18,7 +18,10 @@ import {
     billingUsageIntervals,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
-import { ImageJobConflictError, PlacementIntegrityError, readPlacement, readPlacementProvider, type PlacementExecutor } from '@/server/lib/compute/placement';
+import {
+    ImageJobConflictError, noNonCloudflarePlacement, PlacementIntegrityError, readLastUsageStop, readPlacement, readPlacementProvider,
+    type PlacementExecutor,
+} from '@/server/lib/compute/placement';
 import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
@@ -635,31 +638,49 @@ export function createBillingStore(db: Database): BillingStore {
     return store;
 }
 
+/** Round 6 R1-01: one held-bound candidate (store.ts `runningAwsComputersAfterEpochs`). */
+export interface HeldCandidate {
+    userId: string;
+    computerId: string;
+    /** RUNNING (stoppable), or UNCONFIRMED (a failed stop or boot: reported, never stopped from here). */
+    state: 'RUNNING' | 'UNCONFIRMED';
+    /** The placement row's last write: never before it entered `state`, but a lease renewal moves it later. */
+    since: Date;
+    /** When the computer's newest compute epoch closed. */
+    closedAt: Date;
+    /** Its host stopped after that close (a usage row closed since): what runs now is a later open with no epoch. */
+    stoppedSinceClose: boolean;
+}
+
 /**
- * Round 6 R1-01: the billing sweep's held-bound input. The computers whose newest compute epoch (open, or closed
- * since `since`) is an AWS size and closed, newest close first, read through the placement module (the one reader
- * of the placement tables, C-2): those RUNNING with no lifecycle, migration or image job in flight, with the row's
- * last write (never before it went RUNNING). An open epoch is the policy pass's; a re-open whose epoch failed to
- * open still has its last session's. No placement table (a billing-only database) reads as none.
+ * Round 6 R1-01: one page of the billing sweep's held-bound input, `after` a cursor from the previous page (null =
+ * the first). The computers with an aws-ec2 placement (placement.ts `noNonCloudflarePlacement`, applied before the
+ * LIMIT: a Cloudflare computer never fills a page) whose newest compute epoch is closed, newest close first, at any
+ * age; each read through the placement module (the one reader of the placement tables, C-2). Kept: RUNNING with no
+ * lifecycle, migration or image job in flight, and UNCONFIRMED; same owner. An open epoch is the policy pass's; a
+ * re-open whose epoch failed to open still has its last session's. A computer that never had an epoch is not seen:
+ * that needs a placement-side lister (placement.ts). Needs the placement table: the caller gates on placement reads.
  */
-export async function runningAwsComputersAfterEpochs(db: Database, since: Date, limit: number):
-    Promise<{ userId: string; computerId: string; since: Date }[]> {
+export async function runningAwsComputersAfterEpochs(db: Database, after: string | null, limit: number):
+    Promise<{ candidates: HeldCandidate[]; next: string | null }> {
     const bounded = Math.max(0, Math.min(200, Math.floor(limit)));
-    if (bounded === 0) return [];
+    if (bounded === 0) return { candidates: [], next: null };
     const placements = db as unknown as PlacementExecutor;
-    const result = await db.execute(sql`/* billing:held-candidates */ SELECT computer_id::text AS computer_id, user_id::text AS user_id
-        FROM (SELECT DISTINCT ON (computer_id) computer_id, user_id, size, ended_at
+    // The cursor is the last row's (ended_at as Postgres text, computer_id): exact, whatever the stored precision.
+    const cursor = after === null ? null : /^(.+)\|([0-9a-f-]{36})$/.exec(after);
+    if (after !== null && !cursor) throw new Error('held cursor invalid');
+    const result = await db.execute(sql`/* billing:held-candidates */ SELECT computer_id::text AS computer_id, user_id::text AS user_id,
+            extract(epoch FROM ended_at)::text AS ended_epoch, ended_at::text AS ended_key
+        FROM (SELECT DISTINCT ON (computer_id) computer_id, user_id, ended_at
             FROM ${billingComputeEpochs}
-            WHERE ended_at IS NULL OR ended_at >= ${since.toISOString()}::timestamptz
             ORDER BY computer_id, ready_at DESC, id DESC) newest
-        WHERE size <> 'free-cf' AND ended_at IS NOT NULL
-        ORDER BY ended_at DESC, computer_id
+        WHERE ended_at IS NOT NULL AND NOT ${noNonCloudflarePlacement(sql`newest.computer_id`)}
+            ${cursor ? sql`AND (ended_at, computer_id) < (${cursor[1]}::timestamptz, ${cursor[2]}::uuid)` : sql``}
+        ORDER BY ended_at DESC, computer_id DESC
         LIMIT ${bounded}`);
     const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Record<string, unknown>[];
-    const running: { userId: string; computerId: string; since: Date }[] = [];
+    const candidates: HeldCandidate[] = [];
     for (const row of rows) {
-        // A paid Cloudflare computer also rates std-2: only an aws-ec2 row (and only where the table exists) is read.
-        if (await readPlacementProvider(placements, String(row.computer_id)) !== 'aws-ec2') continue;
         let record;
         try {
             ({ record } = await readPlacement(placements, String(row.computer_id)));
@@ -668,9 +689,16 @@ export async function runningAwsComputersAfterEpochs(db: Database, since: Date, 
             if (error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError) continue;
             throw error;
         }
-        if (!record || record.provider !== 'aws-ec2' || record.state !== 'RUNNING' || record.lifecycleJobId !== null
-            || record.lastError?.startsWith('migration_pending:') || record.ownerUserId !== String(row.user_id).toLowerCase()) continue;
-        running.push({ userId: record.ownerUserId, computerId: record.computerId, since: record.updatedAt });
+        if (!record || record.provider !== 'aws-ec2' || record.lastError?.startsWith('migration_pending:')
+            || record.ownerUserId !== String(row.user_id).toLowerCase()) continue;
+        const running = record.state === 'RUNNING' && record.lifecycleJobId === null;
+        if (!running && record.state !== 'UNCONFIRMED') continue;
+        const closedAt = new Date(Math.round(Number(row.ended_epoch) * 1000));
+        // A usage row closes only when its host stops (or is replaced); a lease renewal never moves it.
+        const lastStop = running ? await readLastUsageStop(placements, record.computerId, record.ownerUserId) : null;
+        candidates.push({ userId: record.ownerUserId, computerId: record.computerId, state: running ? 'RUNNING' : 'UNCONFIRMED',
+            since: record.updatedAt, closedAt, stoppedSinceClose: lastStop !== null && lastStop.getTime() >= closedAt.getTime() });
     }
-    return running;
+    const last = rows.at(-1);
+    return { candidates, next: rows.length === bounded && last ? `${String(last.ended_key)}|${String(last.computer_id)}` : null };
 }

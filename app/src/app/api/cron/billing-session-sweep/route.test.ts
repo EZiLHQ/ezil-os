@@ -5,7 +5,8 @@ import { readBillingConfig } from '@/server/billing/config';
 import type { BillingDeps, BillingStore } from '@/server/billing/ports';
 import { db } from '@/server/db';
 import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
-import { readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
+import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { handleBillingSessionSweep } from './handler';
 import { GET, maxDuration } from './route';
@@ -15,14 +16,17 @@ vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ routeComputer: vi.fn() }));
-vi.mock('@/server/lib/compute/placement', () => ({ readPlacement: vi.fn() }));
+vi.mock('@/server/lib/compute/placement', () => ({ readPlacement: vi.fn(), readLastUsageStop: vi.fn() }));
+vi.mock('@/server/lib/compute/aws-config', () => ({ isPlacementReadEnabled: vi.fn() }));
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: vi.fn() }));
 vi.mock('@/server/billing/store', () => ({ runningAwsComputersAfterEpochs: vi.fn() }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation' }));
-vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000, HELD_LOOKBACK_MS: 7 * 86_400_000 }));
+vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000 }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
+/** The policy close a retry is for. */
+const closedAt = new Date(now.getTime() - 3_600_000);
 const counts = { examined: 2, stopped: 1, closed: 2, stopFailed: 0, heartbeatClosed: 1, retried: 0, shadow: 0 };
 const deps: BillingDeps = { config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
     store: {} as BillingStore, stripe: null, usage: null, now: () => now };
@@ -35,6 +39,8 @@ beforeEach(() => {
     mockEnv.CRON_SECRET = 'cron';
     vi.mocked(getBillingDeps).mockReturnValue(deps);
     vi.mocked(handleBillingSessionSweep).mockResolvedValue(counts);
+    vi.mocked(isPlacementReadEnabled).mockReturnValue(true);
+    vi.mocked(readLastUsageStop).mockResolvedValue(null);
 });
 
 async function wiring() {
@@ -65,6 +71,12 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now, stop: expect.any(Function),
             isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function) });
         expect(maxDuration).toBe(300);
+    });
+
+    it('wires no held bound where placement reads are off (no placement table to read, as sandbox-reap)', async () => {
+        vi.mocked(isPlacementReadEnabled).mockReturnValue(false);
+        expect(await wiring()).not.toHaveProperty('runningAwsPlacements');
+        expect(isPlacementReadEnabled).toHaveBeenCalledWith(process.env);
     });
 
     // Round 3 (D9): stale AWS epochs close only on placement PROOF, never on a read error.
@@ -115,7 +127,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
             ownerUserId: computer.userId, provider: 'aws-ec2', state, updatedAt: new Date(now.getTime() - 600_000),
         } } as ResolvedPlacement);
         const input = await wiring();
-        expect(await input.isStillRunning(computer)).toBe(state === 'RUNNING');
+        expect(await input.isStillRunning(computer, closedAt)).toBe(state === 'RUNNING');
         expect(routeComputer).toHaveBeenCalledExactlyOnceWith(db, computer);
         expect(readPlacement).toHaveBeenCalledExactlyOnceWith(db, computer.computerId);
         expect(status).not.toHaveBeenCalled();
@@ -126,14 +138,41 @@ describe('GET /api/cron/billing-session-sweep', () => {
         vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record: {
             ownerUserId: computer.userId, provider: 'aws-ec2', state: 'RUNNING', updatedAt: new Date(now.getTime() - age),
         } } as ResolvedPlacement);
-        expect(await (await wiring()).isStillRunning(computer)).toBe(expected);
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(expected);
     });
 
-    it('lists running AWS computers for the held bound from the last 7 days of AWS sessions', async () => {
-        const rows = [{ ...computer, since: now }];
-        vi.mocked(runningAwsComputersAfterEpochs).mockResolvedValue(rows);
-        expect(await (await wiring()).runningAwsPlacements!(7)).toBe(rows);
-        expect(runningAwsComputersAfterEpochs).toHaveBeenCalledExactlyOnceWith(db, new Date(now.getTime() - 7 * 86_400_000), 7);
+    // Round 6 review: a host whose usage row closed after the policy close stopped then; RUNNING now is a later open
+    // (a paid one whose epoch failed to open, or a held one: the held bound's), never the session that close was for.
+    // A lease renewal moves updated_at but never the usage stop, so a still-running cut host is retried.
+    it.each([
+        ['never stopped', null, true],
+        ['stopped before the close', new Date(closedAt.getTime() - 1), true],
+        ['stopped at the close', closedAt, false],
+        ['stopped after the close', new Date(closedAt.getTime() + 60_000), false],
+    ])('CR-4: a RUNNING host whose last usage stop is %s is retried: %s', async (_, stoppedAt, expected) => {
+        vi.mocked(routeComputer).mockResolvedValue({ kind: 'aws-ec2', provider: {}, instanceType: null } as RoutedComputer);
+        vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record: {
+            ownerUserId: computer.userId, provider: 'aws-ec2', state: 'RUNNING', updatedAt: new Date(now.getTime() - 600_000),
+        } } as ResolvedPlacement);
+        vi.mocked(readLastUsageStop).mockResolvedValue(stoppedAt);
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(expected);
+        expect(readLastUsageStop).toHaveBeenCalledExactlyOnceWith(db, computer.computerId, computer.userId);
+    });
+
+    it('a usage read error is not running (no blind retry)', async () => {
+        vi.mocked(routeComputer).mockResolvedValue({ kind: 'aws-ec2', provider: {}, instanceType: null } as RoutedComputer);
+        vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record: {
+            ownerUserId: computer.userId, provider: 'aws-ec2', state: 'RUNNING', updatedAt: new Date(now.getTime() - 600_000),
+        } } as ResolvedPlacement);
+        vi.mocked(readLastUsageStop).mockRejectedValue(new Error('usage unavailable'));
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(false);
+    });
+
+    it('pages the held bound\'s candidates through the store, at any age', async () => {
+        const page = { candidates: [], next: 'cursor' };
+        vi.mocked(runningAwsComputersAfterEpochs).mockResolvedValue(page);
+        expect(await (await wiring()).runningAwsPlacements!('previous', 7)).toBe(page);
+        expect(runningAwsComputersAfterEpochs).toHaveBeenCalledExactlyOnceWith(db, 'previous', 7);
     });
 
     it('does not retry if the placement owner no longer matches the epoch', async () => {
@@ -141,7 +180,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
         vi.mocked(readPlacement).mockResolvedValue({ provider: 'aws-ec2', record: {
             ownerUserId: 'another-owner', provider: 'aws-ec2', state: 'RUNNING', updatedAt: new Date(now.getTime() - 600_000),
         } } as ResolvedPlacement);
-        expect(await (await wiring()).isStillRunning(computer)).toBe(false);
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(false);
     });
 
     it.each([
@@ -151,7 +190,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
     ])('Cloudflare retry trusts a successful running status (%j)', async ({ expected, ...answer }) => {
         const status = vi.fn().mockResolvedValue(answer);
         vi.mocked(routeComputer).mockResolvedValue({ kind: 'cloudflare', provider: { status } } as unknown as RoutedComputer);
-        expect(await (await wiring()).isStillRunning(computer)).toBe(expected);
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(expected);
         expect(status).toHaveBeenCalledExactlyOnceWith({ correlationId: 'correlation' }, computer);
         expect(readPlacement).not.toHaveBeenCalled();
     });
@@ -164,6 +203,6 @@ describe('GET /api/cron/billing-session-sweep', () => {
             vi.mocked(readPlacement).mockRejectedValue(fail);
         } else vi.mocked(routeComputer).mockResolvedValue({ kind: 'cloudflare',
             provider: { status: vi.fn().mockRejectedValue(fail) } } as unknown as RoutedComputer);
-        expect(await (await wiring()).isStillRunning(computer)).toBe(false);
+        expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(false);
     });
 });

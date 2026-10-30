@@ -125,6 +125,9 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('round 6 hold sessions w
         const stop = vi.fn(async () => ({ kind: 'aws-ec2' as const, result: { ok: true, terminated: false } }));
         return { stop, run: handleBillingSessionSweep({ deps, now: at, stop, isStillRunning: async () => false }) };
     };
+    /** This test's stops only: the sweep reads the whole table, and suites running in parallel commit open epochs too. */
+    const stopsOfMine = (stop: ReturnType<typeof sweep>['stop']) => (stop.mock.calls as unknown as [{ computerId: string }, string][])
+        .filter(([computer]) => computer.computerId === computerId);
     const row = async () => {
         const [r] = await client`select ready_at, deadline_at, ended_at, end_reason from ezil_billing_compute_epochs where computer_id = ${computerId}::uuid`;
         const at = (v: unknown) => v === null ? null : new Date(v as string);
@@ -140,10 +143,12 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('round 6 hold sessions w
         // The stored values are unchanged by the fix (live 217b9546 shows the same 3599).
         expect(epochSeconds(opened.deadlineAt) - epochSeconds(opened.readyAt)).toBe(3599);
         const early = sweep(new Date('2026-10-28T13:04:59Z'));
-        expect(await early.run).toMatchObject({ examined: 1, closed: 0 });
+        await early.run;
+        expect(stopsOfMine(early.stop)).toEqual([]);
+        expect(await row()).toMatchObject({ endedAt: null, endReason: null });
         const due = sweep(new Date('2026-10-28T13:05:00Z'));
-        expect(await due.run).toMatchObject({ examined: 1, closed: 1, stopped: 1 });
-        expect(due.stop).toHaveBeenCalledExactlyOnceWith({ userId, computerId }, 'session_max');
+        await due.run;
+        expect(stopsOfMine(due.stop)).toEqual([[{ userId, computerId }, 'session_max']]);
         expect(await row()).toMatchObject({ endReason: 'session_max', endedAt: new Date('2026-10-28T13:05:00Z') });
     });
 
@@ -158,7 +163,8 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('round 6 hold sessions w
         await client`update ezil_billing_subscriptions set status = 'canceled' where stripe_subscription_id = ${subscriptionId}`;
         const later = new Date(READY.getTime() + 18 * 3600_000);
         const swept = sweep(later);
-        expect(await swept.run).toMatchObject({ closed: 1, stopped: 1 });
+        await swept.run;
+        expect(stopsOfMine(swept.stop)).toEqual([[{ userId, computerId }, 'session_max']]);
         expect(await row()).toMatchObject({ endReason: 'session_max', endedAt: later });
     });
 

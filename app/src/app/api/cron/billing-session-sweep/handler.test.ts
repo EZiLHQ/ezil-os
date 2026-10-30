@@ -5,7 +5,7 @@ import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { handleBillingSessionSweep, HELD_LOOKBACK_MS, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, HELD_BUDGET_MS, HELD_PAGE_SIZE, HELD_PAGES, RUNNING_GRACE_MS } from './handler';
 import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
@@ -285,7 +285,8 @@ describe('billing session sweep', () => {
         f.isStillRunning.mockResolvedValue(true);
         await f.run(0);
         expect(f.stop).toHaveBeenCalledExactlyOnceWith({ userId: ref.userId, computerId: 'recent' }, 'overage_cap');
-        expect(f.isStillRunning).toHaveBeenCalledTimes(1);
+        // Round 6: with the close it retries, so a host that stopped after it (a later open) is never taken for it.
+        expect(f.isStillRunning).toHaveBeenCalledExactlyOnceWith({ userId: ref.userId, computerId: 'recent' }, at(-7200));
     });
 
     it('passes the batch limit to both scans and honors it', async () => {
@@ -490,33 +491,45 @@ describe('paid sessions have no time cap', () => {
 describe('round 6 R1-01: a held host is bounded by its session alone', () => {
     const canceled = [{ stripeSubscriptionId: 'sub', sku: 'standard_monthly_v3', status: 'canceled',
         currentPeriodStart: new Date(window.start), currentPeriodEnd: new Date(window.end), cancelAtPeriodEnd: false }];
-    /** A Free (held) owner unless `paid`; `since` is the placement row's last write, in seconds from T. */
-    function held(epochs: StoredComputeEpoch[], { paid = false, enforcement = true, since = -600 } = {}) {
+    type Candidate = Awaited<ReturnType<NonNullable<SweepInput['runningAwsPlacements']>>>['candidates'][number];
+    /**
+     * A held candidate: `since` is the placement row's last write and `closedAt` its newest session's close (seconds
+     * from T); `stoppedSinceClose` that its host stopped after that close (a later open now runs with no epoch).
+     */
+    const candidate = (over: { since?: number; closedAt?: number; stoppedSinceClose?: boolean; state?: Candidate['state']; computerId?: string } = {}): Candidate => ({
+        ...ref, state: over.state ?? 'RUNNING', since: at(over.since ?? -600), closedAt: at(over.closedAt ?? -86_400),
+        stoppedSinceClose: over.stoppedSinceClose ?? true, ...(over.computerId ? { computerId: over.computerId } : {}),
+    });
+    /** A Free (held) owner unless `paid`, whose placement read answers `pages` (one page by default). */
+    function held(epochs: StoredComputeEpoch[], { paid = false, enforcement = true, pages = [[candidate()]] as Candidate[][] } = {}) {
         const f = fixture(epochs, { sku: paid ? 'standard_monthly_v3' : null, allowance: 144000, enforcement });
         if (!paid) f.store.subscriptionsFor.mockResolvedValue(canceled);
-        const runningAwsPlacements = vi.fn<NonNullable<SweepInput['runningAwsPlacements']>>().mockResolvedValue([{ ...ref, since: at(since) }]);
+        const runningAwsPlacements = vi.fn<NonNullable<SweepInput['runningAwsPlacements']>>(async after => {
+            const index = after === null ? 0 : Number(after);
+            return { candidates: pages[index] ?? [], next: index + 1 < pages.length ? String(index + 1) : null };
+        });
         const run = (seconds: number) => handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop,
             isStillRunning: f.isStillRunning, runningAwsPlacements });
         return { ...f, runningAwsPlacements, run };
     }
-    const overrunLines = () => vi.mocked(console.info).mock.calls.map(call => String(call[0])).filter(line => line.startsWith('{"event":"held-overrun"'))
-        .map(line => JSON.parse(line));
+    const lines = (event: string) => [...vi.mocked(console.info).mock.calls, ...vi.mocked(console.warn).mock.calls]
+        .map(call => String(call[0])).filter(line => line.startsWith(`{"event":"${event}"`)).map(line => JSON.parse(line));
 
-    it('the grace is two minutes and the lookback seven days (route.test pins the same values)', () => {
+    it('the grace is two minutes (route.test pins the same), and a pass reads 10 pages of 100 within 10 s', () => {
         expect(RUNNING_GRACE_MS).toBe(120_000);
-        expect(HELD_LOOKBACK_MS).toBe(7 * 86_400_000);
+        expect([HELD_PAGE_SIZE, HELD_PAGES, HELD_BUDGET_MS]).toEqual([100, 10, 10_000]);
     });
 
-    it('stops a held RUNNING host whose session never opened, once the grace has passed', async () => {
+    it('stops a held RUNNING host whose later open never opened a session, once the grace has passed', async () => {
         const f = held([]);
         expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
-        expect(f.runningAwsPlacements).toHaveBeenCalledExactlyOnceWith(200);
+        expect(f.runningAwsPlacements).toHaveBeenCalledExactlyOnceWith(null, 100);
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(overrunLines()).toEqual([{ event: 'held-overrun', computer: 'computer', session: 'none', enforced: true, overSeconds: 600 }]);
+        expect(lines('held-overrun')).toEqual([{ event: 'held-overrun', computer: 'computer', session: 'none', enforced: true, overSeconds: 600 }]);
     });
 
     it.each([0, 60, 119])('leaves a held host alone %i s after its row changed (an epoch may be opening now)', async age => {
-        const f = held([], { since: -age });
+        const f = held([], { pages: [[candidate({ since: -age })]] });
         expect(await f.run(0)).toEqual(zeros);
         expect(f.store.openEpochFor).not.toHaveBeenCalled();
         expect(f.stop).not.toHaveBeenCalled();
@@ -530,22 +543,30 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
 
     it('keeps stopping a held host past the 2 h retry window while it still runs', async () => {
         const f = held([epoch({ readyAt: iso(-4 * 3600), endedAt: iso(-3 * 3600), endReason: 'session_max', deadlineAt: iso(-3 * 3600) })],
-            { since: -4 * 3600 });
+            { pages: [[candidate({ since: -4 * 3600, closedAt: -3 * 3600, stoppedSinceClose: false })]] });
         f.isStillRunning.mockResolvedValue(true);
         expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
         expect(f.store.policyClosedEpochsSince).toHaveBeenCalledExactlyOnceWith(at(-7200), 50);
         expect(f.isStillRunning).not.toHaveBeenCalled(); // outside the retry window: only the held bound acts
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(overrunLines()).toEqual([expect.objectContaining({ session: 'closed', overSeconds: 3 * 3600 })]);
+        expect(lines('held-overrun')).toEqual([expect.objectContaining({ session: 'closed', overSeconds: 3 * 3600 })]);
+    });
+
+    // Review: a lease renewal moves the row's updated_at past the close; the line must still say how long since the cut.
+    it('measures a never-stopped session from its close, not from a later lease renewal of the row', async () => {
+        const f = held([], { pages: [[candidate({ since: -600, closedAt: -2 * 3600 - 1800, stoppedSinceClose: false })]] });
+        await f.run(0);
+        expect(lines('held-overrun')).toEqual([expect.objectContaining({ session: 'closed', overSeconds: 9000 })]);
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
     });
 
     it('a paid host keeps the 2 h window: no stop past it, and no lapsed-lease stop', async () => {
         const f = held([epoch({ readyAt: iso(-4 * 3600), endedAt: iso(-3 * 3600), endReason: 'allowance_exhausted' })],
-            { paid: true, since: -4 * 3600 });
+            { paid: true, pages: [[candidate({ since: -4 * 3600, closedAt: -3 * 3600, stoppedSinceClose: false })]] });
         f.isStillRunning.mockResolvedValue(true);
         expect(await f.run(0)).toEqual(zeros);
         expect(f.stop).not.toHaveBeenCalled();
-        expect(overrunLines()).toEqual([]);
+        expect(lines('held-overrun')).toEqual([]);
     });
 
     it('a paid host with no open session is not the held bound\'s to stop', async () => {
@@ -555,9 +576,11 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
     });
 
     it('stops a computer once per pass: a retry inside the window already attempted it', async () => {
-        const f = held([epoch({ readyAt: iso(-3600), endedAt: iso(-60), endReason: 'session_max', deadlineAt: iso(-60) })], { since: -3600 });
+        const f = held([epoch({ readyAt: iso(-3600), endedAt: iso(-60), endReason: 'session_max', deadlineAt: iso(-60) })],
+            { pages: [[candidate({ since: -3600, closedAt: -60, stoppedSinceClose: false })]] });
         f.isStillRunning.mockResolvedValue(true);
         expect(await f.run(0)).toEqual({ ...zeros, retried: 1, stopped: 1 });
+        expect(f.isStillRunning).toHaveBeenCalledExactlyOnceWith(ref, at(-60));
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
     });
 
@@ -565,15 +588,58 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
         const f = held([], { enforcement: false });
         expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, shadow: 1 });
         expect(f.stop).not.toHaveBeenCalled();
-        expect(overrunLines()).toEqual([expect.objectContaining({ enforced: false, session: 'none' })]);
+        expect(lines('held-overrun')).toEqual([expect.objectContaining({ enforced: false, session: 'none' })]);
     });
 
-    it('a failed stop is counted and retried on the next pass', async () => {
+    // Only a stop that leaves the row RUNNING (a lost CAS, a config failure) can be retried from here; a refused or
+    // failed Step Functions stop leaves it UNCONFIRMED (next test).
+    it('a stop that throws and leaves the row RUNNING is counted and retried on the next pass', async () => {
         const f = held([]);
         f.stop.mockRejectedValueOnce(new Error('stop unavailable'));
         expect(await f.run(0)).toMatchObject({ heldOverrun: 1, stopFailed: 1 });
         expect(await f.run(60)).toMatchObject({ heldOverrun: 1, stopped: 1 });
         expect(f.stop).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports a held UNCONFIRMED row (a refused or failed stop) every pass, and never stops it from here', async () => {
+        const f = held([], { pages: [[candidate({ state: 'UNCONFIRMED', since: -3600, closedAt: -4000 })]] });
+        expect(await f.run(0)).toEqual(zeros);
+        expect(await f.run(60)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(lines('held-unconfirmed')).toEqual([
+            { event: 'held-unconfirmed', computer: 'computer', closedSeconds: 4000 },
+            { event: 'held-unconfirmed', computer: 'computer', closedSeconds: 4060 },
+        ]);
+        const paid = held([], { paid: true, pages: [[candidate({ state: 'UNCONFIRMED' })]] });
+        await paid.run(0);
+        expect(lines('held-unconfirmed')).toHaveLength(2); // a paid row is not held: nothing new
+    });
+
+    it('reads every page until the last, so a held host behind other closes is still found', async () => {
+        // Newer closes of paid computers fill the first pages; the held host's own session closed 9 days ago.
+        const paidPage = (page: number) => Array.from({ length: 3 }, (_, i) =>
+            ({ ...candidate({ computerId: `paid-${page}-${i}`, stoppedSinceClose: false }), userId: 'paid' }));
+        const f = held([], { pages: [paidPage(0), paidPage(1), [candidate({ closedAt: -9 * 86_400 })]] });
+        f.store.subscriptionsFor.mockImplementation(async userId => userId === ref.userId ? canceled : [{ stripeSubscriptionId: 'sub',
+            sku: 'standard_monthly_v3', status: 'active', currentPeriodStart: new Date(window.start), currentPeriodEnd: new Date(window.end), cancelAtPeriodEnd: false }]);
+        await f.run(0);
+        expect(f.runningAwsPlacements.mock.calls).toEqual([[null, 100], ['1', 100], ['2', 100]]);
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it('stops reading after HELD_PAGES pages, and when its own time budget is spent', async () => {
+        const pages = Array.from({ length: 12 }, () => [] as Candidate[]);
+        const f = held([], { pages });
+        await f.run(0);
+        expect(f.runningAwsPlacements).toHaveBeenCalledTimes(10);
+        const clock = vi.spyOn(Date, 'now');
+        let t = 0;
+        clock.mockImplementation(() => (t += 4_000));
+        f.runningAwsPlacements.mockClear();
+        await f.run(60);
+        // Each clock read is 4 s later: the pass starts at s, reads at s + 4 and s + 8, and stops at s + 12 (≥ 10 s).
+        expect(f.runningAwsPlacements).toHaveBeenCalledTimes(2);
+        expect(console.warn).toHaveBeenCalledWith('[billing.sweep] held pass out of time', expect.objectContaining({ page: expect.any(Number) }));
     });
 
     it('an unreadable placement list or billing state skips the held pass, never the rest of the sweep', async () => {
