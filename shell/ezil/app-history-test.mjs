@@ -342,6 +342,20 @@ for (const fail of [false, true]) {
     focus(code);
     same([url(), w.history.length], ['/app/code', 3], 'the latest launch\'s late focus still names it');
 }
+for (const order of ['older first', 'newer first']) {
+    // Two clicks on Code that resolve with the same (single-instance)
+    // window, in either order: it is the newer launch's.
+    const { w, controller, open, focus, url } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    const older = controller.begin('code');
+    const newer = controller.begin('code');
+    const code = open('code', 10);
+    for (const launch of order === 'older first' ? [older, newer] : [newer, older]) launch.end(code);
+    same(controller.superseded(code), false, `${order}: not superseded`);
+    focus(settings); focus(code);
+    same([url(), w.history.length], ['/app/code', 3], `${order}: its late focus still names it`);
+}
 for (const order of ['older first', 'newer first']) for (const olderOpened of [true, false]) {
     // Close, then reopen, while the first launch is still pending.
     const { w, controller, open, close, url } = harness('/os');

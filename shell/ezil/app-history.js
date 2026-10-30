@@ -147,8 +147,10 @@ export function createAppHistory () {
     // `settled`. Until then its focus events are the launch's own (UIWindow's
     // 80ms `showWindow` focus, registry's 120ms `ensureOnTop` re-focus), and
     // they count only while that launch is the latest one.
+    // Two launches can resolve with the same single-instance window, in
+    // either order: it keeps the newer one's number.
     const settling = new WeakMap();
-    const settle = (el, gen) => { if ( el && typeof el === 'object' ) settling.set(el, gen); };
+    const settle = (el, gen) => { if ( el && typeof el === 'object' && ! (settling.get(el) > gen) ) settling.set(el, gen); };
     const superseded = el => settling.has(el) && settling.get(el) !== launchGeneration;
 
     const win = () => deps.win;
