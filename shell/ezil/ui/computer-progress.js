@@ -77,7 +77,8 @@ const time = value => { const at = typeof value === 'string' ? Date.parse(value)
 export const MOVE_BUDGET_SECONDS = 13200;
 /**
  * §6.2: the most a move copies (the export cap, lane A's `EXPORT_MAX_BYTES`, which reads this line), in bytes. Shown
- * only in the shell's MB unit (÷ 1,000,000, no decimals): "537 MB". 🔴 Keep it a plain literal.
+ * only in the shell's MB unit (÷ 1,000,000, no decimals), always derived from here: no copy carries the number as a
+ * literal. 🔴 Keep it a plain literal.
  */
 export const MOVE_LIMIT_BYTES = 536870912;
 /** §5.10 phases → the §6.1 step (the same step map the Computer tab's card uses). */
@@ -123,6 +124,103 @@ export function moveAskOf (data, computerId) {
     if (move.outcome === 'committed') return 'ask';
     if (move.outcome !== null) return 'stop';
     return data.operation === 'moving' && data.stage === 'moving' ? 'ask' : 'wait';
+}
+
+/** "120 MB of 2.4 GB copied": the Computer tab card's units (`moveView`), never the opening's `formatBytes`. */
+export function moveBytesText (done, total) {
+    if (!Number.isFinite(done) || done < 0 || !Number.isFinite(total) || total <= 0) return '';
+    return `${(done / 1e6).toLocaleString('en-US', { maximumFractionDigits: 0 })} MB of ${(total / 1e9).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB copied`;
+}
+
+/** §6.3/§6.4: the Workspace folder is over the cap (`workspace_too_large`). `holdOpenable: false`: the Free hold can't open it. */
+export function moveTooLargeText (holdOpenable) {
+    return `Your Workspace folder is larger than a Free computer can hold (${formatBytes(MOVE_LIMIT_BYTES)}), so your files stay on your AWS computer. Nothing was deleted. ${
+        holdOpenable === false ? 'Upgrade to use them again.' : 'Remove some files on your AWS computer and try again, or upgrade to keep using them.'}`;
+}
+
+/**
+ * §6.4 the open overlay's words for a move (status line, one sentence). No countdown, no speed or duration claims,
+ * no city or region names. The Computer tab's card (§6.3) words its steps for a card; these are the overlay's.
+ */
+export const MOVE_COPY = {
+    moving: 'Moving your files to your Free computer',
+    steps: ['Step 1 of 4: Saving your files.', 'Step 2 of 4: Copying your files.', 'Step 3 of 4: Checking your files.', 'Step 4 of 4: Switching to your Free computer.'],
+    committed: 'Your files are on your Free computer',
+    committedBody: 'Opening your Free computer.',
+    failed: "We couldn't move your files",
+    failedBody: "They're still on your AWS computer and nothing was deleted.",
+    entitlementPaid: 'Your plan is active again, so your files stay on your AWS computer.',
+    regionMissing: "This computer needs a fix on our side before it can open or move; we're looking into it.",
+    unfinished: "We couldn't finish moving your files",
+    finishing: "We're finishing moving your files",
+    blockedBody: "Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.",
+    unsettledBody: "Your files are safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it.",
+    openAws: 'Open my AWS computer',
+};
+
+/** §6.4 the overlay's sentence for an in-flight move: the step, and on step 2 the bytes in the card's units. */
+export function moveStepText (move) {
+    const step = Math.min(3, Math.max(0, move?.step ?? 0));
+    const bytes = step === 1 ? moveBytesText(move.bytesDone, move.bytesTotal) : '';
+    return bytes ? `${MOVE_COPY.steps[1]} ${bytes}.` : MOVE_COPY.steps[step];
+}
+
+/**
+ * §6.4 the overlay's outcome, keyed on `move.outcome` and `move.openBlocked` ONLY, never on `stage` (a terminal row
+ * carries the placement's own stage). `needsAttention`: the open was answered `computeMoveNeedsAttention`, with or
+ * without a `move` read yet. Returns null for a move still in flight. `openAws`: offer [Open my AWS computer] (it
+ * re-asks the open: the D16 hold); `committed`: the bar is full and the ordinary Cloudflare open follows.
+ */
+export function moveOutcomeCopy (move, { needsAttention = false } = {}) {
+    if (needsAttention || (move?.outcome === 'failed_needs_operator' && move.openBlocked === true)) {
+        return move?.reason === 'boot_unsettled'
+            ? { status: MOVE_COPY.unfinished, body: MOVE_COPY.unsettledBody, openAws: false, feedback: true, blocked: true }
+            : { status: MOVE_COPY.finishing, body: MOVE_COPY.blockedBody, openAws: false, feedback: true, blocked: true };
+    }
+    if (move?.outcome === 'committed') return { status: MOVE_COPY.committed, body: MOVE_COPY.committedBody, openAws: false, feedback: false, committed: true };
+    const keep = move?.holdOpenable === false ? '' : ', and you can keep using it';
+    if (move?.outcome === 'failed_needs_operator') {
+        return { status: MOVE_COPY.unfinished, body: `They're safe on your AWS computer and nothing was deleted${keep}. We're looking into it.`,
+            openAws: move.holdOpenable === true, feedback: true };
+    }
+    if (move?.outcome !== 'failed_reopened') return null;
+    const body = move.reason === 'entitlement_paid' ? MOVE_COPY.entitlementPaid
+        : move.reason === 'workspace_too_large' ? moveTooLargeText(move.holdOpenable)
+            : move.reason === 'region_missing' ? `${MOVE_COPY.failedBody} ${MOVE_COPY.regionMissing}` : MOVE_COPY.failedBody;
+    return { status: MOVE_COPY.failed, body, openAws: move.holdOpenable === true && move.reason !== 'region_missing', feedback: true };
+}
+
+/** The moving view's bar: four equal steps; a measured copy fills step 2's segment. */
+const MOVE_FLOOR = [0, 0.25, 0.5, 0.75, 1];
+
+/**
+ * §5.10 + §6.4: the moving view (`operation: 'moving'`) as the overlay shows it. In flight: the step and its bar,
+ * never an opening (`activeAws` false: no opening budget, no ten-minute stop). The open-blocked row (stage
+ * `needs_operator`): the needs-attention card, from the move itself.
+ */
+function movingView (data, move, { now, firstObservedAt, features }) {
+    const blocked = data.stage === 'needs_operator' || move.outcome !== null;
+    const startedAtMs = move.startedAtMs ?? time(data.startedAt) ?? firstObservedAt;
+    const typical = Number.isFinite(data.typicalSeconds) && data.typicalSeconds > 0 ? data.typicalSeconds : 600;
+    const expected = move.expectedSeconds ?? typical;
+    const step = move.step ?? 0;
+    const outcome = blocked ? moveOutcomeCopy(move, { needsAttention: true }) : null;
+    const fraction = step === 1 && move.bytesDone !== null && move.bytesTotal ? Math.min(1, move.bytesDone / move.bytesTotal) : null;
+    return {
+        stage: blocked ? 'needs_operator' : 'moving', path: null,
+        title: blocked ? outcome.status : MOVE_COPY.moving, body: blocked ? outcome.body : moveStepText(move),
+        bytes: blocked ? '' : step === 1 ? moveBytesText(move.bytesDone, move.bytesTotal) : '',
+        manualAttention: blocked,
+        active: !blocked && data.active === true, activeAws: false,
+        elapsed: Math.max(0, (now - startedAtMs) / 1000), expected, reached: step, serverReady: false,
+        bar: blocked ? null : { startedAtMs, expected, reached: step, floors: MOVE_FLOOR,
+            migrationFraction: fraction === null ? null : MOVE_FLOOR[1] + (MOVE_FLOOR[2] - MOVE_FLOOR[1]) * fraction },
+        connect: false, connectExpected: null, indeterminate: false, transition: null,
+        openingKey: `move:${move.moveId ?? startedAtMs}`,
+        updated: features?.devDetails === true && typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
+            ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,
+        moving: true, move,
+    };
 }
 /**
  * The loading-stage sentence for a reached server milestone (HF3). "Almost there" only at
@@ -183,6 +281,13 @@ export function openingAt (view, now = Date.now(), { reducedMotion = false, clie
  */
 export function progressView(data, computerId, { features = bootFeatures(), now = Date.now(), firstObservedAt = now, appName, openRequested = false } = {}) {
     if (!data || ![1, 2].includes(data.version) || data.computerId !== computerId) return null;
+    // Phase B (§6.4): the moving view BEFORE the needs_operator mapping (the open-blocked row sends `needsOperator`
+    // and stage `needs_operator`; it is the move's card, not "Your computer needs attention") and before the
+    // unknown-stage return (`moving` is a stage only this branch knows).
+    if (data.operation === 'moving') {
+        const move = moveOf(data, computerId);
+        return move ? movingView(data, move, { now, firstObservedAt, features }) : null;
+    }
     const stage = data.operationsPaused === true || data.paused === true || data.stage === 'operations_paused' ? 'operations_paused'
         : data.needsOperator === true || ['needs_operator', 'failed_needs_operator'].includes(data.stage) ? 'needs_operator' : data.stage;
     if (!Object.hasOwn(stages, stage) || stage === 'unavailable') return null;
@@ -249,7 +354,10 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
         floors: opening ? MILESTONE_FLOOR : MIGRATION_FLOOR,
         migrationFraction: moving === 2 && percent !== null ? MIGRATION_FLOOR[2] + (MIGRATION_FLOOR[3] - MIGRATION_FLOOR[2]) * percent / 100 : null,
     };
-    return {
+    // Phase B (§5.10): a terminal reverse row keeps today's description and adds `move` (its outcome). With no
+    // visible row the view is exactly today's.
+    const reverse = moveOf(data, computerId);
+    const view = {
         stage, path, title,
         // One loading-stage sentence while opening; none while moving; other states keep one explanatory sentence.
         body,
@@ -269,8 +377,14 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
         updated: features?.devDetails === true && typeof data.updatedAt === 'string' && Number.isFinite(Date.parse(data.updatedAt))
             ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).format(new Date(data.updatedAt)) : null,
     };
+    return reverse ? { ...view, moving: false, move: reverse } : view;
 }
 
+/**
+ * `onChange(view, move)`: the view (`progressView`), and on every answered poll this computer's reverse move
+ * (`moveOf`, or null). A committed move's row arrives with the Cloudflare placement's stage, which has no view, so
+ * the move travels on its own. `move` is undefined when nothing was read (a failed poll, a hidden tab).
+ */
 export function observeComputerProgress({ computerId, element, onChange, query = trpc.query, appName, openRequested = () => false }) {
     let watching = false, generation = 0, timer, deadline, operation, firstObservedAt;
     async function poll() {
@@ -292,7 +406,7 @@ export function observeComputerProgress({ computerId, element, onChange, query =
                     if (operation !== key) { operation = key; firstObservedAt = now; }
                     view = progressView(result.data, computerId, { now, firstObservedAt, appName, openRequested: requested });
                 }
-                onChange(view);
+                onChange(view, result.ok ? moveOf(result.data, computerId) : undefined);
             }
         } catch {
             if (watching && own === generation && element.isConnected) onChange(null);
