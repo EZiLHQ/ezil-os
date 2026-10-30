@@ -189,6 +189,69 @@ await window.$(B).close();
 await settle(8);
 push('…and that close gives the taskbar back', ! B.isConnected && taskbar_shown());
 
+// Bounded wait on a condition (no fixed sleeps in the checks below).
+const until = async (cond, tries = 200) => {
+    for ( let i = 0; i < tries; i++ ) { if ( cond() ) return true; await tick(10); }
+    return !! cond();
+};
+
+// ── 9. full view entered while the window is still opening ─────────────────
+// UIWindow opens a window with `$(el).show(0, cb)`, which jQuery runs as a
+// "show" animation that captures the inline geometry and writes it back when
+// it completes. Whenever another jQuery animation is already running (the
+// shell nearly always has one) that completion is a later fx tick, after
+// `code.js` has entered full view (`await UIWindow()`, then `enter()`), and it
+// put the window back at its windowed box. Reproduced exactly: a long
+// animation elsewhere keeps the fx timer running, the window is shown with
+// `show(0)` at a known box, and full view is entered in the same turn.
+await window.ezil.registry.launch('settings');
+await until(() => q('.window[data-app="settings"]'));
+const C = q('.window[data-app="settings"]');
+const fc = createFullView(C);
+const keeper = window.$('<div>').appendTo(doc.body).animate({ opacity: 0 }, 60_000);
+window.$(C).css({ width: '612px', height: '433px', top: '41px', left: '57px' }).hide().show(0);
+const opening = window.$(C).is(':animated');
+fc.enter();
+const done = await until(() => ! window.$(C).is(':animated'));
+const after_open = geom(C);
+keeper.stop(true).remove();
+push('setup: the window is still in its opening show animation when full view is entered', opening === true && done === true);
+push('🔴 …and it keeps 100% x 100% once that animation has completed (THE BUG: the animation wrote 612x433 back over full view)',
+    fc.is_full() && after_open.width === '100%' && after_open.height === '100%' && after_open.top === '0px', JSON.stringify(after_open));
+push('…the stash is the settled windowed box', C.dataset.ezilPrevFpWidth === '612px' && C.dataset.ezilPrevFpHeight === '433px',
+    JSON.stringify({ w: C.dataset.ezilPrevFpWidth, h: C.dataset.ezilPrevFpHeight }));
+fc.exit();
+push('…positive control: leaving full view restores that box', JSON.stringify(geom(C)) === JSON.stringify({ width: '612px', height: '433px', top: '41px', left: '57px' }),
+    JSON.stringify(geom(C)));
+
+// ── 10. showWindow on a full window that is NOT minimised (a relaunch) ──────
+// The registry calls `showWindow()` on an already-open single-instance window
+// (a dock click, Back/Forward onto an open app). Its geometry restore is the
+// box `hideWindow` recorded in `data-orig-*`, and it must reach only a window
+// that is minimised: written over a visible full window, it shrank it to that
+// snapshot with the full-view class still on.
+fc.enter();
+fc.minimise();
+await until(() => is_minimized(C));
+// jsdom has no layout, so the box hideWindow measured is 0x0; give the
+// snapshot recognisable values, as a drag or resize stop would.
+window.$(C).attr({ 'data-orig-width': 701, 'data-orig-height': 502, 'data-orig-top': 23, 'data-orig-left': 19 });
+const snapshot = ['width', 'height'].map(k => C.getAttribute(`data-orig-${k}`));
+window.$(C).showWindow();
+const restored_px = geom(C);
+push('positive control: showWindow on a MINIMISED window writes the snapshot back',
+    restored_px.width === '701px' && restored_px.height === '502px' && restored_px.top === '23px', JSON.stringify({ snapshot, restored_px }));
+await until(() => ! is_minimized(C));
+fc.enter();
+push('setup: back in full view, with that snapshot still on the window', fc.is_full() && geom(C).width === '100%'
+    && C.getAttribute('data-orig-width') === snapshot[0]);
+window.$(C).showWindow();
+push('🔴 showWindow on a VISIBLE full window leaves its geometry alone (THE BUG: it wrote the stale snapshot over 100% x 100%)',
+    geom(C).width === '100%' && geom(C).height === '100%' && fc.is_full(), JSON.stringify(geom(C)));
+fc.exit();
+await window.$(C).close();
+await until(() => ! C.isConnected);
+
 push('no uncaught page errors', uncaught.length === 0, uncaught.slice(0, 2).join(' | '));
 
 let failed = 0;

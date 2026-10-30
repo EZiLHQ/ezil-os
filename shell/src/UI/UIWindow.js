@@ -4361,13 +4361,29 @@ $.fn.showWindow = async function (options) {
                 return;
             }
 
-            $(el_window).css({
-                'transition': 'top 0.2s, left 0.2s, bottom 0.2s, right 0.2s, width 0.2s, height 0.2s',
-                top: `${$(el_window).attr('data-orig-top') }px`,
-                left: `${$(el_window).attr('data-orig-left') }px`,
-                width: `${$(el_window).attr('data-orig-width') }px`,
-                height: `${$(el_window).attr('data-orig-height') }px`,
-            });
+            // MODIFIED BY EZIL 2026-10-30 (app-code full view): the geometry
+            // below is the box `hideWindow` recorded in `data-orig-*` before
+            // shrinking the window to 0x0, so it is written back only to a
+            // window that IS minimised. The registry calls `showWindow()` on
+            // an already-visible single-instance window too (a dock click,
+            // Back/Forward onto an open app), and this used to write that
+            // stale snapshot over it: a full-view window (100% x 100%) was
+            // put back at the box it was last minimised, dragged or resized
+            // at, keeping its full-view class (measured in Chromium: a
+            // relaunch onto an open full Code last minimised while windowed
+            // -> 230,135 980x680; one last minimised in full view, after a
+            // viewport resize -> the old viewport's pixels). A visible window
+            // keeps its geometry; it is still raised and focused below.
+            const was_minimized = ['1', 'true'].includes($(el_window).attr('data-is_minimized'));
+            if ( was_minimized ) {
+                $(el_window).css({
+                    'transition': 'top 0.2s, left 0.2s, bottom 0.2s, right 0.2s, width 0.2s, height 0.2s',
+                    top: `${$(el_window).attr('data-orig-top') }px`,
+                    left: `${$(el_window).attr('data-orig-left') }px`,
+                    width: `${$(el_window).attr('data-orig-width') }px`,
+                    height: `${$(el_window).attr('data-orig-height') }px`,
+                });
+            }
             $(el_window).css('z-index', raised_zindex());
 
             $(el_window).attr({
@@ -4380,9 +4396,11 @@ $.fn.showWindow = async function (options) {
 
             // remove `transitions` a good while after setting css to make sure
             // it doesn't interfere with an ongoing animation
-            setTimeout(() => {
-                $(el_window).css('transition', 'none');
-            }, 250);
+            if ( was_minimized ) {
+                setTimeout(() => {
+                    $(el_window).css('transition', 'none');
+                }, 250);
+            }
         }
     });
     return this;

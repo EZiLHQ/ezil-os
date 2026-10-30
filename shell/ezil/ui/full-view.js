@@ -107,6 +107,24 @@ export function createFullView (el_window) {
         if ( is_minimized(el_window) ) return false;
         if ( is_full() ) return false;
 
+        // 🔴 Settle the window's own jQuery animations BEFORE taking its
+        // geometry. UIWindow opens every window with `show(0, cb)`, and jQuery
+        // turns any numeric speed, 0 included, into a "show" animation over
+        // width/height/margin/padding/opacity: it captures the inline values
+        // the window was built with and writes them back when it completes,
+        // on a later fx tick. A window entering full view as soon as it is
+        // built (Code from `/app/code`, or remembered full) was put back at
+        // 980x680 one frame later, keeping full view's left/top/radius —
+        // measured on real Next and in Chromium: `left: 0px; top: 0px;
+        // width: 980px; height: 680px; border-radius: 0px`, with the class on.
+        // `finish()` completes any such animation now, so its write lands
+        // BEFORE the full-view geometry and the stash below reads the settled
+        // bounds. A no-op when nothing is animating, which is every later
+        // entry (the Browser's included: it enters once its frame is
+        // confirmed). It also runs the show's callback now instead of a tick
+        // later; that applies `window_css` / `onAppend`, which neither window
+        // passes.
+        $(el_window).finish();
         el_window.classList.add(FULL_VIEW_CLASS);
         window.enter_fullpage_mode(el_window);
         // `$.fn.close` reads this to decide whether it owes the user a taskbar

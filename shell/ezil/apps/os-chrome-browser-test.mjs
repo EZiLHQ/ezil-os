@@ -196,6 +196,11 @@ async function scenarioCodeFullView () {
 
         const b0 = await browserBox();
         push(`${L} setup: the Browser is full-bleed`, b0.full, JSON.stringify(b0));
+        // The Browser's full-bleed is the same mechanism (`full-view.js`), entered
+        // late (once its frame is confirmed); its geometry is the reference.
+        const bg0 = await settledGeometry(page, '.window[data-app="desktop"]');
+        push(`${L} 🔴 the Browser's full-bleed fills the viewport: window = viewport, body below the strip, nothing over it`,
+            fillsViewport(bg0), JSON.stringify(bg0));
 
         // ── the dock: windowed ──
         await page.evaluate(() => document.querySelector('.window[data-app="desktop"]')._ezil_minimise());
@@ -302,6 +307,28 @@ async function scenarioCodeFullView () {
         const m7 = await measure();
         push(`${L} 🔴 a launch with view "full" (the /app/code route) opens straight into full view, on top`,
             !! m7 && m7.full && m7.barDisplay === 'flex' && m7.btns.every(b => b.hit), JSON.stringify(m7?.win));
+        // 🔴 The class alone is how a 980x680 "full view" shipped: UIWindow's
+        // opening `show(0)` animation wrote the windowed box back over it.
+        const g7 = await settledGeometry(page, CODE);
+        push(`${L} 🔴 …and FILLS the viewport once its opening has settled: window = viewport, body below the strip, opaque, on top`,
+            fillsViewport(g7), JSON.stringify(g7));
+        // Keeps filling through a viewport resize, then leaves to the exact box
+        // full view stashed when it entered (positive control: not the viewport).
+        const stash = await page.evaluate((sel) => {
+            const d = document.querySelector(sel).dataset;
+            return [d.ezilPrevFpLeft, d.ezilPrevFpTop, d.ezilPrevFpWidth, d.ezilPrevFpHeight].map(v => Number.parseFloat(v));
+        }, CODE);
+        await page.setViewportSize({ width: vw - 140, height: vh - 100 });
+        await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [vw - 140, vh - 100]);
+        const g8 = await settledGeometry(page, CODE);
+        push(`${L} 🔴 a viewport resize while full: it keeps filling (${vw - 140}x${vh - 100})`,
+            fillsViewport(g8) && g8.vp[0] === vw - 140, JSON.stringify(g8));
+        await page.click(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
+        await page.waitForSelector(`${CODE}:not(.ezil-fullbleed)`);
+        const g9 = await settledGeometry(page, CODE);
+        push(`${L} positive control: Restore window leaves it at the EXACT box it had before full view (980x680, not the viewport)`,
+            JSON.stringify(g9.rect) === JSON.stringify(stash) && stash[2] === 980 && stash[3] === 680 && ! fillsViewport(g9),
+            JSON.stringify({ rect: g9.rect, stash }));
         push(`${L} never the Fullscreen API`, await page.evaluate(() => document.fullscreenElement === null));
 
         push(`${L} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
@@ -424,6 +451,42 @@ async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true }
         await sleep(1600);
     }
     return { page, page_errors };
+}
+
+/**
+ * A window's geometry once nothing is moving it: no jQuery animation (UIWindow
+ * opens with one), no CSS transition (`showWindow` restores with one), then
+ * two frames. Read twice, two frames apart, so a late write shows as
+ * `stable: false`.
+ */
+async function settledGeometry (page, sel) {
+    await page.waitForFunction((s) => {
+        const w = document.querySelector(s);
+        return !! w && ! window.$(w).is(':animated') && w.getAnimations().length === 0;
+    }, sel, { timeout: 5_000 });
+    const read = () => page.evaluate(async (s) => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const w = document.querySelector(s);
+        const r = w.getBoundingClientRect();
+        const b = w.querySelector(':scope > .window-body').getBoundingClientRect();
+        const hit = (x, y) => document.elementFromPoint(x, y)?.closest('.window') === w;
+        return {
+            rect: [r.x, r.y, r.width, r.height], body: [b.x, b.y, b.width, b.height], vp: [innerWidth, innerHeight],
+            strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
+            opacity: getComputedStyle(w).opacity, full: w.classList.contains('ezil-fullbleed'),
+            hits: hit(innerWidth / 2, innerHeight / 2) && hit(1, innerHeight - 1) && hit(innerWidth - 1, innerHeight - 1),
+        };
+    }, sel);
+    const first = await read();
+    const second = await read();
+    return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
+}
+
+/** Window rect = viewport rect, the body directly below the strip to the bottom edge, opaque, on top. */
+function fillsViewport (g) {
+    return g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
+        && JSON.stringify(g.rect) === JSON.stringify([0, 0, g.vp[0], g.vp[1]])
+        && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
 }
 
 /** Open an app through the registry, the same call a dock click makes. */

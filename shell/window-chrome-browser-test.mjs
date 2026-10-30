@@ -529,6 +529,70 @@ await page.mouse.click(codeItem.cx, codeItem.cy);
 await sleep(700);
 push('GROUP 6: back from the dock it is in full view again', isFullView(await codeState()), JSON.stringify(await codeState()));
 
+// ── GROUP 6 geometry: full view keeps FILLING the viewport (2026-10-30) ─────
+// No fixed sleeps below: each read waits until nothing is moving the window
+// (no jQuery animation, no CSS transition), then reads twice, two frames apart.
+const settledGeometry = async () => {
+    await page.waitForFunction((s) => {
+        const w = document.querySelector(s);
+        return !! w && ! $(w).is(':animated') && w.getAnimations().length === 0;
+    }, CODE, { timeout: 5000 });
+    const read = () => page.evaluate(async (s) => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const w = document.querySelector(s);
+        const r = w.getBoundingClientRect();
+        const b = w.querySelector(':scope > .window-body').getBoundingClientRect();
+        const hit = (x, y) => document.elementFromPoint(x, y)?.closest('.window') === w;
+        return {
+            rect: [r.x, r.y, r.width, r.height], body: [b.x, b.y, b.width, b.height], vp: [innerWidth, innerHeight],
+            strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
+            opacity: getComputedStyle(w).opacity, full: w.classList.contains('ezil-fullbleed'),
+            hits: hit(innerWidth / 2, innerHeight / 2) && hit(1, innerHeight - 1) && hit(innerWidth - 1, innerHeight - 1),
+        };
+    }, CODE);
+    const first = await read();
+    const second = await read();
+    return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
+};
+const fills = (g) => g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
+    && JSON.stringify(g.rect) === JSON.stringify([0, 0, g.vp[0], g.vp[1]])
+    && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+const resizeTo = async (width, height) => {
+    await page.setViewportSize({ width, height });
+    await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [width, height]);
+};
+let g = await settledGeometry();
+push('🔴 GROUP 6 geometry: back from the dock it FILLS the viewport (window = viewport, body below the strip, on top)', fills(g), JSON.stringify(g));
+await resizeTo(1100, 720);
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: a viewport resize while full keeps filling (1100x720)', fills(g) && g.vp[0] === 1100, JSON.stringify(g));
+// A relaunch onto the open window: what a dock click or Back/Forward onto
+// `/app/code` does (registry.js: `showWindow()`, then `_ezil_relaunch` with
+// no view). `showWindow` used to write back the box the last minimise
+// recorded (here the 1280x860 viewport), and the window kept its class.
+const origBeforeRelaunch = await page.evaluate((s) => document.querySelector(s).getAttribute('data-orig-width'), CODE);
+push('GROUP 6 geometry setup: the last minimise left its snapshot (the old viewport width) on the window',
+    Number(origBeforeRelaunch) === vp.width, String(origBeforeRelaunch));
+await page.evaluate(async () => {
+    const p = window.__EZIL_BOOT__;
+    await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState });
+});
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: a relaunch onto the open full Code (dock / Back-Forward) leaves it filling the RESIZED viewport, '
+    + 'not the box its last minimise recorded', fills(g) && g.vp[0] === 1100, JSON.stringify(g));
+// Minimised from full view, the viewport changes, then back from the dock.
+await page.locator(`${CODE} > .ezil-full-view-bar [data-action="minimize"]`).click();
+await page.waitForFunction((s) => ['true', '1'].includes(document.querySelector(s).getAttribute('data-is_minimized')), CODE);
+await resizeTo(1180, 780);
+await page.locator('.taskbar-item[data-app="code"]').click();
+await page.waitForSelector(`${CODE}.ezil-fullbleed`, { timeout: 5000 });
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: restored from minimised-in-full after a resize, it fills the NEW viewport (1180x780)',
+    fills(g) && g.vp[0] === 1180, JSON.stringify(g));
+await resizeTo(vp.width, vp.height);
+g = await settledGeometry();
+push('GROUP 6 geometry: and back at the original viewport it still fills', fills(g) && g.vp[0] === vp.width, JSON.stringify(g));
+
 // Keyboard modality, so `:focus-visible` applies: Tab from minimise to restore.
 await page.focus(`${CODE} > .ezil-full-view-bar [data-action="minimize"]`);
 await page.keyboard.press('Tab');

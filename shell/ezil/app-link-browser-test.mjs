@@ -66,6 +66,36 @@ await context.addInitScript(({ computerId }) => {
     addEventListener('popstate', event => { if (event.state && !event.state.__NA) window.__reloadingPops += 1; });
 }, { computerId });
 const windows = page => page.locator('.window[data-app]');
+// ── Code's geometry (docs/APP-CODE-FULL-VIEW.md §1) ──────────────────────────
+// Read once nothing is moving the window: no jQuery animation (UIWindow opens
+// with one, and its end used to write 980x680 back over full view), no CSS
+// transition (`showWindow` restores with one), then two frames; twice, two
+// frames apart, so a late write shows as `stable: false`. No timed waits.
+const geometry = async page => {
+    await page.waitForFunction(() => {
+        const w = document.querySelector('.window[data-app="code"]');
+        return !!w && !window.$(w).is(':animated') && w.getAnimations().length === 0;
+    }, null, { timeout: 5000 });
+    const read = () => page.evaluate(async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const w = document.querySelector('.window[data-app="code"]');
+        const r = w.getBoundingClientRect(), b = w.querySelector(':scope > .window-body').getBoundingClientRect();
+        const hit = (x, y) => document.elementFromPoint(x, y)?.closest('.window') === w;
+        return { rect: [r.x, r.y, r.width, r.height], body: [b.x, b.y, b.width, b.height], vp: [innerWidth, innerHeight],
+            strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
+            opacity: getComputedStyle(w).opacity, full: w.classList.contains('ezil-fullbleed'),
+            hits: hit(innerWidth / 2, innerHeight / 2) && hit(1, innerHeight - 1) && hit(innerWidth - 1, innerHeight - 1) };
+    });
+    const first = await read(), second = await read();
+    return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
+};
+// Full view: the window IS the viewport, the body runs from the strip to the bottom edge, opaque, on top.
+const fills = g => g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
+    && JSON.stringify(g.rect) === JSON.stringify([0, 0, ...g.vp]) && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+const resize = async (page, width, height) => {
+    await page.setViewportSize({ width, height });
+    await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [width, height]);
+};
 try {
     const page = await context.newPage();
     await page.goto(`${origin}/os?app=code&computer=${computerId}&path=%2Fproject%2Fa&project=demo`);
@@ -187,24 +217,85 @@ try {
         await fullCode.waitFor();
         const base = (await now())[1];
         assert.deepEqual(await now(), ['/app/code', base, 'full', true, 0], `${label}: E1, Code full from its route, and E1 says so`);
+        let g = await geometry(tab);
+        assert.ok(fills(g), `🔴 ${label}: E1, the first load of /app/code FILLS the viewport (not 980x680 at 0,0): ${JSON.stringify(g)}`);
         await bar('minimize');
         await tab.locator('.taskbar-item[data-app="settings"]').click();
         await tab.locator('.window[data-app="settings"].window-active').waitFor(); await at('/app/settings');
         await tab.locator('.taskbar-item[data-app="code"]').click();
         await at('/app/code'); await fullCode.waitFor();
         assert.deepEqual(await now(), ['/app/code', base + 2, 'full', true, 0], `${label}: E3, Code back from the dock in full view`);
+        g = await geometry(tab);
+        assert.ok(fills(g), `🔴 ${label}: E3, back from the dock it FILLS the viewport: ${JSON.stringify(g)}`);
+        // The viewport changes while Code is open. The minimise above left a
+        // 1280x800 snapshot on the window, which `showWindow` used to write
+        // back when Back/Forward relaunched the open window.
+        await resize(tab, 1100, 700);
+        g = await geometry(tab);
+        assert.ok(fills(g) && g.vp[0] === 1100, `🔴 ${label}: a viewport resize while full keeps filling: ${JSON.stringify(g)}`);
+        let windowed = null;
         if ( restore ) {
+            const stash = await tab.evaluate(() => { const d = document.querySelector('.window[data-app="code"]').dataset;
+                return [d.ezilPrevFpLeft, d.ezilPrevFpTop, d.ezilPrevFpWidth, d.ezilPrevFpHeight].map(Number.parseFloat); });
             await bar('restore'); await fullCode.waitFor({ state: 'detached' });
             assert.deepEqual(await now(), ['/app/code', base + 2, 'window', false, 0], 'Restore window, recorded on E3');
+            g = await geometry(tab); windowed = g.rect;
+            assert.deepEqual([windowed, windowed.slice(2), g.stable], [stash, [980, 680], true],
+                'positive control: Restore window lands on the EXACT 980x680 box Code had before full view, not the viewport');
         }
         await tab.goBack(); await at('/app/settings');
         await tab.goBack(); await at('/app/code');
         assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
             restore ? '🔴 Back to E1: Code stays windowed, and E1 takes its view' : `${label}: Back to E1, full`);
+        // Back focuses Code 80ms after `showWindow` (Settings is in front until then).
+        await tab.locator('.window[data-app="code"].window-active').waitFor();
+        g = await geometry(tab);
+        if ( restore ) assert.deepEqual([g.rect, g.stable], [windowed, true], '🔴 Back onto the open, windowed Code leaves its box exactly where it was');
+        else assert.ok(fills(g) && g.vp[0] === 1100, `🔴 ${label}: Back onto the open full Code leaves it filling the RESIZED viewport: ${JSON.stringify(g)}`);
         await tab.reload();
         await tab.locator('.window[data-app="code"].ezil-full-view-host').waitFor();
         assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
             restore ? '🔴 a reload of E1 opens Code WINDOWED, as it was on screen' : `${label}: a reload of E1 opens Code full`);
+        g = await geometry(tab);
+        if ( restore ) assert.deepEqual([g.rect.slice(2), g.full], [[980, 680], false], 'positive control: the windowed reload opens at 980x680');
+        else assert.ok(fills(g) && g.vp[0] === 1100, `🔴 ${label}: the reload FILLS the viewport: ${JSON.stringify(g)}`);
+        await tab.close();
+    }
+    // ── two more ways a NEW Code window opens straight into full view ──────
+    // Back to an entry whose Code was closed (its recorded view, 'full'), and a
+    // dock launch after the user's last choice was full (`ezil-os:view.code`).
+    // Both build the window and enter full view in the same turn, as a first
+    // load does. Positive control: the dock's first, windowed open.
+    {
+        const tab = await context.newPage();
+        const at = pathname => tab.waitForFunction(p => location.pathname === p, pathname);
+        const code = tab.locator('.window[data-app="code"]');
+        const bar = action => tab.locator(`.window[data-app="code"] > .ezil-full-view-bar [data-action="${action}"]`).click();
+        await tab.goto(`${origin}/app/code`);
+        await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
+        await bar('minimize');
+        await tab.locator('.taskbar-item[data-app="settings"]').click();
+        await tab.locator('.window[data-app="settings"].window-active').waitFor(); await at('/app/settings');
+        await tab.evaluate(() => window.$('.window[data-app="code"]').close());
+        await code.waitFor({ state: 'detached' });
+        await tab.goBack(); await at('/app/code');
+        await tab.locator('.window[data-app="code"].ezil-fullbleed.window-active').waitFor();
+        let g = await geometry(tab);
+        assert.ok(fills(g), `🔴 Back to a closed Code reopens it full, FILLING the viewport: ${JSON.stringify(g)}`);
+        await bar('close'); await code.waitFor({ state: 'detached' });
+        await tab.locator('.taskbar-item[data-app="code"]').click();
+        await code.waitFor();
+        g = await geometry(tab);
+        assert.deepEqual([g.rect.slice(2), g.full], [[980, 680], false], 'positive control: a dock launch with no remembered choice opens windowed, 980x680');
+        await tab.locator('.window[data-app="code"] > .window-head .window-scale-btn').click();
+        await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
+        g = await geometry(tab);
+        assert.ok(fills(g), `🔴 the green button on a windowed Code FILLS the viewport: ${JSON.stringify(g)}`);
+        await bar('close'); await code.waitFor({ state: 'detached' });
+        await tab.locator('.taskbar-item[data-app="code"]').click();
+        await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
+        g = await geometry(tab);
+        assert.ok(fills(g), `🔴 a dock launch remembering full opens straight into full view, FILLING the viewport: ${JSON.stringify(g)}`);
         await tab.close();
     }
     // 🔴 PRE-EXISTING, NOT A ROUTE ARTIFACT: `bundle.min.css` carries jQuery
