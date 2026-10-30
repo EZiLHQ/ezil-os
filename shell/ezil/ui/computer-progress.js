@@ -69,6 +69,61 @@ const EASE_CAP = 0.9;
 const formatBytes = bytes => bytes >= 1_000_000_000 ? `${(bytes / 1_000_000_000).toFixed(1)} GB` : `${Math.round(bytes / 1_000_000)} MB`;
 const vcpuOf = size => { const m = typeof size === 'string' && /^(?:std|cmp)-(\d+)$/.exec(size); return m ? Number(m[1]) : null; };
 const time = value => { const at = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(at) ? at : null; };
+
+// ── Phase B: the reverse move (AWS → Cloudflare), reverse move contract §5.10, §6.4 ─────────────
+// While a computer's files move from its AWS computer to its Free computer, `computer.progress` sends the
+// MOVING VIEW (`operation: 'moving'`): nothing in it is an opening, and none of the opening clocks apply.
+/** §5.10 `budgetSeconds`: the sum of the §5.4 deadlines. The shell never ends a move on its own clock before it + 300 s. */
+export const MOVE_BUDGET_SECONDS = 13200;
+/**
+ * §6.2: the most a move copies (the export cap, lane A's `EXPORT_MAX_BYTES`, which reads this line), in bytes. Shown
+ * only in the shell's MB unit (÷ 1,000,000, no decimals): "537 MB". 🔴 Keep it a plain literal.
+ */
+export const MOVE_LIMIT_BYTES = 536870912;
+/** §5.10 phases → the §6.1 step (the same step map the Computer tab's card uses). */
+const MOVE_PHASES = { export_boot: 0, exporting: 0, importing: 1, checking: 2, committing: 3 };
+const MOVE_OUTCOMES = ['committed', 'failed_reopened', 'failed_needs_operator'];
+const MOVE_RETRY = ['now', 'after_aws_session', 'no'];
+const count = value => Number.isFinite(value) && value >= 0 ? value : null;
+
+/**
+ * This computer's reverse move from a `computer.progress` answer (`move`, §5.10), from server fields only, or null.
+ * Read for in-flight rows (the moving view) and for terminal rows alike: a terminal row keeps today's placement
+ * description, so only `outcome` and `openBlocked` say how the move ended, never `stage`.
+ */
+export function moveOf (data, computerId) {
+    if (!data || ![1, 2].includes(data.version) || data.computerId !== computerId) return null;
+    const m = data.move;
+    if (!m || typeof m !== 'object' || m.direction !== 'to_cloudflare') return null;
+    const outcome = MOVE_OUTCOMES.includes(m.outcome) ? m.outcome : null;
+    const phase = outcome === null && Object.hasOwn(MOVE_PHASES, m.phase) ? m.phase : null;
+    const expected = Number.isFinite(m.expectedSeconds) && m.expectedSeconds > 0 ? m.expectedSeconds : null;
+    return {
+        moveId: typeof m.moveId === 'string' ? m.moveId : null, phase, step: phase === null ? null : MOVE_PHASES[phase],
+        startedAtMs: time(m.startedAt), expectedSeconds: expected,
+        budgetSeconds: Number.isFinite(m.budgetSeconds) && m.budgetSeconds > 0 ? m.budgetSeconds : MOVE_BUDGET_SECONDS,
+        bytesDone: count(m.bytesDone), bytesTotal: count(m.bytesTotal) || null, outcome,
+        // The same reason rule as the Computer tab's card (§6.1).
+        reason: outcome !== null && /^[a-z0-9_:-]{1,64}$/i.test(String(m.reason ?? '')) ? m.reason : null,
+        retry: MOVE_RETRY.includes(m.retry) ? m.retry : null,
+        openBlocked: outcome === 'failed_needs_operator' && m.openBlocked === true,
+        holdOpenable: typeof m.holdOpenable === 'boolean' ? m.holdOpenable : null,
+    };
+}
+
+/**
+ * §6.4 rule 3: what a moving open loop does after one `computer.progress` read. `ask`: the move is in flight (the
+ * moving view) or committed (the open now opens the Free computer). `stop`: a failed outcome; the caller shows it and
+ * NEVER asks again (after a failure an ordinary open is a D16 hold boot of the AWS computer). `wait`: the read says
+ * nothing about this move (failed, another computer, no move): never an ask.
+ */
+export function moveAskOf (data, computerId) {
+    const move = moveOf(data, computerId);
+    if (!move) return 'wait';
+    if (move.outcome === 'committed') return 'ask';
+    if (move.outcome !== null) return 'stop';
+    return data.operation === 'moving' && data.stage === 'moving' ? 'ask' : 'wait';
+}
 /**
  * The loading-stage sentence for a reached server milestone (HF3). "Almost there" only at
  * desktop_ready (reached 4, the server's ready): never earlier, never for a hold or failure.
