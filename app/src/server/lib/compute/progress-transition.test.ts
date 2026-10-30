@@ -7,7 +7,7 @@ import { SWITCH_DEMAND_WINDOW_MS } from './ready-pool';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { Placement } from './placement';
 import {
-    canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, readComputerProgress, reconcileTransition, resolveTransition, transitionView,
+    APP_CONNECT_EXPECTED_SECONDS, canonicalJson, describeOpening, describeProgress, expectedOpeningSeconds, parseOpening, parseTransition, readComputerProgress, reconcileTransition, resolveTransition, transitionView,
     TRANSITION_MAX_AGE_MS, TRANSITION_STOP_GRACE_MS, TRANSITION_STOP_TIMEOUT_MS, TRANSITION_WAKE_TIMEOUT_MS, type ComputerTransition, type OpeningRecord,
 } from './progress';
 
@@ -234,7 +234,30 @@ describe('describeProgress: OpeningProgressV3 fields, capacity wait, expected se
         expect(describeProgress(C, starting, null, env, at(0))).toMatchObject({ stage: 'starting', operation: 'opening', active: true });
     });
     it('no opening: the round-3 fields are present and empty', () => {
-        expect(describeProgress(C, placement(), null, env, at(0))).toMatchObject({ openingStartedAt: null, path: null, expectedSeconds: null, milestones: [], transition: null });
+        expect(describeProgress(C, placement({ state: 'STOPPED' }), null, env, at(0))).toMatchObject({ openingStartedAt: null, path: null, expectedSeconds: null, milestones: [], transition: null });
+    });
+    // Round 6 (R3-4, live 10-30 05:43Z): Code opened on a RUNNING computer showed "usually about 4 min" (the
+    // client's 240 s cold fallback) because nothing was expected. A running computer with nothing opening has one
+    // wait left, an app connecting, and says so through the same field: no opening record, no new DTO field.
+    it('RUNNING with nothing opening: a connect expectation under a minute, through expectedSeconds only', () => {
+        const running = describeProgress(C, placement(), null, env, at(0));
+        expect(running).toMatchObject({ operation: 'none', stage: 'running', active: false, openingStartedAt: null, path: null,
+            expectedSeconds: APP_CONNECT_EXPECTED_SECONDS, milestones: [], transition: null });
+        expect(APP_CONNECT_EXPECTED_SECONDS).toBeGreaterThan(0);
+        expect(APP_CONNECT_EXPECTED_SECONDS).toBeLessThan(60);
+        expect(running.typicalSeconds).toBeNull();
+        expect(Object.keys(running).sort()).toEqual(Object.keys(describeProgress(C, placement({ state: 'STOPPED' }), null, env, at(0))).sort());
+        // Not while paused, a settled transition shown on a running computer keeps it, an in-flight one is an opening.
+        expect(describeProgress(C, placement(), null, { ...env, EZIL_AWS_KILL_SWITCH: '1' }, at(0)).expectedSeconds).toBeNull();
+        expect(describeProgress(C, placement({ leaseEpoch: 8, instanceType: 'm6i.2xlarge' }), null, env, at(60), null,
+            { transition: transitionView(transition(), { phase: 'done', reason: null }) }).expectedSeconds).toBe(APP_CONNECT_EXPECTED_SECONDS);
+        expect(describeProgress(C, placement(), null, env, at(10), null, { transition: transitionView(transition(), { phase: 'stopping', reason: null }) }))
+            .toMatchObject({ operation: 'opening', stage: 'switching' });
+        expect(describeProgress(C, placement(), null, env, at(10), null, { transition: transitionView(transition(), { phase: 'stopping', reason: null }) }).expectedSeconds)
+            .not.toBe(APP_CONNECT_EXPECTED_SECONDS);
+        for (const state of ['STOPPED', 'STARTING', 'STOPPING', 'UNCONFIRMED'] as const) {
+            expect(describeProgress(C, placement({ state }), null, env, at(0)).expectedSeconds, state).not.toBe(APP_CONNECT_EXPECTED_SECONDS);
+        }
     });
 });
 function nonceIn(s: number) { return new Date(T0.getTime() + s * 1000); }

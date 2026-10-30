@@ -46,6 +46,15 @@ export const OPENING_TYPICAL_SECONDS = 240;
 export const TYPICAL_SECONDS_MIN = 90;
 export const TYPICAL_SECONDS_MAX = 600;
 
+/**
+ * Round 6 (R3-4): what a RUNNING computer with nothing opening still waits for: an app connecting to it
+ * (Code's mint and frame confirm, a desktop re-attach). Measured live 10-30: mint 0.5-2 s, frame confirm
+ * ~6 s. Sent in the existing `expectedSeconds` so the shell shows a connect expectation instead of its
+ * 240 s cold-open fallback ("usually about 4 min" over a running computer). Deliberately not clamped to
+ * the 90-600 s opening band: a connect is not an opening.
+ */
+export const APP_CONNECT_EXPECTED_SECONDS = 30;
+
 export function openingTypicalSeconds(poolBootP90Minutes?: number | null): number {
     const measured = typeof poolBootP90Minutes === 'number' && Number.isFinite(poolBootP90Minutes) && poolBootP90Minutes > 0
         ? Math.round(poolBootP90Minutes * 60) : OPENING_TYPICAL_SECONDS;
@@ -112,6 +121,8 @@ export function describeProgress(computerId: string, placement: Placement | null
     const needsOperator = stage === 'failed_needs_operator' || (lifecycle === 'UNCONFIRMED' && !healing) || enrollmentExpired;
     // A cutoff must never be presented as active transfer. Keep recordedStage for diagnostics.
     const opening = (operation === 'opening' || operation === 'migration') && !paused && !needsOperator ? options.opening ?? null : null;
+    // Round 6 (R3-4): running with nothing opening, stopping or failed: only an app's connect is left.
+    const connecting = operation === 'none' && lifecycle === 'RUNNING' && !active && !relevantFailure && !paused && !needsOperator;
     return {
         version: 2 as const, computerId, observedAt: now.toISOString(), operation,
         stage: paused ? 'operations_paused' : needsOperator ? 'needs_operator' : transitionStage ?? (stage === 'requested' ? 'queued' : stage), recordedStage: stage,
@@ -128,7 +139,7 @@ export function describeProgress(computerId: string, placement: Placement | null
         openingStartedAt: opening?.startedAt ?? null,
         path: opening?.path ?? null,
         expectedSeconds: opening ? opening.path === 'migrate' ? transferProgress(migration, stage, false).typicalSeconds ?? expectedOpeningSeconds('cold', null)
-            : expectedOpeningSeconds(opening.path, options.warmMedianSeconds, options.warmAdopted) : null,
+            : expectedOpeningSeconds(opening.path, options.warmMedianSeconds, options.warmAdopted) : connecting ? APP_CONNECT_EXPECTED_SECONDS : null,
         milestones: opening ? OPENING_MILESTONES_V3.flatMap(key => opening.milestones[key] ? [{ key, at: opening.milestones[key]! }] : []) : [],
         transition: options.transition ?? null,
         selectedNextOpenHardware: selected ? { size: entitlement!.size!, vcpu: selected.vcpu, memoryGiB: selected.memoryGiB, effective: 'next_open' as const } : null,
