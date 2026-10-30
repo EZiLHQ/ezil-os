@@ -110,9 +110,10 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     // Round 6 (R4-05): credits kept from an earlier plan or period (a cancel keeps them until they expire), named and dated.
     const previous = ai?.previous && Number.isSafeInteger(ai.previous.remaining) && ai.previous.remaining > 0 && validDate(ai.previous.expiresAt) ? ai.previous : null;
     // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
-    // Round 6 (R1-10): the trial grant is said once, by the starter line when the server reports it.
+    // Round 6 (R1-10): the trial grant is said once, by the starter line when the server reports it. Review: and
+    // never beside a balance it does not explain (above the grant, or credits from a previous plan).
     const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
-        : grant.per === 'once' && !(starter > 0) ? `Includes ${grantLabel} one-time trial credits` : '' : '';
+        : grant.per === 'once' && !(starter > 0) && !aboveGrant && !previous ? `Includes ${grantLabel} one-time trial credits` : '' : '';
     const splitParts = aboveGrant && purchased > 0 && (starter ?? 0) + purchased + (previous?.remaining ?? 0) === balance ? { plan: starter ?? 0, extra: purchased } : null;
     const split = splitParts ? `${esc(creditsLabel(null, splitParts.plan))} from your plan + ${esc(creditsLabel(null, splitParts.extra))} extra` : '';
     const extras = [
@@ -157,8 +158,10 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     // 1-hour cut comes with a time). A clock time only within a day of the reading; a paid fair-use
     // deadline weeks away is no time "today".
     const deadline = summary?.computer?.activeDeadline;
-    const ends = validDate(deadline) && validDate(usage?.asOf) && Date.parse(deadline) - Date.parse(usage.asOf) <= 86_400_000
-        ? ` · ends ${timestamp(deadline, true)}` : '';
+    // Review: only while that time is still ahead of the reading (as the Computer tab); a passed deadline the
+    // per-minute sweep has not closed yet is no end to announce.
+    const ahead = validDate(deadline) && validDate(usage?.asOf) ? Date.parse(deadline) - Date.parse(usage.asOf) : null;
+    const ends = ahead !== null && ahead > 0 && ahead <= 86_400_000 ? ` · ends ${timestamp(deadline, true)}` : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
         : current.state === 'stale' || stale ? `${measuringLine(current.elapsedSeconds)}${ends}`

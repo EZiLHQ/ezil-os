@@ -321,6 +321,17 @@ const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_tim
 
 let summary = null;   // billing.summary (v3) or null when it cannot be read
 let usage = null;     // billing.usage of the main computer, read only under the Free hold (round 6), else null
+// Round 6 review: the last billing.summary / billing.usage request answers (an older answer never overwrites a newer one).
+let summarySeq = 0;
+let usageSeq = 0;
+// Round 6 review (CR-2): the summary's session deadline belongs to the session running when it was read. A poll
+// that sees the computer not running retires it until the next read; a running capped session with no deadline
+// yet (its epoch opens just after RUNNING) is asked again, at most this many times.
+let deadlineStale = false;
+let staleAfter = 0;   // only a summary requested after this `summarySeq` retires `deadlineStale`
+let deadlineRetries = 0;
+const DEADLINE_RETRIES = 2;
+let sawRunning = null; // the last poll's running state (null before the first)
 // computer.progress of the main computer, AS READ DURING THIS ACTIVATION. Follow-up r5
 // (ACCEPT-9a755827 FINDING 2): it is cleared whenever a window or the tab goes away and only
 // rendered when `progressGen` matches the current activation, so a reopen never paints the
@@ -434,7 +445,7 @@ export function monthLeft (period) {
  * pending click). Pure, so the states are unit-tested without a DOM.
  * `usage` is `billing.usage` (read only under the hold, for the hours left); `now` dates the deadline.
  */
-export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false, stopping = false, usage = null, now = Date.now() }) {
+export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false, stopping = false, usage = null, now = Date.now(), deadlineStale = false }) {
     // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
     // plan-only model. The plan block may still describe a past_due paid subscription after grace.
     const standing = standingOf(data);
@@ -490,10 +501,12 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
     const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
     // Round 6 (CR-2): a capped session (Free, and the hold's 1 hour) says when it ends, from the summary's
-    // deadline, only while it runs and only while that time is still ahead.
+    // deadline, only while it runs and only while that time is still ahead. Review: never a deadline read for an
+    // earlier session (`deadlineStale`: the computer was seen not running since that read).
     const cap = data?.computer?.sessionMaxSeconds;
     const deadline = data?.computer?.activeDeadline;
-    const sessionEnds = running && ! stopping && Number.isFinite(cap) && cap > 0 && Number.isFinite(Date.parse(deadline ?? '')) && Date.parse(deadline) > now ? deadline : null;
+    const sessionEnds = running && ! stopping && ! deadlineStale && Number.isFinite(cap) && cap > 0
+        && Number.isFinite(Date.parse(deadline ?? '')) && Date.parse(deadline) > now ? deadline : null;
     // Round 6 (R1-08): the hold's limits in numbers ("Free sessions last 1 hour · About 5 of 8 hours left this month").
     const capHours = Number.isFinite(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
     const holdLine = held && ! heldClosed && capHours ? [`Free sessions last ${capHours} hour${capHours === 1 ? '' : 's'}`, monthLeft(usage?.period)].filter(Boolean).join(' · ') : null;
@@ -815,7 +828,7 @@ function webModel () {
     if ( t && IN_FLIGHT.has(t.phase) ) seenInFlight.add(t.transitionId);
     return computerModel({ computer, data: summary, prog,
         pending: pendingSwitch?.computerId === computer.id ? pendingSwitch : null,
-        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true, stopping: stopBusy,
+        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true, stopping: stopBusy, deadlineStale,
         usage: usage?.session?.computerId == null || usage.session.computerId === computer.id ? usage : null });
 }
 
@@ -835,7 +848,8 @@ function schedulePoll ($win) {
     clearTimeout(pollTimer);
     pollTimer = null;
     if ( ! paneActive || isNative() ) return;
-    const fast = pendingSwitch || inFlight(progress) || progress?.operation === 'opening' || progress?.operation === 'stopping' || stopBusy;
+    const fast = pendingSwitch || inFlight(progress) || progress?.operation === 'opening' || progress?.operation === 'stopping' || stopBusy
+        || awaitingDeadline(); // round 6 review: a just-started capped session's deadline is asked again soon
     pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : 20000);
 }
 
@@ -845,9 +859,32 @@ function billingOn () {
 }
 
 async function readSummary () {
+    const seq = ++summarySeq;
     if ( ! billingOn() ) { summary = null; return; }
     const res = await trpc.query('billing.summary').catch(() => ({ ok: false }));
+    if ( seq !== summarySeq ) return; // a newer read answers
     summary = res?.ok && res.data?.enabled === true && res.data.version === 3 ? res.data : null;
+    if ( seq > staleAfter ) deadlineStale = false;
+}
+
+/**
+ * Round 6 review (CR-2): what one progress poll re-reads, from the running state it saw and the summary it holds.
+ * Pure, so the session edges are unit-tested without a DOM.
+ * - Not running: the deadline is retired (`stale`) and the re-reads re-armed; a held session that just ended
+ *   re-reads the hold's hours left.
+ * - Running and capped: a retired deadline (the session started) re-reads the summary, and under the hold the
+ *   hours; a deadline still missing (its epoch opens just after RUNNING) is asked again while re-reads are left.
+ */
+export function sessionReads ({ runningNow, sawRunning, held, capped, hasDeadline, stale, retries }) {
+    if ( ! runningNow ) return { summary: false, usage: sawRunning === true && held, retries: DEADLINE_RETRIES };
+    if ( capped && (stale || (! hasDeadline && retries > 0)) ) return { summary: true, usage: held, retries: stale ? retries : retries - 1 };
+    return { summary: false, usage: false, retries };
+}
+
+/** Round 6 review (CR-2): a running capped session whose deadline has not been read yet, with re-reads left. */
+function awaitingDeadline () {
+    return sawRunning === true && deadlineRetries > 0 && Number.isFinite(summary?.computer?.sessionMaxSeconds)
+        && (deadlineStale || ! summary.computer.activeDeadline);
 }
 
 /**
@@ -855,9 +892,11 @@ async function readSummary () {
  * is a read-only meter (no side effects), scoped to the main computer like the Usage tab's read.
  */
 async function readUsage () {
+    const seq = ++usageSeq;
     const computer = mainComputer();
     if ( ! billingOn() || standingOf(summary) !== 'files_on_aws' || ! computer ) { usage = null; return; }
     const res = await trpc.query('billing.usage', { computerId: computer.id }).catch(() => ({ ok: false }));
+    if ( seq !== usageSeq ) return; // a newer read answers
     usage = res?.ok && res.data?.enabled === true && res.data.period?.unit === 'standard_seconds' ? res.data : null;
 }
 
@@ -869,7 +908,6 @@ async function refreshProgress ($win) {
     if ( ! computer || ! paneActive ) { schedulePoll($win); return; }
     const mine = generation;
     const before = transitionOf(currentProgress(computer));
-    const lifeBefore = currentProgress(computer)?.lifecycleState;
     const res = await trpc.query('computer.progress', { computerId: computer.id }).catch(() => ({ ok: false }));
     if ( mine !== generation ) return;
     if ( res?.ok && res.data ) {
@@ -883,12 +921,21 @@ async function refreshProgress ($win) {
             clearSwitchRequestId(computer.id, t.target);
             if ( before && IN_FLIGHT.has(before.phase) && before.transitionId === t.transitionId ) await readSummary();
         }
-        // Round 6 (CR-2): a held session that started while this pane was open has a new deadline and new
-        // hours left; read them once when this activation sees the computer start running.
-        if ( typeof lifeBefore === 'string' && lifeBefore !== 'RUNNING' && progress.lifecycleState === 'RUNNING' && standingOf(summary) === 'files_on_aws' ) {
-            await readSummary();
-            await readUsage();
-        }
+        // Round 6 (CR-2) + review: a capped session's deadline (and, under the hold, the hours left) belongs to
+        // the session it was read for. Seeing the computer not running retires the deadline (and re-reads the
+        // hold's hours after a session ends); the session starting re-reads both; a deadline still missing just
+        // after the start is asked again on the next polls (fast, at most DEADLINE_RETRIES).
+        const runningNow = webModel()?.running === true;
+        const step = sessionReads({ runningNow, sawRunning, held: standingOf(summary) === 'files_on_aws',
+            capped: Number.isFinite(summary?.computer?.sessionMaxSeconds), hasDeadline: !! summary?.computer?.activeDeadline,
+            stale: deadlineStale, retries: deadlineRetries });
+        deadlineRetries = step.retries;
+        // A summary already in flight may still describe the session that ended: only a later one retires this.
+        if ( ! runningNow ) { deadlineStale = true; staleAfter = summarySeq; }
+        if ( step.summary ) await readSummary();
+        if ( step.usage ) await readUsage();
+        if ( mine !== generation ) return;
+        sawRunning = runningNow;
     }
     if ( mine !== generation ) return;
     if ( ! editingId ) render($win); // never repaint over a rename in progress
@@ -1172,6 +1219,8 @@ async function load ($win) {
     // Follow-up r5 (ACCEPT-9a755827 FINDING 2): asked TOGETHER, so the lifecycle is
     // unknown for one progress request, not for list + the slow summary + progress.
     const mine = ++generation;
+    // Round 6 review: this activation's own view of the session (the deadline re-reads start afresh).
+    sawRunning = null; deadlineRetries = DEADLINE_RETRIES;
     // Round 6: the hold's hours left (billing.usage) once the summary says the files are held.
     await Promise.all([readSummary().then(readUsage), refreshProgress($win)]);
     if ( mine !== generation ) return;

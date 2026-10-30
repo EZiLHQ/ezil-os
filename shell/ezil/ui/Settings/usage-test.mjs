@@ -34,7 +34,9 @@ check('render uses server grants, decimal storage and Billing deep links', () =>
     assert.match(html, /Your plan adds 200 every month/);
     assert.match(html, /903 MB left/);
     assert.match(html, /1\.1 GB used of your 2 GB disk/);
-    assert.match(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' } } }), /Includes 73 one-time trial credits/);
+    assert.match(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' }, balance: 50 } }), /Includes 73 one-time trial credits/);
+    // Round 6 review (R1-10): above the trial grant (120 of 73) the note would not explain the balance, so it is not said.
+    assert.doesNotMatch(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' } } }), /one-time trial credits/);
 });
 check('render keeps null sources honest and escapes plan names', () => {
     assert.match(usageHtml(null, summary), /Not measured yet/);
@@ -333,6 +335,15 @@ check('round 6: AI credits on Free after a cancel — no full bar, the 100 said 
     // Spent or unknown: no line.
     for (const previous of [null, undefined, { remaining: 0, expiresAt: '2026-11-30T12:00:00Z' }, { remaining: 5, expiresAt: 'soon' }])
         assert.doesNotMatch(rendered(heldUsage, { ...heldSummary, ai: { ...heldSummary.ai, previous } }).textContent, /previous plan|Invalid|undefined/);
+    // Review: the starter spent (no starter bucket) beside 663 from the previous plan — the 100 are not in this
+    // balance, so no "one-time trial credits" note; nor above the grant from purchases alone.
+    for (const ai of [{ ...heldSummary.ai, balance: 663, starter: null }, { ...heldSummary.ai, balance: 500, starter: null, previous: null,
+        purchased: { remaining: 500, expiresAt: '2027-10-01T00:00:00Z' } }]) {
+        const spent = meter(rendered(heldUsage, { ...heldSummary, ai }), 'ai');
+        assert.doesNotMatch(spent.textContent, /one-time trial credits|\b100\b/, spent.textContent);
+        assert.deepEqual(scanCopy(spent.textContent), []);
+    }
+    assert.match(meter(rendered(heldUsage, { ...heldSummary, ai: { ...heldSummary.ai, balance: 663, starter: null } }), 'ai').textContent, /663 from your previous plan/);
     // Under the trial grant the bar stays, against the 100.
     const trial = rendered(heldUsage, { ...heldSummary, ai: { ...heldSummary.ai, balance: 60, starter: { remaining: 60 }, previous: null } });
     assert.equal(progress(trial, 'ai').getAttribute('aria-valuenow'), '60');
@@ -348,6 +359,11 @@ check('round 6 (CR-2): a stale hold session still says when it ends; a far-off p
     assert.match(meter(el, 'session').textContent, new RegExp(`Measuring this session… · ends ${clock('2026-10-30T06:42:00Z')}`));
     assert.match(meter(rendered({ ...heldUsage, session: { ...heldUsage.session, state: 'recording', elapsedSeconds: 120 } }, heldSummary), 'session').textContent,
         new RegExp(`running · ends ${clock('2026-10-30T06:42:00Z')}`));
+    // Review: a deadline the reading is already past (the sweep has not closed the epoch yet) is no end to announce.
+    for (const state of ['stale', 'recording']) {
+        const late = rendered({ ...heldUsage, asOf: '2026-10-30T07:05:00Z', session: { ...heldUsage.session, state, elapsedSeconds: 600 } }, heldSummary);
+        assert.doesNotMatch(meter(late, 'session').textContent, /ends/, state);
+    }
     // Ended: no deadline.
     assert.doesNotMatch(meter(rendered({ ...heldUsage, session: { ...heldUsage.session, state: 'ended', endedAt: '2026-10-30T06:42:00Z' } }, heldSummary), 'session').textContent, /ends \d/);
     // A paid fair-use deadline days away is not a clock time today.

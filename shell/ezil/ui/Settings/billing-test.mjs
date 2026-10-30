@@ -1008,6 +1008,11 @@ try {
         contains('[data-role="meter-ai"]', '100 starter credits left');
         contains('[data-role="meter-ai"]', '663 from your previous plan · expire Nov 30, 2026');
         assert.equal((q('[data-role="meter-ai"]').textContent.match(/\b100\b/g) ?? []).length, 1, 'the 100 starter credits are said once');
+        // Review: the starter spent beside the previous plan's 663 — "100 credits to start" would explain nothing in this balance.
+        Object.assign(summary.ai, { balance: 663, starter: null }); await refresh();
+        contains('[data-role="meter-ai"]', '663 from your previous plan');
+        assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /credits to start|\b100\b/);
+        Object.assign(summary.ai, { balance: 763, starter: { remaining: 100 } }); await refresh();
         contains('[data-role="meter-storage"]', '50 GB disk for your projects');
         contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
         assert.doesNotMatch(text(), banned); assert.doesNotMatch(text(), honestyBans); assert.doesNotMatch(text(), /mumbai/i);

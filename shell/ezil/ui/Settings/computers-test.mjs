@@ -425,8 +425,33 @@ check('Round 6: a Free session on Cloudflare also says when it ends; a paid sess
     const cf = { ...free(), computer: { ...free().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
     const model = computerModel({ computer: me, data: cf, prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true, now: HELD_NOW });
     assert.match(scan(computerHtml(model, null, [])), /data-role="session-ends"/);
+    // Review: a deadline read for an earlier session (the desktop was seen closed since) is never shown for a new one.
+    for ( const [data, prog, streaming] of [[cf, { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, true], [heldData(), running(), false]] ) {
+        const stale = computerModel({ computer: me, data, prog, streaming, usage: heldUsage, now: HELD_NOW, deadlineStale: true });
+        assert.equal(stale.sessionEnds, null);
+        assert.doesNotMatch(scan(computerHtml(stale, prog, [])), /data-role="session-ends"/);
+    }
     const paid = { ...premium(), computer: { ...premium().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
     assert.equal(computerModel({ computer: me, data: paid, prog: running(), now: HELD_NOW }).sessionEnds, null);
+});
+
+check('Round 6 review (CR-2): sessionReads — the session edges re-read the deadline and the hold\'s hours, bounded', () => {
+    const { sessionReads } = tab;
+    const base = { sawRunning: true, held: true, capped: true, hasDeadline: true, stale: false, retries: 0 };
+    // Not running: nothing read, the re-reads re-armed; a held session that just ended re-reads the hours left.
+    assert.deepEqual(sessionReads({ ...base, runningNow: false }), { summary: false, usage: true, retries: 2 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: false, sawRunning: false }), { summary: false, usage: false, retries: 2 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: false, held: false }), { summary: false, usage: false, retries: 2 });
+    // The session started (deadline retired): the summary, and under the hold the hours; no retry spent.
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, sawRunning: false, stale: true, retries: 2 }), { summary: true, usage: true, retries: 2 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, sawRunning: false, stale: true, held: false, retries: 2 }), { summary: true, usage: false, retries: 2 });
+    // Running with no deadline yet: asked again while re-reads are left, then never.
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, hasDeadline: false, retries: 2 }), { summary: true, usage: true, retries: 1 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, hasDeadline: false, retries: 1 }), { summary: true, usage: true, retries: 0 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, hasDeadline: false, retries: 0 }), { summary: false, usage: false, retries: 0 });
+    // A known deadline, or an uncapped (paid) session: nothing to read.
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, retries: 2 }), { summary: false, usage: false, retries: 2 });
+    assert.deepEqual(sessionReads({ ...base, runningNow: true, capped: false, stale: true, hasDeadline: false, retries: 2 }), { summary: false, usage: false, retries: 2 });
 });
 
 check('Round 4: after grace the plan block may still describe the past_due paid plan; the standing decides the card', () => {
@@ -747,6 +772,21 @@ if ( haveBundle ) {
         assert.equal(usageReads().length, before.usage + 1);
         assert.match(pane()?.querySelector('[data-role="session-ends"]')?.textContent ?? '', /^This session ends at .+\.$/);
         assert.ok(pane()?.querySelector('[data-action="open"]'));
+    });
+    // Review: a session whose deadline is not there yet (its epoch opens just after RUNNING) is asked again on
+    // fast polls, at most twice more, and never again after that.
+    data = heldData(); data.computer.activeDeadline = null;
+    progress = running('m6i.large', { lifecycleState: 'STARTING', operation: 'opening' });
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+    await settle(3);
+    click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+    await settle();
+    const late = summaryReads().length;
+    progress = running();
+    await settle(60, 200); // the opening poll (3 s), then two fast re-read polls (3 s each)
+    check('bundle: Round 6 review held: a deadline missing at the start is asked again twice (fast polls), then not again', () => {
+        assert.equal(summaryReads().length, late + 3);
+        assert.equal(pane()?.querySelector('[data-role="session-ends"]'), null);
     });
     progress = stoppedAws('m6i.xlarge');
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));

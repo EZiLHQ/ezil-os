@@ -340,8 +340,11 @@ function aiMeterV3 (summary) {
         pending && ! awaitingPayment ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
     ];
     // Round 6 (R1-10): the one-time starter grant is said once, by the starter line when the server reports it.
+    // Review: and never beside a balance it does not explain (above the grant, or credits from a previous plan),
+    // where "100 credits to start" would read as part of a balance that no longer holds them.
+    const beyondStarter = previous !== null || (grant !== null && typeof ai.balance === 'number' && Math.floor(ai.balance) > grant.amount);
     const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.`
-        : starter && starter.remaining > 0 ? '' : `${whole(grant.amount)} credits to start.` : '';
+        : (starter && starter.remaining > 0) || beyondStarter ? '' : `${whole(grant.amount)} credits to start.` : '';
     split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
