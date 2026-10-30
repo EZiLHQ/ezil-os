@@ -37,7 +37,7 @@ import type { PlacementDb, PlacementExecutor } from '@/server/lib/compute/placem
 import type { ComputeProvider, ComputerRef } from '@/server/lib/compute/provider';
 import { readComputerProgress } from '@/server/lib/compute/progress';
 import { readSystemInfo } from '@/server/lib/compute/system-info';
-import { restartWholeComputer, routeComputer, switchComputerConfiguration } from './compute-dispatch';
+import { restartWholeComputer, routeComputer, startReverseMove, switchComputerConfiguration } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
 import {
     createComputerInLowestFreeSlot,
@@ -275,6 +275,34 @@ export const computerRouter = createTRPCRouter({
             return restartWholeComputer(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId },
                 { requestId: input.requestId });
         }),
+
+    /**
+     * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §5.9): move a held Free user's files from the AWS computer to the Free
+     * (Cloudflare) computer. A NESTED router (`computer.move.start`, `computer.move.retry`), never flat names: the SDK's
+     * drift guard reads top-level procedures only. `start` answers the move that holds the computer, in any state; `retry`
+     * answers `move_in_progress` for it (the shell's Try again must stop calling `switchTo`). Every refusal is a value
+     * (`ComputerMoveStartOutputV3`); a computer that is not the caller's live computer is `move_not_held`.
+     */
+    move: createTRPCRouter({
+        start: protectedProcedure
+            .input(z.object({ computerId: z.string().uuid() }))
+            .mutation(async ({ ctx, input }) => {
+                const owned = await ctx.db.query.computers.findFirst({
+                    where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+                });
+                if (!owned) return { ok: false as const, reason: 'move_not_held' as const };
+                return startReverseMove(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId }, 'start');
+            }),
+        retry: protectedProcedure
+            .input(z.object({ computerId: z.string().uuid() }))
+            .mutation(async ({ ctx, input }) => {
+                const owned = await ctx.db.query.computers.findFirst({
+                    where: liveOwnedComputer(ctx.user.id, input.computerId), columns: { id: true },
+                });
+                if (!owned) return { ok: false as const, reason: 'move_not_held' as const };
+                return startReverseMove(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId }, 'retry');
+            }),
+    }),
 
     /** Rename a computer. Ownership-scoped. */
     rename: protectedProcedure

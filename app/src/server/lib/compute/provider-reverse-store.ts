@@ -241,8 +241,9 @@ export async function reverseMoveHolds(tx: PlacementExecutor, computerId: string
 }
 
 /** Whether the forward machine still has work for the computer: an active row, or a failed one whose
- * AWS provision is not released yet (exactly what forward claimStale still picks up). */
-async function forwardMoveBusy(tx: PlacementExecutor, computerId: string): Promise<boolean> {
+ * AWS provision is not released yet (exactly what forward claimStale still picks up). Exported for the triggers'
+ * own check (§5.9 step 5, the open trigger) as a plain read; the create repeats it under the computer lock. */
+export async function forwardMoveBusy(tx: PlacementExecutor, computerId: string): Promise<boolean> {
     return rows(await tx.execute(sql`SELECT 1 AS busy FROM public.ezil_compute_migrations
         WHERE computer_id = ${computerId}::uuid AND (state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
           OR (state IN ('failed_reopened', 'failed_needs_operator') AND workspace_head ? '_awsProvision'
