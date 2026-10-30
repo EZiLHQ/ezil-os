@@ -80,11 +80,13 @@ export interface AwsTunnelRecord {
   aiProxyNonce?: string;
   aiBootId?: string;
   /**
-   * The host boot whose RUNNING desktop was last pushed a config, and when (ms). The host applies
-   * it only by restarting the desktop, so later asks wait for that instead of pushing again
-   * (aws-ice.ts `ensureAwsDesktopConfig`).
+   * The host boot whose RUNNING desktop was last pushed a config, that config's expiry (which
+   * identifies it in the host's status) and when (ms). The host applies it only by restarting
+   * the desktop, so later asks wait for that instead of pushing again (aws-ice.ts
+   * `ensureAwsDesktopConfig`).
    */
   restartPushBootId?: string;
+  restartPushExpiresAt?: number;
   restartPushAt?: number;
 }
 

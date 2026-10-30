@@ -380,10 +380,10 @@ describe('ensureAwsDesktop: one config push per host boot while the host applies
     const ask = (at = now) => {
       now = at;
       return ensureAwsDesktop({ record: reg.rec, zone: ZONE, fetch: h.fetch, nowMs: () => now, neko: NEKO, mint: m.mint, aiConfig: ai,
-        restartPush: async (bootId) => {
+        restartPush: async (bootId, expiresAt) => {
           reg.writes += 1;
           if (reg.failWrite) throw new Error('registry down');
-          reg.rec = { ...reg.rec, restartPushBootId: bootId, restartPushAt: now };
+          reg.rec = { ...reg.rec, restartPushBootId: bootId, restartPushExpiresAt: expiresAt, restartPushAt: now };
         } });
     };
     const pushes = () => h.calls.filter((c) => c.path.startsWith('/__ezil/control/ice/')).length;
@@ -401,7 +401,7 @@ describe('ensureAwsDesktop: one config push per host boot while the host applies
     expect(h.st.config!.ai).toBeDefined();
     for (let i = 1; i <= 55; i++) expect(await o.ask(start + i * 2_000)).toEqual({ state: 'starting', reason: 'config_pending' });
     expect([o.pushes(), o.mints(), o.reg.writes]).toEqual([1, 1, 1]);
-    expect(o.reg.rec).toMatchObject({ restartPushBootId: BOOT, restartPushAt: start });
+    expect(o.reg.rec).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: h.st.expiresAt!, restartPushAt: start });
     // The restart applied it: ready, with no further push.
     h.st.aiConfigured = true;
     expect((await o.ask(NOW + 2_000)).state).toBe('ready');
@@ -418,13 +418,29 @@ describe('ensureAwsDesktop: one config push per host boot while the host applies
   });
   it('a push the host never applies within the bound is a coded failure, never an endless starting', async () => {
     const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false });
-    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushAt: NOW - AWS_DESKTOP_CONFIG_APPLY_MS + 1 });
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushExpiresAt: NOW + 1_700_000,
+      restartPushAt: NOW - AWS_DESKTOP_CONFIG_APPLY_MS + 1 });
     expect(await o.ask()).toEqual({ state: 'starting', reason: 'config_pending' });
     await expect(o.ask(NOW + 1)).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied', status: 502 });
     expect([o.pushes(), o.mints()]).toEqual([0, 0]);
     // The bound sits inside the shell's 215 s wake deadline, so the waiting open receives the code.
     expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeGreaterThanOrEqual(120_000);
     expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeLessThan(215_000);
+  });
+  it('another fresh config held instead of the recorded one (the Restart route staged it) gets its own bound, with no push', async () => {
+    const h = fakeHost({ configured: true, expiresAt: NOW + 1_650_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false });
+    // Our recorded push is long past its bound, but the host now holds another config.
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushExpiresAt: NOW + 1_000_000,
+      restartPushAt: NOW - 2 * AWS_DESKTOP_CONFIG_APPLY_MS });
+    expect(await o.ask()).toEqual({ state: 'starting', reason: 'config_pending' });
+    expect([o.pushes(), o.mints(), o.reg.writes]).toEqual([0, 0, 1]);
+    expect(o.reg.rec).toMatchObject({ restartPushExpiresAt: NOW + 1_650_000, restartPushAt: NOW });
+    expect(await o.ask(NOW + 2_000)).toEqual({ state: 'starting', reason: 'config_pending' });
+    expect(o.reg.writes).toBe(1);
+    // Its own bound: the adopted record ends in the coded failure once that config sits unapplied as long.
+    const later = opener(h, { ...o.reg.rec, restartPushAt: NOW - AWS_DESKTOP_CONFIG_APPLY_MS });
+    await expect(later.ask()).rejects.toMatchObject({ code: 'aws_desktop_config_unapplied' });
+    expect(o.pushes()).toBe(0);
   });
   it('a recorded push whose config the host no longer holds (expired) is a past episode: push again, never the terminal code', async () => {
     // e.g. the desktop crashed long after the first push and restarted without a relay once its config expired.
@@ -511,7 +527,7 @@ describe('handleAwsPreview: the Code and app surfaces never wait on the desktop'
     const tasks: Promise<unknown>[] = [];
     const seen = { desktop: 0, probes: 0 };
     const params = (r: AwsTunnelRecord) => ({ record: r, zone: ZONE, fetch: h.fetch, nowMs: () => NOW, neko: NEKO, mint: mintOk().mint, aiConfig: ai,
-      restartPush: async (bootId: string) => { rec = { ...rec, restartPushBootId: bootId, restartPushAt: NOW }; } });
+      restartPush: async (bootId: string, expiresAt: number) => { rec = { ...rec, restartPushBootId: bootId, restartPushExpiresAt: expiresAt, restartPushAt: NOW }; } });
     const deps = {
       zone: ZONE, secrets: ['s3cr3t'], zoneRoot: 'preview.example.org', lookup: async () => rec,
       verifyOrigin: async () => 'verified' as const, nowMs: () => NOW, surface,

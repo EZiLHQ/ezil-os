@@ -340,14 +340,15 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       await deps.storage.put(RECORD_KEY, { ...rec, aiBootId: bootId, aiProxyNonce: nonce });
       return nonce;
     }),
-    // Internal Worker RPC only. A config pushed to the RUNNING desktop of this host boot: the
-    // host applies it only by restarting the desktop, so the open path waits instead of
-    // pushing again (aws-ice.ts ensureAwsDesktopConfig). Same epoch checks as aiNonce.
-    restartPush: (generation: number, leaseEpoch: number, bootId: string): Promise<boolean> => serial(async () => {
-      if (!/^[0-9a-f-]{36}$/.test(bootId)) return false;
+    // Internal Worker RPC only. A config held for the RUNNING desktop of this host boot (its
+    // expiry identifies it): the host applies it only by restarting the desktop, so the open
+    // path waits instead of pushing again (aws-ice.ts ensureAwsDesktopConfig). Same epoch
+    // checks as aiNonce.
+    restartPush: (generation: number, leaseEpoch: number, bootId: string, expiresAt: number): Promise<boolean> => serial(async () => {
+      if (!/^[0-9a-f-]{36}$/.test(bootId) || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) return false;
       const rec = await liveRecord();
       if (!rec || rec.generation !== generation || rec.leaseEpoch !== leaseEpoch) return false;
-      await deps.storage.put(RECORD_KEY, { ...rec, restartPushBootId: bootId, restartPushAt: now() });
+      await deps.storage.put(RECORD_KEY, { ...rec, restartPushBootId: bootId, restartPushExpiresAt: expiresAt, restartPushAt: now() });
       return true;
     }),
     // Keep unverified records available to the open path's explicit verdict check.
@@ -529,8 +530,8 @@ export class AwsTunnelRegistry {
       return reply({ status: nonce ? 200 : 409, body: { nonce } });
     }
     if (request.method === 'POST' && path === REGISTRY_PATHS.restartPush) {
-      const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string };
-      const recorded = await this.service.restartPush(b.generation, b.leaseEpoch, b.bootId);
+      const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string; expiresAt: number };
+      const recorded = await this.service.restartPush(b.generation, b.leaseEpoch, b.bootId, b.expiresAt);
       return reply({ status: recorded ? 200 : 409, body: { recorded } });
     }
     if (request.method === 'GET' && path === REGISTRY_PATHS.get) {

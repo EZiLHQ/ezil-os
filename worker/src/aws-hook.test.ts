@@ -21,7 +21,7 @@ import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-ori
 import { AwsTunnelRegistry, verifyAwsTunnelOrigin, type TunnelStorage } from './aws-tunnels';
 import { deriveNekoCredentials, hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { deriveAiProxyToken } from './ai-proxy';
-import { sha256Hex } from './aws-ice';
+import { AWS_DESKTOP_CONFIG_APPLY_MS, sha256Hex } from './aws-ice';
 import { relayExpiryFor } from './relay-refresh';
 
 const worker = (await import('./index')).default;
@@ -709,6 +709,45 @@ describe('AWS Code surface through the hook', () => {
       log.mockRestore();
     }
     expect(host.bad).toEqual([]);
+  });
+});
+
+describe('AWS desktop config push bound through the hook', () => {
+  it('a push never applied ends in aws_desktop_config_unapplied; a Restart then waits for its own config instead of failing', async () => {
+    const t0 = 1_800_000_000_000;
+    const now = spyOn(Date, 'now').mockReturnValue(t0);
+    try {
+      const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+      await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+      const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied',
+        aiConfigured: false });
+      const ask = async () => {
+        const r = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+        return [r.status, await r.json()];
+      };
+      const pending = [503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }];
+      const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+      expect(await ask()).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pushed' }]);
+      now.mockReturnValue(t0 + AWS_DESKTOP_CONFIG_APPLY_MS - 1_000);
+      expect(await ask()).toEqual(pending);
+      now.mockReturnValue(t0 + AWS_DESKTOP_CONFIG_APPLY_MS);
+      expect(await ask()).toEqual([502, { ok: false, error: 'aws_desktop_config_unapplied' }]);
+      expect(pushes()).toBe(1);
+      // The user's Restart stages its own fresh config and asks the host to restart the desktop:
+      // the next opens wait for that restart (no push of ours to re-arm it), they do not fail.
+      const restart = await worker.fetch(await signed('POST', `/sandbox/${SID}/restart`, JSON.stringify({ requestId: 'b'.repeat(64) })), e);
+      expect(restart.status).toBe(202);
+      expect(pushes()).toBe(2);
+      expect(await ask()).toEqual(pending);
+      now.mockReturnValue(t0 + 2 * AWS_DESKTOP_CONFIG_APPLY_MS - 1_000);
+      expect(await ask()).toEqual(pending);
+      expect(pushes()).toBe(2);
+      host.aiConfigured = true;
+      expect((await ask())[0]).toBe(200);
+      expect(host.bad).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 

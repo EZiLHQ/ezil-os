@@ -386,15 +386,16 @@ export interface AwsDesktopParams {
   mint: RelayMint;
   aiConfig?: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
   /**
-   * Records, on the tunnel record, a push to the RUNNING desktop of this host boot. The next
-   * asks read it back (`record.restartPushBootId`/`restartPushAt`) and wait instead of pushing.
+   * Records, on the tunnel record, a config held for the RUNNING desktop of this host boot (its
+   * expiry identifies it) and when. The next asks read it back (`record.restartPush*`) and wait
+   * instead of pushing.
    */
-  restartPush?: (bootId: string) => Promise<void>;
+  restartPush?: (bootId: string, expiresAt: number) => Promise<void>;
   budgetMs?: number;
 }
 
 /** Mint once and push this epoch's config (with Chat's AI config when the host reports its boot). */
-async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus): Promise<AwsDesktopStarting> {
+async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus): Promise<{ answer: AwsDesktopStarting; expiresAt: number }> {
   const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
   if (!minted) throw new RelayFailure('turn_unavailable');
   const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
@@ -410,7 +411,7 @@ async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus):
     if (body.error === 'desktop_restart_exhausted') throw new RelayFailure('aws_desktop_failed', 502);
     throw new RelayFailure(typeof body.error === 'string' && /^[a-z_]{1,64}$/.test(body.error) ? body.error : 'aws_desktop_config_refused', 502);
   }
-  return { state: 'starting', reason: body.state === 'restart_scheduled' ? 'restart_scheduled' : 'config_pushed' };
+  return { answer: { state: 'starting', reason: body.state === 'restart_scheduled' ? 'restart_scheduled' : 'config_pushed' }, expiresAt: config.expiresAt };
 }
 
 /**
@@ -422,9 +423,12 @@ async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus):
  *     AI env) -> the host can apply a config only by restarting the desktop, and every push
  *     re-arms that restart (agent.py `_accept_relay`): on 10-30 a push on every ~2 s ask kept a
  *     computer's desktop restarting and its Code waiting ~2 min. So push ONCE per host boot and
- *     record it (`restartPush`); later asks answer `config_pending` with no mint and no push,
- *     and a push still unapplied after AWS_DESKTOP_CONFIG_APPLY_MS fails with
- *     `aws_desktop_config_unapplied`, never an endless `starting`. A host that reports no boot
+ *     record it (`restartPush`); while the host holds exactly that config, later asks answer
+ *     `config_pending` with no mint and no push, and one still unapplied after
+ *     AWS_DESKTOP_CONFIG_APPLY_MS fails with `aws_desktop_config_unapplied`, never an endless
+ *     `starting`. Another fresh config held instead (the Restart route stages its own, with its
+ *     own restart) is recorded in its place and gets its own bound, again without a push. A
+ *     record whose config expired is an earlier episode: push anew. A host that reports no boot
  *     id (an older AMI) keeps the push on every ask;
  *   - the desktop is not running yet and holds a fresh config: `starting` (no mint).
  *     `config_pending` when the AI config still waits for it (this boot's Chat nonce is minted,
@@ -440,25 +444,28 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
   const fresh = status.configured && status.expiresAt !== null && status.expiresAt > now + RELAY_MIN_AHEAD_MS;
   const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
   const needsAi = !!(p.aiConfig && status.bootId && !status.aiConfigured);
-  if (!running && (!fresh || stalled)) return pushDesktopConfig(p, status);
+  if (!running && (!fresh || stalled)) return (await pushDesktopConfig(p, status)).answer;
   if (running && (status.ice !== 'applied' || needsAi)) {
     const boot = status.bootId;
-    if (!boot || !p.restartPush) return pushDesktopConfig(p, status);
-    const { restartPushBootId, restartPushAt } = p.record;
-    // Pending only while the host still holds a fresh config: one it no longer holds (expired)
-    // belongs to an earlier episode of this boot, so this one gets its own push.
+    if (!boot || !p.restartPush) return (await pushDesktopConfig(p, status)).answer;
+    const { restartPushBootId, restartPushAt, restartPushExpiresAt } = p.record;
     if (fresh && restartPushBootId === boot && typeof restartPushAt === 'number') {
+      if (status.expiresAt !== restartPushExpiresAt) {
+        // The record's lost, failed or replaced push (e.g. by the Restart route) is not the held one.
+        await p.restartPush(boot, status.expiresAt!).catch(() => undefined);
+        return { state: 'starting', reason: 'config_pending' };
+      }
       if (now - restartPushAt >= AWS_DESKTOP_CONFIG_APPLY_MS) throw new RelayFailure('aws_desktop_config_unapplied', 502);
       return { state: 'starting', reason: 'config_pending' };
     }
     const pushed = await pushDesktopConfig(p, status);
     // A lost record costs at most another push on the next ask (today's behaviour), never this open.
-    await p.restartPush(boot).catch(() => undefined);
-    return pushed;
+    await p.restartPush(boot, pushed.expiresAt).catch(() => undefined);
+    return pushed.answer;
   }
   if (!running) {
     if (!needsAi) return { state: 'starting', reason: 'desktop_starting' };
-    return p.record.aiBootId === status.bootId ? { state: 'starting', reason: 'config_pending' } : pushDesktopConfig(p, status);
+    return p.record.aiBootId === status.bootId ? { state: 'starting', reason: 'config_pending' } : (await pushDesktopConfig(p, status)).answer;
   }
   return { state: 'applied' };
 }

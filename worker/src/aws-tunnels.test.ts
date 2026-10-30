@@ -418,13 +418,15 @@ describe('restartPush (the open path\'s once-per-boot config push to a running d
     const svc = createAwsTunnelService({ api: fakeApi().api, storage: s, zone: ZONE, nowMs: () => t });
     expect((await svc.create(claims(), body())).status).toBe(200);
     t = 5_000;
-    expect(await svc.restartPush(1, 2, BOOT)).toBe(true);
-    expect(s.map.get('tunnel')).toMatchObject({ restartPushBootId: BOOT, restartPushAt: 5_000, leaseEpoch: 2 });
-    for (const [g, e, b] of [[1, 3, BOOT], [2, 2, BOOT], [1, 2, 'not-a-boot']] as const) expect(await svc.restartPush(g, e, b)).toBe(false);
+    expect(await svc.restartPush(1, 2, BOOT, 9_000_000)).toBe(true);
+    expect(s.map.get('tunnel')).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: 9_000_000, restartPushAt: 5_000, leaseEpoch: 2 });
+    for (const [g, e, b, x] of [[1, 3, BOOT, 1], [2, 2, BOOT, 1], [1, 2, 'not-a-boot', 1], [1, 2, BOOT, 0], [1, 2, BOOT, 1.5]] as const) {
+      expect(await svc.restartPush(g, e, b, x)).toBe(false);
+    }
     expect(s.map.get('tunnel')).toMatchObject({ restartPushAt: 5_000 });
     expect((await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
     expect((s.map.get('tunnel') as AwsTunnelRecord).restartPushBootId).toBeUndefined();
-    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT)).toBe(false);
+    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT, 1)).toBe(false);
   });
   it('the registry route answers 200 on a write and 409 for another epoch; lookups return the record with it', async () => {
     const reg = new AwsTunnelRegistry({ storage: memStorage() }, {
@@ -435,10 +437,10 @@ describe('restartPush (the open path\'s once-per-boot config push to a running d
     const create = await routeAwsTunnels('POST', claims(), body(), () => reg);
     expect(create.status).toBe(200);
     const push = (leaseEpoch: number) => reg.fetch(new Request('https://aws-tunnels/restart-push', {
-      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT }) }));
+      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT, expiresAt: 9_000_000 }) }));
     expect((await push(2)).status).toBe(200);
     expect((await push(9)).status).toBe(409);
-    expect(await lookupAwsTunnel(() => reg, SID)).toMatchObject({ restartPushBootId: BOOT });
+    expect(await lookupAwsTunnel(() => reg, SID)).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: 9_000_000 });
   });
 });
 

@@ -4381,12 +4381,12 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
   };
 }
 
-/** Records a config push to this epoch's RUNNING desktop for one host boot (aws-ice ensureAwsDesktopConfig). */
+/** Records the config held for this epoch's RUNNING desktop for one host boot (aws-ice ensureAwsDesktopConfig). */
 function awsRestartPush(env: Env, record: AwsTunnelRecord) {
   const registry = awsRegistryFor(env);
-  return async (bootId: string) => {
+  return async (bootId: string, expiresAt: number) => {
     await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.restartPush}`, {
-      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId }),
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId, expiresAt }),
     }));
   };
 }
