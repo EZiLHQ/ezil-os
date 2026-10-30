@@ -33,7 +33,7 @@ Parameters:
     Type: String
     Default: ''
     AllowedPattern: '(arn:aws:iam::452630323510:role/[A-Za-z0-9+=,.@_/-]+)?'
-    Description: Exact existing app-caller role; empty until the Mumbai lifecycle stack exists. No wildcard or account root.
+    Description: Exact existing app-caller role, or ''. Staging, the Mumbai lifecycle's caller; production, only arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller once the prd lifecycle stack exists. No wildcard or account root.
 Rules:
   ProductionUsesOnlyProductionResources:
     RuleCondition: !Equals [!Ref Environment, production]
@@ -44,8 +44,10 @@ Rules:
         AssertDescription: Production uses the prod subnet subnet-0e7c19ed848d0fcea.
       - Assert: !Equals [!Ref ArtifactBucket, ezil-main-prod-artifacts-452630323510-aps1]
         AssertDescription: Production uses ezil-main-prod-artifacts-452630323510-aps1, the only artifacts bucket its S3 endpoint allows.
-      - Assert: !Equals [!Ref AppCallerRoleArn, '']
-        AssertDescription: The only app-caller role is staging's (its trust requires ezil:env=billing-staging); production passes ''.
+      - Assert: !Or
+          - !Equals [!Ref AppCallerRoleArn, '']
+          - !Equals [!Ref AppCallerRoleArn, 'arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller']
+        AssertDescription: Production passes '' or exactly the prd app caller arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller (its trust requires ezil:env=production).
   StagingNeverUsesProductionResources:
     RuleCondition: !Equals [!Ref Environment, staging]
     Assertions:
@@ -55,6 +57,8 @@ Rules:
         AssertDescription: Staging never uses the prod subnet.
       - Assert: !Not [!Equals [!Ref ArtifactBucket, ezil-main-prod-artifacts-452630323510-aps1]]
         AssertDescription: Staging never uses a production bucket.
+      - Assert: !Not [!Equals [!Ref AppCallerRoleArn, 'arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller']]
+        AssertDescription: Staging never uses the production app caller.
 Mappings:
   # Staging values are the literals this template used before the Environment
   # parameter, so an existing staging stack resolves to identical resources.
@@ -270,7 +274,7 @@ Outputs:
     Description: DNS A record for os-staging.ezil.work (staging) or os-prod.ezil.work (production).
     Value: !Ref PublicIp
   InstanceRoleArn:
-    Description: Staging only, add this exact ARN to appCaller.ec2CallerRoleArns after host creation.
+    Description: Add this exact ARN to appCaller.ec2CallerRoleArns of this environment's lifecycle (staging, mum; production, prd with ec2CallerEnv production) after host creation.
     Value: !GetAtt InstanceRole.Arn
   AppSecurityGroupId:
     Description: Source SG for the separate DB ingress stack (db-access.yaml).

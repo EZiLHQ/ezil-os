@@ -188,7 +188,8 @@ and **wipes** the token.
 2. Host 1-minute load below 0.5, strictly parsed; an unknown load counts as busy.
 3. A **successful** flush. A dpkg/apt lock held in the guest (`busy`, detected host-side
    through `/proc/locks`) or a stale lease or fence (`stale`) blocks the stop and the
-   check repeats.
+   check repeats. The flush binds the guard's `guard-ok` stamp (the full committed
+   marker) to this lease by `generation` and `leaseEpoch`, as the guard's own check does.
 
 Then the agent marks `runDir/stopping` (so the desktop's `Restart=` cannot bring it back),
 stops the desktop, unmounts the overlay, syncs, unmounts the data volume and runs
@@ -589,6 +590,10 @@ directory, and it counts as killed only if the named check fails.
 | M53 | stop record written without the data volume mounted | `test-units`: refused, nothing written |
 | M54 | boot does not report `lastStop` | `test-units`: reported at boot |
 | M55 | `PROMPT_COMMAND` without `history -a` | `test-units`: open terminal appends each command |
+| M56 | flush requires an exact two-key `guard-ok` (G9: the guard stamps the full marker) | `test-units`: idle tick stops with `idle`, a requested stop flushes `ok` |
+| M57 | flush compares only one of generation/epoch, or no stamp check | `test-units`: another lease's stamp is `stale` and stops no desktop |
+| M58 | flush without the dict check | `test-units`: a non-object stamp is `stale`, not an agent crash |
+| M59 | `busy_load` returns silently | `test-units`: `idle stop blocked: busy_load load1=…` logged |
 
 `test/test_history_stop.py` (run by `test-units`) is unprivileged. Its history tests drive
 **real interactive bash shells on ptys**. There is a control showing that a plain shell
@@ -623,7 +628,10 @@ profile block. It fails against the pre-change script.
 - **Tunnel down.** Check `journalctl -u ezil-cloudflared`. A fence exit is final for that
   epoch; a new lease brings a new token.
 - **Stuck idle stop.** `journalctl -u ezil-agent` shows `flush=busy` while apt/dpkg runs in
-  the guest. Caps still stop the instance from the control plane.
+  the guest, or `busy_load load1=…` while the host load is at or above `load1Busy`.
+  A repeating `flush=stale` with no fence means the `guard-ok` stamp does not match the
+  lease (an agent older than the G9 fix rejects every full-marker stamp; rebake). Caps
+  still stop the instance from the control plane.
 
 ## Open items
 

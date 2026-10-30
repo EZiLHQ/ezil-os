@@ -9,10 +9,11 @@ fixture() {
     case_dir=$scratch/$1
     python3 "$here/fixture.py" "$case_dir" "$2"
 }
+ns=()
 run() {
     local expected=$1 script=$2; shift 2
     local actual=0
-    PATH="$case_dir/bin:$PATH" bash "$case_dir/checkout/deploy/aws/mum/$script" "$@" --release-dir "$case_dir/release" > "$case_dir/output" 2>&1 || actual=$?
+    PATH="$case_dir/bin:$PATH" bash "$case_dir/checkout/deploy/aws/mum/$script" "$@" "${ns[@]}" --release-dir "$case_dir/release" > "$case_dir/output" 2>&1 || actual=$?
     if [[ "$expected" == pass ]]; then [[ "$actual" == 0 ]]; else [[ "$actual" != 0 ]]; fi
 }
 check() { python3 "$here/assert.py" "$case_dir" "$1"; }
@@ -30,7 +31,33 @@ test_case() {
 if [[ "${1:-}" == --case ]]; then
     name=$2; scenario=$3; mode=$4
     fixture "$name" "$scenario"
+    # prd-<case>: the same scenario under --namespace prd (fixture.py renders prd names).
+    if [[ "$name" == prd-* ]]; then ns=(--namespace prd); name=${name#prd-}; fi
     case "$name" in
+        unpinned-promote|origin)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check "$mode"
+            check no-secret-write ;;
+        recovery-promote)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
+            check "$mode"
+            check no-secret-write
+            check no-lifecycle-publish
+            cmp "$case_dir/config.json" "$case_dir/original-config.json"
+            [[ ! -e "$case_dir/release/promotion.json" ]] ;;
+        manifest)
+            run fail promote-ami.sh --manifest "$case_dir/config.json" --apply
+            check "$mode" ;;
+        mum-config)
+            run fail promote-ami.sh --ami ami-22222222222222222 --config /root/ezil-aws-mum/config/lifecycle.mum.json --apply
+            check "$mode" ;;
+        unknown-ns)
+            run fail rebuild-ami.sh --namespace qa --desktop-image desktop:test --source-sha aaaaaaaa --apply
+            check "$mode"
+            [[ ! -s "$case_dir/calls.jsonl" ]] ;;
+        rebase-flags)
+            run fail rebuild-ami.sh --desktop-image desktop:test --source-sha aaaaaaaa --previous-desktop-image-ref x --previous-desktop-image-id y --apply
+            check "$mode" ;;
         foundation-readback-rollback)
             run fail promote-ami.sh --ami ami-22222222222222222 --config "$case_dir/config.json" --apply
             check foundation-stopped
@@ -218,10 +245,35 @@ test_case 'lifecycle parameter value drift refused' lifecycle-parameter '{"lifec
 test_case 'lifecycle resolved SSM value drift refused' lifecycle-ssm '{"lifecycle_change":"ssm"}' 'refuse-lifecycle parameter/resolved SSM change'
 test_case 'lifecycle incomplete change-set page refused' lifecycle-page '{"lifecycle_change":"page"}' 'refuse-incomplete change set'
 test_case 'lifecycle change-set property values checked' lifecycle-context '{"lifecycle_change":"context"}' 'refuse-lifecycle change-set values are not'
+# Namespace prd (production): the same flows under --namespace prd with the post-P4 pin
+# stand-ins; assert.py first proves no recorded call or output names a mum resource.
+P='"namespace":"prd","prd_pins":true'
+test_case 'prd rebuild dry-run sequence and zero mutations' prd-dry-rebuild "{$P}" dry-rebuild
+test_case 'prd all previous parameters and archive root preserved' prd-parameters "{$P}" parameters
+test_case 'prd polling/AVAILABLE path' prd-available "{$P,\"non_replacing_double\":true}" available
+test_case 'prd recipe version update proceeds' prd-recipe-allowed "{$P}" pass
+test_case 'prd promotion dry-run and latest published N+1' prd-dry-promote "{$P}" dry-promote
+test_case 'prd promotion edits only the production secret deployment' prd-promote "{$P,\"authority_origin\":\"https://os-prod.ezil.work\"}" promote
+test_case 'prd rollback restores previous AMI/template/workflow' prd-rollback "{$P}" rollback
+test_case 'prd promotion with recovery and no tuple refused before any write' prd-recovery-promote "{$P,\"recovery\":true}" 'refuse-cannot promote a lifecycle with recovery'
+test_case 'prd foundation launch-template identity refused' prd-foundation-identity "{$P,\"foundation_identity\":true}" no-foundation-execute
+test_case 'prd lifecycle Lambda code change refused' prd-lifecycle-template-code "{$P,\"lifecycle_template_change\":\"code\"}" 'refuse-unexpected lifecycle property'
+test_case 'prd unpinned rebuild refused before any AWS call' prd-unpinned '{"namespace":"prd"}' 'refuse-not pinned yet'
+test_case 'prd unpinned promotion refused before any AWS call' prd-unpinned-promote '{"namespace":"prd"}' 'refuse-not pinned yet'
+test_case 'prd pointed at mum stacks refused' prd-mum-data '{"prd_pins":true}' 'refuse-unexpected CloudFormation execution role'
+test_case 'prd AMI baked with the staging enroll URL refused' prd-enroll "{$P,\"enroll_url\":\"https://os-staging.ezil.work/api/compute/aws/enroll\"}" 'refuse-AMI enroll URL mismatch'
+test_case 'mum AMI with the production enroll URL refused' enroll-prod '{"enroll_url":"https://os-prod.ezil.work/api/compute/aws/enroll"}' 'refuse-AMI enroll URL mismatch'
+test_case 'prd lifecycle with the staging authority origin refused' prd-origin "{$P,\"authority_origin\":\"https://os-staging.ezil.work\"}" 'refuse-lifecycle authority origin mismatch'
+test_case 'mum lifecycle with the production authority origin refused' origin '{"authority_origin":"https://os-prod.ezil.work"}' 'refuse-lifecycle authority origin mismatch'
+test_case 'prd manifest (rebase) promotion refused' prd-manifest "{$P}" 'refuse-no rebase tuple'
+test_case 'prd rebase bake flags refused' prd-rebase-flags "{$P}" 'refuse-no rebase tuple'
+test_case 'prd never reads mum operator configs' prd-mum-config "{$P}" 'refuse-never reads mum operator configs'
+test_case 'unknown namespace refused before any AWS call' unknown-ns '{}' 'refuse-unknown namespace'
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/base-ami.py"
 python3 "$here/locking.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_namespace.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rebase.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rollout.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/registry_gc.py"

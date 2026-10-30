@@ -1,6 +1,6 @@
 """Offline checks for app-host.yaml and db-access.yaml per environment (no AWS calls).
 
-A small resolver evaluates Ref, FindInMap, Sub, If, Equals and Not with the
+A small resolver evaluates Ref, FindInMap, Sub, If, Equals, Not and Or with the
 parameters given, so the staging and production stacks can be compared as
 CloudFormation would see them, and the Rules can be exercised.
 """
@@ -15,6 +15,9 @@ PSEUDO = {"AWS::Partition": "aws", "AWS::Region": "ap-south-1", "AWS::AccountId"
 NO_VALUE = object()
 PROD_VPC, PROD_SUBNET = "vpc-040bdd6e09e35425f", "subnet-0e7c19ed848d0fcea"
 PROD_BUCKET, PROD_DB_SG = "ezil-main-prod-artifacts-452630323510-aps1", "sg-0f3151c94e0ed4ee6"
+# The prd lifecycle's caller: roleName ezil-prd-app-caller under the /ezil/prd/ workload path.
+PRD_CALLER = "arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller"
+MUM_CALLER = "arn:aws:iam::452630323510:role/ezil/mum/ezil-mum-lifecycle-AppCallerRoleEA1CB1F0-example"
 
 
 class Loader(yaml.SafeLoader):
@@ -90,6 +93,8 @@ class Resolver:
                 return left == right
             if key == "Fn::Not":
                 return not self.resolve(value[0])
+            if key == "Fn::Or":
+                return any(self.resolve(item) is True for item in value)
             if key == "Fn::If":
                 name, yes, no = value
                 return self.resolve(yes if self.condition(name) else no)
@@ -166,7 +171,12 @@ class AppHostTemplateTests(unittest.TestCase):
             "Production uses the prod VPC": {**PRODUCTION_HOST, "VpcId": "vpc-0f6bc19fdfd4209aa"},
             "Production uses the prod subnet": {**PRODUCTION_HOST, "SubnetId": "subnet-0dd4cf8f7d3d92e20"},
             "Production uses ezil-main-prod-artifacts": {**PRODUCTION_HOST, "ArtifactBucket": "ezil-preview-artifacts-example"},
-            "production passes ''": {**PRODUCTION_HOST, "AppCallerRoleArn": "arn:aws:iam::452630323510:role/caller"},
+            "Production passes '' or exactly the prd app caller": {**PRODUCTION_HOST, "AppCallerRoleArn": "arn:aws:iam::452630323510:role/caller"},
+            "Production passes '' or exactly the prd app caller (mum)": {**PRODUCTION_HOST, "AppCallerRoleArn": MUM_CALLER},
+            "Production passes '' or exactly the prd app caller (suffix)": {**PRODUCTION_HOST, "AppCallerRoleArn": PRD_CALLER + "x"},
+            "Production passes '' or exactly the prd app caller (path)": {**PRODUCTION_HOST,
+                "AppCallerRoleArn": "arn:aws:iam::452630323510:role/ezil-prd-app-caller"},
+            "Staging never uses the production app caller": {**STAGING_HOST, "AppCallerRoleArn": PRD_CALLER},
             "Staging never uses the prod VPC": {**STAGING_HOST, "VpcId": PROD_VPC},
             "Staging never uses the prod subnet": {**STAGING_HOST, "SubnetId": PROD_SUBNET},
             "Staging never uses a production bucket": {**STAGING_HOST, "ArtifactBucket": PROD_BUCKET},
@@ -175,11 +185,22 @@ class AppHostTemplateTests(unittest.TestCase):
             with self.subTest(message):
                 failed = Resolver(self.template, parameters).failed_rules()
                 self.assertEqual(len(failed), 1, failed)
-                self.assertIn(message, failed[0])
+                self.assertIn(message.split(" (")[0], failed[0])
         # Positive controls: each environment's own values pass.
         self.assertEqual(Resolver(self.template, PRODUCTION_HOST).failed_rules(), [])
+        self.assertEqual(Resolver(self.template, {**PRODUCTION_HOST, "AppCallerRoleArn": PRD_CALLER}).failed_rules(), [])
         self.assertEqual(Resolver(self.template, {**STAGING_HOST,
                          "AppCallerRoleArn": "arn:aws:iam::452630323510:role/caller"}).failed_rules(), [])
+
+    def test_production_with_the_prd_caller_changes_only_the_role_policy(self):
+        without = Resolver(self.template, PRODUCTION_HOST).resources()
+        with_caller = Resolver(self.template, {**PRODUCTION_HOST, "AppCallerRoleArn": PRD_CALLER}).resources()
+        policy, = with_caller["InstanceRole"]["Properties"]["Policies"]
+        self.assertEqual(policy["PolicyDocument"]["Statement"][-1],
+                         {"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": PRD_CALLER})
+        policy["PolicyDocument"]["Statement"].pop()
+        self.assertEqual(with_caller, without)
+        self.assertTrue(re.fullmatch(self.template["Parameters"]["AppCallerRoleArn"]["AllowedPattern"], PRD_CALLER))
 
     def test_bucket_pattern_admits_only_the_production_artifacts_bucket(self):
         pattern = self.template["Parameters"]["ArtifactBucket"]["AllowedPattern"]

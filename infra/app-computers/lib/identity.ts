@@ -10,15 +10,21 @@ import { ImageJobBoundary, imageJobBoundaryArn, imageJobRoleArns, imageJobRoleNa
  * bootstrap: the stack holds its own asset bucket, a scoped CloudFormation
  * execution role and the GitHub OIDC deploy role. Only workload roles carry
  * the boundary; identity roles retain the old denies as an attached policy. */
+const DEPLOY_SUBJECT = /^repo:[A-Za-z0-9_.-]{1,39}@\d{1,20}\/[A-Za-z0-9_.-]{1,100}@\d{1,20}:environment:(aws-[a-z0-9-]{1,40})$/;
+/** The GitHub deploy environment the deploy role trusts (the subject's pinned suffix). */
+export function deployEnvironment(c: { deploySubject: string }): string {
+    return DEPLOY_SUBJECT.exec(c.deploySubject)![1]!;
+}
 export const IdentityConfigSchema = z.object({
     namespace: NamespaceSchema,
     accountId: z.string().regex(/^\d{12}$/),
     region: z.string().regex(REGION_PATTERN),
     /** The account's existing GitHub OIDC provider (reused, not created). */
     githubOidcProviderArn: z.string(),
-    /** Immutable-ID subject, environment aws-pilot, e.g.
-     * repo:<org>@<orgId>/<repo>@<repoId>:environment:aws-pilot */
-    deploySubject: z.string().max(256).regex(/^repo:[A-Za-z0-9_.-]{1,39}@\d{1,20}\/[A-Za-z0-9_.-]{1,100}@\d{1,20}:environment:aws-pilot$/),
+    /** Immutable-ID subject of one GitHub deploy environment named `aws-<label>`,
+     * chosen per namespace (mum: aws-pilot; prd: aws-prd). Never a bare environment
+     * such as `production`. e.g. repo:<org>@<orgId>/<repo>@<repoId>:environment:aws-pilot */
+    deploySubject: z.string().max(256).regex(DEPLOY_SUBJECT),
     /** No dots: one DNS label, so virtual-host S3 URLs and TLS stay simple. */
     assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
     /** Founder-controlled §4 kill switch, enforced by the boundary and identity guardrails. */
@@ -373,7 +379,7 @@ export class DeployIdentityStack extends Stack {
             assumedBy: new iam.ServicePrincipal('cloudformation.amazonaws.com', { conditions: { StringEquals: { 'aws:SourceAccount': c.accountId } } }),
             inlinePolicies: { exec: new iam.PolicyDocument({ statements: execStatements(c) }) } });
         const deploy = new iam.Role(this, 'DeployRole', { roleName: n.deployRoleName, path: n.identityPath, managedPolicies: [guardrails],
-            maxSessionDuration: Duration.hours(1), description: 'GitHub OIDC deploy (environment aws-pilot): change sets via the execution role',
+            maxSessionDuration: Duration.hours(1), description: `GitHub OIDC deploy (environment ${deployEnvironment(c)}): change sets via the execution role`,
             assumedBy: new iam.FederatedPrincipal(c.githubOidcProviderArn, deployTrust(c).conditions, 'sts:AssumeRoleWithWebIdentity'),
             inlinePolicies: { deploy: new iam.PolicyDocument({ statements: deployStatements(c) }) } });
         new CfnOutput(this, 'BoundaryArn', { value: boundary.managedPolicyArn });

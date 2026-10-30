@@ -182,6 +182,11 @@ class ProductionEnvironmentTests(unittest.TestCase):
         renderer.validate({**self.values, "BILLING_FUNDING_URL": "https://ai.ezil.work"}, "production")
         self.assertRefused({**self.values, "BILLING_FUNDING_URL": "https://ai.ezil.work/"}, "BILLING_FUNDING_URL must be")
 
+    def test_staging_pins_funding_url(self):
+        staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+        renderer.validate({**staging, "BILLING_FUNDING_URL": "https://ai-staging.ezil.work"})
+        self.assertRefused({**staging, "BILLING_FUNDING_URL": "https://ai.ezil.work"}, "Staging BILLING_FUNDING_URL", "staging")
+
     def test_staging_refuses_production_values(self):
         staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
         renderer.validate(dict(staging))  # Positive control: the staging shape is unchanged.

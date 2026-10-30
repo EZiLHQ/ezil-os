@@ -29,6 +29,8 @@ const computer = { computerId: C, userId: U };
 const options = { sessionId: 'session', desktopMode: 'neko' } as const;
 const D = { ...fixtureDeployment('ap-south-1', ['t3a.medium', 'm6i.large', 'm6i.xlarge', 'm6i.2xlarge']), namespace: 'mum',
     stateMachineVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-mum-lifecycle:1' };
+const PRD = { ...D, namespace: 'prd', stateMachineVersionArn: D.stateMachineVersionArn.replace('mum', 'prd') };
+const PILOT = { ...D, namespace: 'pilot', stateMachineVersionArn: D.stateMachineVersionArn.replace('mum', 'pilot') };
 const paid: EntitlementRecord = { status: 'active', source: 'billing_v2', provider: 'aws', planId: 'standard_monthly_v2', size: 'std-2' };
 const host: PoolHostRow = { poolHostId: HOST, poolGeneration: 1, region: D.region, zoneId: D.zoneId, instanceType: 'm6i.large',
     instanceId: INSTANCE, state: 'leased', readyAt: new Date(NOW.getTime() - 120_000), enrolledAt: NOW,
@@ -262,11 +264,38 @@ describe('POOL-OPEN warm lifecycle', () => {
             stateMachineVersionArn: D.stateMachineVersionArn.replace('mum', 'pilot') } });
         await s.ensure(); expect(s.starts[0].intent.operation).toBe('replace');
     });
-    it('mode requires both Mumbai and mum', () => {
+    it('mode requires Mumbai and a pool namespace (staging mum, production prd)', () => {
         expect(isPoolMode(D)).toBe(true);
+        expect(isPoolMode(PRD)).toBe(true);
         expect(isPoolMode({ ...D, region: 'us-east-1' })).toBe(false);
-        expect(isPoolMode({ ...D, namespace: 'pilot' })).toBe(false);
+        expect(isPoolMode({ ...PRD, region: 'us-east-1' })).toBe(false);
+        for (const namespace of ['pilot', 'prod', 'prdx', 'mumx', 'mu', 'constructor'])
+            expect(isPoolMode({ ...D, namespace })).toBe(false);
         expect(poolPriorityForEntitlement(undefined)).toBe(1);
+    });
+    it('production prd adopts a warm spare on open and releases it at session end, like mum', async () => {
+        const s = setup({ deployment: PRD });
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(s.pool.leasePoolHost).toHaveBeenCalledWith(expect.anything(),
+            { region: PRD.region, zoneId: PRD.zoneId, instanceType: 'm6i.large', deployment: PRD }, C, 1, NOW);
+        expect(s.pool.validateCapacity).toHaveBeenCalledOnce();
+        expect(s.starts).toHaveLength(1);
+        expect(s.starts[0].intent).toMatchObject({ operation: 'adopt', poolHostId: HOST, providerInstanceId: INSTANCE,
+            deployment: { namespace: 'prd', stateMachineVersionArn: PRD.stateMachineVersionArn } });
+        expect(s.starts[0].stateMachineArn).toBe(PRD.stateMachineVersionArn);
+        s.execution('SUCCEEDED'); await s.status(); s.at(20); await s.ready();
+        s.at(60); expect(await s.status()).toMatchObject({ state: 'running' });
+        const end = sessionEndWork(await s.placement(), PRD, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', s.pool);
+        expect(end.intent).toMatchObject({ operation: 'release', deployment: { namespace: 'prd' } });
+        expect(sessionEndWork(await s.placement(), PILOT, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', s.pool).intent.operation).toBe('stop');
+    });
+    it('production prd reopens a released computer on a spare, never in place', async () => {
+        const s = setup({ rows: [stopped()], deployment: PRD });
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_starting' });
+        expect(s.starts[0].intent).toMatchObject({ operation: 'adopt', dataVolumeId: VOLUME, deployment: { namespace: 'prd' } });
+        const cold = setup({ rows: [stopped({ last_error: null })], deployment: PRD, host: null });
+        await cold.ensure();
+        expect(cold.starts[0].intent.operation).toBe('replace');
     });
 
     it('missing P8 wiring fails closed before committing any boot', async () => {

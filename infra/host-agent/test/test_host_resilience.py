@@ -207,11 +207,11 @@ class DesktopRestart(unittest.TestCase):
             self.assertFalse(self.send("desktop_status")["restartsExhausted"])
 
     def test_the_desktop_step_refuses_while_the_agent_is_stopping(self):
-        lease = {"generation": 1, "leaseEpoch": 2}
+        lease = dict(LEASE)
         with open(os.path.join(self.cfg.runDir, "lease.json"), "w") as f:
             json.dump(lease, f)
         with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
-            json.dump(lease, f)
+            json.dump(guard.new_marker(lease, DIGEST, "i-0abc"), f)   # as guard.run_guard writes it
         with open(os.path.join(self.cfg.runDir, desktop.STOPPING), "w") as f:
             f.write("1\n")
         with mock.patch.object(desktop, "run") as run, mock.patch.object(cli, "desktop_relay") as relay, \

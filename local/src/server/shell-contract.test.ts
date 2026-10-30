@@ -511,8 +511,11 @@ describe('GET /api/shell/desktop — the cheap poll', () => {
                 const body = await (await get(`${SHELL_API_ROUTES.desktop}?${query}`)).json() as Record<string, unknown>;
                 expect(body).toMatchObject({ ok: true, confirmed: true, status });
                 expect(Object.hasOwn(body, 'reason')).toBe(false);
-                expect(await shell.observeFrame(computerId(), localUrlFor('code'), 'code'))
-                    .toEqual({ confirmed: true, retryable: false });
+                const observed = await shell.observeFrame(computerId(), localUrlFor('code'), 'code');
+                // The observer now carries the origin status for attribution;
+                // a positive still has no reason.
+                expect(observed).toEqual({ confirmed: true, retryable: false, status });
+                expect(observed.reason).toBeUndefined();
             }
         } finally {
             if (priorWindow === undefined) delete global.window; else global.window = priorWindow;

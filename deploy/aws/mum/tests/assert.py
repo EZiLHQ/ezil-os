@@ -6,6 +6,19 @@ import sys
 root, mode = Path(sys.argv[1]), sys.argv[2]
 calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
 output = (root / "output").read_text()
+prd = (root / "namespace").exists()
+if prd:
+    # A --namespace prd run names no mum stack, role, bucket, template, secret or origin;
+    # it is then held to every mum assertion below, in mum vocabulary.
+    sys.dont_write_bytecode = True
+    import namespaces
+    # The suite's own scratch path (/tmp/ezil-mum-tests.*) is not a resource name.
+    recorded = ((root / "calls.jsonl").read_text() + output).replace(str(root.parent), "<scratch>")
+    leaked = [t for t in namespaces.MUM_TOKENS if t in recorded]
+    assert not leaked, leaked
+    assert not calls or any("ezil-prd-" in json.dumps(c) for c in calls), calls
+    calls = [json.loads(namespaces.to_mum(line)) for line in (root / "calls.jsonl").read_text().splitlines()]
+    output = namespaces.to_mum(output)
 
 
 def has(*parts):
@@ -13,7 +26,8 @@ def has(*parts):
 
 
 def read(name):
-    return json.loads((root / name).read_text())
+    text = (root / name).read_text()
+    return json.loads(namespaces.to_mum(text) if prd else text)
 
 
 def preserved():
