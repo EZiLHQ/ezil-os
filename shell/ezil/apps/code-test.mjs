@@ -750,11 +750,15 @@ await settle(4);
 
     // 7f. The single-instance relaunch hook (contract item 4).
     views.length = 0;
-    const remembered = store.getItem(VIEW_KEY);
+    // A value no relaunch could write, so "nothing remembered" holds whichever
+    // view a relaunch applies (7b/7c are the positive control: gestures write it).
+    const remembered = 'sentinel';
+    store.setItem(VIEW_KEY, remembered);
     push('7f the window exposes _ezil_relaunch', typeof w._ezil_relaunch === 'function');
     w._ezil_relaunch({ view: 'full', project: '00000000-0000-4000-8000-000000000000', repo: 'r', anything: 1 });
     await settle(2);
     push('7f 🔴 relaunch with view "full" enters full view; the other keys are ignored', isFull(w) && views.map(v => v.view).join() === 'full');
+    push('7f 🔴 …and a relaunch to "full" is not remembered', store.getItem(VIEW_KEY) === remembered, String(store.getItem(VIEW_KEY)));
     let threw = null;
     try {
         w._ezil_relaunch({ view: 'bogus' }); w._ezil_relaunch({}); w._ezil_relaunch(undefined);
@@ -768,7 +772,24 @@ await settle(4);
         isWindowed(w) && geom(w) === windowed && views.map(v => v.view).join() === 'full,window');
     w._ezil_relaunch({ view: 'window' });
     push('7f a relaunch to the view it already has announces nothing', views.length === 2);
+    // The same unknown values again, now WINDOWED: none of them may read as "full".
+    threw = null;
+    try {
+        for ( const c of [{ view: 'bogus' }, { view: 'FULL' }, { view: 'Full' }, { view: true }, { view: 1 }, {}, undefined, { project: 'p' }] ) {
+            w._ezil_relaunch(c);
+        }
+    } catch ( e ) { threw = e; }
+    await settle(2);
+    push('7f 🔴 while windowed, no view or an unknown one changes nothing and never throws',
+        ! threw && isWindowed(w) && geom(w) === windowed && views.length === 2, `${String(threw)} ${geom(w)} ${JSON.stringify(views)}`);
     push('7f a relaunch is not the user\'s explicit choice: nothing remembered', store.getItem(VIEW_KEY) === remembered);
+    w._ezil_relaunch({ view: 'full' });
+    await settle(2);
+    push('7f positive control: the same windowed state still enters full view on view "full"',
+        isFull(w) && views.map(v => v.view).join() === 'full,window,full');
+    w._ezil_relaunch({ view: 'window' });
+    await settle(2);
+    push('setup: windowed again after the relaunch checks', isWindowed(w) && geom(w) === windowed);
 
     // 7g. The title setter writes TEXT.
     const evil = '<img src=x onerror="window.__ezilTitleInjected=1">';
