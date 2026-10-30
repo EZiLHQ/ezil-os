@@ -319,6 +319,15 @@ export async function openCodeWindow (ctx = {}) {
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
+    /**
+     * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
+     * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
+     */
+    let last_progress = null;
+    /** The mint's timeout give-up while it is on screen with the generic copy (no running answer yet). */
+    let generic_timeout = null;
+    /** A timeout give-up over a computer last seen running with nothing opening is Code's, not the computer's. */
+    const code_timeout = failed => last_progress?.connect === true ? { ...failed, copy: CODE_UNREACHABLE_COPY } : failed;
 
     const stop_timers = () => {
         stop_confirmation(); stop_confirmation = () => {};
@@ -330,7 +339,14 @@ export async function openCodeWindow (ctx = {}) {
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
+        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy,
+        onProgressChange: () => {
+            const seen = progress.computerProgress();
+            if ( ! seen ) return;
+            last_progress = seen;
+            // A give-up painted before any running answer (tab hidden, polls failing) takes Code's words once one arrives.
+            if ( generic_timeout && seen.connect === true ) { progress.render(code_timeout(generic_timeout)); generic_timeout = null; }
+        } });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -386,6 +402,7 @@ export async function openCodeWindow (ctx = {}) {
 
     async function start_boot () {
         last_failure = null;
+        last_progress = null; generic_timeout = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -463,9 +480,11 @@ export async function openCodeWindow (ctx = {}) {
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
             });
-            // A give-up over a computer the server says is running (and opening nothing) is Code's, not the computer's.
-            const running = progress.computerProgress()?.connect === true;
-            progress.render(failed.kind === 'failed' && failed.reason === 'timeout' && running ? { ...failed, copy: CODE_UNREACHABLE_COPY } : failed);
+            // A give-up over a computer last seen running (and opening nothing) is Code's, not the computer's.
+            const timed_out = failed.kind === 'failed' && failed.reason === 'timeout';
+            const shown = timed_out ? code_timeout(failed) : failed;
+            generic_timeout = timed_out && ! shown.copy ? failed : null;
+            progress.render(shown);
             // Terminal: the mint failed for real.
             trace.step('mint_error');
             trace.end('error');

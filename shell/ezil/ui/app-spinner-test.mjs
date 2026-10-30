@@ -540,6 +540,31 @@ try {
             statusOf(spinner).textContent);
     });
     now = 0;
+    // 🔴 Its OWN expectation, not the 240 s fallback a running answer carries: an opening the server expected in
+    // 150 s that is long at 2:40 stays long when it reaches running at 3:20 (never back to "usually about 4 min").
+    await observe({ ...opening, path: 'cold', expectedSeconds: 150 }, async spinner => {
+        now = 160_000; await poll();
+        const before = `${stateOf(spinner)} ${metaOf(spinner).textContent}`;
+        now = 200_000; payload = runningNow; await poll();
+        push('🔴 opening (150 s) → running at 3:20: still long on its own expectation, never "usually about 4 min"',
+            before === 'long Taking longer than usual · 2:40' && stateOf(spinner) === 'long'
+            && metaOf(spinner).textContent === 'Taking longer than usual · 3:20' && ! /about 4 min/.test(spinner.el.textContent),
+            `${before} → ${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
+    // 🔴 A connect that the server turns into an opening (a stop and wake inside it) is an opening to the end:
+    // running again later is that opening's arrival, not a fresh 30 s connect.
+    await observe(runningNow, async spinner => {
+        push('connect first', statusOf(spinner).textContent === 'Connecting to Browser…', statusOf(spinner).textContent);
+        now = 20_000; payload = { ...opening, path: 'cold', expectedSeconds: 150 }; await poll();
+        push('...then an opening: its own words', statusOf(spinner).textContent !== 'Connecting to Browser…', statusOf(spinner).textContent);
+        now = 100_000; payload = runningNow; await poll();
+        push('🔴 connect → opening → running: the HF3 sentence and the opening\'s expectation, not "Connecting to…" at 30 s',
+            statusOf(spinner).textContent === 'Almost there — waiting for Browser to connect.'
+            && stateOf(spinner) === 'opening' && metaOf(spinner).textContent === '1:40 · usually about 3 min',
+            `${stateOf(spinner)} "${statusOf(spinner).textContent}" ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
     // A running computer without the server's connect figure (an older server): the existing behaviour.
     await observe({ ...runningNow, expectedSeconds: null }, async spinner => {
         now = 5_000; spinner.render({ kind: 'progress' });

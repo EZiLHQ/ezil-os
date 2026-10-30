@@ -167,8 +167,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
     /**
      * This open, from the client's first sight of it to ready / failure. `t0` anchors the elapsed
-     * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display;
-     * `connect` is decided once, by the open's first observation (round 6, R3-4).
+     * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display
+     * (`T`: the last OPENING expectation; a connect answer carries none); `connect`: this open is a
+     * connect, set by its first opening-or-connect observation and cleared for good by an opening
+     * (or a move) seen inside it (round 6, R3-4).
      */
     let open = null;
     let aria = { at: -Infinity, key: null };
@@ -273,8 +275,11 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (pending) observer?.start();
         if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
         if (open && observation && progressing) {
-            open.view = observation; open.T = observation.expected ?? open.T;
-            open.connect ??= observation.connect === true;
+            open.view = observation;
+            // A connect answer's `expected` is only the 240 s fallback: it never replaces an opening's own.
+            if (observation.connect !== true) open.T = observation.expected ?? open.T;
+            // Holds (no bar) neither make nor break a connect; an opening seen inside one makes it an opening to the end.
+            if (observation.bar) open.connect = (open.connect ?? true) && observation.connect === true;
         }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
@@ -305,7 +310,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             // Round 6 (R3-4): a connect (this open began on a running computer with nothing opening) runs on the
             // server's connect expectation; an opening that reaches running keeps the expectation it had.
             const connecting = view.connect === true && open?.connect === true && view.connectExpected > 0;
-            const T = connecting ? view.connectExpected : view.expected ?? open?.T ?? 240;
+            const T = connecting ? view.connectExpected : view.connect === true && open?.T ? open.T : view.expected ?? open?.T ?? 240;
             const long = t >= T;
             let bar = 'indeterminate';
             if (view.bar || open?.high > 0 || client >= URL_RECEIVED) {
