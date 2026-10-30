@@ -670,7 +670,7 @@ against an uncommitted row, `aws-receipts.ts:294-295`):
 ### 5.2 Export-boot placement path (receipts mode and release; no new placement edges)
 
 **Receipts: an export-boot mode, not a skip.** `applyLifecycleReceipt` (`aws-receipts.ts:247`) keeps running for the export boot. It switches to export-boot mode when `p0.provider === 'aws-ec2'` and `readByExportBoot(p0.computerId, p0.generation, p0.leaseEpoch, p0.volumeId)` returns a row. (A database without 0012 has none: call `reverseMovesTablePresent` first, §3.4.) The lookup matches every state **except `committed`**, on the same volume:
-- a released (`failed_*`) row still keeps its own boot out of RUNNING, and that placement's next boot at N+2/E+2 never matches;
+- a released (`failed_*`) row still keeps its own boot out of RUNNING, and that placement's next boot at E+2 (generation N+1 or N+2, **[r5]** §5.7) never matches;
 - a committed row never matches: the flip deleted that placement row, so a later `aws-ec2` row (a forward move onto a fresh volume) may reach the same counters and must boot normally.
 
 In this mode exactly two things change:
@@ -1061,6 +1061,9 @@ replace) counts as settled.
 ### 5.9 Triggers and gates
 
 - **`computer.move.start`** (new mutation in `app/src/server/api/routers/computer.ts`, `startedBy:'user'`).
+  - **[r5]** `computer.move` is a **nested** router (`computer.move.start`, `computer.move.retry`), never flat names such
+    as `moveStart`. The SDK drift guard (`sdk/src/surface.test.ts`) matches only top-level procedures, so it stays green
+    only with the nested form, and that file belongs to no Phase B lane.
   - **[r4]** To **create** a row it requires standing `files_on_aws` (`standing.ts:12-13`), an `aws-ec2` placement, the kill
     switch off, and no forward work (steps 3–8 below). None of these applies to a row that already holds the computer: step 2
     returns it first, with the kill switch on or off.
@@ -1734,5 +1737,58 @@ says otherwise.
 | minor (U): overlay rules keyed partly on `stage`, which terminal rows do not set from the move | §5.10, §6.4 | Whenever `move.outcome` is set, the outcome is keyed on `move.outcome` + `move.openBlocked` only. The open-blocked card shows if and only if both `failed_needs_operator` and `openBlocked` hold (or the open answered `computeMoveNeedsAttention`). A lane U test feeds each outcome with each stage. |
 | fold-in: `billing-test-db.sh` applies 0012 for every PG suite | — | r4 re-ran the suites against its own DB (`billing-test-db.sh`, journal 0000–0007 and 0012), the three table-enumerating ones among them: `feedback/ingest.pg` 4/4, `rebase.pg` 15/15, `ready-pool.pg` 167/167. The same run passed all 8 PG files, 239/239, 0 skipped. |
 
-The review's findings list reached this revision truncated inside its tenth finding. Anything after it was not visible
-and is not addressed here.
+r4 saw the review's findings only up to the tenth; §12.1 (r5) dispositions all 28.
+
+### 12.1 r5: every finding of the r3 review, and every r4 verifier gap **[r5]**
+
+Numbers are the review's own order (1-based; the first ten are r4's rows above). **already** = fixed at `6c405fee` (r4),
+**fixed** = fixed in r5, **accepted** = kept with the reason given. Store and test changes are r5's commits on this branch.
+
+| # | Finding (severity, lane) | Disposition | Section(s) | Note |
+|---|---|---|---|---|
+| 1 | §5.9 order: placement checks before the holding row (major, A+U) | already | §5.9, §6.2 | r4 row 1. Its recorded deviation stands: `move_unavailable` before `move_computer_running`/`move_computer_unsettled`. |
+| 2 | Image-rebase reservations vs reverse moves; `ImageJobConflictError` unmapped (major, A) | already | §5.2.1, §5.1.1 step 4, §5.9 | r4 row 2. |
+| 3 | Summary fields not implementable; `billing.ts` unowned; no move computer (major, A) | already | §6.1.1, §1.1 | r4 row 3. r5 moves the carrier to `reverseMove` (#12). |
+| 4 | One spent snapshot execution starves later D21 snapshots (major, O+A) | already | §3.4, §7.1 | r4 row 4 (store `markSnapshotSpent`). |
+| 5 | Billing tab's `standingCopy` keeps the region; `billing.js` unowned (minor, U) | already | §6.2, §1.1 | r4 row 5. |
+| 6 | `computer_move_needs_attention` thrown as a tRPC error (minor, A+U) | already | §5.3, §6.2 | r4 row 6 (blocked provider, a value). |
+| 7 | `requested` deadline outcome not decidable from the row (minor, A) | already | §5.1.1, §5.4, §5.5 | r4 row 7. r5 adds the open epoch and `move_capacity` to the same rule. |
+| 8 | Fleet-wide `duplicate_placement`/`region_not_configured` were final (minor, A) | already | §5.1.1, §5.5 | r4 row 8. |
+| 9 | Moving view passed the export boot's `lifecycleState` (minor, U+A) | already | §5.10, §6.4 | r4 row 9. |
+| 10 | Overlay keyed terminal outcomes on `stage` (minor, U) | already | §5.10, §6.4 | r4 row 10. r5 updates its example: `boot_unsettled` is now open blocked. |
+| 11 | Try-later copy promises minutes for monthly caps (minor, U) | fixed | §6.3 | Every try-later sentence is time-neutral ("Try again later."). The vocabulary is not split: one code, one honest sentence. |
+| 12 | Old cached shells render the now non-null summary move; [Try again] calls `switchTo` (minor, U+A) | fixed | §6.1, §6.1.1, §6.2, §6.4 | The move rides the new key `summary.computer.reverseMove`; `computer.move` stays null, so the dormant card never renders. |
+| 13 | `snapshot_missing` alert has no caller (minor, O) | fixed | §7, §1.1 | `advanceReverseSnapshots` runs the listing once per pass and logs one line; lane O tests it. |
+| 14 | Billing start gate runs before the reverse waiting answer (major, A+U) | fixed | §5.3, §5.5, §6.1.1, §6.3, §6.4 | All four open routes answer `routed.reverse` right after `routeComputer`. `holdOpenable` drives the retry and copy of a computer the hold cannot open (`workspace_too_large` → `retry: 'no'`, Upgrade only; no [Open my AWS computer]). |
+| 15 | Compensation's "settled" misses the generation rollback (major, A) | fixed | §5.7, §5.1.2, §5.5 | Settled = STOPPED, no job, the claim's volume, epoch ≥ E+1, generation N or N+1. A refused replace runs `settleReplacementGeneration` first. The flip stays strict at N+1/E+1. |
+| 16 | `reverseSnapshotStateMachineVersionArn` in strict schemas; release order (major, O) | fixed | §7.2, §1.1, §8 | Lead decision: lane O owns it end to end; infra accepts, then the app, then the env; rollback removes the key first. **Narrowed, with reason:** `release-manifest.ts` and `aws-rebase-release.ts` leave lane O's list, because the field is not a release field. |
+| 17 | Same as #1 (major, A+U) | already | §5.9 | **Accepted deviation from its proposed order** (`move_not_held` before the holding row): r4 checks the holding row first. A holding row with the same owner is the user's own move, and showing it is right even if the standing changed meanwhile (for example a resubscribe while `failed_needs_operator`). Another owner's row answers `move_not_held` from that same step. |
+| 18 | Same as #4 (major, O+A) | already | §3.4, §7.1 | — |
+| 19 | Same as #3 (minor, A) | already | §6.1.1, §1.1 | — |
+| 20 | The reverse waiting provider's `kind` is unpinned (minor, A) | fixed | §5.3 | Both reverse providers are `kind: 'aws-ec2'` with a `reverse` marker; the delete refusal relies on it. |
+| 21 | Same as #8 (minor, A) | already | §5.1.1, §5.5 | — |
+| 22 | "Open works" for `boot_unsettled` is false (minor, A+U) | fixed | §5.3, §5.5, §5.5.1, §5.7, §5.10, §6.1.1, §6.3, §6.4 | `boot_unsettled` is open blocked, with its own copy; the release runbook settles the placement first. `abort_unconfirmed` is written only after the placement settled, so its "Open works" is true. |
+| 23 | Same as #9 (minor, U) | already | §5.10, §6.4 | — |
+| 24 | The volume's region is never recorded (minor, O+A) | fixed | §3.1, §5.1.1 step 8, §7.1; store | `export_boot.region`, required and kept (store r5, unit and PG tests; a mutant without the keep-check fails). The snapshot intent's region and deployment come from it. |
+| 25 | A stale open epoch would be billed across the move (minor, A) | fixed | §5.1.1, §5.4, §5.5 | With metering active, an open epoch makes the placement not claimable (wait; `computer_busy` at the deadline). |
+| 26 | Throughput arithmetic overstated chunks per pass (minor, A) | fixed | §5.4, §5.1.1 step 5b, §3.4 | Concurrent per-row drive, `claimStale(10)` with active rows first (lane A's store change), at most 3 moves past `requested`. At least 20 chunks per row per pass at 0.5 MiB/s: about 26 min worst case against 60. |
+| 27 | `listRetentionExpired` has no purge marker (minor, O+A) | fixed | §7, §3.1, §3.4; store | Runbook `operator_purged` sets `retain_until = NULL` (0012 unchanged). `listUnsnapshotted` skips purged rows; PG test and mutant. |
+| 28 | The §5.1.2 parity test only holds when the wake builds a replace (minor, A) | fixed | §5.1.2 | Fixture: STOPPED with `INSTANCE_LOST`, non-pool deployment; a second case with `wakeMode: 'replace'`. |
+
+| r4 verifier gap | Disposition | Section(s) | Note |
+|---|---|---|---|
+| AMI train (C3, F11, `pool_desktop_not_ready`) had no owner (MAJOR) | fixed | §2.8, §1.1, §8 | Lane H owns the host files and the pool/C3 app files no other lane owns; the seams with A (`aws-receipts.ts`, `placement.ts`, the `pool-replenish` route) are pinned. F11's file set is provisional and diagnosis comes first; a cause outside it changes §2.8 first. |
+| Deployment field: strict parsers and unowned files (MAJOR) | fixed | §7.2, §1.1, §8 | As #16. Every infra parser imports one `deployment.ts`; the pool refill after the env change is expected and disclosed. |
+| Lane O IAM: no file named; does a promote need `json-tool.py`? (MINOR) | fixed | §7.2, §1.1 | `app-caller.ts`, its tests and snapshots, and the registration in `bin/lifecycle.ts` and `computer-lifecycle.ts` are O's. No promote needs to carry the key (evidence in §7.2), so `json-tool.py` stays H's, unchanged. |
+| §5.5 `commit{verifyOnly}` `other` lacked `worker_conflict` (MINOR) | fixed | §5.5 | Same note as `begin` and `pull`. |
+| Cron still in v1 (MINOR) | fixed | D-5, §3.1, §3.2, §5.9, §5.9.1, §8, §9 | Moved to §9. The 0012 CHECK keeps `'cron'` (digest registered); no v1 code writes it. |
+| §5.2 actor routes unowned (MINOR) | fixed | §1.1, §5.2 | Lane A owns those route and handler files and their tests. |
+| Clock rule not mutation-proven: C4, C5, C6 survived (TEST GAP, blocking) | fixed | store PG test | Faked app clock (2001) around `recordImportProgress`, `advance('flipping')` and `finish`. C4, C5 and C6 each fail it (assertion failures, run in r5). |
+| `listRetentionExpired` boundary unpinned: R1b survived (TEST GAP) | fixed | store PG test | A committed row expiring 1 minute from now must not be listed; R1b fails it (run in r5). |
+
+**r4 verifier blind spots, noted (not findings):**
+- The SDK drift guard needs `computer.move` to be a nested router: pinned in §5.9.
+- **Accepted:** the System tab (`system.describe`) still describes the export boot's placement during a move. It is a
+  diagnostics view, not move copy, and no lane owns it in Phase B; the Computer tab and the overlay carry the move (§6.4).
+- `billing-placement.pg`, `ai-credit-outbox.pg`, `processor-v2.pg`, `compute-access.pg` and the shell, Worker and SDK
+  suites are outside this store change; r5's gates are listed in its handoff.
