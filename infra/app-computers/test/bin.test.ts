@@ -145,7 +145,10 @@ test('bin/lifecycle prd: the production host alone trusts ezil-prd-app-caller at
         assert.deepEqual(caller[0].Properties.AssumeRolePolicyDocument.Statement, [{ Effect: 'Allow', Action: 'sts:AssumeRole',
             Principal: { AWS: host }, Condition: { StringEquals: { 'aws:PrincipalTag/ezil:env': 'production' } } }]);
         for (const r of roles(template)) assert.equal(r.Properties.Path, '/ezil/prd/');
-        assert.ok(JSON.stringify(template).includes('https://os-prod.ezil.work'), 'authority origin baked into the lifecycle');
+        const settings = Object.values<any>(template.Resources)
+            .map(r => r.Properties?.Environment?.Variables?.EZIL_LIFECYCLE_SETTINGS).filter(Boolean);
+        assert.ok(settings.length > 0);
+        for (const s of settings) assert.equal(JSON.parse(s).authorityOrigin, 'https://os-prod.ezil.work', 'authority origin baked into the lifecycle');
         assert.ok(!/billing-staging|os-staging|ezil-mum|ezil-pilot/.test(JSON.stringify(template)));
     } finally { rmSync(dir, { recursive: true, force: true }); }
 });
