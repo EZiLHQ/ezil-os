@@ -30,8 +30,10 @@ interface TrpcFailure {
 }
 
 const joinUrl = (baseUrl: string, path: string): string => {
-    const base = baseUrl.replace(/\/+$/, '');
-    return `${base}/api/trpc/${path}`;
+    // Linear trailing-slash trim (a /\/+$/ regex backtracks quadratically on many '/').
+    let end = baseUrl.length;
+    while (end > 0 && baseUrl.charCodeAt(end - 1) === 47) end--;
+    return `${baseUrl.slice(0, end)}/api/trpc/${path}`;
 };
 
 export interface CallOptions {
