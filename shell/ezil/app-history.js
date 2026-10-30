@@ -166,9 +166,9 @@ export function createAppHistory () {
     }
 
     function onFocus (event) {
-        // A gesture launch in flight pushes its own entry when it resolves;
-        // the window it creates focuses first, and replacing now would
-        // overwrite the entry Back is supposed to return to.
+        // A gesture launch in flight has already pushed its entry (`begin`);
+        // until it ends, a late focus of some other window must not
+        // overwrite it — `end` puts the launched app back if one did.
         if ( ! enabled || holds > 0 ) return;
         const el = event.detail?.window;
         const id = el?.getAttribute?.('data-app');
