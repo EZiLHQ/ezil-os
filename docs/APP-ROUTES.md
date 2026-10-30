@@ -175,7 +175,9 @@ or Back/Forward is also the latest **launch** intent.
   and `ensureOnTop` (`registry.js`) re-focuses a launched window at 120ms.
   Neither is the user's. Until `ensureOnTop` has run (it calls
   `settled(el)` on every path), a focus of that window counts only while its
-  launch is the latest launch intent. Every other focus counts as before.
+  launch is the latest launch intent (a window two launches resolved with,
+  in either order, belongs to the newer one). Every other focus counts as
+  before.
 - **The front window follows too.** `ensureOnTop` of a launch that a newer
   click or Back/Forward has superseded (`superseded(el)`) does not re-focus
   its window, so it cannot take the front back from the newer launch's
