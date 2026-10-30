@@ -263,8 +263,12 @@ async function ordered() {
     const delayed = [];
     const setTimeout = w.setTimeout;
     w.setTimeout = (fn, ms, ...args) => (ms === 80 || ms === 120 ? delayed.push({ ms, run: () => fn(...args) }) : setTimeout.call(w, fn, ms, ...args));
-    // Every queued callback of that delay, in the order they were queued.
-    const elapse = ms => { for (const timer of delayed.filter(t => t.ms === ms)) { delayed.splice(delayed.indexOf(timer), 1); timer.run(); } };
+    // Every queued callback of that delay, in the order they were queued,
+    // with `check` after each one: a write that a later timer would undo is
+    // still caught.
+    const elapse = (ms, check) => {
+        for (const timer of delayed.filter(t => t.ms === ms)) { delayed.splice(delayed.indexOf(timer), 1); timer.run(); check?.(); }
+    };
     // The next `open` of `id` waits for the returned release().
     const gate = id => {
         const app = w.ezil.registry.getApp(id);
@@ -294,8 +298,8 @@ async function ordered() {
     release();
     ok(await older === win('code'), 'Code opens after it');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], 'the older launch, resolving last, does not take the address bar');
-    elapse(80); elapse(120);
-    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "nor does its ensureOnTop re-focus, once both launches' have run");
+    const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "nor do the launches' delayed focuses, one by one (Code's ensureOnTop re-focus included)");
+    elapse(80, held); elapse(120, held);
     w.$(win('code')).focusWindow();
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'positive control: once it has settled, a focus of Code replaces');
     done(w);
@@ -310,10 +314,8 @@ async function ordered() {
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 4]);
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5]);
-    elapse(80);
-    same(url(), `/app/settings?computer=${COMPUTER}`, "Code's late showWindow focus does not take the address bar from the newer click");
-    elapse(120);
-    same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5], '... nor its ensureOnTop');
+    const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 5], "Code's late showWindow focus, then each ensureOnTop, leave the newer click's URL");
+    elapse(80, held); elapse(120, held);
     // Positive control: the same late focus with no newer launch, after a
     // focus elsewhere, names Code.
     await launch('code');
@@ -335,8 +337,8 @@ async function ordered() {
     same([url(), w.history.length], [`/app/code?computer=${COMPUTER}`, 3], 'Back to Code commits in place');
     await launch('settings');
     same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3]);
-    elapse(80);
-    same(url(), `/app/settings?computer=${COMPUTER}`, "the Back launch's late focus does not take the address bar from the newer click");
+    const held = () => same([url(), w.history.length], [`/app/settings?computer=${COMPUTER}`, 3], "the Back launch's late focus does not take the address bar from the newer click");
+    elapse(80, held); elapse(120, held);
     done(w);
 }
 
