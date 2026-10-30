@@ -41,7 +41,11 @@ export interface BillingSessionSweepCounts {
 /** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
 export type AwsStopProof = (computer: ComputerRef) => Promise<{ running: boolean; stoppedAt: Date | null }>;
 
-/** Round 6 R1-01: RUNNING aws-ec2 computers with nothing in flight; `since` is the placement row's last write (≥ RUNNING entry). */
+/**
+ * Round 6 R1-01: RUNNING aws-ec2 computers with nothing in flight, found through the billing ledger (store.ts
+ * `runningAwsComputersAfterEpochs`: an AWS session closed within HELD_LOOKBACK_MS, newest first, up to `limit`);
+ * `since` is the placement row's last write (≥ RUNNING entry).
+ */
 export type RunningAwsPlacements = (limit: number) => Promise<readonly (ComputerRef & { since: Date })[]>;
 
 export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, limit = 50 }: {
@@ -198,9 +202,11 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     }
 
     // Round 6 R1-01: a held host (Free, its files still on AWS: the D16 hold) is bounded by its session alone, and
-    // the policy pass above sees open sessions only. One still RUNNING with no open epoch, whose session closed
-    // (a failed or lost stop, also past RETRY_WINDOW_MS) or never opened (a metering error, 'concurrent'), is
-    // stopped every pass until it is not RUNNING. Paid hosts are not touched here: no lapsed-lease stop
+    // the policy pass above sees open sessions only. One still RUNNING with no open epoch is stopped every pass until
+    // it is not RUNNING: its session closed (a failed or lost stop, also past RETRY_WINDOW_MS), or a later open's
+    // epoch never opened (a metering error, 'concurrent'). Candidates come from the billing ledger, so a computer
+    // with no AWS session closed within HELD_LOOKBACK_MS (or past the newest HELD_SCAN_LIMIT) is not seen; a
+    // placement-centric read belongs in placement.ts (C-2). Paid hosts are not touched here: no lapsed-lease stop
     // (ROOT-FLEET-LEASE-INCIDENT-118); their policy closes keep the retry window above.
     if (runningAwsPlacements) {
         let running: readonly (ComputerRef & { since: Date })[] = [];
