@@ -1,12 +1,14 @@
 # Reverse move contract: AWS → Cloudflare (Phase B, round 6b)
 
-**Status:** pinned (S0 r5), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
+**Status:** pinned (S0 r6), 2026-10-30. Lanes H, W, A, U and O build against this file in parallel.
 A change to any wire shape, state, code or limit below changes this file first. Every lane cites the
 section it implements. r2 applied the review of `dc362e53` (§10). r3 closes the S0 verifier's contract gaps
 G1–G4 and the minors (§11 maps each gap to its section). r4 applies the review of r3 (`4abd237a`; §12 maps each
 finding to its section). **r5 dispositions every one of that review's 28 findings (r4 saw only the first 10) and every
-r4 verifier gap (§12.1).** Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections r4 changed carry
-**[r4]**; sections r5 changed carry **[r5]**.
+r4 verifier gap (§12.1).** **r6 rebases onto round 6a (`7a1f2ed1`), applies the lead's §7.2 decision (DECISION_72: no
+deployment field, lane O held, DLM covers D21 in v1), reconciles 6a's changes and closes the r5 verifier's gaps (§12.2),
+and lists lane A's required mutants (§12.3).** Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections
+r4 changed carry **[r4]**; sections r5 changed carry **[r5]**; sections r6 changed carry **[r6]**.
 
 **Base [r6]:** citations are `path:line` at `7a1f2ed1` (`r6/integ-20261030`, round 6a, LIVE on os-staging). r6 rebased
 this branch onto it (no conflicts) and re-pinned every citation into a file 6a changed; a file 6a did not change is
@@ -1954,3 +1956,26 @@ conflicts**: 6a and this branch touch disjoint files. `0012_compute_reverse_move
 | r5 verifier MINOR: §1.1 said lane A is the store's sole writer "from r4 on" | §1.1 | Now "from r5 on", as the header and §3.4 say. |
 | r5 verifier MINOR: r4 fixer deviation 5 not recorded | §6.1.1 rule 4 | **Recorded:** with placement reads disabled (`isPlacementReadEnabled()` false), `userPlacement` returns no computer ids (`billing.ts:163`), so there is no move computer: `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`. No move action can be shown where no move can run. |
 | r5 verifier MINOR: an `aws-ec2` placement with a null region waited as `region_not_configured` and ended `boot_unavailable` (try later) forever | §5.1.1 step 4 and table, §5.4, §5.5, §5.5.1, §6.1.1, §6.3, §6.4 | New per-computer final code **`region_missing`** (`reopen_final`, logged `[reverse-move] anomaly`), decided by `admitExportBoot` step 4 and by the `requested` pass's own read, before `decideAdmission`. It has its own copy, with no Try again and no [Open my AWS computer] (the hold cannot open it either). `operator_cleared`'s list gains it, so an operator who fixes the region can offer Try again; the store's PG suite runs the edited block. |
+
+### 12.3 Lane A acceptance items: required mutants **[r6]**
+
+Lane A is the only writer of `provider-reverse-store.ts` and its two test files from r5 on (§1.1). The store mutants that
+survived the r5 verifier are **required** acceptance items for lane A. Each must fail lane A's tests with an assertion
+failure (never a crash or a transform error), and lane A's handoff lists each one with that evidence. "Faked app clock"
+means the r5 pattern (Date set to 2001, and once to 2100) around the **read or write named**, not only around the writes.
+
+| # | Mutant (in `provider-reverse-store.ts`) | What must kill it |
+|---|---|---|
+| **L4f** | `listUnsnapshotted`'s `committedForSeconds` age compared on the app clock, not `clock_timestamp()` | Call `listUnsnapshotted(10, 3600)` under the faked app clock: a row committed 61 min ago (DB clock) is listed and a row committed 30 min ago is not, exactly as on the real clock. |
+| **R1f** | `listRetentionExpired`'s `retain_until < clock_timestamp()` compared on the app clock | Call `listRetentionExpired` under the faked app clock: an expired row is listed and the row expiring in 1 minute is not, in both the 2001 and the 2100 window. |
+| **L5d** | `listUnsnapshotted` ordered by `created_at` | Fixture: row X created first, row Y created later; Y's `commit_sent_at` is later than X's but Y commits (`state_entered_at` of `committed`) **before** X. `listUnsnapshotted` returns Y first. |
+| **L5f** | `listUnsnapshotted` ordered by `commit_sent_at` | The same fixture: ordering by `commit_sent_at` puts X first, so it fails. |
+| **C9** | `cas()` writes `state_entered_at` from the app clock | Under the faked app clock, an `advance` sets `stateEnteredAt` to PostgreSQL's now (within seconds of a `SELECT now()`) and `ages.stateEntered` near 0, never 2001 or 2100. |
+| **K1** | `claimStale`'s 30 s idle window compared on the app clock | Under the faked app clock, a row idle 31 s on the DB clock is claimed and a row idle 5 s is not. |
+| **K2** | `claimStale` without the active-first order (r5's pinned change, §5.4: `updated_at, id` only) | 9 old `requested` rows and 1 newer `copying` row: `claimStale(1)` returns the `copying` row. (The r5 verifier could not run this one: the order was pinned but not yet implemented.) |
+
+- The other r5 survivors are not required: R1d, S5, RB2 and RB3 are equivalent (the microsecond clock, a terminal
+  `committed` state, the 0012 CHECK, NULL semantics), and S8 (`recordSnapshot` without an `updated_at` bump) is harmless,
+  because no writer on a committed row compares and swaps on `updated_at`.
+- **Any further mutant a verifier invents is reported, not blocking.** Only the rows above, and the tests other sections
+  pin for lane A, gate lane A's acceptance.
