@@ -286,8 +286,10 @@ for (const fail of [false, true]) {
 {
     // Three clicks before anything opens, ending in every order, each one
     // opening or failing: 6 x 8 cases. The newest click (Settings) owns the
-    // address bar from its begin(); if it fails it gives back the URL it
-    // replaced, Code's, whatever became of Code.
+    // address bar from its begin(). A click that fails gives it back to the
+    // one before it, and that one, if it failed meanwhile, to the one before
+    // it in turn: the address bar names the newest click that has not
+    // failed (still pending, or opened), else `/os`.
     const ids = ['desktop', 'code', 'settings'];
     const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
     let cases = 0;
@@ -295,16 +297,98 @@ for (const fail of [false, true]) {
         const { w, controller, open, url } = harness('/os');
         const launches = ids.map(id => controller.begin(id));
         const opened = ids.map((id, i) => ((failing >> i) & 1 ? null : open(id, 10 + i)));
-        const final = opened[2] ? ['/app/settings', 4, 'settings'] : ['/app/code', 4, 'code'];
+        const ended = ids.map(() => false);
+        const named = () => {
+            const i = [2, 1, 0].find(j => ! ended[j] || opened[j]);
+            return i === undefined ? ['/os', 4, undefined] : [`/app/${ids[i]}`, 4, ids[i]];
+        };
         const label = order.map(i => `${ids[i]} ${opened[i] ? 'opens' : 'fails'}`).join(', then ');
         for (const i of order) {
             launches[i].end(opened[i]);
-            same([url(), w.history.length, w.history.state.ezilApp], order.indexOf(2) <= order.indexOf(i) ? final : ['/app/settings', 4, 'settings'],
-                `${label}: after ${ids[i]} ends`);
+            ended[i] = true;
+            same([url(), w.history.length, w.history.state.ezilApp], named(), `${label}: after ${ids[i]} ends`);
         }
         cases += 1;
     }
     same(cases, 48, 'every order x every outcome');
+}
+{
+    // The same cascade, spelled out (review of 2026-10-30; the end values
+    // are base ba36b095's): newest-first failures walk the address bar back
+    // down to the launch that opened.
+    const { w, controller, open, url } = harness('/os');
+    const [desktop, code, settings] = ['desktop', 'code', 'settings'].map(id => controller.begin(id));
+    settings.end(null);
+    same(url(), '/app/code', 'Settings fails: Code, still pending, has the address bar back');
+    code.end(null);
+    same(url(), '/app/desktop', 'then Code fails: Desktop, still pending, has it');
+    desktop.end(open('desktop', 10));
+    same([url(), w.history.length, w.history.state.ezilApp], ['/app/desktop', 4, 'desktop'], 'then Desktop opens: it is named');
+}
+{
+    // ... to `/os`, when every launch fails.
+    const { w, controller, url } = harness('/os');
+    const [desktop, code, settings] = ['desktop', 'code', 'settings'].map(id => controller.begin(id));
+    settings.end(null); code.end(null); desktop.end(null);
+    same([url(), w.history.length, w.history.state], ['/os', 4, { __NA: true }], 'all three fail, newest first: /os and its own state');
+}
+for (const newerFirst of [true, false]) {
+    // Two clicks that both fail, in either order: the older one's failure,
+    // overtaken when it happened, is given back once the newer one fails.
+    const { w, controller, url } = harness('/os');
+    const code = controller.begin('code');
+    const settings = controller.begin('settings');
+    for (const launch of newerFirst ? [settings, code] : [code, settings]) launch.end(null);
+    same([url(), w.history.length, w.history.state], ['/os', 3, { __NA: true }], `Code and Settings both fail, ${newerFirst ? 'newer' : 'older'} first: /os`);
+}
+{
+    // Two clicks on the same app (the second pushes nothing), both failing.
+    const { w, controller, url } = harness('/os');
+    const first = controller.begin('code');
+    const second = controller.begin('code');
+    same([url(), w.history.length], ['/app/code', 2]);
+    second.end(null);
+    same(url(), '/app/code', 'the second fails: the first, still pending, keeps the entry');
+    first.end(null);
+    same([url(), w.history.length], ['/os', 2], 'then the first fails: /os');
+}
+for (const closed of [true, false]) {
+    // A close between the newer launch and its failure: the close decided,
+    // and nothing gives back over it. Positive control: without the close,
+    // the cascade runs.
+    const { w, controller, open, close, url } = harness('/os');
+    settledLaunch(controller, 'desktop', open('desktop', 5));
+    const settingsWindow = open('settings', 6);
+    settledLaunch(controller, 'settings', settingsWindow);
+    const code = controller.begin('code');
+    const settings = controller.begin('settings');
+    if ( closed ) {
+        close(settingsWindow);
+        same(url(), '/app/desktop', 'the close names the front app');
+    }
+    settings.end(null);
+    same(url(), closed ? '/app/desktop' : '/app/code', closed ? 'Settings fails after the close: nothing given back' : 'positive control: Settings fails, Code has it back');
+    code.end(null);
+    same([url(), w.history.length], [closed ? '/app/desktop' : '/app/settings', 5], closed ? 'then Code fails: still the close\'s' : 'positive control: then Code fails, the URL it replaced');
+}
+{
+    // A newer launch that fails gives the front back too: the older launch's
+    // window, still settling, is no longer superseded (its ensureOnTop runs,
+    // registry.js), and its late focus counts again.
+    const { controller, open, focus, url } = harness('/os');
+    const settings = open('settings', 5);
+    settledLaunch(controller, 'settings', settings);
+    const older = controller.begin('code');
+    const newer = controller.begin('desktop');
+    const code = open('code', 10);
+    older.end(code);
+    same([url(), controller.superseded(code)], ['/app/desktop', true], 'while the newer launch is pending, the older window stands down');
+    newer.end(null);
+    same([url(), controller.superseded(code)], ['/app/code', false], 'the newer launch fails: Code has the address bar back, and the front');
+    focus(settings);
+    same(url(), '/app/settings', 'positive control: focus replaces');
+    focus(code);
+    same(url(), '/app/code', "Code's late focus, still before it settles, names it");
 }
 {
     // The late focus: UIWindow focuses a restored window 80ms after

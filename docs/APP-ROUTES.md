@@ -159,18 +159,29 @@ build, then a click on Settings, which opens first. `app-history.js` numbers
 every intent as it happens (one counter per controller, never reset): a
 click's launch (`begin`), Back/Forward (whatever entry it lands on, `/os`
 included), the close of an app window, and a focus it writes for. A click
-or Back/Forward is also the latest **launch** intent.
+or Back/Forward is also the latest **launch** intent. The intent that
+decides is the latest one, unless the latest launch failed ("gives back",
+below).
 
 | Pending | When it resolves it writes | only if, since it began, there was no newer |
 |---|---|---|
 | A click's launch that opened a window (`end(el)`) | that app's URL (replace), if the entry does not already name it | click or Back/Forward. A close in between does not stop it: the window that opened is in front. |
-| A click's launch that opened nothing (`end(null)`) | the URL and state it replaced | intent of any kind (a close has already named the front app). The app's own parameters go back only if no later launch has set them. |
+| A click's launch that opened nothing (`end(null)`) | the URL and state it replaced, and gives the address bar back | intent of any kind (a close has already named the front app), other than a newer click's launch that failed and gave it back. The app's own parameters go back only if no later launch has set them. |
 | A Back/Forward launch (`commit`) | the entry's app and parameters, in place | intent of any kind |
 | A launched window's own late focus, until its launch settles | that app's URL (replace) | click or Back/Forward |
 
 - **A superseded launch writes nothing**: no push, no replace, no rollback,
   and it is not recorded as a focus either, even when its window ends up in
   front. The address bar names that window at its next focus that counts.
+- **A failed launch gives back.** A click's launch that fails while it
+  decides is undone: the URL and state it replaced, and the address bar
+  goes back to the intent it took it from. If that is an older click's
+  launch still pending, that launch decides again (its `end`, its window's
+  late focus and its `ensureOnTop` count). If that launch has failed
+  meanwhile, it gives back in turn. So three clicks that end
+  Settings fails, Code fails, Desktop opens leave `/app/desktop`, and two
+  that both fail leave the URL from before them, in either order. A close
+  or Back/Forward in between ends the chain: nothing is given back over it.
 - **Settling.** UIWindow focuses a restored window 80ms after `showWindow`,
   and `ensureOnTop` (`registry.js`) re-focuses a launched window at 120ms.
   Neither is the user's. Until `ensureOnTop` has run (it calls
@@ -196,20 +207,22 @@ Known limits, not changed here:
   the newer launch opened, after the newer `ensureOnTop` has run, it stays
   in front while the address bar keeps the newer intent, until the next
   focus that counts.
-- If the newer launch failed, nothing re-asserts the older launch's window
-  against a late focus of some other window (its `ensureOnTop` stands down).
+- If the newer launch fails only after the older launch's `ensureOnTop` has
+  already stood down, nothing re-asserts the older launch's window against
+  a late focus of some other window.
 - A click on a window that is still settling after a newer launch is
   ignored until it settles (at most 120ms).
 - A launch that never resolves keeps every focus write off, as before.
-- If the latest launch fails, it gives back the URL it replaced, which can
-  name an older launch that also failed. That launch's pushed entry stays,
-  and Back to it launches the app again.
+- A failed launch's pushed entry stays behind the URL it gave back, as
+  before (the current entry is rewritten, not removed). Back to it launches
+  that app again.
 - A reopen that coalesces with a launch whose window was closed meanwhile
   (`launchSingle`) resolves with that closed window, so the URL names an app
   with no window open.
 
 Tests: `app-history-test.mjs` ("order": the coordinator's two cases, three
-launches in every end order with every open/fail outcome, late focus,
+launches in every end order with every open/fail outcome, the failure
+cascade spelled out (with a close ending it), late focus,
 close and reopen, closing another window, Back and Forward while a launch
 is pending, overtaken Back launches, parameters, positive controls) and
 `app-link-test.mjs` (the bundle through `registry.launch`: a slow open, the

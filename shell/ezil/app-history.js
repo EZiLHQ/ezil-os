@@ -132,13 +132,22 @@ export function createAppHistory () {
     // Each open app's own parameters (Code's project, Settings' tab), so
     // focusing it again restores the URL it was opened with.
     const params = new Map();
-    // Every intent takes the next number: a click's launch (`begin`),
-    // Back/Forward, the close of an app window, a focus this module writes
-    // for. `launchGeneration` is the number of the latest LAUNCH intent (a
-    // click or Back/Forward) alone. A pending launch compares its own number
-    // with these when it ends (`end`, `commit`).
+    // Every intent takes the next number (`issued`, never reused): a click's
+    // launch (`begin`), Back/Forward, the close of an app window, a focus
+    // this module writes for. `generation` is the number of the intent that
+    // decides the address bar: the latest one, unless the latest launch
+    // failed and gave it back (`end`) to the intent it took it from.
+    // `launchGeneration` is the same for LAUNCH intents (a click or
+    // Back/Forward) alone. A pending launch compares its own number with
+    // these when it ends (`end`, `commit`).
+    let issued = 0;
     let generation = 0;
     let launchGeneration = 0;
+    // A click's launch that failed while a newer intent decided -> its
+    // give-back, run if the address bar comes back to it (every launch since
+    // failed too). An intent that cannot fail ends every such chain.
+    const failed = new Map();
+    const intent = () => { failed.clear(); generation = issued += 1; return generation; };
     // A Back/Forward launch's ctx -> its number, for `commit`. Keyed by the
     // object `registry.launch` hands back: a key added to the ctx itself
     // would reach the app.
@@ -184,7 +193,7 @@ export function createAppHistory () {
         // The newest intent, whichever entry it lands on (`/os` included): a
         // click's launch or an earlier traversal's still opening must not
         // write over it.
-        const gen = launchGeneration = generation += 1;
+        const gen = launchGeneration = intent();
         const link = parseAppLink(win().location, apps());
         if ( ! link ) return;
         params.set(link.id, linkParams(link));
@@ -215,7 +224,7 @@ export function createAppHistory () {
         // begun since: this is that launch's late focus, not the user's.
         if ( superseded(el) ) return;
         if ( currentApp() === id ) return;
-        generation += 1;
+        intent();
         write('replaceState', urlFor(id), stateFor(id));
     }
 
@@ -241,7 +250,7 @@ export function createAppHistory () {
             // An intent: a launch still opening may not give back, over what
             // this decides, the URL it replaced (`end(null)`). Not a LAUNCH
             // intent: a launch whose window opens still names it.
-            generation += 1;
+            intent();
             if ( ! liveWindow(closed) ) params.delete(closed);
         }
         const next = frontApp();
@@ -328,13 +337,17 @@ export function createAppHistory () {
          * app only while no newer click or Back/Forward has happened;
          * `end(null)` puts anything back only while no newer intent at all
          * has (a close included), and the app's parameters only while no
-         * later launch has set them.
+         * later launch has set them. A launch that fails gives the address
+         * bar back to the intent it took it from: an older launch still
+         * pending decides again, and one that failed meanwhile gives it back
+         * in turn.
          * @returns {{end: (el: Element|null) => void}|null} null when this
          *   module will not write for `id` (an /os-only host, an unknown app).
          */
         begin (id, ctx = {}) {
             if ( ! deps || ! enabled || ! known(id) ) return null;
-            const gen = launchGeneration = generation += 1;
+            const prior = [generation, launchGeneration];
+            const gen = launchGeneration = generation = issued += 1;
             holds += 1;
             const before = { url: here(), state: win().history.state, params: params.get(id) };
             const pushed = currentApp() !== id;
@@ -342,6 +355,16 @@ export function createAppHistory () {
                 write(pushed ? 'pushState' : 'replaceState', urlFor(id), pushed ? { ezilApp: id, ezilView: undefined } : stateFor(id));
             }
             const mine = params.get(id);
+            // As if this launch never happened: the URL and state it
+            // replaced, and the numbers from before it. If those are an older
+            // launch's that failed meanwhile, that one gives back too.
+            const giveBack = () => {
+                if ( pushed ) win().history.replaceState(before.state, '', before.url);
+                [generation, launchGeneration] = prior;
+                const older = failed.get(generation);
+                failed.delete(generation);
+                older?.();
+            };
             let ended = false;
             return {
                 end (el) {
@@ -360,7 +383,8 @@ export function createAppHistory () {
                         if ( before.params === undefined ) params.delete(id);
                         else params.set(id, before.params);
                     }
-                    if ( pushed && gen === generation ) win().history.replaceState(before.state, '', before.url);
+                    if ( gen === generation ) giveBack();
+                    else failed.set(gen, giveBack);
                 },
             };
         },

@@ -604,8 +604,9 @@ export function resolve (payload) {
  * legitimately moved to afterwards would be a worse bug than the one being
  * fixed. So would stealing it back from a NEWER launch's window: when a
  * click or Back/Forward has begun since this launch (`launchGeneration` in
- * `../app-history.js`, read through `superseded`), this one stands down.
- * The newest launch's own re-focus always runs.
+ * `../app-history.js`, read through `superseded`), this one stands down —
+ * unless every such newer launch failed and gave the address bar back
+ * before this runs. The newest launch's own re-focus always runs.
  *
  * It is also when this launch SETTLES for the address bar: until then the
  * window's focus events (the 80ms one, this re-focus) are the launch's own,
