@@ -731,6 +731,67 @@ class IdleHold(unittest.TestCase):
             self.assertEqual(agent.tick(), "held_terminal", "past the cap the normal predicate applies")
 
 
+def load_validate_lowers():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("validate_lowers", os.path.join(HERE, "..", "ami", "validate-lowers.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Bake(unittest.TestCase):
+    """T0 (b2) at bake time: the current lower has the codec's python3 and git, and every mount
+    destination of the export spec (ami/validate-lowers.py, run by the bake and its validate phase)."""
+
+    def setUp(self):
+        self.v = load_validate_lowers()
+        self.d, _, self.lower = scratch(self)
+        self.lowers = os.path.dirname(self.lower)
+        bin_dir = os.path.join(self.lower, "usr", "bin")
+        for name in ("python3.12", "git"):
+            with open(os.path.join(bin_dir, name), "w") as f:
+                f.write("#!/bin/true\n")
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        os.symlink("python3.12", os.path.join(bin_dir, "python3"))
+
+    def check(self):
+        self.v.validate_export(__import__("pathlib").Path(self.lowers), DIGEST)
+
+    def test_mirrors_the_export_spec(self):
+        self.assertEqual((self.v.EXPORT_LOWER_DIRS, self.v.EXPORT_LOWER_FILES),
+                         (desktop.EXPORT_LOWER_DIRS, desktop.EXPORT_LOWER_FILES))
+
+    def test_complete_lower_passes_and_absolute_links_resolve_inside_it(self):
+        self.check()
+        os.unlink(os.path.join(self.lower, "usr/bin/python3"))
+        os.symlink("/usr/bin/python3.12", os.path.join(self.lower, "usr/bin/python3"))
+        self.check()
+
+    def test_each_missing_requirement_fails_the_bake(self):
+        cases = {
+            "git": lambda: os.unlink(os.path.join(self.lower, "usr/bin/git")),
+            "git not executable": lambda: os.chmod(os.path.join(self.lower, "usr/bin/git"), 0o644),
+            "python3 escapes the lower": lambda: (os.unlink(os.path.join(self.lower, "usr/bin/python3")),
+                                                  os.symlink("../../../../../../usr/bin/python3",
+                                                             os.path.join(self.lower, "usr/bin/python3"))),
+            "dangling python3": lambda: os.unlink(os.path.join(self.lower, "usr/bin/python3.12")),
+            "workspace": lambda: os.rmdir(os.path.join(self.lower, "workspace")),
+            "tmp is a link": lambda: (os.rmdir(os.path.join(self.lower, "tmp")),
+                                      os.symlink("workspace", os.path.join(self.lower, "tmp"))),
+            "hosts": lambda: os.unlink(os.path.join(self.lower, "etc/hosts")),
+        }
+        for name, breaker in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                breaker()
+                with self.assertRaises(ValueError):
+                    self.check()
+
+    def test_the_cli_runs_the_export_check(self):
+        with open(os.path.join(HERE, "..", "ami", "validate-lowers.py")) as f:
+            self.assertIn("    validate_export(args.lowers_dir, args.current)", f.read())
+
+
 class Quiesce(unittest.TestCase):
     def test_a_stop_during_a_capture_removes_the_export_container_before_the_volume_unmounts(self):
         d, cfg, _ = scratch(self)
