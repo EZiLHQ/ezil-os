@@ -386,7 +386,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
         // The open: started by the first progress paint after a concluded one, never by a re-open.
         if (progressing && !runningLong && (!open || open.ended)) {
-            if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; progressChecked = false; }
+            // A fresh open reads afresh: no earlier open's move outcome is ever painted as this one's.
+            if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; observedMove = undefined; progressChecked = false; }
             open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null,
                 moving: false, moveView: null, moveHigh: 0, moveKey: null };
             client = 0;

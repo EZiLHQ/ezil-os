@@ -246,6 +246,22 @@ test('the desktop window\'s handed-back move (state.move moving) that later comm
     assert.equal(s.computerMove().outcome, 'committed');
 });
 
+test('a fresh open never paints an earlier open\'s move outcome (a new move answered before any read)', async t => {
+    let moving = false;
+    const { s, set } = await surface(t, movingProgress(), { isMoving: () => moving });
+    await set(terminalProgress({ outcome: 'failed_reopened', reason: 'copy_stalled' }));
+    assert.equal(title(s), "We couldn't move your files");
+    retry(s).click(); // [Open my AWS computer]: the hold's open, a fresh one
+    globalThis.fetch = async () => { throw new Error('network'); };
+    t.after(() => { globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) }); });
+    moving = true; // a new move (started from Settings) answers the next open
+    s.render({ kind: 'progress' });
+    await tick();
+    assert.equal(title(s), 'Moving your files to your Free computer');
+    assert.equal(bar(s).dataset.indeterminate, 'true');
+    assert.equal(retry(s).hidden, true);
+});
+
 test('every move state painted passes the copy guards and names no city or region', () => {
     assert.ok(shown.length >= 20, `${shown.length} states`);
     for ( const text of shown ) {
