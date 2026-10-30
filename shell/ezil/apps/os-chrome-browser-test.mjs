@@ -150,6 +150,165 @@ setInterval(() => {
 }, 100);
 </script></body></html>`;
 
+// ════════════════════════════════════════════════════════════════════════════
+// SCENARIO 5 — Code's full view and its top bar (app-code lane A2, 2026-10-30)
+// ════════════════════════════════════════════════════════════════════════════
+// 🔴 PROVISIONAL visuals (docs/APP-CODE-FULL-VIEW.md; no reference screenshots
+// existed). So these checks pin RELATIONSHIPS, not pixel values: the bar is the
+// control strip, the title is centred, the drawer is at the left, the three
+// controls are ordered, on top, unobstructed and clear of the Feedback corner,
+// nothing overlaps, keyboard focus is visible — at the two sizes the brief
+// names (900x700, 1440x1000). Plus the two-window case: the Browser stays
+// full-bleed, untouched, while Code enters and leaves full view and closes.
+async function scenarioCodeFullView () {
+    for ( const viewport of [{ width: 900, height: 700 }, { width: 1440, height: 1000 }] ) {
+        const L = `[code-full-view ${viewport.width}x${viewport.height}]`;
+        const vw = viewport.width, vh = viewport.height;
+        const { page, page_errors } = await boot(viewport);
+        const CODE = '.window[data-app="code"]';
+        const browserBox = () => page.evaluate(() => {
+            const w = document.querySelector('.window[data-app="desktop"]');
+            const r = w.getBoundingClientRect();
+            return { full: w.classList.contains('ezil-fullbleed'), rect: [r.x, r.y, r.width, r.height].map(Math.round),
+                drawer: getComputedStyle(w.querySelector('.ezil-app-drawer')).display };
+        });
+        const measure = () => page.evaluate((sel) => {
+            const w = document.querySelector(sel);
+            if ( ! w ) return null;
+            const box = (el) => { if ( ! el ) return null; const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; };
+            const bar = w.querySelector(':scope > .ezil-full-view-bar');
+            const hit = (el) => { const b = el.getBoundingClientRect(); return document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2)?.closest('button') === el; };
+            const btns = [...bar.querySelectorAll('button')];
+            return {
+                full: w.classList.contains('ezil-fullbleed'),
+                win: box(w), body: box(w.querySelector(':scope > .window-body')),
+                head: getComputedStyle(w.querySelector(':scope > .window-head')).display,
+                taskbar: getComputedStyle(document.querySelector('.taskbar')).display,
+                barDisplay: getComputedStyle(bar).display, bar: box(bar),
+                strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
+                title: box(w.querySelector('.ezil-full-view-title')), titleText: w.querySelector('.ezil-full-view-title').textContent,
+                drawer: box(w.querySelector(':scope > .ezil-app-drawer')),
+                drawerDisplay: getComputedStyle(w.querySelector(':scope > .ezil-app-drawer')).display,
+                btns: btns.map(b => ({ action: b.dataset.action, ...box(b), hit: hit(b) })),
+            };
+        }, CODE);
+        const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+        const b0 = await browserBox();
+        push(`${L} setup: the Browser is full-bleed`, b0.full, JSON.stringify(b0));
+
+        // ── the dock: windowed ──
+        await page.evaluate(() => document.querySelector('.window[data-app="desktop"]')._ezil_minimise());
+        await sleep(400);
+        await page.evaluate(() => { $('.taskbar-item[data-app="code"]').trigger('click'); });
+        await page.waitForSelector(CODE, { timeout: 10_000 });
+        await sleep(900);
+        const m1 = await measure();
+        push(`${L} 🔴 a dock launch opens Code WINDOWED (head, taskbar, no top bar, not the viewport)`,
+            !! m1 && ! m1.full && m1.head !== 'none' && m1.taskbar !== 'none' && m1.barDisplay === 'none'
+            && ! (m1.win.x === 0 && m1.win.y === 0 && m1.win.w === vw && m1.win.h === vh), JSON.stringify(m1?.win));
+        const windowedBox = JSON.stringify(m1?.win);
+
+        // ── the green button: full view, and the bar's layout ──
+        await page.click(`${CODE} > .window-head .window-scale-btn`);
+        await sleep(500);
+        const m2 = await measure();
+        push(`${L} 🔴 the green button takes the whole viewport (no head, no taskbar)`,
+            m2.full && m2.head === 'none' && m2.taskbar === 'none' && m2.win.x === 0 && m2.win.y === 0
+            && Math.round(m2.win.w) === vw && Math.round(m2.win.h) === vh, JSON.stringify(m2.win));
+        push(`${L} the top bar IS the control strip: top edge, full width, strip height; the editor starts below it`,
+            m2.barDisplay === 'flex' && m2.bar.y === 0 && Math.round(m2.bar.w) === vw && Math.round(m2.bar.h) === m2.strip
+            && m2.strip > 0 && Math.round(m2.body.y) === m2.strip, JSON.stringify({ bar: m2.bar, strip: m2.strip, body: m2.body }));
+        push(`${L} the title is centred in the bar and inside it`,
+            Math.abs(m2.title.x + m2.title.w / 2 - vw / 2) <= 1 && m2.title.y >= 0 && m2.title.y + m2.title.h <= m2.strip
+            && m2.titleText === 'Code', JSON.stringify(m2.title));
+        push(`${L} the drawer sits at the bar's left edge, inside the strip`,
+            m2.drawerDisplay !== 'none' && Math.round(m2.drawer.x) === 8 && m2.drawer.y >= 0 && m2.drawer.y + m2.drawer.h <= m2.strip,
+            JSON.stringify(m2.drawer));
+        push(`${L} minimise / restore / close sit at the right, in that order, inside the strip`,
+            m2.btns.map(b => b.action).join() === 'minimize,restore,close'
+            && m2.btns.every((b, i) => b.y >= 0 && b.y + b.h <= m2.strip && (i === 0 || b.x > m2.btns[i - 1].x + m2.btns[i - 1].w - 0.5))
+            && m2.btns[0].x > vw / 2, JSON.stringify(m2.btns));
+        push(`${L} 🔴 the controls end clear of the Feedback corner (24px icon at right 6px: they stop at least 36px from the edge)`,
+            m2.btns[2].x + m2.btns[2].w <= vw - 36, JSON.stringify(m2.btns[2]));
+        const parts = [{ n: 'title', ...m2.title }, { n: 'drawer', ...m2.drawer }, ...m2.btns.map(b => ({ n: b.action, ...b }))];
+        const clashes = parts.flatMap((a, i) => parts.slice(i + 1).filter(b => overlap(a, b)).map(b => `${a.n}/${b.n}`));
+        push(`${L} 🔴 nothing in the bar overlaps (drawer, title, three controls)`, clashes.length === 0, clashes.join(', '));
+        push(`${L} each control is what a click at its centre hits (nothing on top)`, m2.btns.every(b => b.hit), JSON.stringify(m2.btns.map(b => b.hit)));
+
+        // ── the keyboard ──
+        // DOM order is tab order: the drawer (focus opens it, so its own
+        // Show desktop / Restore window / Close come first), then the bar.
+        await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
+        const order = [];
+        for ( let i = 0; i < 6; i++ ) {
+            await page.keyboard.press('Tab');
+            order.push(await page.evaluate(() => {
+                const el = document.activeElement;
+                const where = el?.closest('.ezil-full-view-bar') ? 'bar' : el?.closest('.ezil-app-drawer') ? 'drawer' : 'other';
+                const action = el?.dataset?.action ?? [...(el?.classList ?? [])].find(c => /^dashboard-app-drawer-(minimize|restore|close)$/.test(c))?.slice(21);
+                return { where, action, ring: el ? getComputedStyle(el).outlineStyle : 'none' };
+            }));
+        }
+        push(`${L} 🔴 Tab walks the drawer's Show desktop / Restore / Close, then the bar's minimise / restore / close, each with a visible focus ring`,
+            order.map(o => `${o.where}:${o.action}`).join() === 'drawer:minimize,drawer:restore,drawer:close,bar:minimize,bar:restore,bar:close'
+            && order.every(o => o.ring !== 'none'), JSON.stringify(order));
+        await page.keyboard.press('Shift+Tab');
+        await page.keyboard.press('Enter');
+        await sleep(500);
+        const m3 = await measure();
+        push(`${L} 🔴 Enter on restore returns to the EXACT previous window box`,
+            ! m3.full && JSON.stringify(m3.win) === windowedBox && m3.taskbar !== 'none' && m3.head !== 'none', `${JSON.stringify(m3.win)} vs ${windowedBox}`);
+
+        // ── double-clicks ──
+        await page.dblclick(`${CODE} > .window-head .window-head-title`);
+        await sleep(500);
+        push(`${L} a title double-click enters full view`, (await measure()).full);
+        await page.dblclick(`${CODE} .ezil-full-view-title`);
+        await sleep(500);
+        const m4 = await measure();
+        push(`${L} a double-click on the top bar returns to the previous box`, ! m4.full && JSON.stringify(m4.win) === windowedBox);
+
+        // ── two full windows: the Browser stays full-bleed through all of it ──
+        await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
+        await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 10_000 });
+        await sleep(400);
+        await page.evaluate((sel) => window.scale_window(document.querySelector(sel)), CODE);
+        await sleep(500);
+        const both = await measure();
+        push(`${L} setup: Code full view over a full-bleed Browser`, both.full && (await browserBox()).full && both.btns.every(b => b.hit));
+        await page.click(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
+        await sleep(500);
+        const m5 = await measure(), b5 = await browserBox();
+        push(`${L} 🔴 Code back to a window while the Browser is full-bleed: the taskbar stays hidden, the Browser is untouched`,
+            ! m5.full && m5.head !== 'none' && m5.taskbar === 'none' && b5.full && JSON.stringify(b5.rect) === JSON.stringify(b0.rect),
+            JSON.stringify({ code: m5.win, taskbar: m5.taskbar, browser: b5 }));
+        await page.evaluate((sel) => window.scale_window(document.querySelector(sel)), CODE);
+        await sleep(400);
+        await page.click(`${CODE} > .ezil-full-view-bar [data-action="close"]`);
+        await page.waitForSelector(CODE, { state: 'detached', timeout: 5_000 });
+        await sleep(300);
+        const b6 = await browserBox();
+        const tb6 = await page.evaluate(() => getComputedStyle(document.querySelector('.taskbar')).display);
+        push(`${L} 🔴 closing Code from full view over a full-bleed Browser leaves the taskbar hidden and the Browser untouched`,
+            tb6 === 'none' && b6.full && b6.drawer !== 'none' && JSON.stringify(b6.rect) === JSON.stringify(b0.rect), JSON.stringify({ tb6, b6 }));
+
+        // ── the route: view "full" ──
+        await page.evaluate(async () => {
+            const p = window.__EZIL_BOOT__;
+            await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
+        });
+        await sleep(900);
+        const m7 = await measure();
+        push(`${L} 🔴 a launch with view "full" (the /app/code route) opens straight into full view, on top`,
+            !! m7 && m7.full && m7.barDisplay === 'flex' && m7.btns.every(b => b.hit), JSON.stringify(m7?.win));
+        push(`${L} never the Fullscreen API`, await page.evaluate(() => document.fullscreenElement === null));
+
+        push(`${L} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
+        await page.close();
+    }
+}
+
 const browser = await chromium.launch();
 let anyHardFailure = false;
 
@@ -158,6 +317,7 @@ for ( const scenario of [
     scenarioFullbleed,
     scenarioStreamFit,
     scenarioCreatedSize,
+    scenarioCodeFullView,
 ] ) {
     try {
         await scenario();
