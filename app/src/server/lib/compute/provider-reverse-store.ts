@@ -284,6 +284,15 @@ export function importComplete(m: Pick<ComputeReverseMove, 'exportHead' | 'impor
 /** Bounds of the lane O / lane A listings (contract §7, G4). */
 export const REVERSE_SNAPSHOT_LIST_MAX = 10;
 export const REVERSE_RETENTION_LIST_MAX = 100;
+/**
+ * `last_error` values that mark a committed row's snapshot execution as spent (contract §3.4, §7.1, r4): `snapshot_failed`
+ * (FAILED, TIMED_OUT or ABORTED) and `snapshot_receipt_invalid` (SUCCEEDED with a receipt that fails validation). The
+ * execution name is spent too, so the sweep never retries it; the row leaves the sweep's queue and stays on the
+ * `snapshot_missing` listing until an operator records a snapshot by hand.
+ */
+export const REVERSE_SNAPSHOT_SPENT_REASONS = ['snapshot_failed', 'snapshot_receipt_invalid'] as const;
+export type ReverseSnapshotSpentReason = (typeof REVERSE_SNAPSHOT_SPENT_REASONS)[number];
+const SPENT = sql.raw(`(${REVERSE_SNAPSHOT_SPENT_REASONS.map(r => `'${r}'`).join(', ')})`);
 const clamp = (limit: number, max: number) => Number.isFinite(limit) ? Math.max(0, Math.min(max, Math.trunc(limit))) : 0;
 
 /** Clock rule (contract §5.4): the store has no app clock. Every timestamp it writes is PostgreSQL's, and `ages` are computed by it. */
@@ -453,15 +462,37 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             return current?.state === 'committed' && current.awsSnapshotId === awsSnapshotId ? current : refuse('lost_race');
         },
         /**
+         * Takes a committed row whose snapshot execution is spent out of the sweep's queue (contract §7.1, r4), so spent rows
+         * never fill `listUnsnapshotted` and starve newer commits. A CAS on `aws_snapshot_id IS NULL AND last_error IS NULL`
+         * (not `updated_at`): the first reason wins and a replay is free. After a write that matched nothing it re-reads; a
+         * committed row that already left the queue (snapshotted, or spent) is returned unchanged. Writes only `last_error`
+         * and `updated_at`: never `state_entered_at`, `retain_until` or `aws_snapshot_id`. A committed row's `last_error` is
+         * never shown to the user (§6.1).
+         */
+        async markSnapshotSpent(expected: ComputeReverseMove, reason: ReverseSnapshotSpentReason): Promise<ComputeReverseMove> {
+            if (expected.state !== 'committed') refuse('illegal_transition');
+            if (!(REVERSE_SNAPSHOT_SPENT_REASONS as readonly string[]).includes(reason)) refuse('invalid_input');
+            const leftQueue = (m: ComputeReverseMove) => m.awsSnapshotId !== null
+                || (REVERSE_SNAPSHOT_SPENT_REASONS as readonly (string | null)[]).includes(m.lastError);
+            if (leftQueue(expected)) return expected;
+            const written = one(await db.execute(sql`UPDATE public.ezil_compute_reverse_moves SET last_error = ${reason}, updated_at = ${STAMP}
+                WHERE id = ${expected.id}::uuid AND state = 'committed' AND aws_snapshot_id IS NULL AND last_error IS NULL RETURNING ${COLUMNS}`));
+            if (written) return written;
+            const current = await readById(expected.id);
+            return current?.state === 'committed' && leftQueue(current) ? current : refuse('lost_race');
+        },
+        /**
          * Committed rows with no D21 snapshot yet, oldest commit first (`state_entered_at` of a committed row is its commit
          * time), at most `REVERSE_SNAPSHOT_LIST_MAX`. `committedForSeconds` (DB clock) lists only rows committed at least that
-         * long ago: 0 for the sweep's snapshot step, 3600 for the `snapshot_missing` listing. A plain read: starting the
-         * snapshot is idempotent by its execution name (contract §7), so two sweeps never need a row lock.
+         * long ago. Rows marked spent (`markSnapshotSpent`) are left out unless `includeSpent`: the sweep's snapshot step calls
+         * `listUnsnapshotted(3)`, the `snapshot_missing` listing `listUnsnapshotted(10, 3600, {includeSpent: true})`. A plain
+         * read: starting the snapshot is idempotent by its execution name (contract §7), so two sweeps never need a row lock.
          */
-        async listUnsnapshotted(limit: number, committedForSeconds = 0): Promise<ComputeReverseMove[]> {
+        async listUnsnapshotted(limit: number, committedForSeconds = 0, options: { includeSpent?: boolean } = {}): Promise<ComputeReverseMove[]> {
             const age = Number.isFinite(committedForSeconds) ? Math.max(0, Math.trunc(committedForSeconds)) : 0;
+            const spent = options.includeSpent === true ? sql`` : sql` AND (last_error IS NULL OR last_error NOT IN ${SPENT})`;
             return rows(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
-                WHERE state = 'committed' AND aws_snapshot_id IS NULL
+                WHERE state = 'committed' AND aws_snapshot_id IS NULL${spent}
                   AND state_entered_at <= clock_timestamp() - make_interval(secs => ${age}::int)
                 ORDER BY ezil_compute_reverse_moves.state_entered_at, id LIMIT ${clamp(limit, REVERSE_SNAPSHOT_LIST_MAX)}`)).map(parse);
         },

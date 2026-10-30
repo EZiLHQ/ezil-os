@@ -9,7 +9,8 @@ import { computeReverseMoves } from '../../db/schema/computers';
 import type { PlacementDb, PlacementExecutor } from './placement';
 import { createProviderMigrationStore, MigrationConflictError } from './provider-migrate-store';
 import {
-    createProviderReverseStore, EXPORT_CHUNK_BYTES, REVERSE_RETENTION_LIST_MAX, REVERSE_SNAPSHOT_LIST_MAX, reverseMovesTablePresent,
+    createProviderReverseStore, EXPORT_CHUNK_BYTES, REVERSE_RETENTION_LIST_MAX, REVERSE_SNAPSHOT_LIST_MAX, REVERSE_SNAPSHOT_SPENT_REASONS,
+    reverseMovesTablePresent,
     type ComputeReverseMove, type ReverseExportBoot, type ReverseExportHead,
 } from './provider-reverse-store';
 
@@ -472,6 +473,50 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         await insertCommitted(12, '14 days');
         expect(await reverse.listUnsnapshotted(1000)).toHaveLength(REVERSE_SNAPSHOT_LIST_MAX);
         expect(REVERSE_SNAPSHOT_LIST_MAX).toBe(10);
+    });
+
+    it('markSnapshotSpent (r4): 3 spent rows never starve a new commit; the snapshot_missing listing keeps them; idempotent, first reason wins', async () => {
+        expect(REVERSE_SNAPSHOT_SPENT_REASONS).toEqual(['snapshot_failed', 'snapshot_receipt_invalid']);
+        const [a0, b0, c0] = [await commit(C), await commit(C2), await commit(C3)];
+        // Commit times: a 2 h, b 90 min, c 70 min ago; d commits now. r3's queue was the oldest 3, so a, b, c filled it.
+        for (const [m, ago] of [[a0, '2 hours'], [b0, '90 minutes'], [c0, '70 minutes']] as const)
+            await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = state_entered_at - interval '${ago}' WHERE id = '${m.id}'`);
+        const d = await commit(C4);
+        const [a, b, c] = [(await reverse.readById(a0.id))!, (await reverse.readById(b0.id))!, (await reverse.readById(c0.id))!];
+        expect((await reverse.listUnsnapshotted(3)).map(m => m.id)).toEqual([a.id, b.id, c.id]);
+        const spentA = await reverse.markSnapshotSpent(a, 'snapshot_failed');
+        expect(spentA).toMatchObject({ id: a.id, state: 'committed', lastError: 'snapshot_failed', awsSnapshotId: null,
+            stateEnteredAt: a.stateEnteredAt, retainUntil: a.retainUntil, commitSentAt: a.commitSentAt });
+        expect(spentA.updatedAt).not.toBe(a.updatedAt);
+        await reverse.markSnapshotSpent(b, 'snapshot_receipt_invalid');
+        await reverse.markSnapshotSpent(c0, 'snapshot_failed'); // a stale copy is fine: the CAS is not on updated_at
+        // The sweep's queue skips spent rows; the snapshot_missing listing (1 h, includeSpent) keeps them.
+        expect((await reverse.listUnsnapshotted(3)).map(m => m.id)).toEqual([d.id]);
+        expect((await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).map(m => m.id)).toEqual([a.id, b.id, c.id, d.id]);
+        expect((await reverse.listUnsnapshotted(10, 3600, { includeSpent: true })).map(m => m.id)).toEqual([a.id, b.id, c.id]);
+        expect(await reverse.listUnsnapshotted(10, 3600)).toEqual([]);
+        // A replay (lost response, or another sweep) returns the recorded row unchanged: the first reason wins.
+        expect(await reverse.markSnapshotSpent(a, 'snapshot_receipt_invalid')).toMatchObject({ lastError: 'snapshot_failed', updatedAt: spentA.updatedAt });
+        expect(await reverse.markSnapshotSpent(spentA, 'snapshot_receipt_invalid')).toBe(spentA);
+        // Two sweeps at once on one row: exactly one write, both get the same spent row back.
+        const both = await Promise.all([reverse.markSnapshotSpent(d, 'snapshot_failed'), reverse.markSnapshotSpent(d, 'snapshot_receipt_invalid')]);
+        expect(new Set(both.map(m => `${m.lastError}|${m.updatedAt}`)).size).toBe(1);
+        // A spent row still takes a snapshot (an operator's, or a late success), and then leaves every listing.
+        const snapped = await reverse.recordSnapshot(spentA, 'snap-02639db95fe545d4f');
+        expect(snapped).toMatchObject({ awsSnapshotId: 'snap-02639db95fe545d4f', lastError: 'snapshot_failed', stateEnteredAt: a.stateEnteredAt });
+        expect((await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).map(m => m.id)).toEqual([b.id, c.id, d.id]);
+        // A snapshotted row has left the queue: marking it writes nothing and returns the current row, even from a stale copy.
+        expect(await reverse.markSnapshotSpent(snapped, 'snapshot_failed')).toBe(snapped);
+        const e = await commit(C5);
+        const eSnapped = await reverse.recordSnapshot(e, 'snap-053333a158f9cc895');
+        expect(await reverse.markSnapshotSpent(e, 'snapshot_failed'))
+            .toMatchObject({ awsSnapshotId: 'snap-053333a158f9cc895', lastError: null, updatedAt: eSnapped.updatedAt });
+        // Refused before any statement: a row that is not committed, an unknown reason.
+        await expect(reverse.markSnapshotSpent(await create(C), 'snapshot_failed')).rejects.toEqual(conflict('illegal_transition'));
+        await expect(reverse.markSnapshotSpent(b, 'boot_timeout' as never)).rejects.toEqual(conflict('invalid_input'));
+        // The operator runbook still records a snapshot on a spent row (§7.1); b then leaves the listing.
+        expect(await runbookSql('operator_snapshot', b.id)).toEqual([expect.objectContaining({ state: 'committed', aws_snapshot_id: 'snap-0a1b2c3d4e5f60718' })]);
+        expect((await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).map(m => m.id)).toEqual([c.id, d.id]);
     });
 
     it('listRetentionExpired: committed rows whose retain_until passed on the DB clock, oldest first, bounded at 100', async () => {
