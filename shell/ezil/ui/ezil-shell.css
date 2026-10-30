@@ -572,6 +572,161 @@ body.device-phone {
     display: none;
 }
 
+/* ── Code in full view: the compact top bar ("notch") ─────────────────────
+ * App-code lane A2, 2026-10-30. 🔴 PROVISIONAL VISUALS: no reference
+ * screenshots were available; every number below is recorded in
+ * docs/APP-CODE-FULL-VIEW.md and is to be refined after a pixel review.
+ *
+ * The bar sits in the same control strip as the Browser's
+ * (`--ezil-control-strip-height`, 43px / 59px coarse, set by the shared rule
+ * above), so the small Feedback icon's fixed full-bleed position
+ * (feedback.css: `top: 9.5px` / `7.5px`, right edge) is centred in it with no
+ * Code-specific rule. Left: the control drawer, moved from the strip's centre
+ * to its left edge. Middle: the title. Right: minimise / restore / close,
+ * ending `--ezil-fv-chip-reserve` short of the edge so they never sit under the
+ * Feedback icon (24px at right 6px; 44px at right 0 under `pointer: coarse`).
+ *
+ * Specificity: `.ezil-code-window.ezil-fullbleed > …` is (0,3,0) against the
+ * shared `.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer` (0,3,0), and
+ * comes later — so only the drawer's horizontal placement changes for Code. */
+.ezil-code-window > .ezil-full-view-bar {
+    display: none;
+}
+.ezil-code-window.ezil-fullbleed {
+    --ezil-fv-chip-reserve: 40px;
+    --ezil-fv-btn: 28px;
+    --ezil-fv-side: 150px;
+}
+@media (pointer: coarse) {
+    .ezil-code-window.ezil-fullbleed {
+        --ezil-fv-chip-reserve: 50px;
+        --ezil-fv-btn: 44px;
+        --ezil-fv-side: 200px;
+    }
+}
+.ezil-code-window.ezil-fullbleed > .ezil-full-view-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--ezil-control-strip-height);
+    /* Below the drawer (600), so an expanded drawer covers the title, and
+       above the window body, which starts under the strip anyway. */
+    z-index: 550;
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 0 var(--ezil-fv-chip-reserve) 0 78px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--color-offwhite, #f5f5f4);
+    -webkit-user-select: none;
+    user-select: none;
+}
+.ezil-code-window.ezil-fullbleed > .ezil-app-drawer {
+    left: 8px;
+    transform: none;
+}
+.ezil-full-view-title {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    max-width: calc(100% - 2 * var(--ezil-fv-side));
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.2;
+    opacity: 0.86;
+}
+.ezil-full-view-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+.ezil-full-view-btn {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--ezil-fv-btn);
+    height: var(--ezil-fv-btn);
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    opacity: 0.8;
+    cursor: pointer;
+}
+.ezil-full-view-btn svg {
+    width: 16px;
+    height: 16px;
+}
+.ezil-full-view-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    opacity: 1;
+}
+.ezil-full-view-btn:focus-visible {
+    outline: 2px solid var(--ezil-accent, #00adb5);
+    outline-offset: 2px;
+    opacity: 1;
+}
+
+/* ── Code: "Reconnecting…" / "Computer stopped" ───────────────────────────
+ * App-code lane A2. Covers the editor frame (and the opening surface, z 2)
+ * while the shell knows the computer is not there. Hidden with `hidden` and
+ * the `[hidden]` rule below — never an inline `display` (see the
+ * "not available" panels above for why). Provisional visuals, as above. */
+.ezil-code-state {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+    background: var(--color-charcoal, #161616);
+    color: var(--color-offwhite, #f5f5f4);
+}
+.ezil-code-state[hidden],
+.ezil-code-state-start[hidden] {
+    display: none;
+}
+.ezil-code-state-title {
+    font-size: 15px;
+    font-weight: 600;
+}
+.ezil-code-state-body {
+    font-size: 13px;
+    max-width: 34em;
+    opacity: 0.75;
+}
+.ezil-code-state-start {
+    margin-top: 4px;
+    padding: 7px 18px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--ezil-accent-contrast);
+    background: var(--ezil-accent);
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+    min-height: 34px;
+}
+.ezil-code-state-start:hover {
+    background: var(--ezil-accent-strong);
+}
+.ezil-code-state-start:focus-visible {
+    outline: 2px solid var(--ezil-accent);
+    outline-offset: 2px;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * THE KEYBOARD AND THE SAFE AREA, ON A PHONE — W7, 2026-08-19, contract §7.3.
  * 🔴 NO RULE HERE. This note exists so the next person looks in the right file.
