@@ -34,9 +34,36 @@ TIMING_PHASES = ("claimObservedMs", "guardDoneMs", "enrollDoneMs", "warmStoppedM
                  "relayAvailableMs", "desktopStartedMs", "desktopHealthyMs")
 FENCE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 SERIAL_RE = re.compile(r"vol-?([0-9a-f]{8,17})")
+# C3 (REVERSE-MOVE-CONTRACT §2.8): a claim may carry the migration's restore lease, the same
+# RestoreLease the cold provision puts in user data (app provider-migrate.ts restoreLeaseFor), so
+# an adopted spare restores the Cloudflare workspace before the marker, exactly as a cold boot.
+RESTORE_KEYS = {"kind", "migrationId", "generation", "system", "fetchBase", "identityToken"}
+RESTORE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
-def parse_claim(raw, *, require_nonce=True):
+def parse_restore(r, computer_id, origin=None):
+    """The claim's restore lease, closed; the token is never echoed. fetchBase is the app's
+    restore route for THIS computer, over https (restore.http_fetch requires it), and on the
+    pool's own app origin when that is known."""
+    if (not isinstance(r, dict) or set(r) != RESTORE_KEYS or r["kind"] != "cf-snapshot" or type(r["system"]) is not bool
+            or not all(isinstance(r[k], str) and leasemod.POOL_UUID_RE.fullmatch(r[k]) for k in ("migrationId", "generation"))
+            or not isinstance(r["identityToken"], str) or not RESTORE_TOKEN_RE.fullmatch(r["identityToken"])
+            or not isinstance(r["fetchBase"], str) or len(r["fetchBase"]) > 512):
+        raise Refused("pool_claim_invalid", "restore")
+    try:
+        url = urlsplit(r["fetchBase"])
+        ok = (url.scheme == "https" and url.hostname and not url.username and not url.password and not url.query
+              and not url.fragment and url.path == "/api/compute/restore/" + computer_id
+              and not any(ord(c) <= 32 for c in r["fetchBase"]))
+        url.port
+    except ValueError:
+        ok = False
+    if not ok or (origin is not None and urlunsplit((url.scheme, url.netloc, "", "", "")) != origin):
+        raise Refused("pool_claim_invalid", "restore fetchBase")
+    return dict(r)
+
+
+def parse_claim(raw, *, require_nonce=True, origin=None):
     try:
         claim = leasemod.strict_json(raw)
     except (ValueError, UnicodeDecodeError, TypeError, RecursionError) as e:
@@ -59,13 +86,18 @@ def parse_claim(raw, *, require_nonce=True):
         raise Refused("pool_claim_invalid", "createVolume")
     if claim.get("createVolume") and "fsUuid" not in claim:
         raise Refused("pool_claim_invalid", "createVolume requires fsUuid")
+    if "restore" in claim:
+        # The guard restores only into a fresh volume (its marker-less init path).
+        if claim.get("createVolume") is not True:
+            raise Refused("pool_claim_invalid", "restore requires createVolume")
+        claim["restore"] = parse_restore(claim["restore"], claim["computerId"], origin)
     if "claimPublishedAtMs" in claim:
         published = claim["claimPublishedAtMs"]
         if type(published) not in (int, float) or not 0 <= published <= 4102444800000:
             raise Refused("pool_claim_invalid", "claimPublishedAtMs")
     # Unknown response fields cannot override local paths, authority or device identity.
-    return {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence",
-                                  "volumeSerial", "enrollNonce", "fsUuid", "createVolume", "claimPublishedAtMs") if k in claim}
+    return {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence", "volumeSerial", "enrollNonce",
+                                  "fsUuid", "createVolume", "claimPublishedAtMs", "restore") if k in claim}
 
 
 def timing(cfg, phase=None, claim=None):
@@ -166,7 +198,7 @@ class Client:
 
     def claim(self):
         status, body = self.request("GET", "claim")
-        return None if status == 204 else parse_claim(body)
+        return None if status == 204 else parse_claim(body, origin=self.origin)
 
 
 def read_record(cfg):
@@ -184,7 +216,8 @@ def read_record(cfg):
             if record["phase"] not in ("reserved", "guarding", "enrolled", "switched", "failed"):
                 raise ValueError
             record["claim"] = parse_claim(json.dumps(record["claim"]),
-                                         require_nonce=record["phase"] in ("reserved", "guarding"))
+                                         require_nonce=record["phase"] in ("reserved", "guarding"),
+                                         origin=record.get("appOrigin"))
             leasemod.parse(json.dumps({"kind": "pool", "poolHostId": record["poolHostId"],
                                       "poolGeneration": record["poolGeneration"]}))
             if not isinstance(record["instanceId"], str) or not record["instanceId"]:
@@ -243,6 +276,8 @@ def computer_lease(cfg, claim):
              "provision": claim.get("createVolume", False)}
     if "enrollNonce" in claim:
         lease["nonce"] = claim["enrollNonce"]
+    if "restore" in claim:
+        lease["restore"] = dict(claim["restore"])   # guard.run_guard restores before the marker
     return leasemod.parse(json.dumps(lease))
 
 

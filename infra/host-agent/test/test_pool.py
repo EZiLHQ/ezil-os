@@ -31,6 +31,11 @@ TAGS = {"ezil:computer": CLAIM["computerId"], "ezil:generation": "4",
 FS_UUID = "44444444-4444-4444-8444-444444444444"
 IDENTITY = {"document": '{"instanceId":"i-0123456789abcdef0"}', "signature": "c2ln\n"}
 HEALTH = {"ok": True, "desktop": True, "editor": True}
+TOKEN = "T0kEn_" + "x" * 37
+RESTORE = {"kind": "cf-snapshot", "migrationId": "55555555-5555-4555-8555-555555555555",
+           "generation": "66666666-6666-4666-8666-666666666666", "system": True,
+           "fetchBase": POOL["appOrigin"] + "/api/compute/restore/" + CLAIM["computerId"], "identityToken": TOKEN}
+RESTORE_CLAIM = dict(CLAIM, fsUuid=FS_UUID, createVolume=True, restore=RESTORE)
 ANSWER = json.dumps({"tunnelToken": "t" * 32, "controlKey": base64.b64encode(b"k" * 32).decode(),
                      "sandboxId": "guac-1111-2222", "zone": "example.test"}).encode()
 
@@ -111,6 +116,38 @@ class Parsing(PoolTest):
             for value in values:
                 with self.subTest(key=key, value=value), self.assertRaises(Refused):
                     pool.parse_claim(json.dumps({**CLAIM, key: value}))
+
+    def test_claim_may_carry_the_migrations_restore_lease(self):
+        # C3: the cold provision's RestoreLease (provider-migrate.ts restoreLeaseFor), carried by a claim.
+        self.assertEqual(pool.parse_claim(json.dumps(RESTORE_CLAIM)), RESTORE_CLAIM)
+        self.assertEqual(pool.parse_claim(json.dumps(RESTORE_CLAIM), origin=POOL["appOrigin"]), RESTORE_CLAIM)
+        self.assertEqual(pool.parse_claim(json.dumps(dict(RESTORE_CLAIM, restore=dict(RESTORE, system=False))))["restore"]["system"], False)
+
+    def test_restore_lease_is_closed_and_bound_to_this_computer_and_origin(self):
+        other = "77777777-7777-4777-8777-777777777777"
+        bad = {
+            "kind": ["s3", None], "system": [1, "true", None], "migrationId": ["x", "ABCDEF77-7777-4777-8777-777777777777", None],
+            "generation": ["", other + "\n"], "identityToken": ["short", "x" * 44, "bad token " + "x" * 33, None],
+            "fetchBase": ["http://app.example.test/api/compute/restore/" + CLAIM["computerId"],
+                          POOL["appOrigin"] + "/api/compute/restore/" + other,
+                          POOL["appOrigin"] + "/api/compute/restore/" + CLAIM["computerId"] + "?x=1",
+                          "https://u:p@app.example.test/api/compute/restore/" + CLAIM["computerId"],
+                          "https://app.example.test:99999/api/compute/restore/" + CLAIM["computerId"], 7],
+        }
+        for key, values in bad.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(Refused) as caught:
+                        pool.parse_claim(json.dumps(dict(RESTORE_CLAIM, restore=dict(RESTORE, **{key: value}))))
+                    self.assertNotIn(TOKEN, str(caught.exception), "the token is never echoed")
+        for restore in ({**RESTORE, "extra": 1}, {k: v for k, v in RESTORE.items() if k != "system"}, [], None):
+            with self.subTest(restore=restore), self.assertRaises(Refused):
+                pool.parse_claim(json.dumps(dict(RESTORE_CLAIM, restore=restore)))
+        with self.assertRaisesRegex(Refused, "restore fetchBase"):
+            pool.parse_claim(json.dumps(RESTORE_CLAIM), origin="https://other.example.test")
+        for claim in (dict(CLAIM, restore=RESTORE), dict(CLAIM, fsUuid=FS_UUID, restore=RESTORE)):
+            with self.subTest(createVolume=claim.get("createVolume")), self.assertRaisesRegex(Refused, "restore requires createVolume"):
+                pool.parse_claim(json.dumps(claim))
 
     def test_https_origin_from_pool_lease_or_existing_config(self):
         self.assertEqual(pool.app_origin(self.cfg, POOL), "https://app.example.test")
@@ -505,6 +542,15 @@ class Devices(PoolTest):
             with self.assertRaisesRegex(Refused, "pool_volume_has_signature"):
                 pool.computer_lease(self.cfg, dict(CLAIM, fsUuid=FS_UUID, createVolume=True))
 
+    def test_restore_claim_lease_restores_into_the_fresh_volume(self):
+        self.patch(guard, "wait_device_for_volume", return_value="/dev/nvme0n1")
+        self.patch(guard, "fs_uuid", return_value=None)
+        self.patch(pool.subprocess, "run", return_value=SimpleNamespace(returncode=2, stdout=""))
+        result = pool.computer_lease(self.cfg, RESTORE_CLAIM)
+        self.assertEqual((result["restore"], result["provision"], result["fsUuid"]), (RESTORE, True, FS_UUID))
+        self.assertIsNot(result["restore"], RESTORE_CLAIM["restore"], "the guard augments its own copy")
+        self.assertNotIn("restore", pool.computer_lease(self.cfg, dict(CLAIM, fsUuid=FS_UUID, createVolume=True)))
+
     def test_pool_disk_guard_disables_same_instance_reboot_exception(self):
         self.cfg["lowerDigestFile"] = os.path.join(self.cfg.runDir, "digest")
         with open(self.cfg.lowerDigestFile, "w") as f:
@@ -718,6 +764,24 @@ class Resume(PoolTest):
         self.client.enroll.assert_not_called()
         self.client.ready.assert_not_called()
         self.assertFalse(self.guarded.call_args.kwargs["allow_reboot"])
+        self.assertEqual(pool.read_record(self.cfg)["phase"], "switched")
+
+    def test_restore_claim_reaches_the_guard_and_survives_a_resume(self):
+        # C3: the adopted spare restores before the marker, as the cold provision does.
+        self.patch(pool, "wait_claim", return_value=RESTORE_CLAIM)
+        self.patch(guard, "fs_uuid", return_value=None)
+        self.command.return_value = SimpleNamespace(returncode=2, stdout="")
+        self.guarded.side_effect = SystemExit(99)          # crash inside the guard (the restore)
+        with self.assertRaises(SystemExit):
+            pool.run(self.cfg, POOL)
+        lease = self.guarded.call_args.args[1]
+        self.assertEqual((lease["restore"], lease["provision"]), (RESTORE, True))
+        record = pool.read_record(self.cfg)
+        self.assertEqual((record["phase"], record["claim"]["restore"], record["lease"]["restore"]),
+                         ("guarding", RESTORE, RESTORE))
+        self.guarded.side_effect = None
+        pool.run(self.cfg, POOL)
+        self.assertEqual(self.guarded.call_args.args[1]["restore"], RESTORE)
         self.assertEqual(pool.read_record(self.cfg)["phase"], "switched")
 
     def test_restart_with_leased_host_picks_up_claim_before_pool_enrollment(self):
