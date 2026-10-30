@@ -339,6 +339,8 @@ export async function openCodeWindow (ctx = {}) {
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
+        // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
+        isPreparing: () => session.isComputePreparing(computer.id),
         onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy,
         onProgressChange: () => {
             const seen = progress.computerProgress();

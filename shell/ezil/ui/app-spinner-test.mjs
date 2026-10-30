@@ -572,6 +572,81 @@ try {
             && statusOf(spinner).textContent === 'Almost there — waiting for Browser to connect.', `${statusOf(spinner).textContent} ${metaOf(spinner).textContent}`);
     });
     now = 0;
+    // Round 6 (seam C): the first Code open after a host boot waits for ONE config push and a container restart
+    // (the Worker bounds it at 150 s). When the server says so (`computePreparing`), the open shows that wait:
+    // never "usually under a minute", its own 150 s bound from when it was first seen, a monotonic bar, and it
+    // stays that wait for the rest of the open even when later answers carry no flag (the container restarting).
+    {
+        let preparing = false;
+        await observe(runningNow, async spinner => {
+            push('seam C: a connect first', statusOf(spinner).textContent === 'Connecting to Browser…', statusOf(spinner).textContent);
+            const bars = [];
+            const sample = () => bars.push(barOf(spinner));
+            for (const t of [1_000, 2_000, 3_000, 4_000]) { now = t; spinner.render({ kind: 'progress' }); sample(); }
+            preparing = true; now = 5_000; spinner.render({ kind: 'progress' }); sample();
+            push('🔴 seam C: preparing says what is happening and when, never "under a minute"',
+                statusOf(spinner).textContent === 'Preparing Browser — the first open after your computer starts takes a minute or two.'
+                && ! /under a minute/.test(spinner.el.textContent), `${statusOf(spinner).textContent} | ${metaOf(spinner).textContent}`);
+            push('seam C: the meta line is the elapsed time only (no expectation to contradict the status)',
+                metaOf(spinner).textContent === '0:05', metaOf(spinner).textContent);
+            preparing = false;
+            for (let t = 5_250; t <= 154_000; t += 250) { now = t; spinner.render({ kind: 'progress' }); if (t % 5_000 === 0) await poll(); sample(); }
+            push('🔴 seam C: sticky — later answers without the flag never bring back the connect copy',
+                statusOf(spinner).textContent.startsWith('Preparing Browser') && ! /Connecting to|under a minute/.test(spinner.el.textContent),
+                statusOf(spinner).textContent);
+            push('seam C: 2:34 (149 s into its 150 s bound) is not yet long', stateOf(spinner) === 'opening' && metaOf(spinner).textContent === '2:34',
+                `${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+            now = 155_000; spinner.render({ kind: 'progress' }); sample();
+            push('seam C: past its bound (150 s from 0:05): "Taking longer than usual · 2:35", no Try again',
+                stateOf(spinner) === 'long' && metaOf(spinner).textContent === 'Taking longer than usual · 2:35' && $(spinner, '.ezil-boot-actions').hidden,
+                `${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+            const atSwitch = bars[4], before = bars[3];
+            push('🔴 seam C: the bar never steps back across the switch or after it, and stays below 100',
+                bars.every((v, i) => v < 100 && v >= (bars[i - 1] ?? 0)), bars.filter((_, i) => i % 40 === 0).join());
+            push('🔴 seam C: the bar keeps moving after the switch (no park at the connect\'s position)',
+                bars[4 + 120] > atSwitch && bars[4 + 400] > bars[4 + 120] && atSwitch >= before, `${before} → ${atSwitch} → ${bars[4 + 120]} → ${bars[4 + 400]}`);
+            spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
+            push('seam C, URL in hand: "Waiting for Browser to answer…"', statusOf(spinner).textContent === 'Waiting for Browser to answer…',
+                statusOf(spinner).textContent);
+            spinner.render({ kind: 'ready' });
+            push('seam C: ready is 100', barOf(spinner) === 100 && stateOf(spinner) === 'done');
+            // A fresh open (Try again) starts clean: no flag, the connect again.
+            now = 200_000; spinner.render({ kind: 'progress' }); await tick();
+            push('seam C: a fresh open without the flag is a connect again', statusOf(spinner).textContent === 'Connecting to Browser…',
+                statusOf(spinner).textContent);
+        }, { isPreparing: () => preparing });
+        now = 0;
+        // Preparing seen at the start of an open (the first answer already says so): 150 s bound from there.
+        await observe(runningNow, async spinner => {
+            push('seam C at once: preparing copy, elapsed blank before 0:03', statusOf(spinner).textContent.startsWith('Preparing Browser')
+                && metaOf(spinner).textContent === '' && ! barEl(spinner).hidden && barOf(spinner) >= 85 && barOf(spinner) < 100,
+                `${statusOf(spinner).textContent} ${barOf(spinner)}`);
+            now = 60_000; spinner.render({ kind: 'progress' });
+            push('seam C at once: at 1:00 still opening, below 100', stateOf(spinner) === 'opening' && metaOf(spinner).textContent === '1:00'
+                && barOf(spinner) < 100, `${stateOf(spinner)} ${metaOf(spinner).textContent} ${barOf(spinner)}`);
+        }, { isPreparing: () => true });
+        now = 0;
+        // A cold opening that reaches running and then prepares: the same honest wait, never "under a minute".
+        await observe({ ...opening, path: 'cold' }, async spinner => {
+            now = 120_000; payload = runningNow; await poll();
+            preparing = true; spinner.render({ kind: 'progress' });
+            push('seam C after a cold opening: the preparing copy and the elapsed clock (2:00), no connect copy',
+                statusOf(spinner).textContent.startsWith('Preparing Browser') && metaOf(spinner).textContent === '2:00'
+                && ! /under a minute|Connecting to/.test(spinner.el.textContent), `${statusOf(spinner).textContent} ${metaOf(spinner).textContent}`);
+            now = 271_000; spinner.render({ kind: 'progress' });
+            push('seam C after a cold opening: long only 150 s after preparing began', stateOf(spinner) === 'long', stateOf(spinner));
+        }, { isPreparing: () => preparing });
+        preparing = false; now = 0;
+        // No observation (a hidden tab or failed polls): the preparing copy still governs the window's paint.
+        failFetch = true;
+        await observe(runningNow, async spinner => {
+            now = 10_000; spinner.render({ kind: 'progress' });
+            push('seam C without an observation: the preparing copy and the elapsed time',
+                statusOf(spinner).textContent.startsWith('Preparing Browser') && metaOf(spinner).textContent === '0:10'
+                && ! /under a minute/.test(spinner.el.textContent), `${statusOf(spinner).textContent} ${metaOf(spinner).textContent}`);
+        }, { isPreparing: () => true });
+        now = 0;
+    }
     // A failed state may carry its own copy (Code: the computer is running, Code did not answer).
     await observe(runningNow, async spinner => {
         spinner.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting', copy: { title: 'App copy', body: 'App body.' } });

@@ -249,8 +249,18 @@ const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 
 // Concurrent opens cannot clear one another's still-active migration signal.
 const migratingRequests = new Map();
 const launchingRequests = new Map();
+/**
+ * Round 6 (seam C): in-flight asks whose server answer said the computer's desktop is taking this host
+ * boot's config (one push, then a container restart; the Worker bounds it at 150 s) or code-server is
+ * starting after it (`computePreparing`, app aws-preview.ts AWS_PREPARING_REASONS). Kept for the rest of
+ * that ask's loop once seen: during the restart the Worker answers other starting codes without the flag.
+ */
+const preparingRequests = new Map();
 export function isComputeLaunching (computerId) {
     return !!computerId && [...launchingRequests.values()].includes(computerId);
+}
+export function isComputePreparing (computerId) {
+    return !!computerId && [...preparingRequests.values()].includes(computerId);
 }
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
@@ -396,6 +406,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
     const cancelled = () => {
         migratingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
+        preparingRequests.delete(progressKey);
         console.info(`[ezil-os:session] ${what}: cancelled by the caller after ${asks} ask(s); not asking again`);
         return { ok: false, errorCode: 'cancelled', message: 'Stopped asking: the caller cancelled.' };
     };
@@ -459,6 +470,11 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
             } else {
                 launchingRequests.delete(progressKey);
             }
+            // Seam C: a qualifier on the wake, never a bound. The wait stays within this loop's deadline.
+            if ( computerId && res.ok !== true && res.errorCode === 'sandbox_starting'
+                 && res.computeProvider === 'aws-ec2' && res.computePreparing === true ) {
+                preparingRequests.set(progressKey, computerId);
+            }
             if ( res.ok === true ) return res;
 
             if ( res.errorCode === 'sandbox_starting' ) {
@@ -505,6 +521,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
     } finally {
         migratingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
+        preparingRequests.delete(progressKey);
     }
 }
 
@@ -792,6 +809,7 @@ export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
         ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
         ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
+        ...(data?.computePreparing === true ? { computePreparing: true } : {}),
         ...capacityAttemptOf(data) };
 }
 
@@ -1503,7 +1521,7 @@ export default {
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching,
+    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching, isComputePreparing,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

@@ -61,6 +61,12 @@ const OPENING_FLOOR = [0.05, 0.05, 0.35, 0.6, 0.85, 0.85];
  * floor toward this over the server's connect expectation, instead of parking at 85% until the frame.
  */
 const CONNECT_MAX = 0.97;
+/**
+ * Round 6 (seam C): the Worker's bound on a desktop taking this host boot's config (one push, its 30 s agent
+ * tick, then a container stop and start: worker/src/aws-ice.ts AWS_DESKTOP_CONFIG_APPLY_MS). While the server
+ * says the computer is preparing, this is the wait's expectation, measured from when it was first seen.
+ */
+export const PREPARE_EXPECTED_S = 150;
 /** Migration steps: saving, getting the AWS computer, moving (the real percent governs), starting. */
 const MIGRATION_FLOOR = [0.05, 0.05, 0.05, 0.6];
 /** `progressView` maps a measured transfer into this segment of its own migration bar. */
@@ -86,6 +92,8 @@ export function openingFill ({ t = 0, T = 240, floor = 0, prev = 0, real = null,
 }
 
 const expectText = T => T < 60 ? 'usually under a minute' : `usually about ${Math.max(1, Math.round(T / 60))} min`;
+/** Seam C: the preparing status. The meta line shows the elapsed time only, so nothing contradicts it. */
+export const preparingText = app => `Preparing ${app} — the first open after your computer starts takes a minute or two.`;
 const ICON_URL = /^(?:data:image\/(?:svg\+xml|png|gif|webp|jpeg)[;,]|https:\/\/|\/(?!\/))/;
 const feedbackAvailable = () => typeof globalThis.window?.__EZIL_BOOT__?.desktopState?.endpoints?.feedback === 'string';
 /** "Opening Code…" → "Code". */
@@ -116,10 +124,12 @@ function viewComputerStatus () {
  * @param {() => void} [opts.onViewStatus] Called by "View computer status" (default: Settings → Computer).
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
+ * @param {() => boolean} [opts.isPreparing] Round 6 (seam C): the server said this computer's desktop is taking its
+ *   config (or code-server is starting after it). Seen once, the open shows that wait to its end.
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
 export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
-    failureCopy, isMigrating = () => false, isLaunching = () => false } = {}) {
+    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
@@ -170,7 +180,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
      * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display
      * (`T`: the last OPENING expectation; a connect answer carries none); `connect`: this open is a
      * connect, set by its first opening-or-connect observation and cleared for good by an opening
-     * (or a move) seen inside it (round 6, R3-4).
+     * (or a move) seen inside it (round 6, R3-4). `prepare`: round 6 seam C, `{at, from}` (this open's
+     * elapsed seconds and its bar) when the server first said the computer is preparing; never cleared.
      */
     let open = null;
     let aria = { at: -Infinity, key: null };
@@ -241,6 +252,27 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     const frozen = () => open && open.high > 0 ? open.high : null;
 
     /**
+     * Round 6 (seam C): the preparing wait. Its expectation is the Worker's 150 s bound from when it was first seen
+     * (never "under a minute"), stated by the status line; the meta line shows only the elapsed time until that bound
+     * passes. The bar eases from where it stood when preparing was seen toward CONNECT_MAX over that bound, so it
+     * never steps back or parks; 100 only on the first frame.
+     */
+    function paintPreparing (t, floor, details) {
+        const since = Math.max(0, t - open.prepare.at);
+        const long = since >= PREPARE_EXPECTED_S;
+        const from = Math.max(open.prepare.from, floor);
+        const real = from + (CONNECT_MAX - from) * (1 - Math.exp(-CURVE_RATE * since / PREPARE_EXPECTED_S));
+        open.high = client >= FIRST_FRAME ? 1 : openingFill({ t, T: PREPARE_EXPECTED_S, floor, prev: open.high, real, reducedMotion: reduced() });
+        const app = name || 'your desktop';
+        paint({
+            state: long ? 'long' : 'opening', title: label,
+            status: client >= URL_RECEIVED ? `Waiting for ${app} to answer…` : preparingText(app),
+            meta: long ? `${OPEN_COPY.long} · ${formatElapsed(t)}` : t >= META_AFTER_S ? formatElapsed(t) : '',
+            bar: open.high, details,
+        });
+    }
+
+    /**
      * @param {import('../boot-phases.js').BootUiState} state
      * @param {{elapsedMs?: number, reopening?: boolean}} [extra] `reopening`: the desktop window is
      *   re-asking because the AWS observation said the computer is still opening.
@@ -269,8 +301,13 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // The open: started by the first progress paint after a concluded one, never by a re-open.
         if (progressing && !runningLong && (!open || open.ended)) {
             if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; progressChecked = false; }
-            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null };
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null };
             client = 0;
+        }
+        // Seam C: latched for the rest of this open, so a later answer without the flag (the desktop's container
+        // restarting) never flips it back to a connect's expectation.
+        if (open && !open.ended && progressing && !open.prepare && client < URL_RECEIVED && isPreparing() === true) {
+            open.prepare = { at: elapsedOf(), from: open.high };
         }
         if (pending) observer?.start();
         if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
@@ -307,6 +344,13 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
                 return;
             }
             const t = elapsedOf();
+            if (open?.prepare) {
+                const reached = Math.max(0, view.bar?.reached ?? 0);
+                const opening = !view.bar || view.bar.floors.length === OPENING_MILESTONES.length;
+                const floor = opening ? OPENING_FLOOR[Math.min(Math.max(reached, Math.min(client, URL_RECEIVED)), OPENING_FLOOR.length - 1)] : 0;
+                paintPreparing(t, floor, details);
+                return;
+            }
             // Round 6 (R3-4): a connect (this open began on a running computer with nothing opening) runs on the
             // server's connect expectation; an opening that reaches running keeps the expectation it had.
             const connecting = view.connect === true && open?.connect === true && view.connectExpected > 0;
@@ -336,6 +380,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             // Optional AWS/migration metadata must not replace physical app startup.
             const copy = observer ? null : isMigrating() === true ? MIGRATION_COPY : isLaunching() === true ? LAUNCH_COPY : null;
             const t = elapsedOf();
+            if (open?.prepare) {
+                paintPreparing(t, client >= URL_RECEIVED ? OPENING_FLOOR[URL_RECEIVED] : state.confirmed === true ? OPENING_FLOOR[3] : 0, null);
+                return;
+            }
             // An AWS observer that has not answered yet: elapsed only. Its expectation is unknown,
             // so neither "under a minute" nor "taking longer" may be claimed.
             const awaiting = root.dataset.progress === 'pending';
