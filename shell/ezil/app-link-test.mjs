@@ -173,6 +173,9 @@ for (const [entry, canonical] of [
 {
     const routed = await boot(`/app/code?${pr}&path=src/main.ts`);
     same(routed.opens.map(c => [c.view, c.project]), [['full', { projectId: P, repoId: R, path: 'src/main.ts' }]], 'route launch context carries view and project');
+    // Apps spread their ctx into launches of their own (clicks): a route's
+    // historyMode must not ride along and turn those into replaces.
+    same(routed.opens.map(c => 'historyMode' in c), [false], 'the app never sees historyMode');
     done(routed.w);
     const rejected = await boot(`/os?app=code&${pr}&path=a%2Fb`);
     same(rejected.opens.map(c => c.project), [{ projectId: P, repoId: R }], 'an invalid path is dropped, the project is not');
