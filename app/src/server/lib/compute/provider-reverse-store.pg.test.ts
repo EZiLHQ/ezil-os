@@ -9,7 +9,7 @@ import { computeReverseMoves } from '../../db/schema/computers';
 import type { PlacementDb, PlacementExecutor } from './placement';
 import { createProviderMigrationStore, MigrationConflictError } from './provider-migrate-store';
 import {
-    createProviderReverseStore, EXPORT_CHUNK_BYTES,
+    createProviderReverseStore, EXPORT_CHUNK_BYTES, REVERSE_RETENTION_LIST_MAX, REVERSE_SNAPSHOT_LIST_MAX, reverseMovesTablePresent,
     type ComputeReverseMove, type ReverseExportBoot, type ReverseExportHead,
 } from './provider-reverse-store';
 
@@ -19,6 +19,8 @@ const C = '11111111-1111-4111-8111-111111111111', U = '22222222-2222-4222-8222-2
 const C2 = '33333333-3333-4333-8333-333333333333', OTHER = '44444444-4444-4444-8444-444444444444';
 const JOB = '55555555-5555-4555-8555-555555555555';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** `to_jsonb(timestamptz)`: ISO 8601 with an offset, which Date.parse reads. */
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}:\d{2}|Z)$/;
 const start = new Date('2026-10-30T09:00:00Z');
 const boot: ReverseExportBoot = { placementGeneration: 4, leaseEpoch: 7, volumeId: 'vol-0b1ffbc8f8cfa6384', jobId: null,
     instanceId: null, fsUuid: null, claimedAt: start.toISOString() };
@@ -38,8 +40,7 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
     } });
     const db: PlacementDb = { execute: q => executor(client!).execute(q), transaction: async fn =>
         client!.begin(async tx => fn(executor(tx))) as Promise<Awaited<ReturnType<typeof fn>>> };
-    let clock = start;
-    const reverse = createProviderReverseStore(db, { now: () => clock });
+    const reverse = createProviderReverseStore(db);
     const forward = createProviderMigrationStore(db);
     const q = (text: string) => client!.unsafe(text.replaceAll('$S', schema));
     const holding = async () => Number((await q(`SELECT
@@ -69,7 +70,6 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
             await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle', file), 'utf8')));
     });
     beforeEach(async () => {
-        clock = start;
         await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_reverse_moves, ${schema}.ezil_compute_migrations`);
     });
     afterAll(async () => { try { if (created) await client!.unsafe(`DROP SCHEMA ${schema} CASCADE`); } finally { await client?.end(); } });
@@ -194,15 +194,17 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect(copying).toMatchObject({ state: 'copying', exportHead: head, bytesTotal: 2 * EXPORT_CHUNK_BYTES + 1234, skipped: 2, importProgress: null });
         await expect(reverse.advance(copying, 'checking')).rejects.toEqual(conflict('illegal_transition'));
         const p1 = await reverse.recordImportProgress(copying, [2, 0, 2]);
+        // first/last are the DB clock (r3, contract §5.4), one statement's time on the first write.
         expect(p1.importProgress).toEqual({ bitmap: '05'.padEnd(128, '0'), bytes: EXPORT_CHUNK_BYTES + 1234, archiveSha256: head.sha256,
-            first: start.toISOString(), last: start.toISOString() });
+            first: expect.stringMatching(ISO), last: p1.importProgress!.first });
         expect(await reverse.recordImportProgress(p1, [0])).toBe(p1);
         await expect(reverse.recordImportProgress(p1, [3])).rejects.toEqual(conflict('invalid_input'));
         await expect(reverse.recordImportProgress(p1, [])).rejects.toEqual(conflict('invalid_input'));
         await expect(reverse.advance(p1, 'checking')).rejects.toEqual(conflict('illegal_transition'));
-        clock = new Date(start.getTime() + 5_000);
         const p2 = await reverse.recordImportProgress(p1, [1]);
-        expect(p2.importProgress).toMatchObject({ bitmap: '07'.padEnd(128, '0'), bytes: head.bytes, first: start.toISOString(), last: clock.toISOString() });
+        expect(p2.importProgress).toMatchObject({ bitmap: '07'.padEnd(128, '0'), bytes: head.bytes, first: p1.importProgress!.first });
+        const [moved] = await q(`SELECT '${p2.importProgress!.last}'::timestamptz > '${p1.importProgress!.last}'::timestamptz AS ok`);
+        expect(moved!.ok).toBe(true);
         await expect(reverse.recordImportProgress(p1, [1])).rejects.toEqual(conflict('lost_race'));
         const flipping = await reverse.advance(await reverse.advance(p2, 'checking'), 'flipping');
         expect(flipping.state).toBe('flipping');
@@ -370,6 +372,185 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect(await reverse.readByExportBoot(C, g + 2, e + 2, v)).toBeNull();
         for (const bad of [[1.5, e, v], [g, Number.NaN, v], [g, e, 'vol-NOPE']] as const)
             await expect(reverse.readByExportBoot(C, bad[0], bad[1], bad[2])).rejects.toEqual(conflict('invalid_input'));
+    });
+
+    // ── r3 (G4, clocks, operator runbook) ─────────────────────────────────────
+    const C3 = '66666666-6666-4666-8666-666666666666', C4 = '77777777-7777-4777-8777-777777777777';
+    const C5 = '88888888-8888-4888-8888-888888888888';
+    const VOL = 'vol-0b1ffbc8f8cfa6384';
+    const commit = async (computerId: string) => reverse.finish(await toFlippingFrom(await create(computerId)),
+        { awsVolumeId: VOL, awsFsUuid: null, awsSnapshotId: null });
+    /** Committed rows straight into the table (bounds tests): retain_until is `retain` from now. */
+    const insertCommitted = (n: number, retain: string) => q(`INSERT INTO $S.ezil_compute_reverse_moves
+        (computer_id, user_id, started_by, state, commit_sent_at, aws_volume_id, retain_until)
+        SELECT gen_random_uuid(), '${U}', 'user', 'committed', now(), '${VOL}', clock_timestamp() + interval '${retain}' FROM generate_series(1, ${n})`);
+
+    it('ages are computed by PostgreSQL from DB-written anchors only; import_progress first/last are the DB clock and last never moves back', async () => {
+        const m = await create();
+        expect(m.ages).toMatchObject({ commitSent: null, lastChunk: null });
+        expect(m.ages.created).toBeGreaterThanOrEqual(0);
+        expect(m.ages.created).toBeLessThan(60);
+        // Backdating the DB anchors moves the ages: nothing on the app side does.
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET created_at = created_at - interval '11 minutes',
+            state_entered_at = state_entered_at - interval '10 minutes' WHERE id = '${m.id}'`);
+        const aged = (await reverse.readById(m.id))!;
+        expect(aged.ages.created).toBeGreaterThanOrEqual(660);
+        expect(aged.ages.stateEntered).toBeGreaterThanOrEqual(600);
+        expect(aged.ages.stateEntered).toBeLessThan(660);
+        // booting's deadline anchor is the claim's own state change; completing the claim never moves it.
+        const b1 = await reverse.recordExportBoot(aged, boot);
+        expect(b1.ages.stateEntered).toBeLessThan(60);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = state_entered_at - interval '16 minutes' WHERE id = '${m.id}'`);
+        const b2 = await reverse.recordExportBoot((await reverse.readById(m.id))!, enrolled);
+        expect(b2.ages.stateEntered).toBeGreaterThanOrEqual(960);
+        // copying: the stall clock is import_progress.last, written by PostgreSQL.
+        let x = await reverse.recordExportHead(await reverse.advance(b2, 'exporting'), headFor(b2.generation));
+        expect(x.ages.lastChunk).toBeNull();
+        x = await reverse.recordImportProgress(x, [0]);
+        expect(x.importProgress).toMatchObject({ first: expect.stringMatching(ISO), last: expect.stringMatching(ISO) });
+        const [db1] = await q(`SELECT '${x.importProgress!.last}'::timestamptz BETWEEN clock_timestamp() - interval '1 minute' AND clock_timestamp() AS ok`);
+        expect(db1!.ok).toBe(true);
+        expect(x.ages.lastChunk).toBeGreaterThanOrEqual(0);
+        expect(x.ages.lastChunk).toBeLessThan(60);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET import_progress = jsonb_set(import_progress, '{last}',
+            to_jsonb(clock_timestamp() - interval '10 minutes')) WHERE id = '${m.id}'`);
+        expect((await reverse.readById(m.id))!.ages.lastChunk).toBeGreaterThanOrEqual(600);
+        // A later DB-written `last` is kept over this statement's time; `first` stays the archive's first chunk.
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET import_progress = jsonb_set(import_progress, '{last}',
+            to_jsonb(clock_timestamp() + interval '1 hour')) WHERE id = '${m.id}'`);
+        const ahead = (await reverse.readById(m.id))!;
+        const kept = await reverse.recordImportProgress(ahead, [1]);
+        expect(kept.importProgress).toMatchObject({ first: x.importProgress!.first, last: ahead.importProgress!.last });
+        expect(kept.ages.lastChunk).toBeLessThan(0);
+        // A hand-edited, non-ISO `last` never breaks a read; it only has no age, and the next chunk rewrites it.
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET import_progress = jsonb_set(import_progress, '{last}', '"yesterday"') WHERE id = '${m.id}'`);
+        const odd = (await reverse.readById(m.id))!;
+        expect(odd.ages.lastChunk).toBeNull();
+        expect((await reverse.recordImportProgress(odd, [2])).importProgress!.last).toMatch(ISO);
+        // flipping: commit_sent_at is the flip_stuck anchor.
+        const f = await toFlippingFrom(await create(C2));
+        expect(f.ages.commitSent).toBeGreaterThanOrEqual(0);
+        // claimStale's RETURNING carries the same ages.
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET commit_sent_at = commit_sent_at - interval '31 minutes',
+            updated_at = updated_at - interval '1 minute' WHERE id = '${f.id}'`);
+        const [claimed] = await reverse.claimStale(10);
+        expect(claimed).toMatchObject({ id: f.id, state: 'flipping' });
+        expect(claimed!.ages.commitSent).toBeGreaterThanOrEqual(1860);
+    });
+
+    it('recordSnapshot is a CAS on aws_snapshot_id IS NULL: one of two ids wins, a replayed id returns the row, the commit time stays', async () => {
+        const done = await commit(C);
+        const results = await Promise.allSettled([reverse.recordSnapshot(done, 'snap-02639db95fe545d4f'), reverse.recordSnapshot(done, 'snap-053333a158f9cc895')]);
+        const won = results.filter((r): r is PromiseFulfilledResult<ComputeReverseMove> => r.status === 'fulfilled');
+        expect(won).toHaveLength(1);
+        for (const r of results) if (r.status === 'rejected') expect(r.reason).toEqual(conflict('lost_race'));
+        const snapped = won[0]!.value;
+        expect(snapped).toMatchObject({ state: 'committed', stateEnteredAt: done.stateEnteredAt, retainUntil: done.retainUntil });
+        // A lost response: the executor replays its own id with its stale copy and gets the recorded row back, unchanged.
+        const replay = await reverse.recordSnapshot(done, snapped.awsSnapshotId!);
+        expect(replay).toMatchObject({ id: done.id, awsSnapshotId: snapped.awsSnapshotId, updatedAt: snapped.updatedAt });
+        expect(await reverse.recordSnapshot(snapped, snapped.awsSnapshotId!)).toBe(snapped);
+        expect((await reverse.readById(done.id))!.updatedAt).toBe(snapped.updatedAt);
+        // Only committed rows; the in-flight and failed rows of another computer are refused before any write.
+        const failed = await reverse.fail(await create(C2), 'failed_reopened', 'boot_timeout');
+        await expect(reverse.recordSnapshot(failed, 'snap-02639db95fe545d4f')).rejects.toEqual(conflict('illegal_transition'));
+    });
+
+    it('listUnsnapshotted: committed rows with no snapshot, oldest commit first, bounded; the age filter is the DB clock', async () => {
+        const [a, b, c] = [await commit(C), await commit(C2), await commit(C3)];
+        await reverse.recordSnapshot(await commit(C4), 'snap-02639db95fe545d4f');
+        await reverse.fail(await create(C5), 'failed_needs_operator', 'boot_unsettled');
+        await create(C);
+        // Commit times: a 2 h ago, b 30 min ago, c now (state_entered_at of a committed row is its commit).
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = state_entered_at - interval '2 hours' WHERE id = '${a.id}'`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = state_entered_at - interval '30 minutes' WHERE id = '${b.id}'`);
+        expect((await reverse.listUnsnapshotted(10)).map(m => m.id)).toEqual([a.id, b.id, c.id]);
+        expect((await reverse.listUnsnapshotted(10, 3600)).map(m => m.id)).toEqual([a.id]);
+        expect((await reverse.listUnsnapshotted(10, 1200)).map(m => m.id)).toEqual([a.id, b.id]);
+        expect((await reverse.listUnsnapshotted(2)).map(m => m.id)).toEqual([a.id, b.id]);
+        for (const limit of [0, -5, Number.NaN]) expect(await reverse.listUnsnapshotted(limit)).toEqual([]);
+        await insertCommitted(12, '14 days');
+        expect(await reverse.listUnsnapshotted(1000)).toHaveLength(REVERSE_SNAPSHOT_LIST_MAX);
+        expect(REVERSE_SNAPSHOT_LIST_MAX).toBe(10);
+    });
+
+    it('listRetentionExpired: committed rows whose retain_until passed on the DB clock, oldest first, bounded at 100', async () => {
+        const live = await commit(C);
+        const [old, older] = [await commit(C2), await commit(C3)];
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '1 day' WHERE id = '${old.id}'`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '3 days' WHERE id = '${older.id}'`);
+        await create(C4);
+        const expired = await reverse.listRetentionExpired(10);
+        expect(expired.map(m => m.id)).toEqual([older.id, old.id]);
+        expect(expired.map(m => m.id)).not.toContain(live.id);
+        expect(await reverse.listRetentionExpired(1)).toHaveLength(1);
+        for (const limit of [0, Number.NaN]) expect(await reverse.listRetentionExpired(limit)).toEqual([]);
+        await insertCommitted(105, '-1 hour');
+        expect(await reverse.listRetentionExpired(1000)).toHaveLength(REVERSE_RETENTION_LIST_MAX);
+        expect(REVERSE_RETENTION_LIST_MAX).toBe(100);
+    });
+
+    it('reverseMovesTablePresent: true with 0012, false on a schema without it (production), and the probe itself never fails', async () => {
+        expect(await reverseMovesTablePresent(db)).toBe(true);
+        const bareSchema = `${schema}_bare`;
+        await client!.unsafe(`CREATE SCHEMA ${bareSchema}`);
+        try {
+            const bare: PlacementExecutor = { execute: async query => {
+                const rendered = dialect.sqlToQuery(query); return client!.unsafe(rendered.sql.replaceAll('public.', `${bareSchema}.`), rendered.params as never[]);
+            } };
+            expect(await reverseMovesTablePresent(bare)).toBe(false);
+            await expect(createProviderReverseStore(bare).readByComputer(C)).rejects.toThrow(/does not exist/);
+        } finally { await client!.unsafe(`DROP SCHEMA ${bareSchema} CASCADE`); }
+    });
+
+    it('CAS checks the state too: a hand-written state change that keeps updated_at still refuses a stale writer', async () => {
+        const stuck = await reverse.fail(await create(), 'failed_needs_operator', 'abort_unconfirmed');
+        // A careless operator statement (not the runbook's, which bumps updated_at) changes only the state.
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state = 'failed_reopened', last_error = 'operator_released' WHERE id = '${stuck.id}'`);
+        expect((await reverse.readById(stuck.id))!.updatedAt).toBe(stuck.updatedAt);
+        await expect(reverse.fail(stuck, 'failed_reopened', 'operator_released')).rejects.toEqual(conflict('lost_race'));
+        await expect(reverse.fail(stuck, 'failed_reopened', 'abort_unconfirmed')).rejects.toEqual(conflict('lost_race'));
+        expect((await reverse.readById(stuck.id))!).toMatchObject({ state: 'failed_reopened', lastError: 'operator_released', updatedAt: stuck.updatedAt });
+    });
+
+    const runbook: Record<string, string> = Object.fromEntries([...readFileSync(path.resolve(__dirname, '../../../../../docs/compute/REVERSE-MOVE-CONTRACT.md'), 'utf8')
+        .matchAll(/```sql\n-- runbook: ([a-z_]+)\n([\s\S]*?)```/g)].map(m => [m[1]!, m[2]!]));
+    const runbookSql = (name: string, id: string, snapshotId = 'snap-0a1b2c3d4e5f60718') => q(runbook[name]!.replaceAll('public.', '$S.')
+        .replaceAll('<move-id>', id).replaceAll('<snapshot-id>', snapshotId));
+
+    it('the contract\'s operator runbook SQL (§5.5.1, §7.1) runs on 0012: each statement is guarded and bumps updated_at', async () => {
+        expect(Object.keys(runbook).sort()).toEqual(['clear_commit_sent', 'operator_cleared', 'operator_released', 'operator_snapshot']);
+        // operator_released: failed_needs_operator with no commit_sent_at → failed_reopened; a stale writer then loses.
+        const a = await reverse.fail(await create(), 'failed_needs_operator', 'abort_unconfirmed');
+        expect(await runbookSql('operator_released', a.id)).toEqual([expect.objectContaining({ state: 'failed_reopened', last_error: 'operator_released' })]);
+        const released = (await reverse.readById(a.id))!;
+        expect(released.updatedAt).not.toBe(a.updatedAt);
+        expect(released.stateEnteredAt).not.toBe(a.stateEnteredAt);
+        await expect(reverse.fail(a, 'failed_reopened', 'abort_unconfirmed')).rejects.toEqual(conflict('lost_race'));
+        // Never with commit_sent_at: the flip may have landed. Clearing it is its own guarded statement.
+        const f = await reverse.fail(await toFlippingFrom(await create(C2)), 'failed_needs_operator', 'flip_stuck');
+        expect(await runbookSql('operator_released', f.id)).toHaveLength(0);
+        expect(await runbookSql('clear_commit_sent', f.id)).toEqual([expect.objectContaining({ state: 'failed_needs_operator', commit_sent_at: null })]);
+        expect(await runbookSql('clear_commit_sent', f.id)).toHaveLength(0);
+        expect(await runbookSql('operator_released', f.id)).toEqual([expect.objectContaining({ state: 'failed_reopened' })]);
+        expect(await runbookSql('clear_commit_sent', (await create(C3)).id)).toHaveLength(0);
+        // operator_cleared: only the computer's newest row, only failed_reopened with a reopen_final code.
+        const final = await reverse.fail(await create(C4), 'failed_reopened', 'head_moved');
+        expect(await runbookSql('operator_cleared', final.id)).toEqual([expect.objectContaining({ state: 'failed_reopened', last_error: 'operator_cleared' })]);
+        expect(await runbookSql('operator_cleared', final.id)).toHaveLength(0);
+        const ordinary = await reverse.fail(await create(C4), 'failed_reopened', 'boot_timeout');
+        expect(await runbookSql('operator_cleared', ordinary.id)).toHaveLength(0);
+        const older = await reverse.fail(await create(C5), 'failed_reopened', 'boot_refused');
+        await reverse.fail(await create(C5), 'failed_reopened', 'export_failed');
+        expect(await runbookSql('operator_cleared', older.id)).toHaveLength(0);
+        expect((await reverse.readById(older.id))!.lastError).toBe('boot_refused');
+        // operator_snapshot (§7.1): committed rows with no snapshot only; an executor holding the old copy then replays as a no-op.
+        const done = await commit(C);
+        expect(await runbookSql('operator_snapshot', done.id)).toEqual([expect.objectContaining({ state: 'committed', aws_snapshot_id: 'snap-0a1b2c3d4e5f60718' })]);
+        expect(await runbookSql('operator_snapshot', done.id, 'snap-053333a158f9cc895')).toHaveLength(0);
+        expect(await runbookSql('operator_snapshot', (await create(C3)).id)).toHaveLength(0);
+        await expect(reverse.recordSnapshot(done, 'snap-02639db95fe545d4f')).rejects.toEqual(conflict('lost_race'));
+        expect((await reverse.recordSnapshot(done, 'snap-0a1b2c3d4e5f60718')).awsSnapshotId).toBe('snap-0a1b2c3d4e5f60718');
     });
 
     it('RLS is enabled with no policy, and no client role keeps any privilege (defaults granted ALL)', async () => {

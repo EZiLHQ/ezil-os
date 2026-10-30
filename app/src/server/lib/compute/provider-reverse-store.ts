@@ -53,7 +53,7 @@ export const REVERSE_MOVE_TRANSITIONS: Readonly<Record<ReverseMoveState, readonl
 };
 const ADVANCE: Readonly<Partial<Record<ReverseMoveState, ReverseMoveState>>> = { booting: 'exporting', copying: 'checking', checking: 'flipping' };
 
-/** `summary.computer.move.stage` per row state; the shell's MOVE_STEP_OF reads these (contract §7). */
+/** `summary.computer.move.stage` per row state; the shell's MOVE_STEP_OF reads these (contract §6.1). */
 export const REVERSE_MOVE_DTO_STAGE: Readonly<Record<ReverseMoveState, string>> = {
     requested: 'saving', booting: 'saving', exporting: 'saving', copying: 'copying', checking: 'checking', flipping: 'flipping',
     committed: 'committed', failed_reopened: 'failed_reopened', failed_needs_operator: 'failed_needs_operator',
@@ -87,13 +87,26 @@ export interface ReverseExportHead {
     bytes: number;
     chunks: Array<{ i: number; size: number; sha256: string }>;
 }
-/** Bitmap: 128 hex chars = 512 bits, bit i = byte ⌊i/8⌋ mask 1<<(i%8) (PostgreSQL get_bit/set_bit, as restore_progress). */
+/** Bitmap: 128 hex chars = 512 bits, bit i = byte ⌊i/8⌋ mask 1<<(i%8) (PostgreSQL get_bit/set_bit, as restore_progress).
+ * `first`/`last` are DB-clock ISO 8601 text (`to_jsonb(timestamptz)`), written by the store, never by the app clock. */
 export interface ReverseImportProgress {
     bitmap: string;
     bytes: number;
     archiveSha256: string;
     first: string;
     last: string;
+}
+/**
+ * Seconds since each deadline anchor, computed by PostgreSQL (`clock_timestamp()`) when the row is read or written
+ * (contract §5.4): every deadline compares the DB clock with a DB-written timestamp, never the app clock.
+ * - `stateEntered`: also the `booting` anchor (the claim's own transaction wrote it; completing the claim never moves it).
+ * - `lastChunk`: since `import_progress.last`; null before the first chunk (the copy-stall clock then uses `stateEntered`).
+ */
+export interface ReverseMoveAges {
+    created: number;
+    stateEntered: number;
+    commitSent: number | null;
+    lastChunk: number | null;
 }
 export interface ComputeReverseMove {
     id: string;
@@ -121,6 +134,8 @@ export interface ComputeReverseMove {
     createdAt: string;
     /** Opaque PostgreSQL timestamp text, preserving microseconds for CAS. */
     updatedAt: string;
+    /** DB-clock ages at the moment this copy was read or written (contract §5.4). */
+    ages: ReverseMoveAges;
 }
 
 export type ReverseMoveConflictReason = 'lost_race' | 'forward_active' | 'owner_mismatch' | 'illegal_transition' | 'invalid_input' | 'create_failed';
@@ -139,8 +154,19 @@ const SNAPSHOT = /^snap-[0-9a-f]{8,17}$/;
 const INSTANCE = /^i-[0-9a-f]{8,17}$/;
 const REASON = /^[a-z0-9_.:-]{1,200}$/;
 const BITMAP_HEX = EXPORT_MAX_CHUNKS / 4;
-const COLUMNS = sql.raw('*, state_entered_at::text AS state_entered_at, commit_sent_at::text AS commit_sent_at, '
-    + 'created_at::text AS created_at, updated_at::text AS updated_at');
+/** The ISO 8601 text `to_jsonb(timestamptz)` writes; anything else (a hand edit) never breaks a read, it just has no age. */
+const ISO_TEXT = `'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?([+-][0-9]{2}(:[0-9]{2})?|Z)$'`;
+/** Every read and RETURNING: timestamps as PostgreSQL text (CAS tokens) plus the DB-clock ages of §5.4. */
+function columnsOf(alias = ''): SQL {
+    const a = alias ? `${alias}.` : '';
+    const age = (anchor: string) => `EXTRACT(EPOCH FROM clock_timestamp() - ${anchor})::float8`;
+    return sql.raw(`${a}*, ${a}state_entered_at::text AS state_entered_at, ${a}commit_sent_at::text AS commit_sent_at, `
+        + `${a}created_at::text AS created_at, ${a}updated_at::text AS updated_at, `
+        + `${age(`${a}created_at`)} AS age_created, ${age(`${a}state_entered_at`)} AS age_state_entered, `
+        + `${age(`${a}commit_sent_at`)} AS age_commit_sent, `
+        + `CASE WHEN ${a}import_progress->>'last' ~ ${ISO_TEXT} THEN ${age(`(${a}import_progress->>'last')::timestamptz`)} END AS age_last_chunk`);
+}
+const COLUMNS = columnsOf();
 const HOLDING = sql.raw(`state NOT IN ('committed', 'failed_reopened')`);
 const STAMP = sql`GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')`;
 const json = (value: unknown) => sql`(${JSON.stringify(value)}::text)::jsonb`;
@@ -149,6 +175,7 @@ function rows(result: unknown): Record<string, unknown>[] {
     return (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
 }
 const int = (value: unknown) => value == null ? null : Number(value);
+const seconds = (value: unknown) => value == null ? null : Number(value);
 function parse(r: Record<string, unknown>): ComputeReverseMove {
     return {
         id: String(r.id), userId: String(r.user_id), computerId: String(r.computer_id),
@@ -162,6 +189,8 @@ function parse(r: Record<string, unknown>): ComputeReverseMove {
         attempts: Number(r.attempts), lastError: (r.last_error ?? null) as string | null,
         stateEnteredAt: String(r.state_entered_at), commitSentAt: r.commit_sent_at == null ? null : String(r.commit_sent_at),
         createdAt: String(r.created_at), updatedAt: String(r.updated_at),
+        ages: { created: Number(r.age_created), stateEntered: Number(r.age_state_entered),
+            commitSent: seconds(r.age_commit_sent), lastChunk: seconds(r.age_last_chunk) },
     };
 }
 const one = (result: unknown): ComputeReverseMove | null => { const r = rows(result)[0]; return r ? parse(r) : null; };
@@ -181,12 +210,20 @@ export async function lockComputerMoves(tx: PlacementExecutor, computerId: strin
     if (r?.isolation !== 'read committed') throw new MoveLockIsolationError(String(r?.isolation));
 }
 
+/**
+ * Whether this database has 0012. Production (and the forward suites' schemas) do not: every reader of the table OUTSIDE
+ * the reverse machine (forward create, receipts, select, progress, summary, the open trigger) calls this first and treats
+ * an absent table as "no reverse move" (contract §3.4). Its own statement: a missing relation fails at parse time, and a
+ * failed statement would abort the caller's transaction.
+ */
+export async function reverseMovesTablePresent(db: PlacementExecutor): Promise<boolean> {
+    return rows(await db.execute(sql`SELECT to_regclass('public.ezil_compute_reverse_moves') IS NOT NULL AS present`))[0]?.present === true;
+}
+
 /** Whether a reverse move holds the computer. Called by the FORWARD create after its insert. A
- * database without 0012 (production; the forward suites' schemas) has no reverse move by definition:
- * the probe is its own statement because a missing relation fails at parse time. */
+ * database without 0012 has no reverse move by definition (`reverseMovesTablePresent`). */
 export async function reverseMoveHolds(tx: PlacementExecutor, computerId: string): Promise<boolean> {
-    const probe = rows(await tx.execute(sql`SELECT to_regclass('public.ezil_compute_reverse_moves') IS NOT NULL AS present`))[0];
-    if (probe?.present !== true) return false;
+    if (!(await reverseMovesTablePresent(tx))) return false;
     await lockComputerMoves(tx, computerId);
     return rows(await tx.execute(sql`SELECT 1 AS held FROM public.ezil_compute_reverse_moves
         WHERE computer_id = ${computerId}::uuid AND ${HOLDING} LIMIT 1`)).length > 0;
@@ -244,8 +281,13 @@ export function importComplete(m: Pick<ComputeReverseMove, 'exportHead' | 'impor
 
 // ── Store ────────────────────────────────────────────────────────────────
 
-export function createProviderReverseStore(db: PlacementExecutor, options: { now?: () => Date } = {}) {
-    const now = options.now ?? (() => new Date());
+/** Bounds of the lane O / lane A listings (contract §7, G4). */
+export const REVERSE_SNAPSHOT_LIST_MAX = 10;
+export const REVERSE_RETENTION_LIST_MAX = 100;
+const clamp = (limit: number, max: number) => Number.isFinite(limit) ? Math.max(0, Math.min(max, Math.trunc(limit))) : 0;
+
+/** Clock rule (contract §5.4): the store has no app clock. Every timestamp it writes is PostgreSQL's, and `ages` are computed by it. */
+export function createProviderReverseStore(db: PlacementExecutor) {
     const readById = async (id: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves WHERE id = ${id}::uuid`));
     const readByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
         WHERE computer_id = ${computerId}::uuid ORDER BY ezil_compute_reverse_moves.created_at DESC, id DESC LIMIT 1`));
@@ -335,7 +377,11 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
             return cas(expected, 'copying', sql`export_head = ${json(stored)}, bytes_total = ${head.bytes}::bigint, skipped = ${head.skipped}::int,
                 import_progress = NULL, attempts = 0, last_error = NULL`);
         },
-        /** Chunks the Worker verified and stored (contract §4 pull). Idempotent per index; progress resets attempts. */
+        /**
+         * Chunks the Worker verified and stored (contract §4 pull). Idempotent per index; progress resets attempts.
+         * `first`/`last` are the DB clock (`statement_timestamp()`, ISO text): `last` is the copy-stall anchor (§5.4) and never
+         * moves back; `first` is kept for the same archive. The app clock never reaches this column.
+         */
         async recordImportProgress(expected: ComputeReverseMove, indices: readonly number[]): Promise<ComputeReverseMove> {
             const head = expected.exportHead;
             if (expected.state !== 'copying' || !head) refuse('illegal_transition');
@@ -344,11 +390,15 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
             const bitmap = previous?.bitmap ?? '0'.repeat(BITMAP_HEX);
             const fresh = [...new Set(indices)].filter(i => !bitmapHas(bitmap, i));
             if (!fresh.length) return expected;
-            const at = now().toISOString();
-            const progress: ReverseImportProgress = { bitmap: bitmapSet(bitmap, fresh), archiveSha256: head!.sha256,
-                bytes: (previous?.bytes ?? 0) + fresh.reduce((sum, i) => sum + head!.chunks[i]!.size, 0),
-                first: previous?.first ?? at, last: previous && previous.last > at ? previous.last : at };
-            return cas(expected, 'copying', sql`import_progress = ${json(progress)}, attempts = 0, last_error = NULL`);
+            const sha = head!.sha256;
+            const bytes = (previous?.bytes ?? 0) + fresh.reduce((sum, i) => sum + head!.chunks[i]!.size, 0);
+            const same = sql`import_progress->>'archiveSha256' = ${sha}::text`;
+            const lastBefore = sql`CASE WHEN ${same} AND import_progress->>'last' ~ ${sql.raw(ISO_TEXT)} THEN (import_progress->>'last')::timestamptz END`;
+            return cas(expected, 'copying', sql`import_progress = jsonb_build_object('bitmap', ${bitmapSet(bitmap, fresh)}::text,
+                'bytes', ${bytes}::bigint, 'archiveSha256', ${sha}::text,
+                'first', CASE WHEN ${same} AND jsonb_typeof(import_progress->'first') = 'string' THEN import_progress->'first'
+                    ELSE to_jsonb(statement_timestamp()) END,
+                'last', to_jsonb(GREATEST(${lastBefore}, statement_timestamp()))), attempts = 0, last_error = NULL`);
         },
         /**
          * One more bounded retry in the current state; `exhausted` (nothing written) means the caller must compensate and `fail`.
@@ -366,7 +416,7 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
         /**
          * In-flight → `failed_reopened` | `failed_needs_operator`; an operator releases `failed_needs_operator` → `failed_reopened`.
          * `failed_reopened` is refused once `commit_sent_at` is set (the 0012 CHECK refuses it too): an operator who proved
-         * the commit never landed clears `commit_sent_at` by hand first (runbook, contract §5.6).
+         * the commit never landed clears `commit_sent_at` by hand first (runbook `clear_commit_sent`, contract §5.5.1).
          */
         async fail(expected: ComputeReverseMove, to: ReverseMoveFailure, reason: string): Promise<ComputeReverseMove> {
             if (!legal(expected.state, to) || (to === 'failed_reopened' && expected.commitSentAt !== null)) refuse('illegal_transition');
@@ -386,23 +436,51 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
                 aws_snapshot_id = ${retained.awsSnapshotId}, retain_until = clock_timestamp() + make_interval(days => ${REVERSE_MOVE_RETENTION_DAYS}::int),
                 attempts = 0, last_error = NULL`);
         },
-        /** D21 snapshot of the retained volume, taken after the flip (lane O). Committed rows only; set once. */
+        /**
+         * D21 snapshot of the retained volume, taken after the flip (lane O, contract §7). Committed rows only; set once.
+         * The compare-and-swap is on `aws_snapshot_id IS NULL` (not `updated_at`), so it is idempotent: replaying the SAME id
+         * after a lost response returns the row; a DIFFERENT id never replaces a recorded one (`lost_race`, or
+         * `illegal_transition` when the caller's copy already shows it). `state_entered_at` (the commit time) never moves.
+         */
         async recordSnapshot(expected: ComputeReverseMove, awsSnapshotId: string): Promise<ComputeReverseMove> {
-            if (expected.state !== 'committed' || expected.awsSnapshotId !== null) refuse('illegal_transition');
+            if (expected.state !== 'committed') refuse('illegal_transition');
             if (!SNAPSHOT.test(awsSnapshotId)) refuse('invalid_input');
-            return cas(expected, 'committed', sql`aws_snapshot_id = ${awsSnapshotId}`);
+            if (expected.awsSnapshotId !== null) return expected.awsSnapshotId === awsSnapshotId ? expected : refuse('illegal_transition');
+            const written = one(await db.execute(sql`UPDATE public.ezil_compute_reverse_moves SET aws_snapshot_id = ${awsSnapshotId}, updated_at = ${STAMP}
+                WHERE id = ${expected.id}::uuid AND state = 'committed' AND aws_snapshot_id IS NULL RETURNING ${COLUMNS}`));
+            if (written) return written;
+            const current = await readById(expected.id);
+            return current?.state === 'committed' && current.awsSnapshotId === awsSnapshotId ? current : refuse('lost_race');
+        },
+        /**
+         * Committed rows with no D21 snapshot yet, oldest commit first (`state_entered_at` of a committed row is its commit
+         * time), at most `REVERSE_SNAPSHOT_LIST_MAX`. `committedForSeconds` (DB clock) lists only rows committed at least that
+         * long ago: 0 for the sweep's snapshot step, 3600 for the `snapshot_missing` listing. A plain read: starting the
+         * snapshot is idempotent by its execution name (contract §7), so two sweeps never need a row lock.
+         */
+        async listUnsnapshotted(limit: number, committedForSeconds = 0): Promise<ComputeReverseMove[]> {
+            const age = Number.isFinite(committedForSeconds) ? Math.max(0, Math.trunc(committedForSeconds)) : 0;
+            return rows(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
+                WHERE state = 'committed' AND aws_snapshot_id IS NULL
+                  AND state_entered_at <= clock_timestamp() - make_interval(secs => ${age}::int)
+                ORDER BY ezil_compute_reverse_moves.state_entered_at, id LIMIT ${clamp(limit, REVERSE_SNAPSHOT_LIST_MAX)}`)).map(parse);
+        },
+        /** Committed rows whose 14-day retention has ended (`retain_until < clock_timestamp()`), oldest first, at most
+         * `REVERSE_RETENTION_LIST_MAX`. Read-only: deletion is an operator step outside the app (rule R11, contract §7). */
+        async listRetentionExpired(limit: number): Promise<ComputeReverseMove[]> {
+            return rows(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
+                WHERE state = 'committed' AND retain_until < clock_timestamp()
+                ORDER BY retain_until, id LIMIT ${clamp(limit, REVERSE_RETENTION_LIST_MAX)}`)).map(parse);
         },
         /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` only (the caller re-reads), never `state_entered_at`. */
         async claimStale(limit: number): Promise<ComputeReverseMove[]> {
-            const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
             return rows(await db.execute(sql`WITH stale AS (
                 SELECT id FROM public.ezil_compute_reverse_moves
                 WHERE state IN ('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping')
                   AND updated_at < clock_timestamp() - interval '30 seconds'
-                ORDER BY updated_at, id LIMIT ${count} FOR UPDATE SKIP LOCKED
+                ORDER BY updated_at, id LIMIT ${clamp(limit, 10)} FOR UPDATE SKIP LOCKED
             ) UPDATE public.ezil_compute_reverse_moves m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
-              FROM stale WHERE m.id = stale.id RETURNING m.*, m.state_entered_at::text AS state_entered_at,
-                m.commit_sent_at::text AS commit_sent_at, m.created_at::text AS created_at, m.updated_at::text AS updated_at`)).map(parse);
+              FROM stale WHERE m.id = stale.id RETURNING ${columnsOf('m')}`)).map(parse);
         },
     };
 }
