@@ -43,8 +43,12 @@ const MINUTE = 60_000;
  * same replenish pass provisions its replacement (live 10-30: refills retired ~11 min after launch).
  */
 export const POOL_BOOT_STALLED_MS = 6 * MINUTE;
-/** The agent's own wait after enrolling (warm start + wait_ready 180 s): an enrollment younger than this may still answer. */
-export const POOL_ENROLLED_READY_WAIT_MS = 4 * MINUTE;
+/**
+ * The agent's own wait after enrolling: start_warm, then wait_ready (180 s), then the ready POST, which
+ * `pool.py` retries on 5xx/429 (a deploy window). An enrollment younger than this may still answer. That is
+ * about four minutes plus a minute for the POST. Healthy live refills were ready in 84 s and 51 s (10-30).
+ */
+export const POOL_ENROLLED_READY_WAIT_MS = 5 * MINUTE;
 const bootStalled = (h: { createdAt: Date; enrolledAt?: Date }, now: Date) => !!h.enrolledAt
     && now.getTime() - h.createdAt.getTime() > POOL_BOOT_STALLED_MS && now.getTime() - h.enrolledAt.getTime() > POOL_ENROLLED_READY_WAIT_MS;
 /** The same predicate for `readPoolDemand`'s spare count: what planPool fails is never a spare. */

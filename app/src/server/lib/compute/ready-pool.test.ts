@@ -106,11 +106,12 @@ describe('P1/P2 pool planning', () => {
     // (pool_desktop_not_ready) is failed at six minutes, not ten, and readPoolDemand no longer counts it
     // as a spare, so its replacement provisions in the same pass.
     it('fails an enrolled boot that never became ready: six minutes from creation, its own readiness wait spent', () => {
-        const dead = { poolHostId: 'dead', createdAt: ago(6.5), enrolledAt: ago(4.5) };
+        const dead = { poolHostId: 'dead', createdAt: ago(6.5), enrolledAt: ago(5.5) };
         // readPoolDemand reports the dead host outside `spares`; the one paid user's spare is missing.
         expect(planPool(c, demand({ spares: 0, vcpuInUse: 2, booting: [dead] }), NOW)).toEqual({ target: 1, provision: 1, retire: [], fail: ['dead'] });
-        // Still inside a bound: younger than six minutes, enrolled under four minutes ago, or never enrolled.
-        for (const alive of [{ createdAt: ago(5.9), enrolledAt: ago(5) }, { createdAt: ago(9), enrolledAt: ago(3.9) }, { createdAt: ago(9.9) }]) {
+        // Still inside a bound: younger than six minutes, enrolled under five minutes ago (its readiness wait plus a
+        // retried ready POST), or never enrolled.
+        for (const alive of [{ createdAt: ago(5.9), enrolledAt: ago(5.5) }, { createdAt: ago(9), enrolledAt: ago(4.9) }, { createdAt: ago(9.9) }]) {
             expect(planPool(c, demand({ spares: 1, vcpuInUse: 2, booting: [{ poolHostId: 'alive', ...alive }] }), NOW)).toEqual({ target: 1, provision: 0, retire: [], fail: [] });
         }
         // The provision budget and the region cap are unchanged: a full region launches nothing.
@@ -259,17 +260,17 @@ describe('readPoolDemand', () => {
         expect((await readPoolDemand(capture([aggregate]).db, c, NOW)).regionVcpuCap).toBe(0);
     });
     it('refuses missing snapshot', () => expect(readPoolDemand(capture([]).db, c, NOW)).rejects.toThrow('pool_demand_missing'));
-    it('R2-4: a stalled enrolled boot is not a spare, by the same six/four-minute cutoffs planPool fails it with', async () => {
-        const { db, queries } = capture([{ ...aggregate, booting: [{ poolHostId: 'b', createdAt: ago(7).toISOString(), enrolledAt: ago(5).toISOString() },
+    it('R2-4: a stalled enrolled boot is not a spare, by the same six/five-minute cutoffs planPool fails it with', async () => {
+        const { db, queries } = capture([{ ...aggregate, booting: [{ poolHostId: 'b', createdAt: ago(7).toISOString(), enrolledAt: ago(5.5).toISOString() },
             { poolHostId: 'n', createdAt: ago(1).toISOString(), enrolledAt: null }] }]);
         const d = await readPoolDemand(db, c, NOW);
-        expect(d.booting).toEqual([{ poolHostId: 'b', createdAt: ago(7), enrolledAt: ago(5) }, { poolHostId: 'n', createdAt: ago(1) }]);
+        expect(d.booting).toEqual([{ poolHostId: 'b', createdAt: ago(7), enrolledAt: ago(5.5) }, { poolHostId: 'n', createdAt: ago(1) }]);
         expect(planPool(c, d, NOW).fail).toEqual(['b']);
         const { sql: text, params } = queries[0]!;
         const spares = text.slice(text.indexOf("(state = 'booting' AND NOT"), text.indexOf(' AS spares'));
         expect(spares).toMatch(/^\(state = 'booting' AND NOT \(enrolled_at IS NOT NULL AND created_at < \$\d+::timestamptz AND enrolled_at < \$\d+::timestamptz\)\) OR/);
         const cutoffs = [...spares.matchAll(/\$(\d+)::timestamptz AND enrolled_at < \$(\d+)/g)][0]!.slice(1).map(n => params[Number(n) - 1]);
-        expect(cutoffs).toEqual([ago(6).toISOString(), ago(4).toISOString()]);
+        expect(cutoffs).toEqual([ago(6).toISOString(), ago(5).toISOString()]);
         expect(text).toContain("json_build_object('poolHostId', id, 'createdAt', created_at, 'enrolledAt', enrolled_at)");
     });
     it('queries authoritative tables and guarded demand windows without counting polls or duplicate joins', async () => {

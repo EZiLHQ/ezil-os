@@ -728,14 +728,14 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
     it('R2-4: an enrolled boot that never became ready is not a spare past six minutes, and the planner fails it', async () => {
         await boot(1); await recordPoolEnrollment(db, uuid(1), 'i-1', ago(1));
         expect(await readPoolDemand(db, c, NOW)).toMatchObject({ spares: 1, booting: [{ poolHostId: uuid(1), enrolledAt: ago(1) }] });
-        // Inside its own readiness wait (enrolled under four minutes ago): still a spare, not failed.
+        // Inside its own readiness wait and a retried ready POST (enrolled under five minutes ago): still a spare, not failed.
         await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET created_at = ${ago(7).toISOString()}::timestamptz,
-            enrolled_at = ${ago(3.9).toISOString()}::timestamptz WHERE id = ${uuid(1)}::uuid`);
+            enrolled_at = ${ago(4.9).toISOString()}::timestamptz WHERE id = ${uuid(1)}::uuid`);
         let d = await readPoolDemand(db, c, NOW);
         expect(d.spares).toBe(1); expect(poolData.planPool(c, d, NOW).fail).toEqual([]);
-        await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET enrolled_at = ${ago(5).toISOString()}::timestamptz WHERE id = ${uuid(1)}::uuid`);
+        await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET enrolled_at = ${ago(5.5).toISOString()}::timestamptz WHERE id = ${uuid(1)}::uuid`);
         d = await readPoolDemand(db, c, NOW);
-        expect(d).toMatchObject({ spares: 0, booting: [{ poolHostId: uuid(1), enrolledAt: ago(5) }] });
+        expect(d).toMatchObject({ spares: 0, booting: [{ poolHostId: uuid(1), enrolledAt: ago(5.5) }] });
         expect(poolData.planPool(c, d, NOW).fail).toEqual([uuid(1)]);
     });
     it('obsolete settled boot timeout remains visible while claimed or leased hosts are excluded',async()=>{
