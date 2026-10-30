@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readBillingConfig } from '@/server/billing/config';
 import type { BillingDeps, BillingStore, StoredComputeEpoch } from '@/server/billing/ports';
-import { loadComputeBillingState } from '@/server/billing/v2/compute-access';
+import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/compute-access';
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
@@ -52,6 +52,7 @@ function fixture(epochs = [epoch()], { sku = 'standard_monthly_v2', allowance = 
         epochsFor: vi.fn<BillingStore['epochsFor']>(async (userId, since) => epochs.filter(e =>
             e.userId === userId && (e.endedAt === null || Date.parse(e.endedAt) > since.getTime()))),
         openEpochsForSweep: vi.fn<BillingStore['openEpochsForSweep']>(async ({ limit }) => epochs.filter(e => e.endedAt === null).slice(0, limit)),
+        openEpochFor: vi.fn<BillingStore['openEpochFor']>(async computerId => epochs.find(e => e.computerId === computerId && e.endedAt === null) ?? null),
         closeEpoch: vi.fn<BillingStore['closeEpoch']>(async input => {
             const open = epochs.find(e => e.computerId === input.computerId && e.endedAt === null
                 && (input.epochId === undefined || e.id === input.epochId));
@@ -326,6 +327,56 @@ describe('v3 session deadlines', () => {
         f.store.grantsForPeriod.mockResolvedValue([]);
         await f.run(200);
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(200), endReason: 'allowance_exhausted' });
+    });
+});
+
+// Round 6 CR-1: store.ts rounds readiness up and the deadline down, so a hold opened at 05:42:00.400 is stored
+// 05:42:01 → 06:42:00 (ready + 3599). Live 217b9546 closed those as allowance_exhausted with hours left.
+describe('round 6 CR-1: the hold cap survives whole-second rounding', () => {
+    const stored = (readyMs: number, maxRunSeconds: number) => ({
+        readyAt: isoSeconds(epochSeconds(new Date(T.getTime() + readyMs), 'ceil')),
+        deadlineAt: isoSeconds(epochSeconds(new Date(T.getTime() + readyMs + maxRunSeconds * 1000))),
+    });
+    /** Closed earlier hold sessions (each ≤ 1 h, so Free rating counts them in full) that leave `left` seconds of fair use. */
+    async function leaving(left: number) {
+        const probe = fixture([], { sku: null });
+        const spent = (await loadComputeBillingState(probe.deps, ref.userId, T)).allowanceStdSeconds - left;
+        return Array.from({ length: Math.ceil(spent / 3600) }, (_, i) => {
+            const readyAt = -7200 * (i + 1);
+            return epoch({ id: `past-${i}`, readyAt: iso(readyAt), endedAt: iso(readyAt + Math.min(3600, spent - i * 3600)), endReason: 'session_max' });
+        });
+    }
+
+    it('a 05:42:00.400 hold (stored ready + 3599) closes session_max at its stored deadline', async () => {
+        const f = fixture([epoch(stored(400, 3600))], { sku: null });
+        expect(f.epochs[0]).toMatchObject({ readyAt: iso(1), deadlineAt: iso(3600) });
+        expect(await f.run(3599)).toMatchObject({ stopped: 0, closed: 0 });
+        expect(await f.run(3600)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'session_max' });
+    });
+
+    it.each([[0, 3601], [400, 3601], [400, 3600]])('ready +%i ms with %i s of fair use left is cut by the session cap', async (readyMs, left) => {
+        const f = fixture([...await leaving(left), epoch(stored(readyMs, Math.min(3600, left)))], { sku: null });
+        await f.run(3700);
+        expect(f.epochs.at(-1)).toMatchObject({ endReason: 'session_max' });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it.each([[0, 1800], [400, 1800], [0, 3599], [400, 3599], [0, 3598], [400, 3598]])(
+        'ready +%i ms with only %i s left is cut by the allowance: allowance_exhausted', async (readyMs, left) => {
+            const e = epoch(stored(readyMs, left));
+            const f = fixture([...await leaving(left), e], { sku: null });
+            expect(await f.run(epochSeconds(e.deadlineAt!) - epochSeconds(T))).toMatchObject({ stopped: 1, closed: 1 });
+            expect(f.epochs.at(-1)).toMatchObject({ endedAt: e.deadlineAt, endReason: 'allowance_exhausted' });
+            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
+        });
+
+    it('after the session_max cut the next hold open is admitted, never refused as time used up', async () => {
+        const f = fixture([...await leaving(4 * 3600), epoch(stored(400, 3600))], { sku: null });
+        await f.run(3600);
+        expect(f.epochs.at(-1)).toMatchObject({ endReason: 'session_max' });
+        expect(await gateComputerStart({ deps: f.deps, ...ref, kind: 'aws-ec2', instanceType: 'm6i.large', now: at(3700) })).toEqual({ allowed: true });
     });
 });
 

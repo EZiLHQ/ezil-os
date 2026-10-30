@@ -124,11 +124,15 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             ? state.summary.computer.activeDeadline : epoch.deadlineAt;
         const deadline = Math.min(maximum, storedDeadline === null ? Infinity : Date.parse(storedDeadline));
         const due = now.getTime() >= deadline;
+        const overageOn = state.family === 'compute' && state.overage?.enabled === true;
+        // Round 6 CR-1: store.ts rounds readiness up and the deadline down to whole seconds, so a session cut by the
+        // cap can be stored one second short of ready + cap (05:42:01 → 06:42:00). That bound is still the cap unless
+        // the allowance is spent (used is clamped at deadline_at); an allowance bound sits a full second or more lower.
+        const sessionCut = deadline >= maximum - 1000 && (overageOn || state.usedStdSeconds < state.allowanceStdSeconds);
         let reason: SweepReason;
         if (state.paymentIssue) reason = 'allowance_exhausted';
-        else if (state.sessionMaxSeconds !== null && due && deadline === maximum) reason = 'session_max';
+        else if (state.sessionMaxSeconds !== null && due && sessionCut) reason = 'session_max';
         else {
-            const overageOn = state.family === 'compute' && state.overage?.enabled === true;
             if (!due) {
                 const exhausted = overageOn
                     ? (state.summary.version === 2 ? state.summary.overage?.accruedCents ?? 0 : 0) >= state.overage!.capCents
