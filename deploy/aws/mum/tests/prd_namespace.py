@@ -33,7 +33,8 @@ HOST = f"arn:aws:iam::{A}:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr"
 SCOPE = {"namespace": "prd", "accountId": A, "region": R}
 IDENTITY = {**SCOPE, "githubOidcProviderArn": f"arn:aws:iam::{A}:oidc-provider/token.actions.githubusercontent.com",
             "deploySubject": "repo:EZiLHQ@315435740/ezil-os@1339112799:environment:aws-prd",
-            "assetBucketName": f"ezil-prd-deploy-assets-{A}", "killSwitch": False, "poolLifecycle": True, "maxVolumeGiB": 100}
+            "assetBucketName": f"ezil-prd-deploy-assets-{A}", "killSwitch": False, "poolLifecycle": True, "maxVolumeGiB": 100,
+            "appCallerRoleName": "ezil-prd-app-caller"}
 OPS = {**SCOPE, "monthlyBudgetUsd": 70, "budgetEmails": ["ops@example.com"], "alertEmails": ["ops@example.com"],
        "egressBytesPer5Min": 3000000000, "quotaAlarmPercent": 80, "capacityAlarmVcpus": 40}
 FOUNDATION = {"stage": "prd", "region": R, "zoneIds": ["aps1-az1"], "instanceType": "m6i.large", "rootDeviceName": "/dev/sda1", "rootVolumeGiB": 30}
@@ -100,6 +101,8 @@ REFUSED = {
         ("image-job boundary without a rebase tuple", edit(IDENTITY, ["imageJobDeployment"], {"namespace": "prd"})),
         ("mum asset bucket", edit(IDENTITY, ["assetBucketName"], f"ezil-mum-deploy-assets-{A}")),
         ("kill switch on at creation", edit(IDENTITY, ["killSwitch"], True)),
+        ("app caller role name omitted (CloudFormation cannot check the named role)", edit(IDENTITY, ["appCallerRoleName"], DELETE)),
+        ("another app caller role name", edit(IDENTITY, ["appCallerRoleName"], "ezil-prd-other-caller")),
         ("mum namespace", edit(IDENTITY, ["namespace"], "mum")),
     ],
     "keys": [("mum namespace", edit(SCOPE, ["namespace"], "mum")), ("extra field", edit(SCOPE, ["killSwitch"], False)),
