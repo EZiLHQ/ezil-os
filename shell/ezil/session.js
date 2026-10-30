@@ -446,7 +446,6 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  *      without the flag re-anchors the wake clocks. A
  *      `computeMoveNeedsAttention` answer is deterministic and returns at once.
  *
-
  * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
  *   Sends the request once. Must never throw.
  * @param {string} what For the log line only.

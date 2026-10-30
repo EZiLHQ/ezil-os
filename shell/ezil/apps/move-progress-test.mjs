@@ -139,6 +139,25 @@ for ( const app of ['desktop', 'code', 'preview'] ) {
     });
 }
 
+test('desktop: after a commit, the Free computer\'s own open timing out is that open\'s failure, never a re-open loop', async t => {
+    let committed = false;
+    const h = await open(t, 'desktop', {
+        progress: () => committed ? terminalProgress({ outcome: 'committed' }) : movingProgress({ phase: 'committing' }),
+        answer: () => committed ? { ok: false, errorCode: 'sandbox_starting' } : waitingAnswer(),
+    });
+    await until(() => label(h.spinner) === 'Moving your files to your Free computer');
+    committed = true;
+    await until(() => label(h.spinner) === 'Your files are on your Free computer');
+    const asked = h.asks;
+    await until(() => h.asks > asked + 1, 'the Free computer\'s open');
+    h.now += 300_000; // past the re-anchored wake deadline
+    await until(() => label(h.spinner) === 'This is taking too long', 'the open\'s own failure');
+    const asks = h.asks;
+    await wait(120);
+    assert.equal(h.asks, asks, 'no automatic re-open after the commit');
+    assert.equal(h.spinner.querySelector('.ezil-boot-retry').hidden, false, 'its own Try again');
+});
+
 test('desktop: a move handed back after its watch, then committed, opens the Free computer', async t => {
     let committed = false;
     const h = await open(t, 'desktop', {

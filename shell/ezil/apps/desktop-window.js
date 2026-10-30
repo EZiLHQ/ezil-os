@@ -1172,6 +1172,9 @@ export async function openDesktopWindow (ctx = {}) {
         onProgressChange: () => {
             const seen = spinner.computerProgress();
             if ( seen ) aws_observation = seen;
+            // Phase B: a read that says the move ended retires the kept moving view, even when it has no view of its
+            // own (a commit's Cloudflare placement): a later timeout of the Free computer's open is that open's.
+            else if ( aws_observation?.moving === true && spinner.computerMove()?.outcome ) aws_observation = null;
             if ( seen?.path ) tti_path = seen.path;
             if ( seen?.activeAws === true ) aws_seen_active = true;
             // A switch or restart is in flight: re-open again once it settles, and a
