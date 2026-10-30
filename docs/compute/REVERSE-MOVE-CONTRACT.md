@@ -323,6 +323,13 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   built on it), the receipts' export-boot lookup (§5.2), routing (§5.3), `computer.progress` (§5.10), the summary DTO
   (§6.1) and the open trigger (§5.9). Production has no 0012, and `readComputerProgress` swallows a throw into an empty
   progress (`progress.ts:154-157`), so a missing probe would blank `computer.progress` for every production computer.
+- **[0012 probe] Production (no 0012) is a pinned, tested state, not an error:**
+  - the sweep's `advanceReverseMoves` and lane O's `advanceReverseSnapshots` return at once when the probe is false. Like
+    `advanceStaleMigrations` (`provider-migrate-orchestrator.ts:172-179`), neither ever throws out of the billing handler;
+  - `computer.move.start`/`retry` answer the refusal value `move_unsupported` (§5.9), never a 500;
+  - `summary.computer.moveAvailable` is false (§6.1), so no move action is shown;
+  - routing, `computer.progress`, the summary and the open trigger behave exactly as today.
+  - Lane A tests each of these on a database without 0012.
 - **Constants:** `REVERSE_MOVE_DTO_STAGE` (§6.1), `EXPORT_*` limits, `REVERSE_MOVE_MAX_ATTEMPTS = 5`, `REVERSE_MOVE_RETENTION_DAYS = 14`.
 - To write inside a placement transaction, build the store over that `tx`.
 - **Owner after r3: lane A** (§1.1). Lane O consumes the three snapshot/retention calls and adds nothing here.
@@ -832,6 +839,7 @@ If step 1 or step 2 cannot be confirmed within its bound, write `failed_needs_op
 
     | `reason` | When | Copy key (§6.3) |
     |---|---|---|
+    | `move_unsupported` | this database has no 0012 (`reverseMovesTablePresent` false: production today) | none; the action is not shown (`moveAvailable` false) |
     | `move_not_held` | standing is not `files_on_aws`, or the placement is not `aws-ec2` | none; the card is not shown |
     | `move_paused` | the kill switch is on (`aws-config.ts:274`) | try later |
     | `move_busy` | forward work for the computer (`forward_active`, §3.3) | try later |
@@ -969,13 +977,16 @@ interface ComputerMoveV3 {
 }
 // summary.computer.moveOnOpen: boolean. True when standing is files_on_aws, no move holds, and the open
 // trigger would fire (§5.9: not founder-owned, newest row not failed_*). The pre-move card copy needs it.
+// summary.computer.moveAvailable: boolean (r3). True only when this database has 0012, AWS computers are enabled
+// with the kill switch off (aws-config.ts:274), standing is files_on_aws and the placement is aws-ec2. Without it
+// no move action is shown: production has no 0012 today, and its users must never see a button that cannot work.
 ```
 
 - **Stage map** (`REVERSE_MOVE_DTO_STAGE`, `provider-reverse-store.ts:57`): `requested`, `booting` and `exporting` → `saving` (step 0); `copying` → `copying` (1, with bytes); `checking` → `checking` (2); `flipping` → `flipping` (3).
   - These are keys the dormant `MOVE_STEP_OF` already has (`computers.js:504`), and a unit test pins that.
   - The shell's own `exporting: 1` entry is never sent for `to_cloudflare`.
 - **Visibility [clocks]:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
-- Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `move: null`, `moveOnOpen: false`.
+- Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `move: null`, `moveOnOpen: false`, `moveAvailable: false`.
 - The shell already accepts `reason` with `/^[a-z0-9_:-]{1,64}$/i` (`computers.js:511`).
 
 ### 6.2 Shell changes (lane U)
@@ -984,6 +995,8 @@ interface ComputerMoveV3 {
 - `move-retry` calls `computer.move.retry`, and is shown only when `retry === 'now'`.
 - The done, failed and needs-attention cards use the §6.3 copy.
 - Add a pre-move card with the "Move my files…" action on the files-held state, with the variant chosen by `moveOnOpen`.
+  **r3:** the card and its action are shown only when `moveAvailable` is true. Otherwise the files-held state keeps the
+  banner without any move sentence or button (§6.3, "files held, `moveAvailable` false").
 - An open refused with `computer_move_needs_attention` shows the needs-attention card, never a spinner.
 - The `files_on_aws` banner (`computers.js:499`) drops the region name.
 - **[G3]** `computer.move.start`/`retry` refusals (§5.9) render their §6.3 row. `move_computer_running` shows **[Stop and move my files]**:
@@ -996,6 +1009,8 @@ interface ComputerMoveV3 {
   as `formatBytes` at `computer-progress.js:69` and `moveView` at `computers.js:515`), which gives **"537 MB"**. The string
   "512 MB" appears nowhere. Lane U's shell test pins "537 MB". Lane A's `provider-reverse-store.test.ts` reads the constant
   from `computer-progress.js` and asserts it equals `EXPORT_MAX_BYTES`, the same cross-file pattern as the `MOVE_STEP_OF` test.
+  **Order:** that assertion lands in the same integration as lane U's constant, or after it, never before: the constant does
+  not exist until U ships it.
 
 ### 6.3 User copy per state (no city or region names, no speed or duration claims)
 
@@ -1004,6 +1019,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | State | Copy |
 |---|---|
 | files held, `moveOnOpen` true | **Your files are on your AWS computer.** The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files now] |
+| files held, `moveAvailable` false (r3) | **Your files are on your AWS computer.** Opening it uses your Free limits. (no move sentence, no button) |
 | files held, `moveOnOpen` false | **Your files are on your AWS computer.** Opening it uses your Free limits. You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer] |
 | `saving` | Moving your files to your Free computer. Step 1 of 4: Saving your files. |
 | `copying` | Step 2 of 4: Copying your files to your Free computer. "X MB of Y GB copied" (existing `moveView`). |
@@ -1026,7 +1042,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | `move_paused`, `move_busy`, `move_computer_unsettled` | We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again in a few minutes. [Try again] |
 | `move_in_progress` | (no new card: the current move's card stays) |
 | `move_unavailable` | (the newest failed row's own card above) |
-| `move_not_held` | (no card) |
+| `move_not_held`, `move_unsupported` | (no card / no action) |
 
 ### 6.4 The open overlay and the Computer tab during a move (lane U) **[G1]**
 
@@ -1084,7 +1100,7 @@ so they agree.
 | **Name** | `reverse_snapshot`. It is a **separate** Standard Step Functions state machine, owned, deployed and versioned by lane O like the preparation machine (`infra/app-computers/lib/rebase-preparation.ts`). Its version ARN reaches the app on the deployment as **`reverseSnapshotStateMachineVersionArn`**, next to `preparationStateMachineVersionArn` (`aws-intent.ts`, `release-manifest.ts`; lane O owns both edits, which are additive and optional). It is **not** a new value in `LIFECYCLE_OPERATIONS` (`aws-intent.ts:183`): the placement lifecycle machine and its allowlist are unchanged. |
 | **Intent** | Strict JSON with exactly these keys: `{"schemaVersion": 1, "operation": "reverse_snapshot", "jobId": "<moveId>", "moveId": "<moveId>", "computerId": "<uuid>", "region": "ap-south-1", "accountId": "<12 digits>", "volumeId": "<the row's aws_volume_id>", "fsUuid": "<the row's aws_fs_uuid> \| null", "committedAt": "<ISO of the row's commit, state_entered_at>"}`. The execution input is `{schemaVersion: 1, document, digest}` with `digest = sha256(document)`, as `buildRebasePreparation` builds it (`aws-rebase-preparation.ts:23-32`). |
 | **Idempotency key** | **`jobId = moveId`, so the execution name is `computer-<moveId>`** (the `EXECUTION_NAME` grammar, `aws-clients.ts:212`). A start whose name is already used counts as success (`ExecutionAlreadyExists`, `aws-clients.ts:228-247`). A Standard execution's name cannot be reused for 90 days, longer than the 14-day retention. So a lost StartExecution response, a retried start, or two sweeps never run a second execution for one move. Names are scoped to one state machine, so `computer-<moveId>` never collides with a placement job's name. |
-| **EC2 dedupe inside the execution** | EC2 `CreateSnapshot` takes **no client token** (the preparation step passes only `VolumeId`, `Description` and `TagSpecifications`, `preparation-definition.ts:40-42`). So the lead's "client token derived from the move id" is the execution name above, and inside the one execution the helper dedupes as the preparation helper does (`preparation-helper.ts:83-96`): it calls create **at most once** (`createAttempted`), tags the snapshot at creation with `ezil:reverse-move = <moveId>` and `ezil:computer-id = <computerId>`, looks that tag up before creating, and resolves an uncertain create by the tag (`snapshot_ambiguous` when 2 or more exist, `snapshot_create_unconfirmed` when none exists after an attempt). |
+| **EC2 dedupe inside the execution** | EC2 `CreateSnapshot` takes **no client token**. The SDK's `CreateSnapshotRequest` has only `Description`, `OutpostArn`, `VolumeId`, `TagSpecifications`, `Location` and `DryRun` (`app/node_modules/@aws-sdk/client-ec2/dist-types/models/models_2.d.ts:1969`, client-ec2 3.1140.0), and the preparation step passes only `VolumeId`, `Description` and `TagSpecifications` (`preparation-definition.ts:40-42`). So the lead's "client token derived from the move id" is the execution name above, and inside the one execution the helper dedupes as the preparation helper does (`preparation-helper.ts:83-96`): it calls create **at most once** (`createAttempted`), tags the snapshot at creation with `ezil:reverse-move = <moveId>` and `ezil:computer-id = <computerId>`, looks that tag up before creating, and resolves an uncertain create by the tag (`snapshot_ambiguous` when 2 or more exist, `snapshot_create_unconfirmed` when none exists after an attempt). |
 | **Preconditions** | As above, plus `volumeId` equals the row's `aws_volume_id`. Any failure ends the execution failed with a closed code; the helper never mutates the volume. |
 | **Success** | As soon as the tagged snapshot is `pending` or `completed`. `error` → failed `snapshot_error`. The output is the receipt `{schemaVersion: 1, jobId, digest, moveId, computerId, volumeId, snapshotId, snapshotState: 'pending' \| 'completed', snapshotStartedAt}`, at most 8 KiB, as the preparation receipt is (`preparation-helper.ts:104`). |
 | **How the id reaches the app** | Lane O's `advanceReverseSnapshots` reads execution `computer-<moveId>` with the existing reader (`createSfnExecutionReader`, `aws-clients.ts:254`). It validates the receipt against the intent it built (digest, `moveId`, `computerId`, `volumeId`; the `validateRebaseSnapshotReceipt` pattern, `aws-rebase-preparation.ts:44-53`), then calls `recordSnapshot(m, snapshotId)`. A replay of the same id returns the row (§3.4). |
@@ -1196,5 +1212,7 @@ and gives the closest workable rule.
 | minor: too-large copy | §6.2, §6.3, §6.4 | "537 MB" is `MOVE_LIMIT_BYTES` (536,870,912) in the shell's own MB unit; "512 MB" appears nowhere. A cross-file test pins the constant against `EXPORT_MAX_BYTES`. |
 | minor: export path digest | §2.2 | The sha256 is over the exact body bytes the Worker sends. The edge hashes before parsing and never re-serializes; it checks the closed key set and refuses duplicate keys. |
 | fold-in: open-overlay copy | §6.4 | The overlay copy per phase and per outcome. The open loop treats `computeMoving` as a move (no 10-minute or 600 s clock), re-asks at most every 30 s, and never auto-opens the AWS computer after a failure. |
+| r3 review: production has no 0012 | §3.4, §5.9, §6.1, §6.2, §6.3 | The sweep and the snapshot step probe first and never throw out of the handler. Start/retry answer `move_unsupported`. `moveAvailable` (false with no 0012 or the kill switch on) gates every move action, so production users see no button that cannot work. |
+| r3 review: the EC2 client token | §7.1 | Checked against the SDK on disk: `CreateSnapshotRequest` has no `ClientToken` (`models_2.d.ts:1969`, client-ec2 3.1140.0). The idempotency key stays the execution name, with the tag as the EC2 dedupe. |
 | blind spot: CAS `state` predicate (m3a survived) | §5.5.1, store PG test | A new PG test changes `state` by hand without bumping `updated_at`; the stale writer must lose. With the `state =` predicate removed, that test fails. |
 | blind spot: `billing-test-db.sh` now applies 0012 for every PG suite | — | r3 ran the three table-enumerating suites against a DB built by `billing-test-db.sh` (journal 0000–0007 and 0012): `feedback/ingest.pg` 4/4, `rebase.pg` 15/15, `ready-pool.pg` 167/167, 0 skipped. Each filters by table name, so 0012 does not disturb them. |
