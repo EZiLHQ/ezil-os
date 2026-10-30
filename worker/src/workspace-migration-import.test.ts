@@ -852,6 +852,11 @@ describe('reverse import: abort (§4.5)', () => {
       // Another move's abort behind the same gate is idempotent.
       expect(await f.call('abort', { ...ids, moveId: uuid(), generation: uuid() })).toEqual({ status: 200, body: { ok: true } });
       expect(f.store.map.has(REVERSE_IMPORT_KEY)).toBe(true);
+      // §4.5's first rule comes before the gate: once committing, the head CAS may have landed.
+      f.store.map.set(REVERSE_IMPORT_KEY, ownState({ committing: true }));
+      for (const body of [ids, { ...ids, moveId: uuid(), generation: uuid() }]) {
+        expect(await f.call('abort', body)).toEqual({ status: 409, body: { ok: false, error: 'commit_in_progress' } });
+      }
     });
   }
 
