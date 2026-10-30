@@ -79,6 +79,13 @@ export interface AwsTunnelRecord {
   /** Worker-generated AI nonce, rotated when the trusted host reports a new boot. */
   aiProxyNonce?: string;
   aiBootId?: string;
+  /**
+   * The host boot whose RUNNING desktop was last pushed a config, and when (ms). The host applies
+   * it only by restarting the desktop, so later asks wait for that instead of pushing again
+   * (aws-ice.ts `ensureAwsDesktopConfig`).
+   */
+  restartPushBootId?: string;
+  restartPushAt?: number;
 }
 
 export function isAwsOriginFresh(record: AwsTunnelRecord, nowMs: number): boolean {
