@@ -143,9 +143,16 @@ export interface PoolDeps {
     replenish(c: PoolClass, now: Date): Promise<void>;
 }
 
-/** No deployment pool flag exists in v1. No new environment variable. */
+/**
+ * Namespaces whose computers run the warm-pool lifecycle (adopt on open, release on session end).
+ * Staging `mum` and production `prd` (founder: pool mode, one warm spare). Every other namespace runs
+ * the cold path. Keep in step with each namespace's infra identity `poolLifecycle: true`, which grants
+ * the lifecycle the pool IAM (DetachVolume/DeleteTags).
+ */
+const POOL_NAMESPACES: ReadonlySet<string> = new Set(['mum', 'prd']);
+/** No deployment pool flag exists in v1. No new environment variable. The pool policy is Mumbai-only. */
 export function isPoolMode(deployment: Pick<LifecycleDeployment, 'region' | 'namespace'>): boolean {
-    return deployment.region === 'ap-south-1' && deployment.namespace === 'mum';
+    return deployment.region === 'ap-south-1' && POOL_NAMESPACES.has(deployment.namespace);
 }
 export const POOL_RELEASED = 'pool_released';
 
