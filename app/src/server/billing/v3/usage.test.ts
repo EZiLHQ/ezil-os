@@ -121,7 +121,7 @@ describe('round 6 settings truth: Free, and Free held on AWS (D16)', () => {
     const held = (): Input => ({ ...input(), userCreatedAt: new Date('2026-10-22T00:00:00Z'), grants: [], sizePreference: 'std-2',
         subs: [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'canceled',
             currentPeriodStart: new Date('2026-10-27Z'), currentPeriodEnd: new Date('2026-11-27Z'), cancelAtPeriodEnd: false }],
-        epochs: [{ ...epoch, size: 'std-2', weight: 1, readyAt: '2026-10-26T11:30:00Z', deadlineAt: '2026-10-26T12:29:59Z', lastHeartbeatAt: null }],
+        epochs: [{ ...epoch, size: 'std-2', weight: 1, readyAt: '2026-10-26T11:30:00Z', deadlineAt: '2026-10-26T12:29:59Z', lastHeartbeatAt: null } as StoredComputeEpoch],
         placementProvider: 'aws-ec2' });
     it('legacy Free: the allowance is the real 8 hours (FREE_V2_EFFECTIVE_AT is null), never the 5 the new Free offer has', () => {
         const period = buildUsageV3(held()).period;
