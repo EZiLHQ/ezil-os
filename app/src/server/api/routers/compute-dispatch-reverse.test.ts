@@ -49,7 +49,7 @@ vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ scheduleRevers
 
 import { cloudflareGuacamoleRouter } from './cloudflare-guacamole';
 import { computerRouter } from './computer';
-import { reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 import { reverseBlockedProvider, reverseWaitingProvider } from '@/server/lib/compute/provider-reverse-placement';
 import { REVERSE_MOVE_IN_FLIGHT } from '@/server/lib/compute/provider-reverse-store';
@@ -437,5 +437,28 @@ describe('§5.2 actors: the sweep\'s policy stop never stops an export boot', ()
         const w = world([held()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
         expect(await stopComputerForPolicy(w.db, { userId: U, computerId: C }, 'session_max'))
             .toEqual({ kind: 'aws-ec2', result: { ok: false, terminated: false, outcome: 'computer_move_needs_attention' } });
+    });
+});
+
+describe('compute-dispatch flags (§5.3): computeMoving / computeMoveNeedsAttention next to computeMigrating', () => {
+    const preview = vi.fn(async () => { throw new Error('never previewed'); });
+    it('awsPreviewAnswer rewrites error to the errorCode, so the flag is the only carrier', async () => {
+        expect(await awsPreviewAnswer(await reverseWaitingProvider.ensure({ correlationId: 'c' }, { userId: U, computerId: C }, { sessionId: C, desktopMode: 'neko' }), preview))
+            .toEqual({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', retryable: true, provider: 'cloudflare-guacamole',
+                computeProvider: 'aws-ec2', computeMoving: true });
+        expect(await awsPreviewAnswer(await reverseBlockedProvider.ensure({ correlationId: 'c' }, { userId: U, computerId: C }, { sessionId: C, desktopMode: 'neko' }), preview))
+            .toEqual({ ok: false, error: 'preconditions_unmet', errorCode: 'preconditions_unmet', retryable: false, provider: 'cloudflare-guacamole',
+                computeProvider: 'aws-ec2', computeMoveNeedsAttention: true });
+        expect(preview).not.toHaveBeenCalled();
+    });
+    it('only the reverse providers\' codes set them; never computeMigrating', async () => {
+        expect(awsStatusAnswer({ ok: false, error: 'computer_move_needs_attention' })).toMatchObject({ computeMoveNeedsAttention: true });
+        expect(awsStatusAnswer({ ok: false, error: 'computer_moving' })).not.toHaveProperty('computeMigrating');
+        for (const error of ['computer_starting', 'computer_migrating', 'capacity_unavailable']) {
+            const status = awsStatusAnswer({ ok: false, error });
+            expect(status, error).not.toHaveProperty('computeMoving');
+            expect(status, error).not.toHaveProperty('computeMoveNeedsAttention');
+        }
+        expect(awsStatusAnswer({ ok: true, error: 'computer_moving' } as never)).not.toHaveProperty('computeMoving');
     });
 });
