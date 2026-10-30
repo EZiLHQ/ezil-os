@@ -2,9 +2,10 @@
 
 How the EZiL OS shell is addressed, as implemented on branch
 `feat/os-app-code-a1-20261030` (lane A1) and integrated on
-`feat/os-app-code-20261030` (§6's compatibility cases and return review,
-§7). This file describes behaviour that exists and is tested. Where a rule
-is a choice this lane made inside the shared A1/A2 contract, it says so.
+`feat/os-app-code-20261030` (§5's launch order, §6's compatibility cases
+and return review, §7). This file describes behaviour that exists and is
+tested. Where a rule is a choice this lane made inside the shared A1/A2
+contract, it says so.
 
 | Concern | Code | Tests |
 |---|---|---|
@@ -138,11 +139,11 @@ nothing sets.)
 
 | Event | Effect |
 |---|---|
-| A user's click launches an app (dock, Start, App Store, Settings drawer, Settings → open a computer, spinner's "Settings") | **push** `/app/<id>` **before** the window is built; nothing if the address bar already names that app (its URL is rewritten in place only if the launch changed the app's own parameters, e.g. Settings opened at another tab). If the app does not open, the previous URL and state are put back (the extra entry stays, as a duplicate). |
+| A user's click launches an app (dock, Start, App Store, Settings drawer, Settings → open a computer, spinner's "Settings") | **push** `/app/<id>` **before** the window is built; nothing if the address bar already names that app (its URL is rewritten in place only if the launch changed the app's own parameters, e.g. Settings opened at another tab). If the app does not open, the previous URL and state are put back (the extra entry stays, as a duplicate). A launch that resolves after a newer intent writes nothing ("Order" below). |
 | Focus moves to another app's window | **replace** with that app's URL |
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
-| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) does nothing. |
+| Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
 | Boot with a link | **replace** (canonicalise) before launching |
 
 Why the push happens first: in Chromium a frame navigation is filed under
@@ -150,6 +151,59 @@ the entry that was current when it started. The Code and Browser windows
 start their iframes' navigations while they are built; committing after a
 later push, those navigations pruned it (measured: `history.length` 3 → 2,
 and Back skipped the app).
+
+### Order: only the latest intent decides
+
+Launches resolve out of order: a click on Code, whose window is slow to
+build, then a click on Settings, which opens first. `app-history.js` numbers
+every intent as it happens (one counter per controller, never reset): a
+click's launch (`begin`), Back/Forward (whatever entry it lands on, `/os`
+included), the close of an app window, and a focus it writes for. A click
+or Back/Forward is also the latest **launch** intent.
+
+| Pending | When it resolves it writes | only if, since it began, there was no newer |
+|---|---|---|
+| A click's launch that opened a window (`end(el)`) | that app's URL (replace), if the entry does not already name it | click or Back/Forward. A close in between does not stop it: the window that opened is in front. |
+| A click's launch that opened nothing (`end(null)`) | the URL and state it replaced | intent of any kind (a close has already named the front app). The app's own parameters go back only if no later launch has set them. |
+| A Back/Forward launch (`commit`) | the entry's app and parameters, in place | intent of any kind |
+| A launched window's own late focus, until its launch settles | that app's URL (replace) | click or Back/Forward |
+
+- **A superseded launch writes nothing**: no push, no replace, no rollback,
+  and it is not recorded as a focus either, even when its window ends up in
+  front. The address bar names that window at its next focus that counts.
+- **Settling.** UIWindow focuses a restored window 80ms after `showWindow`,
+  and `ensureOnTop` (`registry.js`) re-focuses a launched window at 120ms.
+  Neither is the user's. Until `ensureOnTop` has run (it calls
+  `settled(el)` on every path), a focus of that window counts only while its
+  launch is the latest launch intent. Every other focus counts as before.
+- While any click's launch is pending, focus events write nothing (as
+  before: the new window focuses itself while it is built, and a late focus
+  of another window cannot be told from a click).
+- The boot's own link launch is not numbered against a click made during
+  the boot.
+
+Known limits, not changed here:
+
+- Z-order belongs to `registry.js` and UIWindow. A superseded launch's window
+  can still come to the front (its own focus while it is built, its
+  `ensureOnTop`); the address bar keeps the newer intent until that window's
+  next focus that counts.
+- A click on a window that is still settling after a newer launch is
+  ignored until it settles (at most 120ms).
+- A launch that never resolves keeps every focus write off, as before.
+- If the latest launch fails, it gives back the URL it replaced, which can
+  name an older launch that also failed. That launch's pushed entry stays,
+  and Back to it launches the app again.
+- A reopen that coalesces with a launch whose window was closed meanwhile
+  (`launchSingle`) resolves with that closed window, so the URL names an app
+  with no window open.
+
+Tests: `app-history-test.mjs` ("order": the coordinator's two cases, three
+launches in every end order with every open/fail outcome, late focus,
+close and reopen, closing another window, Back and Forward while a launch
+is pending, overtaken Back launches, parameters, positive controls) and
+`app-link-test.mjs` (the bundle through `registry.launch`: a slow open, the
+80/120ms focuses run by hand, a Back launch).
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
@@ -336,6 +390,10 @@ Still open:
   was opened at.
 - A page load at a compute app's URL starts a stopped computer with no
   click (§6, "After sign-in"). Owner decision.
+- Launch order (§5, "Order"): the address bar follows the latest intent,
+  but a superseded launch's window can still take the front (z-order is
+  `registry.js`'s and UIWindow's), and a reopen that coalesces with a closed
+  window's launch names an app with no window.
 - The committed bundle (`app/public/os/`) does not match the sources
   (`shell/build-shell.sh --check` fails), so CI's shell job stops at
   "Committed bundle matches source". Regenerating it is a separate step.
