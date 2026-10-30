@@ -13,6 +13,31 @@ const before = JSON.parse(readFileSync(join(__dirname, 'fixtures/identity-before
 type Statement = Record<string, any>;
 const list = (value: string | string[] | undefined): string[] => value === undefined ? [] : [value].flat();
 
+/** Billing v2 explicitly adds these two x86 types. Keep the historical fixture
+ * frozen and every other action/resource/condition inside its old ceiling. */
+function billingV2Ceiling(statements: Statement[]): Statement[] {
+    return statements.map(statement => {
+        const types = statement.Condition?.StringEquals?.['ec2:InstanceType'];
+        if (!types) return statement;
+        assert.deepEqual(types, ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge']);
+        const updated = structuredClone(statement);
+        updated.Condition.StringEquals['ec2:InstanceType'] = [...types, 'm6i.xlarge', 'm6i.2xlarge'];
+        return updated;
+    });
+}
+
+/** Pool lifecycle v1 opens only two formerly denied workload actions. The
+ * deploy/exec identities retain the historical blanket denies above. */
+function poolCeiling(statements: Statement[], c: { region: string; accountId: string; namespace: string }): Statement[] {
+    const managed = { 'aws:ResourceTag/ezil:managed-by': 'app-computer-platform', 'aws:ResourceTag/ezil:stage': c.namespace };
+    return [...statements.map(s => s.Effect === 'Deny' && s.Action ? {
+        ...s, Action: list(s.Action).filter(a => !['ec2:DetachVolume', 'ec2:DeleteTags'].includes(a)),
+    } : s),
+    { Effect: 'Allow', Action: ['ec2:DetachVolume', 'ec2:DeleteTags'],
+        Resource: [`arn:aws:ec2:${c.region}:${c.accountId}:instance/*`, `arn:aws:ec2:${c.region}:${c.accountId}:volume/*`],
+        Condition: { StringEquals: managed } }];
+}
+
 /** Conservative language containment, not matching a wildcard as a literal.
  * Exact equality and a single trailing wildcard cover our ARN/action shapes.
  * Unknown wildcard relationships fail closed. */
@@ -83,14 +108,14 @@ function addedAfterDesignA(c: { region: string; accountId: string; namespace: st
             'kms:ViaService': `states.${c.region}.amazonaws.com` } } }] };
 }
 
-for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
-    test(`Design A: unchanged identity grants, old allow containment and attached denies ${JSON.stringify({ killSwitch, userDataAttributeKeyVerified })}`, () => {
-        const config = IdentityConfigSchema.parse({ ...before.config, killSwitch, userDataAttributeKeyVerified });
-        const legacy = [
+for (const poolLifecycle of [false, true]) for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
+    test(`Design A: unchanged identity grants, old allow containment and attached denies ${JSON.stringify({ poolLifecycle, killSwitch, userDataAttributeKeyVerified })}`, () => {
+        const config = IdentityConfigSchema.parse({ ...before.config, poolLifecycle, killSwitch, userDataAttributeKeyVerified });
+        const legacy = billingV2Ceiling([
             ...before.boundary.filter((s: Statement) => !(userDataAttributeKeyVerified && s.Sid === 'NoModifyInstanceAttribute')),
             ...(userDataAttributeKeyVerified ? before.userData : []),
             ...(killSwitch ? [before.killSwitch] : []),
-        ];
+        ]);
         const stack = new DeployIdentityStack(new App({ autoSynth: false }), 'IdentityContainment', {
             config, env: { account: config.accountId, region: config.region }, synthesizer: new BootstraplessSynthesizer(),
         });
@@ -130,12 +155,18 @@ for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified 
             assertDeniesRetained(legacy, fences);
         }
         const workload = boundaryStatements(config).map(s => s.toStatementJson());
-        assertAllowsWithin(workload, legacy);
-        assertDeniesRetained(legacy, workload);
+        const ceiling = [...(poolLifecycle ? poolCeiling(legacy, config) : legacy), { Effect: 'Allow', Action: 'ec2:DescribeSnapshots', Resource: '*' }];
+        assertAllowsWithin(workload, ceiling);
+        assertDeniesRetained(ceiling, workload);
     });
 }
 
 test('containment proof rejects removed tags, wider resources, weaker role conditions and missing denies', () => {
+    const ceiling = billingV2Ceiling(before.boundary);
+    const launch = structuredClone(ceiling.find(s => s.Condition?.StringEquals?.['ec2:InstanceType']));
+    assert.ok(launch);
+    launch.Condition.StringEquals['ec2:InstanceType'].push('m6i.4xlarge');
+    assert.throws(() => assertAllowsWithin([launch], ceiling), /exceeds old boundary/);
     for (const mutate of [
         (s: Statement) => { delete s.Condition; },
         (s: Statement) => { s.Resource = '*'; },

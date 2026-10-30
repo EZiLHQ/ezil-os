@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isBurstable } from '../lib/lifecycle/deployment.js';
 import { parseLifecycleWork } from '../lib/lifecycle/intent.js';
+import { createHash } from 'node:crypto';
 
 const FIXTURES = join(__dirname, '../../../app/src/server/lib/compute/aws-intent.fixtures.json');
 interface AppFixture { name: string; stateMachineArn: string; digest: string; input: string }
@@ -32,8 +33,16 @@ for (const [key, f] of Object.entries(fixtures)) {
         assert.deepEqual(Object.keys(envelope), ['schemaVersion', 'document', 'digest']);
         assert.equal(envelope.schemaVersion, 1);
         assert.equal(envelope.digest, f.digest);
-        const intent = parseLifecycleWork({ document: envelope.document as string, digest: f.digest, createdAt: new Date() });
+        const document = envelope.document as string, digest = f.digest;
+        assert.equal(createHash('sha256').update(document, 'utf8').digest('hex'), digest);
+        const intent = parseLifecycleWork({ document, digest, createdAt: new Date() });
+        if (intent.rebasePreparation) assert.equal(JSON.stringify(intent), document, 'schema order and every byte must match the app');
         assert.equal(f.name, `computer-${intent.jobId}`);
         assert.equal(f.stateMachineArn, intent.deployment.stateMachineVersionArn);
     });
 }
+
+test('real rebase and EBS restore fixtures have pinned byte-for-byte hashes', () => {
+    assert.equal(fixtures['rebase-replace']!.digest, 'f6f7238c7ea93f964963e6ff8475eb482af8e03a308f6e0f1742a1e461471d9f');
+    assert.equal(fixtures['ebs-restore-rebind']!.digest, 'b8f44018ce1c923a17224c524f789af3a85dc520f3a315b2d39e064eee3f48a9');
+});

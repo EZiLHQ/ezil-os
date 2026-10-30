@@ -5,11 +5,20 @@
  * the callers hand the adapter the right computer.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
 import { initTRPC, TRPCError } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const captured = vi.hoisted(() => ({ reapDeps: undefined as unknown, softDelete: undefined as unknown }));
 
+// Billing effects are exercised in compute-dispatch.test.ts.
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({ now: () => new Date() }) }));
+vi.mock('@/server/billing/v2/compute-access', () => ({
+    billingV2EntitlementReader: () => ({ read: async () => null }),
+    gateComputerStart: async () => ({ allowed: true }),
+}));
 vi.mock('@/server/api/trpc', () => {
     const t = initTRPC.context<{ user: { id: string } | null; db: unknown }>().create();
     return {
@@ -53,6 +62,47 @@ const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
 const sandbox = deriveGuacamoleSandboxId(userId, computerId);
 const base = 'https://worker.example';
+
+describe('every lifecycle router call inherits the billing reader', () => {
+    it.each([
+        // Status also re-reads dispatch if a migration fence races its first read.
+        ['server/api/routers/cloudflare-guacamole.ts', 7, './compute-dispatch'],
+        ['server/api/routers/computer.ts', 1, './compute-dispatch'],
+        ['server/lib/compute/stop-policy.ts', 1, '@/server/api/routers/compute-dispatch'],
+        // isStillRunning plus the round-3 awsStopProof (both take the dispatch default).
+        ['app/api/cron/billing-session-sweep/route.ts', 2, '@/server/api/routers/compute-dispatch'],
+    ] as const)('%s uses the dispatch default on every routeComputer call', (file, expectedCalls, dispatchImport) => {
+        const source = ts.createSourceFile(file, readFileSync(path.resolve(__dirname, '../../..', file), 'utf8'), ts.ScriptTarget.Latest, true);
+        const calls: ts.CallExpression[] = [];
+        const isDispatch = (node: ts.Expression): boolean => {
+            if (ts.isIdentifier(node)) return node.text === 'routeComputer';
+            if (ts.isParenthesizedExpression(node)) return isDispatch(node.expression);
+            return ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+                && isDispatch(node.right);
+        };
+        const visit = (node: ts.Node) => {
+            if (ts.isCallExpression(node) && isDispatch(node.expression)) calls.push(node);
+            ts.forEachChild(node, visit);
+        };
+        visit(source);
+        expect(calls).toHaveLength(expectedCalls);
+        expect(source.statements.some(node => ts.isImportDeclaration(node)
+            && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === dispatchImport
+            && node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)
+            && node.importClause.namedBindings.elements.some(element => element.name.text === 'routeComputer'))).toBe(true);
+        for (const call of calls) {
+            const options = call.arguments[2];
+            if (!options) continue;
+            // No spread/opaque options may replace the tested dispatch default.
+            expect(ts.isObjectLiteralExpression(options)).toBe(true);
+            if (!ts.isObjectLiteralExpression(options)) continue;
+            for (const property of options.properties) {
+                expect(ts.isPropertyAssignment(property)).toBe(true);
+                if (ts.isPropertyAssignment(property)) expect(property.name.getText(source)).not.toBe('entitlements');
+            }
+        }
+    });
+});
 
 let calls: { method: string; url: string; auth: string | undefined; body?: string }[] = [];
 let reply: unknown = { ok: true };

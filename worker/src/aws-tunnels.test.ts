@@ -5,14 +5,16 @@
  */
 import { describe, expect, it } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
-import type { AwsTunnelRecord, FetchLike } from './aws-origin';
-import type { PreviewTokenV2Claims } from './hmac';
+import { handleAwsBrowserHost, handleAwsPreview, type AwsTunnelRecord, type FetchLike } from './aws-origin';
+import { mintPreviewCookie, type PreviewTokenV2Claims } from './hmac';
 import {
   AwsTunnelRegistry,
   createAwsTunnelService,
   createCloudflareTunnelApi,
   isPublicIpv4,
   lookupAwsTunnel,
+  lookupAwsTunnelForBrowser,
+  verifyAwsTunnelOrigin,
   routeAwsTunnels,
   type CloudflareTunnelApi,
   type TunnelStorage,
@@ -125,18 +127,133 @@ describe('replay of a completed create (Codex PR #200: enrollment 200 lost)', ()
   });
 });
 
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+// Let the service's microtasks drain without imposing a latency threshold.
+const nextTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe('create overlaps only the work after the durable pending marker and tunnel ID', () => {
+  it('starts all three legs together and publishes only after the last settlement', async () => {
+    const s = memStorage(); const f = fakeApi(); const original = { ...f.api };
+    const pending = gate(); const tunnel = gate();
+    const gates = { ingress: gate(), dns: gate(), token: gate() };
+    const started: string[] = [];
+    const put = s.put;
+    s.put = async (key, value) => { if (key === 'pending_create') await pending.promise; await put(key, value); };
+    f.api.createTunnel = async (name) => { await tunnel.promise; return original.createTunnel(name); };
+    f.api.putTunnelIngress = async (...args) => { started.push('ingress'); await gates.ingress.promise; return original.putTunnelIngress(...args); };
+    f.api.createDnsCname = async (...args) => { started.push('dns'); await gates.dns.promise; return original.createDnsCname(...args); };
+    f.api.getTunnelToken = async (...args) => { started.push('token'); await gates.token.promise; return original.getTunnelToken(...args); };
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    let settled = false;
+    const creating = svc.create(claims(), body()).then((r) => { settled = true; return r; });
+    try {
+      await nextTurn();
+      expect(f.calls).toEqual([]); expect(f.lookups).toEqual([]); expect(started).toEqual([]);
+      pending.resolve(); await nextTurn();
+      expect(s.map.has('pending_create')).toBe(true); expect(started).toEqual([]);
+      expect(f.lookups).toEqual([`findTunnel ezil-c-${SID}-g1-e2`]);
+      tunnel.resolve(); await nextTurn();
+      expect(started.slice().sort()).toEqual(['dns', 'ingress', 'token']);
+      for (const leg of ['token', 'ingress'] as const) {
+        gates[leg].resolve(); await nextTurn();
+        expect(settled).toBe(false); expect(s.map.has('tunnel')).toBe(false); expect(s.map.has('pending_create')).toBe(true);
+      }
+      gates.dns.resolve();
+      expect(await creating).toEqual({ status: 200, body: { tunnelToken: 'token-for-tun-1-0123456789' } });
+      expect(s.map.get('tunnel')).toMatchObject({ tunnelId: 'tun-1', dnsRecordId: 'dns-1' });
+      expect(s.map.has('pending_create')).toBe(false);
+    } finally {
+      pending.resolve(); tunnel.resolve(); Object.values(gates).forEach((g) => g.resolve()); await creating;
+    }
+  });
+
+  for (const failure of ['ingress', 'dns', 'token'] as const) {
+    for (const synchronous of [false, true]) {
+      for (const followup of ['remove', 'new epoch', 'restart retry'] as const) {
+        it(`${failure} ${synchronous ? 'throw' : 'rejection'} drains the other write before ${followup}`, async () => {
+          const s = memStorage(); const f = fakeApi(); const original = { ...f.api };
+          const outstanding = gate();
+          const heldLeg = failure === 'dns' ? 'ingress' : 'dns';
+          const started: string[] = []; const completed: string[] = [];
+          let failed = false; let held = false;
+          function step<T>(leg: string, run: () => Promise<T>): Promise<T> {
+            started.push(leg);
+            if (leg === failure && !failed) {
+              failed = true;
+              if (synchronous) throw new Error('injected failure');
+              return Promise.reject(new Error('injected failure'));
+            }
+            if (leg === heldLeg && !held) {
+              held = true;
+              return outstanding.promise.then(run).then((r) => { completed.push(leg); return r; });
+            }
+            return run();
+          }
+          f.api.putTunnelIngress = (...args) => step('ingress', () => original.putTunnelIngress(...args));
+          f.api.createDnsCname = (...args) => step('dns', () => original.createDnsCname(...args));
+          f.api.getTunnelToken = (...args) => step('token', () => original.getTunnelToken(...args));
+          const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+          let settled = false;
+          const creating = svc.create(claims(), body()).then((r) => { settled = true; return r; });
+          let queued: ReturnType<typeof svc.create> | undefined;
+          try {
+            await nextTurn();
+            const beforeQueue = { calls: [...f.calls], lookups: [...f.lookups], state: structuredClone(s.map) };
+            if (followup === 'remove') queued = svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+            if (followup === 'new epoch') queued = svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
+            await nextTurn();
+            expect(started.slice().sort()).toEqual(['dns', 'ingress', 'token']);
+            expect(settled).toBe(false); expect(completed).toEqual([]);
+            expect(s.map.has('pending_create')).toBe(true); expect(s.map.has('tunnel')).toBe(false);
+            expect({ calls: f.calls, lookups: f.lookups, state: s.map }).toEqual(beforeQueue);
+            outstanding.resolve();
+            expect(await creating).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed' } });
+            expect(completed).toEqual([heldLeg]);
+            if (followup === 'restart retry') {
+              expect(s.map.get('pending_create')).toMatchObject({ leaseEpoch: 2 });
+              expect(s.map.has('tunnel')).toBe(false);
+              const restarted = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+              expect((await restarted.create(claims(), body())).status).toBe(200);
+              expect(f.calls.filter((c) => c.startsWith('createTunnel'))).toHaveLength(1);
+              expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).toBe('tun-1');
+            } else {
+              expect((await queued!).status).toBe(200);
+              if (followup === 'remove') {
+                expect(f.tunnels.size).toBe(0); expect(f.dns.size).toBe(0); expect(s.map.has('tunnel')).toBe(false);
+                expect(s.map.get('fenced_epoch')).toBe(2);
+              } else {
+                expect([...f.tunnels.keys()]).toEqual([`ezil-c-${SID}-g1-e3`]);
+                expect([...f.dns.keys()]).toEqual([`c-${SID}-g1-e3.${ZONE}`]);
+                expect((s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch).toBe(3);
+                expect(f.calls.indexOf('deleteTunnel tun-1')).toBeLessThan(f.calls.indexOf(`createTunnel ezil-c-${SID}-g1-e3`));
+              }
+            }
+            expect(s.map.has('pending_create')).toBe(false);
+          } finally {
+            outstanding.resolve(); await creating; if (queued) await queued;
+          }
+        });
+      }
+    }
+  }
+});
+
 describe('create (fence-first, once per epoch)', () => {
   it('creates tunnel, ingress to the edge, proxied CNAME, stores an unverified record, returns only the token', async () => {
     const s = memStorage(); const { api, calls } = fakeApi();
     const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => 42 });
     const r = await svc.create(claims(), body());
     expect(r).toEqual({ status: 200, body: { tunnelToken: 'token-for-tun-1-0123456789' } });
-    expect(calls).toEqual([
-      `createTunnel ezil-c-${SID}-g1-e2`,
+    expect(calls[0]).toBe(`createTunnel ezil-c-${SID}-g1-e2`);
+    expect(calls.slice(1).sort()).toEqual([
       `ingress tun-1 c-${SID}-g1-e2.${ZONE} http://127.0.0.1:18080`,
       `dns c-${SID}-g1-e2.${ZONE} -> tun-1.cfargotunnel.com`,
       'getTunnelToken tun-1',
-    ]);
+    ].sort());
     const rec = s.map.get('tunnel') as AwsTunnelRecord;
     expect(rec).toMatchObject({ computerId: CID, sandboxId: SID, generation: 1, leaseEpoch: 2, tunnelId: 'tun-1', dnsRecordId: 'dns-1', originVerified: false, createdAt: 42 });
     expect(JSON.stringify(r.body)).not.toContain(vectors.controlKeyBase64);
@@ -427,6 +544,242 @@ describe('verifyOrigin (C-6 step 5)', () => {
   });
 });
 
+describe('browser lookup origin verification', () => {
+  const ROOT = 'preview.example.org';
+  const SECRET = 'browser-lookup-test-secret';
+  const connections = 'GET /accounts/acct/cfd_tunnel/tid/connections';
+  const deleted = [
+    'DELETE /zones/zone/dns_records/did',
+    'DELETE /accounts/acct/cfd_tunnel/tid/connections',
+    'DELETE /accounts/acct/cfd_tunnel/tid',
+  ];
+
+  async function fixture(create = true) {
+    const storage = memStorage();
+    const calls: string[] = [];
+    const forwarded: string[] = [];
+    const state = { now: Date.now(), origins: Array(4).fill('13.200.1.2') as string[], disconnected: false, deleteFails: false };
+    const apiFetch: FetchLike = async (url, init) => {
+      const path = new URL(url).pathname.replace('/client/v4', '');
+      const call = `${init.method} ${path}`;
+      calls.push(call);
+      if ((call === connections && state.disconnected) || (init.method === 'DELETE' && state.deleteFails)) {
+        return new Response('{}', { status: 503 });
+      }
+      const result = call === connections ? [{ conns: state.origins.map((origin_ip) => ({ origin_ip })) }]
+        : path.endsWith('/token') ? 'tunnel-token-0123456789'
+        : init.method === 'GET' ? []
+        : { id: path.endsWith('/dns_records') ? 'did' : 'tid' };
+      return Response.json({ success: true, result });
+    };
+    const registry = new AwsTunnelRegistry({ storage }, {
+      AWS_TUNNEL_CF_ACCOUNT_ID: 'acct', AWS_TUNNEL_CF_ZONE_ID: 'zone', AWS_TUNNEL_CF_API_TOKEN: 'test-token',
+      AWS_ORIGIN_ZONE: ZONE, AWS_ORIGIN_ZONE_ALLOWLIST: ZONE,
+    }, apiFetch, undefined, () => state.now);
+    const registryFor = () => registry;
+    if (create) {
+      expect((await routeAwsTunnels('POST', claims(), body(), registryFor)).status).toBe(200);
+      expect((storage.map.get('tunnel') as AwsTunnelRecord).originVerified).toBe(false);
+    }
+    calls.length = 0;
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const browser = async () => {
+      const url = new URL(`https://aws-8181-${SID}-aws.${ROOT}/api/health`);
+      return (await handleAwsBrowserHost(new Request(url, { headers: { cookie: `ezil_preview=${cookie}` } }), url, {
+        routingEnabled: true, zone: ZONE, zoneRoot: ROOT, secrets: [SECRET], nowMs: () => state.now,
+        lookup: (sandboxId) => lookupAwsTunnelForBrowser(registryFor, sandboxId),
+        fetch: async (url) => { forwarded.push(url); return new Response('desktop healthy'); },
+      }))!;
+    };
+    return { storage, calls, forwarded, state, browser, getForBrowser: () => lookupAwsTunnelForBrowser(registryFor, SID),
+      get: () => lookupAwsTunnel(registryFor, SID),
+      preview: () => handleAwsPreview(claims(), {
+        zone: ZONE, zoneRoot: ROOT, secrets: [SECRET], nowMs: () => state.now,
+        lookup: (sandboxId) => lookupAwsTunnel(registryFor, sandboxId),
+        verifyOrigin: (sandboxId) => verifyAwsTunnelOrigin(registryFor, sandboxId),
+      }),
+      remove: () => routeAwsTunnels('DELETE', claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }), registryFor) };
+  }
+
+  it.each(['empty', 'error', 'mismatch'])('open keeps its explicit %s verdict through the real registry', async (failure) => {
+    const f = await fixture();
+    const created = f.storage.map.get('tunnel');
+    f.state.origins = failure === 'mismatch' ? ['203.0.113.9'] : [];
+    f.state.disconnected = failure === 'error';
+    expect(await f.get()).toEqual(created);
+    expect(f.calls).toEqual([]);
+    const response = await f.preview();
+    expect(response.status).toBe(failure === 'mismatch' ? 502 : 503);
+    expect(await response.json()).toEqual({ ok: false,
+      error: failure === 'mismatch' ? 'tunnel_origin_mismatch' : 'aws_origin_starting' });
+    expect(f.calls).toEqual(failure === 'mismatch' ? [connections, ...deleted] : [connections]);
+    expect(f.storage.map.has('tunnel')).toBe(failure !== 'mismatch');
+    expect(f.storage.map.get('fenced_epoch')).toBe(failure === 'mismatch' ? 2 : undefined);
+    expect(f.forwarded).toEqual([]);
+  });
+
+  it('browser failure backoff leaves the open path able to verify immediately', async () => {
+    const f = await fixture();
+    f.state.origins = [];
+    expect((await f.browser()).status).toBe(502);
+    expect((await f.preview()).status).toBe(503);
+    f.state.origins = ['13.200.1.2'];
+    expect((await f.preview()).status).toBe(200);
+    expect(f.calls).toEqual([connections, connections, connections]);
+    expect((await f.browser()).status).toBe(200);
+    expect(f.calls).toEqual([connections, connections, connections]);
+  });
+
+  it('browser failure backoff at time zero does not carry over to a replacement tunnel', async () => {
+    const storage = memStorage();
+    const { api, calls } = fakeApi({ listConnectorOrigins: async (id) => { calls.push(`list ${id}`); return []; } });
+    const svc = createAwsTunnelService({ api, storage, zone: ZONE, nowMs: () => 0 });
+    await svc.create(claims(), body());
+    calls.length = 0;
+    expect(await svc.getForBrowser()).toBeNull();
+    expect(await svc.getForBrowser()).toBeNull();
+    expect(calls).toEqual(['list tun-1']);
+    expect((await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
+    calls.length = 0;
+    api.listConnectorOrigins = async (id) => { calls.push(`list ${id}`); return ['13.200.1.2']; };
+    expect((await svc.getForBrowser())?.leaseEpoch).toBe(3);
+    expect(calls).toEqual(['list tun-2']);
+  });
+
+  it.each(['getForBrowser', 'browser'])('first %s verifies all matching connectors and proxies without an open', async (first) => {
+    const f = await fixture();
+    const created = f.storage.map.get('tunnel') as AwsTunnelRecord;
+    if (first === 'getForBrowser') {
+      expect(await f.getForBrowser()).toEqual({ ...created, originVerified: true, originVerifiedAt: f.state.now });
+    }
+    const response = await f.browser();
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('desktop healthy');
+    expect(f.forwarded).toEqual([`https://c-${SID}-g1-e2.${ZONE}/__p/8181/api/health`]);
+    expect(await f.getForBrowser()).toEqual({ ...created, originVerified: true, originVerifiedAt: f.state.now });
+    expect(f.storage.map.get('tunnel')).toEqual(await f.getForBrowser());
+    expect(f.calls).toEqual([connections]);
+  });
+
+  it.each(['empty', 'error'])('browser %s connections back off for 10 seconds and retry at the boundary', async (failure) => {
+    const f = await fixture();
+    const created = f.storage.map.get('tunnel');
+    f.state.origins = [];
+    f.state.disconnected = failure === 'error';
+    const response = await f.browser();
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    expect(await f.getForBrowser()).toBeNull();
+    expect(f.storage.map.get('tunnel')).toEqual(created);
+    expect(f.storage.map.has('fenced_epoch')).toBe(false);
+    expect(f.calls).toEqual([connections]);
+    expect(f.forwarded).toEqual([]);
+    f.state.now += 9_999;
+    for (const retry of await Promise.all([f.browser(), f.browser()])) expect(retry.status).toBe(502);
+    expect(f.calls).toEqual([connections]);
+    f.state.now++;
+    expect((await f.browser()).status).toBe(502);
+    expect(f.calls).toEqual([connections, connections]);
+    // Another failed check starts a new window; later connector arrival can verify.
+    f.state.origins = ['13.200.1.2'];
+    f.state.disconnected = false;
+    expect((await f.browser()).status).toBe(502);
+    expect(f.calls).toEqual([connections, connections]);
+    f.state.now += 10_000;
+    expect((await f.browser()).status).toBe(200);
+    expect(f.calls).toEqual([connections, connections, connections]);
+    expect(f.forwarded).toHaveLength(1);
+  });
+
+  it.each([['13.200.1.2', '203.0.113.9'], ['203.0.113.9', '13.200.1.2']])(
+    'first lookup with mixed connector IPs %s / %s destroys and fences before returning browser 502', async (a, b) => {
+      const f = await fixture();
+      f.state.origins = [a, b];
+      const response = await f.browser();
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+      expect(f.storage.map.has('tunnel')).toBe(false);
+      expect(f.storage.map.get('fenced_epoch')).toBe(2);
+      expect(await f.getForBrowser()).toBeNull();
+      expect(f.calls).toEqual([connections, ...deleted]);
+      expect(f.forwarded).toEqual([]);
+    },
+  );
+
+  it('verified and fresh lookup makes no extra API call through the 60 second TTL', async () => {
+    const f = await fixture();
+    const verified = await f.getForBrowser();
+    f.calls.length = 0;
+    f.state.now += 59_999;
+    expect(await f.getForBrowser()).toEqual(verified);
+    expect((await f.browser()).status).toBe(200);
+    expect(f.calls).toEqual([]);
+  });
+
+  it('verified but stale lookup re-verifies at the TTL boundary and returns the refreshed record', async () => {
+    const f = await fixture();
+    const verified = await f.getForBrowser();
+    f.calls.length = 0;
+    f.state.now += 60_000;
+    expect(await f.getForBrowser()).toEqual({ ...verified, originVerifiedAt: f.state.now });
+    expect((await f.browser()).status).toBe(200);
+    expect(f.calls).toEqual([connections]);
+  });
+
+  it.each(['fenced', 'removed'])('%s unverified record returns null without connector verification', async (mode) => {
+    const f = await fixture();
+    f.state.deleteFails = mode === 'fenced';
+    expect((await f.remove()).status).toBe(mode === 'fenced' ? 502 : 200);
+    expect(f.storage.map.has('tunnel')).toBe(mode === 'fenced');
+    expect(f.storage.map.get('fenced_epoch')).toBe(2);
+    f.calls.length = 0;
+    expect(await f.getForBrowser()).toBeNull();
+    expect((await f.browser()).status).toBe(502);
+    expect(f.calls).toEqual([]);
+    expect(f.forwarded).toEqual([]);
+  });
+
+  it('unknown sandbox returns null and browser 502 without a verification call', async () => {
+    const f = await fixture(false);
+    expect(await f.getForBrowser()).toBeNull();
+    expect((await f.browser()).status).toBe(502);
+    expect(f.calls).toEqual([]);
+    expect(f.forwarded).toEqual([]);
+    expect(f.storage.map.size).toBe(0);
+  });
+
+  it('serializes concurrent first lookups with removal and never resurrects the removed epoch', async () => {
+    const storage = memStorage();
+    let started!: () => void;
+    let release!: () => void;
+    const verifying = new Promise<void>((resolve) => { started = resolve; });
+    const resume = new Promise<void>((resolve) => { release = resolve; });
+    const { api, calls } = fakeApi({ listConnectorOrigins: async () => {
+      calls.push('list tun-1');
+      started();
+      await resume;
+      return ['13.200.1.2'];
+    } });
+    const svc = createAwsTunnelService({ api, storage, zone: ZONE });
+    await svc.create(claims(), body());
+    calls.length = 0;
+    const first = svc.getForBrowser();
+    await verifying;
+    const second = svc.getForBrowser();
+    const removal = svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+    const last = svc.getForBrowser();
+    release();
+    const [a, b, removed, c] = await Promise.all([first, second, removal, last]);
+    expect(a?.originVerified).toBe(true);
+    expect(b).toEqual(a);
+    expect(removed.body).toEqual({ deleted: true });
+    expect(c).toBeNull();
+    expect(storage.map.has('tunnel')).toBe(false);
+    expect(storage.map.get('fenced_epoch')).toBe(2);
+    expect(calls).toEqual(['list tun-1', 'deleteDns dns-1', 'deleteTunnel tun-1']);
+  });
+});
+
 describe('Cloudflare REST client (fake fetch only)', () => {
   function capture(result: unknown = { id: 'x' }, status = 200) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -486,7 +839,8 @@ describe('registry protocol and the internal route', () => {
   });
   it('a real registry with the default zone resolver: create via the route, then lookup returns the record', async () => {
     const f: FetchLike = async (url) => {
-      const result = url.endsWith('/token') ? 'tunnel-token-0123456789' : { id: 'tid' };
+      const result = url.endsWith('/connections') ? [{ conns: [{ origin_ip: '13.200.1.2' }] }]
+        : url.endsWith('/token') ? 'tunnel-token-0123456789' : { id: 'tid' };
       return new Response(JSON.stringify({ success: true, result }), { status: 200 });
     };
     const reg = new AwsTunnelRegistry({ storage: memStorage() }, env, f);
@@ -496,11 +850,41 @@ describe('registry protocol and the internal route', () => {
     const rec = await lookupAwsTunnel(() => reg, SID);
     expect(rec?.hostname).toBe(`c-${SID}-g1-e2.${ZONE}`);
     expect(await lookupAwsTunnel(() => reg, 'guac-other-sandbox')).toBeNull();
+    expect(await lookupAwsTunnelForBrowser(() => reg, 'guac-other-sandbox')).toBeNull();
   });
   it('public IPv4 check refuses private, loopback, link-local, CGNAT and multicast', () => {
     for (const ip of ['10.1.2.3', '172.16.0.1', '192.168.1.1', '127.0.0.1', '169.254.169.254', '100.64.0.1', '224.0.0.1', '0.1.2.3', '1.2.3', '01.2.3.4']) {
       expect(isPublicIpv4(ip)).toBe(false);
     }
     expect(isPublicIpv4('13.200.1.2')).toBe(true);
+  });
+});
+
+
+describe('AWS AI boot nonce', () => {
+  it('is random, stable under concurrent retry, rotates on boot/epoch, and refuses fenced or mismatched leases', async () => {
+    const storage = memStorage(); const { api } = fakeApi();
+    const svc = createAwsTunnelService({ storage, api, zone: ZONE });
+    const boot = '11111111-1111-4111-8111-111111111111';
+    expect(await svc.aiNonce(1, 2, boot)).toBeNull();
+    await svc.create(claims(), body());
+    expect(await svc.aiNonce(1, 2, 'container-choice')).toBeNull();
+    expect(await svc.aiNonce(2, 2, boot)).toBeNull();
+    expect(await svc.aiNonce(1, 3, boot)).toBeNull();
+    const [one, retry] = await Promise.all([svc.aiNonce(1, 2, boot), svc.aiNonce(1, 2, boot)]);
+    expect(one).toMatch(/^[0-9a-f-]{36}$/);
+    expect(one).not.toBe(boot);
+    expect(retry).toBe(one);
+    expect((await svc.get())!.aiProxyNonce).toBe(one);
+    const restarted = createAwsTunnelService({ storage, api, zone: ZONE });
+    expect(await restarted.aiNonce(1, 2, boot)).toBe(one);
+    const two = await svc.aiNonce(1, 2, '22222222-2222-4222-8222-222222222222');
+    expect(two).not.toBe(one);
+    await svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+    expect(await svc.aiNonce(1, 2, boot)).toBeNull();
+    expect(await svc.get()).toBeNull();
+    await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
+    expect((await svc.get())!.aiProxyNonce).toBeUndefined();
+    expect(await svc.aiNonce(1, 3, boot)).not.toBe(one);
   });
 });

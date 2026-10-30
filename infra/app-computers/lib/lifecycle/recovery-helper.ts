@@ -1,10 +1,12 @@
+import { matchesLifecycleDeployment } from './preparation-evidence.js';
+import { createImageRecoveryHelper } from './image-recovery-helper.js';
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
 import { EnvelopeSchema, LAUNCH_ACTIONS, equal, tagsFor, token } from './contract.js';
 import { toLambdaError } from './errors.js';
 import { parseLifecycleWork } from './intent.js';
-import { tagged } from './helper.js';
-import { RecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
+import { matchingPresentTags, releasedPoolSource, releasedSourceApplies, tagged } from './helper.js';
+import { CleanupRecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
     type RecoverySettings, type RecoveryReceipt } from './recovery-contract.js';
 import { recoveryDependencies, type RecoveryDependencies } from './recovery-aws.js';
 
@@ -16,6 +18,7 @@ const terminal = ['FAILED', 'ABORTED', 'TIMED_OUT'];
  * no launch, attach, retag, detach, modify, delete or current-authority capability. */
 export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryDependencies) {
     return async (input: unknown): Promise<Record<string, unknown>> => {
+        if (input && typeof input === 'object' && 'mode' in input) return createImageRecoveryHelper(settings, deps)(input);
         const e = Event.parse(input), d = settings.lifecycle.deployment;
         const recoveryMachine = machineArn(settings.recoveryVersionArn), sourceMachine = machineArn(d.stateMachineVersionArn);
         if (!e.executionArn.startsWith(recoveryMachine.replace(':stateMachine:', ':execution:') + ':cleanup-computer-')) return fail();
@@ -26,7 +29,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || Buffer.byteLength(execution.input) > 1024) return fail();
         const began = execution.startDate.getTime();
         if (!Number.isFinite(began) || began > now || now - began >= 600000) return fail();
-        const { sourceExecutionArn } = RecoveryInputSchema.parse(JSON.parse(execution.input));
+        const { sourceExecutionArn } = CleanupRecoveryInputSchema.parse(JSON.parse(execution.input));
         if (!sourceExecutionArn.startsWith(sourceMachine.replace(':stateMachine:', ':execution:') + ':computer-')) return fail();
         const source = await deps.execution(sourceExecutionArn);
         if (source.executionArn !== sourceExecutionArn || source.stateMachineArn !== sourceMachine
@@ -37,7 +40,10 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || now - source.startDate.getTime() > 86400000) return fail();
         const envelope = EnvelopeSchema.parse(JSON.parse(source.input));
         const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
-        if (!equal(i.deployment, d)
+        // The historical cleanup graph cannot prove a pool claim or perform
+        // release's detach sequence. Leave its reservation unconfirmed.
+        if (['pool-provision', 'pool-retire', 'adopt', 'release'].includes(i.operation)) return fail();
+        if (!await matchesLifecycleDeployment(i, d, deps)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`
             || e.executionArn !== recoveryMachine.replace(':stateMachine:', ':execution:') + ':' + execution.name) return fail();
@@ -77,8 +83,15 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             // gone instance is refused by the attachment check below.
             if (rows.length === 0) gone = { instanceId: originalId, generation, fenceToken };
             else {
+                // A replace after a pool release names the released pool host: accepted by its claim
+                // identity only while terminating or terminated, so cleanup never stops or terminates it.
+                // Every present identity alias (cold-launch or claim, plus namespace) must agree first.
+                const applies = releasedSourceApplies(i), instance = rows[0]!.instance;
+                if (applies && !matchingPresentTags(instance.Tags, { ...oldTags, 'ezil:computer': i.computerId, 'ezil:fence': fenceToken,
+                    'ezil:namespace': i.deployment.namespace })) return fail();
+                const released = applies && releasedPoolSource(instance, i.computerId, i.deployment.namespace, generation, fenceToken);
                 if (rows.length !== 1 || rows[0]?.owner !== d.accountId || rows[0].instance.InstanceId !== originalId
-                    || !tagged(rows[0].instance.Tags, oldTags)) return fail();
+                    || !(tagged(rows[0].instance.Tags, oldTags) || released)) return fail();
                 targets.push({ role: 'old', instance: rows[0].instance, generation, fenceToken });
             }
         }
@@ -95,7 +108,10 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         }
         if (targets.length && !v) return fail();
         for (const { instance } of targets) {
-            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || instance.SubnetId !== d.subnetId
+            // EC2 may omit networking fields once termination starts (shutting-down or terminated);
+            // reported values must still match. A shutting-down instance only ever waits below.
+            const subnetOmitted = (instance.State?.Name === 'terminated' || instance.State?.Name === 'shutting-down') && instance.SubnetId === undefined;
+            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || (!subnetOmitted && instance.SubnetId !== d.subnetId)
                 || (instance.Placement?.AvailabilityZoneId !== undefined && instance.Placement.AvailabilityZoneId !== d.zoneId)) return fail();
         }
         if (v?.Attachments?.some(a => !targets.some(t => t.instance.InstanceId === a.InstanceId) || a.VolumeId !== v.VolumeId)) return fail();

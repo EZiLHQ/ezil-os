@@ -28,6 +28,7 @@ import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
 import { monthUsageFromRows } from './usage';
+import { instanceVcpu } from './aws-config';
 
 const dialect = new PgDialect();
 
@@ -68,12 +69,17 @@ const RUNNING_EXCLUDED = new Set(['STOPPED', 'RETIRED', 'PURGE_ELIGIBLE']);
 
 export interface FakeSeed {
     placements?: Row[];
+    imageJobs?: Row[];
     usage?: Row[];
     computers?: { id: string; user_id: string; deleted_at?: Date | null; created_at?: Date }[];
+    /** ezil_compute_capacity_demands rows (capacity-demand.ts). */
+    demands?: Row[];
 }
 
 export interface FakeOptions {
     clock?: () => Date;
+    /** Fake-timer polling tests may replace the database's event-loop yield. */
+    yield?: () => Promise<void>;
     /** What `current_setting('transaction_isolation')` answers. */
     isolation?: string;
 }
@@ -114,11 +120,14 @@ export function placementRow(over: Row & { computer_id: string }): Row {
 const uuidEq = (a: unknown, b: unknown) => String(a).toLowerCase() === String(b).toLowerCase();
 
 export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions = {}) {
+    const yieldStatement = options.yield ?? tick;
     const clock = options.clock ?? (() => new Date('2026-10-13T12:00:00Z'));
     const isolation = options.isolation ?? 'read committed';
     const placements: Row[] = (seed.placements ?? []).map((r) => ({ ...r }));
+    const imageJobs: Row[] = (seed.imageJobs ?? []).map(r => ({ ...r }));
     const usage: Row[] = (seed.usage ?? []).map((r) => ({ ...r }));
     const computers = seed.computers ?? [];
+    const demands: Row[] = (seed.demands ?? []).map(r => ({ ...r }));
     const statements: Statement[] = [];
     const locks = new Map<string, Mutex>();
     let txSeq = 0;
@@ -130,9 +139,16 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     });
 
     const value = (expr: string, params: unknown[]): unknown => {
-        const p = expr.match(/^\$(\d+)(?:::\w+)?$/);
-        if (p) return params[Number(p[1]) - 1];
-        if (expr === 'now()') return clock();
+        const p = expr.match(/^\$(\d+)(?:::\w+)*$/);
+        if (p) {
+            const parameter = params[Number(p[1]) - 1];
+            if (!expr.endsWith('::jsonb') || parameter === null) return parameter;
+            // Match postgres-js's first-cast serializer: a direct JSONB bind
+            // serializes even strings, whereas text is parsed by the SQL cast.
+            return JSON.parse(expr.includes('::text::jsonb') ? String(parameter) : JSON.stringify(parameter));
+        }
+        if (expr === "'aws-ec2'") return 'aws-ec2';
+        if (expr === 'now()' || expr === "date_trunc('milliseconds', now())") return clock();
         if (/^\d+$/.test(expr)) return Number(expr);
         throw new Error(`fake db: unsupported value expression ${expr}`);
     };
@@ -140,9 +156,100 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     async function run(query: SQL, tx: Tx | null): Promise<{ rows: Row[] }> {
         const { sql: text, params } = dialect.sqlToQuery(query);
         statements.push({ sql: text, params, tx: tx?.id ?? null });
-        await tick();
-        const tag = text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
+        await yieldStatement();
+        // Existing placement-only fixtures have no migration intent; migration tests wrap this executor.
+        if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
+        const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
+        const writeRows = imageTable ? imageJobs : placements;
+        const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;
+        if (imageTable && text.startsWith('SELECT')) {
+            const byJob = /WHERE job_id =/.test(text);
+            return { rows: imageJobs.filter(r => byJob ? r.job_id === params[0] : r.computer_id === params[0]
+                && !['succeeded', 'recovered', 'cancelled'].includes(String(r.phase))).slice(0, 2).map(r => ({ ...r })) };
+        }
+        if (text.startsWith('SELECT user_id::text AS user_id FROM public.ezil_computers'))
+            return { rows: computers.filter(c => c.id === params[0] && c.deleted_at == null).map(c => ({ user_id: c.user_id })) };
+        if (text.startsWith('SELECT id FROM public.ezil_compute_pool_hosts')) return { rows: [] };
+        if (text.startsWith('SELECT lower_image_digest')) return { rows: placements.filter(r => r.computer_id === params[0]
+            && r.generation === params[1] && r.lease_epoch === params[2] && r.enroll_consumed_hash === params[3]
+            && r.image_upgrade_job_id == null).map(r => ({ lower_image_digest: r.lower_image_digest })) };
+        const demandTag = text.match(/\/\* demand:([a-z]+) \*\//)?.[1];
+        if (demandTag) {
+            // In-memory capacity demands: the statement shapes capacity-demand.ts issues, under the same clock.
+            const now = clock().getTime(), active = (d: Row) => d.closed_at == null;
+            const close = (d: Row, state: string) => { const before = { ...d }; Object.assign(d, { state, closed_at: clock(), revision: Number(d.revision) + 1 });
+                tx?.undo.push(() => Object.assign(d, before)); return d; };
+            switch (demandTag) {
+                case 'hold': {
+                    const [computerId, owner] = params as unknown[];
+                    // RETRY-118 routing decision: any demand of this exact owner/computer, in any state, is AWS intent.
+                    return { rows: demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner)).slice(0, 1) };
+                }
+                case 'peek': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d) && new Date(d.expires_at as string).getTime() > now).slice(0, 2) };
+                case 'computer': return { rows: demands.filter(d => uuidEq(d.computer_id, params[0]) && active(d)) };
+                case 'region': return { rows: demands.filter(d => d.region === params[0] && active(d)) };
+                case 'expire': return { rows: demands.filter(d => active(d) && new Date(d.expires_at as string).getTime() <= now).map(d => close(d, 'expired')) };
+                case 'orphan': return { rows: demands.filter(d => active(d) && !computers.some(c => uuidEq(c.id, d.computer_id)
+                    && uuidEq(c.user_id, d.owner_user_id) && c.deleted_at == null)).map(d => close(d, 'cancelled')) };
+                case 'close': {
+                    const d = demands.find(x => x.id === params[1] && Number(x.revision) === Number(params[2]) && active(x));
+                    return { rows: d ? [close(d, String(params[0]))] : [] };
+                }
+                case 'insert': {
+                    const [request_id, owner_user_id, computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest,
+                        source_generation, source_lease_epoch, cleanup, ttl] = params as unknown[];
+                    if (demands.some(d => active(d) && (d.region === region || uuidEq(d.computer_id, computer_id) || uuidEq(d.owner_user_id, owner_user_id))))
+                        throw new Error('fake db: duplicate key value violates unique constraint (active demand)');
+                    const row: Row = { id: `00000000-0000-4000-8000-${String(demands.length + 1).padStart(12, '0')}`, request_id, owner_user_id,
+                        computer_id, kind, region, zone_id, instance_type, vcpu, deployment_digest, source_generation, source_lease_epoch,
+                        state: 'active', revision: 1, cleanup: JSON.parse(String(cleanup)), created_at: clock(),
+                        expires_at: new Date(now + Number(ttl) * 1000), closed_at: null };
+                    demands.push(row); tx?.undo.push(() => { demands.splice(demands.indexOf(row), 1); });
+                    return { rows: [row] };
+                }
+                case 'cleanup': {
+                    const d = demands.find(x => x.id === params[1] && Number(x.revision) === Number(params[2]) && active(x));
+                    if (!d) return { rows: [] };
+                    const before = { ...d }; Object.assign(d, { cleanup: JSON.parse(String(params[0])), revision: Number(d.revision) + 1 });
+                    tx?.undo.push(() => Object.assign(d, before)); return { rows: [d] };
+                }
+                case 'terminal': {
+                    const [computerId, kind, gen, epoch] = params as unknown[];
+                    const same = (d: Row) => uuidEq(d.computer_id, computerId) && d.kind === kind
+                        && (d.source_generation ?? null) === (gen ?? null) && (d.source_lease_epoch ?? null) === (epoch ?? null);
+                    const cancelledAfter = (d: Row) => demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
+                        && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime());
+                    return { rows: demands.filter(d => same(d) && d.state === 'expired' && !cancelledAfter(d)).slice(0, 1) };
+                }
+                case 'cancelexpired': {
+                    const [computerId, owner] = params as unknown[];
+                    const expired = demands.filter(d => uuidEq(d.computer_id, computerId) && uuidEq(d.owner_user_id, owner) && d.state === 'expired'
+                        && !demands.some(c => uuidEq(c.computer_id, d.computer_id) && c.state === 'cancelled'
+                            && new Date(c.closed_at as string).getTime() >= new Date(d.closed_at as string).getTime()))
+                        .sort((a, b) => new Date(b.closed_at as string).getTime() - new Date(a.closed_at as string).getTime())[0];
+                    if (!expired) return { rows: [] };
+                    const row: Row = { ...expired, id: `00000000-0000-4000-8000-${String(demands.length + 1).padStart(12, '0')}`, state: 'cancelled',
+                        cleanup: [], created_at: clock(), expires_at: new Date(now + 1000), closed_at: clock(), revision: 1 };
+                    demands.push(row); tx?.undo.push(() => { demands.splice(demands.indexOf(row), 1); });
+                    return { rows: [{ id: row.id }] };
+                }
+                default: throw new Error(`fake db: unsupported demand statement ${demandTag}`);
+            }
+        }
+        const tag = imageTable && text.startsWith('INSERT') ? 'insert' : imageTable && text.startsWith('UPDATE') ? 'cas'
+            : text.match(/\/\* placement:([a-z-]+) \*\//)?.[1];
         switch (tag) {
+            case 'demand-reclaimable':
+                return { rows: [] };
+            case 'count-demand': {
+                const [userId, computerId] = params as string[];
+                const live = demands.filter(d => d.closed_at == null && new Date(d.expires_at as string).getTime() > clock().getTime() && !uuidEq(d.computer_id, computerId));
+                const regions = [...new Set(live.map(d => String(d.region)))];
+                return { rows: regions.map(region => { const r = live.filter(d => d.region === region);
+                    return { region, n: r.length, vcpu: String(r.reduce((x, d) => x + Number(d.vcpu), 0)), own: r.filter(d => uuidEq(d.owner_user_id, userId)).length }; }) };
+            }
+            case 'image-reservation':
+                return { rows: placements.filter(r => r.image_upgrade_job_id != null && r.computer_id === params[0]).map(r => ({ job_id: r.image_upgrade_job_id })) };
             case 'lock-computer':
             case 'lock-admission': {
                 if (!tx) throw new Error('fake db: pg_advisory_xact_lock outside a transaction is a no-op in Postgres');
@@ -155,6 +262,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 tx.locks.push(m);
                 return { rows: [{ pg_advisory_xact_lock: '', isolation }] };
             }
+            case 'image-read':
+                return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).slice(0, 2).map(r => present({
+                    lower_image_digest: null, lower_digest_observed_at: null, image_upgrade_job_id: null, ...r })) };
             case 'read':
                 return { rows: placements.filter((r) => uuidEq(r.computer_id, params[0])).slice(0, 2).map(present) };
             case 'duplicates': {
@@ -178,19 +288,20 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             }
             case 'count-running': {
                 const states = new Set(params as string[]);
-                const n = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state))).length;
-                return { rows: [{ n }] };
+                const rows = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)));
+                return { rows: [{ n: rows.length, vcpu: rows.reduce((sum, r) => sum + instanceVcpu(r.instance_type as string | null), 0) }] };
             }
             case 'count-running-region': {
                 if (!/provider = 'aws-ec2' AND state IN \([^)]*\)\s+GROUP BY region/.test(text)) throw new Error('fake db: unexpected per-region count SQL');
                 const states = new Set(params as string[]);
-                const byRegion = new Map<string | null, number>();
+                const byRegion = new Map<string | null, { n: number; vcpu: number }>();
                 for (const r of placements) {
                     if (r.provider !== 'aws-ec2' || !states.has(String(r.state))) continue;
                     const key = (r.region as string | null) ?? null;
-                    byRegion.set(key, (byRegion.get(key) ?? 0) + 1);
+                    const prev = byRegion.get(key) ?? { n: 0, vcpu: 0 };
+                    byRegion.set(key, { n: prev.n + 1, vcpu: prev.vcpu + instanceVcpu(r.instance_type as string | null) });
                 }
-                return { rows: [...byRegion].map(([region, n]) => ({ region, n })) };
+                return { rows: [...byRegion].map(([region, counts]) => ({ region, ...counts })) };
             }
             case 'count-user': {
                 const [computerId, userId] = params as string[];
@@ -203,6 +314,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 ).size;
                 return { rows: [{ n }] };
             }
+            case 'usage-stale': {
+                const excluded = text.match(/p\.state NOT IN \(([^)]+)\)/)![1]!.split(',').map(s => s.trim().replaceAll("'", ''));
+                return { rows: usage.filter(u => u.stopped_at == null).flatMap(u => placements
+                    .filter(p => uuidEq(p.computer_id, u.computer_id) && !excluded.includes(String(p.state)))
+                    .map((p): Row => ({ ...u, placement_state: p.state, placement_updated_at: p.updated_at })))
+                    .sort((a, b) => new Date(String(a.started_at)).getTime() - new Date(String(b.started_at)).getTime()
+                        || String(a.computer_id).localeCompare(String(b.computer_id)) || String(a.instance_id).localeCompare(String(b.instance_id))) };
+            }
             case 'usage-month': {
                 // The SQL totals per user in the database; answer with the same arithmetic
                 // (usage.ts `monthUsageFromRows`, the reference placement-usage-sql pins on real
@@ -210,25 +329,28 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const now = new Date(String(params[0]));
                 const rows = usage.map((u) => ({
                     computerId: String(u.computer_id), userId: String(u.user_id),
+                    instanceType: (u.instance_type as string | null) ?? null,
                     startedAt: u.started_at as Date, stoppedAt: (u.stopped_at as Date | null) ?? null,
                     egressBytes: u.egress_bytes === null || u.egress_bytes === undefined ? null : Number(u.egress_bytes),
                 }));
                 const totals = monthUsageFromRows(rows, now);
                 return {
                     rows: [...totals.byUser].map(([user_id, t]) => ({
-                        user_id, seconds: (t.hours * 3_600).toFixed(6), egress_bytes: String(t.egressBytes),
+                        user_id, seconds: (t.hours * 3_600).toFixed(6), weighted_seconds: String(t.weightedSeconds), egress_bytes: String(t.egressBytes),
                     })),
                 };
             }
             case 'usage-close':
             case 'usage-close-other': {
                 if (!tx) throw new Error('fake db: a usage write outside its transition transaction');
-                const [observedBy, computerId, keepInstance] = params as string[];
+                const dated = tag === 'usage-close' && /SET stopped_at = \$1::timestamptz/.test(text);
+                const stoppedAt = dated ? new Date(String(params[0])) : clock();
+                const [observedBy, computerId, keepInstance] = (dated ? params.slice(1) : params) as string[];
                 const hit = usage.filter((u) => uuidEq(u.computer_id, computerId) && u.stopped_at == null
                     && (tag === 'usage-close' || u.instance_id !== keepInstance));
                 for (const u of hit) {
                     const before = { ...u };
-                    Object.assign(u, { stopped_at: clock(), observed_by: observedBy, updated_at: clock() });
+                    Object.assign(u, { stopped_at: stoppedAt, observed_by: observedBy, updated_at: clock() });
                     tx.undo.push(() => Object.assign(u, before));
                 }
                 return { rows: [] };
@@ -309,13 +431,25 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 const m = text.match(/\(([^)]*)\)\s*VALUES\s*\(([\s\S]*)\)\s*RETURNING/);
                 if (!m) throw new Error('fake db: unparsed insert');
                 const cols = m[1]!.split(',').map((s) => s.trim());
-                const vals = m[2]!.split(',').map((s) => s.trim());
-                const row: Row = placementRow({ computer_id: '' });
+                // Timestamp functions contain commas; split only at the top level.
+                const vals: string[] = [];
+                let depth = 0, start = 0;
+                const values = m[2]!;
+                for (let k = 0; k < values.length; k++) {
+                    if (values[k] === '(') depth++;
+                    else if (values[k] === ')') depth--;
+                    else if (values[k] === ',' && depth === 0) { vals.push(values.slice(start, k).trim()); start = k + 1; }
+                }
+                vals.push(values.slice(start).trim());
+                const row: Row = imageTable ? {} : placementRow({ computer_id: '' });
                 cols.forEach((c, i) => (row[c] = value(vals[i]!, params)));
-                placements.push(row);
-                tx?.undo.push(() => placements.splice(placements.indexOf(row), 1));
-                return { rows: [present(row)] };
+                writeRows.push(row);
+                tx?.undo.push(() => writeRows.splice(writeRows.indexOf(row), 1));
+                return { rows: [presentWrite(row)] };
             }
+            case 'image-cas':
+            case 'image-write':
+            case 'enroll-digest':
             case 'cas': {
                 const m = text.match(/SET\s+([\s\S]*?)\s+WHERE\s+([\s\S]*?)\s+RETURNING/);
                 if (!m) throw new Error('fake db: unparsed update');
@@ -333,12 +467,13 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                         const values = list[2]!.split(',').map((v) => value(v.trim(), params));
                         return (r) => values.includes(r[list[1]!]);
                     }
-                    const w = text.match(/^(\w+) (=|>) (\$\d+(?:::\w+)?|now\(\))$/);
+                    const w = text.match(/^(\w+) (=|>) (\$\d+(?:::\w+)?|now\(\)|'aws-ec2')$/);
                     if (!w) throw new Error(`fake db: unsupported predicate ${pred}`);
                     if (w[2] === '>' && w[3] !== 'now()' && !w[3]!.endsWith('::timestamptz')) throw new Error(`fake db: unsupported comparison ${pred}`);
                     const col = w[1]!, v = value(w[3]!, params);
                     return (r) => w[2] === '>'
                         ? instant(r[col]) > instant(v)
+                        : w[3]!.endsWith('::timestamptz') ? instant(r[col]) === instant(v)
                         : col === 'computer_id' || col === 'owner_user_id'
                           ? uuidEq(r[col], v)
                           : r[col] !== null && r[col] !== undefined && String(r[col]) === String(v);
@@ -354,6 +489,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 }
                 assignments.push(setText.slice(start).trim());
                 const sets = assignments.map((assign) => {
+                    if (assign === "updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')") {
+                        return (r: Row) => { r.updated_at = new Date(Math.max(clock().getTime(), instant(r.updated_at) + 1)); };
+                    }
                     const inc = assign.match(/^(\w+) = (\w+) \+ (\$\d+)$/);
                     if (inc) return (r: Row) => (r[inc[1]!] = Number(r[inc[2]!]) + Number(value(inc[3]!, params)));
                     // Postgres GREATEST ignores NULLs: NULL only when both sides are.
@@ -368,13 +506,13 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     return (r: Row) => (r[set[1]!] = set[2]!.trim() === set[1] ? r[set[1]!] : value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every((matches) => matches(r)));
+                const hit = writeRows.filter((r) => where.every((matches) => matches(r)));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));
                     tx?.undo.push(() => Object.assign(r, before));
                 }
-                return { rows: hit.map(present) };
+                return { rows: hit.map(presentWrite) };
             }
             default:
                 throw new Error(`fake db: untagged statement ${text.slice(0, 60)}`);
@@ -400,5 +538,5 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         },
     };
 
-    return { db, placements, usage, statements, runningExcluded: RUNNING_EXCLUDED };
+    return { db, placements, imageJobs, usage, demands, statements, runningExcluded: RUNNING_EXCLUDED };
 }

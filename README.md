@@ -39,8 +39,8 @@
 > **[local container mode](docs/LOCAL-MODE.md)** needs only Docker and Bun — no
 > Cloudflare, no Vercel, no Supabase, no account. See
 > [Prerequisites](#prerequisites) before you start with the hosted path.
-> Hosted service: [Terms and Conditions](https://os.ezil.org/terms) ·
-> [Privacy Policy](https://os.ezil.org/privacy). These cover the hosted service;
+> Hosted service: [Terms and Conditions](https://os.ezil.work/terms) ·
+> [Privacy Policy](https://os.ezil.work/privacy). These cover the hosted service;
 > the source code remains under [AGPL-3.0](LICENSE).
 >
 > **macOS status: internal Apple Silicon preview.** The native app runs on

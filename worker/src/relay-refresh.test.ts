@@ -16,6 +16,13 @@ function fixture(options: { loginFails?: boolean; unavailable?: boolean; postSta
 }
 const mint = async () => ({ servers: [{ urls: ['turn:relay.example:3478'], username: 'ephemeral', credential: 'private-test-credential' }], expiresAt: current.expiresAt + 300000 });
 describe('relay refresh failure handling', () => {
+  it('Cloudflare renewal retains STUN in its backend by default', async () => {
+    const f = fixture();
+    const servers = [{ urls: ['stun:s.example:3478', 'turn:t.example:3478'], username: 'test-user', credential: 'test-pass' }];
+    await relayOperation(f.container, 'test-admin', { runtimeId, mint: async () => ({ servers, expiresAt: current.expiresAt + 300000 }) });
+    const body = JSON.parse(String(f.requests.find(r => r.path === '/api/relay' && r.init.method === 'POST')!.init.body));
+    expect(body.backend).toEqual(servers);
+  });
   it('checkpoint queueing shares the forwarding budget and fences expired operations', () => {
     expect(remainingRelayBudget(1000, 6500)).toBe(21500);
     expect(remainingRelayBudget(1000, 1000)).toBe(24000);

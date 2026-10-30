@@ -12,8 +12,9 @@
  *      `cloudflareGuacamole` returns booleans instead of config.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { readBillingConfig } from '@/server/billing/config';
 import type { Computer } from '@/server/db/schema';
 import {
     SHELL_API_ROUTES,
@@ -21,12 +22,44 @@ import {
     bootPayloadScript,
     buildShellBootPayload,
     serializeBootPayload,
+    shellBootFeatures,
     toShellBootComputer,
     toShellBootUser,
     toShellDesktopState,
 } from './boot-payload';
 
 const USER = { id: '11111111-1111-1111-1111-111111111111', email: 'user@example.com' };
+
+beforeEach(() => {
+    for (const key of ['BILLING_TAB_ENABLED', 'STRIPE_SECRET', 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_KEY']) vi.stubEnv(key, '');
+});
+afterEach(() => vi.unstubAllEnvs());
+
+describe('shellBootFeatures', () => {
+    it.each(['test', 'live'] as const)('enables diagnostics only in Stripe test mode (%s)', mode => {
+        const config = readBillingConfig({ STRIPE_SECRET: `sk_${mode}_fixture`, STRIPE_PUBLISHABLE_KEY: `pk_${mode}_fixture` });
+        expect(shellBootFeatures(config)).toEqual(mode === 'test' ? { devDetails: true } : undefined);
+        expect(shellBootFeatures({ ...config, tabEnabled: true })).toEqual(
+            mode === 'test' ? { billing: true, devDetails: true } : { billing: true },
+        );
+    });
+
+    it.each([
+        {},
+        { STRIPE_SECRET: 'unrecognized_fixture' },
+        { STRIPE_SECRET: 'sk_test_fixture', STRIPE_PUBLISHABLE_KEY: 'pk_live_fixture' },
+    ])('omits features when billing is off and Stripe mode is unavailable (%j)', env => {
+        expect(shellBootFeatures(readBillingConfig(env))).toBeUndefined();
+        expect(shellBootFeatures(readBillingConfig({ ...env, BILLING_TAB_ENABLED: '1' }))).toEqual({ billing: true });
+    });
+
+    it.each(['test', 'live'] as const)('reads Stripe mode from the boot environment (%s)', mode => {
+        vi.stubEnv('STRIPE_SECRET', `sk_${mode}_fixture`);
+        const payload = buildShellBootPayload({ user: USER, computer: computer(), isNew: false, provider: null });
+        if (mode === 'test') expect(payload.features).toEqual({ devDetails: true });
+        else expect(payload).not.toHaveProperty('features');
+    });
+});
 
 function computer(overrides: Partial<Computer> = {}): Computer {
     return {
@@ -214,7 +247,18 @@ describe('buildShellBootPayload', () => {
             'hasHmacSecret',
             'provider',
             'status',
+            'ui',
         ]);
+        // `ui` carries booleans only, and is all-off unless features are passed.
+        expect(desktopState.ui).toEqual({ floatingControls: false, feedbackScreenshots: false });
+    });
+
+    it('exposes endpoints.feedback ONLY when the feedback feature is on', () => {
+        expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
+        const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
+        expect(on.endpoints.feedback).toBe('/api/shell/feedback');
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true });
+        expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
     });
 });
 
@@ -254,6 +298,10 @@ describe('toShellDesktopState — never implies an observation it does not have'
             // it still opens the desktop at the right shape — it just cannot
             // change it afterwards.
             screen: '/api/shell/screen',
+            // RETRY-118: explicit user Retry after an expired capacity attempt.
+            capacityRetry: '/api/shell/capacity-retry',
+            // Round 3: one computer, selectable configuration (SWITCH-CONTRACT.md).
+            switch: '/api/shell/switch',
         });
     });
 

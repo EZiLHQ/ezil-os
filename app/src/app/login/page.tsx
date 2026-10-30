@@ -1,14 +1,15 @@
 import Link from 'next/link';
 import type { Viewport } from 'next';
 
+import { auth0Enabled } from '@/server/auth/auth0';
+import { readBillingConfig } from '@/server/billing/config';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
-import { LoginForm } from './login-form';
 
-/** `/login?method=email` opens the email and password panel straight away. */
-const METHOD_PARAM = 'method';
+/** Shown instead of the sign-in button when EZiL ID is not configured here. */
+const UNAVAILABLE = 'Sign-in is unavailable right now. Please try again later or contact contact@ezil.work.';
 
-// The login form scrolls with the Android keyboard; the desktop keeps its
+// The lock screen scrolls with the Android keyboard; the desktop keeps its
 // separate overlay policy from the root layout.
 export const viewport: Viewport = {
     width: 'device-width',
@@ -24,6 +25,9 @@ export const viewport: Viewport = {
 function noticeFor(error: string | string[] | undefined): string | null {
     if (error === undefined) return null;
     if (error === 'auth_callback_failed') return 'Sign-in did not finish. Please try again.';
+    if (error === 'email_unverified') return 'Verify your email address with EZiL ID first, then sign in again.';
+    if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
+    if (error === 'auth0_disabled') return UNAVAILABLE;
     return 'We could not sign you in. Please try again.';
 }
 
@@ -31,10 +35,12 @@ function noticeFor(error: string | string[] | undefined): string | null {
  * `/login` — the lock screen.
  *
  * Drawn as a computer waiting for its owner: the desktop's own "Horizon"
- * wallpaper, the time, a profile picture and one button. "Continue with
- * Google" signs in an existing account and creates a new one, so there is
- * nothing to choose between. Email and password stay available, one click
- * away, for accounts that were invited with one.
+ * wallpaper, the time, a profile picture and one button. "Continue with EZiL
+ * ID" (Auth0 at id.ezil.work, `/auth/auth0/*`) is the only way in: it signs in
+ * an existing account and creates a new one, so there is nothing to choose
+ * between. Supabase-hosted Google OAuth and email/password sign-in are not
+ * offered. Without the Auth0 settings this page says sign-in is unavailable;
+ * it never falls back to another method.
  *
  * The profile picture is a generic silhouette, never the visitor's: this page
  * does not look anyone up (see the next note), so it has no one to show.
@@ -60,11 +66,12 @@ export default async function LoginPage({
     searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
     const params = await searchParams;
-    // Narrowed here, at the edge, so the value handed to the form (and from
-    // there to `window.location.assign`) can only ever be a path on this
-    // origin. See `safeReturnUrl`.
+    // Narrowed here, at the edge, so the value carried through EZiL ID and
+    // back to the browser can only ever be a path on this origin. See
+    // `safeReturnUrl`.
     const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM]);
-    const notice = noticeFor(params.error);
+    const useAuth0 = auth0Enabled();
+    const notice = useAuth0 ? noticeFor(params.error) : UNAVAILABLE;
 
     return (
         <main className="ezil-lock">
@@ -90,7 +97,7 @@ export default async function LoginPage({
                     Your computer awaits.
                 </h1>
                 <p className="mt-1.5 text-center text-small text-white/65">
-                    Sign in or get started with Google.
+                    Sign in with your EZiL ID.
                 </p>
 
                 {notice && (
@@ -99,7 +106,14 @@ export default async function LoginPage({
                     </p>
                 )}
 
-                <LoginForm returnUrl={returnUrl} startWithEmail={params[METHOD_PARAM] === 'email'} />
+                {/* A plain link: the route handler's 302s are document loads. */}
+                {useAuth0 && (
+                    <div className="ezil-lock-auth">
+                        <a className="ezil-lock-google" href={`/auth/auth0/login?${new URLSearchParams({ returnUrl })}`}>
+                            Continue with EZiL ID
+                        </a>
+                    </div>
+                )}
             </section>
 
             <footer className="ezil-lock-footer">
@@ -118,6 +132,12 @@ export default async function LoginPage({
                     Privacy Policy
                 </Link>
                 .
+                {readBillingConfig().pricingPageEnabled && (
+                    <>
+                        {' '}
+                        <a href="/pricing" className="underline decoration-white/30 underline-offset-2 transition-colors hover:text-white">Plans</a>
+                    </>
+                )}
             </footer>
         </main>
     );

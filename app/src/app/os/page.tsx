@@ -4,7 +4,9 @@ import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
+import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
+import { shellFeaturesFor } from '@/server/shell/features';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
@@ -91,7 +93,15 @@ export const metadata = {
 /** Never prerender or cache: the payload is per-user and can create a row. */
 export const dynamic = 'force-dynamic';
 
-export default async function Page() {
+export default async function Page({ searchParams }: {
+    searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+    const params = await searchParams ?? {};
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+        for (const item of Array.isArray(value) ? value : value === undefined ? [] : [value]) query.append(key, item);
+    }
+    const returnUrl = `${Routes.OS}${query.size ? `?${query}` : ''}`;
     // The tRPC context is built here rather than reusing `src/trpc/server.ts`'s
     // `api` for one reason: this page needs the resolved user for the payload
     // AND for the auth gate, and `createTRPCContext` has already resolved it.
@@ -107,7 +117,7 @@ export default async function Page() {
         // Same gate as `src/app/computers/layout.tsx` and
         // `src/app/computer/layout.tsx`. The pathname is known statically here,
         // so it is used directly rather than read back from `x-pathname`.
-        redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(Routes.OS)}`);
+        redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(returnUrl)}`);
     }
 
     const user = ctx.user;
@@ -117,7 +127,11 @@ export default async function Page() {
     // one indexed read for a returning user, `isConfigured` reads environment
     // variables and returns.
     const [computerResult, providerResult] = await Promise.all([
-        caller.computer.getOrCreateDefault().catch((err: unknown) => {
+        (params.computer !== undefined
+            ? (typeof params.computer === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.computer)
+                ? caller.computer.get({ id: params.computer }).then(computer => ({ computer, created: false }))
+                : Promise.reject(new Error('Invalid computer target')))
+            : caller.computer.getOrCreateDefault()).catch((err: unknown) => {
             console.error('[os] could not open a computer', {
                 userId: user.id,
                 error: err instanceof Error ? err.message : String(err),
@@ -142,6 +156,7 @@ export default async function Page() {
         computer: computerResult.computer,
         isNew: computerResult.created,
         provider: providerResult,
+        shellFeatures: shellFeaturesFor(user.email, env),
     });
 
     return (
@@ -231,7 +246,7 @@ function CouldNotOpen() {
                 href={Routes.COMPUTERS}
                 className="inline-flex items-center gap-2 rounded-md bg-teal px-4 py-2 text-sm font-medium text-black hover:opacity-90"
             >
-                Your computers
+                Your computer
             </Link>
         </main>
     );

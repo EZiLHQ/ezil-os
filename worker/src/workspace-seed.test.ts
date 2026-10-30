@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  buildTemplateCopyCommand,
   realR2KeyPrefix,
   SEED_SENTINEL_FILENAME,
   seedWorkspaceIfAbsent,
@@ -447,5 +448,73 @@ describe('parseTurbopackConfigOutcome', () => {
     expect(parseTurbopackConfigOutcome(undefined)).toBeNull();
     expect(parseTurbopackConfigOutcome(null)).toBeNull();
     expect(parseTurbopackConfigOutcome('some unrelated exec output')).toBeNull();
+  });
+});
+
+
+describe.skipIf(process.platform === 'win32')('workspace command argument security', () => {
+  const hostilePaths = ['; rm -rf /', '$(id)', 'line\nbreak', "single'quote", 'double"quote', '`id`', '-option'];
+  // Shadow destructive/probe commands so a regression fails without harming the host.
+  const guards = "rm() { echo INJECTION_RM; }; id() { echo INJECTION_ID; }; ";
+
+  for (const hostile of hostilePaths) {
+    it(`template copy treats ${JSON.stringify(hostile)} as one literal destination`, () => {
+      const root = mkdtempSync(join(tmpdir(), 'ezil-seed-argv-'));
+      try {
+        const template = join(root, 'template');
+        const target = `${root}/target-${hostile}-end`;
+        mkdirSync(template);
+        mkdirSync(target, { recursive: true });
+        writeFileSync(join(template, 'starter.txt'), 'starter');
+        // Relocate only the fixed image fixture; execute the generated argument unchanged.
+        const command = buildTemplateCopyCommand(target).replaceAll('/opt/ezil-sandbox-template', template);
+        const out = execFileSync('bash', ['-c', guards + command], { encoding: 'utf8' });
+        expect(out).toBe('');
+        expect(readFileSync(join(target, 'starter.txt'), 'utf8')).toBe('starter');
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it(`Turbopack copy treats ${JSON.stringify(hostile)} as literal source and destination`, () => {
+      const root = mkdtempSync(join(tmpdir(), 'ezil-config-argv-'));
+      try {
+        const target = `${root}/target-${hostile}-end`;
+        const sourceDir = `${root}/source-${hostile}-end`;
+        mkdirSync(target, { recursive: true });
+        mkdirSync(sourceDir, { recursive: true });
+        const source = join(sourceDir, 'template.js');
+        writeFileSync(source, TEMPLATE_CONFIG_MARKER);
+        writeFileSync(join(target, 'package.json'), '{"dependencies":{"next":"16.2.12"}}');
+        const command = buildEnsureTurbopackConfigCommand(target, source);
+        const run = () => execFileSync('bash', ['-c', guards + command], { encoding: 'utf8' }).trim();
+        expect(run()).toBe(TURBOPACK_CONFIG_WRITTEN_MARKER);
+        expect(readFileSync(join(target, 'next.config.js'), 'utf8')).toBe(TEMPLATE_CONFIG_MARKER);
+        expect(run()).toBe(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+  }
+
+  it('ends cp option parsing for option-like source and destination paths', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ezil-seed-options-'));
+    try {
+      const template = join(root, 'template');
+      const target = '--target-directory=else';
+      mkdirSync(template);
+      mkdirSync(join(root, target));
+      writeFileSync(join(template, 'starter.txt'), 'starter');
+      const copy = buildTemplateCopyCommand(target).replaceAll('/opt/ezil-sandbox-template', template);
+      expect(execFileSync('bash', ['-c', copy], { cwd: root, encoding: 'utf8' })).toBe('');
+      expect(readFileSync(join(root, target, 'starter.txt'), 'utf8')).toBe('starter');
+      writeFileSync(join(root, '--version'), TEMPLATE_CONFIG_MARKER);
+      writeFileSync(join(root, target, 'package.json'), '{"dependencies":{"next":"16.2.12"}}');
+      const ensure = buildEnsureTurbopackConfigCommand(target, '--version');
+      expect(execFileSync('bash', ['-c', ensure], { cwd: root, encoding: 'utf8' }).trim()).toBe(TURBOPACK_CONFIG_WRITTEN_MARKER);
+      expect(readFileSync(join(root, target, 'next.config.js'), 'utf8')).toBe(TEMPLATE_CONFIG_MARKER);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rejects NUL in every shell argument before constructing a command', () => {
+    expect(() => buildTemplateCopyCommand('/tmp/bad\0path')).toThrow('invalid_shell_argument');
+    expect(() => buildEnsureTurbopackConfigCommand('/tmp/bad\0path')).toThrow('invalid_shell_argument');
+    expect(() => buildEnsureTurbopackConfigCommand('/tmp/good', '/tmp/bad\0source')).toThrow('invalid_shell_argument');
   });
 });

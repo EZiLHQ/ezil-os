@@ -5,6 +5,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const handle = vi.fn();
+const deferred = vi.hoisted(() => vi.fn());
+const prime = vi.hoisted(() => vi.fn());
+vi.mock('next/server', async importOriginal => ({ ...await importOriginal<typeof import('next/server')>(), after: deferred }));
+vi.mock('@/server/lib/compute/aws-pool-session', () => ({ primePoolRelay: prime }));
 vi.mock('@/server/db', () => ({ db: { execute: vi.fn(), transaction: vi.fn() } }));
 vi.mock('@/server/lib/compute/aws-enroll', () => ({
     handleAwsEnrollment: (...args: unknown[]) => handle(...args),
@@ -16,9 +20,32 @@ const { awsEnrollmentDescriber } = await import('@/server/lib/compute/aws-descri
 
 const post = (body: string) => POST(new Request('https://app.example.test/api/compute/aws/enroll', { method: 'POST', body, headers: { 'content-type': 'application/json' } }));
 
-afterEach(() => handle.mockReset());
+afterEach(() => { handle.mockReset(); deferred.mockReset(); prime.mockReset(); });
 
 describe('POST /api/compute/aws/enroll', () => {
+    const enrollment = { computerId: 'computer', ownerUserId: 'owner', generation: 4, leaseEpoch: 9,
+        instanceId: 'instance', fenceToken: 'fence' };
+    it('defers relay preparation until after the credential response and never returns the server-only binding', async () => {
+        handle.mockResolvedValue({ status: 200, body: { tunnelToken: 'test-token' }, poolRelay: enrollment });
+        const r = await post('{}');
+        expect(await r.json()).toEqual({ tunnelToken: 'test-token' });
+        expect(deferred).toHaveBeenCalledTimes(1);
+        expect(prime).not.toHaveBeenCalled();
+        await deferred.mock.calls[0]![0]();
+        expect(prime).toHaveBeenCalledWith(expect.objectContaining({ env: process.env }), enrollment);
+    });
+
+    it.each([200, 403, 503])('does not prepare without an authenticated successful pool binding (%i)', async status => {
+        handle.mockResolvedValue({ status, body: {}, ...(status !== 200 ? { poolRelay: enrollment } : {}) });
+        await post('{}'); expect(deferred).not.toHaveBeenCalled(); expect(prime).not.toHaveBeenCalled();
+    });
+
+    it('preserves a successful enrollment if background scheduling fails', async () => {
+        handle.mockResolvedValue({ status: 200, body: { tunnelToken: 'test-token' }, poolRelay: enrollment });
+        deferred.mockImplementation(() => { throw new Error('no after context'); });
+        const r = await post('{}'); expect(r.status).toBe(200); expect(await r.json()).toEqual({ tunnelToken: 'test-token' });
+    });
+
     it('invalid JSON → 400 enroll_request_invalid, no-store, handler not called', async () => {
         const r = await post('{');
         expect(r.status).toBe(400);

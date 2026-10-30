@@ -11,6 +11,8 @@
  */
 import { describe, expect, it, mock } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { flushWorkspaceToR2, migrationFenceState } from './workspace-persist';
+import { flushSystemLayer } from './system-persist';
 
 mock.module('cloudflare:workers', () => ({
   DurableObject: class {},
@@ -81,7 +83,7 @@ async function makeFake(opts: { sysCapture?: SysCapture; wsCaptureExit?: number;
     writeFile: async () => ({ success: true }),
     mkdir: async () => ({ success: true }),
     listFiles: async () => ({ files: [] }),
-    stop: async () => void calls.stops++,
+    stop: async () => { calls.stops++; fake.ctx.container.running = false; },
     listSchedules: async () => [],
     deleteSchedules: () => undefined,
     schedule: async (seconds: number) => void calls.scheduled.push(seconds),
@@ -278,7 +280,10 @@ describe('C-7 on the Durable Object', () => {
     const { fake, objects } = await makeFake();
     const begun = (await (await proto()).beginMigrationExport.call(fake)) as { head: { etag: string }; systemEtag: string | null };
     (fake as { lastOkCheckpoint: unknown }).lastOkCheckpoint = null;
-    await (await proto()).runWorkspaceFlush.call(fake, 'explicit' as never); // late Cloudflare checkpoint
+    fake.ctx.container.running = true; // simulate a new start after expiry
+    const flag = objects.get(FLAG)!;
+    flag.bytes = new TextEncoder().encode(JSON.stringify({ startedAt: new Date(Date.now() - 41 * 60_000).toISOString() }));
+    await (await proto()).runWorkspaceFlush.call(fake, 'explicit' as never); // late checkpoint after fence expiry
     expect(objects.get(HEAD)!.etag).not.toBe(begun.head.etag);
     expect(await (await proto()).commitMigration.call(fake, { targetProvider: 'aws-ec2', expectedEtag: begun.head.etag, expectedSystemEtag: begun.systemEtag } as never))
       .toEqual({ ok: false, reason: 'head_moved' });
@@ -355,4 +360,107 @@ describe('C-7: the Durable Object fences the SYSTEM prefix GC with the workspace
       expect(objects.has(`${sp}/.ezil-snapshots/${g1}/0`)).toBe(true);
     });
   }
+});
+
+
+describe('fresh migration export fence', () => {
+  async function begun() {
+    const f = await makeFake();
+    const result = await f.fake.beginMigrationExport();
+    expect(result.ok).toBe(true);
+    return f;
+  }
+  async function start(fake: any, method = 'start') {
+    const base = Object.getPrototypeOf(await proto()), original = base[method];
+    let starts = 0;
+    base[method] = async () => { starts++; };
+    try { await fake[method](); return starts; }
+    finally { base[method] = original; }
+  }
+  const flush = (f: Awaited<ReturnType<typeof makeFake>>) => flushWorkspaceToR2({
+    container: f.fake, bucket: f.bucket, mountPath: MOUNT_PATH, realPrefix: PREFIX,
+    hydrationComplete: true, manifest: {}, log: () => {},
+  });
+  it('fresh flag skips workspace and system writers without touching the container or head', async () => {
+    const f = await begun(), before = [...f.objects];
+    f.fake.exec = async () => { throw new Error('container touched'); };
+    expect(await flush(f)).toMatchObject({ ok: false, skippedReason: 'migrating' });
+    expect(await flushSystemLayer({ container: f.fake, bucket: f.bucket, realPrefix: PREFIX, log: () => {} }))
+      .toMatchObject({ ok: false, skippedReason: 'migrating' });
+    expect([...f.objects]).toEqual(before);
+  });
+  it('fresh flag refuses explicit starts, implicit wakes, hydrate, desktop launch and restart', async () => {
+    const f = await begun();
+    for (const method of ['start', 'startAndWaitForPorts']) await expect(start(f.fake, method)).rejects.toThrow('migrating');
+    const response = await f.fake.containerFetch('http://localhost/');
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'migrating' });
+    expect(await f.fake.hydrateWorkspace({ mountPath: MOUNT_PATH, prefix: PREFIX })).toEqual({ mounted: false, detail: 'migrating' });
+    await expect(f.fake.startAiDesktop('example.invalid', 'sandbox', 'desktop', {})).rejects.toThrow('migrating');
+    expect(await f.fake.restartDesktopStack('example.invalid', 'sandbox', 'neko', 'neko')).toMatchObject({ ok: false, error: 'migrating' });
+  });
+  for (const flag of [JSON.stringify({ startedAt: new Date(Date.now() - 41 * 60_000).toISOString() }),
+    '{', '{}', '{"startedAt":"not-a-date"}', 'null']) {
+    it(`stale or invalid flag allows workspace/system flush and both starts: ${flag}`, async () => {
+      const f = await begun();
+      await f.bucket.put(FLAG, flag);
+      expect(await migrationFenceState(f.bucket, PREFIX, () => {})).toBe('stale');
+      expect((await flush(f)).ok).toBe(true);
+      const exec = f.fake.exec;
+      f.fake.exec = async (command: string) => command.includes('"op":"sys-capture"')
+        ? exec(command.replaceAll('sys-capture', 'capture')) : exec(command);
+      expect((await flushSystemLayer({ container: f.fake, bucket: f.bucket, realPrefix: PREFIX, log: () => {} })).ok).toBe(true);
+      for (const method of ['start', 'startAndWaitForPorts']) expect(await start(f.fake, method)).toBe(1);
+    });
+  }
+  it('abort deletes the flag and permits a normal flush and both starts', async () => {
+    const f = await begun();
+    expect(await f.fake.abortMigrationExport()).toEqual({ ok: true });
+    expect(f.objects.has(FLAG)).toBe(false);
+    expect((await flush(f)).ok).toBe(true);
+    for (const method of ['start', 'startAndWaitForPorts']) expect(await start(f.fake, method)).toBe(1);
+  });
+  it('begin stops the container only after writing the pinned flag', async () => {
+    const f = await makeFake();
+    f.fake.stop = async () => {
+      f.calls.stops++;
+      const flag = JSON.parse(new TextDecoder().decode(f.objects.get(FLAG)!.bytes));
+      expect(flag.headEtag).toBe(f.objects.get(HEAD)!.etag);
+      f.fake.ctx.container.running = false;
+    };
+    expect((await f.fake.beginMigrationExport()).ok).toBe(true);
+    expect(f.calls.stops).toBe(1);
+    expect(f.fake.ctx.container.running).toBe(false);
+    expect(await f.fake.flushWorkspaceNow()).toMatchObject({ skippedReason: 'migrating' });
+  });
+  it('reopen clears the fence and permits normal starts and a flush', async () => {
+    const f = await begun();
+    expect((await f.fake.commitMigration({ targetProvider: 'aws-ec2', expectedEtag: f.objects.get(HEAD)!.etag, expectedSystemEtag: null })).ok).toBe(true);
+    expect(await f.fake.reopenMigration({ expectedMigratedEtag: f.objects.get(HEAD)!.etag })).toEqual({ ok: true });
+    expect(f.objects.has(FLAG)).toBe(false);
+    for (const method of ['start', 'startAndWaitForPorts']) expect(await start(f.fake, method)).toBe(1);
+    expect((await flush(f)).ok).toBe(true);
+  });
+  it('the fence expires at exactly forty minutes', async () => {
+    const f = await makeFake();
+    await f.bucket.put(FLAG, JSON.stringify({ startedAt: new Date(Date.now() - 39 * 60_000).toISOString() }));
+    expect(await migrationFenceState(f.bucket, PREFIX, () => {})).toBe('fresh');
+    await f.bucket.put(FLAG, JSON.stringify({ startedAt: new Date(Date.now() - 40 * 60_000).toISOString() }));
+    expect(await migrationFenceState(f.bucket, PREFIX, () => {})).toBe('stale');
+  });
+  it('a stop that leaves the runtime running is a stop failure and removes the flag', async () => {
+    const f = await makeFake();
+    f.fake.stop = async () => {};
+    f.fake.ctx.container.monitor = async () => {};
+    expect(await f.fake.beginMigrationExport()).toEqual({ ok: false, reason: 'stop_failed' });
+    expect(f.objects.has(FLAG)).toBe(false);
+  });
+  it('stop failure removes the flag and permits start and flush again', async () => {
+    const f = await makeFake();
+    f.fake.stop = async () => { throw new Error('synthetic stop failure'); };
+    expect(await f.fake.beginMigrationExport()).toEqual({ ok: false, reason: 'stop_failed' });
+    expect(f.objects.has(FLAG)).toBe(false);
+    expect((await flush(f)).ok).toBe(true);
+    expect(await start(f.fake)).toBe(1);
+  });
 });

@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Removable OS app ingress on the environment's DB security group (preview for staging, prod for production); owns no database or security group.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    ref: [INFRASTRUCTURE.md]
+Parameters:
+  Environment:
+    Type: String
+    Default: staging
+    AllowedValues: [staging, production]
+    Description: staging resolves exactly as before this parameter existed; production is pinned by the Rules below.
+  DbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Staging, verify this belongs only to preview host i-097aa7c356e91c78f; production, sg-0f3151c94e0ed4ee6 (prod DB host i-09012068d96166828). No default.
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: AppSecurityGroupId output of the same environment's app-host stack.
+Rules:
+  ProductionUsesOnlyTheProductionDatabase:
+    RuleCondition: !Equals [!Ref Environment, production]
+    Assertions:
+      - Assert: !Equals [!Ref DbSecurityGroupId, sg-0f3151c94e0ed4ee6]
+        AssertDescription: Production opens only the prod DB security group sg-0f3151c94e0ed4ee6.
+  StagingNeverUsesTheProductionDatabase:
+    RuleCondition: !Equals [!Ref Environment, staging]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DbSecurityGroupId, sg-0f3151c94e0ed4ee6]]
+        AssertDescription: Staging never opens the prod DB security group.
+Mappings:
+  # The staging description is the literal this template used before the
+  # Environment parameter, so an existing staging stack resolves identically.
+  Environments:
+    staging:
+      Description: OS billing staging to preview PostgreSQL proxy
+    production:
+      Description: OS production app to private PostgreSQL
+Resources:
+  AppToPostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Withdraw app access by deleting only this rule stack.
+        must: [The environment's DB SG only, Source is the same environment's dedicated app SG, Staging never modifies production]
+    # This CloudFormation resource has no Tags property. Tag the stack with
+    # ezil:env=billing-staging and ezil:purpose=os-staging (staging) or
+    # ezil:env=production and ezil:purpose=os (production).
+    Properties:
+      GroupId: !Ref DbSecurityGroupId
+      SourceSecurityGroupId: !Ref AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      Description: !FindInMap [Environments, !Ref Environment, Description]

@@ -22,7 +22,8 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
 // shapes are only what `@cloudflare/sandbox` destructures at import time.
@@ -46,6 +47,9 @@ async function mintToken(secret = SECRET, now = Date.now()): Promise<string> {
 }
 
 interface CallLog {
+  aiNonces: string[];
+  aiStored: StoredAiCredential[];
+  aiDeletes: number;
   terminateSandbox: number;
   resetRuntimeForAcceptance: number;
   restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
@@ -136,6 +140,7 @@ function fakeSandboxNamespace(options: {
    * only proves the ROUTE TABLE (auth, kill switch, response mapping).
    */
   restartResult?: Record<string, unknown>;
+  restartThrows?: unknown;
   /** Canned `resetRuntimeForAcceptance` answer (default: the reset is scheduled). */
   resetResult?: Record<string, unknown>;
   /** Make `resetRuntimeForAcceptance` throw, as an object on an older revision does. */
@@ -170,6 +175,9 @@ function fakeSandboxNamespace(options: {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
+    aiNonces: [],
+    aiStored: [],
+    aiDeletes: 0,
     terminateSandbox: 0,
     resetRuntimeForAcceptance: 0,
     restartDesktopStack: [],
@@ -185,7 +193,33 @@ function fakeSandboxNamespace(options: {
     startProcess: [],
   };
 
+  let credential: StoredAiCredential | undefined;
+  let nonce: string | null = null;
+  let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    getAiProxyNonce: async () => nonce,
+    getAiCredential: async () => usableAiCredential(credential),
+    putAiCredential: async (...args) => {
+      const result = chooseAiCredential(credential, args[0] as StoredAiCredential);
+      credential = result.keep;
+      if (result.stored) calls.aiStored.push(result.keep);
+      return { stored: result.stored, expiresAt: result.keep.expiresAt };
+    },
+    dropAiCredential: async (...args) => {
+      calls.aiDeletes++;
+      if (args[0] === undefined || args[0] === credential?.token) credential = undefined;
+    },
+    startAiDesktop: async (...args) => {
+      const [hostname, sandboxId, command, env] = args as [string, string, string, Record<string, string>];
+      nonce = crypto.randomUUID();
+      calls.aiNonces.push(nonce);
+      processResult = await impl.startProcess!(command, { env: { ...env,
+        EZIL_AI_BASE_URL: `https://8443-${sandboxId}-code.${hostname}/ai/v1`,
+        EZIL_AI_PROXY_TOKEN: await deriveAiProxyToken(SECRET, sandboxId, nonce),
+      } });
+      return 'ai-launcher';
+    },
+    getProcess: async () => processResult,
     desktopReachable: async () => true,
     hydrateWorkspace: async (...args: unknown[]) =>
       options.hydrateWorkspace ? options.hydrateWorkspace(args[0]) : ({ mounted: true, mountPath: '/workspace' }),
@@ -275,6 +309,7 @@ function fakeSandboxNamespace(options: {
       );
     },
     restartDesktopStack: async (...args: unknown[]) => {
+      if ('restartThrows' in options) throw options.restartThrows;
       const [hostname, sandboxId, explicitMode, fallbackMode] = args as [string, string, unknown, unknown];
       calls.restartDesktopStack.push({ hostname, sandboxId, explicitMode, fallbackMode });
       return (
@@ -3397,5 +3432,535 @@ describe('v2 signed envelope on the real route table', () => {
         expect((await worker.fetch(await signedPreview(), e)).status).toBe(200);
       });
     }
+  });
+});
+
+describe('AI credential and code-host routes', () => {
+  const userId = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const jwt = (claims: Record<string, unknown>) => `e30.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.c2ln`;
+  const token = (extra = {}) => jwt({ sub: userId, role: 'authenticated', exp: Math.floor(Date.now() / 1000) + 3600, ...extra });
+  const credentialRequest = async (method: 'POST' | 'DELETE', accessToken?: string, signed = true) => {
+    const body = method === 'POST' ? JSON.stringify({ accessToken }) : '';
+    return new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
+      method, body: body || undefined,
+      headers: signed ? { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), Date.now(), method) } : {},
+    });
+  };
+
+  it('pushes only an owner-bound live authenticated JWT, retains later expiry, and deletes while disabled', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'off' };
+    for (const bad of [token({ sub: '00000000-0000-0000-0000-000000000000' }), token({ role: 'anon' }), token({ exp: 1 })]) {
+      expect((await worker.fetch(await credentialRequest('POST', bad), env)).status).toBe(400);
+    }
+    expect(calls.aiStored).toHaveLength(0);
+    expect((await worker.fetch(await credentialRequest('POST', token(), false), env)).status).toBe(401);
+    expect((await worker.fetch(await credentialRequest('POST', token()), { Sandbox: binding })).status).toBe(503);
+    expect((await worker.fetch(await credentialRequest('POST', token()), env)).status).toBe(200);
+    const older = token({ exp: Math.floor(Date.now() / 1000) + 600 });
+    expect(await (await worker.fetch(await credentialRequest('POST', older), env)).json()).toMatchObject({ stored: false });
+    expect(calls.aiStored).toHaveLength(1);
+    expect((await worker.fetch(await credentialRequest('DELETE', undefined, false), env)).status).toBe(401);
+    expect(calls.aiDeletes).toBe(0);
+    expect((await worker.fetch(await credentialRequest('DELETE'), env)).status).toBe(200);
+    expect(calls.aiDeletes).toBe(1);
+    expect(calls.exec).toBe(0);
+    expect(calls.startProcess).toHaveLength(0);
+  });
+
+  it('owns /ai before the code cookie gate, and refuses unconfigured AWS hosts', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const url = `https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/models`;
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET };
+    const disabled = await worker.fetch(new Request(url), { ...env, SANDBOX_AI_PROXY: 'off' });
+    expect(disabled.status).toBe(503);
+    expect(await disabled.json()).toEqual({ error: { code: 'os_ai_unavailable', source: 'ezil-os-proxy' } });
+    const unauthorized = await worker.fetch(new Request(url), { ...env, SANDBOX_AI_PROXY: 'on' });
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized' } });
+    const upstream = spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({}));
+    try {
+      for (const cookie of [null, 'ezil_preview=not-an-ai-token']) {
+        const responses = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/responses`, {
+          method: 'POST', headers: cookie === null ? {} : { cookie },
+        }), env);
+        expect(responses.status).toBe(401);
+        expect(await responses.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized', source: 'ezil-os-proxy' } });
+        expect(responses.headers.get('set-cookie')).toBeNull();
+        expect(responses.headers.get('location')).toBeNull();
+      }
+      const admin = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/admin/pending`, { method: 'POST' }), env);
+      expect(admin.status).toBe(404);
+      expect(await admin.json()).toMatchObject({ error: { code: 'not_found', source: 'ezil-os-proxy' } });
+      expect(admin.headers.get('set-cookie')).toBeNull();
+      expect(upstream).not.toHaveBeenCalled();
+    } finally { upstream.mockRestore(); }
+    for (const flag of ['on', 'off']) {
+      const res = await worker.fetch(new Request(`https://aws-8443-${SANDBOX_NAME}-aws.ezil.org/ai/v1/models`), { ...env, AWS_ROUTING_ENABLED: flag });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ error: { code: 'os_ai_unavailable' } });
+    }
+    expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('AWS code hosts share the signed credential store and enforce every proxy guard', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    let nonce: string | null = 'aws-boot-one';
+    let present = true;
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: present ? { sandboxId: id, aiProxyNonce: nonce } : null }) }) } };
+    const origin = `https://aws-8443-${SANDBOX_NAME}-aws.ezil.org`;
+    const auth = await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce!);
+    const req = (bearer: string | null = auth, path = '/ai/v1/models', init: RequestInit = {}, host = origin) =>
+      new Request(host + path, { ...init, headers: { ...(bearer === null ? {} : { authorization: `Bearer ${bearer}` }),
+        cookie: 'ezil_preview=not-an-ai-token', 'x-ezil-ai-nonce': 'client-chosen', ...init.headers } });
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request); return Response.json({ models: [] }); }) as typeof fetch;
+    try {
+      expect((await worker.fetch(await credentialRequest('POST', token(), false), env)).status).toBe(401);
+      expect((await worker.fetch(await credentialRequest('POST', token()), env)).status).toBe(200);
+      expect((await worker.fetch(req(), env)).status).toBe(200);
+      expect(upstream[0]!.url).toBe('https://ai.ezil.work/v1/models');
+      expect(upstream[0]!.headers.get('authorization')).toBe(`Bearer ${calls.aiStored[0]!.token}`);
+      upstream.length = 0;
+      for (const bad of [null, 'f'.repeat(64), await deriveAiProxyToken(SECRET, 'guac-other-computer', nonce!),
+        await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'cloudflare-boot')]) {
+        const res = await worker.fetch(req(bad), env);
+        expect(res.status).toBe(401);
+        expect(await res.json()).toMatchObject({ error: { code: 'os_proxy_unauthorized' } });
+      }
+      for (const path of ['/ai', '/ai/v1/admin/pending', '/ai/v1/responses']) {
+        expect((await worker.fetch(req(auth, path), env)).status).toBe(404);
+      }
+      expect((await worker.fetch(req(auth, '/ai/v1/models', { method: 'POST' }), env)).status).toBe(404);
+      for (const headers of [{}, { 'content-length': '1' }]) {
+        expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(160 * 1024 + 1), headers }), env)).status).toBe(413);
+      }
+      for (const over of [{ SANDBOX_AI_PROXY: 'off' }, { SANDBOX_AI_PROXY: 'false', EZIL_AI_GATEWAY_URL: 'invalid' }]) {
+        const off = await worker.fetch(req(null), { ...env, ...over });
+        expect(off.status).toBe(503);
+        expect(await off.json()).toEqual({ error: { code: 'os_ai_unavailable', source: 'ezil-os-proxy' } });
+      }
+      for (const over of [{ AWS_ROUTING_ENABLED: 'off' }, { AWS_ORIGIN_ZONE_ALLOWLIST: '' }, { AWS_TUNNELS: undefined }]) {
+        expect((await worker.fetch(req(), { ...env, ...over })).status).toBe(404);
+      }
+      expect((await worker.fetch(req(), { ...env, SANDBOX_HMAC_SECRET: undefined })).status).toBe(503);
+      for (const host of [origin.replace('8443', '8181'), origin.replace('.ezil.org', '.evil.org'), origin.replace('-aws.', '-code.')]) {
+        expect((await worker.fetch(req(auth, '/ai/v1/models', {}, host), env)).status).not.toBe(200);
+      }
+      nonce = 'aws-boot-two';
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      nonce = null;
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      present = false;
+      expect((await worker.fetch(req(), env)).status).toBe(401);
+      expect(upstream).toHaveLength(0);
+      present = true; nonce = 'aws-boot-one';
+      expect((await worker.fetch(await credentialRequest('DELETE'), env)).status).toBe(200);
+      expect(await (await worker.fetch(req(), env)).json()).toMatchObject({ error: { code: 'os_session_missing' } });
+      expect(calls.exec).toBe(0);
+      expect(calls.startProcess).toHaveLength(0);
+      expect(calls.containerFetch).toHaveLength(0);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('injects boot vars even with the kill switch off; an exposed warm desktop never rotates', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'off', SANDBOX_DESKTOP_MODE: 'neko', SANDBOX_NEKO_ICE_POLICY: 'diagnostic', SANDBOX_WORKSPACE_R2_BUCKET: {} };
+    const body = JSON.stringify({ token: await mintToken(), userId, projectId: 'fedcba98-7654-3210-fedc-ba9876543210', desktopMode: 'neko' });
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', { method: 'POST', body }), env);
+    expect(res.status).toBe(200);
+    expect(calls.startProcess[0]?.env.EZIL_AI_BASE_URL).toBe(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1`);
+    expect(calls.startProcess[0]?.env.EZIL_AI_PROXY_TOKEN).toBe(await deriveAiProxyToken(SECRET, SANDBOX_NAME, calls.aiNonces[0]!));
+    const aiRequest = () => new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/models`, {
+      headers: { authorization: `Bearer ${calls.startProcess[0]!.env.EZIL_AI_PROXY_TOKEN}` },
+    });
+    const missing = await worker.fetch(aiRequest(), { ...env, SANDBOX_AI_PROXY: 'on' });
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toMatchObject({ error: { code: 'os_session_missing' } });
+    await worker.fetch(await credentialRequest('POST', token()), env);
+    await worker.fetch(await credentialRequest('DELETE'), env);
+    expect(await (await worker.fetch(aiRequest(), { ...env, SANDBOX_AI_PROXY: 'on' })).json()).toMatchObject({ error: { code: 'os_session_missing' } });
+    const warm = fakeSandboxNamespace({ exposedPorts: [{ port: 8181, url: 'https://desktop.ezil.org' }] });
+    await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', { method: 'POST', body }), { ...env, Sandbox: warm.binding });
+    expect(warm.calls.aiNonces).toHaveLength(0);
+  });
+});
+
+describe('AI Durable Object storage and boot lifecycle', () => {
+  async function object(secret: string | undefined = SECRET) {
+    const { Sandbox } = await import('./index');
+    const values = new Map<string, unknown>();
+    const storage = {
+      get: async (key: string) => values.get(key),
+      put: async (key: string, value: unknown) => { values.set(key, value); },
+      delete: async (key: string) => values.delete(key),
+      transaction: async (operation: (txn: unknown) => unknown) => operation(storage),
+    };
+    const obj = Object.create(Sandbox.prototype);
+    Object.assign(obj, { ctx: { storage, container: { running: true } }, env: { SANDBOX_HMAC_SECRET: secret, SANDBOX_AI_PROXY: 'off' }, runtimeMutationTail: Promise.resolve() });
+    return { obj, values };
+  }
+
+  // Route auth and storage ordering both run for real; only SDK plumbing and
+  // transactional storage are faked. Recreate the DO to prove durable revocation.
+  async function credentialRoute() {
+    const state = await object();
+    let obj = state.obj;
+    const stub = new Proxy({}, {
+      get(_target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop === 'putAiCredential' || prop === 'dropAiCredential') return obj[prop].bind(obj);
+        return async () => undefined;
+      },
+    });
+    const env = { Sandbox: { idFromName: () => ({}), get: () => stub }, SANDBOX_HMAC_SECRET: SECRET };
+    return {
+      ...state,
+      recover: () => { obj = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx }); },
+      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string) => {
+        const body = method === 'POST' ? JSON.stringify({ accessToken }) : '';
+        const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
+          method, body: body || undefined,
+          headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, method) },
+        }), env);
+        expect(response.status).toBe(200);
+        return response.json();
+      },
+    };
+  }
+
+  const sessionToken = (sessionId: string, issuedAt: number) => `e30.${Buffer.from(JSON.stringify({
+    sub: 'abcdef01-2345-6789-abcd-ef0123456789', role: 'authenticated',
+    session_id: sessionId, iat: Math.floor(issuedAt / 1000), exp: Math.floor(issuedAt / 1000) + 3600,
+  })).toString('base64url')}.c2ln`;
+
+  it('refuses a signed POST replay after logout, including timestamp ties and DO recovery', async () => {
+    const { obj, values, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const token = sessionToken('session-one', t);
+    expect(await send('POST', t, token)).toMatchObject({ stored: true });
+    const stored = values.get(AI_CREDENTIAL_STORAGE_KEY);
+    expect(await send('POST', t, token)).toMatchObject({ stored: true });
+    expect(values.get(AI_CREDENTIAL_STORAGE_KEY)).toBe(stored);
+    await send('DELETE', t + 1000);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+    recover();
+    expect(await send('POST', t, token)).toMatchObject({ stored: false });
+    expect(await send('POST', t + 1000, token)).toMatchObject({ stored: false });
+    await send('DELETE', t + 1000);
+    await send('DELETE', t);
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
+  it('an older signed DELETE cannot remove a newer push, even when both pushes carry the same JWT', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const token = sessionToken('session-one', t);
+    await send('POST', t, token);
+    expect(await send('POST', t + 2000, token)).toMatchObject({ stored: true });
+    expect(await send('POST', t, token)).toMatchObject({ stored: false });
+    await send('DELETE', t + 1000);
+    await send('DELETE', t + 1000);
+    expect(await obj.getAiCredential()).toBe(token);
+    expect(values.get(AI_CREDENTIAL_STORAGE_KEY)).toMatchObject({ signedAt: t + 2000 });
+    // Logout wins ties regardless of whether the push arrived first or last.
+    await send('DELETE', t + 2000);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(await send('POST', t + 2000, token)).toMatchObject({ stored: false });
+  });
+
+  it('accepts a new login after logout and makes replaying the old DELETE harmless', async () => {
+    const { obj, values, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    const oldToken = sessionToken('session-one', t);
+    const newToken = sessionToken('session-two', t + 2000);
+    await send('POST', t, oldToken);
+    await send('DELETE', t + 1000);
+    recover();
+    expect(await send('POST', t + 2000, newToken)).toMatchObject({ stored: true });
+    await send('DELETE', t + 1000);
+    expect(await send('POST', t, oldToken)).toMatchObject({ stored: false });
+    expect(await obj.getAiCredential()).toBe(newToken);
+    expect(values.get(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY)).toBe(t + 1000);
+  });
+
+  it('retains a logout watermark even if the signed DELETE arrives before the first push', async () => {
+    const { obj, send, recover } = await credentialRoute();
+    const t = Date.now() - 10_000;
+    await send('DELETE', t + 1000);
+    recover();
+    expect(await send('POST', t, sessionToken('session-one', t))).toMatchObject({ stored: false });
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
+  it('keeps credentials across DO instances, drops only the rejected token, and supports unconditional logout', async () => {
+    const { obj, values } = await object();
+    const expiresAt = Date.now() + 3600_000;
+    await obj.putAiCredential({ token: 'new', expiresAt }, 1);
+    await obj.putAiCredential({ token: 'old', expiresAt: expiresAt - 1000 }, 2);
+    const recovered = Object.create(Object.getPrototypeOf(obj));
+    Object.assign(recovered, { ctx: obj.ctx });
+    expect(await recovered.getAiCredential()).toBe('new');
+    await recovered.dropAiCredential('old');
+    expect(await recovered.getAiCredential()).toBe('new');
+    await recovered.dropAiCredential('new');
+    expect(await recovered.getAiCredential()).toBeNull();
+    await obj.putAiCredential({ token: 'new', expiresAt }, 3);
+    await obj.dropAiCredential();
+    expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+  });
+
+  it('serializes concurrent starts, reuses their nonce, and rotates when the stopped launcher is restarted', async () => {
+    const { obj, values } = await object();
+    let running = false;
+    const launched: Record<string, string>[] = [];
+    obj.listProcesses = async () => running ? [{ id: 'launcher', command: 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', status: 'running' }] : [];
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
+      launched.push(options.env); running = true; return { id: 'launcher' };
+    };
+    const start = () => obj.startAiDesktop('ezil.org', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    await Promise.all([start(), start()]);
+    expect(launched).toHaveLength(1);
+    const oldNonce = values.get(AI_PROXY_NONCE_STORAGE_KEY) as string;
+    expect(launched[0]!.EZIL_AI_PROXY_TOKEN).toBe(await deriveAiProxyToken(SECRET, SANDBOX_NAME, oldNonce));
+    running = false;
+    await start();
+    expect(launched).toHaveLength(2);
+    expect(values.get(AI_PROXY_NONCE_STORAGE_KEY)).not.toBe(oldNonce);
+    expect(launched[1]!.EZIL_AI_PROXY_TOKEN).not.toBe(launched[0]!.EZIL_AI_PROXY_TOKEN);
+    const unconfigured = await object('');
+    expect((await unconfigured.obj.aiProxyBootEnv('ezil.org', SANDBOX_NAME)).EZIL_AI_PROXY_TOKEN).toBe('');
+  });
+
+  it('starts Neko beside a Guacamole launcher, then reuses only the matching Neko launcher', async () => {
+    const { obj, values } = await object();
+    const command = 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh';
+    const processes = [{ id: 'guacamole', command: 'DESKTOP_MODE=guacamole bash /usr/local/bin/start-desktop.sh', status: 'running' }];
+    const launched: Array<{ command: string; env: Record<string, string> }> = [];
+    const killProcess = mock(async () => {});
+    obj.killProcess = killProcess;
+    obj.listProcesses = async () => processes;
+    obj.startProcess = async (command: string, options: { env: Record<string, string> }) => {
+      launched.push({ command, env: options.env });
+      processes.push({ id: 'neko', command, status: 'starting' });
+      return { id: 'neko' };
+    };
+    values.set(AI_PROXY_NONCE_STORAGE_KEY, 'old-boot');
+    const start = () => obj.startAiDesktop('ezil.org', SANDBOX_NAME, command, { DESKTOP_MODE: 'neko' });
+    expect(await start()).toBe('neko');
+    const nonce = values.get(AI_PROXY_NONCE_STORAGE_KEY) as string;
+    expect(nonce).not.toBe('old-boot');
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ command, env: {
+      DESKTOP_MODE: 'neko', EZIL_AI_PROXY_TOKEN: await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce),
+    } });
+    expect(await start()).toBe('neko');
+    expect(launched).toHaveLength(1);
+    expect(values.get(AI_PROXY_NONCE_STORAGE_KEY)).toBe(nonce);
+    expect(killProcess).not.toHaveBeenCalled();
+  });
+
+  it('the real restart path rotates and injects a fresh boot token', async () => {
+    const { obj, values } = await object();
+    obj.env.SANDBOX_NEKO_ICE_POLICY = 'diagnostic';
+    obj.withRuntimeTransition = async (operation: () => Promise<unknown>) => operation();
+    let running = true;
+    let exposed = [{ port: 8181, url: 'https://desktop.ezil.org' }];
+    let launched: Record<string, string> = {};
+    obj.getExposedPorts = async () => exposed;
+    obj.listProcesses = async () => running ? [{ id: 'launcher', command: '/usr/local/bin/start-desktop.sh', status: 'running' }] : [];
+    obj.killProcess = async () => { running = false; };
+    obj.unexposePort = async () => { exposed = []; };
+    obj.getProcess = async () => ({ status: running ? 'running' : 'completed', waitForPort: async () => {}, getLogs: async () => ({}) });
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => { launched = options.env; running = true; return { id: 'fresh' }; };
+    obj.exposePort = async (port: number) => ({ url: `https://${port}-desktop.ezil.org` });
+    values.set(AI_PROXY_NONCE_STORAGE_KEY, 'old-boot');
+    const result = await obj.restartDesktopStack('ezil.org', SANDBOX_NAME, 'neko', 'neko');
+    expect(result.ok).toBe(true);
+    const nonce = values.get(AI_PROXY_NONCE_STORAGE_KEY) as string;
+    expect(nonce).not.toBe('old-boot');
+    expect(launched.EZIL_AI_BASE_URL).toBe(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1`);
+    expect(launched.EZIL_AI_PROXY_TOKEN).toBe(await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce));
+  });
+
+
+  it('forgets credentials and nonce on teardown even when no container remains', async () => {
+    const { obj, values } = await object();
+    obj.ctx.container.running = false;
+    obj.cancelWorkspaceFlushLoop = async () => {};
+    values.set(AI_CREDENTIAL_STORAGE_KEY, { token: 'stored', expiresAt: Date.now() + 3600_000 });
+    values.set(AI_PROXY_NONCE_STORAGE_KEY, 'old');
+    // The inherited SDK destroy cannot run under Bun; the production method catches
+    // that failure after deleting AI state, so the privacy postcondition is testable.
+    await obj.terminateSandboxWithCheckpoint();
+    expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+    expect(values.has(AI_PROXY_NONCE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('preserves the teardown outcome when the SDK throws an empty diagnostic', async () => {
+    const { obj } = await object();
+    obj.ctx.container.running = false;
+    obj.cancelWorkspaceFlushLoop = async () => {};
+    const sdk = Object.getPrototypeOf(Object.getPrototypeOf(obj));
+    const destroy = spyOn(sdk, 'destroy').mockRejectedValue(new Error('  '));
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await obj.terminateSandboxWithCheckpoint()).toMatchObject({ ok: true, outcome: 'not_running' });
+    } finally {
+      destroy.mockRestore();
+      logs.mockRestore();
+    }
+  });
+
+});
+
+
+describe('Worker JSON error response boundary', () => {
+  it('keeps explicit route error codes when an exception names a different public code', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const thrown = new Error('setsockoptint: private runtime failure');
+      const bucket = {
+        list: async () => { throw thrown; },
+        delete: async () => { throw thrown; },
+      };
+      for (const action of ['drain', 'ack']) {
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/telemetry/${action}`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${await mintToken()}` },
+            body: JSON.stringify({ keys: ['v1/a.ndjson'] }),
+          }),
+          { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+        );
+        expect(res.status).toBe(500);
+        expect(await res.json()).toEqual({ ok: false, error: `telemetry_${action}_failed` });
+      }
+      const { binding } = fakeSandboxNamespace({ containerResponse: () => { throw thrown; } });
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/browser/health`, {
+          headers: { authorization: `Bearer ${await mintToken()}` },
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({ ok: false, error: 'browser_sidecar_unreachable', port: 9223 });
+      expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+    } finally { logs.mockRestore(); }
+  });
+
+  it('returns internal_error for thrown messages and strings, logging details only on the server', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const error = new Error('private SDK message');
+      error.stack = 'Error: private SDK message\n    at /srv/private.ts:42';
+      for (const thrown of [error, 'private_code_shaped_secret']) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(res.status).toBe(500);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: 'internal_error' });
+        expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('names the two deterministic runtime failures with public codes, never their text', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [thrown, code] of [
+        [new Error('setsockoptint: operation not permitted at /srv/private.ts:9'), 'sandbox_runtime_blocked'],
+        [new Error('CustomDomainRequiredError: Port exposure requires a custom domain (private.example)'), 'custom_domain_required'],
+        ['SETSOCKOPTINT: private runtime failure', 'sandbox_runtime_blocked'],
+        ['Port exposure requires a custom domain: private.example', 'custom_domain_required'],
+      ] as const) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(res.status).toBe(500);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: code });
+        expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('selects allowlisted constants from thrown codes and code-prefixed messages', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [thrown, code] of [
+        ['migrating', 'migrating'],
+        [new Error('focus_switch_failed: private diagnostic'), 'focus_switch_failed'],
+        ['head_moved: private diagnostic', 'head_moved'],
+        ['screen_upstream_418', 'screen_upstream_418'],
+        ['screen_upstream_999: private diagnostic', 'internal_error'],
+        ['sandbox_runtime_blocked', 'sandbox_runtime_blocked'],
+        ['custom_domain_required', 'custom_domain_required'],
+      ] as const) {
+        const { binding } = fakeSandboxNamespace({ restartThrows: thrown });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(res.status).toBe(500);
+        const text = await res.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: code });
+        expect(text).not.toContain('private');
+        expect(logs).toHaveBeenCalledWith('[worker] response error:', thrown);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('strips diagnostic suffixes, preserves protocol codes, and logs the original detail', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [input, output] of [
+        ['focus_switch_failed: PRIVATE_MESSAGE', 'focus_switch_failed'],
+        ['screen_upstream_418', 'screen_upstream_418'],
+        ['screen_upstream_999 PRIVATE_MESSAGE', 'internal_error'],
+        ['acceptance_fault_bad_request', 'acceptance_fault_bad_request'],
+        ['head_moved', 'head_moved'],
+      ]) {
+        const { binding } = fakeSandboxNamespace({ restartResult: { ok: false, error: input } });
+        const res = await worker.fetch(
+          new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+          { Sandbox: binding },
+        );
+        expect(await res.json()).toMatchObject({ ok: false, error: output });
+        if (input !== output) expect(logs).toHaveBeenCalledWith('[worker] response error:', input);
+      }
+    } finally { logs.mockRestore(); }
+  });
+
+  it('removes nested diagnostic fields while preserving trusted public error codes', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { binding } = fakeSandboxNamespace({ restartResult: {
+        ok: false, error: 'migrating', detail: 'PRIVATE_DETAIL', message: 'PRIVATE_MESSAGE', stack: 'PRIVATE_STACK',
+        steps: [{ error: new Error('PRIVATE_ERROR'), detail: 'PRIVATE_NESTED_DETAIL' }],
+      } });
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+        { Sandbox: binding },
+      );
+      expect(res.status).toBe(409);
+      const text = await res.text();
+      expect(text).not.toContain('PRIVATE');
+      expect(JSON.parse(text)).toEqual({ ok: false, sandboxName: SANDBOX_NAME, error: 'migrating', steps: [{ error: 'internal_error' }] });
+      expect(logs.mock.calls.length).toBeGreaterThan(0);
+    } finally { logs.mockRestore(); }
   });
 });

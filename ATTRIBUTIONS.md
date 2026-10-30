@@ -60,6 +60,14 @@ If you believe an attribution is missing or inaccurate, please open an issue
 
 ---
 
+### SnapDOM (`zumerlab/snapdom`)
+- **URL:** https://github.com/zumerlab/snapdom
+- **License:** MIT (`shell/src/lib/snapdom-3.3.4/LICENSE.txt`).
+- **Used for:** Feedback screenshot tier A — a DOM snapshot of the shell only
+  (cross-origin iframes are never captured; they are replaced by a placeholder).
+- **Version:** 3.3.4, vendored unmodified as `shell/src/lib/snapdom-3.3.4/snapdom.mjs`
+  (npm `@zumer/snapdom@3.3.4` `dist/snapdom.mjs`; sha256 in `SHA256SUMS`).
+
 ## 2. Desktop / sandbox container image (`worker/Dockerfile`)
 
 ### Apache Guacamole (`apache/guacamole-client`, `apache/guacamole-server`)
@@ -120,11 +128,10 @@ If you believe an attribution is missing or inaccurate, please open an issue
   Copyright (c) 2019 Coder Technologies Inc.").
 - **Used for:** the in-browser code editor (VS Code in the browser) served
   to users, replacing the Electron VS Code build described above.
-  `worker/Dockerfile` installs it via the official installer
-  (`curl -fsSL https://code-server.dev/install.sh | sh`), which fetches a
-  prebuilt `.deb` release directly from `coder/code-server`'s own GitHub
-  releases — no code-server source is vendored or modified in this
-  repository, and no separate Electron/Chromium renderer is composited into
+  `worker/Dockerfile` installs the pinned **4.141.0** amd64 `.deb` from
+  `coder/code-server`'s GitHub releases after verifying its SHA-256 digest.
+  The bundled MIT VS Code workbench and Copilot Chat are modified at build
+  time as documented below. No separate Electron renderer is composited into
   the container's display for it (code-server serves the IDE over plain
   HTTP; the note in `worker/Dockerfile` explains why the two approaches
   cannot coexist in one container). Because code-server ships the
@@ -134,6 +141,54 @@ If you believe an attribution is missing or inaccurate, please open an issue
   official binary (which the superseded Electron build above downloaded
   under the proprietary Microsoft Software License Terms) — avoids that
   proprietary-terms question entirely.
+
+### GitHub Copilot Chat (`microsoft/vscode`, `extensions/copilot`)
+- **URL:** https://github.com/microsoft/vscode/tree/main/extensions/copilot
+  (the extension formerly developed at `microsoft/vscode-copilot-chat`, folded
+  into the VS Code monorepo and built by code-server from its `lib/vscode`
+  submodule at tag `1.141.0`; shipped as `GitHub.copilot-chat` 0.69.0).
+- **License:** **MIT** (read from the shipped
+  `/usr/lib/code-server/lib/vscode/extensions/copilot/LICENSE.txt` in the
+  code-server 4.141.0 `.deb`: "MIT License, Copyright (c) Microsoft
+  Corporation. All rights reserved." — the manifest says `"license": "SEE
+  LICENSE IN LICENSE.txt"`, so the file, not the field, is the source).
+- **Used for:** the chat panel in the secondary sidebar (Agent mode, tools,
+  clarifying questions, attachments, the Language Models editor), presented
+  to EZiL users as **"EZiL Chat"**. It is not vendored or rebuilt, and is
+  **modified at build time**:
+  `worker/copilot-chat/patch-copilot-chat.sh` (applied by `worker/Dockerfile`,
+  every patch documented with its anchor and gate in
+  `worker/copilot-chat/PATCHES.md`) edits the shipped minified bundles
+  (`extensions/copilot/dist/extension.js`, the workbench's `out/nls.messages.*`
+  and `out/vs/code/browser/workbench/workbench.js`) so that in anonymous mode
+  no GitHub service is called (no Copilot device token, no model-catalogue
+  CDN fetch) and the user-visible GitHub/Copilot strings on EZiL's path —
+  the chat-welcome terms sentence, the status-bar item, the Accounts-menu
+  sign-in entry, the system-prompt identity — read "EZiL Chat" instead. The
+  extension's `LICENSE.txt`, the workbench's copyright headers, `product.json`
+  and every command id / setting key are left untouched; each patched `.js`
+  carries a one-line "Modified at build time by EZiL" notice. This is a
+  derivative of an MIT-licensed work distributed under the same MIT terms;
+  nothing here claims Microsoft or GitHub endorsement, and the remaining
+  `github.copilot.*` identifiers are internal names, not branding. It is run
+  with `chat.allowAnonymousAccess` and fed by the EZiL-authored
+  `extensions/ezil-models` `LanguageModelChatProvider`, so it never
+  requires a GitHub token. The GitHub Copilot service is not used; models
+  are served through the EZiL gateway configured in `/etc/ezil/models.json`.
+  Its telemetry is turned off by the seeded settings
+  (`telemetry.telemetryLevel: off`, `--disable-telemetry`,
+  `APPLICATION_INSIGHTS_NO_STATSBEAT`), and the Copilot/telemetry-only hosts
+  are additionally mapped to loopback at boot by `worker/scripts/editor-state.sh`.
+- **Also bundled by code-server, not by this repository, and not used by
+  EZiL:** the core "Agent Host" runtime `@github/copilot-sdk` and
+  `@github/copilot-sdk-linux-x64` (`lib/vscode/node_modules/@github/`,
+  version `1.0.17-unstable.37397886721.gad270aa`, the Copilot CLI
+  runtime behind the `Local | Copilot | Cloud` session-target picker). Both
+  packages declare **MIT** in their `package.json` (`"license": "MIT"`,
+  repository `github/copilot-sdk`); neither package ships its own `LICENSE`
+  file in the installed tree, so the declared field is what was verified.
+  The runtime starts with code-server and stays dormant without a GitHub
+  token; `worker/` does not configure, call or remove it.
 
 ### Google Chrome
 - Installed via the official `google-chrome-stable` `.deb` from

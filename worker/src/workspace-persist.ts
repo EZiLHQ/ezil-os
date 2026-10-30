@@ -35,6 +35,7 @@ export interface Snapshot {
   chunks: Array<{ size: number; sha256: string }>;
 }
 export interface HydrateR2ObjectBodyLike {
+  body?: ReadableStream<Uint8Array> | null;
   etag?: string;
   size?: number;
   arrayBuffer(): Promise<ArrayBuffer>;
@@ -83,7 +84,7 @@ export interface FlushOutcome {
    */
   skippedReason?: 'hydration_incomplete' | 'container_not_hydrated' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large'
     /** The head is the terminal `migrated` marker (C-7): this computer moved; Cloudflare never writes it again. */
-    | 'migrated';
+    | 'migrated' | 'migrating';
   heartbeatWritten: boolean;
   checkpoint?: string;
 }
@@ -181,9 +182,30 @@ export interface MigratedHead {
   exported: { generation: string; chunkGeneration: string; previousChunkGeneration?: string; sha256: string; entries: number };
   /** The head etag this marker replaced: lets a retried commit recognise its own marker. */
   exportedEtag?: string;
+  /** Complete replaced head for export and explicit rollback; absent on legacy markers. */
+  previous?: Snapshot;
 }
 /** Marker under a prefix while an export runs: garbage collection is suspended. Outside the chunk-key pattern. */
 export const MIGRATING_FLAG = '.ezil-snapshots/migrating.json';
+/** Shared, bounded export fence. Invalid/expired flags never strand a computer. */
+export async function migrationFenceState(
+  bucket: Pick<FlushR2BucketLike, 'get'>, prefix: string, log: (message: string) => void = console.error,
+): Promise<'fresh' | 'stale' | 'none'> {
+  const flag = await bucket.get(`${prefix}/${MIGRATING_FLAG}`);
+  if (!flag) {
+    log('[migration-fence] no flag; proceeding');
+    return 'none';
+  }
+  try {
+    const data = JSON.parse(new TextDecoder().decode(await readBounded(flag, 4096)));
+    if (typeof data?.startedAt === 'string' && Date.now() - Date.parse(data.startedAt) < 40 * 60_000) {
+      log('[migration-fence] fresh flag; operation refused');
+      return 'fresh';
+    }
+  } catch { /* Malformed flags expire just like old ones. */ }
+  log('[migration-fence] stale or invalid flag; proceeding');
+  return 'stale';
+}
 export class WorkspaceMigratedError extends Error {
   constructor(readonly head: MigratedHead) { super('workspace migrated'); }
 }
@@ -198,6 +220,12 @@ export function parseMigratedHead(raw: string): MigratedHead | null {
     || !HASH.test(e.sha256) || !Number.isInteger(e.entries) || e.entries < 0 || e.entries > MAX_ENTRIES
     || (m.exportedEtag !== undefined && (typeof m.exportedEtag !== 'string' || m.exportedEtag === '' || m.exportedEtag.length > 256))) {
     throw new Error('invalid migrated head');
+  }
+  if (m.previous !== undefined) {
+    const previous = parseSnapshot(JSON.stringify(m.previous));
+    if (previous.generation !== e.generation || (previous.chunkGeneration ?? previous.generation) !== e.chunkGeneration
+      || previous.sha256 !== e.sha256 || previous.entries !== e.entries
+      || previous.previousChunkGeneration !== e.previousChunkGeneration) throw new Error('invalid migrated previous head');
   }
   return m;
 }
@@ -254,6 +282,7 @@ export async function writeMigratedHead(deps: {
     exported: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation,
       ...(s.previousChunkGeneration ? { previousChunkGeneration: s.previousChunkGeneration } : {}), sha256: s.sha256, entries: s.entries },
     exportedEtag: current.etag,
+    previous: s,
   };
   const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(head)), { onlyIf: { etagMatches: current.etag } });
   return put ? { ok: true, head } : { ok: false, reason: 'head_moved' };
@@ -293,10 +322,14 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
   if (!deps.hydrationComplete) return { ...outcome, skippedReason: 'hydration_incomplete' };
   const generation = crypto.randomUUID();
   const work = `/tmp/ezil-snapshot-${generation}`;
+  let captureStarted = false;
   try {
+    if (await migrationFenceState(bucket, prefix, log) === 'fresh') return { ...outcome, skippedReason: 'migrating' };
+
     // Read before capture: CAS rejects another container publishing in between.
     const previous = await readHead(bucket, prefix);
     const expected = previous?.snapshot.generation ?? null;
+    captureStarted = true;
     if (deps.beforeCapture) {
       await command(container, { op: 'check', root, work, prefix, expected });
       await deps.beforeCapture();
@@ -368,7 +401,7 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     log(`[workspace-persist] ${error}`);
     outcome.failed.push({ relPath: SNAPSHOT_HEAD, error });
   } finally {
-    try { await command(container, { op: 'cleanup', root, work }); }
+    try { if (captureStarted) await command(container, { op: 'cleanup', root, work }); }
     catch { log('[workspace-persist] snapshot staging cleanup failed'); }
   }
   return outcome;

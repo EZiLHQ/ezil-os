@@ -22,15 +22,18 @@ import { parseAuthFragment } from './fragment';
  *    (a founder-side dashboard change), which lands on `/auth/confirm`; that
  *    route verifies server-side, writes the cookies, and redirects here.
  *
- * Either way the user is now signed in and has NO PASSWORD — the account was
- * created by the invite. This page is the only place that asks for one.
+ * Either way the user is now signed in, and this page sends them straight into
+ * the OS. It does not ask for a password: EZiL ID is the only sign-in, so a
+ * Supabase password would open nothing. Next time they choose "Continue with
+ * EZiL ID" with the invited address; `server/auth/bridge.ts` links the
+ * account by email.
  *
  * ── 🔴 `window.location.assign`, never `router.push` ────────────────────────
  * The destination is `/os`, which is the host document for a separate jQuery
  * application delivered as `<script src>` tags. A `<script>` React inserts
  * during a client-side navigation NEVER EXECUTES, so a soft nav lands the user
  * on a permanently dead page (docs/PLATFORM-NOTES.md §17,
- * `login/entry-contract.test.ts`). The same contract the login form obeys.
+ * `login/entry-contract.test.ts`). The same contract every sign-in path obeys.
  *
  * ── 🔴 The fragment is read in an effect, not during render ─────────────────
  * `window` does not exist on the server, and a first paint that differs
@@ -43,17 +46,10 @@ import { parseAuthFragment } from './fragment';
 
 type Phase =
     | { name: 'checking' }
-    | { name: 'set-password' }
-    | { name: 'saving' }
     | { name: 'failed'; message: string };
-
-const MIN_PASSWORD = 8;
 
 export default function InvitedPage() {
     const [phase, setPhase] = useState<Phase>({ name: 'checking' });
-    const [password, setPassword] = useState('');
-    const [confirm, setConfirm] = useState('');
-    const [formError, setFormError] = useState<string | null>(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -61,6 +57,11 @@ export default function InvitedPage() {
 
         const settle = (next: Phase) => {
             if (!cancelled) setPhase(next);
+        };
+
+        /** 🔴 A document load. See the header. */
+        const enter = () => {
+            if (!cancelled) window.location.assign(Routes.OS);
         };
 
         /** Remove `#access_token=…` from the address bar once it is spent. */
@@ -96,7 +97,7 @@ export default function InvitedPage() {
                     settle({ name: 'failed', message: error.message });
                     return;
                 }
-                settle({ name: 'set-password' });
+                enter();
                 return;
             }
 
@@ -105,7 +106,7 @@ export default function InvitedPage() {
             // opened on its own and there is nothing to do here.
             const { data } = await supabase.auth.getSession();
             if (data.session) {
-                settle({ name: 'set-password' });
+                enter();
                 return;
             }
             window.location.assign(Routes.LOGIN);
@@ -115,32 +116,6 @@ export default function InvitedPage() {
             cancelled = true;
         };
     }, []);
-
-    async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
-        event.preventDefault();
-        setFormError(null);
-
-        if (password.length < MIN_PASSWORD) {
-            setFormError(`Use at least ${MIN_PASSWORD} characters.`);
-            return;
-        }
-        if (password !== confirm) {
-            setFormError('Those two passwords are different.');
-            return;
-        }
-
-        setPhase({ name: 'saving' });
-        const supabase = createClient();
-        const { error } = await supabase.auth.updateUser({ password });
-        if (error) {
-            setPhase({ name: 'set-password' });
-            setFormError(error.message);
-            return;
-        }
-
-        // 🔴 A document load. See the header.
-        window.location.assign(Routes.OS);
-    }
 
     return (
         <main className="flex h-screen w-screen items-center justify-center bg-black p-6">
@@ -161,54 +136,6 @@ export default function InvitedPage() {
                             Back to sign in
                         </a>
                     </div>
-                )}
-
-                {(phase.name === 'set-password' || phase.name === 'saving') && (
-                    <form onSubmit={onSubmit} className="space-y-4">
-                        <p className="text-regular text-gray-400">
-                            Choose a password and your computer is ready.
-                        </p>
-                        <div className="space-y-1.5">
-                            <label htmlFor="password" className="text-small text-gray-400">
-                                Password
-                            </label>
-                            <input
-                                id="password"
-                                name="password"
-                                type="password"
-                                required
-                                minLength={MIN_PASSWORD}
-                                autoComplete="new-password"
-                                value={password}
-                                onChange={event => setPassword(event.target.value)}
-                                className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                            />
-                        </div>
-                        <div className="space-y-1.5">
-                            <label htmlFor="confirm" className="text-small text-gray-400">
-                                Confirm password
-                            </label>
-                            <input
-                                id="confirm"
-                                name="confirm"
-                                type="password"
-                                required
-                                minLength={MIN_PASSWORD}
-                                autoComplete="new-password"
-                                value={confirm}
-                                onChange={event => setConfirm(event.target.value)}
-                                className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                            />
-                        </div>
-                        {formError && <p className="text-small text-red-400">{formError}</p>}
-                        <button
-                            type="submit"
-                            disabled={phase.name === 'saving'}
-                            className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
-                        >
-                            {phase.name === 'saving' ? 'Please wait…' : 'Set password and continue'}
-                        </button>
-                    </form>
                 )}
             </div>
         </main>

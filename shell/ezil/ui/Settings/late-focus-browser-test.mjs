@@ -36,6 +36,7 @@
 // This file reproduces that race deterministically — it schedules the late
 // focus itself rather than waiting for one — and proves both directions.
 
+import { fixtureUrl } from '../../../fixture-url-test-support.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -207,12 +208,14 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
         const req = route.request();
         const url = req.url();
         const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
-        if ( new URL(url).origin === new URL(DESKTOP_URL).origin ) {
+        if ( fixtureUrl(url, DESKTOP_URL)?.pathname === '/' ) {
             return route.fulfill({ status: 200, contentType: 'text/html', body: VIEWER_HTML });
         }
-        if ( url === `${HOST}/os` ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+        const target = fixtureUrl(url, HOST);
+        if ( ! target ) return route.abort();
+        if ( target.pathname === '/os' ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
 
-        if ( url.includes('/api/shell/screen') ) {
+        if ( target.pathname === '/api/shell/screen' ) {
             if ( req.method() === 'GET' ) {
                 state.reads++;
                 // For the mutation proof: put the shell back in the state it
@@ -231,7 +234,7 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
                 source: (m.width === body.width && m.height === body.height) ? 'requested' : 'snapped',
             });
         }
-        if ( url.includes('/api/shell/desktop') && req.method() === 'POST' ) {
+        if ( target.pathname === '/api/shell/desktop' && req.method() === 'POST' ) {
             const body = JSON.parse(req.postData() || '{}');
             // The BOOT ask travels on openDesktop, exactly as in production.
             if ( body?.screen?.width && body?.screen?.height ) {
@@ -246,12 +249,11 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
                 ...(state.applied ? { screen: { ...state.applied, source: 'snapped' } } : {}),
             });
         }
-        if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
-        if ( url.includes('confirm=display') ) return json({ ok: true, display: 'live' });
-        if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
-        if ( url.includes('/api/') ) return json({ ok: true });
-        if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
-        return route.continue();
+        if ( target.pathname === '/api/shell/desktop' && target.searchParams.get('confirm') === 'frame' ) return json({ ok: true, confirmed: true, status: 200 });
+        if ( target.pathname === '/api/shell/desktop' && target.searchParams.get('confirm') === 'display' ) return json({ ok: true, display: 'live' });
+        if ( target.pathname === '/api/shell/desktop' ) return json({ ok: true, guacamoleRunning: true });
+        if ( ['/api/shell/session', '/api/shell/focus', '/api/shell/telemetry'].includes(target.pathname) ) return json({ ok: true });
+        return route.fulfill({ status: 404, body: '' });
     });
 
     await page.goto(`${HOST}/os`, { waitUntil: 'load' });

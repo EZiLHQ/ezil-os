@@ -9,7 +9,7 @@
  */
 import { call, type CallOptions } from './transport';
 import { EzilError } from './errors';
-import type { Computer, DesktopStatus, DesktopUrl, EzilClientOptions, SystemInfo } from './types';
+import type { Computer, DesktopStatus, DesktopUrl, EzilClientOptions, SystemInfo, ComputerProgress } from './types';
 
 /** Per-call escape hatches. */
 export interface RequestOptions {
@@ -37,6 +37,8 @@ export interface EzilClient {
          * only (NOT_FOUND otherwise). Read only: never assigns a provider.
          */
         systemInfo(computerId: string, opts?: RequestOptions): Promise<SystemInfo>;
+        /** Read recorded progress without starting, reconciling or billing a computer. */
+        progress(computerId: string, opts?: RequestOptions): Promise<ComputerProgress>;
         /** Soft-delete, and terminate the container. The row is never hard-deleted. */
         delete(id: string, opts?: RequestOptions): Promise<{ id: string } | unknown>;
     };
@@ -109,6 +111,7 @@ export const createEzilClient = (options: EzilClientOptions): EzilClient => {
             getOrCreateDefault: (opts) => mutate<Computer>('computer.getOrCreateDefault', undefined, opts),
             rename: (id, name, opts) => mutate<Computer>('computer.rename', { id, name }, opts),
             systemInfo: (computerId, opts) => query<SystemInfo>('computer.systemInfo', { computerId }, opts),
+            progress: (computerId, opts) => query<ComputerProgress>('computer.progress', { computerId }, opts),
             delete: (id, opts) => mutate('computer.delete', { id }, opts),
         },
         desktop: {

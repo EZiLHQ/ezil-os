@@ -24,12 +24,22 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  * default (docs/PLATFORM-NOTES.md §13) would kill this handler in the middle of
  * a restart that was going to succeed, and the user would be told it failed
  * while their desktop quietly came back.
+ * AWS also needs this budget: its Worker only queues the host restart (202).
+ * requestAwsRestart waits up to 180s for the new Neko runtime, whose startup
+ * gate includes code-server readiness, before this route returns success.
  *
  * Like every other `/api/shell/*` handler this is a TRANSPORT only. Ownership
  * is checked exactly once, inside the procedure; the sandbox id is derived
  * there from the session, never read from this body.
  *
  *   POST { computerId } -> { ok, errorCode?, correlationId? }
+ *
+ * Round 3: an AWS desktop restart answers a DISTINCT `errorCode`
+ * (`restart_not_running|busy|budget_exhausted|host_unreachable|timeout|unavailable`), and
+ * `{ computerId, scope: 'computer', requestId }` restarts the WHOLE computer (stop, then a
+ * server-initiated open on the same size) and returns at once with its transition:
+ *   -> { ok: true, transitionId, path: 'restart', size } | { ok: false, errorCode: 'restart_<reason>' }
+ * Progress of that restart is `computer.progress` (docs/aws-computers/SWITCH-CONTRACT.md).
  */
 export const maxDuration = 300;
 
@@ -54,9 +64,16 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '' } = (body ?? {}) as { computerId?: string };
+        const { computerId = '', scope = 'desktop', requestId } = (body ?? {}) as { computerId?: string; scope?: unknown; requestId?: string };
+        if (scope !== 'desktop' && scope !== 'computer') {
+            return shellJson({ error: { code: 'BAD_REQUEST', message: 'Unknown restart scope.' } }, 400);
+        }
+        if (scope === 'computer') {
+            const result = await caller.computer.restartComputer({ computerId, requestId: requestId ?? '' });
+            return shellJson(result.ok ? result : { ok: false, errorCode: `restart_${result.reason}`, reason: result.reason });
+        }
 
-        const result = await caller.cloudflareGuacamole.restartDesktop({ computerId });
+        const result = await caller.cloudflareGuacamole.restartDesktop({ computerId, ...(requestId === undefined ? {} : { requestId }) });
 
         return shellJson(result);
     } catch (err) {

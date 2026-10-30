@@ -1,0 +1,2019 @@
+{
+  "identity": {
+    "before": {
+      "Resources": {
+        "BoundaryEA298153": {
+          "Type": "AWS::IAM::ManagedPolicy",
+          "Properties": {
+            "Description": "EZiL workload permission boundary (AWS-COMPUTERS.md \u00a75)",
+            "ManagedPolicyName": "ezil-mum-boundary",
+            "Path": "/ezil/identity/",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:lambda:ap-south-1:452630323510:function:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "states:StartExecution",
+                    "states:ListExecutions"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "states:DescribeExecution",
+                    "states:GetExecutionHistory"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:states:ap-south-1:452630323510:execution:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:logs:ap-south-1:452630323510:log-group:ezil-mum-*"
+                },
+                {
+                  "Action": "sqs:SendMessage",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:sqs:ap-south-1:452630323510:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "ec2:DescribeInstances",
+                    "ec2:DescribeVolumes",
+                    "ec2:DescribeImages",
+                    "ec2:DescribeSnapshots",
+                    "ec2:DescribeLaunchTemplateVersions",
+                    "ec2:DescribeAvailabilityZones",
+                    "logs:DescribeLogGroups",
+                    "logs:CreateLogDelivery",
+                    "logs:GetLogDelivery",
+                    "logs:UpdateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:PutResourcePolicy",
+                    "logs:DescribeResourcePolicies"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:secretsmanager:ap-south-1:452630323510:secret:ezil/mum/*"
+                },
+                {
+                  "Action": [
+                    "kms:Encrypt",
+                    "kms:Decrypt",
+                    "kms:ReEncryptFrom",
+                    "kms:ReEncryptTo",
+                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKeyWithoutPlaintext",
+                    "kms:DescribeKey",
+                    "kms:CreateGrant"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:kms:ap-south-1:452630323510:key/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "ec2:InstanceType": [
+                        "t3a.medium",
+                        "t3.medium",
+                        "m6i.large",
+                        "c6i.xlarge",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:RunInstances",
+                    "ec2:CreateVolume"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "ec2:VolumeType": "gp3"
+                    },
+                    "Bool": {
+                      "ec2:Encrypted": "true"
+                    },
+                    "NumericLessThanEquals": {
+                      "ec2:VolumeSize": "100"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:network-interface/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:subnet/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:security-group/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:launch-template/*"
+                  ]
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::image/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances",
+                    "ec2:AttachVolume",
+                    "ec2:CreateTags"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "aws:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                  ]
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "ec2:CreateAction": [
+                        "RunInstances",
+                        "CreateVolume"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:volume/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:network-interface/*"
+                  ]
+                },
+                {
+                  "Action": [
+                    "ec2:Purchase*",
+                    "ec2:AllocateHosts",
+                    "ec2:ModifyHosts",
+                    "ec2:CreateCapacityReservation*",
+                    "ec2:CreateReservedInstancesListing",
+                    "ec2:AcceptReservedInstancesExchangeQuote",
+                    "ec2:RequestSpot*",
+                    "ec2:CreateFleet",
+                    "savingsplans:*",
+                    "rds:*",
+                    "elasticache:*",
+                    "redshift:*",
+                    "es:*",
+                    "dynamodb:*",
+                    "aws-marketplace:*",
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags",
+                    "ec2:ModifyInstanceAttribute",
+                    "iam:*",
+                    "sts:*",
+                    "organizations:*",
+                    "account:*",
+                    "aws-portal:*",
+                    "billing:*",
+                    "payments:*",
+                    "tax:*",
+                    "ce:*",
+                    "route53:*",
+                    "route53domains:*",
+                    "cloudfront:*",
+                    "budgets:*",
+                    "cloudwatch:*"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "NotAction": "iam:*",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:RequestedRegion": "ap-south-1"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:DescribeInstanceAttribute",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                }
+              ],
+              "Version": "2012-10-17"
+            }
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-identity-mum/Boundary/Resource"
+          }
+        },
+        "ImageJobBoundary853D84E7": {
+          "Type": "AWS::IAM::ManagedPolicy",
+          "Properties": {
+            "Description": "",
+            "ManagedPolicyName": "ezil-mum-image-job-boundary",
+            "Path": "/ezil/mum/",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": [
+                    "ec2:Purchase*",
+                    "ec2:AllocateHosts",
+                    "ec2:ModifyHosts",
+                    "ec2:CreateCapacityReservation*",
+                    "ec2:CreateReservedInstancesListing",
+                    "ec2:AcceptReservedInstancesExchangeQuote",
+                    "ec2:RequestSpot*",
+                    "ec2:CreateFleet",
+                    "savingsplans:*",
+                    "rds:*",
+                    "elasticache:*",
+                    "redshift:*",
+                    "es:*",
+                    "dynamodb:*",
+                    "aws-marketplace:*",
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags",
+                    "ec2:ModifyInstanceAttribute",
+                    "iam:*",
+                    "sts:*",
+                    "organizations:*",
+                    "account:*",
+                    "aws-portal:*",
+                    "billing:*",
+                    "payments:*",
+                    "tax:*",
+                    "ce:*",
+                    "route53:*",
+                    "route53domains:*",
+                    "cloudfront:*",
+                    "budgets:*",
+                    "cloudwatch:*",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:CopySnapshot",
+                    "ec2:ModifySnapshotAttribute",
+                    "ec2:ResetSnapshotAttribute",
+                    "ec2:DescribeInstanceAttribute"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "NotAction": "iam:*",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:RequestedRegion": "ap-south-1"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:lambda:ap-south-1:452630323510:function:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "kms:Encrypt",
+                    "kms:Decrypt",
+                    "kms:ReEncryptFrom",
+                    "kms:ReEncryptTo",
+                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKeyWithoutPlaintext",
+                    "kms:DescribeKey",
+                    "kms:CreateGrant"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:kms:ap-south-1:452630323510:key/*"
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogDelivery",
+                    "logs:GetLogDelivery",
+                    "logs:UpdateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:PutResourcePolicy",
+                    "logs:DescribeResourcePolicies",
+                    "logs:DescribeLogGroups"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateSnapshot",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:ResourceTag/ezil:backup": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": [
+                    "ec2:CreateSnapshot",
+                    "ec2:CreateTags"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:purpose": "pre-rebase"
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:RequestTag/ezil:computer-id": "false",
+                      "aws:RequestTag/ezil:source-volume-id": "false",
+                      "aws:RequestTag/ezil:source-generation": "false",
+                      "aws:RequestTag/ezil:source-fence-token": "false",
+                      "aws:RequestTag/ezil:preparation-job-id": "false"
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:ResourceTag/ezil:purpose": "pre-rebase"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:preparation-job-id": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:backup": "mum",
+                      "ec2:VolumeType": "gp3",
+                      "ec2:AvailabilityZoneId": "aps1-az1"
+                    },
+                    "ArnEquals": {
+                      "ec2:KmsKeyId": "arn:aws:kms:ap-south-1:452630323510:key/de6e9bae-a71f-4bed-8386-8c2b1a6bd82c"
+                    },
+                    "Bool": {
+                      "ec2:Encrypted": "true"
+                    },
+                    "NumericGreaterThanEquals": {
+                      "ec2:VolumeSize": "20"
+                    },
+                    "NumericLessThanEquals": {
+                      "ec2:VolumeSize": "100"
+                    },
+                    "Null": {
+                      "aws:RequestTag/ezil:computer-id": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:backup": "mum",
+                      "ec2:CreateAction": "CreateVolume"
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:RequestTag/ezil:computer-id": "false",
+                      "aws:RequestTag/ezil:generation": "false",
+                      "aws:RequestTag/ezil:fence-token": "false",
+                      "aws:RequestTag/ezil:restored-from-snapshot": "false",
+                      "aws:RequestTag/ezil:original-volume-id": "false",
+                      "aws:RequestTag/ezil:recovery-job-id": "false"
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:backup",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "ec2:CreateAction": "CreateSnapshot"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:backup",
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            }
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-identity-mum/ImageJobBoundary/Resource"
+          }
+        }
+      }
+    },
+    "after": {
+      "Resources": {
+        "BoundaryEA298153": {
+          "Type": "AWS::IAM::ManagedPolicy",
+          "Properties": {
+            "Description": "EZiL workload permission boundary (AWS-COMPUTERS.md \u00a75)",
+            "ManagedPolicyName": "ezil-mum-boundary",
+            "Path": "/ezil/identity/",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:lambda:ap-south-1:452630323510:function:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "states:StartExecution",
+                    "states:ListExecutions"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "states:DescribeExecution",
+                    "states:GetExecutionHistory"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:states:ap-south-1:452630323510:execution:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:logs:ap-south-1:452630323510:log-group:ezil-mum-*"
+                },
+                {
+                  "Action": "sqs:SendMessage",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:sqs:ap-south-1:452630323510:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "ec2:DescribeInstances",
+                    "ec2:DescribeVolumes",
+                    "ec2:DescribeImages",
+                    "ec2:DescribeSnapshots",
+                    "ec2:DescribeLaunchTemplateVersions",
+                    "ec2:DescribeAvailabilityZones",
+                    "logs:DescribeLogGroups",
+                    "logs:CreateLogDelivery",
+                    "logs:GetLogDelivery",
+                    "logs:UpdateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:PutResourcePolicy",
+                    "logs:DescribeResourcePolicies"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:secretsmanager:ap-south-1:452630323510:secret:ezil/mum/*"
+                },
+                {
+                  "Action": [
+                    "kms:Encrypt",
+                    "kms:Decrypt",
+                    "kms:ReEncryptFrom",
+                    "kms:ReEncryptTo",
+                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKeyWithoutPlaintext",
+                    "kms:DescribeKey",
+                    "kms:CreateGrant"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:kms:ap-south-1:452630323510:key/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "ec2:InstanceType": [
+                        "t3a.medium",
+                        "t3.medium",
+                        "m6i.large",
+                        "c6i.xlarge",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:RunInstances",
+                    "ec2:CreateVolume"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "ec2:VolumeType": "gp3"
+                    },
+                    "Bool": {
+                      "ec2:Encrypted": "true"
+                    },
+                    "NumericLessThanEquals": {
+                      "ec2:VolumeSize": "100"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:network-interface/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:subnet/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:security-group/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:launch-template/*"
+                  ]
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::image/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances",
+                    "ec2:AttachVolume",
+                    "ec2:CreateTags",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "aws:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                  ]
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "ec2:CreateAction": [
+                        "RunInstances",
+                        "CreateVolume"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:volume/*",
+                    "arn:aws:ec2:ap-south-1:452630323510:network-interface/*"
+                  ]
+                },
+                {
+                  "Action": [
+                    "ec2:Purchase*",
+                    "ec2:AllocateHosts",
+                    "ec2:ModifyHosts",
+                    "ec2:CreateCapacityReservation*",
+                    "ec2:CreateReservedInstancesListing",
+                    "ec2:AcceptReservedInstancesExchangeQuote",
+                    "ec2:RequestSpot*",
+                    "ec2:CreateFleet",
+                    "savingsplans:*",
+                    "rds:*",
+                    "elasticache:*",
+                    "redshift:*",
+                    "es:*",
+                    "dynamodb:*",
+                    "aws-marketplace:*",
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "iam:*",
+                    "sts:*",
+                    "organizations:*",
+                    "account:*",
+                    "aws-portal:*",
+                    "billing:*",
+                    "payments:*",
+                    "tax:*",
+                    "ce:*",
+                    "route53:*",
+                    "route53domains:*",
+                    "cloudfront:*",
+                    "budgets:*",
+                    "cloudwatch:*"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "NotAction": "iam:*",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:RequestedRegion": "ap-south-1"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:DescribeInstanceAttribute",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                }
+              ],
+              "Version": "2012-10-17"
+            }
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-identity-mum/Boundary/Resource"
+          }
+        },
+        "ImageJobBoundary853D84E7": {
+          "Type": "AWS::IAM::ManagedPolicy",
+          "Properties": {
+            "Description": "",
+            "ManagedPolicyName": "ezil-mum-image-job-boundary",
+            "Path": "/ezil/mum/",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": [
+                    "ec2:Purchase*",
+                    "ec2:AllocateHosts",
+                    "ec2:ModifyHosts",
+                    "ec2:CreateCapacityReservation*",
+                    "ec2:CreateReservedInstancesListing",
+                    "ec2:AcceptReservedInstancesExchangeQuote",
+                    "ec2:RequestSpot*",
+                    "ec2:CreateFleet",
+                    "savingsplans:*",
+                    "rds:*",
+                    "elasticache:*",
+                    "redshift:*",
+                    "es:*",
+                    "dynamodb:*",
+                    "aws-marketplace:*",
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "iam:*",
+                    "sts:*",
+                    "organizations:*",
+                    "account:*",
+                    "aws-portal:*",
+                    "billing:*",
+                    "payments:*",
+                    "tax:*",
+                    "ce:*",
+                    "route53:*",
+                    "route53domains:*",
+                    "cloudfront:*",
+                    "budgets:*",
+                    "cloudwatch:*",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags",
+                    "ec2:CopySnapshot",
+                    "ec2:ModifySnapshotAttribute",
+                    "ec2:ResetSnapshotAttribute",
+                    "ec2:DescribeInstanceAttribute"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "NotAction": "iam:*",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "aws:RequestedRegion": "ap-south-1"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:lambda:ap-south-1:452630323510:function:ezil-mum-*"
+                },
+                {
+                  "Action": [
+                    "kms:Encrypt",
+                    "kms:Decrypt",
+                    "kms:ReEncryptFrom",
+                    "kms:ReEncryptTo",
+                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKeyWithoutPlaintext",
+                    "kms:DescribeKey",
+                    "kms:CreateGrant"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/ezil:namespace": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:kms:ap-south-1:452630323510:key/*"
+                },
+                {
+                  "Action": [
+                    "logs:CreateLogDelivery",
+                    "logs:GetLogDelivery",
+                    "logs:UpdateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:PutResourcePolicy",
+                    "logs:DescribeResourcePolicies",
+                    "logs:DescribeLogGroups"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateSnapshot",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:ResourceTag/ezil:backup": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": [
+                    "ec2:CreateSnapshot",
+                    "ec2:CreateTags"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:purpose": "pre-rebase"
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:RequestTag/ezil:computer-id": "false",
+                      "aws:RequestTag/ezil:source-volume-id": "false",
+                      "aws:RequestTag/ezil:source-generation": "false",
+                      "aws:RequestTag/ezil:source-fence-token": "false",
+                      "aws:RequestTag/ezil:preparation-job-id": "false"
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:ResourceTag/ezil:purpose": "pre-rebase"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:preparation-job-id": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:backup": "mum",
+                      "ec2:VolumeType": "gp3",
+                      "ec2:AvailabilityZoneId": "aps1-az1"
+                    },
+                    "ArnEquals": {
+                      "ec2:KmsKeyId": "arn:aws:kms:ap-south-1:452630323510:key/de6e9bae-a71f-4bed-8386-8c2b1a6bd82c"
+                    },
+                    "Bool": {
+                      "ec2:Encrypted": "true"
+                    },
+                    "NumericGreaterThanEquals": {
+                      "ec2:VolumeSize": "20"
+                    },
+                    "NumericLessThanEquals": {
+                      "ec2:VolumeSize": "100"
+                    },
+                    "Null": {
+                      "aws:RequestTag/ezil:computer-id": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                      "aws:RequestTag/ezil:stage": "mum",
+                      "aws:RequestTag/ezil:backup": "mum",
+                      "ec2:CreateAction": "CreateVolume"
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:RequestTag/ezil:computer-id": "false",
+                      "aws:RequestTag/ezil:generation": "false",
+                      "aws:RequestTag/ezil:fence-token": "false",
+                      "aws:RequestTag/ezil:restored-from-snapshot": "false",
+                      "aws:RequestTag/ezil:original-volume-id": "false",
+                      "aws:RequestTag/ezil:recovery-job-id": "false"
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:backup",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringNotEquals": {
+                      "ec2:CreateAction": "CreateSnapshot"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1::snapshot/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:backup",
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            }
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-identity-mum/ImageJobBoundary/Resource"
+          }
+        }
+      }
+    }
+  },
+  "workflows": {
+    "before": {
+      "Resources": {
+        "LifecyclePreparationRebasePreparationRole07C3BE8F": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-rebase-preparation",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/Resource"
+          }
+        },
+        "LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecyclePreparationObserverCurrentVersion54D5EE083b7db58d4110c6b6b08be8240b1cfe65"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose",
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4",
+            "Roles": [
+              {
+                "Ref": "LifecyclePreparationRebasePreparationRole07C3BE8F"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/DefaultPolicy/Resource"
+          }
+        },
+        "LifecycleControllerRoleDefaultPolicy31C0D948": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecycleObserverCurrentVersion3A1B23A0247d66942e435ebb1ae37961c7749e96"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:AttachVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:AvailabilityZoneId": "aps1-az1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:computer",
+                        "ezil:generation",
+                        "ezil:fence"
+                      ]
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:DeleteTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge",
+                        "m6i.2xlarge"
+                      ]
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:pool"
+                      ]
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:ResourceTag/ezil:computer": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:computer-id",
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecycleControllerRoleDefaultPolicy31C0D948",
+            "Roles": [
+              {
+                "Ref": "LifecycleControllerRole1FB8E154"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/ControllerRole/DefaultPolicy/Resource"
+          }
+        },
+        "RecoveryRecoveryRole1B60FF4C": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-recovery",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/Resource"
+          }
+        },
+        "RecoveryRecoveryRoleDefaultPolicy2A415109": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:backup",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags",
+                    "ec2:CopySnapshot",
+                    "ec2:ModifySnapshotAttribute",
+                    "ec2:ResetSnapshotAttribute"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "RecoveryObserverCurrentVersion680AB0D78465f507cf183c58abfffe1b45b50e80"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "RecoveryRecoveryRoleDefaultPolicy2A415109",
+            "Roles": [
+              {
+                "Ref": "RecoveryRecoveryRole1B60FF4C"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/DefaultPolicy/Resource"
+          }
+        },
+        "CDKMetadata": {
+          "Type": "AWS::CDK::Metadata",
+          "Properties": {
+            "Analytics": "v2:deflate64:H4sIAAAAAAAA/01Qy27CMBD8Fu7LlkKrniFSe6DPROoVGWcTTBybZm0QsvzvlU1auHhm17OzjznOn2Y4m4gTT2XdTbXaYqickB2UxNYPkkCceBO6njGs6QxFY9Z0jqBtyxhebfsyWH9I6T8eQYt+W4uNsTXtGd8zPHsjnbIGlOgxlFZTqsn4abWS2fnCIvBiI5jJMS4TAC9w5WVHbiWYRnsMRWP+Xb9p4IRFY0YagR0dmlHAWV454ehNyJ0yuf1tfC37YQxfnnyWXEh+r3PehBHoSMYxhtKPO3lNEaS2vj4JJ3cYlloMffrKJEbIW1VOtMq0Kf/h3cG7COliuOe74/wB7x9xNtmzUtPBG6d6wvKCv7/cuAy0AQAA"
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/CDKMetadata/Default"
+          }
+        }
+      }
+    },
+    "after": {
+      "Resources": {
+        "LifecyclePreparationRebasePreparationRole07C3BE8F": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-rebase-preparation",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/Resource"
+          }
+        },
+        "LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecyclePreparationObserverCurrentVersion54D5EE08ef5381391af0a263a41a6b8151b48533"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:source-volume-id",
+                        "ezil:source-generation",
+                        "ezil:source-fence-token",
+                        "ezil:preparation-job-id",
+                        "ezil:purpose",
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4",
+            "Roles": [
+              {
+                "Ref": "LifecyclePreparationRebasePreparationRole07C3BE8F"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/Preparation/RebasePreparationRole/DefaultPolicy/Resource"
+          }
+        },
+        "LifecycleControllerRoleDefaultPolicy31C0D948": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "LifecycleObserverCurrentVersion3A1B23A0ca1bf0852b8bf4c978c487f8c78f720d"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:StartInstances",
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:computer": "true",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:AttachVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:AvailabilityZoneId": "aps1-az1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": [
+                    "ec2:StopInstances",
+                    "ec2:TerminateInstances"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer": "false",
+                      "aws:ResourceTag/ezil:pool": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:TerminateInstances",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer": "true",
+                      "aws:ResourceTag/ezil:computer-id": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:DetachVolume",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "ec2:AvailabilityZoneId": "aps1-az1"
+                    },
+                    "Null": {
+                      "aws:ResourceTag/ezil:computer-id": "false",
+                      "aws:ResourceTag/ezil:computer": "true"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+                },
+                {
+                  "Action": "ec2:RunInstances",
+                  "Condition": {
+                    "Null": {
+                      "aws:RequestTag/ezil:pool": "false"
+                    },
+                    "StringNotEquals": {
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:computer",
+                        "ezil:generation",
+                        "ezil:fence"
+                      ]
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:DeleteTags",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": "ap-south-1",
+                      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                      "ec2:ResourceTag/ezil:stage": "mum",
+                      "aws:ResourceTag/ezil:namespace": "mum",
+                      "aws:ResourceTag/ezil:pool": "1",
+                      "ec2:InstanceType": [
+                        "m6i.large",
+                        "m6i.xlarge"
+                      ]
+                    },
+                    "ForAllValues:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:pool"
+                      ]
+                    },
+                    "Null": {
+                      "aws:TagKeys": "false",
+                      "aws:ResourceTag/ezil:computer": "false"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+                },
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:computer-id",
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:backup"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "LifecycleControllerRoleDefaultPolicy31C0D948",
+            "Roles": [
+              {
+                "Ref": "LifecycleControllerRole1FB8E154"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Lifecycle/ControllerRole/DefaultPolicy/Resource"
+          }
+        },
+        "RecoveryRecoveryRole1B60FF4C": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "sts:AssumeRole",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:SourceAccount": "452630323510"
+                    },
+                    "ArnEquals": {
+                      "aws:SourceArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery"
+                    }
+                  },
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "states.amazonaws.com"
+                  }
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "Path": "/ezil/mum/",
+            "PermissionsBoundary": "arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary",
+            "RoleName": "ezil-mum-recovery",
+            "Tags": [
+              {
+                "Key": "ezil:namespace",
+                "Value": "mum"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/Resource"
+          }
+        },
+        "RecoveryRecoveryRoleDefaultPolicy2A415109": {
+          "Type": "AWS::IAM::Policy",
+          "Properties": {
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": "ec2:CreateTags",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "aws:TagKeys": [
+                        "ezil:managed-by",
+                        "ezil:stage",
+                        "ezil:computer-id",
+                        "ezil:generation",
+                        "ezil:fence-token",
+                        "ezil:backup",
+                        "ezil:restored-from-snapshot",
+                        "ezil:original-volume-id",
+                        "ezil:recovery-job-id"
+                      ]
+                    },
+                    "Null": {
+                      "ec2:CreateAction": "true"
+                    }
+                  },
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags",
+                    "ec2:CopySnapshot",
+                    "ec2:ModifySnapshotAttribute",
+                    "ec2:ResetSnapshotAttribute"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                },
+                {
+                  "Action": "lambda:InvokeFunction",
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Ref": "RecoveryObserverCurrentVersion680AB0D7c75683f328543064a4b7287e9090fef7"
+                  }
+                },
+                {
+                  "Action": [
+                    "ec2:DeleteVolume",
+                    "ec2:DeleteSnapshot",
+                    "ec2:ModifyInstanceAttribute",
+                    "ec2:ModifyInstanceMetadataOptions",
+                    "iam:PassRole",
+                    "ec2:DetachVolume",
+                    "ec2:DeleteTags"
+                  ],
+                  "Effect": "Deny",
+                  "Resource": "*"
+                }
+              ],
+              "Version": "2012-10-17"
+            },
+            "PolicyName": "RecoveryRecoveryRoleDefaultPolicy2A415109",
+            "Roles": [
+              {
+                "Ref": "RecoveryRecoveryRole1B60FF4C"
+              }
+            ]
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/Recovery/RecoveryRole/DefaultPolicy/Resource"
+          }
+        },
+        "CDKMetadata": {
+          "Type": "AWS::CDK::Metadata",
+          "Properties": {
+            "Analytics": "v2:deflate64:H4sIAAAAAAAA/01Qy27CMBD8Fu7LlkKrniFSe6DPROoVGWcTTBybZm0QsvzvlU1auHhm17OzjznOn2Y4m4gTT2XdTbXaYqickB2UxNYPkkCceBO6njGs6QxFY9Z0jqBtyxhebfsyWH9I6T8eQYt+W4uNsTXtGd8zPHsjnbIGlOgxlFZTqsn4abWS2fnCIvBiI5jJMS4TAC9w5WVHbiWYRnsMRWP+Xb9p4IRFY0YagR0dmlHAWV454ehNyJ0yuf1tfC37YQxfnnyWXEh+r3PehBHoSMYxhtKPO3lNEaS2vj4JJ3cYlloMffrKJEbIW1VOtMq0Kf/h3cG7COliuOe74/wB7x9xNtmzUtPBG6d6wvKCv7/cuAy0AQAA"
+          },
+          "Metadata": {
+            "aws:cdk:path": "ezil-mum-lifecycle/CDKMetadata/Default"
+          }
+        }
+      }
+    }
+  }
+}

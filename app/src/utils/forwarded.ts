@@ -36,3 +36,31 @@ export function forwardedHost(headers: HeaderReader): string | null {
     const host = firstHop(headers.get('x-forwarded-host')) ?? firstHop(headers.get('host'));
     return host ? withoutDefaultPort(host, forwardedProto(headers)) : null;
 }
+
+/**
+ * The public origin the browser used (e.g. https://os-staging.ezil.work behind
+ * Caddy), not the app's own listener: `request.url` is the loopback address when
+ * the app sits behind a reverse proxy. Falls back to `fallback` with no host header.
+ */
+export function publicOrigin(headers: HeaderReader, fallback: string): string {
+    const host = forwardedHost(headers);
+    return host ? `${forwardedProto(headers) ?? 'http'}://${host}` : new URL(fallback).origin;
+}
+
+/** Public app origins this deployment may redirect to (auth callbacks, Stripe returns). */
+export const OWNED_APP_ORIGINS = [
+    'https://os.ezil.org',
+    'https://os.ezil.work',
+    'https://os-prod.ezil.work',
+    'https://os-staging.ezil.work',
+] as const;
+/** The production app. `os.ezil.org` is the landing site and redirects here. */
+export const CANONICAL_ORIGIN = 'https://os.ezil.work';
+
+/** `publicOrigin`, but only an owned origin (or local dev outside production); otherwise the canonical one. */
+export function ownedPublicOrigin(headers: HeaderReader, fallback: string): string {
+    const origin = publicOrigin(headers, fallback);
+    if ((OWNED_APP_ORIGINS as readonly string[]).includes(origin)) return origin;
+    if (process.env.NODE_ENV !== 'production' && /^http:\/\/(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?$/.test(origin)) return origin;
+    return CANONICAL_ORIGIN;
+}

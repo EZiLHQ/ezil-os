@@ -23,7 +23,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
-from ezil_host import agent as agentmod, cli, config, desktop  # noqa: E402
+from ezil_host import agent as agentmod, cli, config, desktop, edge  # noqa: E402
 from ezil_host.fsops import Refused  # noqa: E402
 
 TURN_USER, TURN_PASS = "turn-user-SECRET-1", "turn-pass-SECRET-2"
@@ -182,7 +182,9 @@ class RelayStore(unittest.TestCase):
             t[0] += s
             if calls[0] == 3:
                 desktop.write_desktop_config(self.cfg, desktop.validate_desktop_config(relay_config(now_ms), now_ms))
+        started = t[0]
         self.assertIsNotNone(desktop.wait_desktop_config(self.cfg, 30, clock=clock, sleep=sleep_then_arrive))
+        self.assertEqual(t[0] - started, 0.75)
 
 
 class AgentIce(unittest.TestCase):
@@ -252,6 +254,110 @@ class AgentIce(unittest.TestCase):
         blob = json.dumps(out) + "\n".join(self.logs)
         for s in SECRETS:
             self.assertNotIn(s, blob)
+
+
+class AiProxyDelivery(unittest.TestCase):
+    def setUp(self):
+        self.d, self.cfg = scratch(self)
+        self.ai = {"baseUrl": "https://aws-8443-guac-abcdef0123456789-fedcba9876543210-aws.ezil.work/ai/v1",
+                   "proxyToken": "cd" * 32}
+
+    def test_token_only_in_private_run_config_and_container_env(self):
+        now = int(time.time() * 1000)
+        c = desktop.validate_desktop_config(relay_config(now, ai=self.ai), now)
+        logs, printed = [], io.StringIO()
+        a = agentmod.Agent(self.cfg, {"generation": 1, "leaseEpoch": 2}, log=logs.append)
+        with redirect_stdout(printed), mock.patch.object(a, "_desktop_state", return_value="absent"), \
+                mock.patch.object(a, "_desktop_unit", return_value="pending"):
+            msg = {"op": "ice", "config": c, "leaseEpoch": 2, "ts": time.time(), "seq": 1}
+            msg["mac"] = agentmod.sign(a.key, msg)
+            answer = a.handle(json.dumps(msg).encode())
+            self.assertTrue(answer["ok"])
+            loaded = desktop.read_desktop_config(self.cfg, now)
+            desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=loaded)
+            status = a._desktop_status(time.time())
+        env, keys = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_AI_PROXY_TOKEN"], self.ai["proxyToken"])
+        self.assertEqual(env["EZIL_AI_BASE_URL"], self.ai["baseUrl"])
+        self.assertEqual(keys.count("EZIL_AI_PROXY_TOKEN"), 1)
+        self.assertTrue(status["aiConfigured"])
+        self.assertRegex(status["bootId"], r"^[0-9a-f-]{36}$")
+        self.assertNotIn(self.ai["proxyToken"], json.dumps(answer) + json.dumps(status) + printed.getvalue() + str(logs))
+        found = []
+        for root, _, files in os.walk(self.d):
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as f:
+                    if self.ai["proxyToken"].encode() in f.read():
+                        self.assertTrue(path.startswith(self.cfg.runDir + "/"), path)
+                        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, path)
+                        found.append(os.path.relpath(path, self.cfg.runDir))
+        self.assertEqual(sorted(found), ["bundle/config.json", "desktop-config.json"])
+
+    def test_image_or_lease_cannot_choose_token(self):
+        with open(self.cfg.imageConfigFile, "w") as f:
+            json.dump({"Env": ["EZIL_AI_PROXY_TOKEN=forged", "EZIL_AI_BASE_URL=https://evil.example"]}, f)
+        desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2, "ai": self.ai})
+        env, _ = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_AI_PROXY_TOKEN"], "")
+        self.assertEqual(env["EZIL_AI_BASE_URL"], "")
+        self.assertFalse(desktop.ai_configured(self.cfg))
+        desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=relay_config(ai=self.ai))
+        env, keys = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_AI_PROXY_TOKEN"], self.ai["proxyToken"])
+        self.assertEqual(keys.count("EZIL_AI_PROXY_TOKEN"), 1)
+
+    def test_invalid_ai_config_fails_without_echoing_secrets(self):
+        now = int(time.time() * 1000)
+        for ai in [None, {}, {**self.ai, "extra": "x"}, {**self.ai, "proxyToken": "short"},
+                   {**self.ai, "proxyToken": self.ai["proxyToken"] + "\n"},
+                   {**self.ai, "baseUrl": "http://evil.example/ai/v1"},
+                   {**self.ai, "baseUrl": self.ai["baseUrl"] + "?token=x"}]:
+            with self.subTest(ai=ai), self.assertRaisesRegex(ValueError, "^ice_config_invalid$"):
+                desktop.validate_desktop_config(relay_config(now, ai=ai), now)
+
+    def test_unsigned_or_tampered_push_cannot_install_a_token(self):
+        a = agentmod.Agent(self.cfg, {"generation": 1, "leaseEpoch": 2}, log=lambda _: None)
+        msg = {"op": "ice", "config": relay_config(ai=self.ai), "leaseEpoch": 2, "ts": time.time(), "seq": 1}
+        self.assertEqual(a.handle(json.dumps(msg).encode())["error"], "bad_mac")
+        msg["mac"] = agentmod.sign(a.key, msg)
+        msg["config"]["ai"]["proxyToken"] = "ef" * 32
+        self.assertEqual(a.handle(json.dumps(msg).encode())["error"], "bad_mac")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.runDir, desktop.DESKTOP_CONFIG)))
+
+        # Check the production edge digest gate without opening a socket. The
+        # edge signs the local agent message only after this body check succeeds.
+        e = object.__new__(edge.Edge)
+        e._agent = mock.Mock()
+        body = json.dumps(relay_config(ai=self.ai)).encode()
+        head = edge._Head("POST", "/unused", "HTTP/1.1", [("content-length", str(len(body)))], body)
+        with mock.patch.object(edge, "_reply") as reply:
+            e._ice(None, head, "0" * 64, "")
+        self.assertEqual(reply.call_args.args[2]["error"], "ice_digest_mismatch")
+        e._agent.assert_not_called()
+        e._ice(None, head, __import__("hashlib").sha256(body).hexdigest(), "")
+        self.assertEqual(e._agent.call_args.kwargs["config"]["ai"], self.ai)
+
+    def test_edge_status_preserves_boot_fields_but_never_config(self):
+        e = object.__new__(edge.Edge)
+        e.seq = mock.Mock()
+        e.seq.send.return_value = {"ok": True, "bootId": "11111111-1111-4111-8111-111111111111",
+                                   "aiConfigured": True, "config": {"ai": self.ai}, "proxyToken": self.ai["proxyToken"]}
+        with mock.patch.object(edge, "_reply") as reply:
+            e._agent(None, "desktop_status")
+        status = reply.call_args.args[2]
+        self.assertEqual(status["bootId"], e.seq.send.return_value["bootId"])
+        self.assertTrue(status["aiConfigured"])
+        self.assertNotIn(self.ai["proxyToken"], json.dumps(status))
+        self.assertNotIn("config", status)
+
+    def test_running_relay_without_ai_is_restarted_to_pick_up_token(self):
+        a = agentmod.Agent(self.cfg, {"generation": 1, "leaseEpoch": 2}, log=lambda _: None)
+        desktop.write_ice_state(self.cfg, "applied")
+        with mock.patch.object(a, "_desktop_state", return_value="running"):
+            self.assertEqual(a._accept_relay(relay_config(ai=self.ai))["state"], "restart_scheduled")
+            desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=relay_config(ai=self.ai))
+            self.assertEqual(a._accept_relay(relay_config(ai=self.ai))["state"], "already_running")
 
 
 class DesktopStep(unittest.TestCase):

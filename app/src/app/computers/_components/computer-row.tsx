@@ -36,107 +36,83 @@ function timeAgo(input: string | Date): string {
  * of via a counter or a disabled state that pops in and out.
  */
 export function ComputerRow({
-    slot,
     computer,
-    onCreate,
-    isCreating,
+    readOnly = false,
     onDelete,
     isDeleting = false,
 }: {
-    slot: number;
-    computer?: ComputerRowData;
-    onCreate: () => void;
-    isCreating: boolean;
-    /** Opens the delete confirmation. Filled rows only. */
+    computer: ComputerRowData;
+    /** An older computer: shown with Delete only, never opened from here. */
+    readOnly?: boolean;
+    /** Opens the delete confirmation. */
     onDelete?: () => void;
     /** True while this row's delete mutation is in flight. */
     isDeleting?: boolean;
 }) {
     const router = useRouter();
     const navigatingRef = useRef(false);
+    const handleOpen = () => {
+        if (readOnly || navigatingRef.current) return;
+        navigatingRef.current = true;
+        router.push(`${Routes.COMPUTER}/${computer.id}`);
+    };
+    const details = (
+        <div className="min-w-0">
+            <div className="truncate text-sm font-medium text-offwhite">{computer.name}</div>
+            <div className="text-xs text-gray-500">
+                Active {timeAgo(computer.lastOpenedAt ?? computer.createdAt)}
+            </div>
+        </div>
+    );
+    const menu = onDelete ? <RowMenu computerName={computer.name} disabled={isDeleting} onDelete={onDelete} /> : null;
 
-    if (computer) {
-        const handleOpen = () => {
-            if (navigatingRef.current) return;
-            navigatingRef.current = true;
-            router.push(`${Routes.COMPUTER}/${computer.id}`);
-        };
-
+    if (readOnly) {
         return (
             <div
-                role="button"
-                tabIndex={0}
-                data-testid="computer-row"
-                onClick={handleOpen}
-                onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        handleOpen();
-                    }
-                }}
-                className="group flex h-20 w-full cursor-pointer items-center justify-between rounded-lg border border-white/10 bg-charcoal-light px-5 transition-colors hover:border-teal"
+                data-testid="computer-row-older"
+                className="flex h-20 w-full items-center justify-between rounded-lg border border-white/10 bg-charcoal-light/50 px-5"
             >
-                <div className="flex min-w-0 items-center gap-3">
-                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-black/30 text-xs font-medium text-gray-400">
-                        {slot}
-                    </span>
-                    <div className="min-w-0">
-                        <div className="truncate text-sm font-medium text-offwhite">{computer.name}</div>
-                        <div className="text-xs text-gray-500">
-                            Active {timeAgo(computer.lastOpenedAt ?? computer.createdAt)}
-                        </div>
-                    </div>
-                </div>
+                {details}
                 <div className="flex shrink-0 items-center gap-2">
-                    {/* "Open" is a hover affordance; "Deleting…" is status,
-                        so it stays visible whether or not the pointer is
-                        over the row. */}
-                    <span
-                        className={`rounded-full border border-white/15 bg-black/30 px-3 py-1 text-xs font-medium text-offwhite transition-opacity ${
-                            isDeleting ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                        }`}
-                    >
-                        {isDeleting ? 'Deleting…' : 'Open'}
-                    </span>
-                    {onDelete ? (
-                        <RowMenu
-                            computerName={computer.name}
-                            disabled={isDeleting}
-                            onDelete={onDelete}
-                        />
-                    ) : null}
+                    {isDeleting ? <span className="text-xs text-gray-400">Deleting…</span> : null}
+                    {menu}
                 </div>
             </div>
         );
     }
 
     return (
-        <button
-            type="button"
-            onClick={onCreate}
-            disabled={isCreating}
-            data-testid="computer-row-empty"
-            className="flex h-20 w-full items-center justify-between rounded-lg border border-dashed border-white/15 px-5 text-left transition-colors hover:border-teal disabled:opacity-60"
+        <div
+            role="button"
+            tabIndex={0}
+            data-testid="computer-row"
+            onClick={handleOpen}
+            onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleOpen();
+                }
+            }}
+            className="group flex h-20 w-full cursor-pointer items-center justify-between rounded-lg border border-white/10 bg-charcoal-light px-5 transition-colors hover:border-teal"
         >
-            <div className="flex items-center gap-3">
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-black/20 text-xs font-medium text-gray-500">
-                    {slot}
+            {details}
+            <div className="flex shrink-0 items-center gap-2">
+                {/* "Open" is a hover affordance; "Deleting…" is status,
+                    so it stays visible whether or not the pointer is
+                    over the row. */}
+                <span
+                    className={`rounded-full border border-white/15 bg-black/30 px-3 py-1 text-xs font-medium text-offwhite transition-opacity ${
+                        isDeleting ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    }`}
+                >
+                    {isDeleting ? 'Deleting…' : 'Open'}
                 </span>
-                <span className="text-sm font-medium text-gray-400">
-                    {isCreating ? 'Creating…' : 'New computer'}
-                </span>
+                {menu}
             </div>
-            <PlusIcon className="h-4 w-4 text-gray-500" />
-        </button>
+        </div>
     );
 }
 
-/**
- * The row's overflow menu. Lives INSIDE the row's `role="button"` element,
- * so every handler here stops propagation — a click on "Delete computer"
- * that bubbled up would open the computer it is about to delete. Escape and
- * a click anywhere else close it.
- */
 function RowMenu({
     computerName,
     disabled,
@@ -214,14 +190,6 @@ function DotsIcon(props: React.SVGProps<SVGSVGElement>) {
             <circle cx="5" cy="12" r="2" />
             <circle cx="12" cy="12" r="2" />
             <circle cx="19" cy="12" r="2" />
-        </svg>
-    );
-}
-
-function PlusIcon(props: React.SVGProps<SVGSVGElement>) {
-    return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden="true" {...props}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
         </svg>
     );
 }

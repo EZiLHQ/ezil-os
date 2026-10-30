@@ -1,0 +1,129 @@
+import { getPricingContent, marketingContent as chrome } from '../pricing/pricing-content';
+import styles from '../marketing.module.css';
+
+/** The desktop is decorative: it demonstrates the workspace without booting a second app. */
+function ProductFrame() {
+    return (
+        <div className={styles.desktop} aria-hidden="true">
+            <div className={`${styles.window} ${styles.browser}`}>
+                <div className={styles.windowTitle}><span className={styles.windowDots} />{chrome.desktop.browser}</div>
+                <div className={styles.addressBar} />
+                <div className={styles.browserPreview}>
+                    <span className={styles.previewBlock} />
+                    <span className={styles.skeleton} /><span className={styles.skeleton} />
+                    <span className={styles.previewButton} />
+                </div>
+            </div>
+            <div className={`${styles.window} ${styles.editor}`}>
+                <div className={styles.windowTitle}><span className={styles.windowDots} />{chrome.desktop.editor}</div>
+                <div className={styles.editorBody}>
+                    <div className={styles.editorSidebar}><span /><span /><span /><span /></div>
+                    <div className={styles.codeLines}><span /><span /><span /><span /><span /><span /></div>
+                </div>
+            </div>
+            <div className={styles.taskbar}>
+                <span className={styles.taskbarBrand}>{chrome.brand}</span>
+                <span className={styles.appIcon}>◎</span><span className={styles.appIcon}>⌘</span><span className={styles.appIcon}>▱</span>
+            </div>
+        </div>
+    );
+}
+
+/**
+ * Both routes share a server-rendered document; /pricing starts at the plans,
+ * while ordinary home visits keep the hero.
+ */
+export default function MarketingHome({ focusPlans = false }: { focusPlans?: boolean; largeStorageEnabled?: boolean }) {
+    const copy = getPricingContent();
+
+    return (
+        <div className={styles.shell}>
+            <a className={styles.skipLink} href="#home-content">{chrome.skipLink}</a>
+            <header className={styles.header}>
+                <div className={styles.headerInner}>
+                    {/* A real document load on purpose: `/` redirects signed-in visitors to /os,
+                        which only boots on a document load (see app/src/app/page.tsx). */}
+                    {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+                    <a href="/" className={styles.brand}>{chrome.brand}</a>
+                    <nav aria-label={chrome.navigationLabel}>
+                        <a href={chrome.plansLink.href} className={styles.plansLink}>{chrome.plansLink.label}</a>
+                        <a href={chrome.signInLink.href}>{chrome.signInLink.label}</a>
+                        <a href={chrome.startLink.href} className={styles.primary}>{chrome.startLink.label}</a>
+                    </nav>
+                </div>
+            </header>
+            <main id="home-content" tabIndex={-1} className={styles.main}>
+                {!focusPlans && (
+                    <>
+                <section className={styles.hero} data-testid="home-hero" aria-labelledby="home-title">
+                        <p className={styles.pill}>{copy.hero.eyebrow}</p>
+                        <h1 id="home-title">{copy.hero.title}</h1>
+                        <p className={styles.description}>{copy.hero.description}</p>
+                        <div className={styles.heroActions}>
+                            <a data-testid="cta-start-free" className={styles.primary} href={chrome.startLink.href}>{chrome.startLink.label}</a>
+                            <a data-testid="cta-sign-in" className={styles.outline} href={chrome.signInLink.href}>{chrome.signInLink.label}</a>
+                        </div>
+                        <p className={styles.caption}>{copy.hero.caption}</p>
+                    </section>
+                    <ProductFrame />
+                    <section className={styles.features} aria-label={chrome.featuresLabel}>
+                        {chrome.features.map((feature, index) => (
+                            <div className={styles.feature} key={feature.title}>
+                                <span className={styles.icon} aria-hidden="true">{['▣', '⌘', '✦'][index]}</span>
+                                <h2>{feature.title}</h2>
+                                {'description' in feature && <p>{feature.description}</p>}
+                                {'badge' in feature && <p className={styles.pill}>{feature.badge}</p>}
+                            </div>
+                        ))}
+                    </section>
+                    </>
+                )}
+                {/* /pricing is plans-first: no hero above the cards, so the plans are
+                    in view on load without any scrolling script. */}
+                <section id="plans" className={styles.section} aria-labelledby="plans-title">
+                    {focusPlans
+                        ? <h1 id="plans-title">{copy.plansLabel}</h1>
+                        : <h2 id="plans-title">{copy.plansLabel}</h2>}
+                    <div className={styles.plans}>
+                        {copy.plans.map(plan => (
+                            <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.highlighted ? styles.premium : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
+                                <div className={styles.cardHeading}>
+                                    <h3 id={`plan-${plan.id}-title`}>{plan.name}</h3>
+                                    {plan.badge && <span className={styles.pill}>{plan.badge}</span>}
+                                </div>
+                                <p className={styles.tagline}>{plan.tagline}</p>
+                                <p className={styles.price}>{plan.price}<span>{plan.interval}</span></p>
+                                <p className={styles.caption}>{plan.billingNote}</p>
+                                <a data-testid={plan.id === 'free' ? undefined : `cta-get-${plan.id}`} className={plan.highlighted ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
+                                <p className={styles.includes}>{plan.includes}</p>
+                                <ul className={styles.bullets}>
+                                    {plan.bullets.map(bullet => <li key={bullet}>{bullet}</li>)}
+                                </ul>
+                            </article>
+                        ))}
+                    </div>
+                    <p className={styles.sharedNote}>{copy.sharedNote}</p>
+                </section>
+                <section className={styles.section} aria-labelledby="faq-title">
+                    <h2 id="faq-title">{copy.faq.title}</h2>
+                    {copy.faq.items.map(item => (
+                        // Keep questions as visible headings for assistive technology.
+                        <div key={item.question} className={styles.faq}>
+                            <h3>{item.question}</h3><p>{item.answer}</p>
+                        </div>
+                    ))}
+                </section>
+                <section className={styles.closing} aria-labelledby="closing-title">
+                    <h2 id="closing-title">{chrome.closing}</h2>
+                    <a className={styles.primary} href={chrome.startLink.href}>{chrome.startLink.label}</a>
+                </section>
+            </main>
+            <footer className={styles.footer}>
+                <p>{chrome.seller}</p>
+                <nav aria-label={chrome.footerLabel}>
+                    {chrome.links.map(link => <a key={link.href} href={link.href}>{link.label}</a>)}
+                </nav>
+            </footer>
+        </div>
+    );
+}

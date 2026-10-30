@@ -1,6 +1,9 @@
 /**
  * Layout-only Chromium checks; every write request is intercepted and aborted.
- * Start the local app with its development environment guards, then run:
+ * /login has one action, "Continue with EZiL ID", and renders it only when
+ * AUTH0_CLIENT_ID and AUTH0_SECRET_ID are set. Start the local app with its
+ * development environment guards and those two set (placeholders suffice: this
+ * never follows the link), then run:
  * PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules node e2e/login-layout.mjs
  * Optional: LOGIN_BASE_URL, LOGIN_SCREENSHOTS, PLAYWRIGHT_CHROMIUM_EXECUTABLE.
  * Keyboard checks resize the viewport; they do not emulate a native keyboard
@@ -28,7 +31,9 @@ try {
     });
     const response = await fetch(new URL('/login', base), { signal: AbortSignal.timeout(15_000) });
     assert(response.ok, 'Local login route must return success');
-    assert.match(await response.text(), /interactive-widget=resizes-content/, 'Login has its own keyboard policy before hydration');
+    const html = await response.text();
+    assert.match(html, /interactive-widget=resizes-content/, 'Login has its own keyboard policy before hydration');
+    assert.match(html, /Continue with EZiL ID/, 'Login renders the EZiL ID action (set AUTH0_CLIENT_ID and AUTH0_SECRET_ID)');
     await mkdir(screenshots, { recursive: true });
 } catch (error) {
     console.error(`UNABLE TO RUN: ${error.message.split('\n')[0]}`);
@@ -41,9 +46,9 @@ const sizes = [
     ['s24-ultra', 412, 915], ['landscape', 915, 412], ['tablet', 768, 1024],
     ['desktop', 1440, 900], ['short-desktop', 1440, 480],
 ];
+// An old `?method=email` link is ignored and renders the same single action.
 const modes = [
-    ['default', ''], ['callback-error', '?error=auth_callback_failed'],
-    ['email', '?method=email'], ['email-error', '?method=email&error=auth_callback_failed'],
+    ['default', ''], ['callback-error', '?error=auth_callback_failed'], ['legacy-email-link', '?method=email'],
 ];
 let passed = 0;
 let failed = 0;
@@ -110,8 +115,12 @@ async function geometry(page, fit = false) {
     for (const target of measured.targets) {
         assert(target.width >= 44 && target.height >= 44, `44px touch target: ${target.name}`);
     }
-    assert.equal(await page.locator('.ezil-lock-google').count(), 1, 'Exactly one Google action');
-    for (const target of await page.locator('.ezil-lock button:visible, .ezil-lock input:visible, .ezil-lock-footer a').all()) {
+    const action = page.locator('.ezil-lock-auth a');
+    assert.equal(await action.count(), 1, 'Exactly one EZiL ID action');
+    assert.equal((await action.innerText()).trim(), 'Continue with EZiL ID');
+    assert.match(await action.getAttribute('href'), /^\/auth\/auth0\/login\?/);
+    assert.equal(await page.locator('.ezil-lock form, .ezil-lock input, .ezil-lock button').count(), 0, 'No form, field or other sign-in control');
+    for (const target of await page.locator('.ezil-lock-auth a, .ezil-lock-footer a').all()) {
         await reachable(page, target);
     }
     return measured;
@@ -136,14 +145,6 @@ try {
             for (const [mode, query] of modes) {
                 await check(`${device} ${width}x${height} ${mode}`, async () => {
                     await ready(page, query);
-                    if (mode === 'email-error') {
-                        // Exercise the actual client error UI without a request
-                        // reaching Next's action or an authentication provider.
-                        await page.locator('#email').fill('layout@example.invalid');
-                        await page.locator('#password').fill('layout-only-placeholder');
-                        await page.locator('.ezil-lock-password').click();
-                        await page.locator('.ezil-lock-auth [role=alert]').waitFor();
-                    }
                     await geometry(page, mode === 'default');
                     await page.evaluate(() => scrollTo(0, 0));
                 });
@@ -152,19 +153,19 @@ try {
         } finally { await context.close(); }
     }
 
-    await check('disclosure focus, retained input and reduced motion', async () => {
+    await check('keyboard reaches the EZiL ID action, reduced motion', async () => {
         const context = await contextFor(360, 740, { reducedMotion: 'reduce' });
         try {
             const page = await context.newPage();
             await ready(page);
             assert.equal(await page.locator('.ezil-lock-profile').evaluate(el => getComputedStyle(el).animationName), 'none');
-            await page.locator('.ezil-lock-disclosure').click();
-            await page.waitForFunction(() => document.activeElement?.id === 'email');
-            await page.locator('#email').fill('layout@example.invalid');
-            await page.locator('.ezil-lock-disclosure').click();
-            assert(await page.locator('.ezil-lock-disclosure').evaluate(el => el === document.activeElement));
-            await page.locator('.ezil-lock-disclosure').click();
-            assert.equal(await page.locator('#email').inputValue(), 'layout@example.invalid');
+            const action = page.locator('.ezil-lock-auth a');
+            let focused = false;
+            for (let presses = 0; presses < 5 && !focused; presses++) {
+                await page.keyboard.press('Tab');
+                focused = await action.evaluate(el => el === document.activeElement);
+            }
+            assert(focused, 'Tab reaches "Continue with EZiL ID" within five presses');
         } finally { await context.close(); }
     });
 
@@ -178,13 +179,13 @@ try {
             const context = await contextFor(width, Math.max(height, 824), { reducedMotion: 'reduce', locale: 'de-DE' });
             try {
                 const page = await context.newPage();
-                await ready(page, '?method=email&error=auth_callback_failed');
+                await ready(page, '?error=auth_callback_failed');
                 if (enlarged) await page.addStyleTag({ content: 'html { font-size: 200% !important; }' });
-                await page.locator('#password').focus();
+                const action = page.locator('.ezil-lock-auth a');
+                await action.focus();
                 await page.setViewportSize({ width, height });
-                await page.keyboard.press('Tab');
-                assert(await page.locator('.ezil-lock-password').evaluate(el => el === document.activeElement));
-                await reachable(page, page.locator('.ezil-lock-password'));
+                assert(await action.evaluate(el => el === document.activeElement));
+                await reachable(page, action);
                 await geometry(page);
                 await page.screenshot({ path: path.join(screenshots, `${name}.png`), fullPage: true });
             } finally { await context.close(); }

@@ -1,0 +1,487 @@
+{
+  "schemaVersion": 1,
+  "namespace": "mum",
+  "stacks": {
+    "identity": {
+      "BoundaryEA298153": {
+        "added": [
+          {
+            "Action": [
+              "account:*",
+              "aws-marketplace:*",
+              "aws-portal:*",
+              "billing:*",
+              "budgets:*",
+              "ce:*",
+              "cloudfront:*",
+              "cloudwatch:*",
+              "dynamodb:*",
+              "ec2:AcceptReservedInstancesExchangeQuote",
+              "ec2:AllocateHosts",
+              "ec2:CreateCapacityReservation*",
+              "ec2:CreateFleet",
+              "ec2:CreateReservedInstancesListing",
+              "ec2:DeleteSnapshot",
+              "ec2:DeleteVolume",
+              "ec2:ModifyHosts",
+              "ec2:ModifyInstanceAttribute",
+              "ec2:Purchase*",
+              "ec2:RequestSpot*",
+              "elasticache:*",
+              "es:*",
+              "iam:*",
+              "organizations:*",
+              "payments:*",
+              "rds:*",
+              "redshift:*",
+              "route53:*",
+              "route53domains:*",
+              "savingsplans:*",
+              "sts:*",
+              "tax:*"
+            ],
+            "Effect": "Deny",
+            "Resource": "*"
+          },
+          {
+            "Action": [
+              "ec2:AttachVolume",
+              "ec2:CreateTags",
+              "ec2:DeleteTags",
+              "ec2:DetachVolume",
+              "ec2:StartInstances",
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "aws:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+              "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+            ]
+          }
+        ],
+        "removed": [
+          {
+            "Action": [
+              "account:*",
+              "aws-marketplace:*",
+              "aws-portal:*",
+              "billing:*",
+              "budgets:*",
+              "ce:*",
+              "cloudfront:*",
+              "cloudwatch:*",
+              "dynamodb:*",
+              "ec2:AcceptReservedInstancesExchangeQuote",
+              "ec2:AllocateHosts",
+              "ec2:CreateCapacityReservation*",
+              "ec2:CreateFleet",
+              "ec2:CreateReservedInstancesListing",
+              "ec2:DeleteSnapshot",
+              "ec2:DeleteTags",
+              "ec2:DeleteVolume",
+              "ec2:DetachVolume",
+              "ec2:ModifyHosts",
+              "ec2:ModifyInstanceAttribute",
+              "ec2:Purchase*",
+              "ec2:RequestSpot*",
+              "elasticache:*",
+              "es:*",
+              "iam:*",
+              "organizations:*",
+              "payments:*",
+              "rds:*",
+              "redshift:*",
+              "route53:*",
+              "route53domains:*",
+              "savingsplans:*",
+              "sts:*",
+              "tax:*"
+            ],
+            "Effect": "Deny",
+            "Resource": "*"
+          },
+          {
+            "Action": [
+              "ec2:AttachVolume",
+              "ec2:CreateTags",
+              "ec2:StartInstances",
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "aws:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+              "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+            ]
+          }
+        ]
+      }
+    },
+    "workflows": {
+      "LifecycleControllerRoleDefaultPolicy31C0D948": {
+        "added": [
+          {
+            "Action": "ec2:AttachVolume",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:namespace": "mum",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:AvailabilityZoneId": "aps1-az1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:computer",
+                  "ezil:generation",
+                  "ezil:fence"
+                ]
+              },
+              "Null": {
+                "aws:TagKeys": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:namespace": "mum",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:DeleteTags",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:pool"
+                ]
+              },
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "false",
+                "aws:TagKeys": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:namespace": "mum",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:DetachVolume",
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "true",
+                "aws:ResourceTag/ezil:computer-id": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "ec2:AvailabilityZoneId": "aps1-az1",
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:volume/*"
+          },
+          {
+            "Action": "ec2:RunInstances",
+            "Condition": {
+              "Null": {
+                "aws:RequestTag/ezil:pool": "false"
+              },
+              "StringNotEquals": {
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ]
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:TerminateInstances",
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "true",
+                "aws:ResourceTag/ezil:computer-id": "true"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:namespace": "mum",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "LifecycleObserverCurrentVersion3A1B23A0ca1bf0852b8bf4c978c487f8c78f720d"
+            }
+          },
+          {
+            "Action": [
+              "ec2:StartInstances",
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "true",
+                "aws:ResourceTag/ezil:computer-id": "false",
+                "aws:ResourceTag/ezil:pool": "true"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": [
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "false",
+                "aws:ResourceTag/ezil:pool": "true"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:namespace": "mum",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          }
+        ],
+        "removed": [
+          {
+            "Action": "ec2:AttachVolume",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:AvailabilityZoneId": "aps1-az1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge",
+                  "m6i.2xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:computer",
+                  "ezil:generation",
+                  "ezil:fence"
+                ]
+              },
+              "Null": {
+                "aws:TagKeys": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge",
+                  "m6i.2xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "ec2:DeleteTags",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "aws:TagKeys": [
+                  "ezil:pool"
+                ]
+              },
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "false",
+                "aws:TagKeys": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "aws:ResourceTag/ezil:pool": "1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge",
+                  "m6i.2xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "LifecycleObserverCurrentVersion3A1B23A0247d66942e435ebb1ae37961c7749e96"
+            }
+          },
+          {
+            "Action": [
+              "ec2:StartInstances",
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer-id": "false",
+                "aws:ResourceTag/ezil:pool": "true"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          },
+          {
+            "Action": [
+              "ec2:StopInstances",
+              "ec2:TerminateInstances"
+            ],
+            "Condition": {
+              "Null": {
+                "aws:ResourceTag/ezil:computer": "false"
+              },
+              "StringEquals": {
+                "aws:RequestedRegion": "ap-south-1",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "m6i.xlarge",
+                  "m6i.2xlarge"
+                ],
+                "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "ec2:ResourceTag/ezil:stage": "mum"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*"
+          }
+        ]
+      },
+      "LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4": {
+        "added": [
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "LifecyclePreparationObserverCurrentVersion54D5EE08ef5381391af0a263a41a6b8151b48533"
+            }
+          }
+        ],
+        "removed": [
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "LifecyclePreparationObserverCurrentVersion54D5EE083b7db58d4110c6b6b08be8240b1cfe65"
+            }
+          }
+        ]
+      },
+      "RecoveryRecoveryRoleDefaultPolicy2A415109": {
+        "added": [
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "RecoveryObserverCurrentVersion680AB0D7c75683f328543064a4b7287e9090fef7"
+            }
+          }
+        ],
+        "removed": [
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": {
+              "Ref": "RecoveryObserverCurrentVersion680AB0D78465f507cf183c58abfffe1b45b50e80"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

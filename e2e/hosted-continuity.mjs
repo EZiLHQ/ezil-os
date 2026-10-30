@@ -90,8 +90,7 @@ try {
   await context.addInitScript(continuityInit);
   page = await context.newPage();
   resizeObserver = observeScreenResizes(page, APP);
-  await page.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await signIn(page, { email: required('EZIL_E2E_EMAIL'), password: required('EZIL_E2E_PASSWORD') });
+  await signIn(page, { email: required('EZIL_E2E_EMAIL'), password: required('EZIL_E2E_PASSWORD'), app: APP });
   await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await bounded('session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   const api = async (path, body) => {

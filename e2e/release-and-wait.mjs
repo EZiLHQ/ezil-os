@@ -33,6 +33,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { signIn } from './sign-in.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
@@ -91,13 +92,7 @@ async function withDesktop(fn) {
   try {
     const ctx = await browser.newContext({ viewport: { width: 1024, height: 768 } });
     const p = await ctx.newPage();
-    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-    await Promise.all([
-      p.waitForURL((u) => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
-    if (/\/login/.test(p.url())) throw new Error('sign-in failed');
+    await signIn(p, { email: EMAIL, password: PASS, app: APP });
     await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
     await p.waitForTimeout(3000);
     return await fn(p);

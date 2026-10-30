@@ -73,6 +73,39 @@ describe('verifyIdentitySignature', () => {
     });
 });
 
+describe('verifyIdentitySignature: the BER form real IMDS emits', () => {
+    // Live in ap-south-1 (2026-10-21) /pkcs7 began `30 80` (indefinite length) with the document in a
+    // constructed OCTET STRING; a DER-only reader refused every real host (identity_signature_malformed).
+    // This fixture has that shape (`openssl cms -sign -nodetach -stream`). Its certificate is newer.
+    const BER_NOW = new Date('2026-12-01T00:00:00Z');
+    const ber = Buffer.from(fx.pkcs7_dsa_ber_embedded, 'base64');
+
+    it('is BER: indefinite outer length and a constructed OCTET STRING', () => {
+        expect(ber.subarray(0, 2)).toEqual(Buffer.from([0x30, 0x80]));
+        expect(ber.includes(Buffer.from([0x24, 0x80]))).toBe(true);
+    });
+    it('accepts it against its certificate', () => {
+        expect(verifyIdentitySignature(fx.document, fx.pkcs7_dsa_ber_embedded, fx.cert_dsa_ber, BER_NOW)).toEqual({ ok: true });
+    });
+    it('refuses it when the document differs by one character (embedded content compared)', () => {
+        const doc = fx.document.replace('i-22222222222222222', 'i-22222222222222223');
+        expect(verifyIdentitySignature(doc, fx.pkcs7_dsa_ber_embedded, fx.cert_dsa_ber, BER_NOW)).toEqual({ ok: false, reason: 'identity_signature_mismatch' });
+    });
+    it('refuses it against another key', () => {
+        expect(verifyIdentitySignature(fx.document, fx.pkcs7_dsa_ber_embedded, fx.cert_dsa, BER_NOW).ok).toBe(false);
+    });
+    it('a missing end-of-contents is malformed, not accepted', () => {
+        const cut = ber.subarray(0, ber.length - 2).toString('base64');
+        expect(verifyIdentitySignature(fx.document, cut, fx.cert_dsa_ber, BER_NOW)).toEqual({ ok: false, reason: 'identity_signature_malformed' });
+    });
+    it('an indefinite length on a primitive value is malformed', () => {
+        // OCTET STRING (primitive) with 0x80: replace the first chunk tag inside the constructed string.
+        const at = ber.indexOf(Buffer.from([0x24, 0x80])) + 2;
+        const bad = Buffer.from(ber); bad[at] = 0x04; bad[at + 1] = 0x80;
+        expect(verifyIdentitySignature(fx.document, bad.toString('base64'), fx.cert_dsa_ber, BER_NOW)).toEqual({ ok: false, reason: 'identity_signature_malformed' });
+    });
+});
+
 describe('readIdentityCertificate', () => {
     const env = (v: unknown) => ({ [AWS_IDENTITY_CERTS_ENV]: typeof v === 'string' ? v : JSON.stringify(v) });
     it('returns the region certificate', () => {

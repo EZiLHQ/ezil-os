@@ -1,13 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as cloudflare from '../cloudflare-guacamole-provider';
 import { AWS_TIERS } from './aws-config';
 import { mintPreviewTokenV2, type WorkerAuth } from './preview-token-v2';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { AWS_INSTANCE_SIZES, CLOUDFLARE_CONTAINER_SIZE, describePlacement, readSystemInfo } from './system-info';
+import { AWS_INSTANCE_SIZES, CLOUDFLARE_CONTAINER_SIZE, describeFreePlan, describePlacement, describePlanPlacement, readSystemInfo } from './system-info';
+
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('No live billing DB in tests'); } }));
 
 const OWNER = '11111111-1111-4111-8111-111111111111';
 const OTHER = '33333333-3333-4333-8333-333333333333';
@@ -148,6 +152,16 @@ describe('readSystemInfo — read only, honest about what is not known', () => {
         expectNoWorkerCall();
     });
 
+    it("another user's placement under an active image job: null (→ NOT_FOUND) before any reservation lookup", async () => {
+        const { db, statements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: computerId, owner_user_id: OTHER, provider: 'aws-ec2', workspace_store: 'ebs', image_upgrade_job_id: '33333333-3333-4333-8333-333333333333' })],
+            imageJobs: [{ job_id: '33333333-3333-4333-8333-333333333333', computer_id: computerId, phase: 'snapshot_pending' }],
+        });
+        expect(await readSystemInfo(db, computer, READS)).toBeNull();
+        expect(statements.some((st: { sql: string }) => st.sql.includes('placement:image-reservation'))).toBe(false);
+        expectNoWorkerCall();
+    });
+
     it('an unreadable placement (missing table, duplicate, unknown provider): "unknown", not Cloudflare', async () => {
         const missing = { execute: async () => { throw new Error('relation "public.ezil_computer_placements" does not exist'); } };
         expect(await readSystemInfo(missing, computer, READS)).toMatchObject({ provider: 'unknown', providerSource: 'unavailable', image: UNKNOWN_IMAGE });
@@ -252,3 +266,146 @@ function baseRecord() {
         fenceToken: null, lifecycleJobId: null, lifecycleDigest: null, lastError: null, updatedAt: new Date(0),
     };
 }
+
+describe('actual placement versus paid entitlement', () => {
+    const paid = { source: 'billing_v2' as const, status: 'active', provider: 'aws' as const, planId: 'standard_monthly_v3', size: 'std-2' as const };
+    const cf = describePlacement({ provider: 'cloudflare', store: 'r2', record: { ...baseRecord(), provider: 'cloudflare' } });
+    it('keeps CF region unknown and 6 GiB while preparing 8 GB in Mumbai', () => {
+        expect(describePlanPlacement(cf, paid, null, { EZIL_AWS_COMPUTERS_ENABLED: '1' })).toMatchObject({ vcpu: 2, memoryGB: 8, region: 'ap-south-1', status: 'preparing' });
+        expect(cf.machine).toMatchObject({ memoryMiB: 6144, region: null });
+    });
+    it.each([{}, { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '1' }])('explains operations pause with %j', env => {
+        expect(describePlanPlacement(cf, paid, null, env)).toMatchObject({ status: 'blocked', reason: 'AWS paused by operations' });
+    });
+    it('shows a failure and preserves the fresh-provision outcome while preparing', () => {
+        expect(describePlanPlacement(cf, paid, { state: 'failed_needs_operator', reason: 'head_moved', outcome: null }, ON_ENV)).toMatchObject({ status: 'failed' });
+        expect(describePlanPlacement(cf, paid, { state: 'committed', reason: 'fresh_provision', outcome: 'fresh_provision' }, ON_ENV)).toMatchObject({ status: 'preparing', outcome: 'fresh_provision' });
+    });
+    it('requires actual Mumbai size and a ready lifecycle before saying ready', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'RUNNING' };
+        expect(describePlanPlacement(aws, paid, null, ON_ENV)?.status).toBe('ready');
+        expect(describePlanPlacement({ ...aws, lifecycleState: 'PROVISIONING' }, paid, null, ON_ENV)?.status).toBe('preparing');
+        expect(describePlanPlacement({ ...aws, machine: { ...aws.machine, region: 'us-east-1' } }, paid, null, ON_ENV)?.status).toBe('preparing');
+    });
+    it('round 3: a size mismatch alone is ready (current vs selected), never being prepared', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'RUNNING' };
+        const premium = { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' as const };
+        expect(describePlanPlacement(aws, premium, null, ON_ENV)).toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-8', vcpu: 8, transition: null });
+        expect(describePlanPlacement({ ...aws, lifecycleState: 'STOPPED' }, premium, null, ON_ENV)?.status).toBe('ready');
+    });
+    it('round 3: being_prepared ONLY while a transition is in flight; a failed one shows failed with its reason', () => {
+        const aws = { ...cf, provider: 'aws-ec2' as const, machine: { ...cf.machine, region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' }, lifecycleState: 'STOPPED' };
+        const premium = { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' as const };
+        const view = { transitionId: 't', kind: 'switch' as const, current: 'std-2' as const, target: 'cmp-8' as const, reason: null, requestedAt: '2026-10-28T00:00:00.000Z', endedAt: null, revertAvailable: false };
+        for (const phase of ['requested', 'stopping', 'waking'] as const)
+            expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase })?.status).toBe('being_prepared');
+        expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase: 'failed', reason: 'capacity_unavailable', revertAvailable: true }))
+            .toMatchObject({ status: 'failed', reason: 'capacity_unavailable', transition: { revertAvailable: true } });
+        expect(describePlanPlacement(aws, premium, null, ON_ENV, { ...view, phase: 'done' })?.status).toBe('ready');
+        expect(describePlanPlacement(aws, premium, null, { ...ON_ENV, EZIL_AWS_KILL_SWITCH: '1' }, { ...view, phase: 'waking' })?.status).toBe('blocked');
+    });
+    it('uses the Premium entitled size', () => {
+        expect(describePlanPlacement(cf, { ...paid, planId: 'premium_monthly_v3', size: 'cmp-8' }, null, ON_ENV)).toMatchObject({ vcpu: 8, memoryGB: 32 });
+    });
+});
+const ON_ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1' };
+
+describe('hotfix 3: a stored switch failure is reconciled against the placement (System plan row)', () => {
+    // 2026-10-29: std-2 → cmp-4 failed in its stop phase at epoch 7 (no wake recorded); a heal released the
+    // host and the user's own open came up RUNNING at epoch 8 on m6i.xlarge = the switch's target.
+    const stopFailed = { v: 1, transitionId: '44444444-4444-4444-8444-444444444444', requestId: 'request-0001', kind: 'switch', computerId, userId: OWNER,
+        current: 'std-2', target: 'cmp-4', phase: 'failed', reason: 'stop_placement_unconfirmed', fromGeneration: 3, fromLeaseEpoch: 7,
+        requestedAt: '2026-10-29T09:36:00.000Z', stoppingAt: '2026-10-29T09:36:00.000Z', wakingAt: null, endedAt: '2026-10-29T09:40:00.000Z' };
+    const dialect = new PgDialect();
+    /** The fake placement db plus the computer row's advisory transition record (`readComputerMeta`). */
+    function awsDb(placement: { lease_epoch: number; instance_type: string; state?: string }, transition: unknown = stopFailed) {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: OWNER, region: 'ap-south-1',
+            generation: 4, state: 'RUNNING', ...placement })] });
+        return { execute: async (query: SQL) => dialect.sqlToQuery(query).sql.includes('/* transition:read */')
+            ? { rows: [{ transition, opening: null }] } : db.execute(query) };
+    }
+    async function system(db: ReturnType<typeof awsDb>, size: 'cmp-4' | 'cmp-8') {
+        const billing = await import('@/server/billing/v2/compute-access');
+        const migrations = await import('./provider-migrate-orchestrator');
+        vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => ({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size }) });
+        vi.spyOn(migrations, 'migrationStatusFor').mockResolvedValue(null);
+        return readSystemInfo(db, computer, { ...READS, ...ON_ENV });
+    }
+    it('recovered (next epoch RUNNING on the target): ready on the placement size, no transition', async () => {
+        const info = await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.xlarge' }), 'cmp-4');
+        expect(info?.machine).toMatchObject({ instanceType: 'm6i.xlarge', vcpu: 4 });
+        expect(info?.plan).toMatchObject({ status: 'ready', reason: null, current: 'cmp-4', selected: 'cmp-4', transition: null });
+    });
+    it('recovered with a different next-start choice: the pending selection is still reported', async () => {
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.xlarge' }), 'cmp-8'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'cmp-4', selected: 'cmp-8', vcpu: 8, transition: null });
+    });
+    it('a real failure (still the switch\'s epoch on the old size) stays failed with the pre-switch size', async () => {
+        expect((await system(awsDb({ lease_epoch: 7, instance_type: 'm6i.large' }), 'cmp-4'))?.plan).toMatchObject({ status: 'failed',
+            reason: 'stop_placement_unconfirmed', current: 'std-2', transition: { phase: 'failed', current: 'std-2', target: 'cmp-4', revertAvailable: true } });
+        expect((await system(awsDb({ lease_epoch: 7, instance_type: 'm6i.large', state: 'STOPPED' }), 'cmp-4'))?.plan).toMatchObject({ status: 'failed' });
+    });
+    it('superseded (no wake recorded; the next epoch is the user\'s own open on another size): ready, no transition', async () => {
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null });
+    });
+    it('its own wake landed on another size: failed size_not_applied', async () => {
+        const woke = { ...stopFailed, reason: 'wake_timeout', wakingAt: '2026-10-29T09:37:00.000Z' };
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }, woke), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'failed', reason: 'size_not_applied', transition: { reason: 'size_not_applied', revertAvailable: true } });
+    });
+    it('an unsettled record that resolves failed keeps the existing rule: shown at the next epoch, history past it', async () => {
+        const dead = { ...stopFailed, phase: 'waking', reason: null, wakingAt: '2026-10-29T09:37:00.000Z', endedAt: null };
+        expect((await system(awsDb({ lease_epoch: 8, instance_type: 'm6i.large' }, dead), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'failed', reason: 'size_not_applied', transition: { phase: 'failed', reason: 'size_not_applied' } });
+        expect((await system(awsDb({ lease_epoch: 9, instance_type: 'm6i.large' }, dead), 'cmp-4'))?.plan)
+            .toMatchObject({ status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null });
+    });
+});
+
+it('wires computer-scoped migration status into the production System data path', async () => {
+    const billing = await import('@/server/billing/v2/compute-access');
+    const migrations = await import('./provider-migrate-orchestrator');
+    vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => ({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'standard_monthly_v3', size: 'std-2' }) });
+    const status = vi.spyOn(migrations, 'migrationStatusFor').mockResolvedValue({ state: 'committed', reason: 'fresh_provision', outcome: 'fresh_provision' });
+    const { db } = cloudflareDb();
+    const info = await readSystemInfo(db, computer, { ...READS, ...ON_ENV });
+    expect(status).toHaveBeenCalledWith(OWNER, computerId, db);
+    expect(info).toMatchObject({ provider: 'cloudflare', machine: { memoryMiB: 6144, region: null }, plan: { memoryGB: 8, status: 'preparing', outcome: 'fresh_provision' } });
+});
+
+describe('round 4: a Free plan is reported, never "not available"', () => {
+    const free = { source: 'billing_v2' as const, status: 'active', provider: 'cloudflare' as const, planId: 'free_v3', size: 'free-cf' as const, paymentIssue: false };
+    const cf = describePlacement({ provider: 'cloudflare', store: 'r2', record: { ...baseRecord(), provider: 'cloudflare' } });
+    const aws = describePlacement({ provider: 'aws-ec2', store: 'ebs', record: { ...baseRecord(), instanceType: 'm6i.large', region: 'ap-south-1' } });
+    it('Free on Cloudflare (or not yet placed) is Free 2 vCPU / 6 GB on Cloudflare', () => {
+        const expected = { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', current: 'free-cf' };
+        expect(describeFreePlan(cf, free)).toMatchObject(expected);
+        expect(describeFreePlan(describePlacement({ provider: 'cloudflare', store: 'r2', record: null }), free)).toMatchObject(expected);
+        const unread = describeFreePlan({ ...cf, provider: 'unknown', providerSource: 'reads_off' }, free);
+        expect(unread).toMatchObject({ name: 'Free', provider: 'cloudflare', vcpu: 2, memoryGB: 6 });
+        expect(unread).not.toHaveProperty('standing');
+    });
+    it('Free with the AWS computer still placed reports that configuration as files_on_aws', () => {
+        expect(describeFreePlan(aws, free)).toEqual({ name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, region: 'ap-south-1',
+            status: 'ready', reason: null, outcome: null, current: 'std-2', selected: null, transition: null });
+        const big = describePlacement({ provider: 'aws-ec2', store: 'ebs', record: { ...baseRecord(), instanceType: 'm6i.2xlarge', region: 'ap-south-1' } });
+        expect(describeFreePlan(big, free)).toMatchObject({ vcpu: 8, memoryGB: 32, current: 'cmp-8', standing: 'files_on_aws' });
+        expect(describeFreePlan(describePlacement({ provider: 'aws-ec2', store: 'ebs', record: baseRecord() }), free)).toMatchObject({ vcpu: 2, memoryGB: 8, current: null, region: null });
+    });
+    it('only for a billing Free plan: paid AWS and unknown entitlements are not Free', () => {
+        expect(describeFreePlan(aws, { ...free, provider: 'aws', planId: 'standard_monthly_v3', size: 'std-2' })).toBeUndefined();
+        expect(describeFreePlan(aws, null)).toBeUndefined();
+        expect(describeFreePlan(aws, { status: 'active', planId: 'free_v3' })).toBeUndefined();
+    });
+    it('paid plans now carry their name and provider', () => {
+        const paid = { source: 'billing_v2' as const, status: 'active', provider: 'aws' as const, planId: 'premium_monthly_v3', size: 'cmp-4' as const };
+        expect(describePlanPlacement(aws, paid, null, ON_ENV)).toMatchObject({ name: 'Premium', provider: 'aws', region: 'ap-south-1' });
+    });
+    it('the System data path sets the Free plan instead of nothing', async () => {
+        const billing = await import('@/server/billing/v2/compute-access');
+        vi.spyOn(billing, 'billingV2EntitlementReader').mockReturnValue({ read: async () => free });
+        const { db } = cloudflareDb();
+        expect(await readSystemInfo(db, computer, { ...READS, ...ON_ENV })).toMatchObject({ provider: 'cloudflare', plan: { name: 'Free', provider: 'cloudflare', standing: 'free' } });
+    });
+});

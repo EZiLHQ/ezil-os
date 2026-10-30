@@ -378,22 +378,30 @@ describe("comment templates are data, asserted verbatim", () => {
 		expect(body).toContain("CONTRIBUTING.md#sign-off-dco");
 	});
 
-	it("not-required-red explains fork/GHCR, cites ci.yml:65-78, and ends with the mandated sentence", () => {
+	it("not-required-red explains fork/GHCR, cites ci.yml, and ends with the mandated sentence", () => {
 		const body = TEMPLATES["not-required-red"];
 		expect(body).toContain("container (real image)");
 		expect(body).toContain("local (typecheck + unit + smoke)");
 		expect(body).toContain("private GitHub Container Registry");
-		expect(body).toContain(".github/workflows/ci.yml#L65-L78");
+		expect(body).toMatch(/\.github\/workflows\/ci\.yml#L\d+-L\d+/);
 		expect(body.endsWith("Neither is one of the fifteen required contexts, so this does not block your merge.")).toBe(true);
 	});
 
-	it("the ci.yml#L65-L78 citation is not a stale line number: those lines in the real file are the fork/GHCR paragraph", () => {
+	it("not-required-red displays the same line range that its ci.yml URL targets", () => {
+		const body = TEMPLATES["not-required-red"];
+		const m = /\[`\.github\/workflows\/ci\.yml` lines (\d+)–(\d+)\]\(https:\/\/github\.com\/EZiLHQ\/ezil-os\/blob\/main\/\.github\/workflows\/ci\.yml#L(\d+)-L(\d+)\)/.exec(body);
+		expect(m).not.toBeNull();
+		const [, labelStart, labelEnd, urlStart, urlEnd] = m!;
+		expect([labelStart, labelEnd]).toEqual([urlStart, urlEnd]);
+	});
+
+	it("the ci.yml citation covers exactly the current fork/GHCR paragraph", () => {
 		// A deep link pins a LINE RANGE, not the text at it -- the two can drift
 		// independently the moment either file is edited. This test re-derives the
 		// range from `TEMPLATES["not-required-red"]` itself and reads the CURRENT
 		// `.github/workflows/ci.yml` from disk, so a future edit to either file that
-		// silently moves the paragraph fails HERE, which is exactly the bug this row
-		// was created to fix (the link had drifted from 62-72 to 65-78).
+		// silently moves the paragraph fails HERE. Match the current explanation
+		// of private-package access, not wording removed from an older workflow.
 		const body = TEMPLATES["not-required-red"];
 		const m = /ci\.yml#L(\d+)-L(\d+)/.exec(body);
 		expect(m).not.toBeNull();
@@ -403,16 +411,18 @@ describe("comment templates are data, asserted verbatim", () => {
 
 		const ciYmlPath = join(import.meta.dir, "..", ".github", "workflows", "ci.yml");
 		const lines = readFileSync(ciYmlPath, "utf8").split(/\r?\n/);
+		expect(start).toBeGreaterThan(1);
+		expect(end).toBeGreaterThanOrEqual(start);
+		expect(end).toBeLessThan(lines.length);
 		const cited = lines.slice(start - 1, end).join("\n"); // 1-indexed, inclusive
 
-		expect(cited).toContain("FORK PRs CANNOT PULL THE PRIVATE PACKAGE");
-		expect(cited).toContain("private `ezilhq/ezil-os-desktop`");
-		// A substring check alone is too weak: the OLD (wrong) range 62-72 still
-		// overlaps the tail of this paragraph (which starts at 65), so it would
-		// still contain both phrases above and this test would not have caught the
-		// bug it exists for. The paragraph is comment-boxed by a bare `#` line
-		// immediately before its first line and immediately after its last --
-		// asserting THOSE two lines pins the exact boundary, not just an overlap.
+		expect(cited).toContain("THE PACKAGE IS PRIVATE — GHCR's default");
+		expect(cited).toContain("`packages: read`");
+		expect(cited).toContain("a fork's PR too");
+		expect(cited).toContain('"Actions access"');
+		// Require one complete comment paragraph, not an overlapping or expanded
+		// range that happens to contain these phrases among unrelated sections.
+		for (const line of lines.slice(start - 1, end)) expect(line.trim()).toMatch(/^# \S/);
 		expect((lines[start - 2] ?? "").trim()).toBe("#"); // the line just before `start`
 		expect((lines[end] ?? "").trim()).toBe("#"); // the line just after `end`
 	});

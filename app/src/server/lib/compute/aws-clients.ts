@@ -5,15 +5,17 @@
  * - `LifecycleExecutionReader`  → Step Functions `DescribeExecution`
  * - `Ec2EnrollmentDescriber`    → EC2 `DescribeInstances` / `DescribeVolumes`
  *
- * 🔴 CREDENTIALS. There are NO long-lived AWS keys. The app runs on Vercel, and
- * every call is made with short-lived credentials from
+ * 🔴 CREDENTIALS. There are NO long-lived AWS keys. On Vercel, every call uses
+ * short-lived credentials from
  * `AssumeRoleWithWebIdentity` on the region's app-caller role, using the Vercel
  * OIDC token of the CURRENT request (`x-vercel-oidc-token` in the request
  * context, else `VERCEL_OIDC_TOKEN_FILE`, else `VERCEL_OIDC_TOKEN`; Vercel
  * docs, "OIDC Federation Reference"). Every client is built with an explicit
  * credentials function, so the SDK's default chain (env keys, shared files,
  * instance metadata) is never consulted. A missing token is
- * `aws_caller_unavailable`; there is no fallback of any kind.
+ * `aws_caller_unavailable`; there is no fallback of any kind. Off Vercel,
+ * explicit IMDSv2 credentials sign STS `AssumeRole` into the SAME regional
+ * app-caller role; instance-role credentials never sign downstream calls.
  *
  * 🔴 REGIONS. A computer lives in its placement's region; every call names
  * that region, and an ARN from another region (or another account than the
@@ -23,15 +25,18 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
-import { DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
-import { DescribeExecutionCommand, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
-import { AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
+import { DescribeSnapshotsCommand, DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
+import { DescribeExecutionCommand, GetExecutionHistoryCommand, type GetExecutionHistoryCommandOutput, type HistoryEvent, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
+import { AssumeRoleCommand, AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
 import { AWS_REGION_PATTERN, isAwsComputersEnabled, readAwsRegions, type Env } from './aws-config';
 import { AwsClientError, toAwsClientError } from './aws-errors';
+import { instanceMetadataCredentials } from './aws-instance-credentials';
 import type { Ec2EnrollmentDescriber, Ec2EnrollmentView } from './aws-enroll';
 import type { LifecycleStarter } from './aws-ec2';
+import type { RebaseSnapshotDescriber } from './aws-rebase-evidence';
 import type { LifecycleExecutionReader } from './aws-receipts';
 
 // ── Errors (aws-errors.ts, SDK-free) ──────────────────────────────────────
@@ -154,6 +159,52 @@ const NO_AMBIENT_CREDENTIALS = async (): Promise<never> => {
     throw new AwsClientError('aws_caller_unavailable', false, 'AmbientCredentialsRefused');
 };
 
+/** EC2 base credentials are used only by STS; downstream clients use this regional session. */
+export function instanceRoleCallerCredentials(opts: {
+    roleArn: string;
+    sts: Sender;
+    now?: () => Date;
+}): () => Promise<AwsCredentials> {
+    if (!ROLE_ARN.test(opts.roleArn)) throw new AwsClientError('aws_config', false, 'AppCallerRoleArnInvalid');
+    const now = opts.now ?? (() => new Date());
+    let cached: AwsCredentials | null = null;
+    let pending: Promise<AwsCredentials> | null = null;
+    const assume = async (): Promise<AwsCredentials> => {
+        let out: { Credentials?: { AccessKeyId?: string; SecretAccessKey?: string; SessionToken?: string; Expiration?: Date } };
+        try {
+            out = await opts.sts.send(new AssumeRoleCommand({
+                RoleArn: opts.roleArn,
+                RoleSessionName: `ezil-os-ec2-${randomBytes(6).toString('hex')}`,
+                DurationSeconds: 900,
+            })) as typeof out;
+        } catch (error) {
+            const mapped = toAwsClientError(error);
+            if (mapped.code === 'credentials_unavailable' || mapped.code === 'aws_throttled') throw mapped;
+            throw new AwsClientError('aws_caller_unavailable', false, mapped.awsName);
+        }
+        const c = out.Credentials;
+        if (!c?.AccessKeyId || !c.SecretAccessKey || !c.SessionToken || !(c.Expiration instanceof Date)
+            || !Number.isFinite(c.Expiration.getTime()) || c.Expiration.getTime() <= now().getTime()) {
+            throw new AwsClientError('aws_caller_unavailable', false, 'StsCredentialsIncomplete');
+        }
+        return { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiration: c.Expiration };
+    };
+    return async () => {
+        if (cached && cached.expiration.getTime() - CREDENTIAL_MARGIN_MS > now().getTime()) return cached;
+        pending ??= assume().finally(() => { pending = null; });
+        cached = await pending;
+        return cached;
+    };
+}
+
+const CREDENTIAL_SOURCE_LOGGED = Symbol.for('ezil.aws-credential-source-logged');
+function logCredentialSource(source: 'vercel-oidc' | 'ec2-instance-role'): void {
+    const state = globalThis as Record<symbol, unknown>;
+    if (state[CREDENTIAL_SOURCE_LOGGED]) return;
+    state[CREDENTIAL_SOURCE_LOGGED] = true;
+    console.info(source);
+}
+
 // ── ARN pinning ─────────────────────────────────────────────────────────
 
 const VERSION_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:([A-Za-z0-9_-]{1,80}):([1-9][0-9]*)$/;
@@ -202,6 +253,32 @@ export function createSfnLifecycleStarter(sfnFor: (region: string) => RegionalCl
 /** `DescribeExecution` of one computer job, in `region`, under the caller role's account. */
 export function createSfnExecutionReader(sfnFor: (region: string) => RegionalClient): LifecycleExecutionReader {
     return {
+        async history(region, executionArn) {
+            assertRegion(region);
+            const m = EXECUTION_ARN.exec(executionArn);
+            if (!m) throw new AwsClientError('aws_config', false, 'ExecutionArnInvalid');
+            const { client, account } = sfnFor(region);
+            if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
+            if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
+            const events: HistoryEvent[] = [], tokens = new Set<string>();
+            let nextToken: string | undefined, bytes = 0;
+            for (let page = 0; page < 100; page++) {
+                let out: GetExecutionHistoryCommandOutput;
+                try {
+                    out = await client.send(new GetExecutionHistoryCommand({ executionArn, nextToken,
+                        maxResults: 1000, reverseOrder: false, includeExecutionData: true })) as GetExecutionHistoryCommandOutput;
+                } catch (error) { throw toAwsClientError(error); }
+                bytes += Buffer.byteLength(JSON.stringify(out));
+                if (!Array.isArray(out.events) || events.length + out.events.length > 10000 || bytes > 8 * 1024 * 1024)
+                    throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound');
+                events.push(...out.events);
+                if (out.nextToken === undefined) return events;
+                if (typeof out.nextToken !== 'string' || !out.nextToken || tokens.has(out.nextToken))
+                    throw new AwsClientError('aws_error', true, 'ExecutionHistoryPagination');
+                tokens.add(out.nextToken); nextToken = out.nextToken;
+            }
+            throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound');
+        },
         async describe(region, executionArn) {
             assertRegion(region);
             const m = EXECUTION_ARN.exec(executionArn);
@@ -209,7 +286,7 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             const { client, account } = sfnFor(region);
             if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
             if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
-            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date };
+            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date; stopDate?: Date; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number };
             try {
                 out = (await client.send(new DescribeExecutionCommand({ executionArn }))) as typeof out;
             } catch (error) {
@@ -217,7 +294,9 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             }
             if (typeof out.status !== 'string') throw new AwsClientError('aws_error', false, 'DescribeExecutionNoStatus');
             const startDate = out.startDate instanceof Date && Number.isFinite(out.startDate.getTime()) ? out.startDate : null;
-            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate };
+            const stopDate = out.stopDate instanceof Date && Number.isFinite(out.stopDate.getTime()) ? out.stopDate : null;
+            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate, stopDate,
+                input: out.input, executionArn: out.executionArn, stateMachineVersionArn: out.stateMachineVersionArn, stateMachineAliasArn: out.stateMachineAliasArn, redriveCount: out.redriveCount };
         },
     };
 }
@@ -225,8 +304,15 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
 // ── EC2 (enrollment's live check) ────────────────────────────────────────
 
 type Ec2Tag = { Key?: string; Value?: string };
-const tagMap = (tags: readonly Ec2Tag[] | undefined): Record<string, string> =>
-    Object.fromEntries((tags ?? []).filter((t) => typeof t.Key === 'string').map((t) => [t.Key!, t.Value ?? '']));
+const tagMap = (tags: readonly Ec2Tag[] | undefined): Record<string, string> => {
+    const out: Record<string, string> = Object.create(null);
+    for (const tag of tags ?? []) {
+        if (typeof tag.Key !== 'string' || typeof tag.Value !== 'string' || Object.hasOwn(out, tag.Key))
+            throw new AwsClientError('aws_error', false, 'DescribeTagsAmbiguous');
+        out[tag.Key] = tag.Value;
+    }
+    return out;
+};
 
 /**
  * The read-only describe C-6 step 3 needs, in `region`. null when EC2 has no
@@ -242,6 +328,15 @@ export interface Ec2VolumeView {
     volumeId: string;
     /** EC2 volume state: creating | available | in-use | deleting | deleted | error. */
     state: string;
+    tags?: Readonly<Record<string, string>>;
+    attachments?: readonly { instanceId: string; state: string }[];
+    encrypted?: boolean;
+    kmsKeyId?: string;
+    sizeGiB?: number;
+    snapshotId?: string;
+    zoneId?: string;
+    /** EC2 VolumeType (gp3 for every computer data volume), when supplied. */
+    volumeType?: string;
 }
 
 export interface Ec2VolumeDescriber {
@@ -261,6 +356,11 @@ export interface Ec2ComputerResources {
     volumes: { volumeId: string; state: string }[];
 }
 
+export interface ReplacementWriter { instanceId: string; state: string; accountId: string; clientToken: string; tags: Readonly<Record<string, string>> }
+export interface Ec2ReplacementDescriber {
+    describeReplacementWriters(region: string, clientToken: string): Promise<ReplacementWriter[]>;
+}
+
 export interface Ec2ComputerResourceFinder {
     findComputerResources(region: string, computerId: string): Promise<Ec2ComputerResources>;
 }
@@ -271,19 +371,39 @@ const COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 
 export function createEc2EnrollmentDescriber(
     ec2For: (region: string) => RegionalClient,
-): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder {
+): Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Ec2ReplacementDescriber & RebaseSnapshotDescriber {
     return {
+        async describeSnapshot(region, snapshotId) {
+            assertRegion(region);
+            if (!/^snap-[0-9a-f]{8,17}$/.test(snapshotId)) throw new AwsClientError('aws_config', false, 'SnapshotIdInvalid');
+            const { client, account } = ec2For(region);
+            let out;
+            try { out = await client.send(new DescribeSnapshotsCommand({ SnapshotIds: [snapshotId], OwnerIds: [account] })) as {
+                Snapshots?: { SnapshotId?: string; OwnerId?: string; VolumeId?: string; VolumeSize?: number; State?: string;
+                    Encrypted?: boolean; KmsKeyId?: string; StartTime?: Date; Tags?: Ec2Tag[] }[] };
+            } catch (error) { if (nameOf(error) === 'InvalidSnapshot.NotFound') return null; throw toAwsClientError(error); }
+            if (!out.Snapshots?.length) return null;
+            const v = out.Snapshots[0]!;
+            if (out.Snapshots.length !== 1 || v.SnapshotId !== snapshotId || v.OwnerId !== account || !(v.StartTime instanceof Date))
+                throw new AwsClientError('aws_error', false, 'DescribeSnapshotsAmbiguous');
+            return { snapshotId, ownerId: v.OwnerId, volumeId: v.VolumeId ?? '', volumeGiB: v.VolumeSize ?? 0, state: v.State ?? 'unknown',
+                encrypted: v.Encrypted === true, kmsKeyId: v.KmsKeyId ?? '', startedAt: v.StartTime, tags: tagMap(v.Tags) };
+        },
         async describeForEnrollment(region, instanceId) {
             assertRegion(region);
             if (!INSTANCE_ID.test(instanceId)) return null;
             const { client } = ec2For(region);
             type Instance = {
                 InstanceId?: string;
+                ImageId?: string;
+                InstanceType?: string;
                 State?: { Name?: string };
+                StateTransitionReason?: string;
+                RootDeviceName?: string;
                 Placement?: { AvailabilityZone?: string; AvailabilityZoneId?: string };
                 PublicIpAddress?: string;
                 Tags?: Ec2Tag[];
-                BlockDeviceMappings?: { Ebs?: { VolumeId?: string; DeleteOnTermination?: boolean } }[];
+                BlockDeviceMappings?: { DeviceName?: string; Ebs?: { VolumeId?: string; DeleteOnTermination?: boolean } }[];
             };
             let instances: Instance[];
             try {
@@ -317,22 +437,34 @@ export function createEc2EnrollmentDescriber(
             if (volumeIds.length > 0) {
                 try {
                     const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: volumeIds }))) as { Volumes?: { VolumeId?: string; Tags?: Ec2Tag[] }[] };
-                    volumeTags = new Map((out.Volumes ?? []).filter((v) => typeof v.VolumeId === 'string').map((v) => [v.VolumeId!, tagMap(v.Tags)]));
+                    const volumes = out.Volumes ?? [];
+                    if (volumes.some(v => typeof v.VolumeId !== 'string' || !volumeIds.includes(v.VolumeId))
+                        || new Set(volumes.map(v => v.VolumeId)).size !== volumes.length) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
+                    volumeTags = new Map(volumes.map((v) => [v.VolumeId!, tagMap(v.Tags)]));
                 } catch (error) {
                     throw toAwsClientError(error);
                 }
                 // Every attached volume must be described: a partial answer is not evidence.
                 if (volumeIds.some((id) => !volumeTags.has(id))) throw new AwsClientError('aws_error', false, 'DescribeVolumesIncomplete');
             }
+            // EC2 supplies shutdown time as e.g. "User initiated (2026-10-19 12:34:56 GMT)".
+            // Only accept that explicit UTC timestamp; other reasons have no usable time.
+            const stamp = /\((\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) GMT\)/.exec(inst.StateTransitionReason ?? '');
+            const transitionAt = stamp ? new Date(`${stamp[1]}T${stamp[2]}Z`) : null;
             const view: Ec2EnrollmentView = {
                 instanceId,
+                ...(inst.RootDeviceName ? { rootDeviceName: inst.RootDeviceName } : {}),
+                ...(inst.ImageId ? { imageId: inst.ImageId } : {}),
+                ...(inst.InstanceType ? { instanceType: inst.InstanceType } : {}),
                 state: inst.State?.Name ?? 'unknown',
+                ...(transitionAt && Number.isFinite(transitionAt.getTime()) ? { stateTransitionAt: transitionAt } : {}),
                 availabilityZone: az,
                 availabilityZoneId: zoneId,
                 publicIp: inst.PublicIpAddress ?? null,
                 tags: tagMap(inst.Tags),
                 volumes: mappings.map((b) => ({
                     volumeId: b.Ebs!.VolumeId!,
+                    ...(b.DeviceName ? { deviceName: b.DeviceName } : {}),
                     // Only an explicit `false` is false: an unknown flag never passes as "kept on terminate".
                     deleteOnTermination: b.Ebs!.DeleteOnTermination !== false,
                     tags: volumeTags.get(b.Ebs!.VolumeId!) ?? {},
@@ -345,17 +477,47 @@ export function createEc2EnrollmentDescriber(
             assertRegion(region);
             if (!VOLUME_ID.test(volumeId)) return null;
             const { client } = ec2For(region);
-            let volumes: { VolumeId?: string; State?: string }[];
+            type Volume = { VolumeId?: string; State?: string; Tags?: Ec2Tag[]; Attachments?: { InstanceId?: string; State?: string }[]; Encrypted?: boolean; KmsKeyId?: string; Size?: number; SnapshotId?: string; AvailabilityZoneId?: string; AvailabilityZone?: string; VolumeType?: string };
+            let volumes: Volume[];
             try {
-                const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: { VolumeId?: string; State?: string }[] };
-                volumes = (out.Volumes ?? []).filter((v) => v.VolumeId === volumeId);
+                const out = (await client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }))) as { Volumes?: Volume[] };
+                volumes = out.Volumes ?? [];
             } catch (error) {
                 if (nameOf(error) === 'InvalidVolume.NotFound') return null;
                 throw toAwsClientError(error);
             }
             if (volumes.length === 0) return null;
-            if (volumes.length !== 1) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
-            return { volumeId, state: volumes[0]!.State ?? 'unknown' };
+            if (volumes.length !== 1 || volumes[0]!.VolumeId !== volumeId) throw new AwsClientError('aws_error', false, 'DescribeVolumesAmbiguous');
+            const v = volumes[0]!;
+            let zoneId = v.AvailabilityZoneId;
+            if (!zoneId && v.AvailabilityZone) {
+                const zones = await client.send(new DescribeAvailabilityZonesCommand({ ZoneNames: [v.AvailabilityZone] })) as { AvailabilityZones?: { ZoneName?: string; ZoneId?: string }[] };
+                if (zones.AvailabilityZones?.length !== 1 || zones.AvailabilityZones[0]!.ZoneName !== v.AvailabilityZone) throw new AwsClientError('aws_error', false, 'VolumeZoneAmbiguous');
+                zoneId = zones.AvailabilityZones[0]!.ZoneId;
+            }
+            return { volumeId, state: v.State ?? 'unknown', tags: tagMap(v.Tags), encrypted: v.Encrypted, kmsKeyId: v.KmsKeyId, sizeGiB: v.Size, snapshotId: v.SnapshotId, zoneId,
+                ...(v.VolumeType ? { volumeType: v.VolumeType } : {}),
+                attachments: v.Attachments?.map((a) => ({ instanceId: a.InstanceId ?? '', state: a.State ?? 'unknown' })) };
+        },
+
+        async describeReplacementWriters(region, clientToken) {
+            assertRegion(region);
+            if (!/^[0-9a-f]{64}$/.test(clientToken)) throw new AwsClientError('aws_config', false, 'ClientTokenInvalid');
+            const { client } = ec2For(region);
+            const found: ReplacementWriter[] = [];
+            let next: string | undefined;
+            for (let page = 0; ; page++) {
+                if (page >= RESOURCE_SEARCH_MAX_PAGES) throw new AwsClientError('aws_error', false, 'DescribeInstancesTooMany');
+                const out = await client.send(new DescribeInstancesCommand({
+                    Filters: [{ Name: 'client-token', Values: [clientToken] }], MaxResults: 100, NextToken: next,
+                })) as { Reservations?: { OwnerId?: string; Instances?: { InstanceId?: string; ClientToken?: string; State?: { Name?: string }; Tags?: Ec2Tag[] }[] }[]; NextToken?: string };
+                for (const r of out.Reservations ?? []) for (const i of r.Instances ?? []) found.push({
+                    instanceId: i.InstanceId ?? '', state: i.State?.Name ?? 'unknown', accountId: r.OwnerId ?? '',
+                    clientToken: i.ClientToken ?? '', tags: tagMap(i.Tags),
+                });
+                next = out.NextToken;
+                if (!next) return found;
+            }
         },
 
         async findComputerResources(region, computerId) {
@@ -405,7 +567,7 @@ export function createEc2EnrollmentDescriber(
 export interface AwsSdkFactories {
     /** Defaults to the Vercel OIDC token of the current request. */
     token?: () => string | null;
-    sts?: (region: string) => Sender;
+    sts?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     sfn?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     ec2?: (region: string, credentials: () => Promise<AwsCredentials>) => Sender;
     now?: () => Date;
@@ -416,7 +578,7 @@ export interface AwsSdkFactories {
 export interface AwsSdkCollaborators {
     starter?: LifecycleStarter;
     executions?: LifecycleExecutionReader;
-    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder;
+    describer?: Ec2EnrollmentDescriber & Ec2VolumeDescriber & Ec2ComputerResourceFinder & Partial<Ec2ReplacementDescriber & RebaseSnapshotDescriber>;
 }
 
 /**
@@ -437,9 +599,11 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
     if (!regions.regions.every((r) => ROLE_ARN.test(env[appCallerRoleEnv(r.name)]?.trim() ?? ''))) return {};
     const configured = new Set(regions.regions.map((r) => r.name));
     const token = f.token ?? (() => readVercelOidcToken(env));
+    const vercel = env.VERCEL === '1';
+    const baseCredentials = vercel ? NO_AMBIENT_CREDENTIALS : instanceMetadataCredentials({ now: f.now });
     // `requestHandler` is spread only when a test supplies it; production uses the SDK's own HTTP handler.
     const http = f.requestHandler ? { requestHandler: f.requestHandler as never } : {};
-    const stsFor = f.sts ?? ((region: string) => new STSClient({ region, credentials: NO_AMBIENT_CREDENTIALS, maxAttempts: 2, ...http }));
+    const stsFor = f.sts ?? ((region: string, credentials: () => Promise<AwsCredentials>) => new STSClient({ region, credentials, maxAttempts: 2, ...http }));
     const sfnFactory =
         f.sfn ?? ((region: string, credentials: () => Promise<AwsCredentials>) => new SFNClient({ region, credentials, maxAttempts: 3, ...http }));
     const ec2Factory =
@@ -453,7 +617,14 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
             const roleArn = env[appCallerRoleEnv(region)]?.trim() ?? '';
             const m = ROLE_ARN.exec(roleArn);
             if (!m) throw new AwsClientError('aws_config', false, 'AppCallerRoleUnset');
-            c = { account: m[1]!, credentials: webIdentityCredentials({ roleArn, region, token, sts: stsFor(region), now: f.now }) };
+            const sts = stsFor(region, baseCredentials);
+            const credentials = vercel
+                ? webIdentityCredentials({ roleArn, region, token, sts, now: f.now })
+                : instanceRoleCallerCredentials({ roleArn, sts, now: f.now });
+            c = { account: m[1]!, credentials: () => {
+                logCredentialSource(vercel ? 'vercel-oidc' : 'ec2-instance-role');
+                return credentials();
+            } };
             credentialsByRegion.set(region, c);
         }
         return c;
@@ -488,7 +659,7 @@ export function createAwsSdkCollaborators(env: Env, f: AwsSdkFactories = {}): Aw
 /** The settings the shared collaborators depend on; a change rebuilds them. */
 function collaboratorKey(env: Env): string {
     const regions = (env.AWS_REGIONS ?? '').split(',');
-    return JSON.stringify([env.EZIL_AWS_COMPUTERS_ENABLED ?? '', env.AWS_REGIONS ?? '', ...regions.map((r) => env[appCallerRoleEnv(r)] ?? '')]);
+    return JSON.stringify([env.EZIL_AWS_COMPUTERS_ENABLED ?? '', env.VERCEL ?? '', env.AWS_REGIONS ?? '', ...regions.map((r) => env[appCallerRoleEnv(r)] ?? '')]);
 }
 let shared: { key: string; value: AwsSdkCollaborators } | null = null;
 

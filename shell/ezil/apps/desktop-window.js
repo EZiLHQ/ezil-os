@@ -97,8 +97,9 @@ import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
+import BootProgress, { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
+import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import {
     computeFitBox,
@@ -153,6 +154,8 @@ const PHASE_LIST_AFTER_MS = 4_000;
 const FRAME_CONFIRM_FALLBACK_MS = 4_000;
 const FRAME_CONFIRM_ATTEMPTS = 3;
 const FRAME_CONFIRM_RETRY_MS = 1_500;
+/** The least origin-probe grace a desktop URL gets, measured from its handover. */
+const FRAME_ORIGIN_GRACE_MS = 60_000;
 
 /**
  * The display gate (`start_display_gate`) — the answer to "did any pixel
@@ -595,6 +598,13 @@ export async function openDesktopWindow (ctx = {}) {
     document.addEventListener('visibilitychange',on_relay_return);
     window.addEventListener('online',on_relay_online);
     const el_iframe = el_window.querySelector('.window-app-iframe');
+    // Scope delegation to this desktop's src origin. The app response also
+    // delegates these features; neither layer bypasses browser permission.
+    el_iframe.setAttribute('allow', 'autoplay; fullscreen; clipboard-read; clipboard-write');
+    el_iframe.setAttribute('tabindex', '0');
+    // Cross-origin autofocus is browser-restricted; there is no iframe
+    // allow-autofocus token. The Neko overlay takes focus on a pointer click.
+    el_iframe.removeAttribute('autofocus');
 
     // ── the desktop's ACTUAL size, and the live-resize path ────────────────
     // ADDED BY EZIL 2026-08-19. See `./desktop-screen.js` and the header block
@@ -850,6 +860,26 @@ export async function openDesktopWindow (ctx = {}) {
     let boot_work = null;
     let stale_recoveries = 0;
     let running_signal;       // undefined until a poll lands; never coerced to false
+    /**
+     * The last `computer.progress` observation the spinner's observer produced
+     * (the same poller; no second one). Kept across a null caused by a hidden tab
+     * or a failed poll, because neither is evidence the AWS computer stopped
+     * opening. Never set for Cloudflare/native: their observation is always null.
+     */
+    let aws_observation = null;
+    /**
+     * While a desktop request is in flight: ends the wait early. `clock` is set
+     * only during a reopen (the ten-minute stop applies); on the first request
+     * only the observed stage can end it. See `check_aws_wait`.
+     */
+    let aws_stop_wait = null;
+    /** Whether THIS attempt has watched the AWS computer actively opening. */
+    let aws_seen_active = false;
+    /**
+     * Cancels this window's own in-flight `session.openDesktop` (a reopen or a
+     * Try again). One controller per request; aborting a finished one is a no-op.
+     */
+    let own_open = null;
     let disposed = false;
     /**
      * Set once the desktop has actually been shown. It is the DESIRE, not the
@@ -1012,6 +1042,8 @@ export async function openDesktopWindow (ctx = {}) {
             viewer_previous = current;
             return;
         }
+        // A viewer that reports accepted input gives the exact first-input stamp.
+        if ( event.data?.source === 'ezil-mobile' && event.data?.type === 'input_accepted' ) { stamp_milestone('first_input'); return; }
         if ( event.data?.type !== 'ezil:preview-runtime-stale' ) return;
         const now = Date.now();
         if ( boot_work ) return;
@@ -1031,6 +1063,90 @@ export async function openDesktopWindow (ctx = {}) {
     };
     window.addEventListener('message', on_frame_message);
 
+    // ── client milestones and time to interactive (round 3) ────────────────
+    // `url_received` (the open answered with a URL), `first_frame` (the display
+    // gate saw decoded frames: ready) and `first_input` (the first pointer or key
+    // the stream accepted). The frame is cross-origin, so the parent sees input
+    // only as focus moving into it (window `blur` with the iframe active), unless
+    // the viewer posts `input_accepted`. Times run from this window's open.
+    let tti = { url: null, frame: null, input: null };
+    const opening_path = () => aws_observation?.path ?? spinner.computerProgress()?.path
+        ?? (desktop_state.provider === 'cloudflare-guacamole' ? 'cloudflare' : 'unknown');
+    function stamp_milestone (key) {
+        if ( disposed ) return;
+        const slot = { url_received: 'url', first_frame: 'frame', first_input: 'input' }[key];
+        if ( ! slot || tti[slot] !== null || (slot === 'input' && tti.frame === null) ) return;
+        const ms = Math.round(performance.now() - t_open);
+        tti[slot] = ms;
+        if ( key !== 'first_input' ) spinner.stamp(key);
+        const path = opening_path();
+        if ( key === 'first_frame' ) console.info(`[desktop] tti=${ms} path=${path}`);
+        else console.info(`[desktop] ${key}=${ms} path=${path}`);
+        // Boot events share a 12-per-page cap with boot_summary, whose trace already
+        // records the mint (`mint_ok`): only the two milestones it lacks are sent.
+        if ( key !== 'url_received' ) telemetry.capture({ eventClass: 'boot_phase', site: 'ezil-os:apps/desktop#tti', code: `${key}_${path}`, durationMs: ms });
+    }
+    const on_first_input_blur = () => {
+        if ( document.activeElement === el_iframe && el_iframe.getAttribute('src') ) stamp_milestone('first_input');
+    };
+    window.addEventListener('blur', on_first_input_blur);
+
+    // ── reconnect after a restart or a switch (round 3) ────────────────────
+    // A restart gives the desktop a new runtime; the open window must re-open
+    // against it (same window, same computer) instead of counting relay failures
+    // into "Your desktop isn't answering". Bounded: a second runtime change within
+    // `STALE_RECOVERY_MIN_GAP_MS` ends in the ordinary failure + Try again (explicit
+    // restart and switch events are user actions and are never throttled).
+    let last_runtime_reopen = 0;
+    function reopen_on_new_runtime (why) {
+        if ( disposed ) return;
+        relay_renewal?.stop();
+        if ( boot_work ) return; // already re-opening; that open waits for the new runtime
+        if ( why === 'relay_runtime_changed' ) {
+            const now = Date.now();
+            if ( last_runtime_reopen !== 0 && now - last_runtime_reopen < STALE_RECOVERY_MIN_GAP_MS ) {
+                ++attempt;
+                active_display_gate?.stop();
+                stop_timers();
+                render_both({ kind: 'failed', reason: 'desktop_unreachable' });
+                show_panel();
+                return;
+            }
+            last_runtime_reopen = now;
+        }
+        console.info(`[${PHASE}] the desktop has a new runtime (${why}); re-opening`);
+        telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: why });
+        void start_boot();
+    }
+    // Settings → Troubleshoot → Restart desktop announces a completed restart.
+    const on_desktop_restarted = (e) => {
+        if ( disposed || e?.detail?.computerId !== computer.id ) return;
+        reopen_on_new_runtime('desktop_restarted');
+    };
+    window.addEventListener('ezil:desktop-restarted', on_desktop_restarted);
+    // A switch or a computer restart replaces the machine: watch the server's
+    // transition and re-open once it settles (done, or failed back to the old size).
+    let transition_watch = null;
+    /** The transition whose failure was already turned into a re-open (once each). */
+    let reopened_for = null;
+    function watch_transition (transitionId) {
+        if ( disposed || transition_watch?.active() ) return;
+        transition_watch = watchComputerTransition({
+            computerId: computer.id, element: el_window, transitionId: transitionId ?? null,
+            onSettled: (t) => {
+                transition_watch = null;
+                if ( disposed ) return;
+                console.info(`[${PHASE}] ${t.kind} ${t.phase}; re-opening the desktop`);
+                reopen_on_new_runtime(t.kind === 'restart' ? 'restart_settled' : 'switch_settled');
+            },
+        });
+    }
+    const on_transition = (e) => {
+        if ( disposed || e?.detail?.computerId !== computer.id ) return;
+        watch_transition(typeof e.detail.transitionId === 'string' ? e.detail.transitionId : null);
+    };
+    window.addEventListener(TRANSITION_EVENT, on_transition);
+
     const stop_runtime_recheck = watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
@@ -1038,7 +1154,12 @@ export async function openDesktopWindow (ctx = {}) {
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
-    const progress = BootProgress({ onRetry: () => { void start_boot(); } });
+    /** RETRY-118: the failure on screen, so an explicit Retry can reset an expired capacity attempt. */
+    let last_failure = null;
+    /** The user's own "Try again" (never the automatic paths above): see `session.userRetry`. */
+    const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); }; // stable: identifies this window to userRetry
+    const user_retry = () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); };
+    const progress = BootProgress({ onRetry: user_retry, appName: ctx.appName || title, icon: ctx.icon });
     el_body.appendChild(progress.el);
 
     // ── W3: opens showing this, not the phase panel ─────────────────────────
@@ -1049,8 +1170,30 @@ export async function openDesktopWindow (ctx = {}) {
     // always fed the identical state, in the same call, so there is no
     // sequence in which one shows a claim the other has not also made.
     const spinner = AppSpinner({
+        computerId: computer.id,
+        onProgressChange: () => {
+            const seen = spinner.computerProgress();
+            if ( seen ) aws_observation = seen;
+            if ( seen?.activeAws === true ) aws_seen_active = true;
+            // A switch or restart is in flight: re-open again once it settles, and a
+            // failure it caused (the old machine stopped under a live desktop) becomes
+            // the opening surface, once per transition.
+            if ( seen?.transition && ['requested', 'stopping', 'waking'].includes(seen.transition.phase) ) {
+                watch_transition(seen.transition.transitionId);
+                if ( last_kind === 'failed' && ! boot_work && reopened_for !== seen.transition.transitionId ) {
+                    reopened_for = seen.transition.transitionId;
+                    reopen_on_new_runtime('transition_in_flight');
+                }
+            }
+            check_aws_wait();
+            if (last_kind === 'progress') show_panel();
+        },
         label: `Opening ${ctx.appName || title}…`,
-        onRetry: () => { void start_boot(); },
+        appName: ctx.appName || title,
+        icon: ctx.icon,
+        isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id),
+        onRetry: user_retry,
     });
     el_body.appendChild(spinner.el);
 
@@ -1063,11 +1206,45 @@ export async function openDesktopWindow (ctx = {}) {
      *  separately-maintained flag that could drift from what was rendered. */
     let last_kind = null;
 
+    /**
+     * While a desktop request is in flight, stop waiting the moment the
+     * observation says the computer stopped opening (needs_operator, stopped,
+     * paused, ...) or, during a reopen, ten minutes (either clock) have passed.
+     * A no-op when no observation exists, i.e. on every non-AWS boot.
+     *
+     * 🔴 STOPPING THE WAIT STOPS THE ASKING. The abandoned `openDesktop` loop is
+     * cancelled, never orphaned: each of its asks runs the server's ensure, which
+     * on an UNCONFIRMED + ENROLLMENT_FAILED placement launches a replacement host
+     * while this window says it stopped.
+     */
+    function check_aws_wait () {
+        if ( ! aws_stop_wait ) return;
+        const { t0, resolve, clock } = aws_stop_wait;
+        const verdict = awsBootWaitVerdict({ observation: aws_observation, bootElapsedMs: performance.now() - t0, clock });
+        if ( verdict === 'wait' ) return;
+        // On the first request only a change this attempt WATCHED happen counts:
+        // a computer that already needed attention when the window opened is being
+        // recovered by this very open, and cancelling it would strand the user.
+        if ( ! clock && ! aws_seen_active ) return;
+        aws_stop_wait = null;
+        own_open?.abort();
+        // The server says stop for this computer: also stop an open this window did
+        // not start itself (the paint-time warm the first attempt joined).
+        if ( verdict === 'fail' ) session.cancelOpenDesktop(computer.id);
+        console.info(`[${PHASE}] stopped waiting for the AWS computer: ${verdict}`
+            + ` (stage ${aws_observation?.stage ?? 'unobserved'}, +${Math.round(performance.now() - t0)}ms)`);
+        resolve({ ok: false, errorCode: 'timeout', message: `Stopped waiting for the AWS computer (${verdict}).` });
+    }
+
     /** The one place either boot surface is told what to render. */
-    function render_both (state) {
+    function render_both (state, elapsedMs) {
         last_kind = state.kind;
-        progress.render(state);
-        spinner.render(state);
+        // This panel is on screen exactly when the spinner has no live observation
+        // (failed poll, hidden tab); during a reopen it says only "still starting".
+        const extra = Number.isFinite(elapsedMs) ? { elapsedMs } : {};
+        progress.render(state, state.kind === 'progress' && aws_stop_wait?.clock ? {} : null, extra);
+        spinner.render(state, extra);
+        if (state.kind === 'progress') show_panel();
     }
 
     // The `ready_unverified` strip. Attached up front, hidden, for the same
@@ -1087,8 +1264,12 @@ export async function openDesktopWindow (ctx = {}) {
      * function's decision (the reveal/failure code paths own it directly).
      */
     const show_panel = () => {
-        progress.el.hidden = ! show_phase_list;
-        spinner.el.hidden = show_phase_list;
+        // Migration and fresh launch copy stay visible on the shared warm path too.
+        const show_phases = show_phase_list && !spinner.hasComputerProgress() && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
+        progress.el.hidden = ! show_phases;
+        spinner.el.hidden = show_phases;
+        // The unverified strip belongs to a revealed desktop; it never sits over the opening surface.
+        notice.hide();
     };
 
     /**
@@ -1137,6 +1318,7 @@ export async function openDesktopWindow (ctx = {}) {
     async function perform_boot () {
         if ( disposed ) return;
         const my_attempt = ++attempt;
+        last_failure = null;
         neko_reachable = false;
         screen_ctl.cancel();
         active_display_gate?.stop();
@@ -1154,6 +1336,10 @@ export async function openDesktopWindow (ctx = {}) {
         // could not check" must not linger over it.
         notice.hide();
         running_signal = undefined;
+        aws_observation = spinner.computerProgress();
+        aws_seen_active = aws_observation?.activeAws === true;
+        spinner.stamp(null);
+        tti = { url: null, frame: null, input: null };
 
         // 🔴 PHASE_LIST_AFTER_MS, measured from THIS attempt's own start, not
         // from anything upstream. Guarded on `last_kind` rather than a second
@@ -1187,11 +1373,12 @@ export async function openDesktopWindow (ctx = {}) {
         const t0 = performance.now();
         paint = () => {
             if ( disposed || my_attempt !== attempt ) return;
+            check_aws_wait();
             render_both(computeBootUiState({
                 requestStatus: 'pending',
                 elapsedMs: performance.now() - t0,
                 confirmedGuacamoleRunning: running_signal,
-            }));
+            }), performance.now() - t0);
         };
         paint();
         tick_timer = setInterval(paint, TICK_MS);
@@ -1240,9 +1427,50 @@ export async function openDesktopWindow (ctx = {}) {
         // open), the first settle corrects it — which is exactly what the live
         // path is for.
         const boot_screen_ask = measure_screen();
-        const res = my_attempt === 1
-            ? await claimWarm(computer.id)
-            : await session.openDesktop(computer.id, boot_screen_ask);
+        const ask_fresh = () => {
+            own_open = new AbortController();
+            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal });
+        };
+        // The first request ends early only on an observed stage change (see
+        // `check_aws_wait`); its own wake loop still owns the clock.
+        const first_stop = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: false }; });
+        let res = await Promise.race([my_attempt === 1 ? claimWarm(computer.id) : ask_fresh(), first_stop]);
+        aws_stop_wait = null;
+
+        // 🔴 A TIMEOUT IS NOT A FAILURE WHILE AWS SAYS IT IS STILL OPENING. A cold
+        // AWS replace measures 210-250 s against a 215 s budget. While the
+        // spinner's `computer.progress` observation reports `activeAws`, ask
+        // again — `openDesktop` with the same screen ask, never a warm replay —
+        // and keep the panel on progress (the clock and the status poll keep
+        // running). Ten minutes (either clock), `needs_operator`, or the reopen
+        // cap end it with the existing failure + Try again. With no observation
+        // (Cloudflare, native) the verdict is always 'fail': unchanged.
+        let aws_reopens = 0;
+        let reopen_started_at = null;
+        let aws_budget_spent = false;
+        while ( ! disposed && my_attempt === attempt && ! res.ok ) {
+            const reason = computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }).reason;
+            const verdict = awsBootTimeoutVerdict({
+                reason, observation: aws_observation, bootElapsedMs: performance.now() - t0, reopens: aws_reopens,
+                // The wake loop gave up on its own ten-minute launch/migration clock.
+                sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true,
+            });
+            if ( verdict === 'budget_spent' ) {
+                aws_budget_spent = true;
+                console.info(`[${PHASE}] AWS boot budget spent at +${Math.round(performance.now() - t0)}ms`
+                    + ` after ${aws_reopens} reopen(s) (stage ${aws_observation?.stage}); showing Try again`);
+            }
+            if ( verdict !== 'reopen' ) break;
+            aws_reopens++;
+            reopen_started_at = performance.now();
+            console.info(`[${PHASE}] ${res.errorCode} at +${Math.round(reopen_started_at - t0)}ms while the AWS computer`
+                + ` is still opening (stage ${aws_observation.stage}, ${aws_observation.countdown || 'no estimate'}); re-opening (#${aws_reopens})`);
+            const stopped = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: true }; });
+            paint();
+            res = await Promise.race([ask_fresh(), stopped]);
+            aws_stop_wait = null;
+            own_open?.abort(); // a no-op when the reopen itself answered
+        }
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -1271,6 +1499,7 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         if ( ! res.ok ) {
+            last_failure = res;
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`
                 + `${res.message ? ` (${res.message})` : ''}`);
             telemetry.capture({
@@ -1285,11 +1514,14 @@ export async function openDesktopWindow (ctx = {}) {
                 // redacted and capped at 200 chars by `telemetry.js`.
                 detail: res.message,
             });
-            render_both(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            // The spinner keeps an active AWS timeout on progress; tell it the
+            // window's budget is spent so it shows Try again.
+            render_both(aws_budget_spent ? { ...failed, observedBudgetSpent: true } : failed);
             // Terminal: the mint itself failed, so there is no URL to
             // navigate to and nothing further will run on this attempt.
             trace.step('mint_error');
@@ -1297,6 +1529,7 @@ export async function openDesktopWindow (ctx = {}) {
             return;
         }
 
+        stamp_milestone('url_received');
         console.info(`[${PHASE}] desktop URL in ${Math.round(performance.now() - t0)}ms`
             + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`
             + ` frame confirmed server-side: ${res.frameConfirmed === true})`);
@@ -1367,12 +1600,20 @@ export async function openDesktopWindow (ctx = {}) {
                 const response = await fetch(relay_endpoint, { method:'POST', credentials:'same-origin',
                     headers:{'Content-Type':'application/json'},body:JSON.stringify({computerId:computer.id,runtimeId}),
                     signal:AbortSignal.timeout(30000) });
-                return response.ok ? response.json() : {ok:false};
+                // The refusal code is in the body (a 200 `{ok:false,error}`, or a 409 from an older route).
+                const data = await response.json().catch(() => null);
+                return response.ok && data ? data : { ok: false, error: data?.error };
             },
+            onRuntimeChanged: () => { if ( ! disposed && my_attempt === attempt ) reopen_on_new_runtime('relay_runtime_changed'); },
             onState: state => {
                 if (disposed || my_attempt !== attempt) return;
                 el_window.dataset.relayState = state;
                 if (state === 'confirming') viewer_previous = null;
+                if (state === 'error' && transition_watch?.active()) {
+                    // The old machine is going away for a switch or restart: wait in the opening surface.
+                    reopen_on_new_runtime('transition_in_flight');
+                    return;
+                }
                 if (state === 'error') {
                     render_both({kind:'failed', reason:'desktop_unreachable'});
                     show_panel();
@@ -1391,6 +1632,16 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
+        // AWS bootstrap redirects to `path`, discarding its outer query. The
+        // viewer reads its navigation ID from the final document URL; without
+        // it every frame report (including renewal confirmation) is rejected.
+        if (viewer_url.pathname === '/preview-bootstrap') {
+            const destination = new URL(viewer_url.searchParams.get('path') || '/', viewer_url);
+            if (destination.origin === viewer_url.origin) {
+                destination.searchParams.set('ezilAttempt', viewer_attempt);
+                viewer_url.searchParams.set('path', destination.pathname + destination.search + destination.hash);
+            }
+        }
         el_iframe.src = viewer_url.href;
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything
@@ -1405,7 +1656,12 @@ export async function openDesktopWindow (ctx = {}) {
             if ( disposed || my_attempt !== attempt ) return;
             if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
         }, { once: true });
-        settle_frame(my_attempt, res.url, gate, t0 + DESKTOP_BOOT_TIMEOUT_MS);
+        // The origin-probe grace never ends before the URL is handed over. A cold
+        // AWS host routinely answers past t0 + 215 s, with or without a reopen
+        // (the wake loop absorbs a launch for up to ten minutes); a fast mint
+        // keeps the original t0 + 215 s.
+        settle_frame(my_attempt, res.url, gate, Math.max(
+            (reopen_started_at ?? t0) + DESKTOP_BOOT_TIMEOUT_MS, performance.now() + FRAME_ORIGIN_GRACE_MS));
     }
 
     // ── the handoff ────────────────────────────────────────────────────────
@@ -1666,6 +1922,7 @@ export async function openDesktopWindow (ctx = {}) {
             // row and not a row overwritten out from under it.
             trace.step(state.kind === 'ready' ? 'display_live' : 'display_unverified');
             trace.end('ok');
+            if ( state.kind === 'ready' ) stamp_milestone('first_frame');
             if ( state.kind === 'ready' || terminal ) stop();
         };
 
@@ -2181,7 +2438,14 @@ export async function openDesktopWindow (ctx = {}) {
     // ── teardown ───────────────────────────────────────────────────────────
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
+        spinner.dispose();
         disposed = true;
+        transition_watch?.stop();
+        window.removeEventListener('ezil:desktop-restarted', on_desktop_restarted);
+        window.removeEventListener(TRANSITION_EVENT, on_transition);
+        window.removeEventListener('blur', on_first_input_blur);
+        // A closed window stops its own in-flight open (a reopen or a Try again).
+        own_open?.abort();
         relay_renewal?.stop();
         document.removeEventListener('visibilitychange',on_relay_return);
         window.removeEventListener('online',on_relay_online);

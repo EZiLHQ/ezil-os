@@ -13,9 +13,10 @@
  *     Worker's `DELETE /sandbox/:name`, whose `handleTerminate` flushes the
  *     workspace to R2 and then calls `sandbox.destroy()`
  *     (`worker/src/index.ts`).
- *   - "frees slot N" — the stamp on `deleted_at` drops the row out of the
- *     partial unique index `(user_id, slot) WHERE deleted_at IS NULL`, so
- *     `computer.create` immediately sees the slot as free.
+ *   - "removes it from your account" — the stamp on `deleted_at` drops the
+ *     row out of `computer.list` and the partial unique index
+ *     `(user_id, slot) WHERE deleted_at IS NULL`. Slots are no longer shown
+ *     (round 3, one computer per person).
  *   - "Your files are not erased" — VERIFIED, not assumed. Deleting is
  *     `UPDATE ... SET deleted_at`; no R2 object is touched by any part of
  *     the delete path. `handleTerminate` does not delete objects, and the
@@ -47,11 +48,12 @@ export interface DeleteComputerCopy {
     pendingLabel: string;
 }
 
-export function deleteComputerCopy({ name, slot }: { name: string; slot: number }): DeleteComputerCopy {
+/** `slot` is accepted for old callers and ignored: there is one computer per person (round 3, D6), so no slot is freed. */
+export function deleteComputerCopy({ name }: { name: string; slot?: number }): DeleteComputerCopy {
     return {
         title: `Delete “${name}”?`,
         body: [
-            `Deleting shuts this computer's desktop down and frees slot ${slot} for a new one.`,
+            "Deleting shuts this computer's desktop down and removes it from your account.",
             'Your files are not erased — they stay in storage. But EZiL OS can’t reach them again: a deleted computer can’t be reopened or restored, and a new computer starts from an empty workspace.',
         ],
         confirmLabel: 'Delete computer',

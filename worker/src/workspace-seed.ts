@@ -121,6 +121,13 @@ export function sentinelKeyFor(mountPrefix: string): string {
 /** Marker line `buildTemplateCopyCommand`'s shell prints when the baked-in template directory is absent. */
 export const TEMPLATE_MISSING_MARKER = 'EZIL_TEMPLATE_MISSING';
 
+/** POSIX shell word: single quotes suppress expansions; embedded quotes reopen safely.
+ * Reject NUL because it cannot be represented in an exec argument. */
+function shellQuote(value: string): string {
+  if (value.includes('\0')) throw new Error('invalid_shell_argument');
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
 /**
  * Shell command that copies the image's baked-in starter template
  * (`/opt/ezil-sandbox-template`, `COPY`'d there by the Dockerfile) into
@@ -131,7 +138,7 @@ export const TEMPLATE_MISSING_MARKER = 'EZIL_TEMPLATE_MISSING';
  * loudly on a hit.
  */
 export function buildTemplateCopyCommand(targetPath: string): string {
-  return `if [ -d /opt/ezil-sandbox-template ]; then cp -a /opt/ezil-sandbox-template/. ${targetPath}/; else echo ${TEMPLATE_MISSING_MARKER}; fi`;
+  return `if [ -d /opt/ezil-sandbox-template ]; then cp -a -- /opt/ezil-sandbox-template/. ${shellQuote(`${targetPath}/`)}; else echo ${TEMPLATE_MISSING_MARKER}; fi`;
 }
 
 /** True when `buildTemplateCopyCommand`'s stdout reports the template directory was missing from the image. */
@@ -221,12 +228,13 @@ export function buildEnsureTurbopackConfigCommand(
   targetPath: string,
   templateConfigPath: string = TEMPLATE_NEXT_CONFIG_PATH,
 ): string {
-  const hasConfig = NEXT_CONFIG_FILENAMES.map((name) => `[ -f "${targetPath}/${name}" ]`).join(' || ');
+  const hasConfig = NEXT_CONFIG_FILENAMES.map((name) => `[ -f ${shellQuote(`${targetPath}/${name}`)} ]`).join(' || ');
+  const packagePath = shellQuote(`${targetPath}/package.json`);
   return (
     `if ${hasConfig}; then ` +
     `echo ${TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER}; ` +
-    `elif [ -f "${targetPath}/package.json" ] && grep -q "\\"next\\":" "${targetPath}/package.json"; then ` +
-    `cp ${templateConfigPath} "${targetPath}/next.config.js" && echo ${TURBOPACK_CONFIG_WRITTEN_MARKER}; ` +
+    `elif [ -f ${packagePath} ] && grep -q -- '"next":' ${packagePath}; then ` +
+    `cp -- ${shellQuote(templateConfigPath)} ${shellQuote(`${targetPath}/next.config.js`)} && echo ${TURBOPACK_CONFIG_WRITTEN_MARKER}; ` +
     `else echo ${TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER}; fi`
   );
 }

@@ -57,6 +57,9 @@ class FakeClock:
 
 class Durability(unittest.TestCase):
     def setUp(self):
+        evidence = mock.patch.object(enroll.guard, "committed_digest", return_value="sha256:" + "a" * 64)
+        evidence.start()
+        self.addCleanup(evidence.stop)
         self.tmp = tempfile.mkdtemp(prefix="ezil-enroll-durability-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))

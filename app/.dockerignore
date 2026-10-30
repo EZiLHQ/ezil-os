@@ -1,0 +1,25 @@
+# Root-context allowlist, installed as Dockerfile.dockerignore by deploy.sh.
+**
+!app/
+!app/package.json
+!app/bun.lock
+!app/next.config.ts
+!app/tsconfig.json
+!app/postcss.config.mjs
+!app/src/
+!app/src/**
+!app/public/
+!app/public/**
+!native/
+!native/src/
+!native/src/contract.ts
+!native/src/surfaces.ts
+**/node_modules
+**/.next
+**/.env*
+**/*.test.*
+**/*.spec.*
+**/tests
+**/__tests__
+**/e2e
+**/.git

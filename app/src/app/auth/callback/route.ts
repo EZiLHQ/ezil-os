@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { createClient } from '@/utils/supabase/server';
+import { publicOrigin } from '@/utils/forwarded';
 
 /**
  * OAuth (Google) + email-confirmation callback. Supabase redirects the
@@ -19,7 +20,8 @@ import { createClient } from '@/utils/supabase/server';
  * break the OAuth route into `/os`.
  */
 export async function GET(request: NextRequest) {
-    const { searchParams, origin } = new URL(request.url);
+    const { searchParams } = new URL(request.url);
+    const origin = publicOrigin(request.headers, request.url);
     const code = searchParams.get('code');
     const returnUrl = safeReturnUrl(searchParams.get('returnUrl'));
 

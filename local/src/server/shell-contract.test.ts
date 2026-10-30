@@ -26,7 +26,8 @@ import { SHELL_APPS, SHELL_API_ROUTES as APP_SHELL_API_ROUTES } from '../../../a
 import { OS_ASSET_PATHS } from '../boot/os-document.ts';
 import { loadConfig, SHELL_ASSET_FILES, type LocalConfig } from '../config.ts';
 import { localUrlFor } from '../container/run-spec.ts';
-import { SHELL_API_ROUTES } from '../contract/shell-api.ts';
+import { probeFrameOrigin } from '../contract/frame-origin.ts';
+import { SHELL_API_ROUTES, SHELL_API_ROUTE_KEYS } from '../contract/shell-api.ts';
 import { FakeSandboxHost, healthyFakeState, type FakeHostState } from './fake-host.ts';
 import {
     LOCAL_FOCUSABLE_APPS,
@@ -37,8 +38,20 @@ import {
 } from './routes.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
 
-// Direct loopback media does not have Cloudflare TURN credentials to renew.
-const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_SHELL_API_ROUTES } = APP_SHELL_API_ROUTES;
+// Local mode has neither hosted TURN credentials, recorded cloud machine
+// metadata, nor AWS capacity attempts (RETRY-118's hosted explicit Retry), and
+// Feedback is hosted-only (per-user flag, hosted database). Keep the
+// unsupported routes explicit so new app routes still fail the shared-contract
+// comparison until their local support is decided.
+const {
+    relayRefresh: HOSTED_RELAY_ROUTE,
+    system: HOSTED_SYSTEM_ROUTE,
+    capacityRetry: HOSTED_CAPACITY_RETRY_ROUTE,
+    feedback: HOSTED_FEEDBACK_ROUTE,
+    // Configuration switching is hosted-only (AWS sizes); local has one fixed machine.
+    switch: HOSTED_SWITCH_ROUTE,
+    ...COMMON_SHELL_API_ROUTES
+} = APP_SHELL_API_ROUTES;
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
@@ -106,7 +119,7 @@ describe('the published endpoint map and the served paths are the same nine', ()
         // nothing of Next.js is loaded. Same technique as
         // `../contract/shell-api.test.ts`.
         expect(Object.keys(SHELL_API_ROUTES).sort()).toEqual(Object.keys(COMMON_SHELL_API_ROUTES).sort());
-        for (const key of Object.keys(COMMON_SHELL_API_ROUTES) as (keyof typeof COMMON_SHELL_API_ROUTES)[]) {
+        for (const key of SHELL_API_ROUTE_KEYS) {
             expect(SHELL_API_ROUTES[key]).toBe(COMMON_SHELL_API_ROUTES[key]);
         }
     });
@@ -133,6 +146,21 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(body.desktopState.endpoints.relayRefresh).toBeUndefined();
         expect((await get(HOSTED_RELAY_ROUTE)).status).toBe(404);
+        expect((await get(HOSTED_FEEDBACK_ROUTE)).status).toBe(404);
+    });
+
+    it('does not advertise or serve hosted machine metadata', async () => {
+        const res = await post(SHELL_API_ROUTES.session, {});
+        const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
+        expect(body.desktopState.endpoints.system).toBeUndefined();
+        expect((await get(`${HOSTED_SYSTEM_ROUTE}?computerId=${computerId()}`)).status).toBe(404);
+    });
+
+    it('does not advertise or serve the hosted capacity Retry', async () => {
+        const res = await post(SHELL_API_ROUTES.session, {});
+        const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
+        expect(body.desktopState.endpoints.capacityRetry).toBeUndefined();
+        expect((await post(HOSTED_CAPACITY_RETRY_ROUTE, { computerId: computerId(), attemptId: computerId() })).status).toBe(404);
     });
 });
 
@@ -464,6 +492,50 @@ describe('GET /api/shell/desktop — the cheap poll', () => {
         expect(badBody.confirmed).toBe(false);
         expect(badBody.status).toBe(500);
         reset();
+    });
+
+    it('successful local Code HTTP probes satisfy the real shell observer without a reason field', async () => {
+        reset();
+        const shell = await import(new URL('../../../shell/ezil/session.js', import.meta.url).href);
+        const global = globalThis as unknown as { window?: unknown };
+        const priorWindow = global.window;
+        global.window = { __EZIL_BOOT__: { user: { id: 'local-test' },
+            desktopState: { provider: 'local-vm', endpoints: { desktop: `${base()}${SHELL_API_ROUTES.desktop}` } } } };
+        try {
+            for (const status of [200, 299, 302, 399]) {
+                frameVerdict = await probeFrameOrigin(localUrlFor('code'), 'code', 0,
+                    Object.assign(async () => new Response(null, { status, headers: { location: localUrlFor('code') } }),
+                        { preconnect: () => {} }));
+                expect(frameVerdict).toEqual({ alive: true, reason: 'ok', status });
+                const query = new URLSearchParams({ computerId: computerId(), confirm: 'frame', surface: 'code', frameUrl: localUrlFor('code') });
+                const body = await (await get(`${SHELL_API_ROUTES.desktop}?${query}`)).json() as Record<string, unknown>;
+                expect(body).toMatchObject({ ok: true, confirmed: true, status });
+                expect(Object.hasOwn(body, 'reason')).toBe(false);
+                expect(await shell.observeFrame(computerId(), localUrlFor('code'), 'code'))
+                    .toEqual({ confirmed: true, retryable: false });
+            }
+        } finally {
+            if (priorWindow === undefined) delete global.window; else global.window = priorWindow;
+            reset();
+        }
+    });
+
+    it('local frame confirmation preserves negative evidence and refuses malformed positive probes', async () => {
+        reset();
+        try {
+            for (const probe of [
+                { alive: false, reason: 'http_error', status: 503 },
+                { alive: false, reason: 'foreign_origin' },
+                { alive: true, reason: 'foreign_origin', status: 200 },
+                ...[undefined, 199, 400, 200.5].map(status => ({ alive: true, reason: 'ok', status })),
+            ] as FrameProbe[]) {
+                frameVerdict = probe;
+                const query = new URLSearchParams({ computerId: computerId(), confirm: 'frame', surface: 'code', frameUrl: localUrlFor('code') });
+                const body = await (await get(`${SHELL_API_ROUTES.desktop}?${query}`)).json() as Record<string, unknown>;
+                expect(body).toMatchObject({ ok: true, confirmed: false, reason: probe.reason });
+                expect(body.status).toBe(probe.status);
+            }
+        } finally { reset(); }
     });
 
     it('confirm=frame pins Code and Preview to their own declared surface ports', async () => {

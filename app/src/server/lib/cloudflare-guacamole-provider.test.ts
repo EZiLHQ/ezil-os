@@ -71,6 +71,21 @@ afterEach(() => {
 });
 
 describe('classifyWorkerHttpFailure — deterministic vs retryable', () => {
+    it('reads the Worker public codes for the two deterministic runtime failures as non-retryable', () => {
+        for (const code of ['sandbox_runtime_blocked', 'custom_domain_required'] as const) {
+            const got = classifyWorkerHttpFailure(500, JSON.stringify({ ok: false, error: code }));
+            expect(got).toBe(code);
+            expect(isRetryablePreviewErrorCode(got)).toBe(false);
+        }
+        expect(classifyWorkerHttpFailure(500, JSON.stringify({ ok: false, error: 'internal_error' }))).not.toBe('sandbox_runtime_blocked');
+    });
+    it('reads the migration fence refusal (409 migrating) as a retryable start, other 409s as bad requests', () => {
+        const code = classifyWorkerHttpFailure(409, JSON.stringify({ ok: false, error: 'migrating' }));
+        expect(code).toBe('sandbox_starting');
+        expect(isRetryablePreviewErrorCode(code)).toBe(true);
+        expect(classifyWorkerHttpFailure(409, JSON.stringify({ ok: false, error: 'head_moved' }))).not.toBe('sandbox_starting');
+        expect(classifyWorkerHttpFailure(409, 'migrating')).not.toBe('sandbox_starting');
+    });
     it('classifies the Worker\'s 400 missing_project_id as a deterministic bad request', () => {
         // The exact body worker/src/index.ts returns when projectId is absent.
         const code = classifyWorkerHttpFailure(400, '{"ok":false,"error":"missing_project_id"}');

@@ -1,0 +1,189 @@
+/* Scoped tokens keep payment legible regardless of the desktop theme. */
+.ezil-upgrade-backdrop {
+    --bg: #04060c;
+    --surface: #0d1118;
+    --surface-2: #141a23;
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #f5f5f4;
+    --muted: #9aa3ad;
+    /* Round 3: the user's accent (`--ezil-accent`, ezil-tokens.css + Appearance). */
+    --accent: var(--ezil-accent, #00adb5);
+    --accent-ink: var(--ezil-accent-contrast, #04060c);
+    --warn: #f5a524;
+    --danger: #f05d5e;
+    position: fixed;
+    inset: 0;
+    /* UIWindow's raised windows and taskbar drag helpers reach 999999999. */
+    /* Above OS windows, below the provider-owned body lightboxes. */
+    z-index: 1000000000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    background: rgba(4, 6, 12, 0.8);
+    color: var(--text);
+    font: 14px/20px system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+}
+
+.ezil-upgrade-backdrop, .ezil-upgrade-backdrop * { box-sizing: border-box; }
+
+.ezil-upgrade-sheet {
+    position: relative;
+    width: min(960px, calc(100vw - 32px));
+    max-height: min(760px, calc(100vh - 32px));
+    max-height: min(760px, calc(100dvh - 32px));
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    overflow: auto;
+    overscroll-behavior: contain;
+    overflow-wrap: anywhere;
+}
+
+.ezil-upgrade-columns {
+    display: grid;
+    grid-template-columns: 300px minmax(420px, 1fr);
+}
+
+.ezil-upgrade-summary, .ezil-upgrade-payment { min-width: 0; }
+.ezil-upgrade-summary { padding: 32px 24px; background: var(--surface-2); }
+.ezil-upgrade-payment { padding: 56px 16px 24px; }
+.ezil-upgrade-summary summary { cursor: pointer; font-weight: 600; list-style: none; }
+.ezil-upgrade-summary summary::-webkit-details-marker { display: none; }
+.ezil-upgrade-summary #ezil-upgrade-title { font-size: 20px; line-height: 28px; }
+.ezil-upgrade-summary p { margin: 16px 0; color: var(--muted); }
+.ezil-upgrade-summary .ezil-upgrade-price {
+    margin: 24px 0 8px;
+    color: var(--text);
+    font-size: 44px;
+    line-height: 52px;
+    font-weight: 600;
+}
+.ezil-upgrade-price span { color: var(--muted); font-size: 14px; font-weight: 400; }
+.ezil-upgrade-summary .ezil-upgrade-caption { margin-top: 8px; font-size: 12px; line-height: 16px; }
+.ezil-upgrade-allowances { display: grid; gap: 16px; margin: 28px 0; padding: 0; list-style: none; }
+.ezil-upgrade-allowances li, .ezil-upgrade-security { display: flex; align-items: flex-start; gap: 10px; }
+.ezil-upgrade-summary svg {
+    flex: 0 0 18px;
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+.ezil-upgrade-allowances svg { color: var(--accent); }
+.ezil-upgrade-summary hr { margin: 24px 0; border: 0; border-top: 1px solid var(--border); }
+.ezil-upgrade-total { display: flex; gap: 16px; align-items: baseline; }
+.ezil-upgrade-total strong { flex-shrink: 0; }
+.ezil-upgrade-total > span { color: var(--muted); font-size: 12px; line-height: 16px; }
+.ezil-upgrade-summary .ezil-upgrade-security { margin-top: 24px; font-size: 12px; line-height: 16px; }
+
+.ezil-upgrade-sheet button {
+    min-height: 40px;
+    max-width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: normal;
+}
+
+.ezil-upgrade-sheet .ezil-upgrade-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 40px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 24px;
+}
+
+.ezil-upgrade-sheet :is(button, summary, a, iframe, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.ezil-upgrade-sheet [data-focus-edge] { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+.ezil-upgrade-sheet #ezil-embedded-checkout { width: 100%; min-width: 0; min-height: 560px; }
+.ezil-upgrade-sheet iframe { width: 100%; max-width: 100%; border: 0; }
+.ezil-upgrade-sheet [hidden] { display: none; }
+.ezil-upgrade-sheet [data-role="upgrade-success"] > span { color: var(--accent); font-size: 28px; }
+.ezil-upgrade-payment [data-role="checkout-state"] > p:empty { display: none; }
+
+/* Viewport width, rather than Settings width, decides when payment stacks. */
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-sheet {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    max-height: 100%;
+    border: 0;
+    border-radius: 0;
+}
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-columns { grid-template-columns: minmax(0, 1fr); }
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-summary { padding: 56px 12px 16px; }
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-payment { padding: 16px 12px; }
+.ezil-upgrade-compact-title { font-size: 12px; line-height: 16px; font-weight: 400; }
+
+@media (prefers-reduced-motion: reduce) {
+    .ezil-upgrade-sheet, .ezil-upgrade-sheet * { animation: none; transition: none; }
+}
+
+/* Billing changes use the same viewport frame and tokens as checkout. */
+.ezil-upgrade-price [data-role="price"] { color: inherit; font: inherit; }
+.ezil-billing-sheet { width: min(560px, calc(100vw - 32px)); padding: 28px; }
+.ezil-billing-sheet h2 { margin: 8px 36px 24px 0; font-size: 22px; line-height: 1.3; }
+.ezil-billing-sheet p { margin: 16px 0; }
+.ezil-billing-sheet .ezil-upgrade-caption,
+.ezil-billing-sheet :is(#ezil-cap-range, #ezil-cap-hours) { color: var(--muted); font-size: 13px; }
+.ezil-billing-sheet-lines { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.ezil-billing-sheet-lines th, .ezil-billing-sheet-lines td { padding: 12px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ezil-billing-sheet-lines th { text-align: left; font-weight: 400; padding-right: 16px; }
+.ezil-billing-sheet-lines td { width: 35%; text-align: right; font-variant-numeric: tabular-nums; }
+.ezil-billing-sheet-total { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ezil-billing-sheet-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.ezil-billing-sheet .ezil-billing-sheet-danger { background: var(--danger); color: var(--accent-ink); }
+.ezil-billing-sheet .ezil-billing-sheet-secondary { background: var(--surface-2); color: var(--text); }
+.ezil-upgrade-sheet button:disabled { opacity: 0.55; cursor: default; }
+.ezil-billing-sheet a { display: inline-block; max-width: 100%; color: var(--accent); margin: 0 16px 16px 0; }
+.ezil-billing-cap { display: grid; gap: 8px; font-weight: 600; }
+.ezil-billing-cap input {
+    width: 100%; min-width: 0; max-width: 240px; min-height: 40px; padding: 8px 12px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);
+    color: var(--text); font: inherit; font-variant-numeric: tabular-nums;
+}
+.ezil-billing-consent { display: flex; align-items: flex-start; gap: 12px; margin: 24px 0; }
+.ezil-billing-consent input { flex: 0 0 20px; width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+.ezil-billing-consent span { min-width: 0; }
+.ezil-billing-sheet input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ezil-billing-sheet [data-role="sheet-error"] { color: var(--danger); }
+.ezil-upgrade-backdrop.is-compact .ezil-billing-sheet { padding: 56px 16px 24px; }
+
+.ezil-billing-choice { border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin: 16px 0; }
+.ezil-billing-choice.is-highlighted { border-color: var(--accent); }
+.ezil-billing-sheet ul { padding-left: 20px; line-height: 1.6; }
+.ezil-billing-sheet li + li { margin-top: 8px; }
+.ezil-billing-fair-use { padding: 12px 0; }
+.ezil-billing-fair-use[data-status="near"] { color: var(--warn); }
+.ezil-billing-fair-use[data-status="paused"] { color: var(--danger); }
+
+/* Round 3 plan sheet (§6.4): three columns, then the bullets in plan order. */
+.ezil-billing-choices { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.ezil-billing-choice { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ezil-billing-choice [data-role="current-plan"] { opacity: 0.7; cursor: default; }
+.ezil-billing-choice-lead { font-weight: 600; margin: 4px 0 0; }
+/* "What happens next" beside the price (M8): a short timeline. */
+.ezil-billing-next { border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08)); margin-top: 12px; padding-top: 12px; }
+.ezil-billing-next h3 { font-size: 14px; margin: 0 0 8px; }
+.ezil-billing-next dl { display: grid; gap: 6px; margin: 0; }
+.ezil-billing-next dl > div { display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr); gap: 8px; }
+.ezil-billing-next dt { font-weight: 600; color: var(--accent); }
+.ezil-billing-next dd { margin: 0; }

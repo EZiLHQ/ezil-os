@@ -84,24 +84,24 @@ function between(startMarker: string, endMarker: string): string {
 
 describe('isIdleStopDue', () => {
   it('is false well before the idle threshold', async () => {
-    const { isIdleStopDue } = await import('./index');
+    const { isIdleStopDue } = await import('./index-test-helpers.test');
     expect(isIdleStopDue({ lastActivityAt: 1_000_000, now: 1_000_000 + 60_000 })).toBe(false); // 1 min
   });
 
   it('is false one millisecond before the threshold', async () => {
-    const { isIdleStopDue } = await import('./index');
+    const { isIdleStopDue } = await import('./index-test-helpers.test');
     const IDLE_STOP_MS = 10 * 60_000;
     expect(isIdleStopDue({ lastActivityAt: 0, now: IDLE_STOP_MS - 1 })).toBe(false);
   });
 
   it('is true exactly at the threshold (inclusive)', async () => {
-    const { isIdleStopDue } = await import('./index');
+    const { isIdleStopDue } = await import('./index-test-helpers.test');
     const IDLE_STOP_MS = 10 * 60_000;
     expect(isIdleStopDue({ lastActivityAt: 0, now: IDLE_STOP_MS })).toBe(true);
   });
 
   it('is true well past the threshold', async () => {
-    const { isIdleStopDue } = await import('./index');
+    const { isIdleStopDue } = await import('./index-test-helpers.test');
     expect(isIdleStopDue({ lastActivityAt: 0, now: 60 * 60_000 })).toBe(true); // 1 hour
   });
 
@@ -111,21 +111,21 @@ describe('isIdleStopDue', () => {
 
 describe('computeNextFlushBackoffSeconds', () => {
   it('resets to the base interval (10s) when a file changed, regardless of prior backoff', async () => {
-    const { computeNextFlushBackoffSeconds } = await import('./index');
+    const { computeNextFlushBackoffSeconds } = await import('./index-test-helpers.test');
     expect(
       computeNextFlushBackoffSeconds({ previousIntervalSeconds: 60, wroteSomething: true, activityAdvanced: false }),
     ).toBe(10);
   });
 
   it('resets to the base interval when activity advanced, even with nothing written', async () => {
-    const { computeNextFlushBackoffSeconds } = await import('./index');
+    const { computeNextFlushBackoffSeconds } = await import('./index-test-helpers.test');
     expect(
       computeNextFlushBackoffSeconds({ previousIntervalSeconds: 60, wroteSomething: false, activityAdvanced: true }),
     ).toBe(10);
   });
 
   it('climbs 10 -> 30 -> 60 across successive empty cycles', async () => {
-    const { computeNextFlushBackoffSeconds } = await import('./index');
+    const { computeNextFlushBackoffSeconds } = await import('./index-test-helpers.test');
     let interval = 10;
     interval = computeNextFlushBackoffSeconds({
       previousIntervalSeconds: interval,
@@ -142,14 +142,14 @@ describe('computeNextFlushBackoffSeconds', () => {
   });
 
   it('caps at 60s — does not keep climbing past it', async () => {
-    const { computeNextFlushBackoffSeconds } = await import('./index');
+    const { computeNextFlushBackoffSeconds } = await import('./index-test-helpers.test');
     expect(
       computeNextFlushBackoffSeconds({ previousIntervalSeconds: 60, wroteSomething: false, activityAdvanced: false }),
     ).toBe(60);
   });
 
   it('an unrecognized previous interval does not throw (defensive fallback)', async () => {
-    const { computeNextFlushBackoffSeconds } = await import('./index');
+    const { computeNextFlushBackoffSeconds } = await import('./index-test-helpers.test');
     expect(() =>
       computeNextFlushBackoffSeconds({ previousIntervalSeconds: 9999, wroteSomething: false, activityAdvanced: false }),
     ).not.toThrow();
@@ -166,12 +166,12 @@ describe('computeNextFlushBackoffSeconds', () => {
 
 describe('computeActivityTimestamp', () => {
   it('derives an earlier timestamp the further back the reported input was', async () => {
-    const { computeActivityTimestamp } = await import('./index');
+    const { computeActivityTimestamp } = await import('./index-test-helpers.test');
     expect(computeActivityTimestamp({ now: 1_000_000, lastInputAgoMs: 60_000 })).toBe(940_000);
   });
 
   it('a report of 0ms ago is "now"', async () => {
-    const { computeActivityTimestamp } = await import('./index');
+    const { computeActivityTimestamp } = await import('./index-test-helpers.test');
     expect(computeActivityTimestamp({ now: 1_000_000, lastInputAgoMs: 0 })).toBe(1_000_000);
   });
 
@@ -180,13 +180,13 @@ describe('computeActivityTimestamp', () => {
     // negative value were allowed through unclamped, the derived
     // `lastActivityAt` would exceed `now`, and `isIdleStopDue` would never
     // fire against real wall-clock time again.
-    const { computeActivityTimestamp } = await import('./index');
+    const { computeActivityTimestamp } = await import('./index-test-helpers.test');
     const now = 1_000_000;
     expect(computeActivityTimestamp({ now, lastInputAgoMs: -5_000 })).toBe(now);
   });
 
   it('treats a non-finite lastInputAgoMs as 0 rather than propagating NaN', async () => {
-    const { computeActivityTimestamp } = await import('./index');
+    const { computeActivityTimestamp } = await import('./index-test-helpers.test');
     const now = 1_000_000;
     expect(computeActivityTimestamp({ now, lastInputAgoMs: NaN })).toBe(now);
     expect(computeActivityTimestamp({ now, lastInputAgoMs: Infinity })).toBe(now);
@@ -199,42 +199,42 @@ describe('computeActivityTimestamp', () => {
 
 describe('validateActivityBody', () => {
   it('accepts a valid non-negative finite number', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     expect(validateActivityBody({ lastInputAgoMs: 12_345 })).toEqual({ ok: true, lastInputAgoMs: 12_345 });
   });
 
   it('accepts exactly 0', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     expect(validateActivityBody({ lastInputAgoMs: 0 })).toEqual({ ok: true, lastInputAgoMs: 0 });
   });
 
   it('rejects a missing field', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     const result = validateActivityBody({});
     expect(result.ok).toBe(false);
   });
 
   it('rejects a non-number (string, closed contract — never coerced)', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     const result = validateActivityBody({ lastInputAgoMs: '5000' });
     expect(result.ok).toBe(false);
   });
 
   it('rejects NaN/Infinity', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     expect(validateActivityBody({ lastInputAgoMs: NaN }).ok).toBe(false);
     expect(validateActivityBody({ lastInputAgoMs: Infinity }).ok).toBe(false);
   });
 
   it('rejects a negative value outright rather than clamping (route-layer contract)', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     const result = validateActivityBody({ lastInputAgoMs: -1 });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain('non_negative');
   });
 
   it('rejects a non-object body', async () => {
-    const { validateActivityBody } = await import('./index');
+    const { validateActivityBody } = await import('./index-test-helpers.test');
     expect(validateActivityBody(null).ok).toBe(false);
     expect(validateActivityBody('not an object').ok).toBe(false);
     expect(validateActivityBody([1, 2, 3]).ok).toBe(false);
@@ -254,23 +254,23 @@ describe('validateActivityBody', () => {
 
 describe('parseLoadAvg1', () => {
   it('reads the 1-minute figure out of a real /proc/loadavg line', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('0.42 0.31 0.28 1/512 1234')).toBe(0.42);
   });
 
   it('reads a genuinely idle 0.00 as the NUMBER zero, not as "no answer"', async () => {
     // The distinction matters: 0 authorizes a stop, `null` refuses one.
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('0.00 0.01 0.05 1/234 567\n')).toBe(0);
   });
 
   it('tolerates leading/trailing whitespace and a trailing newline', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('  1.75 1.20 0.90 3/512 99  \n')).toBe(1.75);
   });
 
   it('reads a load above 1 on a multi-core box', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('12.5 8.0 4.0 9/900 1')).toBe(12.5);
   });
 
@@ -278,18 +278,18 @@ describe('parseLoadAvg1', () => {
   // invented a `0` here would hand `containerBusyFromProbe` an authorization
   // to stop a container based on output it never actually understood.
   it('returns null for empty stdout rather than coercing it to 0', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('')).toBeNull();
     expect(parseLoadAvg1('   \n')).toBeNull();
   });
 
   it('returns null for a non-numeric first token', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('cat: /proc/loadavg: No such file or directory')).toBeNull();
   });
 
   it('returns null for a partially-numeric token rather than the number it starts with', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('0.5abc 1 1')).toBeNull();
   });
 
@@ -301,7 +301,7 @@ describe('parseLoadAvg1', () => {
     // cannot produce. Everything the plain `Number.isFinite`/`< 0` checks
     // already reject lands on the safe side by luck; these two do not, so the
     // format check is the guard that actually carries the fail-safe here.
-    const { parseLoadAvg1, containerBusyFromProbe } = await import('./index');
+    const { parseLoadAvg1, containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('5e-3 1 1')).toBeNull();
     expect(parseLoadAvg1('0x0 1 1')).toBeNull();
     expect(containerBusyFromProbe({ exitCode: 0, stdout: '5e-3 1 1' }).busy).toBe(true);
@@ -309,12 +309,12 @@ describe('parseLoadAvg1', () => {
   });
 
   it('returns null for a negative figure (impossible for a load average)', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1('-1.0 0 0')).toBeNull();
   });
 
   it('does not throw on null/undefined stdout', async () => {
-    const { parseLoadAvg1 } = await import('./index');
+    const { parseLoadAvg1 } = await import('./index-test-helpers.test');
     expect(parseLoadAvg1(undefined as unknown as string)).toBeNull();
     expect(parseLoadAvg1(null as unknown as string)).toBeNull();
   });
@@ -324,7 +324,7 @@ describe('containerBusyFromProbe: 🔴 every way of not knowing is BUSY', () => 
   const THRESHOLD = 0.5; // must match CONTAINER_BUSY_LOAD1 in ./index.ts
 
   it('a quiet container (bench A: no session attached, load 0.00) is NOT busy — the stop may proceed', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     const verdict = containerBusyFromProbe({ exitCode: 0, stdout: '0.00 0.01 0.05 1/234 567' });
     expect(verdict.busy).toBe(false);
     expect(verdict.load1).toBe(0);
@@ -335,36 +335,36 @@ describe('containerBusyFromProbe: 🔴 every way of not knowing is BUSY', () => 
     // single largest slice of the bill: nobody is there, but Neko is still
     // software-encoding 1920x1080 vp8 at a quarter of a core. A threshold
     // that read this as "working" would veto exactly the stops that matter.
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(containerBusyFromProbe({ exitCode: 0, stdout: '0.3055 0.28 0.20 2/400 9' }).busy).toBe(false);
   });
 
   it('🔴 a container mid-build (bench C floor, 0.8054) IS busy — the stop is refused', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     const verdict = containerBusyFromProbe({ exitCode: 0, stdout: '0.8054 0.60 0.40 5/512 1' });
     expect(verdict.busy).toBe(true);
     expect(verdict.load1).toBe(0.8054);
   });
 
   it('a container deep in a parallel build (load 1.8 on 2 vCPU) IS busy', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     const verdict = containerBusyFromProbe({ exitCode: 0, stdout: '1.80 1.40 0.90 5/512 1' });
     expect(verdict.busy).toBe(true);
     expect(verdict.load1).toBe(1.8);
   });
 
   it('exactly at the threshold counts as busy (inclusive)', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(containerBusyFromProbe({ exitCode: 0, stdout: `${THRESHOLD} 0 0` }).busy).toBe(true);
   });
 
   it('just below the threshold is not busy', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(containerBusyFromProbe({ exitCode: 0, stdout: '0.49 0 0' }).busy).toBe(false);
   });
 
   it('🔴 a probe that THREW (null) is busy — a probe that cannot answer never authorizes a stop', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     const verdict = containerBusyFromProbe(null);
     expect(verdict.busy).toBe(true);
     expect(verdict.load1).toBeNull();
@@ -372,7 +372,7 @@ describe('containerBusyFromProbe: 🔴 every way of not knowing is BUSY', () => 
   });
 
   it('🔴 a non-zero exit code is busy, even with plausible-looking stdout', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     // A shell that failed but still echoed something must not be believed.
     const verdict = containerBusyFromProbe({ exitCode: 1, stdout: '0.00 0.00 0.00 1/1 1' });
     expect(verdict.busy).toBe(true);
@@ -380,13 +380,13 @@ describe('containerBusyFromProbe: 🔴 every way of not knowing is BUSY', () => 
   });
 
   it('🔴 unparseable stdout is busy', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(containerBusyFromProbe({ exitCode: 0, stdout: 'cat: /proc/loadavg: Permission denied' }).busy).toBe(true);
     expect(containerBusyFromProbe({ exitCode: 0, stdout: '' }).busy).toBe(true);
   });
 
   it('reports the observed figure so an operator can tell "quiet" from "never answered"', async () => {
-    const { containerBusyFromProbe } = await import('./index');
+    const { containerBusyFromProbe } = await import('./index-test-helpers.test');
     expect(containerBusyFromProbe({ exitCode: 0, stdout: '0.03 0 0' }).load1).toBe(0.03);
     expect(containerBusyFromProbe({ exitCode: 0, stdout: 'nonsense' }).load1).toBeNull();
   });

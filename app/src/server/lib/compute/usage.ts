@@ -5,6 +5,7 @@
  * - Months are UTC calendar months.
  * - Hours: each row covers `[started_at, stopped_at ?? now]`, clipped to the
  *   month and to `now`. An open row counts up to now.
+ * - Caps: floor each clipped row to whole seconds, then multiply by vCPU / 2.
  * - Egress: `egress_bytes` is one total per row with no time breakdown, so it
  *   cannot be clipped. A row's whole egress counts in EVERY month the row
  *   overlaps: a row spanning a boundary is over-counted, which is the safe
@@ -17,6 +18,7 @@
  */
 
 import type { UsageRow } from './placement';
+import { instanceVcpu } from './aws-config';
 
 const HOUR_MS = 3_600_000;
 export const BYTES_PER_GB = 1_000_000_000;
@@ -31,9 +33,18 @@ export function utcNextMonthStart(now: Date): Date {
 
 /** Hours of `row` inside the UTC month containing `now`, up to `now`. Never negative. */
 export function rowHoursInMonth(row: Pick<UsageRow, 'startedAt' | 'stoppedAt'>, now: Date): number {
+    return rowMillisecondsInMonth(row, now) / HOUR_MS;
+}
+
+function rowMillisecondsInMonth(row: Pick<UsageRow, 'startedAt' | 'stoppedAt'>, now: Date): number {
     const from = Math.max(row.startedAt.getTime(), utcMonthStart(now).getTime());
     const to = Math.min((row.stoppedAt ?? now).getTime(), now.getTime(), utcNextMonthStart(now).getTime());
-    return to > from ? (to - from) / HOUR_MS : 0;
+    return to > from ? to - from : 0;
+}
+
+/** Whole seconds per row, clipped before flooring, weighted in 2-vCPU units. */
+export function rowWeightedSecondsInMonth(row: UsageRow, now: Date): number {
+    return Math.floor(rowMillisecondsInMonth(row, now) / 1_000) * (instanceVcpu(row.instanceType) / 2);
 }
 
 /** True when the row overlaps the UTC month containing `now` (and started by `now`). */
@@ -44,19 +55,23 @@ export function rowOverlapsMonth(row: Pick<UsageRow, 'startedAt' | 'stoppedAt'>,
 }
 
 export interface UsageTotals {
+    /** @deprecated for caps; use weightedSeconds. Unweighted wall-clock hours. */
     hours: number;
+    weightedSeconds: number;
     egressBytes: number;
 }
 
 export function totalsFor(rows: readonly UsageRow[], now: Date): UsageTotals {
     let hours = 0;
+    let weightedSeconds = 0;
     let egressBytes = 0;
     for (const row of rows) {
         if (!rowOverlapsMonth(row, now)) continue;
         hours += rowHoursInMonth(row, now);
+        weightedSeconds += rowWeightedSecondsInMonth(row, now);
         egressBytes += row.egressBytes ?? 0;
     }
-    return { hours, egressBytes };
+    return { hours, weightedSeconds, egressBytes };
 }
 
 export function summarizeUsage(rows: readonly UsageRow[], userId: string, now: Date): { user: UsageTotals; global: UsageTotals } {
@@ -75,7 +90,7 @@ export interface MonthUsage {
     byUser: ReadonlyMap<string, UsageTotals>;
 }
 
-const ZERO: UsageTotals = Object.freeze({ hours: 0, egressBytes: 0 });
+const ZERO: UsageTotals = Object.freeze({ hours: 0, weightedSeconds: 0, egressBytes: 0 });
 
 export function monthUsageFromRows(rows: readonly UsageRow[], now: Date): MonthUsage {
     const byUser = new Map<string, UsageTotals>();
@@ -83,7 +98,11 @@ export function monthUsageFromRows(rows: readonly UsageRow[], now: Date): MonthU
         if (!rowOverlapsMonth(row, now)) continue;
         const key = row.userId.toLowerCase();
         const prev = byUser.get(key) ?? ZERO;
-        byUser.set(key, { hours: prev.hours + rowHoursInMonth(row, now), egressBytes: prev.egressBytes + (row.egressBytes ?? 0) });
+        byUser.set(key, {
+            hours: prev.hours + rowHoursInMonth(row, now),
+            weightedSeconds: prev.weightedSeconds + rowWeightedSecondsInMonth(row, now),
+            egressBytes: prev.egressBytes + (row.egressBytes ?? 0),
+        });
     }
     return { global: totalsOf(byUser.values()), byUser };
 }
@@ -91,15 +110,33 @@ export function monthUsageFromRows(rows: readonly UsageRow[], now: Date): MonthU
 /** Fleet-wide totals from per-user totals. */
 export function totalsOf(perUser: Iterable<UsageTotals>): UsageTotals {
     let hours = 0;
+    let weightedSeconds = 0;
     let egressBytes = 0;
     for (const t of perUser) {
         hours += t.hours;
+        weightedSeconds += t.weightedSeconds;
         egressBytes += t.egressBytes;
     }
-    return { hours, egressBytes };
+    return { hours, weightedSeconds, egressBytes };
 }
 
 /** One user's and the fleet's totals: what the caps compare against. */
 export function usageFor(usage: MonthUsage, userId: string): { user: UsageTotals; global: UsageTotals } {
     return { user: usage.byUser.get(userId.toLowerCase()) ?? ZERO, global: usage.global };
+}
+
+/**
+ * Round 3 D11: the AWS usage-ledger backstop (`EZIL_AWS_USER_MONTHLY_HOURS`, weighted
+ * 2-vCPU hours per UTC month) as its own refusal, distinct from the plan's fair use.
+ * Same comparison as `decideAdmission`'s `user_hours_cap`; it reads, it never writes.
+ */
+export const AWS_MONTHLY_CAP_REASON = 'aws_monthly_cap' as const;
+
+export function awsMonthlyCapReached(usage: MonthUsage, userId: string, userMonthlyHours: number): boolean {
+    return Number.isFinite(userMonthlyHours) && usageFor(usage, userId).user.weightedSeconds >= userMonthlyHours * 3_600;
+}
+
+/** Billing's name for a compute admission refusal; null when it is not the AWS ledger cap. */
+export function awsMonthlyCapRefusal(reason: string | null | undefined): typeof AWS_MONTHLY_CAP_REASON | null {
+    return reason === 'user_hours_cap' ? AWS_MONTHLY_CAP_REASON : null;
 }

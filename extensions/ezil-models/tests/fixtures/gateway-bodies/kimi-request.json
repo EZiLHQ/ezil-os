@@ -1,0 +1,22 @@
+{
+  "model": "us.moonshotai.kimi-k3",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Explain the code."
+        }
+      ]
+    }
+  ],
+  "max_tokens": 4096,
+  "stream": false,
+  "system": [
+    {
+      "type": "text",
+      "text": "Be concise."
+    }
+  ]
+}

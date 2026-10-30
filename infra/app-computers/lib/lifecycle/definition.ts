@@ -7,7 +7,8 @@ const fields:Record<Exclude<Action,'modifyInstanceAttribute'>,string[]>={
     runInstances:RUN_FIELDS,
     // T-family launches: the same API plus the (standard) credit option.
     runBurstableInstances:[...RUN_FIELDS,'CreditSpecification'],
-    attachVolume:['Device','InstanceId','VolumeId'],createTags:['Resources','Tags'],
+    attachVolume:['Device','InstanceId','VolumeId'],detachVolume:['Device','InstanceId','VolumeId','Force'],
+    createTags:['Resources','Tags'],claimInstance:['Resources','Tags'],deleteTags:['Resources','Tags'],
     startInstances:['InstanceIds'],stopInstances:['InstanceIds','Force','Hibernate','SkipOsShutdown'],terminateInstances:['InstanceIds'],
 };
 /** Observation is read-only, so transient helper failures retry. Only the
@@ -32,7 +33,7 @@ export function lifecycleDefinition(helperArn:string,features:{userDataNonce?:bo
             {Variable:'$.step.decision',StringEquals:'refused',Next:'Refused'},
             {Variable:'$.step.decision',StringEquals:'rejected',Next:'Rejected'},
             {Variable:'$.step.decision',StringEquals:'success',Next:'Succeeded'}],Default:'Unconfirmed'},
-        Wait:{Type:'Wait',Seconds:5,Next:'Resume'},
+        Wait:{Type:'Wait',SecondsPath:'$.step.delaySeconds',Next:'Resume'},
         Backoff:{Type:'Wait',SecondsPath:'$.step.delaySeconds',Next:'Rearm'},
         Rearm:{Type:'Pass',Parameters:{lastError:NO_ERROR,'observeError.$':'$.ctl.observeError','throttles.$':'States.MathAdd($.ctl.throttles, 1)'},ResultPath:'$.ctl',Next:'Resume'},
         Resume:{Type:'Choice',Choices:phases.map(phase=>({Variable:'$.step.phase',StringEquals:phase,Next:'Observe-'+phase})),Default:'Unconfirmed'},
@@ -50,9 +51,13 @@ export function lifecycleDefinition(helperArn:string,features:{userDataNonce?:bo
         const next='After-'+name;
         States[name]={Type:'Task',Resource:`arn:aws:states:::aws-sdk:ec2:${ec2Api(name as Action)}`,TimeoutSeconds:30,
             Parameters:Object.fromEntries(keys.map(key=>[key+'.$','$.step.parameters.'+key])),
-            ResultSelector:NO_ERROR,ResultPath:'$.ctl.lastError',Next:next,
+            // A confirmed action can be observed immediately; the observer's
+            // fixed phase still records the attempt before any Describe call.
+            ResultSelector:NO_ERROR,ResultPath:'$.ctl.lastError',Next:'Observe-'+afterAction[name as Action],
             Catch:[{ErrorEquals:['States.ALL'],ResultPath:'$.ctl.lastError',Next:next}]};
-        States[next]={Type:'Wait',Seconds:5,Next:'Observe-'+afterAction[name as Action]};
+        // Keep the existing delay and phase on caught errors, including lost
+        // allocation replies that may lead to an identical tokenized retry.
+        States[next]={Type:'Wait',Seconds:1,Next:'Observe-'+afterAction[name as Action]};
     }
     return {Comment:'Bounded EC2 lifecycle; provider receipts do not certify mounted storage or installed apps',StartAt:'Init',TimeoutSeconds:960,States};
 }

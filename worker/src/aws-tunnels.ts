@@ -250,6 +250,8 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
   };
   const edgePort = deps.edgePort ?? AWS_EDGE_PORT_DEFAULT;
   const now = deps.nowMs ?? Date.now;
+  // Per-object, per-tunnel backoff for browser requests before first verification.
+  let browserCheckFailure: { tunnelId: string; lastCheckFailedAt: number } | null = null;
 
   async function fencedEpoch(): Promise<number> {
     return (await deps.storage.get<number>(FENCE_KEY)) ?? 0;
@@ -327,11 +329,36 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
   }
 
   return {
-    // Browser forwarding uses this lookup, so it must never return a stale verified record.
+    // Internal Worker RPC only. Serialize against fencing and concurrent desktop opens;
+    // retries for one host boot must deliver the same token to the running container.
+    aiNonce: (generation: number, leaseEpoch: number, bootId: string): Promise<string | null> => serial(async () => {
+      if (!/^[0-9a-f-]{36}$/.test(bootId)) return null;
+      const rec = await liveRecord();
+      if (!rec || rec.generation !== generation || rec.leaseEpoch !== leaseEpoch) return null;
+      if (rec.aiBootId === bootId && rec.aiProxyNonce) return rec.aiProxyNonce;
+      const nonce = crypto.randomUUID();
+      await deps.storage.put(RECORD_KEY, { ...rec, aiBootId: bootId, aiProxyNonce: nonce });
+      return nonce;
+    }),
+    // Keep unverified records available to the open path's explicit verdict check.
     get: (): Promise<AwsTunnelRecord | null> => serial(async () => {
       const rec = await liveRecord();
       if (!rec || !rec.originVerified) return rec;
       return await verifyOrigin(rec) === 'verified' ? liveRecord() : null;
+    }),
+
+    getForBrowser: (): Promise<AwsTunnelRecord | null> => serial(async () => {
+      const rec = await liveRecord();
+      if (!rec) return null;
+      if (!rec.originVerified && browserCheckFailure?.tunnelId === rec.tunnelId
+        && now() - browserCheckFailure.lastCheckFailedAt < 10_000) return null;
+      // This current-epoch record was created only by an app-authorized, claims-matched
+      // create. First verification only checks connector origin IPs (non-empty, all equal
+      // to rec.publicIp), the same check the open path performs.
+      const verdict = await verifyOrigin(rec);
+      browserCheckFailure = verdict === 'not_connected' && !rec.originVerified
+        ? { tunnelId: rec.tunnelId, lastCheckFailedAt: now() } : null;
+      return verdict === 'verified' ? liveRecord() : null;
     }),
 
     create: (claims: PreviewTokenV2Claims | undefined, text: string): Promise<TunnelResult> => serial(async () => {
@@ -386,9 +413,19 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         // Before the first Cloudflare call, so a lost response is always recoverable by name.
         await deps.storage.put(PENDING_KEY, pending);
         const tunnelId = await ensureTunnel(api, pending.tunnelName);
-        await api.putTunnelIngress(tunnelId, hostname, `http://127.0.0.1:${edgePort}`);
-        const dnsRecordId = await ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`);
-        const tunnelToken = await api.getTunnelToken(tunnelId);
+        // Drain every leg before returning or releasing the serial queue: a failed
+        // sibling must not let removal/new-epoch cleanup overtake an outstanding write.
+        // Defer invocation too, so a synchronous throw cannot bypass the barrier.
+        const [ingress, dns, token] = await Promise.allSettled([
+          Promise.resolve().then(() => api.putTunnelIngress(tunnelId, hostname, `http://127.0.0.1:${edgePort}`)),
+          Promise.resolve().then(() => ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`)),
+          Promise.resolve().then(() => api.getTunnelToken(tunnelId)),
+        ]);
+        if (ingress.status === 'rejected') throw ingress.reason;
+        if (dns.status === 'rejected') throw dns.reason;
+        if (token.status === 'rejected') throw token.reason;
+        const dnsRecordId = dns.value;
+        const tunnelToken = token.value;
         const record: AwsTunnelRecord = {
           computerId: body.computerId, sandboxId: body.sandboxId, generation: body.generation, leaseEpoch: body.leaseEpoch,
           instanceId: body.instanceId, region: body.region, publicIp: body.publicIp, tunnelId, dnsRecordId, hostname,
@@ -444,7 +481,7 @@ export interface AwsTunnelEnv {
 }
 
 /** Internal protocol between the Worker and its registry object (never exposed to clients). */
-export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', verifyOrigin: '/verify-origin' } as const;
+export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', getForBrowser: '/get-for-browser', verifyOrigin: '/verify-origin', aiNonce: '/ai-nonce' } as const;
 
 /**
  * One per sandbox (`idFromName(sandboxId)`). Classic Durable Object `fetch` interface, so
@@ -476,8 +513,16 @@ export class AwsTunnelRegistry {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const reply = (r: TunnelResult) => new Response(JSON.stringify(r.body), { status: r.status, headers: { 'content-type': 'application/json' } });
+    if (request.method === 'POST' && path === REGISTRY_PATHS.aiNonce) {
+      const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string };
+      const nonce = await this.service.aiNonce(b.generation, b.leaseEpoch, b.bootId);
+      return reply({ status: nonce ? 200 : 409, body: { nonce } });
+    }
     if (request.method === 'GET' && path === REGISTRY_PATHS.get) {
       return new Response(JSON.stringify({ record: await this.service.get() }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (request.method === 'GET' && path === REGISTRY_PATHS.getForBrowser) {
+      return new Response(JSON.stringify({ record: await this.service.getForBrowser() }), { headers: { 'content-type': 'application/json' } });
     }
     if (request.method === 'POST' && path === REGISTRY_PATHS.verifyOrigin) {
       return new Response(JSON.stringify({ verdict: await this.service.verifyOrigin() }), { headers: { 'content-type': 'application/json' } });
@@ -518,8 +563,17 @@ export async function routeAwsTunnels(method: string, claims: PreviewTokenV2Clai
 }
 
 export async function lookupAwsTunnel(registryFor: RegistryFor, sandboxId: string): Promise<AwsTunnelRecord | null> {
+  return lookupRecord(registryFor, sandboxId, REGISTRY_PATHS.get);
+}
+
+/** Browser forwarding requires a fresh verified record, including on the first request. */
+export async function lookupAwsTunnelForBrowser(registryFor: RegistryFor, sandboxId: string): Promise<AwsTunnelRecord | null> {
+  return lookupRecord(registryFor, sandboxId, REGISTRY_PATHS.getForBrowser);
+}
+
+async function lookupRecord(registryFor: RegistryFor, sandboxId: string, path: string): Promise<AwsTunnelRecord | null> {
   if (!isRoutableSandboxId(sandboxId)) return null;
-  const res = await registryFor(sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.get}`));
+  const res = await registryFor(sandboxId).fetch(new Request(`https://aws-tunnels${path}`));
   if (!res.ok) return null;
   const { record } = (await res.json()) as { record: AwsTunnelRecord | null };
   return record && record.sandboxId === sandboxId ? record : null;

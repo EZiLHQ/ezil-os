@@ -22,6 +22,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { signIn } from './sign-in.mjs';
 import path from 'node:path';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
@@ -55,12 +56,7 @@ const browser = await chromium.launch({ args: ['--use-gl=swiftshader', '--enable
 try {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const p = await ctx.newPage();
-  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-  await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-  await Promise.all([
-    p.waitForURL((u) => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-    p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-  ]);
+  await signIn(p, { email: EMAIL, password: PASS, app: APP });
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
   await p.waitForTimeout(3500);
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }

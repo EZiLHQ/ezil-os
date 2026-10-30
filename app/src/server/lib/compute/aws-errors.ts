@@ -7,6 +7,7 @@
 // ── Errors ───────────────────────────────────────────────────────────────
 
 export type AwsClientErrorCode =
+    | 'credentials_unavailable' // EC2 IMDSv2 credentials could not be obtained
     | 'aws_caller_unavailable' // no OIDC token, or STS refused/returned no credentials
     | 'aws_throttled' // retry later
     | 'aws_capacity' // a capacity or quota refusal

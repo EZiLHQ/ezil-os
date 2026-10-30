@@ -1,12 +1,12 @@
 import { isNative } from '../../../native-runtime.js';
 // tabs/computers.js — EZiL-authored. Not Puter code.
 //
-// The Computers tab: this is where computer management lives now that login
-// lands in the OS (`/computers` is still the fallback — see the drift test
-// noted in the header of `../index.js`). Two slot rows, always — the cap is
-// structural, not a counter — mirroring `/computers`'s own
-// `_components/select-computers.tsx` layout decision, redrawn here in plain
-// DOM/jQuery because this bundle has no React.
+// The Computer tab. On the web there is ONE computer per person (round 3,
+// plan §6.1, decision D6): its status, its configuration (switchable on
+// Premium), Stop, storage, and any older computer read-only. `/computers` is
+// still the fallback page (see the drift test noted in the header of
+// `../index.js`) and shows the same one-computer model. The native macOS host
+// keeps its own list of local workspaces, rendered by `nativeRowHtml`.
 //
 // `deleteComputerCopy` is imported VERBATIM from
 // `app/src/app/computers/_lib/delete-copy.ts` (read, not edited) — the one
@@ -18,19 +18,11 @@ import UIAlert from '../../../../src/UI/UIAlert.js';
 import registry from '../../../apps/registry.js';
 import session from '../../../session.js';
 import trpc from '../trpc.js';
+import TabBilling from './billing.js';
+import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';
+import { TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/computers';
-
-/**
- * Hard cap on live computers per user. Mirrors
- * `app/src/utils/constants.ts`'s `MAX_COMPUTERS_PER_USER` (also re-exported
- * from `computer.ts`'s router and enforced again in the db schema's CHECK
- * constraint — three independent copies of "2" by design, per that file's
- * own comment). Not imported: pulling in `constants.ts` for one number would
- * also pull its `Routes`/`getReturnUrlQueryParam` neighbours into a bundle
- * that has no login flow to use them in.
- */
-const MAX_COMPUTERS_PER_USER = 2;
 
 const COMPUTERS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -292,7 +284,559 @@ async function closeSandboxWindows (id, keepId) {
     if ( openDesktopComputerId() === null ) activeComputerId = null;
 }
 
-function rowHtml (slot, computer) {
+// ── One computer (web): configuration, switch, stop, storage ─────────────
+// Round 3 (plan §6.1/§6.2, contract v3 D5/D6). The web shell shows ONE
+// computer: the one every launch uses (`session.currentComputer()`). There is
+// no slot list and nothing that creates a computer. Any other live row is an
+// older computer, shown read-only with Delete. The native macOS host keeps its
+// workspace list (`nativeRowHtml`), which is a different product surface.
+//
+// The server owns current vs target (`computer.progress` → `transition`);
+// this tab only acknowledges a click until the server answers, then renders
+// what the server says. Every open tab polls the same state.
+
+/** Fallback sizes, mirroring `SIZES` in `app/src/server/billing/v2/contract.ts`. */
+const SIZE_FALLBACK = {
+    'free-cf': { vcpu: 2, memoryGiB: 6, weight: 1 },
+    'std-2': { vcpu: 2, memoryGiB: 8, weight: 1 },
+    'cmp-4': { vcpu: 4, memoryGiB: 16, weight: 2 },
+    'cmp-8': { vcpu: 8, memoryGiB: 32, weight: 4 },
+};
+const AWS_SIZES = ['std-2', 'cmp-4', 'cmp-8'];
+const VCPU_SIZE = { 2: 'std-2', 4: 'cmp-4', 8: 'cmp-8' };
+const IN_FLIGHT = new Set(['requested', 'stopping', 'waking']);
+const SWITCH_KEY = 'ezil-os:switch.';
+/** D11: the AWS ledger cap is not plan time; it gets its own sentence. */
+export const AWS_CAP_COPY = "You've used this month's AWS computer time. It resets on the 1st — or contact us.";
+const CAP_REASONS = new Set(['billing_user_hours_cap', 'billing_aws_monthly_cap', 'user_hours_cap', 'aws_monthly_cap']);
+/** Failure reasons another attempt can fix; billing, retirement or a missing placement cannot. */
+const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
+
+let summary = null;   // billing.summary (v3) or null when it cannot be read
+let progress = null;  // computer.progress of the main computer
+let pendingSwitch = null; // { computerId, current, target } from the click to the server's answer
+let notice = null;    // { text, tone } from the last switch/stop answer
+let unavailable = new Set();
+let pollTimer = null;
+let paneActive = false;
+let generation = 0;
+let stopBusy = false;
+let paneCtx = null;
+let queuedSwitch = null; // a configuration Billing handed over after an upgrade
+const seenInFlight = new Set(); // transition ids this page saw in flight, so "Done" is never a stale record
+const dismissed = new Set();
+const barFloor = new Map();     // transition id → the highest ratio shown, so the bar never moves back
+
+export function sizeInfo (code, data = summary) {
+    const choice = data?.computer?.machineChoice?.find?.(m => m.size === code);
+    return choice ? { vcpu: choice.vcpu, memoryGiB: choice.memoryGiB, weight: choice.weight } : SIZE_FALLBACK[code] ?? null;
+}
+export function sizeLabel (code, data = summary) {
+    const size = sizeInfo(code, data);
+    return size ? `${size.vcpu} vCPU · ${size.memoryGiB} GB` : 'another configuration';
+}
+/** `m6i.large` → std-2, `m6i.xlarge` → cmp-4, `m6i.2xlarge` → cmp-8 (AWS's own vCPU rule). */
+export function sizeForInstanceType (type) {
+    const m = typeof type === 'string' ? /^[a-z][a-z0-9-]*\.(large|xlarge|(\d+)xlarge)$/.exec(type) : null;
+    if ( ! m ) return null;
+    const vcpu = m[1] === 'large' ? 2 : m[1] === 'xlarge' ? 4 : 4 * Number(m[2]);
+    return VCPU_SIZE[vcpu] ?? null;
+}
+
+function storageOf () {
+    try { return typeof sessionStorage === 'undefined' ? null : sessionStorage; } catch { return null; }
+}
+function mintRequestId () {
+    let id = '';
+    try { id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : ''; } catch { id = ''; }
+    if ( ! id ) id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    return id.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64).padEnd(8, '0');
+}
+/**
+ * One request id per (computer, target), kept in sessionStorage: a double
+ * click, a retry after a dropped answer and a reload all send the same id, so
+ * the server answers with the same transition instead of starting another.
+ */
+export function switchRequestId (computerId, target, store = storageOf()) {
+    const key = `${SWITCH_KEY}${computerId}.${target}`;
+    try {
+        const kept = store?.getItem(key);
+        if ( kept && /^[A-Za-z0-9_-]{8,64}$/.test(kept) ) return kept;
+    } catch { /* storage refused: fall through to a fresh id */ }
+    const id = mintRequestId();
+    try { store?.setItem(key, id); } catch { /* the id still works for this click */ }
+    return id;
+}
+export function clearSwitchRequestId (computerId, target, store = storageOf()) {
+    try { store?.removeItem(`${SWITCH_KEY}${computerId}.${target}`); } catch { /* nothing kept */ }
+}
+
+const transitionOf = p => (p && p.transition && typeof p.transition === 'object' ? p.transition : null);
+export const inFlight = p => IN_FLIGHT.has(transitionOf(p)?.phase);
+
+/** The cheapest plan that offers `size`, for a locked card ("Premium"). */
+function planFor (size, data) {
+    const offer = (data?.catalog?.offers ?? []).filter(o => (o.machineChoice ?? []).includes(size))
+        .sort((a, b) => a.priceCents - b.priceCents)[0];
+    return offer?.name ?? 'Premium';
+}
+
+/** Copy for a switch the server refused. */
+export function refusalCopy (reason, target, data = summary, current = null) {
+    switch ( reason ) {
+    case 'switch_in_progress': return 'A switch is already in progress. Wait for it to finish, then try again.';
+    case 'not_entitled': return "Your plan doesn't include this configuration right now.";
+    case 'capacity_unavailable': {
+        const smaller = AWS_SIZES.slice(0, AWS_SIZES.indexOf(target)).reverse()
+            .find(code => code !== current && (data?.computer?.machineChoice ?? []).some(m => m.size === code));
+        return smaller ? `Not available right now — try ${sizeInfo(smaller, data).vcpu} vCPU or try again later.`
+            : 'Not available right now — try again later.';
+    }
+    case 'computer_busy': return 'Your computer is starting or stopping. Try again in a moment.';
+    case 'foreign_computer': return "This computer can't be switched from here.";
+    case 'user_hours_cap': case 'aws_monthly_cap': return AWS_CAP_COPY;
+    case 'unauthorized': return 'Your session expired — sign in again.';
+    default: return "We couldn't switch. Check your connection and try again.";
+    }
+}
+
+/**
+ * Everything the Computer tab shows, from server data only (plus the one
+ * pending click). Pure, so the states are unit-tested without a DOM.
+ */
+export function computerModel ({ computer, data = null, prog = null, pending = null, refusedSizes = new Set(), streaming = false }) {
+    // Round 4 (STANDING-CONTRACT): the standing decides what opens; an unknown or missing one keeps the
+    // plan-only model. The plan block may still describe a past_due paid subscription after grace.
+    const standing = standingOf(data);
+    // D16: on Free, but the files are still on the AWS computer. It opens under Free limits; nothing has moved.
+    const held = standing === 'files_on_aws';
+    const dropped = held || standing === 'free';
+    const free = data?.plan?.sku === 'free_v3' || dropped;
+    const t = transitionOf(prog);
+    const flying = IN_FLIGHT.has(t?.phase) ? t : null;
+    const lifecycle = typeof prog?.lifecycleState === 'string' ? prog.lifecycleState : null;
+    const running = free && ! held ? streaming : lifecycle === 'RUNNING';
+    const stopped = (! free || held) && lifecycle === 'STOPPED';
+    const hardware = sizeForInstanceType(prog?.hardware?.instanceType);
+    const preference = data?.computer?.size ?? null;
+    const current = held ? flying?.current ?? hardware ?? 'std-2' : free ? 'free-cf' : flying?.current ?? hardware ?? preference;
+    const choice = new Set((data?.computer?.machineChoice ?? []).map(m => m.size));
+    const switching = pending ? { current: pending.current, target: pending.target, phase: 'requested', acknowledged: false }
+        : flying && flying.kind !== 'restart' ? { current: flying.current, target: flying.target, phase: flying.phase, acknowledged: true } : null;
+    const nextStart = ! switching && ! free && preference && current && preference !== current && (stopped || ! lifecycle) ? preference : null;
+    let chip = null;
+    if ( switching ) chip = { state: 'switching', text: `Switching to ${sizeInfo(switching.target, data)?.vcpu ?? ''} vCPU` };
+    else if ( flying ) chip = { state: 'switching', text: 'Restarting…' };
+    else if ( prog?.needsOperator || t?.phase === 'failed' ) chip = { state: 'attention', text: 'Needs attention' };
+    else if ( running ) chip = { state: 'running', text: 'Running' };
+    else if ( prog?.operation === 'opening' ) chip = { state: 'starting', text: 'Starting…' };
+    else if ( prog?.operation === 'stopping' ) chip = { state: 'stopping', text: 'Stopping…' };
+    else if ( stopped ) chip = { state: 'stopped', text: 'Stopped' };
+    // Held on AWS: no Cloudflare card (the files are not there) and every AWS configuration is locked.
+    const sizes = free && ! held ? ['free-cf', ...AWS_SIZES] : AWS_SIZES;
+    const cards = data ? sizes.map(size => {
+        const info = sizeInfo(size, data);
+        let state = held || (dropped && size !== 'free-cf') ? 'locked' : size === current ? 'current' : ! choice.has(size) ? 'locked' : refusedSizes.has(size) ? 'unavailable' : 'available';
+        if ( switching && size === switching.target ) state = 'switching';
+        else if ( nextStart === size ) state = 'next';
+        return { size, vcpu: info.vcpu, memoryGiB: info.memoryGiB, weight: info.weight, state,
+            plan: state === 'locked' ? planFor(size, data) : null };
+    }) : [];
+    const disk = data?.computer?.disk ?? null;
+    const done = ! switching && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
+    const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
+    const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
+    return { computer, data, free, standing, held, move,
+        provider: data ? held ? 'AWS (India) · files kept' : free ? 'Cloudflare' : 'AWS · India' : null, chip, current, nextStart, switching,
+        running, stopped, cards, done, failed, disk, busy: !! (switching || flying || prog?.operation === 'opening' || prog?.operation === 'stopping') };
+}
+
+const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
+/** The server's standing for the computer (`billing.summary` v3 `computer.standing`), or null. */
+export function standingOf (data) {
+    const value = data?.computer?.standing;
+    return STANDINGS.has(value) ? value : null;
+}
+
+/** "27 Nov 2026" from an ISO instant (UTC), or null. Same format as Billing's `dateLabel(iso, true)`. */
+function dayLabel (iso) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? new Date(time).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) : null;
+}
+
+/** Round 4 copy. Billing (`billing.js`) carries the same function; billing-test pins the two equal. */
+export function standingCopy (standing, data) {
+    const plan = data?.plan ?? {};
+    if ( standing === 'grace' ) {
+        const by = dayLabel(plan.graceEndsAt);
+        return `Your payment didn't go through — update it${by ? ` by ${by}` : ''} to keep your ${data?.computer?.filesOn === 'cloudflare' ? 'plan' : 'AWS computer'}.`;
+    }
+    if ( standing === 'plan_ending' ) {
+        const on = dayLabel(plan.planEndsAt ?? plan.cancelsAt);
+        const name = plan.name || 'Your plan';
+        const ends = on ? `${name} ends on ${on}.` : `${name} ends at the end of this period.`;
+        return data?.computer?.filesOn === 'cloudflare' ? `${ends} Your files are kept.`
+            : `${ends} After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.`;
+    }
+    if ( standing === 'files_on_aws' ) return 'Your files are still on your AWS (India) computer. Open it on the Free plan with Free limits, or upgrade to restore full use.';
+    return '';
+}
+
+const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Starting your desktop'];
+const MOVE_STEP_OF = { requested: 0, fenced: 0, saving: 0, exporting: 1, copying: 1, exported: 2, restoring: 2, restored: 2, checking: 2, flipping: 3, starting: 3 };
+
+/** A reverse move (AWS → Cloudflare, Phase B) from server fields only: done, failed or a step index. */
+export function moveView (move) {
+    if ( ! move || move.direction !== 'to_cloudflare' ) return null;
+    const stage = String(move.stage ?? '');
+    if ( stage === 'committed' || stage === 'done' ) return { kind: 'done' };
+    if ( stage.startsWith('failed') ) return { kind: 'failed', code: /^[a-z0-9_:-]{1,64}$/i.test(String(move.reason ?? '')) ? move.reason : `move_${stage}` };
+    const index = MOVE_STEP_OF[stage] ?? 0;
+    const done = /^\d+$/.test(String(move.bytesDone ?? '')) ? Number(move.bytesDone) : null;
+    const total = /^\d+$/.test(String(move.bytesTotal ?? '')) ? Number(move.bytesTotal) : null;
+    const bytes = index === 1 && done !== null && total ? `${(done / 1e6).toLocaleString('en-US', { maximumFractionDigits: 0 })} MB of ${(total / 1e9).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB copied` : '';
+    const fraction = index === 1 && done !== null && total ? Math.min(1, done / total) : 0;
+    return { kind: 'progress', index, steps: MOVE_STEPS, bytes, percent: Math.round(Math.min(0.95, (index + fraction) / MOVE_STEPS.length) * 100) };
+}
+
+function moveHtml (model) {
+    const view = moveView(model.move);
+    if ( ! view ) return '';
+    if ( view.kind === 'done' ) {
+        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>Your files are on your Free computer.</p>
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
+    }
+    if ( view.kind === 'failed' ) {
+        return `<div class="ezil-computer-switch is-failed" data-role="move-failed" role="alert">
+            <p>We couldn't move your files. They're still on your AWS computer and nothing was deleted.</p><div class="ezil-settings-row-actions">
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="move-retry">Try again</button>
+            ${feedback_enabled() ? `<button type="button" class="ezil-settings-btn" data-action="move-feedback" data-code="${html_encode(view.code)}">Send feedback</button>` : ''}</div></div>`;
+    }
+    return `<div class="ezil-computer-switch" data-role="move-progress" role="status" aria-live="polite">
+        <p><strong>Moving your files to your Free computer</strong></p>
+        ${view.bytes ? `<p data-role="move-bytes">${html_encode(view.bytes)}</p>` : ''}
+        <div class="ezil-computer-bar" role="progressbar" aria-label="Move progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.percent}"><span style="width:${view.percent}%"></span></div>
+        <ol class="ezil-computer-steps">${view.steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < view.index ? 'done' : i === view.index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
+}
+
+/** Round 4 standing banners (D16-D18): grace, plan ending, files held on AWS. */
+function standingHtml (model) {
+    const copy = standingCopy(model.standing, model.data);
+    if ( model.standing === 'grace' ) {
+        return `<div class="ezil-computer-switch is-failed" data-role="payment-grace" role="status"><p>${html_encode(copy)}</p>
+            <a class="ezil-settings-btn ezil-settings-btn-primary" data-action="fix-payment" href="/os?settings=billing">Fix payment</a></div>`;
+    }
+    if ( model.standing === 'plan_ending' ) return `<div class="ezil-computer-switch" data-role="plan-ending" role="status"><p>${html_encode(copy)}</p></div>`;
+    if ( model.held ) return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(copy)}</p></div>`;
+    return '';
+}
+
+/**
+ * The switch's steps from server milestones only. Step 2 says whether a ready
+ * machine was found: a switch's expected time is the 60 s stop plus the warm
+ * or the cold wake (contract §3), so ≥ 300 s means a machine is being prepared.
+ */
+export function switchSteps (switching, prog, data = summary) {
+    const keys = new Set((prog?.milestones ?? []).map(m => m?.key));
+    const cold = Number(prog?.expectedSeconds) >= 300;
+    const vcpu = sizeInfo(switching.target, data)?.vcpu;
+    const getting = `Getting ${/^(8|11|18)$/.test(String(vcpu)) ? 'an' : 'a'} ${vcpu} vCPU machine`;
+    const index = ! switching.acknowledged || switching.phase === 'requested' || switching.phase === 'stopping' ? 0
+        : keys.has('files_attached') || keys.has('desktop_starting') ? 3 : keys.has('host_claimed') ? 2 : 1;
+    const detail = index === 1 ? cold ? 'preparing a new machine — can take a few minutes' : keys.has('host_claimed') ? 'ready machine found' : ''
+        : index > 1 && ! cold ? 'ready machine found' : '';
+    return { index, steps: ['Saving and closing your session', detail ? `${getting} — ${detail}` : getting, 'Attaching your files', 'Starting your desktop'] };
+}
+
+/** One bar: milestone floor + server-relative elapsed time, capped below 100 % and never moving back. */
+export function switchRatio (switching, prog, index) {
+    const started = Date.parse(prog?.openingStartedAt ?? ''), observed = Date.parse(prog?.observedAt ?? '');
+    const expected = Number(prog?.expectedSeconds);
+    const timed = Number.isFinite(started) && Number.isFinite(observed) && expected > 0 ? (observed - started) / 1000 / expected : 0;
+    const raw = Math.min(0.95, Math.max(index / 4, Math.min(timed, (index + 1) / 4)));
+    const id = transitionOf(prog)?.transitionId ?? 'pending';
+    const shown = Math.max(raw, barFloor.get(id) ?? 0);
+    barFloor.set(id, shown);
+    return shown;
+}
+
+function cardHtml (card, model) {
+    const label = `${card.vcpu} vCPU · ${card.memoryGiB} GB memory`;
+    const weight = card.size === 'free-cf' ? 'Cloudflare' : card.weight > 1 ? `counts ${card.weight}× time` : 'counts 1× time';
+    let action = '';
+    if ( card.state === 'current' ) action = '<span class="ezil-settings-pill" data-role="config-current">Current</span>';
+    else if ( card.state === 'available' ) action = `<button type="button" class="ezil-settings-btn" data-action="switch-config" data-size="${html_encode(card.size)}"${model.busy || stopBusy ? ' disabled' : ''}>Switch</button>`;
+    else if ( card.state === 'switching' ) action = '<span class="ezil-settings-pill" data-role="config-switching">Switching…</span>';
+    else if ( card.state === 'next' ) action = '<span class="ezil-settings-pill" data-role="config-next">Next start</span>';
+    else if ( card.state === 'locked' ) action = `<span class="ezil-computer-lock" data-role="config-locked"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>${html_encode(card.plan)}</span>
+        <a class="ezil-settings-btn" data-action="config-upgrade" href="/os?settings=billing&amp;upgrade=${card.plan === 'Standard' ? 'standard' : 'premium'}">Upgrade</a>`;
+    else if ( card.state === 'unavailable' ) action = `<span class="ezil-computer-unavailable" data-role="config-unavailable">${html_encode(refusalCopy('capacity_unavailable', card.size, model.data, model.current))}</span>`;
+    return `<li class="ezil-computer-config" data-size="${html_encode(card.size)}" data-state="${card.state}">
+        <div><strong>${html_encode(label)}</strong><span class="ezil-settings-muted">${html_encode(weight)}</span></div>
+        <div class="ezil-computer-config-action">${action}</div></li>`;
+}
+
+function statusHtml (model, prog) {
+    if ( model.switching ) {
+        const { index, steps } = switchSteps(model.switching, prog, model.data);
+        const ratio = switchRatio(model.switching, prog, index);
+        const percent = Math.round(ratio * 100);
+        return `<div class="ezil-computer-switch" data-role="switch-progress" role="status" aria-live="polite">
+            <p data-role="switching-label"><strong>Switching…</strong></p>
+            <p data-role="now-label">Now: ${html_encode(sizeLabel(model.switching.current, model.data))}</p>
+            <p data-role="next-label">Next: ${html_encode(sizeLabel(model.switching.target, model.data))}</p>
+            <div class="ezil-computer-bar" role="progressbar" aria-label="Switch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
+            <ol class="ezil-computer-steps">${steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < index ? 'done' : i === index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
+    }
+    if ( model.done ) {
+        return `<div class="ezil-computer-switch is-done" data-role="switch-done" role="status">
+            <p>${html_encode(`Now running on ${sizeLabel(model.done.target, model.data)}`)}</p>
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop</button></div>`;
+    }
+    if ( model.failed ) {
+        const t = model.failed;
+        const cap = CAP_REASONS.has(t.reason);
+        const retry = ! cap && RETRYABLE.test(String(t.reason ?? ''));
+        // HF3: the size it actually runs (the placement), else the pre-switch size; never offer a switch to that same size.
+        const on = model.current ?? t.current;
+        const copy = cap ? AWS_CAP_COPY : `We couldn't switch to ${sizeLabel(t.target, model.data)}. Your computer is on ${sizeLabel(on, model.data)} and your files are safe.`;
+        return `<div class="ezil-computer-switch is-failed" data-role="switch-failed" role="alert">
+            <p>${html_encode(copy)}</p><div class="ezil-settings-row-actions">
+            ${retry ? `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="switch-retry" data-size="${html_encode(t.target)}">Try again</button>` : ''}
+            ${t.revertAvailable && on !== t.current ? `<button type="button" class="ezil-settings-btn" data-action="switch-back" data-size="${html_encode(t.current)}">${html_encode(`Back to ${sizeLabel(t.current, model.data)}`)}</button>` : ''}
+            ${feedback_enabled() ? '<button type="button" class="ezil-settings-btn" data-action="switch-feedback">Send feedback</button>' : ''}</div></div>`;
+    }
+    if ( model.nextStart ) {
+        return `<div class="ezil-computer-switch" data-role="next-start" role="status">
+            <p>${html_encode(`Next start: ${sizeLabel(model.nextStart, model.data)}`)}</p>
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Start now</button></div>`;
+    }
+    return '';
+}
+
+function manageHtml (computer) {
+    if ( editingId === computer.id ) {
+        return `<div class="ezil-settings-row" data-id="${html_encode(computer.id)}" data-role="computer-manage">
+            <form class="ezil-settings-rename-form" data-role="rename-form">
+                <input type="text" class="ezil-settings-input" data-role="rename-input" value="${html_encode(computer.name)}" maxlength="200" autocomplete="off">
+                <div class="ezil-settings-row-actions"><button type="submit" class="ezil-settings-btn ezil-settings-btn-primary">Save</button>
+                    <button type="button" class="ezil-settings-btn" data-action="cancel-rename">Cancel</button></div></form></div>`;
+    }
+    const isBusy = busyId === computer.id;
+    return `<div class="ezil-settings-row" data-id="${html_encode(computer.id)}" data-role="computer-manage">
+        <div class="ezil-settings-row-meta"><div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
+            <div class="ezil-settings-row-sub">Name shown in your browser tab and window titles</div></div>
+        <div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn" data-action="rename"${isBusy ? ' disabled' : ''}>Rename</button>
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete"${isBusy ? ' disabled' : ''}>${isBusy ? 'Removing…' : 'Delete'}</button></div></div>`;
+}
+
+function olderHtml (rows) {
+    if ( rows.length === 0 ) return '';
+    return `<section class="ezil-computer-section" data-role="older-computers" aria-labelledby="ezil-older-heading">
+        <h4 id="ezil-older-heading">Older computer</h4>
+        <p class="ezil-settings-muted">Kept from before you had one computer. It can't be opened from here; delete it when you no longer need it.</p>
+        ${rows.map(c => `<div class="ezil-settings-row" data-id="${html_encode(c.id)}" data-role="older-computer">
+            <div class="ezil-settings-row-meta"><div class="ezil-settings-row-name">${html_encode(c.name)}</div>
+                <div class="ezil-settings-row-sub">${html_encode(timeAgo(c.lastOpenedAt ?? c.createdAt) ? `Last active ${timeAgo(c.lastOpenedAt ?? c.createdAt)}` : 'Never opened')}</div></div>
+            <div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete"${busyId === c.id ? ' disabled' : ''}>${busyId === c.id ? 'Removing…' : 'Delete'}</button></div></div>`).join('')}
+    </section>`;
+}
+
+/** The whole web pane for one computer. Exported for the unit tests. */
+export function computerHtml (model, prog = progress, older = []) {
+    const { computer, data } = model;
+    const size = sizeInfo(model.current, data);
+    const disk = model.disk?.provisionedGiB;
+    const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
+    const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
+    const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
+    const planLine = ! data ? '' : model.held ? 'Upgrade to restore full use.' : premiumOnly.length && ! model.free
+        ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
+        : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
+            : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
+    const used = typeof model.disk?.usedBytes === 'string' && /^\d+$/.test(model.disk.usedBytes) ? Number(model.disk.usedBytes) / 1e9 : null;
+    const stoppable = model.running && ! model.busy;
+    return `<section class="ezil-computer" data-role="your-computer" data-id="${html_encode(computer.id)}">
+        <header class="ezil-computer-header"><h3>Your computer</h3>
+            ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}
+            ${model.provider ? `<span class="ezil-settings-muted" data-role="computer-provider">${html_encode(model.provider)}</span>` : ''}</header>
+        ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}
+        <div class="ezil-settings-row-actions" data-role="computer-actions">
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>
+            ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
+        ${statusHtml(model, prog)}
+        ${model.switching ? '' : moveHtml(model)}
+        ${standingHtml(model)}
+        ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
+        ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
+            <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
+            <p class="ezil-settings-muted" data-role="plan-line">${html_encode(planLine)} <a href="/os?settings=billing&amp;upgrade=pro" data-action="compare-plans">Compare plans</a></p></section>` : ''}
+        ${data ? `<section class="ezil-computer-section" data-role="computer-storage" aria-labelledby="ezil-storage-heading"><h4 id="ezil-storage-heading">Storage</h4>
+            <p>${html_encode(Number.isFinite(disk) ? `${disk} GB disk for your projects` : 'Your files are saved with your computer.')}</p>
+            ${used !== null && Number.isFinite(disk) ? `<p data-role="storage-used">${html_encode(`${used.toLocaleString(undefined, { maximumFractionDigits: 1 })} of ${disk} GB used`)}</p>` : ''}
+            ${Number.isFinite(disk) ? '<p class="ezil-settings-muted">Stays the same when you switch configuration.</p>' : ''}</section>` : ''}
+        ${manageHtml(computer)}
+    </section>${olderHtml(older)}`;
+}
+
+/** The computer every launch uses; the open desktop's stamp, then the lowest slot, are fallbacks. */
+function mainComputer () {
+    const id = session.currentComputer()?.id ?? openDesktopComputerId() ?? undefined;
+    return computers.find(c => c.id === id) ?? [...computers].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))[0] ?? null;
+}
+
+function webModel () {
+    const computer = mainComputer();
+    if ( ! computer ) return null;
+    const prog = progress?.computerId === undefined || progress?.computerId === computer.id ? progress : null;
+    const t = transitionOf(prog);
+    if ( t && IN_FLIGHT.has(t.phase) ) seenInFlight.add(t.transitionId);
+    return computerModel({ computer, data: summary, prog,
+        pending: pendingSwitch?.computerId === computer.id ? pendingSwitch : null,
+        refusedSizes: unavailable, streaming: desktopStreams(computer.id) === true });
+}
+
+function renderWeb ($list) {
+    const model = webModel();
+    if ( ! model ) {
+        $list.html('<div class="ezil-settings-muted" data-role="no-computer">Your computer is set up the first time you open the desktop.</div>');
+        return;
+    }
+    $list.html(computerHtml(model, progress, computers.filter(c => c.id !== model.computer.id)));
+}
+
+function schedulePoll ($win) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    if ( ! paneActive || isNative() || ! $win.get(0)?.isConnected ) return;
+    const fast = pendingSwitch || inFlight(progress) || progress?.operation === 'opening' || progress?.operation === 'stopping' || stopBusy;
+    pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : 20000);
+}
+
+/** Billing's own gate (`tabs/billing.js` `available`): where Billing is off, no summary is requested. */
+function billingOn () {
+    return TabBilling.available(paneCtx ?? { payload: session.payload() });
+}
+
+async function readSummary () {
+    if ( ! billingOn() ) { summary = null; return; }
+    const res = await trpc.query('billing.summary').catch(() => ({ ok: false }));
+    summary = res?.ok && res.data?.enabled === true && res.data.version === 3 ? res.data : null;
+}
+
+async function refreshProgress ($win) {
+    const computer = mainComputer();
+    if ( ! computer || ! paneActive ) { schedulePoll($win); return; }
+    const mine = generation;
+    const before = transitionOf(progress);
+    const res = await trpc.query('computer.progress', { computerId: computer.id }).catch(() => ({ ok: false }));
+    if ( mine !== generation ) return;
+    if ( res?.ok && res.data ) {
+        progress = { ...res.data, computerId: res.data.computerId ?? computer.id };
+        const t = transitionOf(progress);
+        if ( t && ! IN_FLIGHT.has(t.phase) && (t.phase === 'done' || t.phase === 'failed') ) {
+            clearSwitchRequestId(computer.id, t.target);
+            if ( before && IN_FLIGHT.has(before.phase) && before.transitionId === t.transitionId ) await readSummary();
+        }
+    }
+    if ( mine !== generation ) return;
+    if ( ! editingId ) render($win); // never repaint over a rename in progress
+    schedulePoll($win);
+}
+
+async function confirmAlert (title, body, confirmLabel) {
+    const value = await UIAlert({
+        message: `<strong>${html_encode(title)}</strong><p>${html_encode(body)}</p>`,
+        type: 'warning', body_icon: ALERT_WARNING_ICON,
+        buttons: [{ label: confirmLabel, value: 'confirm', type: 'primary' }, { label: 'Cancel', value: 'cancel', type: 'secondary' }],
+    });
+    return value === 'confirm';
+}
+
+async function postSwitch (computerId, size, requestId) {
+    const url = session.payload()?.desktopState?.endpoints?.switch;
+    if ( typeof url === 'string' && url ) {
+        try {
+            const res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ computerId, size, requestId }) });
+            if ( res.status === 401 ) return { ok: false, reason: 'unauthorized' };
+            const data = await res.json().catch(() => null);
+            return res.ok && data && typeof data.ok === 'boolean' ? data : { ok: false, reason: 'error' };
+        } catch { return { ok: false, reason: 'error' }; }
+    }
+    const res = await trpc.mutate('computer.switchConfiguration', { computerId, size, requestId });
+    return res.ok && res.data && typeof res.data.ok === 'boolean' ? res.data : { ok: false, reason: res.code === 'UNAUTHORIZED' ? 'unauthorized' : 'error' };
+}
+
+/**
+ * The switch. The card and chip change BEFORE the request leaves (the
+ * acknowledgement), and a second click while it is pending does nothing.
+ */
+export async function requestSwitch ($win, target, { confirm = true } = {}) {
+    const computer = mainComputer();
+    if ( ! computer || pendingSwitch || inFlight(progress) || stopBusy ) return;
+    const model = webModel();
+    // Back to <previous> after a failure targets the current size on purpose: it reverts the choice.
+    if ( ! model || target === model.current && ! model.nextStart && ! model.failed ) return;
+    const restarts = model.running || progress?.lifecycleState === 'RUNNING';
+    if ( confirm && restarts ) {
+        const ok = await confirmAlert(`Switch to ${sizeLabel(target)}?`,
+            'Your computer restarts on a bigger machine. Your files and settings stay; running apps restart. Usually about a minute, longer if a machine has to be prepared.'
+                .replace('a bigger machine', (sizeInfo(target)?.vcpu ?? 0) < (sizeInfo(model.current)?.vcpu ?? 0) ? 'a smaller machine' : 'a bigger machine'),
+            'Switch now');
+        if ( ! ok || pendingSwitch || inFlight(progress) ) return;
+    }
+    pendingSwitch = { computerId: computer.id, current: model.current, target };
+    notice = null;
+    unavailable.delete(target);
+    render($win);
+    const requestId = switchRequestId(computer.id, target);
+    const answer = await postSwitch(computer.id, target, requestId);
+    pendingSwitch = null;
+    if ( answer.ok ) {
+        if ( model.failed ) dismissed.add(model.failed.transitionId);
+        if ( answer.effective === 'next_start' ) {
+            clearSwitchRequestId(computer.id, target);
+            if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, size: answer.target } };
+        } else {
+            seenInFlight.add(answer.transitionId);
+            // Open desktop/Code windows follow the transition and re-open on the new size (L4b).
+            window.dispatchEvent(new CustomEvent(TRANSITION_EVENT, { detail: { computerId: computer.id, transitionId: answer.transitionId } }));
+            progress = { ...(progress ?? {}), computerId: computer.id,
+                transition: { transitionId: answer.transitionId, kind: 'switch', current: answer.current, target: answer.target,
+                    phase: transitionOf(progress)?.transitionId === answer.transitionId ? transitionOf(progress).phase : 'requested',
+                    reason: null, revertAvailable: false } };
+        }
+    } else {
+        if ( answer.reason !== 'switch_in_progress' ) clearSwitchRequestId(computer.id, target);
+        if ( answer.reason === 'capacity_unavailable' ) unavailable.add(target);
+        notice = { text: refusalCopy(answer.reason, target, summary, model.current), tone: 'error' };
+    }
+    render($win);
+    void refreshProgress($win);
+}
+
+async function handleStop ($win) {
+    const computer = mainComputer();
+    if ( ! computer || stopBusy || pendingSwitch || inFlight(progress) ) return;
+    if ( ! await confirmAlert('Stop your computer?', 'Open apps close and your files stay. Start it again with Open desktop.', 'Stop') ) return;
+    stopBusy = true;
+    notice = null;
+    render($win);
+    try {
+        // Same guarantee as Delete: every window on this computer closes first.
+        await closeSandboxWindows(computer.id);
+        const res = await fetch('/api/shell/stop', { method: 'POST', credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' }, body: JSON.stringify({ computerId: computer.id }) }).catch(() => null);
+        const data = res ? await res.json().catch(() => null) : null;
+        if ( ! res?.ok || data?.ok === false ) notice = { text: "We couldn't confirm the stop. Try again in a moment.", tone: 'error' };
+    } finally {
+        stopBusy = false;
+    }
+    await refreshProgress($win);
+}
+
+function nativeRowHtml (slot, computer) {
     if ( ! computer ) {
         return `
             <div class="ezil-settings-row ezil-settings-row-empty" data-slot="${slot}">
@@ -376,13 +920,20 @@ function render ($win) {
         return;
     }
 
-    const bySlot = new Map(computers.map(c => [c.slot, c]));
-    let html = '';
-    for ( let slot = 1; slot <= (isNative() ? computers.length : MAX_COMPUTERS_PER_USER); slot++ ) {
-        html += rowHtml(slot, bySlot.get(slot));
+    if ( isNative() ) {
+        const bySlot = new Map(computers.map(c => [c.slot, c]));
+        let html = '';
+        for ( let slot = 1; slot <= computers.length; slot++ ) html += nativeRowHtml(slot, bySlot.get(slot));
+        html += '<div class="ezil-settings-row"><div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="import">Open project folder…</button><button type="button" class="ezil-settings-btn" data-action="create">Create workspace</button></div></div>';
+        $list.html(html);
+    } else {
+        // A poll repaints the pane; keep keyboard focus on the same control.
+        const focused = $list.get(0).contains(document.activeElement) ? document.activeElement : null;
+        const action = focused?.dataset?.action, size = focused?.dataset?.size;
+        renderWeb($list);
+        if ( action ) [...$list.get(0).querySelectorAll('[data-action]')]
+            .find(el => el.dataset.action === action && (el.dataset.size ?? null) === (size ?? null) && ! el.disabled)?.focus();
     }
-    if (isNative()) html += '<div class="ezil-settings-row"><div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="import">Open project folder…</button><button type="button" class="ezil-settings-btn" data-action="create">Create workspace</button></div></div>';
-    $list.html(html);
     // `.trigger('select')` only fires the 'select' EVENT, not the browser's
     // actual text-selection — that needs the native method, hence `.get(0)`.
     const $renameInput = $list.find('[data-role="rename-input"]');
@@ -405,6 +956,19 @@ async function load ($win) {
     }
     computers = Array.isArray(res.data) ? res.data : [];
     render($win);
+    // Only the SHOWN pane reads more: `billing.summary` has side effects
+    // (Stripe preview, Gateway read), so a hidden tab must not call it.
+    if ( isNative() || ! paneActive ) return;
+    // The plan, the configurations it allows and the disk come from the billing
+    // summary; the live state (running, stopped, switching) from progress.
+    const mine = ++generation;
+    await readSummary();
+    if ( mine !== generation ) return;
+    await refreshProgress($win);
+    if ( mine !== generation || ! queuedSwitch ) return;
+    const size = queuedSwitch;
+    queuedSwitch = null;
+    void requestSwitch($win, size, { confirm: true });
 }
 
 async function handleCreate ($win) {
@@ -558,6 +1122,32 @@ function bind ($win, ctx) {
         if (this.dataset.action === 'relink') await load($win);
     });
 
+    // One computer (web): open, stop and the configuration switch.
+    $list.on('click', '[data-action="open"]', () => {
+        const computer = mainComputer();
+        const t = transitionOf(progress);
+        if ( t?.phase === 'done' ) dismissed.add(t.transitionId);
+        if ( computer ) void switchTo(computer, ctx, $win);
+    });
+    $list.on('click', '[data-action="stop"]', () => { void handleStop($win); });
+    $list.on('click', '[data-action="switch-config"], [data-action="switch-retry"], [data-action="switch-back"]', function () {
+        if ( this.disabled ) return;
+        // Back to <previous> and Try again are ordinary switches with a fresh request id.
+        if ( this.dataset.action !== 'switch-config' ) { const c = mainComputer(); if ( c ) clearSwitchRequestId(c.id, this.dataset.size); }
+        void requestSwitch($win, this.dataset.size, { confirm: this.dataset.action === 'switch-config' });
+    });
+    $list.on('click', '[data-action="switch-feedback"]', function () {
+        if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer' });
+    });
+    // Phase B (dormant while computer.move is null): the move restarts on the next open (D20).
+    $list.on('click', '[data-action="move-retry"]', () => {
+        const computer = mainComputer();
+        if ( computer ) void switchTo(computer, ctx, $win);
+    });
+    $list.on('click', '[data-action="move-feedback"]', function () {
+        if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer', errorCode: this.dataset.code });
+    });
+
     $list.on('click', '[data-action="switch"]', function () {
         const id = $(this).closest('.ezil-settings-row').attr('data-id');
         const computer = computers.find(c => c.id === id);
@@ -590,19 +1180,15 @@ function bind ($win, ctx) {
 
 export default {
     id: 'computers',
-    label: 'Computers',
+    get label () { return isNative() ? 'Computers' : 'Computer'; },
     icon: COMPUTERS_ICON,
 
     html () {
         return `
             <div class="ezil-settings-pane-body">
-                <p class="ezil-settings-lead">
-                    ${isNative() ? 'Open an original project folder or create a managed workspace. One workspace runs at a time. Attached project files remain yours when detached.' : `Up to ${MAX_COMPUTERS_PER_USER} computers. Deleting one shuts its desktop down and
-                    frees the slot — your files stay in storage, but the computer itself can't be
-                    reopened.`}
-                </p>
+                ${isNative() ? `<p class="ezil-settings-lead">Open an original project folder or create a managed workspace. One workspace runs at a time. Attached project files remain yours when detached.</p>` : ''}
                 <div class="ezil-settings-slot-list" data-role="slot-list">
-                    <div class="ezil-settings-loading">Loading your computers…</div>
+                    <div class="ezil-settings-loading">Loading your computer…</div>
                 </div>
             </div>`;
     },
@@ -614,34 +1200,43 @@ export default {
      * `[data-role="slot-list"]` element. Settings is `single_instance` and
      * `show_in_taskbar`, so closing it and reopening it from the dock is the
      * ordinary interaction — and on that second open the module flag was
-     * still true, the fresh window's list got no handlers, and Switch / New /
-     * Rename / Delete were all dead buttons. i.e. the 2-computer trap,
-     * reappearing one interaction later.
+     * still true, the fresh window's list got no handlers, and every button
+     * was dead.
      *
      * Re-binding cannot duplicate handlers, because `index.js` calls `init`
      * exactly once per window and each window brings a brand-new element.
      *
      * Transient per-window state is reset for the same reason: an
-     * `editingId` or a `busyId` left over from a window that no longer exists
-     * would render a rename form, or a permanently disabled row, in the new
-     * one. `computers` is deliberately NOT cleared — showing the last known
-     * list for the ~100ms until `load()` returns beats flashing a spinner.
+     * `editingId`, a `busyId` or a pending switch left over from a window that
+     * no longer exists would render a rename form, a permanently disabled
+     * row, or a stuck "Switching…" in the new one. The server's progress is
+     * read again on every activation.
      */
     init ($win, ctx) {
         editingId = null;
         busyId = null;
         loadError = null;
+        pendingSwitch = null;
+        notice = null;
+        stopBusy = false;
+        unavailable = new Set();
         // The fallback hint only — `openDesktopComputerId()` prefers the
         // stamp on the window itself. Read HERE rather than at module-eval
         // time, so the rehydrate path (payload arrives from
         // `/api/shell/session` after this module was imported) is not seeded
-        // empty. See the note on `activeComputerId`. Which computer is
-        // Current is NOT seeded from this window's ctx: that is
-        // `session.currentComputer()`, shared with every launch.
+        // empty. See the note on `activeComputerId`.
         if ( activeComputerId === undefined ) {
             activeComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
         }
+        paneCtx = ctx ?? null;
         bind($win, ctx);
+        const onSwitchRequest = event => { if ( AWS_SIZES.includes(event.detail?.size) ) queuedSwitch = event.detail.size; };
+        window.addEventListener('ezil:computer-switch-request', onSwitchRequest);
+        $win.on('remove.computers', () => {
+            paneActive = false; generation++; clearTimeout(pollTimer); pollTimer = null; queuedSwitch = null;
+            window.removeEventListener('ezil:computer-switch-request', onSwitchRequest);
+        });
+        paneActive = false;
         void load($win);
     },
 
@@ -649,6 +1244,14 @@ export default {
         // Cheap and idempotent — a re-activation (switching back to this
         // tab) should show current data, not what was true when the window
         // opened.
+        paneActive = true;
         void load($win);
+    },
+
+    onDeactivate () {
+        paneActive = false;
+        generation++;
+        clearTimeout(pollTimer);
+        pollTimer = null;
     },
 };

@@ -23,13 +23,19 @@ import stat
 import subprocess
 import time
 
-from . import canary, config as cfgmod
-from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at
+from . import canary, config as cfgmod, restore, lease as leasemod
+from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at, unlink_durable_at
 
 MARKER = ".ezil-marker.json"
 INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{3,17}")
 REBASE_STATE = ".ezil-rebase-state.json"
 MOUNT_OPTS = "nosuid,nodev"
+
+
+def _commit_fault(point):
+    # Existing test-only fault hook; never set by production units.
+    if os.environ.get("EZIL_REBASE_FAULT_AFTER") == point:
+        os._exit(99)
 
 
 def _device_number(number):
@@ -162,6 +168,8 @@ def mount_opts(path):
 
 
 def mount_data(cfg, lease, mode="ro"):
+    if "ebsRestore" in lease and lease.get("provision") is not False:
+        raise Refused("permit_invalid")
     dev = wait_device_for_volume(cfg, lease["volumeId"])
     uuid = fs_uuid(dev)
     if uuid is None:
@@ -174,7 +182,8 @@ def mount_data(cfg, lease, mode="ro"):
     os.makedirs(cfg.dataMount, mode=0o755, exist_ok=True)
     if is_mounted(cfg.dataMount):
         raise Refused("data_mount_busy", cfg.dataMount)
-    subprocess.run(["mount", "-o", f"{mode},{MOUNT_OPTS}", dev, cfg.dataMount], check=True)
+    filesystem = ["-t", "ext4"] if "ebsRestore" in lease else []
+    subprocess.run(["mount", *filesystem, "-o", f"{mode},{MOUNT_OPTS}", dev, cfg.dataMount], check=True)
     return dev
 
 
@@ -191,7 +200,7 @@ def read_marker(root_fd):
     if raw is None:
         raise Refused("marker_malformed", "not a regular file")
     try:
-        m = json.loads(raw)
+        m = leasemod.strict_json(raw)
     except ValueError:
         raise Refused("marker_malformed", "not json")
     ok = (isinstance(m, dict)
@@ -211,7 +220,8 @@ def read_rebase_state(root_fd):
         return None
     raw = read_regular_at(root_fd, REBASE_STATE, limit=65536)
     try:
-        return json.loads(raw) if raw is not None else {"state": "unreadable"}
+        state = leasemod.strict_json(raw) if raw is not None else None
+        return state if isinstance(state, dict) else {"state": "unreadable"}
     except ValueError:
         return {"state": "unreadable"}
 
@@ -255,10 +265,10 @@ def new_marker(lease, digest, instance_id=None):
     return m
 
 
-def run_guard(cfg, lease, rebase_runner=None):
+def run_guard(cfg, lease, rebase_runner=None, allow_reboot=True, restore_runner=None):
     """Steps 1-6, with optional public console diagnostics."""
     try:
-        verdict = _run_guard(cfg, lease, rebase_runner)
+        verdict = _run_guard(cfg, lease, rebase_runner, allow_reboot, restore_runner)
     except Refused:
         canary.guard_result(cfg, "refused")
         raise
@@ -269,8 +279,11 @@ def run_guard(cfg, lease, rebase_runner=None):
     return verdict
 
 
-def _run_guard(cfg, lease, rebase_runner=None):
+def _run_guard(cfg, lease, rebase_runner=None, allow_reboot=True, restore_runner=None):
     """Leaves the data volume mounted rw on success; unmounted on refusal."""
+    if "ebsRestore" in lease:
+        from . import maintenance
+        return maintenance.run(cfg, lease)
     digest = cfgmod.host_digest(cfg)
     instance_id = current_instance_id(cfg)
     stamp = os.path.join(cfg.runDir, "guard-ok")
@@ -286,15 +299,25 @@ def _run_guard(cfg, lease, rebase_runner=None):
         try:
             state = read_rebase_state(root)
             if state is not None:
-                raise Refused("rebase_failed", f"state={state.get('state')}; restore the pre-rebase snapshot")
+                raise Refused("rebase_failed", "restore the pre-rebase snapshot")
+            restore_state = restore.read_state(root)
+            if restore_state is not None:
+                if lease.get("restore"):
+                    if not restore.matches(restore_state, lease["restore"]):
+                        raise Refused("restore_state_mismatch")
+                elif restore_state["state"] != "done":
+                    raise Refused("restore_incomplete")
             m = read_marker(root)
             if m is None:
                 entries = [e for e in os.listdir(root) if e != "lost+found"]
+                if restore_state is not None and lease.get("restore"):
+                    entries = [e for e in entries if e not in
+                               (restore.STATE, restore.STAGE, "workspace", "root", "profiles")]
                 if not lease.get("provision") or entries:
                     raise Refused("marker_missing", "init only on a provisioning lease and an empty volume")
                 verdict = "init"
             else:
-                verdict = check_marker(m, lease, digest, instance_id)
+                verdict = check_marker(m, lease, digest, instance_id if allow_reboot else None)
             if verdict == "rebase_needed":
                 if rebase_runner is None or not lease.get("rebase"):
                     raise Refused("lower_digest_mismatch", f"marker={m['lowerImageDigest']} host={digest}")
@@ -303,12 +326,37 @@ def _run_guard(cfg, lease, rebase_runner=None):
                     raise Refused("rebase_receipt_mismatch", "receipt digests do not match marker/host")
                 if not os.path.isdir(cfgmod.lower_dir(cfg, r["fromDigest"])):
                     raise Refused("rebase_old_lower_missing", r["fromDigest"])
+                try:
+                    leasemod.validate_authorization(lease, lease.get("rebasePermit"),
+                                                   leasemod.PERMIT_KEYS, "rebasePermit")
+                except leasemod.LeaseError as e:
+                    raise Refused("permit_invalid") from e
+                deadline = leasemod.mutation_deadline(lease["rebasePermit"])
+                capacity = os.fstatvfs(root)
+                if capacity.f_bavail == 0 or capacity.f_favail == 0:
+                    raise Refused("rebase_failed", "insufficient filesystem capacity")
+                leasemod.require_budget(lease["rebasePermit"], deadline)
             os.close(root)
             root = None
             remount(cfg, "rw")
             root = os.open(cfg.dataMount, DIR_FLAGS)
             if verdict == "rebase_needed":
-                rebase_runner(cfg, lease, root)        # raises Refused('rebase_failed') on failure
+                leasemod.require_budget(lease["rebasePermit"], deadline)
+                rebase_runner(cfg, lease, root, deadline=deadline)
+                leasemod.require_budget(lease["rebasePermit"], deadline)
+            if lease.get("restore"):
+                try:
+                    fetch = restore.http_fetch(cfg, restore.SnapshotClient(cfg, lease))
+                    (restore_runner or restore.run_restore)(lease["restore"], cfg.dataMount, fetch)
+                except BaseException:
+                    # Exception messages may contain user paths or HTTP credentials.
+                    try:
+                        state = restore.identity(lease["restore"])
+                    except Refused:
+                        state = {}
+                    state.update(state="failed", reason="restore_failed")
+                    write_file_durable_at(root, restore.STATE, json.dumps(state).encode())
+                    raise
             for d in ("root/upper", "root/work", "workspace", "profiles"):
                 _mkdirs_nofollow(root, d)          # not reachable by the guest: refuse if odd
             quarantined = []
@@ -318,8 +366,16 @@ def _run_guard(cfg, lease, rebase_runner=None):
                     quarantined.append(q)
             if quarantined:
                 verdict += " quarantined=" + ",".join(quarantined)
-            # the marker is bumped only after every check, rebase and layout step passed
+            # the marker is bumped only after checks, rebase, restore and layout passed
+            if verdict.startswith("rebase_needed"):
+                leasemod.require_budget(lease["rebasePermit"], deadline)
+            if lease.get("rebase"):
+                _commit_fault("before-marker")
             write_file_durable_at(root, MARKER, (json.dumps(new_marker(lease, digest, instance_id)) + "\n").encode(), 0o600)
+            if lease.get("rebase"):
+                _commit_fault("after-marker")
+            if lease.get("rebase") and read_rebase_state(root) is not None:
+                unlink_durable_at(root, REBASE_STATE)
         finally:
             if root is not None:
                 os.close(root)
@@ -327,8 +383,8 @@ def _run_guard(cfg, lease, rebase_runner=None):
         subprocess.run(["umount", cfg.dataMount])
         raise
     os.makedirs(cfg.runDir, mode=0o700, exist_ok=True)
-    with open(stamp, "w") as f:
-        json.dump({"generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"]}, f)
+    from .enroll import _write_private
+    _write_private(stamp, json.dumps(new_marker(lease, digest, instance_id)).encode())
     return verdict
 
 
@@ -368,8 +424,10 @@ def _mkdirs_nofollow(root, rel):
             except FileExistsError:
                 pass
             nfd = os.open(comp, DIR_FLAGS, dir_fd=fd)      # a planted symlink refuses (ELOOP)
+            os.fsync(fd)
             os.close(fd)
             fd = nfd
+        os.fsync(fd)
     except OSError as e:
         raise Refused("layout_not_a_real_directory", f"{rel}: {os.strerror(e.errno)}")
     finally:
@@ -377,13 +435,14 @@ def _mkdirs_nofollow(root, rel):
 
 
 def clear_stamp(cfg):
-    try:
-        os.unlink(os.path.join(cfg.runDir, "guard-ok"))
-    except FileNotFoundError:
-        pass
+    for name in ("guard-ok", "maintenance-ok"):
+        try:
+            os.unlink(os.path.join(cfg.runDir, name))
+        except FileNotFoundError:
+            pass
 
 
-def assert_data_mounted(cfg, lease):
+def assert_data_mounted(cfg, lease, check_upper=True):
     """The upper must be on THIS lease's data volume — never on the host root disk.
     Checks: dataMount is a mount point whose source is the lease's volume device, the
     device's fs UUID is the lease's, and the upper dir resolves to that same mount."""
@@ -396,6 +455,8 @@ def assert_data_mounted(cfg, lease):
         raise Refused("data_mount_wrong_device", f"mounted={src} lease={dev}")
     if fs_uuid(dev) != lease["fsUuid"]:
         raise Refused("fs_uuid_mismatch", "mounted device")
+    if not check_upper:
+        return
     upper = os.path.join(cfg.dataMount, "root", "upper")
     usrc = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "-T", upper], capture_output=True, text=True).stdout.strip()
     if os.path.realpath(usrc) != dev:
@@ -406,11 +467,41 @@ def require_stamp(cfg, lease):
     """Every downstream unit calls this: nothing starts unless THIS lease passed the guard
     AND the guarded data volume is still the one mounted (data-down removes the stamp;
     a manual umount or a different device is caught by the mount check)."""
+    if "ebsRestore" in lease:
+        raise Refused("maintenance_only")
+    return committed_digest(cfg, lease)
+
+
+def committed_digest(cfg, lease, maintenance=False):
+    """Host evidence comes only from the guarded marker and this boot's full stamp."""
+    if ("ebsRestore" in lease) != maintenance:
+        raise Refused("maintenance_only")
+    stamp_name = "maintenance-ok" if maintenance else "guard-ok"
     try:
-        with open(os.path.join(cfg.runDir, "guard-ok")) as f:
-            s = json.load(f)
+        run = os.open(cfg.runDir, DIR_FLAGS)
+        try:
+            raw = read_regular_at(run, stamp_name, limit=65536)
+            stamp = leasemod.strict_json(raw) if raw is not None else None
+        finally:
+            os.close(run)
     except (OSError, ValueError):
         raise Refused("guard_not_passed")
-    if s != {"generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"]}:
-        raise Refused("guard_stamp_stale", json.dumps(s))
-    assert_data_mounted(cfg, lease)
+    if not isinstance(stamp, dict):
+        raise Refused("guard_not_passed")
+    if any(stamp.get(key) != lease[key] for key in ("generation", "leaseEpoch")):
+        raise Refused("guard_stamp_stale")
+    assert_data_mounted(cfg, lease, check_upper=not maintenance)
+    root = os.open(cfg.dataMount, DIR_FLAGS)
+    try:
+        if read_rebase_state(root) is not None:
+            raise Refused("rebase_failed")
+        marker = read_marker(root)
+    finally:
+        os.close(root)
+    digest = cfgmod.host_digest(cfg)
+    expected = new_marker(lease, digest, current_instance_id(cfg))
+    if marker != expected or stamp != expected:
+        raise Refused("host_digest_mismatch")
+    if maintenance and digest != lease["ebsRestore"]["fromDigest"]:
+        raise Refused("host_digest_mismatch")
+    return marker["lowerImageDigest"]

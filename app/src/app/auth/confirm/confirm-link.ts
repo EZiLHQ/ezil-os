@@ -32,14 +32,14 @@ export function isVerifiableType(value: string | null | undefined): value is Ver
     return typeof value === 'string' && (VERIFIABLE_TYPES as readonly string[]).includes(value);
 }
 
-/** Where an invited user sets the password their account does not have yet. */
+/** Where an invited user's fresh session is turned into a document load of `/os`. */
 export const INVITED_PATH = '/auth/invited';
 
 /**
  * Where a verified link lands.
  *
- * An `invite` has no password — the account was created by the invite itself —
- * so it goes to `/auth/invited`, the one place that asks for one. Everything
+ * An `invite` goes to `/auth/invited`, which sends the new user into the OS
+ * with a document load. Everything
  * else goes to the caller's `next`, which the route has already narrowed with
  * `safeReturnUrl`; that narrowing is what stops `?next=https://evil.example`
  * from turning a freshly-minted session into an open redirect.

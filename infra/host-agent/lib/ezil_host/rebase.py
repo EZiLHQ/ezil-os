@@ -21,7 +21,7 @@ Rules (from the S1 spike; each has a test that fails without it, test/test-rebas
      new lower ships under usr/ opt/ container-server/), /etc excluded: MOVED ASIDE to
      /.ezil-rebase-preserved/<ts>/<path>, never deleted (§3a.5).
   3w whiteouts at owned paths: removed (no data).
-  4  regular files identical (sha256, mode, uid, gid) to the OLD lower: removed, /etc
+  4  regular files identical (sha256, mode, uid, gid, ACLs/xattrs) to the OLD lower: removed, /etc
      included (the only rule that lets an /etc image update through).
   5  opaque dirs outside /etc that would hide owned new-image paths: flag cleared.
 
@@ -44,7 +44,7 @@ import stat
 import sys
 import time
 
-from .fsops import DIR_FLAGS, read_regular_at
+from .fsops import DIR_FLAGS, read_regular_at, regular_xattrs_at
 
 SYSTEM_TREES = ("usr/", "opt/", "container-server/")
 DPKG_STATUS = "var/lib/dpkg/status"
@@ -92,6 +92,14 @@ class Lookup:
         fd, _, fds = self._parent(rel + "/.")
         try:
             return [] if fd is None else os.listdir(fd)
+        finally:
+            for f in fds:
+                os.close(f)
+
+    def xattrs(self, rel, st):
+        fd, name, fds = self._parent(rel)
+        try:
+            return None if fd is None else regular_xattrs_at(fd, name, st)
         finally:
             for f in fds:
                 os.close(f)
@@ -205,7 +213,10 @@ def rebase(upper_path, old_path, new_path, disabled=frozenset(), fault_after=Non
                 or stat.S_IMODE(ost.st_mode) != stat.S_IMODE(st.st_mode) or (ost.st_uid, ost.st_gid) != (st.st_uid, st.st_gid):
             return False
         a, b = read_regular_at(dfd, name, st), old.read(rel)
-        return a is not None and b is not None and hashlib.sha256(a).digest() == hashlib.sha256(b).digest()
+        attrs = regular_xattrs_at(dfd, name, st)
+        return (a is not None and b is not None and attrs is not None
+                and attrs == old.xattrs(rel, ost)
+                and hashlib.sha256(a).digest() == hashlib.sha256(b).digest())
 
     def handle_status(dfd, name, rel, st):
         body = read_regular_at(dfd, name, st) if stat.S_ISREG(st.st_mode) else None
@@ -345,7 +356,8 @@ def rebase(upper_path, old_path, new_path, disabled=frozenset(), fault_after=Non
 def main(argv):
     disabled = frozenset(r for r in os.environ.get("EZIL_REBASE_DISABLE", "").split(",") if r)
     fa = os.environ.get("EZIL_REBASE_FAULT_AFTER")
-    rep = rebase(argv[1], argv[2], argv[3], disabled, int(fa) if fa else None)
+    rep = rebase(argv[1], argv[2], argv[3], disabled,
+                 int(fa) if fa and fa not in ("before-marker", "after-marker") else None)
     print(json.dumps(rep))
 
 
@@ -353,25 +365,38 @@ if __name__ == "__main__":
     main(sys.argv)
 
 
-def run_job(cfg, lease, root_fd):
+def run_job(cfg, lease, root_fd, deadline=None):
     """Called by the guard with the data root open rw. Snapshot-first: the receipt was
     already validated by the guard (volume, digests, old lower present)."""
     import subprocess
     from . import config as cfgmod
+    from . import lease as leasemod
     from .fsops import Refused, write_file_durable_at
     from .guard import REBASE_STATE
     r = lease["rebase"]
+    permit = lease["rebasePermit"]
+    if deadline is None:
+        deadline = leasemod.mutation_deadline(permit)
+    leasemod.require_budget(permit, deadline)
     state = {"state": "in_progress", "receipt": r, "generation": lease["generation"],
              "leaseEpoch": lease["leaseEpoch"], "startedAt": int(time.time())}
     write_file_durable_at(root_fd, REBASE_STATE, (json.dumps(state) + "\n").encode(), 0o600)
     lib = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "EZIL_REBASE_DISABLE", "EZIL_REBASE_FAULT_AFTER")}
     env["PYTHONPATH"] = lib
-    p = subprocess.run([sys.executable, "-m", "ezil_host.rebase", os.path.join(cfg.dataMount, "root/upper"),
-                        # lowers live on the trusted root volume; resolve an operator symlink there
-                        os.path.realpath(cfgmod.lower_dir(cfg, r["fromDigest"])),
-                        os.path.realpath(cfgmod.lower_dir(cfg, r["toDigest"]))],
-                       env=env, capture_output=True, text=True)
+    try:
+        p = subprocess.run([sys.executable, "-m", "ezil_host.rebase", os.path.join(cfg.dataMount, "root/upper"),
+                            # lowers live on the trusted root volume; resolve an operator symlink there
+                            os.path.realpath(cfgmod.lower_dir(cfg, r["fromDigest"])),
+                            os.path.realpath(cfgmod.lower_dir(cfg, r["toDigest"]))],
+                           env=env, capture_output=True, text=True,
+                           timeout=leasemod.require_budget(permit, deadline))
+    except subprocess.TimeoutExpired as e:
+        # subprocess.run kills and reaps the child before raising. The durable
+        # in_progress state still blocks boot if even the failure write fails.
+        state.update(state="rebase_failed", reason="rebase_timeout")
+        write_file_durable_at(root_fd, REBASE_STATE, (json.dumps(state) + "\n").encode(), 0o600)
+        raise Refused("rebase_timeout") from e
     if p.returncode != 0:
         state.update(state="rebase_failed", exitCode=p.returncode, stderr=p.stderr[-2000:])
         os.makedirs(cfg.runDir, mode=0o700, exist_ok=True)
@@ -382,5 +407,5 @@ def run_job(cfg, lease, root_fd):
     os.makedirs(cfg.runDir, mode=0o700, exist_ok=True)
     with open(os.path.join(cfg.runDir, "rebase-report.json"), "w") as f:
         f.write(p.stdout)
-    os.unlink(REBASE_STATE, dir_fd=root_fd)
-    os.fsync(root_fd)
+    write_file_durable_at(root_fd, ".ezil-rebase-report.json", p.stdout.encode(), 0o600)
+    # The guard owns cleanup, after layout checks and the durable marker commit.

@@ -112,7 +112,7 @@ const IMAGE = 'image' in availability ? availability.image : '';
 const OFFSET = 'offset' in availability ? availability.offset : 0;
 
 let host: DockerHost | null = null;
-let bootError: string | null = null;
+let bootError: Error | null = null;
 let bootMs = -1;
 let started = false;
 /** Filled from `docker stats` once ready, so the report carries a real number. */
@@ -145,7 +145,7 @@ if (SKIP_REASON !== null) {
         // The container may exist even when the boot failed; record it so the
         // cleanup below removes it either way.
         started = sh('docker', ['inspect', '--format', '{{.Id}}', CONTAINER], 20_000).status === 0;
-        bootError = err instanceof Error ? err.message : String(err);
+        bootError = err instanceof Error ? err : new Error(String(err));
     }
 }
 
@@ -157,7 +157,8 @@ afterAll(() => {
 
 describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', () => {
     it('booted at all (every assertion below depends on this one)', () => {
-        expect(bootError).toBeNull();
+        // Rethrow the original stack: native spawn failures must retain their call site.
+        if (bootError !== null) throw bootError;
         expect(host).not.toBeNull();
         console.log(
             `\n[T2 measured] image=${IMAGE} offset=${OFFSET}`

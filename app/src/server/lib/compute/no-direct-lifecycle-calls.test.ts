@@ -30,6 +30,9 @@ const CALLERS = [
     'server/api/routers/cloudflare-guacamole.ts',
     'server/api/routers/computer.ts',
     'server/api/routers/compute-dispatch.ts',
+    'server/lib/compute/stop-policy.ts',
+    'app/api/cron/billing-session-sweep/route.ts',
+    'app/api/cron/billing-session-sweep/handler.ts',
     'app/api/cron/sandbox-reap/route.ts',
     'app/api/cron/sandbox-reap/handler.ts',
 ];

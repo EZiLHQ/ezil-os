@@ -1,7 +1,7 @@
 ---
 id: AUTH-01
-title: Forgot-password UI and re-auth before updateUser on /auth/invited
-labels: [app, "help wanted", "size/M"]
+title: /auth/invited shows invite errors in its own words, never the link's or Supabase's
+labels: [app, "help wanted", "size/S"]
 prereq:
 state: open
 github: 50
@@ -9,56 +9,53 @@ github: 50
 
 ## The problem
 
-Two gaps in the auth surface. First: there is no forgot-password path anywhere in the app —
-`app/src/app/login/` (`login-form.tsx`, `actions.ts`, `page.tsx`) has no
-`resetPasswordForEmail` call and no "forgot password" link (verified by grep across the whole
-`login/` directory: zero matches for "forgot" or "reset"). A user who is invited, sets a
-password once at `/auth/invited`, and later forgets it has no way back in. Second: on
-`/auth/invited` itself, the page calls `supabase.auth.setSession()` from the invite link's
-implicit-grant fragment (`app/src/app/auth/invited/page.tsx:90`), then later — after the user
-types a password and submits — calls `supabase.auth.updateUser({ password })`
-(`page.tsx:134`) with no re-authentication or session-freshness check in between. If the tab
-sits open between those two moments (the fragment is parsed once, on page load, per the
-component's structural guarantee described in its own header comment), the session backing the
-second call may no longer be fresh, and the failure mode a user sees is just whatever error
-message Supabase happens to return — not a clear "your invite link expired, ask for a new one."
+This issue used to ask for a forgot-password UI on `/login` and a re-authentication check
+before `updateUser({ password })` on `/auth/invited`. Neither applies any more. EZiL ID
+(Auth0 at id.ezil.work) is the only sign-in, so passwords and their recovery belong to EZiL
+ID, and `/login` offers nothing else. `/auth/invited` no longer sets a password at all: once
+the invite session exists it enters `/os`, and the invited person later continues with EZiL ID
+using the same address (see the header comment of `app/src/app/auth/invited/page.tsx`). The
+part of the old issue that still holds is the error the page shows when an invite fails.
+
+That error is text the page did not write. An error fragment's `error_description` is shown
+as-is (`app/src/app/auth/invited/page.tsx:84`), and a failed `setSession` shows Supabase's
+`error.message` (`page.tsx:97`). The first comes from the link, so anyone can send a link to
+`/auth/invited#error=x&error_description=<any text>` and the page displays that text under
+"Welcome to EZiL OS". The second is whatever Supabase happens to return, not a clear "your
+invite link expired, ask for a new one". `/login` already refuses to do this: `noticeFor`
+(`app/src/app/login/page.tsx:20-32`) matches the `error` value against known codes and never
+displays the value itself.
 
 ## Acceptance criteria
 
-- A forgot-password UI exists on (or reachable from) the login page, calling Supabase's
-  `resetPasswordForEmail` and landing the user on a page that sets a new password the same way
-  `/auth/invited` does today.
-- Before calling `updateUser({ password })` on `/auth/invited`, the code confirms the session
-  is still valid (e.g. re-checks `getSession()`/`getUser()` immediately before the call) and
-  surfaces a specific, actionable error ("your invite link expired — ask a maintainer for a new
-  one") rather than passing through whatever Supabase returns.
-- A test proves the stale-session case: a session that has expired or been revoked between
-  `setSession` and the `updateUser` call is caught and reported clearly, not silently retried
-  or shown a generic error.
-- The forgot-password flow does not create a new account and does not bypass the invite-only
-  gate (`app/src/server/api/trpc.ts`'s `protectedProcedure`) — it only lets an already-invited,
-  already-registered user reset a password they forgot.
+- `/auth/invited` never renders `error_description`, `error.message`, or any other text taken
+  from the URL or from a Supabase response.
+- A known expired-link code (`otp_expired`, as GoTrue sends it) shows a specific sentence
+  telling the person their invite link expired and to ask for a new one; every other failure
+  shows one fixed, generic sentence.
+- The mapping is a pure function next to `parseAuthFragment` in
+  `app/src/app/auth/invited/fragment.ts`, so it is tested without rendering the page.
+- The page still strips the fragment from the address bar and still enters `/os` with a
+  document load on success; neither behaviour changes.
 
 ## Where to look
 
-- `app/src/app/auth/invited/page.tsx:90` — the `setSession` call from the invite fragment.
-- `app/src/app/auth/invited/page.tsx:134` — the `updateUser({ password })` call this issue adds
-  a re-auth check before.
-- `app/src/app/login/login-form.tsx`, `app/src/app/login/actions.ts` — no forgot-password UI or
-  action exists in either file today (verified by grep).
-- `app/src/app/auth/invited/fragment.ts` — the implicit-grant fragment parser; its own doc
-  comment explains why Supabase invites are not PKCE and why `setSession` must be called
-  explicitly (the same reasoning a forgot-password reset link will need to reuse or diverge
-  from, since a password-reset link uses a different Supabase flow than an invite).
+- `app/src/app/auth/invited/page.tsx:84` — `fragment.description` shown as the failure message.
+- `app/src/app/auth/invited/page.tsx:97` — `setSession`'s `error.message` shown as the failure
+  message.
+- `app/src/app/auth/invited/fragment.ts` — `parseAuthFragment` already separates `code` from
+  `description`; its tests (`fragment.test.ts`) include GoTrue's expired-link fragment.
+- `app/src/app/login/page.tsx:20-32` — `noticeFor`, the pattern to follow: known codes map to
+  fixed sentences, and the raw value is never displayed.
 
 ## How to prove it
 
 ```
-cd app && bun run test src/app/auth && bun run typecheck
+cd app && bun run test src/app/auth/invited && bun run typecheck
 ```
-Expected: a new test proves the stale-session case on `/auth/invited` is caught with a specific
-message, and the forgot-password flow's own test proves `resetPasswordForEmail` is called with
-no account created.
+Expected: a new test proves an `error_description` carrying arbitrary text and a `setSession`
+error message both produce only the page's own sentences, and that `otp_expired` produces the
+expired-link sentence.
 
 ## Prerequisite
 

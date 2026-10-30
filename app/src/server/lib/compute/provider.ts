@@ -54,10 +54,14 @@ export interface EnsureOptions {
  */
 export type EnsureResult =
     | { ok: true }
-    | { ok: false; error: string; errorCode: string; retryable: boolean };
+    | { ok: false; error: string; errorCode: string; retryable: boolean; computeLaunching?: boolean;
+        /** `capacity_attempt_expired` only: the expired attempt an explicit user Retry may reset (RETRY-118). */
+        capacityAttemptId?: string };
 
 export interface ComputeStatus {
     ok: boolean;
+    /** A fresh replacement instance is still starting, independently of migration. */
+    computeLaunching?: boolean;
     error?: string;
 }
 

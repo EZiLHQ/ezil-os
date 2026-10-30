@@ -14,7 +14,7 @@ import path from 'node:path';
 import { drizzle } from 'drizzle-orm/pg-proxy';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type * as schema from '@/server/db/schema';
 import { createFakePlacementDb, DEFAULT_OWNER as OWNER, placementRow } from './fake-placement-db.test-support';
@@ -24,6 +24,7 @@ import {
     createPlacement,
     DEFAULT_PLACEMENT,
     findDuplicatePlacements,
+    ImageJobConflictError,
     leasePlacement,
     mintAdmissionTicket,
     PLACEMENT_STATES,
@@ -33,6 +34,7 @@ import {
     placementOwnerTrpcError,
     PlacementOwnerError,
     readPlacement,
+    pinCloudflarePlacement,
     RUNNING_CLASS_STATES,
     readAdmissionCounters,
     withAdmission,
@@ -88,7 +90,7 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
 
     it('an uppercase id from a caller still matches the lowercase ::text column', async () => {
         // Postgres compares uuids by value and returns `::text` lowercase.
-        const db = { execute: async () => ({ rows: [{ ...placementRow({ computer_id: A }), generation: '1', lease_epoch: '0' }] }) };
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: '1', lease_epoch: '0' })] });
         const p = await readPlacement(db, A.toUpperCase());
         expect(p.record?.computerId).toBe(A);
     });
@@ -148,6 +150,69 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
     });
 });
 
+describe('ownership precedes image-reservation refusal', () => {
+    const jobId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const reserved = () => createFakePlacementDb({ placements: [placementRow({
+        computer_id: A, owner_user_id: B, image_upgrade_job_id: jobId,
+    })] });
+
+    it('a foreign reader gets only the ownership refusal, with no reservation query', async () => {
+        const { db, statements } = reserved();
+        await expect(readPlacement(db, A, OWNER)).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(statements.map(s => s.sql)).toEqual([expect.stringContaining('/* placement:read */')]);
+    });
+
+    it.each([B, B.toUpperCase(), undefined])('the owner or an ownerless reader still refuses a reservation (%s)', async owner => {
+        const { db, statements } = reserved();
+        await expect(readPlacement(db, A.toUpperCase(), owner)).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(statements.map(s => ({ sql: s.sql, params: s.params }))).toEqual([
+            { sql: expect.stringContaining('/* placement:read */'), params: [A] },
+            { sql: expect.stringContaining('/* placement:image-reservation */'), params: [A, A] },
+        ]);
+    });
+
+    it('an uppercase owner can read their unreserved placement', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, owner_user_id: B })] });
+        expect((await readPlacement(db, A, B.toUpperCase())).record?.ownerUserId).toBe(B);
+    });
+
+    it('an owner-aware read without a placement still refuses an orphan image job', async () => {
+        const execute = vi.fn<PlacementExecutor['execute']>()
+            .mockResolvedValueOnce({ rows: [] })
+            .mockResolvedValueOnce({ rows: [{ job_id: jobId }] });
+        await expect(readPlacement({ execute }, A, B)).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(execute).toHaveBeenCalledTimes(2);
+    });
+
+    it('an owner-aware read propagates reservation database errors instead of allowing access', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, owner_user_id: B })] });
+        const unavailable = new Error('reservation database unavailable');
+        const execute = vi.fn<PlacementExecutor['execute']>()
+            .mockImplementationOnce(q => db.execute(q))
+            .mockRejectedValueOnce(unavailable);
+        await expect(readPlacement({ execute }, A, B)).rejects.toBe(unavailable);
+    });
+
+    it('pinning rechecks ownership under the computer lock before reservations', async () => {
+        const { db, statements } = reserved();
+        await expect(pinCloudflarePlacement(db, { computerId: A, userId: OWNER })).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(statements.map(s => s.sql)).toEqual([
+            'BEGIN', expect.stringContaining('/* placement:lock-computer */'),
+            expect.stringContaining('/* placement:read */'), 'ROLLBACK',
+        ]);
+    });
+
+    it('ordinary admission still fails closed for the owner under its admission lock', async () => {
+        const { db, statements } = reserved();
+        await expect(withAdmission(db, (tx, lock) => readAdmissionCounters(tx, lock, {
+            computerId: A, userId: B, monthStart: new Date('2026-10-01T00:00:00Z'), now: new Date('2026-10-22T00:00:00Z'),
+        }))).rejects.toBeInstanceOf(ImageJobConflictError);
+        expect(statements.some(s => s.sql.includes('/* placement:image-reservation */'))).toBe(true);
+        expect(statements.at(-1)?.sql).toBe('ROLLBACK');
+        expect(statements.some(s => s.sql.includes('/* placement:insert */') || s.sql.includes('/* placement:cas */'))).toBe(false);
+    });
+});
+
 describe('create: per-computer advisory lock, then refuse an existing row', () => {
     it('two concurrent creates for one computer yield exactly one row', async () => {
         const { db, placements } = createFakePlacementDb();
@@ -167,9 +232,10 @@ describe('create: per-computer advisory lock, then refuse an existing row', () =
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, hashtext\(\$2::uuid::text\)\), current_setting\('transaction_isolation'\) AS isolation/);
         expect(statements[1]!.params[1]).toBe(A);
-        expect(sqls[2]).toMatch(/placement:read/);
-        expect(sqls[3]).toMatch(/INSERT INTO public\.ezil_computer_placements/);
-        expect(sqls[4]).toBe('COMMIT');
+        expect(sqls[2]).toMatch(/placement:image-reservation/);
+        expect(sqls[3]).toMatch(/placement:read/);
+        expect(sqls[4]).toMatch(/INSERT INTO public\.ezil_computer_placements/);
+        expect(sqls[5]).toBe('COMMIT');
     });
 
     it('mixed-case creators of one computer serialise on ONE lock: exactly one row', async () => {
@@ -307,7 +373,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         const { db, statements } = at();
         await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         const cas = statements.find((s) => /placement:cas/.test(s.sql))!;
-        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+\s+AND state = \$\d+\s+AND owner_user_id = \$\d+::uuid\s+RETURNING/);
+        expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+\s+AND image_upgrade_job_id IS NULL\s+AND state = \$\d+\s+AND owner_user_id = \$\d+::uuid\s+RETURNING/);
         expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 });
@@ -439,7 +505,7 @@ describe('R-PL F3: AWS create and lease need the admission ticket, not just the 
 
     it('only admission.ts mints tickets: no other non-test file in the repository names the minter', () => {
         const REPO = path.resolve(__dirname, '../../../../..');
-        const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8' })
+        const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
             .split('\0')
             .filter((f) => /\.(ts|tsx|js|mjs|cjs)$/.test(f) && !f.startsWith('docs/') && !/\.test(-support)?\.(ts|tsx|mjs|js)$/.test(f));
         expect(files.length).toBeGreaterThan(300); // a real tree, not a vacuous pass

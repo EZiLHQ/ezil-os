@@ -275,7 +275,7 @@ function stub (url, method) {
     if ( url.includes('/api/shell/desktop') && method === 'POST' ) {
         return { ok: true, guacamoleUrl: `${HOST}/desktop-frame`, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
     }
-    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true };
+    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true, status: 200 };
     if ( url.includes('/api/shell/desktop') ) return { ok: true, guacamoleRunning: true };
     if ( url.includes('/api/trpc/computer.list') ) return { result: { data: { json: listRows } } };
     return { ok: true };

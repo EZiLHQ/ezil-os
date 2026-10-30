@@ -1,6 +1,7 @@
 // system-describe-test.mjs — EZiL-authored. Pure wording tests for Settings → System.
 // Run: node shell/ezil/ui/Settings/system-describe-test.mjs   (exit 0 pass, 1 fail)
-import { describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
+import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
+import { describeRunningOn, describePlan, standingOf, describeImage, describeMachine, describeProvider, describeScreenError, describeTransport, describeUsage, VITALS_STALE_MS } from './tabs/system-describe.js';
 
 const results = [];
 const push = (name, ok, detail) => results.push({ name, ok: !! ok, detail });
@@ -10,7 +11,7 @@ const cf = { provider: 'cloudflare', providerSource: 'placement', machine: { vcp
 const unassigned = { provider: 'unassigned', providerSource: 'no_placement', machine: { vcpu: null, memoryMiB: null, instanceType: null, region: null, source: 'unknown' }, lifecycleState: null, usage: null };
 
 // Provider
-push('AWS placement names AWS and its region', describeProvider(aws).value === 'AWS EC2 (us-east-1)', describeProvider(aws));
+push('AWS placement names AWS and its region', describeProvider(aws).value === 'AWS (us-east-1)', describeProvider(aws));
 push('Cloudflare placement names Cloudflare Containers', describeProvider(cf).value === 'Cloudflare Containers');
 push('🔴 no placement is "Not assigned yet", never Cloudflare', describeProvider(unassigned).value === 'Not assigned yet');
 push('🔴 unreadable info is Unknown, never Cloudflare', describeProvider(null, 'UPSTREAM').value === 'Unknown');
@@ -22,6 +23,48 @@ push('🔴 reads off: the hint separates configured routing from verification',
     /configured to start computers on Cloudflare/.test(describeProvider(readsOff).hint) && /not verified/.test(describeProvider(readsOff).hint)
     && ! /Every computer/.test(describeProvider(readsOff).hint));
 push('🔴 reads off: no Cloudflare size is presented', describeMachine(readsOff).value === '—', describeMachine(readsOff));
+
+push('actual Cloudflare line never fabricates a city', describeRunningOn(cf).value === 'Cloudflare Containers · 2 vCPU / 6 GiB', describeRunningOn(cf));
+push('plan line separates entitlement and preparation', describePlan({ ...cf, plan: { vcpu: 2, memoryGB: 8, status: 'preparing' } }).value === '2 vCPU / 8 GB on AWS (India) — being prepared');
+// Round 3 (SWITCH-CONTRACT §4): a size mismatch alone is "ready" with a separate next-start hint;
+// "being prepared" only while a transition is in flight; never "Running on X" next to an unrelated "plan Y — being prepared".
+{
+    const aws = { provider: 'aws-ec2', machine: { region: 'ap-south-1', vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large' } };
+    const ready = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null } });
+    push('ready: the running size, with the next start as a separate hint', ready.value === '2 vCPU / 8 GB on AWS (India)' && ready.hint === 'Next start: 4 vCPU / 16 GB.', JSON.stringify(ready));
+    const same = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'ready', current: 'std-2', selected: 'std-2' } });
+    push('ready with the same choice: no hint', same.value === '2 vCPU / 8 GB on AWS (India)' && same.hint === '');
+    const t = { transitionId: 't', kind: 'switch', current: 'std-2', target: 'cmp-8', phase: 'waking', reason: null, revertAvailable: false };
+    const switching = describePlan({ ...aws, plan: { vcpu: 8, memoryGB: 32, status: 'being_prepared', current: 'std-2', selected: 'cmp-8', transition: t } });
+    push('being_prepared: "Switching to" the target; "Now" in the hint, never in one value',
+        switching.value === 'Switching to 8 vCPU / 32 GB' && switching.hint === 'Now: 2 vCPU / 8 GB.' && ! /2 vCPU/.test(switching.value), JSON.stringify(switching));
+    const restart = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'being_prepared', current: 'std-2', transition: { ...t, kind: 'restart', target: 'std-2' } } });
+    push('being_prepared by a restart says so', restart.value === 'Restarting your computer');
+    const failed = describePlan({ ...aws, plan: { vcpu: 8, memoryGB: 32, status: 'failed', reason: 'capacity_unavailable', current: 'std-2', transition: { ...t, phase: 'failed', revertAvailable: true } } });
+    push('failed switch: names the target and the size the computer is on, files safe',
+        failed.value === "Switch to 8 vCPU / 32 GB didn't finish" && failed.hint === 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.', JSON.stringify(failed));
+    // HF3: the placement's size (p.current) wins over the transition's pre-switch size.
+    const ft = { ...t, current: 'std-2', target: 'cmp-4', phase: 'failed', revertAvailable: true };
+    const placed = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'size_not_applied', current: 'cmp-8', transition: ft } });
+    push('failed switch: names p.current, not the transition\'s pre-switch size',
+        placed.value === "Switch to 4 vCPU / 16 GB didn't finish" && placed.hint.startsWith('Your computer is on 8 vCPU / 32 GB.') && ! /back on|2 vCPU/.test(placed.value + placed.hint), JSON.stringify(placed));
+    const fallback = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'wake_timeout', current: null, transition: ft } });
+    push('failed switch: without p.current, falls back to the transition\'s size', fallback.hint === 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.', JSON.stringify(fallback));
+    const unknown = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', current: 'mystery', transition: { ...ft, current: 'mystery', target: 'mystery' } } });
+    push('failed switch: unknown sizes are not guessed', unknown.value === "Switch didn't finish" && unknown.hint === 'Your files are safe. Try again from Settings → Computer.', JSON.stringify(unknown));
+    const restartFailed = describePlan({ ...aws, plan: { vcpu: 2, memoryGB: 8, status: 'failed', current: 'std-2', transition: { ...ft, kind: 'restart', target: 'std-2' } } });
+    push('failed restart is not called a switch', restartFailed.value === "Restart didn't finish" && /on 2 vCPU \/ 8 GB/.test(restartFailed.hint), JSON.stringify(restartFailed));
+    const noTransition = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'failed', reason: 'migration_failed', current: 'std-2', transition: null } });
+    push('failed without a transition keeps the preparation line', noTransition.value === '4 vCPU / 16 GB on AWS (India) — preparation failed' && noTransition.hint === 'migration_failed', JSON.stringify(noTransition));
+    // Contract: a recovered switch is plan ready (current = running size) with no transition; a pending choice is "Next start".
+    const recovered = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'cmp-4', selected: 'cmp-4', transition: null } });
+    push('recovered switch: ready on the running size, no failure', recovered.value === '4 vCPU / 16 GB on AWS (India)' && recovered.hint === '', JSON.stringify(recovered));
+    const pendingNext = describePlan({ ...aws, plan: { vcpu: 4, memoryGB: 16, status: 'ready', current: 'std-2', selected: 'cmp-4', transition: null } });
+    push('ready with selected ≠ current still says "Next start"', pendingNext.value === '2 vCPU / 8 GB on AWS (India)' && pendingNext.hint === 'Next start: 4 vCPU / 16 GB.', JSON.stringify(pendingNext));
+    const copy = [failed, placed, fallback, unknown, restartFailed, recovered, pendingNext].map(d => `${d.value} ${d.hint}`).join(' ');
+    push('HF3 failed copy passes the copy guard', scanCopy(copy).length === 0 && ! /back on/i.test(copy), copy);
+}
+push('paused plan explains operations', describePlan({ plan: { vcpu: 2, memoryGB: 8, status: 'blocked', reason: 'AWS paused by operations' } }).hint === 'AWS paused by operations');
 
 // Image
 const imageId = 'EZiL_os-2026.10:abcdef0123456789';
@@ -78,6 +121,33 @@ push('worker http', describeScreenError('UPSTREAM', 'worker_http_502') === 'the 
 push('🔴 unknown upstream text is NOT echoed; only the code', describeScreenError('UPSTREAM', '<html>secret internal 10.0.0.5 trace</html>') === 'upstream');
 push('🔴 a known token\'s detail is not echoed', ! /generation mismatch/.test(describeScreenError('UPSTREAM', 'aws_origin_unavailable: generation mismatch')));
 push('no code, no message → unavailable', describeScreenError(undefined, undefined) === 'unavailable');
+
+// Round 4 (D16): a Free user whose files are still on the AWS computer. "AWS (India)", never the
+// region code or a city; "Plan: Free" only from an explicit server field, never from a missing plan.
+{
+    const held = { provider: 'aws-ec2', providerSource: 'placement', machine: { vcpu: 2, memoryMiB: 8192, instanceType: 'm6i.large', region: 'ap-south-1', source: 'configured' }, lifecycleState: 'STOPPED', usage: null };
+    const running = describeRunningOn(held);
+    push('Round 4: Running on reads "AWS (India) · 2 vCPU / 8 GiB · stopped"', running.value === 'AWS (India) · 2 vCPU / 8 GiB · stopped', running);
+    const shapes = [
+        ['plan.standing', { ...held, plan: { standing: 'files_on_aws' } }],
+        ['info.standing', { ...held, standing: 'files_on_aws' }],
+        ['a Free plan on provider aws', { ...held, plan: { name: 'Free', provider: 'aws' } }],
+        // The exact server shape (STANDING-CONTRACT §4).
+        ['the contract shape', { ...held, plan: { name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, region: 'ap-south-1', status: 'ready', reason: null, outcome: null, current: 'std-2', selected: null, transition: null } }],
+    ];
+    for ( const [name, info] of shapes ) {
+        const plan = describePlan(info);
+        push(`Round 4: files_on_aws via ${name} → "Plan: Free · files kept on this computer"`, plan.value === 'Plan: Free · files kept on this computer'
+            && ! /Not reported|not available/.test(plan.value + plan.hint), plan);
+    }
+    const freeCf = describePlan({ ...cf, plan: { name: 'Free', provider: 'cloudflare', standing: 'free', vcpu: 2, memoryGB: 6, region: null, status: 'ready', reason: null, outcome: null, current: 'free-cf', selected: null, transition: null } });
+    push('Round 4: Free on Cloudflare names the plan and its computer', freeCf.value === 'Plan: Free · 2 vCPU / 6 GB on Cloudflare', freeCf);
+    push('Round 4: 🔴 no plan field is still "Not reported", never a guessed Free', describePlan(held).value === 'Not reported');
+    push('Round 4: an unknown standing value is ignored', standingOf({ standing: 'moved' }) === null && describePlan({ ...held, standing: 'moved' }).value === 'Not reported');
+    push('Round 4: a paid standing keeps the paid plan line', describePlan({ ...held, plan: { standing: 'paid', vcpu: 2, memoryGB: 8, status: 'ready', current: 'std-2', selected: 'std-2' } }).value === '2 vCPU / 8 GB on AWS (India)');
+    const copy = [running, ...shapes.map(([, info]) => describePlan(info)), freeCf, describeProvider(held)].map(d => `${d.value} ${d.hint}`).join(' ');
+    push('Round 4: copy guard, no region code and no city', scanCopy(copy).length === 0 && ! /ap-south-1|mumbai|moved/i.test(copy), copy);
+}
 
 let failed = 0;
 for ( const r of results ) {
