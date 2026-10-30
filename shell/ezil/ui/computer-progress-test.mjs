@@ -176,6 +176,21 @@ assert.equal(progressView({...opening,stage:'running',active:false},'qa-computer
  assert.equal(progressView({...stopped,stage:'unavailable'},'qa-computer',{openRequested:true}),null,'unavailable stays unobserved');
  // A migration that reports stopped is not an open this tab started.
  assert.equal(progressView({...stopped,operation:'migration'},'qa-computer',{openRequested:true}).title,'Computer stopped');}
+// Round 6 (R3-4): RUNNING with nothing opening is a connect. Its server expectation travels apart
+// (`connectExpected`) so an opening that reaches RUNNING keeps the expectation it always had; the
+// HF3 sentence, the floors and every gate the window's wait reads are unchanged.
+{const running={...base,operation:'none',stage:'running',recordedStage:'running',active:false,durable:false,openingStartedAt:null,path:null,milestones:[],expectedSeconds:30};
+ const v=progressView(running,'qa-computer',{appName:'Code'});
+ assert.equal(v.connect,true);assert.equal(v.connectExpected,30);assert.equal(v.expected,240,'expected keeps its old fallback');
+ assert.equal(v.reached,4);assert.equal(v.serverReady,true);assert.equal(v.activeAws,false);assert.notEqual(v.bar,null);
+ assert.equal(v.body,'Almost there — waiting for Code to connect.','progressView keeps the HF3 sentence; the spinner picks the connect copy');
+ assert.equal(progressView({...running,expectedSeconds:null},'qa-computer').connectExpected,null,'an older server sends none');
+ for(const [over,why] of [[{operation:'opening'},'an opening at desktop_ready'],[{stage:'stopped'},'stopped'],[{stage:'starting'},'starting'],
+  [{operation:'migration'},'a migration'],[{paused:true},'paused'],[{needsOperator:true},'needs_operator'],[{stage:'ready'},'a pool stage']]) {
+  const value=progressView({...running,...over},'qa-computer');
+  assert.equal(value?.connect??false,false,why);assert.equal(value?.connectExpected??null,null,why);
+ }
+ assert.equal(progressView({...running,operation:'opening'},'qa-computer').expected,30,'an opening keeps its own expectedSeconds');}
 
 // ── The bar: pure, monotonic, shared by every tab ──────────────────────────
 assert.equal(openingFraction({ready:true}),1);
