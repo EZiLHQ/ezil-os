@@ -101,6 +101,7 @@ import { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
+import { createFullView, is_minimized } from '../ui/full-view.js';
 import {
     computeFitBox,
     createScreenController,
@@ -215,22 +216,15 @@ const FOCUS_APPS = [
     },
 ];
 
-/** `data-is_minimized` is written as 1/0 at creation and true/false later. */
-function is_minimized (el) {
-    const v = $(el).attr('data-is_minimized');
-    return v === '1' || v === 'true';
-}
-
-/**
- * The class that says "this window currently owns the viewport".
- *
- * It is EZiL's own, deliberately NOT `data-is_fullpage`: upstream's
- * `exit_fullpage_mode` REMOVES that attribute, so it cannot answer "is this
- * window full-bleed right now" across a minimise. `ezil-shell.css` keys the
- * control drawer's visibility off this class, and `go_fullbleed` /
- * `minimise_to_taskbar` are the only two places that write it.
- */
-const FULLBLEED_CLASS = 'ezil-fullbleed';
+// The class that says "this window currently owns the viewport" is
+// `ezil-fullbleed` (`FULL_VIEW_CLASS`). It is EZiL's own, deliberately NOT
+// `data-is_fullpage`: upstream's `exit_fullpage_mode` REMOVES that attribute,
+// so it cannot answer "is this window full-bleed right now" across a minimise.
+// `ezil-shell.css` keys the control drawer's visibility off it. MODIFIED
+// 2026-10-30 (app-code lane A2): the mechanism that writes it — and
+// `is_minimized` — moved to `../ui/full-view.js`, shared with the Code window;
+// this window's `go_fullbleed` / `minimise_to_taskbar` are still the only two
+// callers here.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE STREAM'S SHAPE, AND WHAT THIS FILE CAN AND CANNOT DO ABOUT IT
@@ -872,17 +866,19 @@ export async function openDesktopWindow (ctx = {}) {
     let own_open = null;
     let disposed = false;
     /**
-     * Set once the desktop has actually been shown. It is the DESIRE, not the
-     * state — a minimise clears the full-bleed geometry but not this, which is
-     * how a restore knows to go back to full-bleed instead of a 560x400 box.
+     * The shared full-view mechanism (`../ui/full-view.js`). Two of its fields
+     * are the two flags this window used to keep itself:
+     *
+     *   `full_view.wants` — set once the desktop has actually been shown. It is
+     *     the DESIRE, not the state — a minimise clears the full-bleed geometry
+     *     but not this, which is how a restore knows to go back to full-bleed
+     *     instead of a 560x400 box.
+     *   `full_view.allowed` — cleared (`forbid()`) if the control drawer fails
+     *     to attach. Full-bleed hides the taskbar and the window head, so
+     *     without the drawer there would be no way out of the window at all —
+     *     better to stay windowed forever.
      */
-    let wants_fullbleed = false;
-    /**
-     * Cleared if the control drawer fails to attach. Full-bleed hides the
-     * taskbar and the window head, so without the drawer there would be no way
-     * out of the window at all — better to stay windowed forever.
-     */
-    let may_fullbleed = true;
+    const full_view = createFullView(el_window);
     /**
      * Repaints the panel from the CURRENT attempt's clock and observations.
      * Assigned by `start_boot`, which owns both; held out here so the display
@@ -1108,7 +1104,10 @@ export async function openDesktopWindow (ctx = {}) {
         telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: why });
         void start_boot();
     }
-    // Settings → Troubleshoot → Restart desktop announces a completed restart.
+    // A completed desktop restart is announced with `ezil:desktop-restarted`.
+    // Settings → Troubleshoot → Restart desktop, its only sender, was removed
+    // on 2026-10-30 (app-code lane A2); the listener stays for any caller of
+    // the kept `session.restartDesktop`.
     const on_desktop_restarted = (e) => {
         if ( disposed || e?.detail?.computerId !== computer.id ) return;
         reopen_on_new_runtime('desktop_restarted');
@@ -1251,29 +1250,21 @@ export async function openDesktopWindow (ctx = {}) {
      *
      * Deliberately does nothing while the window is minimised: the user went
      * somewhere else and must not have the viewport yanked out from under
-     * them. `wants_fullbleed` remembers, and the restore observer below
+     * them. `full_view.wants` remembers, and the restore observer below
      * finishes the job when they come back.
+     *
+     * The DOM work is `full_view.enter()` (`../ui/full-view.js`): the class,
+     * `enter_fullpage_mode`, `data-is_fullpage="1"` (which `$.fn.close` reads
+     * to decide whether it owes the user a taskbar back), `focusWindow()` (🔴
+     * `style.css` gives `.window-app-iframe` `pointer-events: none` until the
+     * window is active — a user who clicked the wallpaper during the boot would
+     * otherwise get a desktop that renders perfectly and ignores every click),
+     * and the drawer's intro flash, since the drawer is now the only chrome on
+     * screen. Same writes, same order, as when they lived here.
      */
     function go_fullbleed (why) {
         if ( disposed ) return;
-        wants_fullbleed = true;
-        if ( ! may_fullbleed ) return;
-        if ( is_minimized(el_window) ) return;
-        if ( el_window.classList.contains(FULLBLEED_CLASS) ) return;
-
-        el_window.classList.add(FULLBLEED_CLASS);
-        window.enter_fullpage_mode(el_window);
-        // `$.fn.close` reads this to decide whether it owes the user a taskbar
-        // back (UIWindow.js:3641). It is '0' until now, because until now the
-        // taskbar was never hidden.
-        $(el_window).attr('data-is_fullpage', '1');
-        // 🔴 `style.css` gives `.window-app-iframe` `pointer-events: none` and
-        // only `.window-active .window-app-iframe` gets them back. A user who
-        // clicked the wallpaper during the boot would otherwise get a desktop
-        // that renders perfectly and ignores every click.
-        $(el_window).focusWindow();
-        // The drawer is now the only chrome on screen; let it introduce itself.
-        el_window._ezil_drawer_flash?.();
+        if ( ! full_view.enter() ) return;
         console.info(`[${PHASE}] full-bleed (${why})`);
     }
 
@@ -2080,19 +2071,15 @@ export async function openDesktopWindow (ctx = {}) {
      * intact (`reset_window_size_and_position` consumes it), so a later close
      * still restores the pre-full-bleed geometry correctly.
      */
-    function minimise_to_taskbar (el) {
-        // Guarded, because this handler is now reachable from a window that
-        // never went full-bleed (the drawer exists from the moment the window
-        // does). The fullpage exit on a windowed window would re-show a head
-        // that was never hidden.
-        if ( el.classList.contains(FULLBLEED_CLASS) ) {
-            // The class comes off so the restore observer's `go_fullbleed` is
-            // not turned away by its own already-full-bleed early return; that
-            // call is what puts the chrome back.
-            el.classList.remove(FULLBLEED_CLASS);
-            window.exit_fullpage_chrome(el);
-        }
-        $(el).hideWindow();
+    function minimise_to_taskbar () {
+        // `full_view.minimise()` (`../ui/full-view.js`) is the body this
+        // function used to have: guarded, because this handler is reachable
+        // from a window that never went full-bleed (the drawer exists from the
+        // moment the window does), so a windowed window only hides; a
+        // full-bleed one drops the class (so the restore observer's
+        // `go_fullbleed` is not turned away by its own already-full-bleed early
+        // return) and calls `exit_fullpage_chrome` before `hideWindow`.
+        full_view.minimise();
     }
 
     // ── the two window-control hooks ───────────────────────────────────────
@@ -2142,13 +2129,11 @@ export async function openDesktopWindow (ctx = {}) {
     // so watch the attribute it writes — which keeps this entirely inside EZiL
     // code and leaves the whole-file UIWindow.js port untouched.
     //
-    // 🔴 Gated on `wants_fullbleed`. A window minimised WHILE IT IS STILL
+    // 🔴 Gated on `full_view.wants`. A window minimised WHILE IT IS STILL
     // BOOTING was never full-bleed, and restoring it must not hide the taskbar
     // to show a progress panel.
-    let was_minimized = is_minimized(el_window);
-    const observer = new MutationObserver(() => {
-        const now_minimized = is_minimized(el_window);
-        if ( was_minimized && ! now_minimized && wants_fullbleed ) {
+    const observer = full_view.watch_restore(() => {
+        if ( full_view.wants ) {
             // After showWindow's 0.2s geometry transition, so the window
             // grows back to full-bleed instead of jumping. `go_fullbleed`
             // re-checks `disposed` and the minimised state itself, and
@@ -2178,9 +2163,7 @@ export async function openDesktopWindow (ctx = {}) {
             // than a guess.
             reconcile_screen('restored from the taskbar');
         }
-        was_minimized = now_minimized;
     });
-    observer.observe(el_window, { attributes: true, attributeFilter: ['data-is_minimized'] });
 
     // ── app switching wiring ─────────────────────────────────────────────────
     // See the constants block above for the feature-detection rule. Only
@@ -2280,7 +2263,7 @@ export async function openDesktopWindow (ctx = {}) {
         telemetry.capture({
             eventClass: 'window_error', site: 'ezil-os:apps/desktop#drawer', code: 'drawer_attach_failed',
         });
-        may_fullbleed = false;
+        full_view.forbid();
     }
 
     /**
@@ -2432,6 +2415,10 @@ export async function openDesktopWindow (ctx = {}) {
     // `$.fn.close` awaits this before it dismantles anything, so it is the one
     // place guaranteed to run exactly once per close.
     el_window.on_before_exit = async () => {
+        // Closing while ANOTHER window (Code, since 2026-10-30) is in full
+        // view must not give the taskbar back over it. A no-op whenever this
+        // is the only full window, i.e. in every state that existed before.
+        full_view.prepare_close();
         // Release BEFORE tearing down, so the request is issued while
         // everything it needs still exists — and NOT awaited, so a slow or
         // dead network cannot delay the close by one frame. See

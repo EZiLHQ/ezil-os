@@ -553,24 +553,30 @@ await check('Confirm: the sheet styles use tokens only (accent primary, dark sur
 });
 
 // ── Troubleshoot, System, Feedback ──────────────────────────────────────────
+// App-code lane A2 (2026-10-30): "Restart desktop" was removed from
+// Troubleshoot, and with it its duration sentence and its confirm sheet. Each
+// absence below is paired with the Restart computer control that must remain.
 const RESTART = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
-await check('Troubleshoot: the Restart copy is one sentence, identical in both places', () => {
+await check('Troubleshoot: Restart desktop is gone — no heading, copy, duration, sheet or [data-action="restart"]', () => {
     const src = read('tabs/troubleshoot.js');
-    // Either the sentence is written twice, or it is one constant interpolated into both places.
-    const named = src.match(/const (\w+) = '([^']+)';/g)?.map(line => line.match(/const (\w+) = '([^']+)';/)).find(m => m[2] === RESTART)?.[1];
-    const uses = named ? src.split('${' + named + '}').length - 1 : src.split(RESTART).length - 1;
-    assert.equal(uses, 2, 'the sentence appears in the description and in the restarting status');
-    if ( named ) {
-        assert.match(src, new RegExp(`Restart desktop</h3><p class="ezil-settings-muted">[^<]*\\$\\{${named}\\}</p>`), 'description');
-        assert.match(src, new RegExp(`statusHtml = \`<p class="ezil-settings-muted">\\$\\{${named}\\}</p>\``), 'restarting status');
-    }
+    assert.doesNotMatch(src, /Restart desktop<\/h3>|'Restart desktop'|Restart this desktop\?/, 'no Restart desktop heading, label or sheet title');
+    assert.doesNotMatch(src, /data-action="restart"/, 'no [data-action="restart"] button');
+    assert.doesNotMatch(src, /RESTART_DESKTOP_TIME/, 'no Restart desktop duration constant');
+    assert.ok(! src.includes(RESTART), 'the Restart desktop duration sentence is gone');
+    assert.doesNotMatch(src, /sheet: 'confirm-restart'[,\s]/, 'no Restart desktop confirm sheet');
+    // Code only: the header and `reasonCopy`'s doc still NAME the kept session API.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    assert.doesNotMatch(code, /handleRestart\s*\(|confirmRestart\s*\(|session\.restartDesktop\s*\(/, 'no Restart desktop handler or call');
+    // Positive control: the same file still renders and wires Restart computer.
+    assert.match(src, /<h3>Restart computer<\/h3>/);
+    assert.match(src, /data-action="restart-computer"/);
+    assert.match(src, /\.on\('click', '\[data-action="restart-computer"\]', \(\) => \{ void handleRestartComputer\(\$win\); \}\)/);
+    assert.match(src, /scope: 'computer'/);
     assert.doesNotMatch(src, /About 20 seconds/);
-    assert.deepEqual(scanCopy(RESTART), []);
 });
-await check('Troubleshoot: both Restart confirmations are the sheet frame, never the legacy UIAlert', () => {
+await check('Troubleshoot: the Restart computer confirmation is the sheet frame, never the legacy UIAlert', () => {
     const src = read('tabs/troubleshoot.js');
     assert.ok(! /UIAlert/.test(src), 'no UIAlert in troubleshoot.js');
-    assert.ok(/openConfirmSheet\(\{[^}]*sheet: 'confirm-restart'/.test(src), 'Restart desktop confirms through openConfirmSheet');
     assert.ok(/openConfirmSheet\(\{[^}]*sheet: 'confirm-restart-computer'/.test(src), 'Restart computer confirms through openConfirmSheet');
 });
 globalThis.__dSystemSession = { currentComputer: () => me, payload: () => null, getScreen: async () => ({ ok: false }), getSystemInfo: async () => ({ ok: false, code: 'UPSTREAM' }) };

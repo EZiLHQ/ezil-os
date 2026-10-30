@@ -458,8 +458,20 @@ clickTab('troubleshoot');
 await settle(4);
 const troubleshoot = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
 push('Troubleshoot pane becomes active', troubleshoot?.classList.contains('active'));
-let restartBtn = troubleshoot?.querySelector('[data-action="restart"]');
-push('🔴 restart is DISABLED when the server has not published the route',
+// 🔴 App-code lane A2 (2026-10-30): "Restart desktop" is gone from Troubleshoot —
+// heading, copy, button and its handler. Each negative is paired with a positive
+// control on the SAME pane, so an empty or unrendered pane cannot pass them.
+{
+    const text = troubleshoot?.textContent ?? '';
+    push('🔴 Troubleshoot no longer offers "Restart desktop" (no text, no [data-action="restart"])',
+        ! /Restart desktop/i.test(text) && ! troubleshoot?.querySelector('[data-action="restart"]')
+        && ! /Restart this desktop/i.test(text),
+        JSON.stringify([...(troubleshoot?.querySelectorAll('[data-action]') ?? [])].map(b => b.dataset.action)));
+    push('…positive control: the same pane still renders "Restart computer" and its button',
+        /Restart computer/.test(text) && !! troubleshoot?.querySelector('[data-action="restart-computer"]'));
+}
+let restartBtn = troubleshoot?.querySelector('[data-action="restart-computer"]');
+push('🔴 Restart computer is DISABLED when the server has not published the route',
     !! restartBtn?.disabled, `disabled=${restartBtn?.disabled}`);
 push('🔴 …and says so honestly, rather than staying silent or guessing a URL',
     /available in this deployment/i.test(troubleshoot?.textContent ?? ''));
@@ -476,74 +488,33 @@ clickTab('about'); // away…
 await settle(2);
 clickTab('troubleshoot'); // …and back, re-triggering onActivate
 await settle(4);
-restartBtn = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
+restartBtn = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart-computer"]');
 push('🔴 …and flips to ENABLED the moment the route is published — no code change, live feature-detection',
     restartBtn && ! restartBtn.disabled, `disabled=${restartBtn?.disabled}`);
+push('…and even with the route published there is still no Restart desktop control',
+    ! q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]')
+    && ! /Restart desktop/i.test(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? ''));
 {
     // Round 5 (D6): BANNED_COPY is clean on the rendered Troubleshoot pane, not only its constants.
     const text = (q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '').replace(/\s+/g, ' ');
     const banned = scanCopy(text);
     push('D6: the rendered Troubleshoot pane passes scanCopy', text.length > 200 && banned.length === 0, banned.join(', ') || `${text.length} chars`);
 }
-
-// Click it: confirm, then a stubbed 500 (this harness's `fetch` stub has no
-// `/api/shell/restart` case, so it falls through to the generic 500 at the
-// bottom of the stub) must render as `failed`, never as a claimed success.
+// Nothing in Troubleshoot announces a desktop restart any more. The Code and
+// Browser windows keep their `ezil:desktop-restarted` listeners (code-test.mjs
+// section 5b proves Code's still re-mints on a direct dispatch); this records
+// every such event for the rest of this file, which must stay empty.
 const restartEvents = [];
 window.addEventListener('ezil:desktop-restarted', e => restartEvents.push(e.detail));
-click(restartBtn);
-await settle(2);
-// Round 5 (D6): the confirmation is the sheet frame (openConfirmSheet), not the legacy UIAlert.
-const restartSheet = q('[role="dialog"][data-sheet="confirm-restart"]');
-const restartConfirmBtn = restartSheet?.querySelector('[data-action="confirm"]');
-push('restarting asks for confirmation first, in the sheet frame',
-    !! restartConfirmBtn && restartConfirmBtn.textContent.trim() === 'Restart' && !! restartSheet.closest('.ezil-upgrade-backdrop')
-    && q('.window-alert-message') === null, restartSheet?.textContent);
-click(restartConfirmBtn);
-await settle(6);
-push('🔴 a failed restart is reported as failed, never as a claimed success',
-    /something went wrong|couldn.t reach|expired|too long/i.test(
-        q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '',
-    ));
-push('a failed restart tells no window it restarted', restartEvents.length === 0, `${restartEvents.length}`);
-{
-    // A successful restart tells the windows of THAT computer (Code re-mints: on AWS code-server restarts too).
-    const restartedId = q('.window[data-app="desktop"]')?.getAttribute('data-ezil-computer-id');
-    const realFetch = window.fetch;
-    let completeRestart;
-    let restartRequests = 0;
-    window.fetch = async (url, opts) => {
-        if ( ! String(url).includes('/api/shell/restart') ) return realFetch(url, opts);
-        restartRequests++;
-        return new Promise(resolve => { completeRestart = resolve; });
-    };
-    click(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]'));
-    await settle(2);
-    click(q('[role="dialog"][data-sheet="confirm-restart"] [data-action="confirm"]'));
-    await settle(6);
-    push('a pending AWS restart shows Restarting and sends no completion event',
-        restartRequests === 1 && restartEvents.length === 0
-        && /Restarting/.test(q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? ''));
-    const pendingButton = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
-    click(pendingButton);
-    await settle(2);
-    push('restart stays disabled while waiting for the replacement runtime', pendingButton?.disabled && restartRequests === 1);
-    completeRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{"ok":true}' });
-    await settle(6);
-    window.fetch = realFetch;
-    push('🔴 a successful restart notifies the windows of that computer once',
-        restartEvents.length === 1 && !! restartedId && restartEvents[0]?.computerId === restartedId,
-        JSON.stringify({ restartEvents, restartedId }));
-}
 // ── Troubleshoot: Restart computer (round 3, plan §6.6) ──────────────────────
-// A second, clearly different action: stop + start on the same configuration,
+// The one restart Troubleshoot offers: stop + start on the same configuration,
 // followed through the server's transition. Distinct error codes get distinct
 // sentences (never collapsed into "could not be confirmed").
 {
     const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
-    push('Troubleshoot offers two different restarts with their own descriptions',
-        !! ts()?.querySelector('[data-action="restart"]') && !! ts()?.querySelector('[data-action="restart-computer"]')
-        && /Restarts the desktop and its apps on this machine\. Files stay\. Restarting usually takes about 45 seconds and can take up to 3 minutes\./.test(ts()?.textContent ?? '')
+    push('Troubleshoot offers Restart computer with its own description, and only that restart',
+        ! ts()?.querySelector('[data-action="restart"]') && !! ts()?.querySelector('[data-action="restart-computer"]')
+        && ! /Restarts the desktop and its apps/.test(ts()?.textContent ?? '')
         && /Stops your computer and starts it again\. Files stay\. 1–4 minutes\./.test(ts()?.textContent ?? ''));
     const realFetch = window.fetch;
     const bodies = [];
@@ -580,12 +551,14 @@ push('a failed restart tells no window it restarted', restartEvents.length === 0
     answer = { ok: true, transitionId: 'tr-1', path: 'restart', size: 'std-2' };
     transition = { transitionId: 'tr-1', kind: 'restart', current: 'std-2', target: 'std-2', phase: 'stopping', reason: null, revertAvailable: false };
     await restartComputer();
-    push('an accepted restart shows the in-progress state and disables both restarts',
-        /Restarting your computer/.test(ts()?.textContent ?? '') && ts()?.querySelector('[data-action="restart-computer"]')?.disabled
-        && ts()?.querySelector('[data-action="restart"]')?.disabled);
+    push('an accepted restart shows the in-progress state and disables Restart computer',
+        /Restarting your computer/.test(ts()?.textContent ?? '') && ts()?.querySelector('[data-action="restart-computer"]')?.disabled);
     transition = { ...transition, phase: 'done' };
     await settle(95, 40);
     push('the server\'s done transition shows the result', /Your computer restarted/.test(ts()?.textContent ?? ''), ts()?.querySelector('[data-role="restart-computer-status"]')?.textContent);
+    push('🔴 Restart computer only ever posts scope "computer" and announces no desktop restart',
+        bodies.length === 3 && bodies.every(b => b.scope === 'computer') && restartEvents.length === 0,
+        JSON.stringify({ scopes: bodies.map(b => b.scope), restartEvents }));
     window.fetch = realFetch;
 }
 // ── Troubleshoot tab (diagnostic log) ────────────────────────────────────────

@@ -14,6 +14,9 @@
 //     inside the full-bleed control strip, clear of the drawer and of every
 //     window's traffic lights;
 //   - minimising or closing the last app window hides it again;
+//   - Code in full view (app-code lane A2, 2026-10-30): the icon keeps its
+//     corner of the same strip, right of the compact top bar's minimise /
+//     restore / close, which never sit under it;
 //   - clicking it opens the real dialog: native <dialog> focus, the exact
 //     request bytes and header, refusals, the draft, and Chromium's own offline
 //     emulation followed by its `online` event.
@@ -118,6 +121,8 @@ try {
                 if ( url.searchParams.get('confirm') === 'display' ) return json({ ok: true, display: 'live' });
                 if ( url.pathname === ENDPOINTS.desktop ) return json(request.method() === 'POST'
                     ? { ok: true, guacamoleUrl: `${origin}/frame?desktop=1`, frame: { confirmed: true } } : { ok: true, guacamoleRunning: true });
+                // The Code window's mint (its default route; not in ENDPOINTS).
+                if ( url.pathname === '/api/shell/code-preview-url' ) return json({ ok: true, codePreviewUrl: `${origin}/frame?code=1` });
                 return json({ ok: true });
             }
             return route.fulfill({ status: 404, body: '' });
@@ -152,6 +157,8 @@ try {
                 ...[...w.querySelectorAll(':scope > .window-head > .window-action-btn')].map(rect)
                     .map(r => ({ x: r.x - 6, y: r.y - 6, width: r.width + 12, height: r.height + 12 })),
                 ...[...w.querySelectorAll('.ezil-app-drawer, .ezil-app-drawer button')].map(rect),
+                // Code's full-view top bar (lane A2): its own window controls.
+                ...[...w.querySelectorAll(':scope > .ezil-full-view-bar button')].map(rect),
             ]).filter(r => r.width > 0 && r.height > 0);
             const strip = document.querySelector('.window.ezil-fullbleed');
             return { box, disc: rect(icon.querySelector('svg')), hitIsIcon: hit?.closest('button') === icon, controls,
@@ -290,6 +297,24 @@ try {
             }
             await page.locator('.window[data-app="settings"] > .window-head > .window-close-btn').click();
             await page.waitForSelector('.window[data-app="settings"]', { state: 'detached' });
+            await chip.waitFor({ state: 'hidden' });
+        });
+
+        await check(`${tag}: Code in full view (the /app/code route) shows one tiny icon in its strip, right of and clear of the top bar's controls; closing Code hides it`, async () => {
+            await page.evaluate(async () => {
+                const p = window.__EZIL_BOOT__;
+                await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
+            });
+            await page.waitForSelector('.window[data-app="code"].ezil-fullbleed .ezil-full-view-bar button[data-action="close"]', { state: 'visible' });
+            const m = await assertTiny('Code full view');
+            assert.ok(m.strip > 0 && m.box.y >= 0 && m.box.y + m.box.height <= m.strip, `inside the ${m.strip}px strip (${JSON.stringify(m.box)})`);
+            const bar = await page.evaluate(() => [...document.querySelectorAll('.window[data-app="code"] > .ezil-full-view-bar button')]
+                .map(b => { const r = b.getBoundingClientRect(); return { action: b.dataset.action, x: r.x, w: r.width }; }));
+            assert.deepEqual(bar.map(b => b.action), ['minimize', 'restore', 'close'], 'the bar\'s three controls are on screen');
+            assert.ok(bar.every(b => b.x + b.w <= m.box.x), `every control ends left of the icon (${JSON.stringify({ bar, icon: m.box })})`);
+            assert.ok(m.controls.length >= 3, 'the bar\'s controls were part of the overlap check');
+            await page.locator('.window[data-app="code"] > .ezil-full-view-bar button[data-action="close"]').click();
+            await page.waitForSelector('.window[data-app="code"]', { state: 'detached' });
             await chip.waitFor({ state: 'hidden' });
         });
 

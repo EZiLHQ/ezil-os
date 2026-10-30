@@ -499,11 +499,19 @@ body.device-phone {
  * that are already there, and it spends the tongue's discoverability on a
  * moment nobody needs it.
  *
- * `.ezil-fullbleed` is written by `go_fullbleed` / `minimise_to_taskbar` in
- * shell/ezil/apps/desktop-window.js — NOT `data-is_fullpage`, which upstream's
- * `exit_fullpage_mode` removes. Specificity (0,3,0) and source order both beat
- * `dashboard.css`'s `.dashboard-app-drawer`. */
-.ezil-desktop-window:not(.ezil-fullbleed) .ezil-app-drawer {
+ * `.ezil-fullbleed` is written by `../ui/full-view.js` (for the Browser via
+ * `go_fullbleed` / `minimise_to_taskbar` in shell/ezil/apps/desktop-window.js)
+ * — NOT `data-is_fullpage`, which upstream's `exit_fullpage_mode` removes.
+ * Specificity (0,3,0) and source order both beat `dashboard.css`'s
+ * `.dashboard-app-drawer`.
+ *
+ * MODIFIED 2026-10-30 (app-code lane A2): every full-view rule from here to the
+ * resize-handle rule below was keyed on `.ezil-desktop-window`. The Code window
+ * now has a full view too, so they key on `.ezil-full-view-host`, which
+ * `createFullView()` puts on every window that can go full view (Browser and
+ * Code). Same specificity, same source position: the Browser's cascade is
+ * unchanged. */
+.ezil-full-view-host:not(.ezil-fullbleed) .ezil-app-drawer {
     display: none;
 }
 
@@ -511,21 +519,21 @@ body.device-phone {
  * expanded drawer and the collapsed tongue's hit pad stay above the stream,
  * so Chrome's address bar remains tappable and the exit stays reachable.
  * The stream fitting code already observes the window body when it resizes. */
-.ezil-desktop-window.ezil-fullbleed {
+.ezil-full-view-host.ezil-fullbleed {
     /* The drawer's content height plus its 1px visible border. */
     --ezil-control-strip-height: 43px;
     background-color: #11151f;
 }
 @media (pointer: coarse) {
-    .ezil-desktop-window.ezil-fullbleed {
+    .ezil-full-view-host.ezil-fullbleed {
         --ezil-control-strip-height: 59px;
     }
 }
-.ezil-desktop-window.ezil-fullbleed > .window-body.window-body-app {
+.ezil-full-view-host.ezil-fullbleed > .window-body.window-body-app {
     top: var(--ezil-control-strip-height);
     height: calc(100% - var(--ezil-control-strip-height)) !important;
 }
-.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer {
+.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer {
     --safe-top: 0px;
     top: 0;
     bottom: auto;
@@ -535,14 +543,14 @@ body.device-phone {
     transition: top 0.3s ease, width 0.45s cubic-bezier(0.34, 1.2, 0.4, 1),
         height 0.45s cubic-bezier(0.34, 1.2, 0.4, 1), border-radius 0.45s ease, opacity 0.2s ease;
 }
-.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer.collapsed {
+.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer.collapsed {
     top: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2);
     border-radius: 12px;
     border: 1px solid rgba(255, 255, 255, 0.22);
     transition: top 0.3s ease, width 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
         height 0.3s cubic-bezier(0.5, 0.05, 0.25, 1), border-radius 0.3s ease, opacity 0.2s ease 0.08s;
 }
-.ezil-desktop-window.ezil-fullbleed .dashboard-app-drawer-toggle::after {
+.ezil-full-view-host.ezil-fullbleed .dashboard-app-drawer-toggle::after {
     /* Keep the drawer's invisible hit pad inside the top control strip. */
     bottom: 0;
 }
@@ -560,8 +568,163 @@ body.device-phone {
  * `pointer-events: none` and reduced opacity — which would dim the desktop and
  * swallow every click into it. Hiding the handle elements removes the only
  * thing resizable binds to and touches nothing else. */
-.ezil-desktop-window.ezil-fullbleed > .ui-resizable-handle {
+.ezil-full-view-host.ezil-fullbleed > .ui-resizable-handle {
     display: none;
+}
+
+/* ── Code in full view: the compact top bar ("notch") ─────────────────────
+ * App-code lane A2, 2026-10-30. 🔴 PROVISIONAL VISUALS: no reference
+ * screenshots were available; every number below is recorded in
+ * docs/APP-CODE-FULL-VIEW.md and is to be refined after a pixel review.
+ *
+ * The bar sits in the same control strip as the Browser's
+ * (`--ezil-control-strip-height`, 43px / 59px coarse, set by the shared rule
+ * above), so the small Feedback icon's fixed full-bleed position
+ * (feedback.css: `top: 9.5px` / `7.5px`, right edge) is centred in it with no
+ * Code-specific rule. Left: the control drawer, moved from the strip's centre
+ * to its left edge. Middle: the title. Right: minimise / restore / close,
+ * ending `--ezil-fv-chip-reserve` short of the edge so they never sit under the
+ * Feedback icon (24px at right 6px; 44px at right 0 under `pointer: coarse`).
+ *
+ * Specificity: `.ezil-code-window.ezil-fullbleed > …` is (0,3,0) against the
+ * shared `.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer` (0,3,0), and
+ * comes later — so only the drawer's horizontal placement changes for Code. */
+.ezil-code-window > .ezil-full-view-bar {
+    display: none;
+}
+.ezil-code-window.ezil-fullbleed {
+    --ezil-fv-chip-reserve: 40px;
+    --ezil-fv-btn: 28px;
+    --ezil-fv-side: 150px;
+}
+@media (pointer: coarse) {
+    .ezil-code-window.ezil-fullbleed {
+        --ezil-fv-chip-reserve: 50px;
+        --ezil-fv-btn: 44px;
+        --ezil-fv-side: 200px;
+    }
+}
+.ezil-code-window.ezil-fullbleed > .ezil-full-view-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--ezil-control-strip-height);
+    /* Below the drawer (600), so an expanded drawer covers the title, and
+       above the window body, which starts under the strip anyway. */
+    z-index: 550;
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 0 var(--ezil-fv-chip-reserve) 0 78px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--color-offwhite, #f5f5f4);
+    -webkit-user-select: none;
+    user-select: none;
+}
+.ezil-code-window.ezil-fullbleed > .ezil-app-drawer {
+    left: 8px;
+    transform: none;
+}
+.ezil-full-view-title {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    max-width: calc(100% - 2 * var(--ezil-fv-side));
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.2;
+    opacity: 0.86;
+}
+.ezil-full-view-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+.ezil-full-view-btn {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--ezil-fv-btn);
+    height: var(--ezil-fv-btn);
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    opacity: 0.8;
+    cursor: pointer;
+}
+.ezil-full-view-btn svg {
+    width: 16px;
+    height: 16px;
+}
+.ezil-full-view-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    opacity: 1;
+}
+.ezil-full-view-btn:focus-visible {
+    outline: 2px solid var(--ezil-accent, #00adb5);
+    outline-offset: 2px;
+    opacity: 1;
+}
+
+/* ── Code: "Reconnecting…" / "Computer stopped" ───────────────────────────
+ * App-code lane A2. Covers the editor frame (and the opening surface, z 2)
+ * while the shell knows the computer is not there. Hidden with `hidden` and
+ * the `[hidden]` rule below — never an inline `display` (see the
+ * "not available" panels above for why). Provisional visuals, as above. */
+.ezil-code-state {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+    background: var(--color-charcoal, #161616);
+    color: var(--color-offwhite, #f5f5f4);
+}
+.ezil-code-state[hidden],
+.ezil-code-state-start[hidden] {
+    display: none;
+}
+.ezil-code-state-title {
+    font-size: 15px;
+    font-weight: 600;
+}
+.ezil-code-state-body {
+    font-size: 13px;
+    max-width: 34em;
+    opacity: 0.75;
+}
+.ezil-code-state-start {
+    margin-top: 4px;
+    padding: 7px 18px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--ezil-accent-contrast);
+    background: var(--ezil-accent);
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+    min-height: 34px;
+}
+.ezil-code-state-start:hover {
+    background: var(--ezil-accent-strong);
+}
+.ezil-code-state-start:focus-visible {
+    outline: 2px solid var(--ezil-accent);
+    outline-offset: 2px;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
