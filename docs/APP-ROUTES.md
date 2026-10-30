@@ -43,8 +43,9 @@ registry today.
 - **Billing deep links keep working.** `/os?settings=billing&upgrade=<tier>`
   (the pricing page, the in-app Billing links) and
   `/app/settings?tab=billing&upgrade=<tier>` both open Settings → Billing
-  with the upgrade sheet; afterwards `upgrade` (and `section=ai-credits`) are
-  dropped and the URL becomes `/app/settings?tab=billing…`.
+  with the upgrade sheet. `upgrade` is dropped before Settings opens and
+  `section=ai-credits` after it, and the URL becomes
+  `/app/settings?tab=billing…` (§5 "Order", one-shot keys).
 - **Hosts that serve only `/os` are never rewritten.** The native Mac host
   (`provider: 'native-macos'`, which also refuses any query string) and the
   local runtime (`provider: 'local-vm'`) serve the shell at `/os` alone.
@@ -139,12 +140,12 @@ nothing sets.)
 
 | Event | Effect |
 |---|---|
-| A user's click launches an app (dock, Start, App Store, Settings drawer, Settings → open a computer, spinner's "Settings") | **push** `/app/<id>` **before** the window is built; nothing if the address bar already names that app (its URL is rewritten in place only if the launch changed the app's own parameters, e.g. Settings opened at another tab). If the app does not open, the previous URL and state are put back (the extra entry stays, as a duplicate). A launch that resolves after a newer intent writes nothing ("Order" below). |
+| A user's click launches an app (dock, Start, App Store, Settings drawer, Settings → open a computer, spinner's "Settings") | **push** `/app/<id>` **before** the window is built; nothing if the address bar already names that app (its URL is rewritten in place only if the launch changed the app's own parameters, e.g. Settings opened at another tab). If the app does not open, the previous URL and state are put back (the extra entry stays, as a duplicate). A launch that resolves after a newer intent took the entry writes nothing for it ("Order" below). |
 | Focus moves to another app's window | **replace** with that app's URL |
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
 | Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
-| Boot with a link | **replace** (canonicalise) before launching; the billing link after its launch. Either launch is numbered ("Order" below). |
+| Boot with a link | **replace** (canonicalise) before launching; the billing link after its launch, its `upgrade` key already gone before it. Either launch is numbered ("Order" below). |
 
 Why the push happens first: in Chromium a frame navigation is filed under
 the entry that was current when it started. The Code and Browser windows
@@ -158,28 +159,50 @@ Launches resolve out of order: a click on Code, whose window is slow to
 build, then a click on Settings, which opens first. `app-history.js` numbers
 every intent as it happens (one counter per controller, never reset): a
 click's launch (`begin`), Back/Forward (whatever entry it lands on, `/os`
-included), a route launch the boot starts (`route`), the close of an app
-window, and a focus it writes for. A click, Back/Forward or boot route is
-also the latest **launch** intent. The intent that
-decides is the latest one, unless the latest launch failed ("gives back",
-below).
+included), a route launch the boot starts (`route`), and a close or a focus
+it writes for. A click, Back/Forward or boot route is also a **launch**
+intent.
 
-| Pending | When it resolves it writes | only if, since it began, there was no newer |
+**What a pending launch may still write is decided by the entry's owner,
+not by the latest number.** The current entry belongs to the intent that
+last **took** it: wrote it (a click's push, or its replace in place when the
+app's own parameters changed; a close or a focus that renamed it) or moved
+to another entry (Back/Forward). An intent that wrote nothing took nothing:
+a click on the app the entry already names, at the same parameters (while
+that app's launch is still opening, it coalesces with it and shares its
+window), a close behind the front window, the boot's `route` itself. A
+pending launch keeps the owner it began under (its own click, if it took the
+entry; else the owner it found) and writes for the entry only while that
+owner still holds it. Its own late write (`end`, `commit`, `adopt`) takes
+nothing. A failed click gives the entry back to the owner before it. (Until
+2026-10-30, `commit` and `adopt` stood down once any newer intent had been
+numbered. A click on Settings itself, made while the billing link opened
+Settings, wrote nothing, yet it left the boot's entry uncanonicalised with
+`upgrade` on it, and a reload reopened the upgrade sheet.)
+
+**Which launch has the front is decided by the newest launch.** The newest
+launch intent decides which launch names its app when it opens, and whose
+window's late focus counts. A newer launch that took nothing still takes the
+front, because its window is shown and re-asserted.
+
+| Pending | When it resolves it writes | only if, since it began |
 |---|---|---|
-| A click's launch that opened a window (`end(el)`) | that app's URL (replace), if the entry does not already name it | click or Back/Forward. A close in between does not stop it: the window that opened is in front. |
-| A click's launch that opened nothing (`end(null)`) | the URL and state it replaced, and gives the address bar back | intent of any kind (a close has already named the front app), other than a newer click's launch that failed and gave it back. The app's own parameters go back only if no later launch has set them. |
-| A Back/Forward launch (`commit`) | the entry's app and parameters, in place | intent of any kind |
-| A launched window's own late focus, until its launch settles | that app's URL (replace) | click or Back/Forward |
+| A click's launch that opened a window (`end(el)`) | that app's URL (replace), if the entry does not already name it | it is still the newest launch (no newer click, Back/Forward or boot route): its window is in front. A close in between does not stop it. A newer click on the same app names the same URL itself. |
+| A click's launch that opened nothing (`end(null)`) | the URL and state it replaced, and gives the address bar back | no newer intent took the entry (a close included: it has already named the front app), and it is still the newest launch. A newer launch that took nothing defers it: that is a click on the same app, which shares its window and outcome. When that launch fails too, the give-back runs with its own. The app's own parameters go back only if no later launch has set them. |
+| A Back/Forward or boot route launch (`commit`), and the billing link's `adopt` after it | the entry's app and parameters, in place (`adopt`: the canonical spelling without the consumed keys) | no newer intent took the entry. A click on the app it opens, at the same parameters, wrote nothing and does not stop it. |
+| A launched window's own late focus, until its launch settles | that app's URL (replace) | it is still the newest launch |
 
-- **A superseded launch writes nothing**: no push, no replace, no rollback,
-  and it is not recorded as a focus either, even when its window ends up in
-  front. The address bar names that window at its next focus that counts.
+- **A launch that stands down writes nothing**: no push, no replace, no
+  rollback, and it is not recorded as a focus either, even when its window
+  ends up in front. The address bar names that window at its next focus
+  that counts.
 - **A failed launch gives back.** A click's launch that fails while it
-  decides is undone: the URL and state it replaced, and the address bar
-  goes back to the intent it took it from. If that is an older click's
-  launch still pending, that launch decides again (its `end`, its window's
-  late focus and its `ensureOnTop` count). If that launch has failed
-  meanwhile, it gives back in turn. So three clicks that end
+  still holds the entry and is the newest launch is undone: the URL and
+  state it replaced, and the address bar goes back to the intent it took
+  it from. If that is an older click's launch still pending, that launch
+  decides again (its `end`, its window's late focus and its `ensureOnTop`
+  count). If that launch has failed meanwhile, it gives back in turn,
+  provided the entry is still the one it held. So three clicks that end
   Settings fails, Code fails, Desktop opens leave `/app/desktop`, and two
   that both fail leave the URL from before them, in either order. A close
   or Back/Forward in between ends the chain: nothing is given back over it.
@@ -199,14 +222,28 @@ below).
   before: the new window focuses itself while it is built, and a late focus
   of another window cannot be told from a click).
 - **The boot's own route launches are numbered too** (`route`): its link
-  and the billing link, as Back/Forward is. A click made while either
-  opens decides: the launch's `commit` writes nothing, and nor does the
-  billing link's `adopt` after it (a click that failed gave the address
-  bar back, and then both write). The billing link's one-shot keys
-  (`upgrade`, `section`) then stay on the boot's entry, as they did
-  before: Back to it shows Settings at Billing (a Settings window opened
-  by it scrolls to the AI credits card), never a checkout or upgrade
-  sheet (`openUpgrade` comes from the boot's own launch alone).
+  and the billing link, as Back/Forward is. A click made while either opens
+  decides if it takes the entry, by pushing or by rewriting it: the
+  launch's `commit` writes nothing, and nor does the billing link's `adopt`
+  after it. A click that failed gave the address bar back, and then both
+  write. A click on the app being opened, such as Settings itself while
+  the billing link opens it, writes nothing, so it takes nothing: the link
+  still canonicalises its own entry to `/app/settings?tab=billing`.
+- **One-shot keys.** The billing link's `upgrade` key opens the checkout
+  or upgrade sheet. It leaves the address bar before the launch
+  (`consume`), whatever happens next. `openUpgrade` travels in the launch
+  ctx, so no entry, the boot's included, keeps the key for a reload to
+  open the sheet again. `section` is different: it is a place on the page,
+  not an action (Billing focuses the AI credits card; no sheet, no
+  request). Billing reads it from the address bar while it opens, in
+  either spelling of the link (`settingsAliasSearch`, b5ca3501), so it
+  stays until `adopt`. A click that takes the boot's entry while Settings
+  opens leaves the entry behind with `section` on it, in the alias
+  spelling (`/os?settings=billing&section=ai-credits`). A reload of that
+  entry, or a Back to it that opens Settings anew, focuses the card again.
+  That is the entry's own meaning, and never a sheet. Carrying `section`
+  in the ctx instead would move Billing's reader for no change in what
+  anyone sees. Unknown keys (`x=1`) stay, as everywhere (§2).
 
 Known limits, not changed here:
 
@@ -231,17 +268,27 @@ Known limits, not changed here:
 - A reopen that coalesces with a launch whose window was closed meanwhile
   (`launchSingle`) resolves with that closed window, so the URL names an app
   with no window open.
+- A plain click on Settings that coalesces with the billing link's launch
+  shows Settings at its default tab (`ezilActivateSettings`). The entry is
+  canonicalised to `tab=billing`, so a reload opens Billing. Base ba36b095
+  behaves the same.
 
 Tests: `app-history-test.mjs` ("order": the coordinator's two cases, three
 launches in every end order with every open/fail outcome, the failure
-cascade spelled out (with a close ending it), late focus,
-close and reopen, closing another window, Back and Forward while a launch
-is pending, overtaken Back launches, the boot's link and billing link
-overtaken by a click, parameters, positive controls) and
-`app-link-test.mjs` (the bundle through `registry.launch`: a slow open, the
-80/120ms focuses run by hand one at a time, a Back launch; the address bar
-and the focused window are checked after each; and through `boot.js`, its
-link and billing link held open while a click lands).
+cascade spelled out (with a close ending it, after both clicks or between
+them), late focus, close and reopen, closing another window, a close that
+renames nothing, Back and Forward while a launch is pending, overtaken Back
+launches, the boot's link and billing link overtaken by a click, a click on
+Settings itself while the billing link opens it, the independent review's
+interleavings N1-N11 wired as `boot.js` calls `route`, `consume`,
+parameters, positive controls) and `app-link-test.mjs` (the bundle through
+`registry.launch`: a slow open, the 80/120ms focuses run by hand one at a
+time, a Back launch; the address bar and the focused window are checked
+after each; and through `boot.js`, its link and billing link held open
+while a click lands: on Code, on Settings itself, or none. The address bar
+Settings' `open` sees has no `upgrade`. With billing on, a reload of the
+entry each race leaves hands Settings no `openUpgrade`, and a fresh link
+hands it exactly once).
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
 `project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
@@ -410,7 +457,8 @@ Closed at integration (branch `feat/os-app-code-20261030`, 2026-10-30):
   opens the card exactly as `/os?settings=billing&section=ai-credits` does
   (`billing-test.mjs`). Billing reads the boot URL: Settings calls
   `onActivate` before its window resolves, and the route's history write
-  comes after that.
+  comes after that. Only `upgrade` leaves the address bar before the launch
+  (§5 "Order", one-shot keys).
 - The stale "`/os` is one URL" comments in `shell/ezil/ui/app-drawer.js` and
   `shell/ezil/ui/Settings/index.js` are corrected.
 - `appearance-browser-test.mjs`'s fixture serves `/app/<id>`, which its
