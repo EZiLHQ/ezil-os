@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
-from ezil_host import agent, cli, config, desktop, enroll, guard, lease, pool
+from ezil_host import agent, cli, config, desktop, enroll, guard, lease, pool, restore
 from ezil_host.fsops import Refused
 
 POOL = {"kind": "pool", "poolHostId": "11111111-1111-4111-8111-111111111111",
@@ -38,6 +38,12 @@ RESTORE = {"kind": "cf-snapshot", "migrationId": "55555555-5555-4555-8555-555555
 RESTORE_CLAIM = dict(CLAIM, fsUuid=FS_UUID, createVolume=True, restore=RESTORE)
 ANSWER = json.dumps({"tunnelToken": "t" * 32, "controlKey": base64.b64encode(b"k" * 32).decode(),
                      "sandboxId": "guac-1111-2222", "zone": "example.test"}).encode()
+
+
+def restore_head(generation, chunks):
+    """A Cloudflare v1 head as the app's restore route serves it (restore._head's shape)."""
+    return {"version": 1, "generation": generation, "sha256": "a" * 64, "entries": chunks,
+            "chunks": [{"size": 1024 * 1024, "sha256": "%064x" % i} for i in range(chunks)]}
 
 
 class Clock:
@@ -781,8 +787,37 @@ class Resume(PoolTest):
                          ("guarding", RESTORE, RESTORE))
         self.guarded.side_effect = None
         pool.run(self.cfg, POOL)
+        # run_guard is mocked: this proves the claim-shaped lease reaches a resumed guard, not that
+        # the real guard accepts it once a restore began (restore.matches needs the heads, so it
+        # refuses restore_head_invalid, exactly as the cold path's same-instance reboot does).
         self.assertEqual(self.guarded.call_args.args[1]["restore"], RESTORE)
         self.assertEqual(pool.read_record(self.cfg)["phase"], "switched")
+
+    def test_fetched_restore_heads_stay_in_the_guards_copy_never_in_the_saved_lease(self):
+        # C3: restore.http_fetch publishes the heads INTO the lease it is given (spec.update). A
+        # 30-chunk workspace head pushes that lease past lease.parse's 3072-byte bound, so a saved
+        # copy would make every later read_record (the overlay step's session_record) refuse
+        # pool_epoch_malformed. The real fetch runs here, against a stubbed restore route.
+        self.patch(pool, "wait_claim", return_value=RESTORE_CLAIM)
+        self.patch(guard, "fs_uuid", return_value=None)
+        self.command.return_value = SimpleNamespace(returncode=2, stdout="")
+        heads = {kind: restore_head(RESTORE["generation"], n) for kind, n in (("workspace", 30), ("system", 2))}
+        self.patch(restore.SnapshotClient, "get", side_effect=lambda path, token, response_limit=None: (
+            200, json.dumps(heads[path.split("/")[-2]]).encode()))
+
+        def guard_with_the_real_fetch(cfg, computer_lease, **kwargs):
+            restore.http_fetch(cfg, restore.SnapshotClient(cfg, computer_lease))
+            return "init"
+        self.guarded.side_effect = guard_with_the_real_fetch
+        pool.run(self.cfg, POOL)
+        fetched = self.guarded.call_args.args[1]["restore"]
+        self.assertEqual((fetched["workspace"], fetched["system"]), (heads["workspace"], heads["system"]),
+                         "the guard's own copy carries the fetched heads")
+        record, saved = pool.read_record(self.cfg), enroll.load_lease(self.cfg)
+        for kept in (record["claim"]["restore"], record["lease"]["restore"], saved["restore"]):
+            self.assertEqual(kept, RESTORE, "every saved copy stays claim-shaped")
+        self.assertEqual(pool.session_record(self.cfg, saved)["phase"], "switched")
+        lease.parse(json.dumps({k: v for k, v in saved.items() if k in lease.LEASE_KEYS}))
 
     def test_restart_with_leased_host_picks_up_claim_before_pool_enrollment(self):
         warm = self.patch(pool, "start_warm")

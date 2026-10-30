@@ -5,6 +5,7 @@ disk guard and enrollment; the rest of the boot chain opens the user's overlay/h
 The authenticated claim is authority; durable state permits only exact-instance resume.
 """
 import base64
+import copy
 import fcntl
 from http.client import HTTPException
 import json
@@ -451,7 +452,11 @@ def _adopt(cfg, pool_lease):
         if not resumed_guard:
             record["phase"] = "guarding"
             save_record(cfg, record)
-        guard.run_guard(cfg, lease, rebase_runner=rebase.run_job, allow_reboot=resumed_guard)
+        # The guard gets its OWN copy: a restore publishes the fetched heads into the lease it is
+        # given (restore.http_fetch), up to 512 chunks each, past lease.parse's user-data bound.
+        # Every saved copy (pool-epoch.json, runDir/lease.json) stays claim-shaped, exactly what
+        # a cold boot's user data holds, so read_record and the later steps still parse it.
+        guard.run_guard(cfg, copy.deepcopy(lease), rebase_runner=rebase.run_job, allow_reboot=resumed_guard)
         mounted = True
         timing(cfg, "guardDoneMs")
         enroll._write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
