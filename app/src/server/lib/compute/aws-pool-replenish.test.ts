@@ -72,6 +72,25 @@ it('marks stale boots failed and retires them without competing with leases', as
     expect(deps.data.markPoolHost).toHaveBeenNthCalledWith(2, expect.anything(), HOST, ['ready', 'failed', 'retiring'], 'retiring', NOW);
     expect(deps.starter.start).toHaveBeenCalledOnce();
 });
+// Round 6 (codeopen review, deferred to integration): a stalled boot that commits ready between readPoolDemand and
+// its booting→failed mark is a healthy spare. Its fail mark updates nothing, so it is not reserved for retirement.
+it('does not retire a planned-fail spare that became ready before its fail mark', async () => {
+    const { deps, plan, f } = fixture(); plan.provision = 0; plan.fail = [HOST];
+    deps.data.markPoolHost = vi.fn(async (_tx, id, from, to) => from.length === 1 && from[0] === 'booting'
+        ? null : { ...f.row, poolHostId: id, state: to });
+    const records = await runPoolReplenish(deps);
+    expect(deps.data.markPoolHost).toHaveBeenCalledExactlyOnceWith(deps.db, HOST, ['booting'], 'failed', NOW);
+    expect(deps.store.prepare).not.toHaveBeenCalled(); expect(deps.starter.start).not.toHaveBeenCalled();
+    expect(records![0]).toMatchObject({ retired: 0, retirements: [] });
+});
+it('retires a planned-fail boot its own mark failed, in plan order, and skips the one that raced to ready', async () => {
+    const { deps, plan, f } = fixture(); plan.provision = 0; plan.fail = [HOST, OTHER];
+    deps.data.markPoolHost = vi.fn(async (_tx, id, from, to) => from[0] === 'booting' && from.length === 1 && id === OTHER
+        ? null : { ...f.row, poolHostId: id, state: to });
+    const records = await runPoolReplenish(deps);
+    expect(vi.mocked(deps.data.markPoolHost).mock.calls.map(c => [c[1], c[3]])).toEqual([[HOST, 'failed'], [OTHER, 'failed'], [HOST, 'retiring']]);
+    expect(records![0]).toMatchObject({ retired: 1, retirements: [{ poolHostId: HOST, outcome: 'started' }] });
+});
 it('does not dispatch a retirement when a lease wins the state CAS', async () => {
     const { deps, plan } = fixture(); plan.provision = 0; plan.retire = [HOST];
     deps.data.markPoolHost = vi.fn(async () => null);
