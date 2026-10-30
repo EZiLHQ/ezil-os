@@ -97,6 +97,11 @@ uses the accent style of the existing "Try again" button.
 
 These files are not this lane's to edit.
 
+> **Status at integration (`feat/os-app-code-20261030`, 2026-10-30).** Done:
+> the troubleshoot-test check 4 rewrite (4/4) and the three "Stale wording"
+> items. Still open: the `e2e/billing-staging-journey.mjs` persistence step
+> and the `shell/ezil/runtime-recheck.js:21-22` header.
+
 - **Merge blocker: `shell/ezil/ui/Settings/troubleshoot-test.mjs` check 4 (lines 48-61).** CI runs this file (ci.yml node-suite list). Check 4 still requires `RESTART_DESKTOP_TIME` and the Restart desktop copy, so it fails as soon as this lane lands. Rewrite it to test both sides:
   - Present: the Restart computer heading, copy and `data-action="restart-computer"`, and that copy passes `scanCopy`.
   - Absent: `RESTART_DESKTOP_TIME`, "Restarts the desktop and its apps", `<h3>Restart desktop</h3>`, `data-action="restart"` and `sheet: 'confirm-restart'`.

@@ -1,9 +1,10 @@
 # App routes, link parameters and history
 
 How the EZiL OS shell is addressed, as implemented on branch
-`feat/os-app-code-a1-20261030` (lane A1). This file describes behaviour that
-exists and is tested. Where a rule is a choice this lane made inside the
-shared A1/A2 contract, it says so.
+`feat/os-app-code-a1-20261030` (lane A1) and integrated on
+`feat/os-app-code-20261030` (§6's compatibility cases and return review,
+§7). This file describes behaviour that exists and is tested. Where a rule
+is a choice this lane made inside the shared A1/A2 contract, it says so.
 
 | Concern | Code | Tests |
 |---|---|---|
@@ -210,21 +211,131 @@ Auth0 flow:
   anything else that failed → `/computers` (unchanged from before, and
   asserted by the Auth0, confirm and login tests).
 
-## 7. Known gaps and hand-offs (as of this lane)
+The rule is five numbered cases, in this order, each commented in
+`constants.ts` and pinned by its own test (`constants.test.ts`,
+"compatibility decisions"):
 
-- `shell/ezil/ui/Settings/tabs/billing.js:843-844` reads `settings=billing`
-  and `section=ai-credits` from the address bar; on
-  `/app/settings?tab=billing&section=ai-credits` the AI-credits section does
-  not auto-open. It should also accept `tab=billing` on `/app/settings`.
+| # | Input | Lands on |
+|---|---|---|
+| 1 | nothing: absent, `''`, `[]`, `['']` (a repeat counts by its first value) | `/os` |
+| 2 | hostile shape: a scheme or non-path, `//`, `/\`, a backslash anywhere (query included), a control character or whitespace | `/computers` |
+| 3 | a return page: `/os`, `/app/<registry id or alias>`, `/computers`, `/computer/<uuid>` (either case), `/billing/return` | itself, byte for byte, query and hash included (`path=src/main.ts` keeps its `/`) |
+| 4 | any other path under `/app` (`/app`, `/app/`, `/app/unknown`, `/app/Code`, `/app/../x`, `/app/%2e%2e/x`, `/app/code%2fx`, `/app/code%5cx`, `/app/code/x`) | `/os` |
+| 5 | any other path (`/apps`, `/app%2fcode` included) | `/computers` |
+
+Case 2 is decided before case 4 on purpose: `/app\..\admin` or `/app/code`
+followed by a tab is a smuggling attempt, not an `/app` path the list could
+not vouch for, so it lands on `/computers`. Rejected input landing on
+`/computers` (case 5, and case 2) is asserted, unchanged, by four other
+suites: `app/src/app/login/page.test.ts`,
+`app/src/app/auth/auth0/callback/route.test.ts`,
+`app/src/server/auth/auth0.test.ts` and
+`app/src/app/auth/confirm/confirm-route.test.ts`.
+
+**Compatibility with the rule before `/app/<id>`** (base `74ed2c92`: any
+value starting with `/`, except `//` and `/\`, with no control character or
+whitespace, came back as given):
+
+| Path that base kept | Now | Why | Sent by anything in this repo? |
+|---|---|---|---|
+| `/` | `/computers` | Not a return page. `/` itself sends a signed-in visitor to `/os`, and a sign-in with no `returnUrl` lands on `/os` too. | No |
+| `/pricing` | `/computers` | Marketing page. The pricing CTA sends `/os?settings=billing&upgrade=<tier>`. | No |
+| `/login` | `/computers` | Would loop. | No |
+| `/admin/*` | `/computers` | Admin pages are not return pages. `/admin/telemetry` sends a signed-out visitor to a bare `/login`. | No |
+| `/os/`, `/os/<anything>` | `/computers` | Whole-path match: the shell is `/os`, exactly. | No |
+| `/computers/` | `/computers` | Same page, without the slash. | No |
+| `/app/<anything not allowlisted>` | `/os` | Case 4. Base kept it and the page then answered 404. | No |
+| a backslash past the start (`/os?x=\y`, `/app\..\admin`) | `/computers` | Case 2 (base refused only a leading `/\`). | No |
+| `/os%2fadmin`, `/os/../admin`, `/api/…`, `/auth/…` | `/computers` | Not return pages. | No |
+
+The producer audit behind the last column (grep for `returnUrl=`,
+`getReturnUrlQueryParam`, `RETURN_URL_PARAM` and `next=` in `app/src`,
+`shell/ezil`, `landing`, `e2e`, `worker/src`): the `/os` and `/app/[appId]`
+pages (`returnUrlFor` of the allowlisted literal), `computers/layout.tsx`
+and `computer/layout.tsx` (`x-pathname`: `/computers`, `/computer/<id>`),
+`billing/return/page.tsx` (`/billing/return?session_id=…`), the pricing CTA
+(`/os?settings=billing&upgrade=<tier>`), `EZIL_ID_SIGN_IN_URL`
+(`/auth/auth0/login?returnUrl=/os`), and the e2e scripts (`/computers`,
+`/os`, `/os?settings=billing&upgrade=pro`). Every one is a case-3 page. Not
+auditable from here: the `next` that Supabase's hosted email templates put
+on `/auth/confirm` links. An absent `next` lands on `/os`.
+
+### After sign-in: what each return opens (review, 2026-10-30)
+
+Sign-in returns to the exact path and query: `/app/code?…` and
+`/app/desktop?…` come back as written (`app/src/app/os/page.test.ts`, which
+also runs the return through the shell's parser and `routeLaunchContext`).
+The return is a full document load, and the boot then opens the linked app
+from the URL alone, with no click:
+
+| Return to | The boot opens | What that open does |
+|---|---|---|
+| `/app/code` | Code, in full view (§3: a route with nothing recorded is `'full'`) | `code.js` `start_boot()` on open → `mintCodePreviewUrl` → `session.cancellableWake` → the server's `ensure()`, which **starts a stopped computer** |
+| `/app/desktop`, `/app/browser` | the Browser, no view | `desktop-window.js` `start_boot()` on open → `session.openDesktop` → `cancellableWake` → `ensure()`: **starts or wakes the computer** |
+| `/app/preview` | Preview (shell-local, so it resolves on the web) | `preview.js` `start_boot()` → `session.previewUrl` → `cancellableWake` → `ensure()`: **starts the computer** |
+| `/app/settings`, `/app/app-store` | that window | nothing on the computer (Settings → Billing only reads) |
+| `/app/secure-browser` (web) | nothing (native-only) | nothing |
+| `/os` | nothing (login opens nothing, W3) | nothing |
+
+**Finding: yes, a return path starts a computer without a click.** Every
+page load at `/app/code`, `/app/desktop`/`/app/browser` or `/app/preview`
+starts a stopped computer: a sign-in return, a reload, a bookmark, a
+restored tab, and Back/Forward to the entry of a window that is no longer
+open (§5 launches it). Not changed here, because it is not a clear bug:
+
+- It is the behaviour `/os?app=<id>` already had at base (`boot.js` launched
+  the linked app on boot), and §1/§3 make `/app/<id>` that same link.
+- What is new is how often the address bar carries such a link: the shell
+  now writes `/app/<id>` for the app in front, where base left `/os` in
+  place. A reload of an ordinary session used to open nothing; now it
+  reopens the front app and, for Code, the Browser and Preview, starts the
+  computer.
+- Settings → Stop closes every window on the computer first, so this tab's
+  own address bar falls back to `/os` (or the app still in front). Earlier
+  entries keep their `/app/desktop` URLs, so Back to one relaunches the
+  Browser. `session.holdAfterStop` blocks only hover warms; any window open
+  releases it, a route launch included.
+- Contrast for the owner: since lane A2, Code's return-from-away check no
+  longer starts a stopped computer (docs/APP-CODE-FULL-VIEW.md §4), but
+  reloading `/app/code` after an idle stop, or a stop from another device,
+  does.
+- A shell rebuild (`ensure_intact`) never relaunches from the URL
+  (`appLinkHandled`), and Billing's deep link never touches the computer.
+
+Owner decision (not taken here): keep it, or have a page load that starts
+at a compute app ask before starting a stopped computer.
+
+## 7. Known gaps and hand-offs
+
+Closed at integration (branch `feat/os-app-code-20261030`, 2026-10-30):
+
+- Billing's AI-credits deep link works on the path form:
+  `shell/ezil/ui/Settings/tabs/billing.js` reads the query through
+  `settingsAliasSearch`, so `/app/settings?tab=billing&section=ai-credits`
+  opens the card exactly as `/os?settings=billing&section=ai-credits` does
+  (`billing-test.mjs`). Billing reads the boot URL: Settings calls
+  `onActivate` before its window resolves, and the route's history write
+  comes after that.
+- The stale "`/os` is one URL" comments in `shell/ezil/ui/app-drawer.js` and
+  `shell/ezil/ui/Settings/index.js` are corrected.
+- `appearance-browser-test.mjs`'s fixture serves `/app/<id>`, which its
+  reload now requests.
+- CI runs `app-history-test.mjs` and `full-view-test.mjs` (the "Shell unit
+  suites" list in `.github/workflows/ci.yml`).
+
+Still open:
+
 - In-app links `href="/os?settings=billing…"` (`Settings/tabs/computers.js`
   545, 602, 711; `Settings/tabs/usage.js` 39) and `/os` links in
   `app/src/app/billing/return/*`, `app/src/app/computers/_components/select-computers.tsx`
   still work through the alias, as full document loads.
-- Comments that say the shell does not own the address bar or that `/os` is
-  one URL are now stale: `shell/ezil/ui/app-drawer.js:21-23`,
-  `shell/ezil/ui/Settings/index.js:28-29`.
 - Settings does not report tab changes, so a URL's `tab` reflects the tab it
   was opened at.
+- A page load at a compute app's URL starts a stopped computer with no
+  click (§6, "After sign-in"). Owner decision.
+- The committed bundle (`app/public/os/`) does not match the sources
+  (`shell/build-shell.sh --check` fails), so CI's shell job stops at
+  "Committed bundle matches source". Regenerating it is a separate step.
 
 ## 8. Visual choices
 
