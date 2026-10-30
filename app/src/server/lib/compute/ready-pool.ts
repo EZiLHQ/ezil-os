@@ -21,7 +21,7 @@ export interface PoolDemand {
     /** Pool hosts an active demand needs gone: never adopted, retired once their provision settles. */
     earmarked?: string[];
     idleReady: { poolHostId: string; readyAt: Date; obsolete?: boolean; unusable?: boolean }[];
-    booting: { poolHostId: string; createdAt: Date }[];
+    booting: { poolHostId: string; createdAt: Date; enrolledAt?: Date }[];
 }
 export type PoolData = Pick<typeof import('./ready-pool'), 'recordPoolEnrollment' | 'recordPoolReady' | 'readPoolClaim' | 'markPoolHost' | 'readPoolDemand' | 'readPoolReadinessDiagnostics' | 'planPool' | 'POOL_POLICY'>;
 export interface PoolReadinessDiagnostic {
@@ -36,6 +36,26 @@ export const POOL_POLICY: Record<string, { minSpares: number; maxSpares: number 
     'ap-south-1:m6i.2xlarge': { minSpares: 1, maxSpares: 4 },
 };
 const MINUTE = 60_000;
+/**
+ * Round 6 (R2-4): a booting spare that enrolled but is still not ready this long after its creation died
+ * in its first readiness wait (host agent `pool.py` wait_ready raises pool_desktop_not_ready and the oneshot
+ * guard never restarts). It is failed then instead of at ten minutes, and is not counted as a spare, so the
+ * same replenish pass provisions its replacement (live 10-30: refills retired ~11 min after launch).
+ */
+export const POOL_BOOT_STALLED_MS = 6 * MINUTE;
+/**
+ * The agent's own wait after enrolling: start_warm, then wait_ready (180 s), then the ready POST, which
+ * `pool.py` retries on 5xx/429 (a deploy window). An enrollment younger than this may still answer. That is
+ * about four minutes plus a minute for the POST. Healthy live refills were ready in 84 s and 51 s (10-30).
+ */
+export const POOL_ENROLLED_READY_WAIT_MS = 5 * MINUTE;
+const bootStalled = (h: { createdAt: Date; enrolledAt?: Date }, now: Date) => !!h.enrolledAt
+    && now.getTime() - h.createdAt.getTime() > POOL_BOOT_STALLED_MS && now.getTime() - h.enrolledAt.getTime() > POOL_ENROLLED_READY_WAIT_MS;
+/** The same predicate for `readPoolDemand`'s spare count: what planPool fails is never a spare. */
+function bootStalledSql(now: Date) {
+    return sql`(enrolled_at IS NOT NULL AND created_at < ${new Date(now.getTime() - POOL_BOOT_STALLED_MS).toISOString()}::timestamptz
+                AND enrolled_at < ${new Date(now.getTime() - POOL_ENROLLED_READY_WAIT_MS).toISOString()}::timestamptz)`;
+}
 function rowsOf(result: unknown): Record<string, unknown>[] {
     const rows = Array.isArray(result) ? result : (result as { rows?: unknown } | null)?.rows;
     if (!Array.isArray(rows)) throw new Error('pool_result_invalid');
@@ -201,11 +221,11 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     const excess = Math.max(0, d.spares - target);
     const aged = d.idleReady.filter(h => d.killSwitch || now.getTime() - h.readyAt.getTime() > 30 * MINUTE)
         .sort((a, b) => b.readyAt.getTime() - a.readyAt.getTime() || a.poolHostId.localeCompare(b.poolHostId));
-    const ready = d.ready ?? Math.max(0,d.spares-d.booting.length);
+    const ready = d.ready ?? Math.max(0,d.spares-d.booting.filter(h => !bootStalled(h, now)).length);
     const readyExcess = Math.min(excess,Math.max(0,ready-target));
     const retire = [...aged.filter(h => h.obsolete || h.unusable), ...aged.filter(h => !h.obsolete && !h.unusable).slice(0, readyExcess)]
         .slice(0, 2).map(h => h.poolHostId);
-    const fail = d.booting.filter(h => now.getTime() - h.createdAt.getTime() > 10 * MINUTE).map(h => h.poolHostId);
+    const fail = d.booting.filter(h => now.getTime() - h.createdAt.getTime() > 10 * MINUTE || bootStalled(h, now)).map(h => h.poolHostId);
     return { target, provision: Math.min(2, Math.max(0, target - d.spares)), retire, fail };
 }
 
@@ -314,7 +334,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
             (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (ready_at - created_at)) / 60)
                 FROM class_hosts WHERE ready_at > ${at}::timestamptz - interval '24 hours'
                     AND ready_at <= ${at}::timestamptz AND ready_at > created_at) AS boot_minutes,
-            (SELECT count(*) FROM class_hosts WHERE state = 'booting' OR (${usableReady(at, sql`class_hosts.id`)})) AS spares,
+            (SELECT count(*) FROM class_hosts WHERE (state = 'booting' AND NOT ${bootStalledSql(now)}) OR (${usableReady(at, sql`class_hosts.id`)})) AS spares,
             (SELECT count(*) FROM class_hosts WHERE ${usableReady(at, sql`class_hosts.id`)}) AS ready,
             COALESCE((SELECT sum(${vcpu(sql`instance_type`)}) FROM live_placements), 0)
                 + COALESCE((SELECT sum(${vcpu(sql`h.instance_type`)}) FROM public.ezil_compute_pool_hosts h
@@ -323,7 +343,7 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
                             OR (p.computer_id = h.leased_computer_id AND p.instance_id IS NULL))), 0) AS vcpu,
             (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'readyAt', ready_at, 'obsolete', NOT compatible, 'unusable', NOT COALESCE((${usableReady(at, sql`all_class_hosts.id`)}),false))), '[]')
                 FROM all_class_hosts WHERE state = 'ready' AND leased_at IS NULL AND leased_computer_id IS NULL AND ready_at IS NOT NULL) AS idle_ready,
-            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'createdAt', created_at)), '[]')
+            (SELECT COALESCE(json_agg(json_build_object('poolHostId', id, 'createdAt', created_at, 'enrolledAt', enrolled_at)), '[]')
                 FROM all_class_hosts WHERE state = 'booting' AND leased_computer_id IS NULL AND leased_at IS NULL
                     AND claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL) AS booting,
             COALESCE((SELECT sum(demand.vcpu) FROM public.ezil_compute_capacity_demands demand
@@ -340,7 +360,8 @@ export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: D
         vcpuInUse: count(row.vcpu), regionVcpuCap, killSwitch: process.env.EZIL_AWS_KILL_SWITCH === '1',
         demandVcpu: count(row.demand_vcpu ?? 0), earmarked: ((row.earmarked ?? []) as unknown[]).map(String),
         idleReady: (row.idle_ready as { poolHostId: string; readyAt: string; obsolete?: boolean; unusable?: boolean }[]).map(h => ({ poolHostId:h.poolHostId, readyAt: new Date(h.readyAt), ...(h.obsolete ? {obsolete:true} : {}), ...(h.unusable ? {unusable:true} : {}) })),
-        booting: (row.booting as { poolHostId: string; createdAt: string }[]).map(h => ({ ...h, createdAt: new Date(h.createdAt) })),
+        booting: (row.booting as { poolHostId: string; createdAt: string; enrolledAt?: string | null }[]).map(h => ({ poolHostId: h.poolHostId,
+            createdAt: new Date(h.createdAt), ...(h.enrolledAt ? { enrolledAt: new Date(h.enrolledAt) } : {}) })),
     };
 }
 

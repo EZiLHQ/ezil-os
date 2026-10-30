@@ -649,6 +649,136 @@ await settle(4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5c. 🔴 ROUND 6 (R3-1/R3-2/R3-4, live 10-30 05:42-05:44Z). Code opened on a
+//     RUNNING AWS computer read "Almost there — waiting for Code to connect ·
+//     usually about 4 min" with the bar parked at 85 %, its mint was answered
+//     "starting" for two minutes, and the wake deadline would have ended it in
+//     "This is taking too long — Starting your computer…" over a running computer.
+//     Now it is a connect, and the same give-up (the existing bound) says Code
+//     is not reachable, with Try again. The clock is skewed, not waited.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const originalFetch = window.fetch, realNow = window.Date.now;
+    let skew = 0, progressAnswer = null, mintAsks = 0, progressFail = false, progressAsks = 0;
+    window.Date.now = () => realNow.call(window.Date) + skew;
+    window.fetch = async (url, opts) => {
+        const u = String(url);
+        if ( u.includes('/api/trpc/computer.progress') ) progressAsks++;
+        if ( u.includes('/api/trpc/computer.progress') && progressFail ) throw new Error('network');
+        if ( u.includes('/api/trpc/computer.progress') && progressAnswer ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: progressAnswer } } }) };
+        }
+        if ( u.startsWith(ENDPOINTS.codePreviewUrl) ) {
+            mintAsks++;
+            return { ok: true, status: 200, json: async () => ({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+                provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' }) };
+        }
+        return originalFetch(url, opts);
+    };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    /** The tab hidden or shown: the progress observer drops its answer on hide and asks at once on show. */
+    const setHidden = hidden => {
+        Object.defineProperty(doc, 'hidden', { configurable: true, get: () => hidden });
+        doc.dispatchEvent(new window.Event('visibilitychange'));
+    };
+    const RUNNING = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        durable: false, openingStartedAt: null, path: null, milestones: [], expectedSeconds: 30 };
+    const open = async (progress) => {
+        progressAnswer = progress; skew = 0; mintAsks = 0;
+        await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+        const w = q('.window[data-app="code"]');
+        const spinner = w?.querySelector('.ezil-app-spinner');
+        const text = sel => spinner?.querySelector(sel)?.textContent ?? '';
+        return { w, spinner, status: () => text('.ezil-opening-status'), meta: () => text('.ezil-opening-meta'),
+            title: () => text('.ezil-opening-title'), kind: () => spinner?.getAttribute('data-kind'),
+            percent: () => Number(spinner?.querySelector('.ezil-opening-bar')?.dataset.percent) };
+    };
+
+    const r = await open(RUNNING);
+    await waitFor(() => r.status() === 'Connecting to Code…', 3000);
+    push('🔴 R3-1: Code on a running computer says "Connecting to Code…", never "Almost there"',
+        r.status() === 'Connecting to Code…' && ! /Almost there/.test(r.spinner?.textContent ?? ''), r.status());
+    skew = 5_000;
+    await waitFor(() => r.meta().startsWith('0:05'), 2000);
+    push('🔴 R3-4: "0:05 · usually under a minute", never "usually about 4 min"',
+        r.meta() === '0:05 · usually under a minute' && ! /about 4 min/.test(r.spinner?.textContent ?? ''), r.meta());
+    push('🔴 R3-4: the bar is not parked at the 85% open floor', r.percent() > 85 && r.percent() < 100, String(r.percent()));
+    push('the mint is still asking (sandbox_starting is a wait, not a failure)', mintAsks >= 1 && r.kind() === 'progress', `${mintAsks} ${r.kind()}`);
+    // The wake loop's existing deadline (WAKE_DEADLINE_MS) passes on its next ask.
+    skew = 216_000;
+    await waitFor(() => r.kind() === 'failed', 6000);
+    const retry = r.spinner?.querySelector('.ezil-boot-retry');
+    push('🔴 R3-2: the give-up on a running computer reads "Code isn\'t reachable right now", with Try again',
+        r.kind() === 'failed' && r.title() === "Code isn't reachable right now" && !! retry && retry.hidden === false,
+        `${r.kind()} "${r.title()}" retry=${retry && ! retry.hidden}`);
+    push('🔴 ...and never the "Starting your computer" timeout copy over a running computer',
+        ! /This is taking too long|Starting your computer/.test(r.spinner?.textContent ?? ''), r.status());
+    push('...its body names Code and the running computer', /Code/.test(r.status()) && /running/.test(r.status()), r.status());
+    await window.$(r.w).close();
+    await settle(4);
+
+    // Not observed running (no AWS observation): the existing timeout copy is unchanged.
+    const n = await open(null);
+    await waitFor(() => mintAsks >= 1, 3000);
+    skew = 216_000;
+    await waitFor(() => n.kind() === 'failed', 6000);
+    push('without a running observation the give-up keeps the existing timeout copy',
+        n.kind() === 'failed' && n.title() === 'This is taking too long', `${n.kind()} "${n.title()}"`);
+    // A running answer that arrives only after that give-up (the tab was hidden, the polls failed) corrects it:
+    // the computer is running now, so the failure is Code's. Showing the tab again asks at once.
+    progressAnswer = RUNNING;
+    const asked = progressAsks;
+    setHidden(true); setHidden(false);
+    await waitFor(() => progressAsks > asked && n.title() === "Code isn't reachable right now", 2000);
+    push('🔴 R3-2: a running answer after a generic give-up turns it into "Code isn\'t reachable right now", with Try again',
+        n.kind() === 'failed' && n.title() === "Code isn't reachable right now"
+        && n.spinner?.querySelector('.ezil-boot-retry')?.hidden === false, `${n.kind()} "${n.title()}" asks=${progressAsks - asked}`);
+    await window.$(n.w).close();
+    await settle(4);
+
+    // 🔴 The give-up decides from this attempt's last answer, not the live one. A hidden tab (and a failed or
+    // slow poll) clears the live answer; the tab shown again repaints the state that was decided then.
+    // (Round 6 review probe: hidden across the give-up read "This is taking too long", and kept it.)
+    const h = await open(RUNNING);
+    await waitFor(() => h.status() === 'Connecting to Code…', 3000);
+    setHidden(true);
+    await waitFor(() => h.spinner?.dataset.progress === 'unavailable', 1000);
+    skew = 216_000;
+    await waitFor(() => h.kind() === 'failed', 6000);
+    push('🔴 R3-2: hidden across the give-up (no live answer) still reads "Code isn\'t reachable right now"',
+        h.kind() === 'failed' && h.title() === "Code isn't reachable right now" && h.spinner?.dataset.progress === 'unavailable',
+        `${h.kind()} "${h.title()}" progress=${h.spinner?.dataset.progress}`);
+    setHidden(false);
+    await waitFor(() => h.spinner?.dataset.progress === 'observed', 2000);
+    await settle(4);
+    push('🔴 ...and the tab shown again keeps it',
+        h.spinner?.dataset.progress === 'observed' && h.title() === "Code isn't reachable right now"
+        && ! /This is taking too long|Starting your computer/.test(h.spinner?.textContent ?? ''), `"${h.title()}" ${h.status()}`);
+    await window.$(h.w).close();
+    await settle(4);
+
+    // A progress poll that fails just before the give-up (network, its 15 s timeout): the same decision.
+    const f = await open(RUNNING);
+    await waitFor(() => f.status() === 'Connecting to Code…', 3000);
+    progressFail = true;
+    const before = progressAsks;
+    setHidden(true); setHidden(false);
+    await waitFor(() => progressAsks > before && f.spinner?.dataset.progress === 'unavailable', 2000);
+    await settle(2);
+    skew = 216_000;
+    await waitFor(() => f.kind() === 'failed', 6000);
+    push('🔴 R3-2: a failed progress poll before the give-up still reads "Code isn\'t reachable right now"',
+        f.kind() === 'failed' && f.title() === "Code isn't reachable right now" && f.spinner?.dataset.progress === 'unavailable',
+        `${f.kind()} "${f.title()}" progress=${f.spinner?.dataset.progress} asks=${progressAsks - before}`);
+    progressFail = false;
+    await window.$(f.w).close();
+    await settle(4);
+    delete doc.hidden;
+    window.fetch = originalFetch;
+    window.Date.now = realNow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 // Every request must be same-origin EXCEPT the code-preview frame itself,

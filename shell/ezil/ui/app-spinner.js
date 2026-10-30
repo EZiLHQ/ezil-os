@@ -56,6 +56,11 @@ const CURVE_MAX = 0.88;
 const CURVE_RATE = 2.2;
 /** Stage floors by server milestone index (requested … desktop_ready, then the client's url_received). */
 const OPENING_FLOOR = [0.05, 0.05, 0.35, 0.6, 0.85, 0.85];
+/**
+ * Round 6 (R3-4): a connect (this open began on a running computer with nothing opening) eases from its
+ * floor toward this over the server's connect expectation, instead of parking at 85% until the frame.
+ */
+const CONNECT_MAX = 0.97;
 /** Migration steps: saving, getting the AWS computer, moving (the real percent governs), starting. */
 const MIGRATION_FLOOR = [0.05, 0.05, 0.05, 0.6];
 /** `progressView` maps a measured transfer into this segment of its own migration bar. */
@@ -162,7 +167,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     let observation = null, latestState = null, latestExtra = {}, progressChecked = false, client = 0;
     /**
      * This open, from the client's first sight of it to ready / failure. `t0` anchors the elapsed
-     * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display.
+     * clock; `high` is the bar's high-water; `view`/`T` hold the last observation for the display
+     * (`T`: the last OPENING expectation; a connect answer carries none); `connect`: this open is a
+     * connect, set by its first opening-or-connect observation and cleared for good by an opening
+     * (or a move) seen inside it (round 6, R3-4).
      */
     let open = null;
     let aria = { at: -Infinity, key: null };
@@ -261,12 +269,18 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // The open: started by the first progress paint after a concluded one, never by a re-open.
         if (progressing && !runningLong && (!open || open.ended)) {
             if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; progressChecked = false; }
-            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false };
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null };
             client = 0;
         }
         if (pending) observer?.start();
         if (observer) root.dataset.progress = observation ? 'observed' : progressChecked ? 'unavailable' : 'pending';
-        if (open && observation && progressing) { open.view = observation; open.T = observation.expected ?? open.T; }
+        if (open && observation && progressing) {
+            open.view = observation;
+            // A connect answer's `expected` is only the 240 s fallback: it never replaces an opening's own.
+            if (observation.connect !== true) open.T = observation.expected ?? open.T;
+            // Holds (no bar) neither make nor break a connect; an opening seen inside one makes it an opening to the end.
+            if (observation.bar) open.connect = (open.connect ?? true) && observation.connect === true;
+        }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
 
@@ -293,7 +307,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
                 return;
             }
             const t = elapsedOf();
-            const T = view.expected ?? open?.T ?? 240;
+            // Round 6 (R3-4): a connect (this open began on a running computer with nothing opening) runs on the
+            // server's connect expectation; an opening that reaches running keeps the expectation it had.
+            const connecting = view.connect === true && open?.connect === true && view.connectExpected > 0;
+            const T = connecting ? view.connectExpected : view.connect === true && open?.T ? open.T : view.expected ?? open?.T ?? 240;
             const long = t >= T;
             let bar = 'indeterminate';
             if (view.bar || open?.high > 0 || client >= URL_RECEIVED) {
@@ -302,11 +319,15 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
                 const index = Math.max(reached, opening ? Math.min(client, URL_RECEIVED) : 0);
                 const floor = opening ? OPENING_FLOOR[Math.min(index, OPENING_FLOOR.length - 1)] : MIGRATION_FLOOR[Math.min(reached, MIGRATION_FLOOR.length - 1)];
                 const mf = view.bar?.migrationFraction;
-                const real = Number.isFinite(mf) ? (mf - TRANSFER_SEGMENT[0]) / (TRANSFER_SEGMENT[1] - TRANSFER_SEGMENT[0]) : null;
+                // A connect eases from its floor toward CONNECT_MAX; `real` carries that position, as a transfer's does.
+                const real = connecting ? floor + (CONNECT_MAX - floor) * (1 - Math.exp(-CURVE_RATE * t / T))
+                    : Number.isFinite(mf) ? (mf - TRANSFER_SEGMENT[0]) / (TRANSFER_SEGMENT[1] - TRANSFER_SEGMENT[0]) : null;
                 open.high = client >= FIRST_FRAME ? 1 : openingFill({ t, T, floor, prev: open.high, real, reducedMotion: reduced() });
                 bar = open.high;
             }
-            const status = view.body || [view.title, view.bytes].filter(Boolean).join(' · ');
+            const app = name || 'your desktop';
+            const status = connecting ? client >= URL_RECEIVED ? `Waiting for ${app} to answer…` : `Connecting to ${app}…`
+                : view.body || [view.title, view.bytes].filter(Boolean).join(' · ');
             paint({ state: long ? 'long' : 'opening', title: label, status, meta: metaFor(t, T, long), bar, details });
             return;
         }
@@ -343,7 +364,8 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
 
         if ( state.kind === 'failed' ) {
             endOpen();
-            const copy = failureCopy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
+            // `state.copy`: the caller's app-specific words for this one failure (round 6: Code on a running computer).
+            const copy = failureCopy ?? state.copy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
             paint({ state: 'failed', title: copy.title, status: copy.body, bar: null, retry: true, feedback: true });
             return;
         }

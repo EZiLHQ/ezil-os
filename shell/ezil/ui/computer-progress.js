@@ -151,7 +151,12 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
     const elapsed = Math.max(0, (now - (startedAt ?? firstObservedAt)) / 1000);
     // The bar's clock is the server-stamped opening start, shared by every tab and reload.
     const openingStartedAt = time(data.openingStartedAt) ?? startedAt ?? firstObservedAt;
-    const expected = [data.expectedSeconds, data.typicalSeconds].find(v => Number.isFinite(v) && v > 0) ?? 240;
+    // Round 6 (R3-4): running with nothing opening: only an app's connect is left, and the server sends that
+    // connect's expectation in `expectedSeconds`. It is kept apart (`connectExpected`): an open that began as an
+    // opening and reaches this state keeps the expectation it always had, never a 30 s one at minute three.
+    const connect = opening && data.operation === 'none' && stage === 'running';
+    const expectation = [data.expectedSeconds, data.typicalSeconds].find(v => Number.isFinite(v) && v > 0);
+    const expected = (connect ? undefined : expectation) ?? 240;
     const measured = Number.isFinite(data.bytes?.transferred) && data.bytes.transferred >= 0
         && Number.isFinite(data.bytes?.total) && data.bytes.total >= 0;
     const percent = measured && Number.isFinite(data.percent) && data.percent >= 0 && data.percent <= 100 ? Math.min(99, data.percent) : null;
@@ -199,6 +204,7 @@ export function progressView(data, computerId, { features = bootFeatures(), now 
         activeAws: data.active === true && ['migration', 'opening'].includes(data.operation) && !serverReady
             && !['operations_paused', 'needs_operator', 'queued', 'failed_reopened', 'stopped', 'retired', 'purge_eligible'].includes(stage),
         elapsed, expected, reached, serverReady, bar,
+        connect, connectExpected: connect ? expectation ?? null : null,
         // No server opening to measure yet: the surface shows an indeterminate bar, never a guessed position.
         indeterminate: preOpening,
         transition: transition ? { transitionId: transition.transitionId, kind: transition.kind, phase: transition.phase, target: transition.target,

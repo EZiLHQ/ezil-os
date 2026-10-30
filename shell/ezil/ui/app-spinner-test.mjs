@@ -499,6 +499,88 @@ try {
         });
         now = 0;
     }
+    // Round 6 (R3-4, live 10-30 05:43Z): Code opened on a RUNNING computer read "Almost there — waiting for Code to
+    // connect · usually about 4 min" with the bar parked at 85 %. An open whose first observation is a running
+    // computer with nothing opening is a CONNECT: its own words, the server's connect expectation, a moving bar.
+    const runningNow = { ...opening, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        path: null, openingStartedAt: null, milestones: [], expectedSeconds: 30 };
+    await observe(runningNow, async spinner => {
+        push('connect: "Connecting to Browser…", never "Almost there"', statusOf(spinner).textContent === 'Connecting to Browser…'
+            && ! /Almost there/.test(spinner.el.textContent), statusOf(spinner).textContent);
+        const first = barOf(spinner);
+        now = 5_000; spinner.render({ kind: 'progress' });
+        push('connect: "0:05 · usually under a minute"', metaOf(spinner).textContent === '0:05 · usually under a minute', metaOf(spinner).textContent);
+        const at5 = barOf(spinner);
+        push('🔴 connect: the bar does not park at the 85% floor', first >= 85 && at5 > 85 && at5 < 100, `${first} → ${at5}`);
+        now = 10_000; await poll();
+        const at10 = barOf(spinner);
+        push('connect: the bar keeps easing toward (not to) the top', at10 > at5 && at10 < 100, `${at5} → ${at10}`);
+        spinner.stamp('url_received'); spinner.render({ kind: 'progress' });
+        push('connect, URL in hand: "Waiting for Browser to answer…"', statusOf(spinner).textContent === 'Waiting for Browser to answer…'
+            && barOf(spinner) >= at10, statusOf(spinner).textContent);
+        now = 31_000; await poll();
+        push('connect past its 30 s: "Taking longer than usual · 0:31", no Try again, below 100', stateOf(spinner) === 'long'
+            && metaOf(spinner).textContent === 'Taking longer than usual · 0:31' && $(spinner, '.ezil-boot-actions').hidden && barOf(spinner) < 100,
+            `${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+        const seen = [];
+        for (const t of [60_000, 215_000, 600_000]) { now = t; await poll(); seen.push(barOf(spinner)); }
+        push('🔴 connect: never "usually about 4 min", never 100 before ready, monotonic', ! /about 4 min/.test(spinner.el.textContent)
+            && seen.every((v, i) => v < 100 && v >= (seen[i - 1] ?? 0)), seen.join());
+        spinner.render({ kind: 'ready' });
+        push('connect: ready is 100', barOf(spinner) === 100 && stateOf(spinner) === 'done');
+    });
+    now = 0;
+    // 🔴 An opening that REACHES running keeps its own expectation and its HF3 sentence: at 3:20 of a cold
+    // open the server's 30 s connect figure must not turn the meta into "Taking longer than usual".
+    await observe({ ...opening, path: 'cold' }, async spinner => {
+        now = 200_000; payload = runningNow; await poll();
+        push('🔴 opening → running at 3:20: still "3:20 · usually about 4 min", data-state opening',
+            metaOf(spinner).textContent === '3:20 · usually about 4 min' && stateOf(spinner) === 'opening', `${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+        push('opening → running: the HF3 sentence, not the connect copy', statusOf(spinner).textContent === 'Almost there — waiting for Browser to connect.',
+            statusOf(spinner).textContent);
+    });
+    now = 0;
+    // 🔴 Its OWN expectation, not the 240 s fallback a running answer carries: an opening the server expected in
+    // 150 s that is long at 2:40 stays long when it reaches running at 3:20 (never back to "usually about 4 min").
+    await observe({ ...opening, path: 'cold', expectedSeconds: 150 }, async spinner => {
+        now = 160_000; await poll();
+        const before = `${stateOf(spinner)} ${metaOf(spinner).textContent}`;
+        now = 200_000; payload = runningNow; await poll();
+        push('🔴 opening (150 s) → running at 3:20: still long on its own expectation, never "usually about 4 min"',
+            before === 'long Taking longer than usual · 2:40' && stateOf(spinner) === 'long'
+            && metaOf(spinner).textContent === 'Taking longer than usual · 3:20' && ! /about 4 min/.test(spinner.el.textContent),
+            `${before} → ${stateOf(spinner)} ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
+    // 🔴 A connect that the server turns into an opening (a stop and wake inside it) is an opening to the end:
+    // running again later is that opening's arrival, not a fresh 30 s connect.
+    await observe(runningNow, async spinner => {
+        push('connect first', statusOf(spinner).textContent === 'Connecting to Browser…', statusOf(spinner).textContent);
+        now = 20_000; payload = { ...opening, path: 'cold', expectedSeconds: 150 }; await poll();
+        push('...then an opening: its own words', statusOf(spinner).textContent !== 'Connecting to Browser…', statusOf(spinner).textContent);
+        now = 100_000; payload = runningNow; await poll();
+        push('🔴 connect → opening → running: the HF3 sentence and the opening\'s expectation, not "Connecting to…" at 30 s',
+            statusOf(spinner).textContent === 'Almost there — waiting for Browser to connect.'
+            && stateOf(spinner) === 'opening' && metaOf(spinner).textContent === '1:40 · usually about 3 min',
+            `${stateOf(spinner)} "${statusOf(spinner).textContent}" ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
+    // A running computer without the server's connect figure (an older server): the existing behaviour.
+    await observe({ ...runningNow, expectedSeconds: null }, async spinner => {
+        now = 5_000; spinner.render({ kind: 'progress' });
+        push('connect without a server expectation: the existing 240 s meta and sentence', metaOf(spinner).textContent === '0:05 · usually about 4 min'
+            && statusOf(spinner).textContent === 'Almost there — waiting for Browser to connect.', `${statusOf(spinner).textContent} ${metaOf(spinner).textContent}`);
+    });
+    now = 0;
+    // A failed state may carry its own copy (Code: the computer is running, Code did not answer).
+    await observe(runningNow, async spinner => {
+        spinner.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting', copy: { title: 'App copy', body: 'App body.' } });
+        push('failed with state.copy: that copy, Try again', titleOf(spinner) === 'App copy' && statusOf(spinner).textContent === 'App body.'
+            && $(spinner, '.ezil-boot-retry').hidden === false, titleOf(spinner));
+        spinner.render({ kind: 'failed', reason: 'timeout' });
+        push('failed without state.copy: the reason\'s copy', titleOf(spinner) === 'This is taking too long');
+    });
+    now = 0;
     {
         const element = document.createElement('div'); document.body.appendChild(element);
         const seen = [];

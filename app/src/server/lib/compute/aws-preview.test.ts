@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deriveGuacamoleSandboxId } from '@/server/lib/cloudflare-guacamole-provider';
-import { AWS_BROWSER_ROUTE_TOKEN, prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from './aws-preview';
+import { AWS_BROWSER_ROUTE_TOKEN, awsPreviewRefusal, prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from './aws-preview';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import type { EnsureOptions } from './provider';
 import { ENROLLMENT_FAILED, ENROLLMENT_PENDING } from './placement';
@@ -443,6 +443,57 @@ describe('AWS preview handoff', () => {
         if (!transport) expect(console.warn).toHaveBeenCalledExactlyOnceWith(
             `[aws-preview] unavailable reason=${kind === 'database' ? 'placement_read_failed' : 'parse_failed'}`,
         );
+    });
+});
+
+// Round 6 (R3-2): every refusal says why, as one bounded code (and the Worker's HTTP status when it
+// answered), for the router's one `aws-preview` log line. The wire answer is unchanged.
+describe('AWS preview refusal reasons', () => {
+    const reasonOf = async (placements = [row()]) => {
+        const out = await setup(placements).open();
+        expect(out.ok).toBe(false);
+        return awsPreviewRefusal(out);
+    };
+    it.each([
+        ['PROVISIONING', { state: 'PROVISIONING' }], ['MOUNTING', { state: 'MOUNTING' }],
+    ])('an owned %s placement: placement_opening', async (_state, over) => {
+        expect(await reasonOf([row(over)])).toEqual({ reason: 'placement_opening', status: null });
+    });
+    it.each([
+        [{ enroll_nonce_hash: 'pending-nonce' }, 'enrollment_pending'], [{ last_error: ENROLLMENT_PENDING }, 'enrollment_pending'],
+        [{ lifecycle_job_id: computerId }, 'lifecycle_pending'], [{ lifecycle_digest: 'a'.repeat(64) }, 'lifecycle_pending'],
+    ] as const)('a RUNNING placement still settling %j: %s', async (over, reason) => {
+        expect(await reasonOf([row(over)])).toEqual({ reason, status: null });
+    });
+    it.each([
+        [503, 'aws_desktop_starting'], [503, 'aws_origin_starting'], [503, 'aws_desktop_unreachable'], [502, 'aws_origin_unavailable'],
+        [409, 'relay_busy'], [409, 'relay_runtime_changed'], [409, 'relay_negotiation_busy'], [504, 'relay_timeout'],
+    ])('a Worker transient %s %s: that allow-listed code and its status', async (status, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
+        expect(await reasonOf()).toEqual({ reason: error, status });
+    });
+    it('an unknown Worker refusal is only its status, never its body', async () => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error: 'LEAK_unknown_starting' }, { status: 503 }));
+        expect(await reasonOf()).toEqual({ reason: 'worker_status_503', status: 503 });
+    });
+    it('a transport loss and an epoch replaced during the ask', async () => {
+        fetchMock.mockRejectedValue(new DOMException('LEAK', 'TimeoutError'));
+        expect(await reasonOf()).toEqual({ reason: 'transport_failed', status: null });
+        const { fake, open } = setup();
+        fetchMock.mockImplementationOnce(async () => { fake.placements[0]!.lease_epoch = 12; return Response.json(ready()); });
+        expect(awsPreviewRefusal(await open())).toEqual({ reason: 'epoch_moved', status: 200 });
+    });
+    it('a hard refusal keeps its existing category', async () => {
+        expect(await reasonOf([row({ state: 'STOPPED' })])).toEqual({ reason: 'placement_not_running', status: null });
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=placement_not_running');
+    });
+    it('an ok answer, a copy and a foreign object have no reason', async () => {
+        const ok = await setup().open();
+        expect(ok.ok).toBe(true);
+        expect(awsPreviewRefusal(ok)).toBeUndefined();
+        const refused = await setup([row({ state: 'STARTING' })]).open();
+        expect(awsPreviewRefusal({ ...refused })).toBeUndefined();
+        expect(awsPreviewRefusal({ ok: false, error: 'sandbox_starting' })).toBeUndefined();
     });
 });
 
