@@ -25,6 +25,11 @@ PRODUCTION_DB_HOST = "10.63.20.252"
 PRODUCTION_MARKERS = ("db.ezil.work", PRODUCTION_DB_HOST)
 # Preview API, preview DB proxy and the staging hostname.
 STAGING_MARKERS = ("13-203-99-168.sslip.io", "10.61.20.35", "os-staging.ezil.work")
+# Any EZiL or sslip.io host whose name says staging/preview (ai-staging, api-desktop-staging,
+# db-preview, ...) or any sslip.io host at all; production only uses named hosts.
+STAGING_HOST = re.compile(r"[a-z0-9.-]*(?:staging|preview)[a-z0-9.-]*\.(?:ezil\.work|ezil\.org)|[a-z0-9.-]+\.sslip\.io",
+                          re.IGNORECASE)
+PRODUCTION_FUNDING_URL = "https://ai.ezil.work"
 LIVE_STRIPE = ("pk_live_", "sk_live_", "rk_live_")
 REQUIRED = frozenset("""
 NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY
@@ -81,8 +86,11 @@ def validate(values, environment="staging"):
 
 def validate_production(values):
     """Pin production to its own API, private database and live Stripe; refuse staging values."""
-    if any(marker in value for value in values.values() for marker in STAGING_MARKERS):
+    if any(marker in value for value in values.values() for marker in STAGING_MARKERS) \
+            or any(STAGING_HOST.search(value) for value in values.values()):
         raise RenderError("Production refuses staging or preview values")
+    if "BILLING_FUNDING_URL" in values and values["BILLING_FUNDING_URL"] != PRODUCTION_FUNDING_URL:
+        raise RenderError("Production BILLING_FUNDING_URL must be https://ai.ezil.work")
     if values["NEXT_PUBLIC_SUPABASE_URL"] != PRODUCTION_API_URL:
         raise RenderError("Production NEXT_PUBLIC_SUPABASE_URL must be https://db.ezil.work")
     try:

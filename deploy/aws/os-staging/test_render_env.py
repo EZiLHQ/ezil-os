@@ -142,7 +142,9 @@ class ProductionEnvironmentTests(unittest.TestCase):
     def test_production_pins_api_url(self):
         for url in ("https://13-206-183-230.sslip.io", "https://db.ezil.work/", "http://db.ezil.work"):
             with self.subTest(url=url):
-                self.assertRefused({**self.values, "NEXT_PUBLIC_SUPABASE_URL": url}, "NEXT_PUBLIC_SUPABASE_URL must be")
+                # The sslip.io host is refused earlier, as a non-production host.
+                self.assertRefused({**self.values, "NEXT_PUBLIC_SUPABASE_URL": url},
+                                   "NEXT_PUBLIC_SUPABASE_URL must be|Production refuses staging")
 
     def test_production_pins_private_database_with_tls(self):
         for url in (PRODUCTION_DB.replace("?sslmode=require", ""),
@@ -167,6 +169,18 @@ class ProductionEnvironmentTests(unittest.TestCase):
                            ("EZIL_AWS_ENROLL_URL", "https://os-staging.ezil.work/api/compute/aws/enroll")):
             with self.subTest(key=key):
                 self.assertRefused({**self.values, key: value}, "Production refuses staging")
+
+    def test_production_refuses_any_staging_or_sslip_host(self):
+        for key, value in (("BILLING_FUNDING_URL", "https://ai-staging.ezil.work"),
+                           ("CLOUDFLARE_GUACAMOLE_WORKER_URL", "https://api-desktop-staging.ezil.work"),
+                           ("EZIL_AWS_ENROLL_URL", "https://db-preview.ezil.work/x"),
+                           ("EZIL_AWS_BROWSER_ZONE", "13-206-183-230.sslip.io")):
+            with self.subTest(key=key):
+                self.assertRefused({**self.values, key: value}, "Production refuses staging")
+
+    def test_production_pins_funding_url(self):
+        renderer.validate({**self.values, "BILLING_FUNDING_URL": "https://ai.ezil.work"}, "production")
+        self.assertRefused({**self.values, "BILLING_FUNDING_URL": "https://ai.ezil.work/"}, "BILLING_FUNDING_URL must be")
 
     def test_staging_refuses_production_values(self):
         staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}

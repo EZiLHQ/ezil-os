@@ -580,8 +580,10 @@ test('image change detection baselines on the newest deployment receipt, never a
     const outputs = {}; let warnings = 0;
     const github = {rest:{actions:{
       listWorkflowRuns:async args => {
-        assert.deepEqual(args, {owner:'test', repo:'os', workflow_id:'preview.yml', branch, status:'success', per_page:100});
-        return {data:{workflow_runs:runs.map(r => ({head_branch:branch, ...r}))}};
+        assert.deepEqual(args, {owner:'test', repo:'os', workflow_id:'preview.yml', branch, status:'success', per_page:100, page:args.page});
+        // `runs` is in API order (newest first); serve it 100 per page like GitHub.
+        const page = runs.slice((args.page - 1) * 100, args.page * 100);
+        return {data:{workflow_runs:page.map(r => ({head_branch:branch, ...r}))}};
       },
       // Every artifact of the run comes back, so only an exact name can select a receipt.
       listWorkflowRunArtifacts:async ({run_id}) => {
@@ -639,6 +641,13 @@ test('image change detection baselines on the newest deployment receipt, never a
     ['(b) rerun dispatch deploy uses its own attempt', {runs:[run(60, 'workflow_dispatch', D, 20, {run_attempt:2})],
       artifacts:{60:[{name:'live-evidence-main-60-1'}, ...deployedRun('main', 60, receipt('main', S0, D), 2)]}},
       main, B, {changed:'false', source:S0, run:'60'}],
+    // The receipt sits behind 150 newer push-only runs: the lookup pages past the first 100.
+    ['(a) receipt older than the newest 100 runs', (() => {
+      const pushes = Array.from({length:150}, (_, i) => run(1000 + 150 - i, 'push', A, 0,
+        {updated_at:new Date(Date.UTC(2026, 9, 29, 12) - i * 1000).toISOString()}));
+      return {runs:[...pushes, ...pushOnly.runs.slice(1)],
+        artifacts:{...Object.fromEntries(pushes.map(r => [r.id, buildOnly('main', r.id, A)])), 20:pushOnly.artifacts[20]}};
+    })(), main, B, {changed:'false', source:S0, run:'20'}],
     ['(c) app-only preview push', staged, preview, B, {changed:'false', source:S0, run:'41'}],
     ['(c) image-changing preview push', staged, preview, I, {changed:'true', source:S0, run:'41'}],
     // Negative controls: no receipt, an expired newest receipt, or an API failure rebuild.

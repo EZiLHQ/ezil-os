@@ -77,26 +77,31 @@ jobs:
             // dispatches succeed without deploying, so the artifact itself decides.
             try {
               const branch = context.ref.replace('refs/heads/', '');
-              const {data} = await github.rest.actions.listWorkflowRuns({
-                ...context.repo, workflow_id: 'preview.yml', branch, status: 'success', per_page: 100,
-              });
-              const runs = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
-                && run.head_branch === branch && run.conclusion === 'success'
-                && ['push', 'workflow_dispatch'].includes(run.event)
-                && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
-              for (const run of runs) {
-                const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;
-                const {data: {artifacts}} = await github.rest.actions.listWorkflowRunArtifacts({
-                  ...context.repo, run_id: run.id, name: artifact, per_page: 100,
+              // Main deploys only by dispatch, so its receipt can sit behind many push runs:
+              // page back (bounded) instead of reading only the newest 100.
+              for (let page = 1; page <= 10; page++) {
+                const {data} = await github.rest.actions.listWorkflowRuns({
+                  ...context.repo, workflow_id: 'preview.yml', branch, status: 'success', per_page: 100, page,
                 });
-                const evidence = artifacts.find(found => found.name === artifact);
-                if (!evidence) continue;
-                // The newest deployment decides; an expired receipt rebuilds, never an older one.
-                if (evidence.expired) return;
-                core.setOutput('run', String(run.id));
-                core.setOutput('sha', run.head_sha);
-                core.setOutput('artifact', artifact);
-                return;
+                const runs = data.workflow_runs.filter(run => run.path === '.github/workflows/preview.yml'
+                  && run.head_branch === branch && run.conclusion === 'success'
+                  && ['push', 'workflow_dispatch'].includes(run.event)
+                  && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+                for (const run of runs) {
+                  const artifact = `live-evidence-${branch}-${run.id}-${run.run_attempt}`;
+                  const {data: {artifacts}} = await github.rest.actions.listWorkflowRunArtifacts({
+                    ...context.repo, run_id: run.id, name: artifact, per_page: 100,
+                  });
+                  const evidence = artifacts.find(found => found.name === artifact);
+                  if (!evidence) continue;
+                  // The newest deployment decides; an expired receipt rebuilds, never an older one.
+                  if (evidence.expired) return;
+                  core.setOutput('run', String(run.id));
+                  core.setOutput('sha', run.head_sha);
+                  core.setOutput('artifact', artifact);
+                  return;
+                }
+                if (data.workflow_runs.length < 100) break;
               }
             } catch {
               core.warning('Deployment evidence unavailable; rebuilding images');
