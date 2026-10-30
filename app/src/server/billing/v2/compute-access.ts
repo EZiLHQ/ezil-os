@@ -34,6 +34,11 @@ export interface ComputeBillingState {
     allowanceStdSeconds: number;
     overage: { enabled: boolean; capCents: number } | null;
     summary: BillingSummaryV2 | BillingSummaryV3;
+    /**
+     * Round 6 R1-04 (v3 only): when Free began (a paid period or payment grace that ended); null while paid, or
+     * when no time is recorded (an immediate cancel). A paid-era session still open on Free ends here.
+     */
+    freeSince?: string | null;
 }
 
 export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' | 'enforcementEnabled'>): boolean {
@@ -70,6 +75,9 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
             usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: allowance }),
             allowanceStdSeconds: allowance, overage: null, summary,
+            // deriveStanding reports the drop time (heldSince) only with files on AWS; it is the same for any placement.
+            freeSince: paidAccess(standing) ? null
+                : deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: 'aws-ec2', now }).heldSince,
         };
         if (resolved.sku !== 'free_v3' && !paidAccess(standing)) {
             // D17/D18: grace over, raw unpaid or never paid (incomplete): Free now, with Free's window and limits

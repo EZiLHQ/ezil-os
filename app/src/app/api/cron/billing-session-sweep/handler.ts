@@ -122,7 +122,13 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
         const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
             ? state.summary.computer.activeDeadline : epoch.deadlineAt;
-        const deadline = Math.min(maximum, storedDeadline === null ? Infinity : Date.parse(storedDeadline));
+        const stored = storedDeadline === null ? Infinity : Date.parse(storedDeadline);
+        // Round 6 R1-04: a session opened on a paid plan with no session cap (its stored deadline lies past this
+        // plan's cap) and still open on Free ends at the drop: its recorded time, else now (the sweep runs every
+        // minute), never back-dated to ready + 1 h, and never before the Free hour itself.
+        const paidEra = state.planSku === 'free_v3' && maximum !== Infinity && stored > maximum + 1000;
+        const dropAt = state.freeSince ? Math.min(Date.parse(state.freeSince), now.getTime()) : now.getTime();
+        const deadline = paidEra ? Math.max(maximum, dropAt) : Math.min(maximum, stored);
         const due = now.getTime() >= deadline;
         const overageOn = state.family === 'compute' && state.overage?.enabled === true;
         // Round 6 CR-1: store.ts rounds readiness up and the deadline down to whole seconds, so a session cut by the

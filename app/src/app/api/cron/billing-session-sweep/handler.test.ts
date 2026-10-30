@@ -380,6 +380,44 @@ describe('round 6 CR-1: the hold cap survives whole-second rounding', () => {
     });
 });
 
+// Round 6 R1-04: the Free cap used to back-date a paid-era session to ready + 1 h, erasing the paid hours after it.
+describe('round 6 R1-04: a paid-era session still open after the drop to Free ends at the drop', () => {
+    const canceled = (periodEnd: Date) => [{ stripeSubscriptionId: 'sub', sku: 'standard_monthly_v3', status: 'canceled',
+        currentPeriodStart: new Date(periodEnd.getTime() - 30 * 86_400_000), currentPeriodEnd: periodEnd, cancelAtPeriodEnd: false }];
+    // Opened on Standard: no session cap, so the stored deadline is the fair-use bound (40 h).
+    const paidEra = () => epoch({ deadlineAt: iso(40 * 3600) });
+
+    it('an immediate cancel (no recorded drop time) closes at the sweep that sees it, not ready + 1 h', async () => {
+        const f = fixture([paidEra()], { sku: null });
+        f.store.subscriptionsFor.mockResolvedValue(canceled(new Date(window.end)));
+        expect(await f.run(18 * 3600)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(18 * 3600), endReason: 'session_max' });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it('a period that ended at ready + 5 h closes at that period end', async () => {
+        const f = fixture([paidEra()], { sku: null });
+        f.store.subscriptionsFor.mockResolvedValue(canceled(at(5 * 3600)));
+        await f.run(18 * 3600);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(5 * 3600), endReason: 'session_max' });
+    });
+
+    it('a drop within the first hour still gives the Free hour: ready + 1 h, and not before it', async () => {
+        const f = fixture([paidEra()], { sku: null });
+        f.store.subscriptionsFor.mockResolvedValue(canceled(at(1800)));
+        expect(await f.run(3599)).toMatchObject({ stopped: 0, closed: 0 });
+        await f.run(3600);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'session_max' });
+    });
+
+    it('a session opened on Free keeps its own 1-hour bound however late the sweep runs', async () => {
+        const f = fixture([epoch({ deadlineAt: iso(3600) })], { sku: null });
+        f.store.subscriptionsFor.mockResolvedValue(canceled(new Date(window.end)));
+        await f.run(18 * 3600);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'session_max' });
+    });
+});
+
 describe('paid sessions have no time cap', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
