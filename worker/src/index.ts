@@ -65,7 +65,7 @@ import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@clou
 import { awsPreviewSurface, awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
 import { AwsTunnelRegistry, lookupAwsTunnel, lookupAwsTunnelForBrowser, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
-import { awsRelayRefresh, awsScreenDesktop, awsSurfaceAnswers, ensureAwsDesktop, ensureAwsDesktopConfig, type RelayMint, type ScreenDesktop } from './aws-ice';
+import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, ensureAwsDesktopConfig, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
@@ -4381,13 +4381,21 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
   };
 }
 
-/** Records the config held for this epoch's RUNNING desktop for one host boot (aws-ice ensureAwsDesktopConfig). */
+/**
+ * The registry's compare-and-set on this epoch's push to its RUNNING desktop for one host boot
+ * (aws-ice ensureAwsDesktopConfig): the record's new time, null when refused (409: another ask
+ * got there first). Anything else throws, and the caller keeps today's behaviour.
+ */
 function awsRestartPush(env: Env, record: AwsTunnelRecord) {
   const registry = awsRegistryFor(env);
-  return async (bootId: string, expiresAt: number) => {
-    await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.restartPush}`, {
-      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId, expiresAt }),
+  return async (bootId: string, expectAt: number | null, next: { expiresAt?: number; release?: boolean } = {}) => {
+    const res = await registry!(record.sandboxId).fetch(new Request(`https://aws-tunnels${REGISTRY_PATHS.restartPush}`, {
+      method: 'POST', body: JSON.stringify({ generation: record.generation, leaseEpoch: record.leaseEpoch, bootId, expectAt, ...next }),
     }));
+    if (res.status === 409) return null;
+    const { at } = await res.json() as { at?: unknown };
+    if (!res.ok || typeof at !== 'number') throw new RelayFailure('aws_origin_unavailable');
+    return at;
   };
 }
 
@@ -4641,9 +4649,9 @@ interface PreviewBody {
   screen?: { width?: unknown; height?: unknown };
   /**
    * AWS computers only: the window that asks, `code` or `app`; anything else, or absent (an app
-   * that sends none), is the desktop. Code and the hosted app are answered once their own
-   * origin answers, without waiting on the desktop's relay (`awsPreviewSurface`, aws-origin.ts).
-   * Covered by the v2 body digest like every other field.
+   * that sends none), is the desktop. Code and the hosted app are answered once the desktop
+   * config is applied (and, for Code, code-server answers), without waiting on the desktop's
+   * relay (`awsPreviewSurface`, aws-origin.ts). Covered by the v2 body digest like every other field.
    */
   surface?: unknown;
 }
@@ -4789,11 +4797,10 @@ async function handlePreview(
           lookup: (sid) => lookupAwsTunnel(registry, sid),
           verifyOrigin: (sid) => verifyAwsTunnelOrigin(registry, sid),
           ensureDesktop: async (record) => ensureAwsDesktop(await desktop(record)),
-          // Code and the hosted app answer from their own origin, never the desktop's relay (aws-origin.ts).
+          // Code and the hosted app wait for the applied desktop config, never the desktop's relay (aws-origin.ts).
           surface: awsPreviewSurface(body.surface),
-          surfaceAnswers: async (record, surface) => !!zone && awsSurfaceAnswers(record, zone, surface, awsFetch, Date.now),
           ensureConfig: async (record) => ensureAwsDesktopConfig(await desktop(record)),
-          background: ctx ? (task) => ctx.waitUntil(task) : undefined,
+          codeAnswers: async (record) => !!zone && awsCodeServerAnswers(record, zone, awsFetch, Date.now),
           nowMs: Date.now,
         });
         if (answer.status !== 200) {

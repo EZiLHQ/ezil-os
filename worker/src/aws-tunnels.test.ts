@@ -412,23 +412,49 @@ describe('create (fence-first, once per epoch)', () => {
 
 describe('restartPush (the open path\'s once-per-boot config push to a running desktop)', () => {
   const BOOT = '11111111-1111-4111-8111-111111111111';
-  it('records the boot and the time on this epoch\'s record only; the next epoch starts without it', async () => {
+  it('claims, records and releases on this epoch\'s record only, each only while the record shows what the caller read', async () => {
     const s = memStorage();
     let t = 1_000;
     const svc = createAwsTunnelService({ api: fakeApi().api, storage: s, zone: ZONE, nowMs: () => t });
     expect((await svc.create(claims(), body())).status).toBe(200);
+    const pushOf = () => {
+      const r = s.map.get('tunnel') as AwsTunnelRecord;
+      return [r.restartPushBootId, r.restartPushAt, r.restartPushExpiresAt];
+    };
     t = 5_000;
-    expect(await svc.restartPush(1, 2, BOOT, 9_000_000)).toBe(true);
-    expect(s.map.get('tunnel')).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: 9_000_000, restartPushAt: 5_000, leaseEpoch: 2 });
-    for (const [g, e, b, x] of [[1, 3, BOOT, 1], [2, 2, BOOT, 1], [1, 2, 'not-a-boot', 1], [1, 2, BOOT, 0], [1, 2, BOOT, 1.5]] as const) {
-      expect(await svc.restartPush(g, e, b, x)).toBe(false);
+    // Claim (no expiry yet): exactly one of two asks that read "no push" gets it.
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBe(5_000);
+    expect(pushOf()).toEqual([BOOT, 5_000, undefined]);
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBeNull();
+    // The claimer records the pushed config against its own claim; a stale reader cannot.
+    t = 6_000;
+    expect(await svc.restartPush(1, 2, BOOT, 4_999, { expiresAt: 9_000_000 })).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT, 5_000, { expiresAt: 9_000_000 })).toBe(6_000);
+    expect(pushOf()).toEqual([BOOT, 6_000, 9_000_000]);
+    expect([(s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch, typeof (s.map.get('tunnel') as AwsTunnelRecord).tunnelId]).toEqual([2, 'string']);
+    // Another boot reads "no push" for itself and claims over the old boot's record.
+    const BOOT2 = '22222222-2222-4222-8222-222222222222';
+    t = 7_000;
+    expect(await svc.restartPush(1, 2, BOOT2, 6_000)).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT2, null)).toBe(7_000);
+    expect(pushOf()).toEqual([BOOT2, 7_000, undefined]);
+    // A failed push releases its own claim only.
+    expect(await svc.restartPush(1, 2, BOOT2, 6_999, { release: true })).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT2, 7_000, { release: true })).toBe(0);
+    expect(pushOf()).toEqual([undefined, undefined, undefined]);
+    expect(s.map.get('tunnel')).toMatchObject({ leaseEpoch: 2, generation: 1 });
+    // Wrong epoch, generation, boot id, expectation or expiry: refused, nothing written.
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBe(7_000);
+    for (const [g, e, b, x, n] of [[1, 3, BOOT, 7_000, {}], [2, 2, BOOT, 7_000, {}], [1, 2, 'not-a-boot', null, {}], [1, 2, BOOT, 7_000, { expiresAt: 0 }],
+      [1, 2, BOOT, 7_000, { expiresAt: 1.5 }], [1, 2, BOOT, -1, {}], [1, 2, BOOT, 1.5, {}]] as const) {
+      expect(await svc.restartPush(g, e, b, x, n)).toBeNull();
     }
-    expect(s.map.get('tunnel')).toMatchObject({ restartPushAt: 5_000 });
+    expect(pushOf()).toEqual([BOOT, 7_000, undefined]);
     expect((await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
     expect((s.map.get('tunnel') as AwsTunnelRecord).restartPushBootId).toBeUndefined();
-    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT, 1)).toBe(false);
+    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT, null)).toBeNull();
   });
-  it('the registry route answers 200 on a write and 409 for another epoch; lookups return the record with it', async () => {
+  it('the registry route answers 200 with the time on a write and 409 when refused; lookups return the record with it', async () => {
     const reg = new AwsTunnelRegistry({ storage: memStorage() }, {
       AWS_TUNNEL_CF_ACCOUNT_ID: 'a', AWS_TUNNEL_CF_ZONE_ID: 'z', AWS_TUNNEL_CF_API_TOKEN: 't',
     }, async (url) => new Response(JSON.stringify({ success: true,
@@ -436,10 +462,15 @@ describe('restartPush (the open path\'s once-per-boot config push to a running d
     () => ZONE);
     const create = await routeAwsTunnels('POST', claims(), body(), () => reg);
     expect(create.status).toBe(200);
-    const push = (leaseEpoch: number) => reg.fetch(new Request('https://aws-tunnels/restart-push', {
-      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT, expiresAt: 9_000_000 }) }));
-    expect((await push(2)).status).toBe(200);
-    expect((await push(9)).status).toBe(409);
+    const push = (leaseEpoch: number, b: Record<string, unknown>) => reg.fetch(new Request('https://aws-tunnels/restart-push', {
+      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT, ...b }) }));
+    const claim = await push(2, { expectAt: null });
+    const { at } = await claim.json() as { at: number };
+    expect([claim.status, typeof at]).toEqual([200, 'number']);
+    const lost = await push(2, { expectAt: null });
+    expect([lost.status, await lost.json()]).toEqual([409, { at: null }]);
+    expect((await push(9, { expectAt: at, expiresAt: 9_000_000 })).status).toBe(409);
+    expect((await push(2, { expectAt: at, expiresAt: 9_000_000 })).status).toBe(200);
     expect(await lookupAwsTunnel(() => reg, SID)).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: 9_000_000 });
   });
 });

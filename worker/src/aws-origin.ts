@@ -81,9 +81,9 @@ export interface AwsTunnelRecord {
   aiBootId?: string;
   /**
    * The host boot whose RUNNING desktop was last pushed a config, that config's expiry (which
-   * identifies it in the host's status) and when (ms). The host applies it only by restarting
-   * the desktop, so later asks wait for that instead of pushing again (aws-ice.ts
-   * `ensureAwsDesktopConfig`).
+   * identifies it in the host's status; absent while the claiming ask still pushes it) and when
+   * (ms). The host applies it only by restarting the desktop, so later asks wait for that
+   * instead of pushing again (aws-ice.ts `ensureAwsDesktopConfig`, aws-tunnels.ts `restartPush`).
    */
   restartPushBootId?: string;
   restartPushExpiresAt?: number;
@@ -395,12 +395,10 @@ export interface AwsPreviewDeps {
   ensureDesktop?: (record: AwsTunnelRecord) => Promise<AwsDesktopReadiness>;
   /** The asking surface; absent is the desktop (today's app sends none). */
   surface?: AwsPreviewSurface;
-  /** Code/app: whether that surface answers on the origin (`./aws-ice` `awsSurfaceAnswers`). */
-  surfaceAnswers?: (record: AwsTunnelRecord, surface: 'code' | 'app') => Promise<boolean>;
   /** Code/app: the desktop config alone, no relay (`./aws-ice` `ensureAwsDesktopConfig`). */
   ensureConfig?: (record: AwsTunnelRecord) => Promise<AwsDesktopConfigReadiness>;
-  /** Work that may finish after the answer (the Worker's `ctx.waitUntil`). */
-  background?: (task: Promise<unknown>) => void;
+  /** Code: whether code-server answers on the origin (`./aws-ice` `awsCodeServerAnswers`). */
+  codeAnswers?: (record: AwsTunnelRecord) => Promise<boolean>;
   nowMs: () => number;
 }
 
@@ -430,24 +428,25 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
   }
   let relay: RelayState | undefined;
   const surface = deps.surface ?? 'desktop';
-  if (surface !== 'desktop' && deps.surfaceAnswers && deps.ensureConfig) {
-    // Code and the hosted app run in the desktop's container but never use neko or its relay:
-    // answer as soon as the surface itself does. The desktop config still goes out (it also
-    // carries Chat's AI env, which code-server's ezil-models extension reads), once per host
-    // boot (ensureAwsDesktopConfig), after the answer.
-    if (await deps.surfaceAnswers(record, surface)) {
-      const configured = deps.ensureConfig(record).catch(() => undefined);
-      deps.background?.(configured);
-    } else {
-      // Not up yet: the container may be waiting for this epoch's config to start at all.
-      let readiness: AwsDesktopConfigReadiness;
-      try {
-        readiness = await deps.ensureConfig(record);
-      } catch (error) {
-        const failure = relayFailureResult(error);
-        return json({ ok: false, error: failure.error }, failure.status);
-      }
-      return json({ ok: false, error: 'aws_desktop_starting', reason: readiness.state === 'starting' ? readiness.reason : `${surface}_starting` }, 503);
+  if (surface !== 'desktop' && deps.ensureConfig && (surface === 'app' || deps.codeAnswers)) {
+    // Code and the hosted app run in the desktop's container but never use neko or its relay,
+    // so they never wait on those. They do wait for the desktop config to be applied: the host
+    // applies a config to a RUNNING desktop only by restarting that container (agent.py
+    // `_accept_relay`), code-server and the user's dev server with it, and Chat's AI env reaches
+    // code-server's ezil-models extension only that way (desktop.py `build_spec`). An answer
+    // before then would hand out a window that the host's next tick tears down.
+    let readiness: AwsDesktopConfigReadiness;
+    try {
+      readiness = await deps.ensureConfig(record);
+    } catch (error) {
+      const failure = relayFailureResult(error);
+      return json({ ok: false, error: failure.error }, failure.status);
+    }
+    if (readiness.state === 'starting') return json({ ok: false, error: 'aws_desktop_starting', reason: readiness.reason }, 503);
+    // Applied: the container runs. The hosted app's dev server is the user's (one that is absent
+    // is normal, and the app's own page says so); Code waits for code-server itself.
+    if (surface === 'code' && (await deps.codeAnswers?.(record)) !== true) {
+      return json({ ok: false, error: 'aws_desktop_starting', reason: 'code_starting' }, 503);
     }
   } else if (deps.ensureDesktop) {
     let readiness: AwsDesktopReadiness;

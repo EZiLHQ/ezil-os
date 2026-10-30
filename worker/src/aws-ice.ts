@@ -61,6 +61,14 @@ export const AWS_SURFACE_PROBE_TIMEOUT_MS = 5_000;
  * Inside the shell's 215 s wake deadline, so the open that waited receives the coded failure.
  */
 export const AWS_DESKTOP_CONFIG_APPLY_MS = 150_000;
+/** The config push answers within this, or it failed (the host stores it under its lock). */
+export const AWS_DESKTOP_PUSH_TIMEOUT_MS = 8_000;
+/**
+ * How long one ask's claim on that push (`restartPush` with no expiry yet) holds the others
+ * back: its mint (20 s) and push (AWS_DESKTOP_PUSH_TIMEOUT_MS) end well within it. A claim
+ * older than this lost its asker; the next ask claims the push anew.
+ */
+export const AWS_DESKTOP_CONFIG_CLAIM_MS = 40_000;
 const MAX_SERVERS = 8;
 const MAX_URLS = 8;
 const NEKO_VALUE = /^[0-9a-f]{32}$/;
@@ -257,26 +265,21 @@ export async function readAwsDesktopStatus(
 }
 
 /**
- * Whether a Code or hosted-app surface answers on this computer's origin, whatever the desktop
- * (neko, its relay, Chat's AI config) is doing. Code: code-server's own `/healthz` answers a
- * gw1-signed GET on `/__p/8443/healthz` (the host edge answers 502 `desktop_unreachable` while
- * nothing listens). The hosted app: the desktop container runs; its dev server is the user's,
- * so one that is absent is normal and the app's own page says so. Any failure is "not yet".
+ * Whether code-server answers on this computer's origin, whatever neko and its relay are doing:
+ * its own `/healthz` answers a gw1-signed GET on `/__p/8443/healthz` (the host edge answers 502
+ * `desktop_unreachable` while nothing listens). Any failure is "not yet".
  */
-export async function awsSurfaceAnswers(
+export async function awsCodeServerAnswers(
   record: AwsTunnelRecord,
   zone: string,
-  surface: 'code' | 'app',
   fetchFn: FetchLike,
   nowMs: () => number,
   timeoutMs = AWS_SURFACE_PROBE_TIMEOUT_MS,
 ): Promise<boolean> {
   try {
-    const nowSeconds = Math.floor(nowMs() / 1000);
-    if (surface === 'app') return (await readAwsDesktopStatus(record, zone, fetchFn, nowSeconds, timeoutMs)).desktop === 'running';
     const { host, key } = originFor(record, zone);
     const path = `/__p/${CODE_PREVIEW_PORT}${CODE_HEALTH_PATH}`;
-    const header = await signGatewayHeader(key, record, 'GET', path, nowSeconds);
+    const header = await signGatewayHeader(key, record, 'GET', path, Math.floor(nowMs() / 1000));
     const res = await fetchFn(`https://${host}${path}`, { method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header },
       redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
     await res.body?.cancel().catch(() => undefined);
@@ -386,11 +389,13 @@ export interface AwsDesktopParams {
   mint: RelayMint;
   aiConfig?: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
   /**
-   * Records, on the tunnel record, a config held for the RUNNING desktop of this host boot (its
-   * expiry identifies it) and when. The next asks read it back (`record.restartPush*`) and wait
-   * instead of pushing.
+   * The tunnel registry's compare-and-set on this host boot's push to its RUNNING desktop
+   * (aws-tunnels.ts `restartPush`): applies only while the record still shows `expectAt` (the
+   * push this ask read, null for none). No `expiresAt` claims the push; an `expiresAt` records
+   * the config the host holds; `release` drops a failed claim. The record's new time, or null
+   * when another ask got there first. The next asks read it back (`record.restartPush*`).
    */
-  restartPush?: (bootId: string, expiresAt: number) => Promise<void>;
+  restartPush?: (bootId: string, expectAt: number | null, next?: { expiresAt?: number; release?: boolean }) => Promise<number | null>;
   budgetMs?: number;
 }
 
@@ -400,7 +405,14 @@ async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus):
   if (!minted) throw new RelayFailure('turn_unavailable');
   const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
   if (p.aiConfig && status.bootId) config.ai = await p.aiConfig(status.bootId);
-  const res = await pushAwsDesktopConfig(p.record, p.zone, config, p.fetch, Math.floor(p.nowMs() / 1000));
+  const bounded: FetchLike = (url, init) => p.fetch(url, { ...init, signal: AbortSignal.timeout(AWS_DESKTOP_PUSH_TIMEOUT_MS) });
+  let res: Response;
+  try {
+    res = await pushAwsDesktopConfig(p.record, p.zone, config, bounded, Math.floor(p.nowMs() / 1000));
+  } catch (error) {
+    if (error instanceof RelayFailure) throw error;
+    throw new RelayFailure('aws_desktop_unreachable', 503);
+  }
   let body: Record<string, unknown> = {};
   try {
     body = (await res.json()) as Record<string, unknown>;
@@ -415,15 +427,17 @@ async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus):
 }
 
 /**
- * The config half of an open (no relay; the Code and app surfaces use it alone):
+ * The config half of an open (no relay; the Code and app surfaces answer on `applied`):
  *   - the host has no usable config for this epoch while its desktop is down, or the desktop is
  *     not running and its unit exited or failed (a crash: nothing would start it) -> mint once,
  *     push, report `starting` (the host restarts it);
  *   - the RUNNING desktop lacks the pushed config (it started without a relay, or without Chat's
  *     AI env) -> the host can apply a config only by restarting the desktop, and every push
  *     re-arms that restart (agent.py `_accept_relay`): on 10-30 a push on every ~2 s ask kept a
- *     computer's desktop restarting and its Code waiting ~2 min. So push ONCE per host boot and
- *     record it (`restartPush`); while the host holds exactly that config, later asks answer
+ *     computer's desktop restarting and its Code waiting ~2 min. So push ONCE per host boot:
+ *     claim it on the tunnel record first (`restartPush`, compare-and-set, so overlapping asks
+ *     push once between them; a failed push releases the claim), then record the pushed
+ *     config. While a claim is in flight or the host holds exactly that config, later asks answer
  *     `config_pending` with no mint and no push, and one still unapplied after
  *     AWS_DESKTOP_CONFIG_APPLY_MS fails with `aws_desktop_config_unapplied`, never an endless
  *     `starting`. Another fresh config held instead (the Restart route stages its own, with its
@@ -448,19 +462,35 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
   if (running && (status.ice !== 'applied' || needsAi)) {
     const boot = status.bootId;
     if (!boot || !p.restartPush) return (await pushDesktopConfig(p, status)).answer;
+    const pending: AwsDesktopStarting = { state: 'starting', reason: 'config_pending' };
     const { restartPushBootId, restartPushAt, restartPushExpiresAt } = p.record;
-    if (fresh && restartPushBootId === boot && typeof restartPushAt === 'number') {
+    const seen = restartPushBootId === boot && typeof restartPushAt === 'number' ? restartPushAt : null;
+    // Another ask claimed this boot's push and is pushing it (checked before the held config:
+    // the host still holds the previous one until that push lands).
+    if (seen !== null && restartPushExpiresAt === undefined && now - seen < AWS_DESKTOP_CONFIG_CLAIM_MS) return pending;
+    if (seen !== null && restartPushExpiresAt !== undefined && fresh) {
       if (status.expiresAt !== restartPushExpiresAt) {
-        // The record's lost, failed or replaced push (e.g. by the Restart route) is not the held one.
-        await p.restartPush(boot, status.expiresAt!).catch(() => undefined);
-        return { state: 'starting', reason: 'config_pending' };
+        // The record's push is not the held one (the Restart route staged its own): adopt that.
+        await p.restartPush(boot, seen, { expiresAt: status.expiresAt! }).catch(() => null);
+        return pending;
       }
-      if (now - restartPushAt >= AWS_DESKTOP_CONFIG_APPLY_MS) throw new RelayFailure('aws_desktop_config_unapplied', 502);
-      return { state: 'starting', reason: 'config_pending' };
+      if (now - seen >= AWS_DESKTOP_CONFIG_APPLY_MS) throw new RelayFailure('aws_desktop_config_unapplied', 502);
+      return pending;
     }
-    const pushed = await pushDesktopConfig(p, status);
-    // A lost record costs at most another push on the next ask (today's behaviour), never this open.
-    await p.restartPush(boot, pushed.expiresAt).catch(() => undefined);
+    // Claim the push before pushing, so overlapping asks (Code, the desktop window, retries)
+    // push once between them. A registry that does not answer leaves today's behaviour: push.
+    const claim = await p.restartPush(boot, seen).catch(() => undefined);
+    if (claim === null) return pending;
+    let pushed: Awaited<ReturnType<typeof pushDesktopConfig>>;
+    try {
+      pushed = await pushDesktopConfig(p, status);
+    } catch (error) {
+      // A failed mint or push leaves nothing to wait for: the next ask tries again.
+      if (claim !== undefined) await p.restartPush(boot, claim, { release: true }).catch(() => null);
+      throw error;
+    }
+    // A lost record costs at most another push on a later ask (today's behaviour), never this open.
+    await p.restartPush(boot, claim ?? seen, { expiresAt: pushed.expiresAt }).catch(() => null);
     return pushed.answer;
   }
   if (!running) {

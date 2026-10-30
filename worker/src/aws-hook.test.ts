@@ -95,6 +95,8 @@ interface FakeHost {
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
   /** code-server answers its /healthz on 8443; otherwise the edge's 502. */
   codeUp?: boolean;
+  /** neko's admin API (8181) not up yet: the edge's 502. */
+  nekoDown?: boolean;
   pushed?: { ai?: { baseUrl: string; proxyToken: string }; expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; turnStatus?: number; bad: string[]; paths: string[];
 }
@@ -128,6 +130,7 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
       h.pushed = JSON.parse(body);
       return j({ ok: true, state: 'accepted' });
     }
+    if (h.nekoDown && url.pathname.startsWith('/__p/8181/')) return j({ ok: false, error: 'desktop_unreachable' }, 502);
     const neko = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID);
     if (url.pathname === '/__p/8181/api/login') return (JSON.parse(body) as { password: string }).password === neko.admin ? j({ token: 't' }) : j({}, 401);
     if (url.pathname === '/__p/8181/api/relay' && method === 'GET') return j({ runtimeId, expiresAt: h.relayExpiresAt });
@@ -670,41 +673,49 @@ describe('AWS AI signed boot delivery', () => {
 });
 
 describe('AWS Code surface through the hook', () => {
-  it('Code answers at once while the desktop waits on its AI config; the config goes out once (waitUntil); the desktop still waits', async () => {
+  it('Code and the desktop window asking together push once; Code waits for the restart that applies it, then answers without neko', async () => {
     const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
     await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
     const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied',
-      aiConfigured: false, codeUp: true });
-    const tasks: Promise<unknown>[] = [];
-    const ctx = { waitUntil: (t: Promise<unknown>) => { tasks.push(t); }, passThroughOnException() {} } as never;
+      aiConfigured: false, codeUp: true, nekoDown: true });
     const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+    const starting = (reason: string) => ({ ok: false, error: 'aws_desktop_starting', reason });
     const logs: string[] = [];
     const log = spyOn(console, 'log').mockImplementation((line: unknown) => { logs.push(String(line)); });
     try {
       const codeBody = JSON.stringify({ userId: USER, projectId: CID, surface: 'code' });
-      const code = await worker.fetch(await signed('POST', '/sandbox/preview', codeBody), e, ctx);
-      expect(code.status).toBe(200);
-      const body = await code.json() as Record<string, unknown>;
-      expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.ezil.work/preview-bootstrap?token=`);
-      expect(body.relay).toBeUndefined();
-      expect(host.paths.slice(0, 1)).toEqual(['GET /__p/8443/healthz']);
-      await Promise.all(tasks);
+      const ask = async (b: string) => {
+        const r = await worker.fetch(await signed('POST', '/sandbox/preview', b), e);
+        return [r.status, await r.json() as Record<string, unknown>] as const;
+      };
+      // Both read "no push" for this boot; the registry lets exactly one of them push.
+      const both = await Promise.all([ask(codeBody), ask(previewBody)]);
+      expect(both.map(([s]) => s)).toEqual([503, 503]);
+      expect(both.map(([, b]) => b.reason).sort()).toEqual(['config_pending', 'config_pushed']);
       expect(pushes()).toBe(1);
       expect(host.pushed!.ai!.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
-      // The desktop (no surface: today's app) still waits for the restart that applies it; nothing more is pushed.
-      const desk = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e, ctx);
-      expect([desk.status, await desk.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }]);
+      // Until the host restarts the desktop with it (code-server restarts with it), Code never answers 200.
+      for (const b of [codeBody, previewBody, codeBody]) expect(await ask(b)).toEqual([503, starting('config_pending')]);
+      expect(pushes()).toBe(1);
+      expect(host.paths).not.toContain('GET /__p/8443/healthz');
+      // Applied; neko still booting: Code answers (no relay fields), the desktop window still waits.
+      host.aiConfigured = true;
+      const [status, body] = await ask(codeBody);
+      expect(status).toBe(200);
+      expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.ezil.work/preview-bootstrap?token=`);
+      expect([body.relay, body.turnRelay]).toEqual([undefined, undefined]);
+      expect(await ask(previewBody)).toEqual([503, starting('desktop_starting')]);
       expect(pushes()).toBe(1);
       // Each non-200 answer is logged with its code and reason (never a URL or token).
-      const line = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
-        .find((ev) => ev?.event === 'sandbox.preview.aws');
-      expect(line).toMatchObject({ outcome: 'error', errorCode: 'aws_desktop_starting', detail: 'aws_desktop_starting:config_pending' });
+      const details = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+        .filter((ev) => ev?.event === 'sandbox.preview.aws').map((ev) => ev!.detail);
+      expect(details).toEqual(expect.arrayContaining(['aws_desktop_starting:config_pushed', 'aws_desktop_starting:config_pending',
+        'aws_desktop_starting:desktop_starting']));
+      for (const d of details) expect(String(d)).not.toMatch(/https?:|token/i);
       // The surface is part of the signed body: a body changed after signing is refused.
       const forged = await signed('POST', '/sandbox/preview', previewBody);
       const tampered = new Request(forged.url, { method: 'POST', body: codeBody, headers: forged.headers });
-      expect((await worker.fetch(tampered, e, ctx)).status).toBe(401);
-      // No ExecutionContext (tests, older callers): Code still answers.
-      expect((await worker.fetch(await signed('POST', '/sandbox/preview', codeBody), e)).status).toBe(200);
+      expect((await worker.fetch(tampered, e)).status).toBe(401);
     } finally {
       log.mockRestore();
     }
