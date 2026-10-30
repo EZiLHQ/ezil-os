@@ -112,7 +112,7 @@ export async function enrollAiMember(authUserId: string, verifiedAuth0Sub: strin
         };
         client = postgres(databaseUrl, options);
         const ownedClient = client;
-        async function query<T extends postgres.Row[] = postgres.Row[]>(statement: string, parameters: string[] = []) {
+        async function query<T extends postgres.Row[] = postgres.Row[]>(statement: string, parameters: postgres.ParameterOrJSON<never>[] = []) {
             assertActive();
             const rows = await ownedClient.unsafe<T>(statement, parameters);
             assertActive(); // No continuation may dispatch SQL after the deadline.
@@ -172,10 +172,12 @@ export async function enrollAiMember(authUserId: string, verifiedAuth0Sub: strin
             });
             const item = aiCreditOutboxItem(authUserId, entitlement, 'grant', null);
             await transaction(async () => {
-                // Same unique event_key and conflict policy as BillingStore.
+                // Same unique event_key and conflict policy as BillingStore. Bind the object: this
+                // raw client serializes a jsonb parameter itself, so a JSON string would be stored
+                // as a jsonb string that the outbox never claims (drizzle's pool disables that).
                 await query(`insert into public.ezil_billing_outbox (event_key, user_id, kind, payload)
                     values ($1, $2::uuid, $3, $4::jsonb) on conflict do nothing`,
-                [item.eventKey, item.userId, item.kind, JSON.stringify(item.payload)]);
+                [item.eventKey, item.userId, item.kind, item.payload as postgres.JSONValue]);
             });
         }
 
