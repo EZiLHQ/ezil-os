@@ -141,3 +141,40 @@ describe('the export-boot mode of applyLifecycleReceipt (§5.2)', () => {
         expect(await isReverseExportBoot(s.db, await s.current())).toBe(true);
     });
 });
+
+/**
+ * §5.2: every actor that acts on an `aws-ec2` row in LEASED, STARTING or MOUNTING leaves an export boot below RUNNING and
+ * opens no usage. The two that apply receipts to a live computer are driven here (aws-reconcile and sandbox-reap both run
+ * `runAwsBackgroundReconcile`; aws-stop-settle runs `runAwsStopSettlement`). The others, by construction:
+ * - billing-session-sweep: never transitions a placement; its held pass skips an in-flight move (handler.test.ts);
+ * - internal image-rebase: a reservation is refused while a reverse row holds the computer (rebase.pg.test.ts), so it never
+ *   acts on an export boot; lifecycle-authority only authorizes the boot's own recorded job (readLifecyclePlacement);
+ * - pool-replenish: works on pool hosts only, and a Free export boot is never a pool adopt (aws-ec2.ts `tier_free`).
+ */
+describe('§5.2 actors: an enrolled export boot stays below RUNNING with no usage', () => {
+    const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '10', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+        EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200', AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
+        EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ 'ap-south-1': D }) };
+    const enrolled = () => bootRow({ state: 'MOUNTING', lifecycle_job_id: null, lifecycle_digest: null, instance_id: INSTANCE,
+        last_error: ENROLLMENT_SUCCEEDED, enroll_nonce_hash: null, enroll_consumed_hash: 'c'.repeat(64), presence_at: NOW });
+    it('aws-reconcile / sandbox-reap (runAwsBackgroundReconcile → reconcileAwsFleet), pass after pass', async () => {
+        const { LIFECYCLE_DEPLOYMENTS_ENV } = await import('./aws-intent');
+        expect(LIFECYCLE_DEPLOYMENTS_ENV).toBe('EZIL_AWS_LIFECYCLE_DEPLOYMENTS');
+        const { runAwsBackgroundReconcile } = await import('./aws-receipts');
+        for (const row of [enrolled(), bootRow({ last_error: ENROLLMENT_SUCCEEDED, enroll_nonce_hash: null, instance_id: INSTANCE })]) {
+            const s = setup([row], ok);
+            for (let i = 0; i < 3; i++) await runAwsBackgroundReconcile(ENV, { ...s.deps });
+            expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', generation: 5, lease_epoch: 8 });
+            expect(s.usage).toEqual([]);
+            expect(s.meter.ready).not.toHaveBeenCalled();
+            expect(s.starts).toEqual([]);
+        }
+    });
+    it('aws-stop-settle (runAwsStopSettlement, terminal receipts only) never touches it', async () => {
+        const { runAwsStopSettlement } = await import('./aws-receipts');
+        const s = setup([enrolled()], ok);
+        expect(await runAwsStopSettlement(ENV, s.deps)).toMatchObject({ ok: true, checked: 0, settled: 0 });
+        expect(s.placements[0]).toMatchObject({ state: 'MOUNTING' });
+        expect(s.usage).toEqual([]);
+    });
+});

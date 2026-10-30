@@ -315,7 +315,8 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
         if (atClaim(p, boot) && p.state === 'MOUNTING') {
             // Record what the boot proved (its instance) on the SAME claim, then advance once enrollment succeeded.
             let row = m;
-            if (p.instanceId && (boot.instanceId === null || boot.fsUuid === null) && (boot.instanceId === null || boot.instanceId === p.instanceId))
+            const learns = boot.instanceId === null || (boot.fsUuid === null && p.fsUuid !== null);
+            if (p.instanceId && learns && (boot.instanceId === null || boot.instanceId === p.instanceId))
                 row = await ports.store.recordExportBoot(m, { ...boot, instanceId: p.instanceId, fsUuid: boot.fsUuid ?? p.fsUuid });
             if (p.lifecycleJobId === null && p.lastError === ENROLLMENT_SUCCEEDED && row.exportBoot?.instanceId === p.instanceId)
                 return next(await ports.store.advance(row, 'exporting'));
