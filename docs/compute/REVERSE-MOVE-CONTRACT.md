@@ -614,7 +614,7 @@ apply; the user's own allowance does not.
 | `user_hours_cap`, `user_egress_cap` | **no**: removed in step 5 | — |
 | `user_has_aws_computer` | yes. It passes for this computer: the counter excludes the target computer (`p.computer_id <> target`, `placement.ts:1803-1807`) and its own demand (`:1810-1816`). It fails only when the user holds **another** AWS computer or demand. | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `computer_not_owned`, `computer_deleted` | yes | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
-| **[r6]** `region_missing` (step 4: the placement's `region` is null or invalid) | yes: this computer, permanently | `reopen_final` → **`region_missing`**, logged `[reverse-move] anomaly`. The `requested` pass also checks the region on its own placement read, before the claim, with the same outcome. The hold cannot open such a computer either (`aws-ec2.ts:699-700` answers `region_not_configured`), so its copy promises neither Open nor Try again (§6.3). |
+| **[r6]** `region_missing` (step 4: the placement's `region` is null or invalid) | yes: this computer, permanently | `reopen_final` → **`region_missing`**, logged `[reverse-move] anomaly`. The `requested` pass also checks the region on its own placement read, before the claim, with the same outcome. The hold cannot open such a computer either (a null `region` is refused first, `aws-ec2.ts:693-694` → `aws_placement_incomplete`; a region absent from `cfg.deployments` reaches `:699-700` → `region_not_configured`), so its copy promises neither Open nor Try again (§6.3). |
 | `aws_tier_invalid` | cannot occur (no tier is requested) | — |
 
 **[r4] The `requested` deadline rule (one rule; §5.4 and §5.5 say the same).** Nothing durable records why earlier passes
@@ -775,7 +775,7 @@ Any other kind is unsafe:
 - `computer.delete` retires first only for kind `'aws-ec2'` (`computer.ts:342-350`). For any other kind
   `softDeleteComputer` deletes even after a failed teardown (`computer-store.ts:382-393`), and the flip would later insert
   a Cloudflare row for a deleted computer (§5.6 step 3).
-- `awsStopProof` treats a non-`aws-ec2` kind as running (`billing-session-sweep/route.ts:48-49`).
+- `awsStopProof` treats a non-`aws-ec2` kind as running (`billing-session-sweep/route.ts:50`).
 
 The `reverse` marker is set only by `select.ts` for these two providers. Lane A tests the kind and the marker for both.
 
@@ -801,7 +801,11 @@ answers too), pushing that config once per host boot (`ensureAwsDesktopConfig`, 
 `restartPush*` claim, `aws-tunnels.ts:351`). The reverse answer is returned right after `routeComputer`, before all of it:
 - It goes out as `return awsAnswered(routed.kind, '<surface>', input.computerId, <answer>, startedAt)`, with surface
   `desktop`, `app` or `code` and **no** `preview` argument, so a move's waits are in the web log as `error: 'sandbox_starting',
-  reason: 'computer_moving'` (blocked: `preconditions_unmet`, `computer_move_needs_attention`). The restart route has no
+  reason: 'computer_moving'` (blocked: `preconditions_unmet`, `computer_move_needs_attention`). **[r6 lead]** `awsAnswered`
+  logs `reason` from the answer's own `error` (`cloudflare-guacamole.ts:146`), so this early answer is built **without**
+  `awsPreviewAnswer`'s rewrite (`compute-dispatch.ts:221`): `errorCode` is `sandbox_starting` (blocked:
+  `preconditions_unmet`) and `error` keeps the provider code `computer_moving` (blocked: `computer_move_needs_attention`).
+  The shell keys on the flags only, never on `error`. The restart route has no
   `awsAnswered` and returns the answer bare. Lane A tests the line for each surface.
 - No `surface` ever reaches the Worker for a computer in a move, `requestAwsPreview` never runs for it, and no desktop
   config push is claimed for its export boot: that boot's tunnel record never gets `restartPushBootId`. Lane W's import
@@ -857,8 +861,9 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:738-750`)
 **after `drain()`**, as the handler's last step:
 - **Main path [r6]:** the policy pass → the retry pass → **round 6a's held pass** (`billing-session-sweep/handler.ts:212-257`)
   → `advanceStaleMigrations` → `reconcilePaidCloudflareUsers` → `drain()` → **`advanceReverseMoves`** (`handler.ts:258-260`).
-  The driver stays last, after the held pass: that pass ends by its own start + 10 s and by handler start + 30 s
-  (`HELD_BUDGET_MS`, `HELD_SWEEP_BUDGET_MS`, `handler.ts:27-28,222`), so it adds no wait beyond the 40 s bound below.
+  The driver stays last, after the held pass: that pass **starts its last page** by its own start + 10 s and by handler start + 30 s
+  (`HELD_BUDGET_MS`, `HELD_SWEEP_BUDGET_MS`, `handler.ts:26-27,222`; the deadline is checked between pages of ≤100
+  candidates, so a page in flight can run past it). T0 (j)'s `startOffsetMs` line measures the real spread.
 - **Metering-inactive early return:** `drain()` → **`advanceReverseMoves`** → `finish()` (`handler.ts:83`). Forward moves do not
   run there at base. Reverse moves must, because only the driver enforces their deadlines (§5.4 table), and a held row with
   no driver would hold the computer indefinitely.
@@ -1015,7 +1020,7 @@ The classes are:
   - **Try later** (r3, §5.1.1): `kill_switch` and `boot_unavailable` only. They are `reopen` codes with their own copy (§6.3).
 - `failed_needs_operator`:
   - Open works: `abort_unconfirmed` only. **[r5]** It is written only after the placement settled (§5.7), so the next open is an ordinary hold replace that never matches `readByExportBoot`;
-  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:683-688`).
+  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:691`).
 - **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`. **[r6]** No v1 writer (§7.3).
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
 
@@ -1297,7 +1302,8 @@ move?: null | {
   `progress.ts:45`), 120 the capture, `import = ceil(bytesTotal / 1,048,576)` seconds (1 MiB/s; 120 before the head is known),
   and 150 the check, host retire and commit.
 - **`budgetSeconds = 13200`** (**[r6]**; r5: 9300), the sum of the §5.4 deadlines: 600 (`requested`) + 900 (`booting`) +
-  1200 (`exporting`) + 7500 (`copying`) + 1200 (`checking`) + 1800 (`flipping`). With the driver running (§5.4), every row is terminal by then.
+  1200 (`exporting`) + 7500 (`copying`) + 1200 (`checking`) + 1800 (`flipping`). With the driver running (§5.4), every row is terminal by then **plus the per-state pass-detection lag (up to 2 cron ticks per
+  state)**; the shell's `+300 s` margin absorbs it.
   The shell never fails a move on its own clock before `startedAt + budgetSeconds + 300 s` (§6.4).
 - **[r6] 6a's connect expectation never applies.** The server sends `APP_CONNECT_EXPECTED_SECONDS` (30 s) only for
   `operation: 'none'` on a RUNNING computer (`progress.ts:56,125,142`), and the shell marks a connect only for
@@ -1394,7 +1400,7 @@ After a committed move the user has no `aws-ec2` placement, so "the newest row f
 3. else the computer whose newest row is terminal and **visible** (§6.1 24 h rule), the most recent by
    `ages.stateEntered`. This is the "after commit" case: the placement is now Cloudflare;
 4. else none: `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`. **[r6]** This includes placement reads
-   disabled: `userPlacement` then returns no computer ids (`isPlacementReadEnabled`, `billing.ts:163`), so there is no move
+   disabled: `userPlacement` then returns no computer ids (`isPlacementReadEnabled`, `billing.ts:164`), so there is no move
    computer (the r4 fixer's deviation 5, recorded in §12.2).
 
 **New `buildSummaryV3` input (pure; lane A):**
@@ -1554,7 +1560,12 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
   `min(that answer + PREPARE_DEADLINE_MS (180 s), t0 + LAUNCH_DEADLINE_MS (600 s))` and raises `maxIssues`, never
   lowering either (`session.js:263-264,498-508`), and `pendingOrRefused` passes `computePreparing` through (`:839-845`).
   None of this may cap a move:
-  1. `pendingOrRefused` also passes `computeMoving: true` and `computeMoveNeedsAttention: true` through, in the same form.
+  1. **[r6 lead]** Both not-ok builders pass `computeMoving: true` and `computeMoveNeedsAttention: true` through, in the
+     same form as `computeMigrating`/`computeLaunching`: `pendingOrRefused` (`:839-845`) **and** `openDesktopOnce`
+     (`session.js:766-774`, the object it builds for `/api/shell/desktop` → `cloudflareGuacamole.previewUrl`, which is
+     where the D20 next-open trigger lives, §5.9). Lane U owns both. Without the second, the desktop loop
+     (`openDesktop` → `cancellableWake`, `:597`) never sees a move and rule 2 never fires on the primary path.
+     Lane U tests a moving answer through `openDesktop` as well as through `previewUrl` and Code's mint.
   2. The loop tests `res.computeMoving === true` **first**: before the migrating, launching and preparing branches
      (`:465-508`) and before the `sandbox_starting` deadline check (`:510-530`). A moving answer deletes this loop's
      migrating, launching and preparing entries (so `isComputeMigrating`, `isComputeLaunching` and `isComputePreparing`
@@ -1910,10 +1921,10 @@ Numbers are the review's own order (1-based; the first ten are r4's rows above).
 | 10 | Overlay keyed terminal outcomes on `stage` (minor, U) | already | §5.10, §6.4 | r4 row 10. r5 updates its example: `boot_unsettled` is now open blocked. |
 | 11 | Try-later copy promises minutes for monthly caps (minor, U) | fixed | §6.3 | Every try-later sentence is time-neutral ("Try again later."). The vocabulary is not split: one code, one honest sentence. |
 | 12 | Old cached shells render the now non-null summary move; [Try again] calls `switchTo` (minor, U+A) | fixed | §6.1, §6.1.1, §6.2, §6.4 | The move rides the new key `summary.computer.reverseMove`; `computer.move` stays null, so the dormant card never renders. |
-| 13 | `snapshot_missing` alert has no caller (minor, O) | fixed | §7, §1.1 | `advanceReverseSnapshots` runs the listing once per pass and logs one line; lane O tests it. |
+| 13 | `snapshot_missing` alert has no caller (minor, O) | fixed in r5; **[r6] superseded by DECISION_72 (§7.1-§7.3) where it concerns the snapshot executor** | §7, §1.1 | `advanceReverseSnapshots` runs the listing once per pass and logs one line; lane O tests it. |
 | 14 | Billing start gate runs before the reverse waiting answer (major, A+U) | fixed | §5.3, §5.5, §6.1.1, §6.3, §6.4 | All four open routes answer `routed.reverse` right after `routeComputer`. `holdOpenable` drives the retry and copy of a computer the hold cannot open (`workspace_too_large` → `retry: 'no'`, Upgrade only; no [Open my AWS computer]). |
 | 15 | Compensation's "settled" misses the generation rollback (major, A) | fixed | §5.7, §5.1.2, §5.5 | Settled = STOPPED, no job, the claim's volume, epoch ≥ E+1, generation N or N+1. A refused replace runs `settleReplacementGeneration` first. The flip stays strict at N+1/E+1. |
-| 16 | `reverseSnapshotStateMachineVersionArn` in strict schemas; release order (major, O) | fixed | §7.2, §1.1, §8 | Lead decision: lane O owns it end to end; infra accepts, then the app, then the env; rollback removes the key first. **Narrowed, with reason:** `release-manifest.ts` and `aws-rebase-release.ts` leave lane O's list, because the field is not a release field. |
+| 16 | `reverseSnapshotStateMachineVersionArn` in strict schemas; release order (major, O) | fixed in r5; **[r6] superseded by DECISION_72 (§7.1-§7.3) where it concerns the snapshot executor** | §7.2, §1.1, §8 | Lead decision: lane O owns it end to end; infra accepts, then the app, then the env; rollback removes the key first. **Narrowed, with reason:** `release-manifest.ts` and `aws-rebase-release.ts` leave lane O's list, because the field is not a release field. |
 | 17 | Same as #1 (major, A+U) | already | §5.9 | **Accepted deviation from its proposed order** (`move_not_held` before the holding row): r4 checks the holding row first. A holding row with the same owner is the user's own move, and showing it is right even if the standing changed meanwhile (for example a resubscribe while `failed_needs_operator`). Another owner's row answers `move_not_held` from that same step. |
 | 18 | Same as #4 (major, O+A) | already | §3.4, §7.1 | — |
 | 19 | Same as #3 (minor, A) | already | §6.1.1, §1.1 | — |
@@ -1921,7 +1932,7 @@ Numbers are the review's own order (1-based; the first ten are r4's rows above).
 | 21 | Same as #8 (minor, A) | already | §5.1.1, §5.5 | — |
 | 22 | "Open works" for `boot_unsettled` is false (minor, A+U) | fixed | §5.3, §5.5, §5.5.1, §5.7, §5.10, §6.1.1, §6.3, §6.4 | `boot_unsettled` is open blocked, with its own copy; the release runbook settles the placement first. `abort_unconfirmed` is written only after the placement settled, so its "Open works" is true. |
 | 23 | Same as #9 (minor, U) | already | §5.10, §6.4 | — |
-| 24 | The volume's region is never recorded (minor, O+A) | fixed | §3.1, §5.1.1 step 8, §7.1; store | `export_boot.region`, required and kept (store r5, unit and PG tests; a mutant without the keep-check fails). The snapshot intent's region and deployment come from it. |
+| 24 | The volume's region is never recorded (minor, O+A) | fixed in r5; **[r6] superseded by DECISION_72 (§7.1-§7.3) where it concerns the snapshot executor** | §3.1, §5.1.1 step 8, §7.1; store | `export_boot.region`, required and kept (store r5, unit and PG tests; a mutant without the keep-check fails). The snapshot intent's region and deployment come from it. |
 | 25 | A stale open epoch would be billed across the move (minor, A) | fixed | §5.1.1, §5.4, §5.5 | With metering active, an open epoch makes the placement not claimable (wait; `computer_busy` at the deadline). |
 | 26 | Throughput arithmetic overstated chunks per pass (minor, A) | fixed | §5.4, §5.1.1 step 5b, §3.4 | Concurrent per-row drive, `claimStale(10)` with active rows first (lane A's store change), at most 3 moves past `requested`. At least 20 chunks per row per pass at 0.5 MiB/s: about 26 min worst case against 60. |
 | 27 | `listRetentionExpired` has no purge marker (minor, O+A) | fixed | §7, §3.1, §3.4; store | Runbook `operator_purged` sets `retain_until = NULL` (0012 unchanged). `listUnsnapshotted` skips purged rows; PG test and mutant. |
@@ -1930,8 +1941,8 @@ Numbers are the review's own order (1-based; the first ten are r4's rows above).
 | r4 verifier gap | Disposition | Section(s) | Note |
 |---|---|---|---|
 | AMI train (C3, F11, `pool_desktop_not_ready`) had no owner (MAJOR) | fixed | §2.8, §1.1, §8 | Lane H owns the host files and the pool/C3 app files no other lane owns; the seams with A (`aws-receipts.ts`, `placement.ts`, the `pool-replenish` route) are pinned. F11's file set is provisional and diagnosis comes first; a cause outside it changes §2.8 first. |
-| Deployment field: strict parsers and unowned files (MAJOR) | fixed | §7.2, §1.1, §8 | As #16. Every infra parser imports one `deployment.ts`; the pool refill after the env change is expected and disclosed. |
-| Lane O IAM: no file named; does a promote need `json-tool.py`? (MINOR) | fixed | §7.2, §1.1 | `app-caller.ts`, its tests and snapshots, and the registration in `bin/lifecycle.ts` and `computer-lifecycle.ts` are O's. No promote needs to carry the key (evidence in §7.2), so `json-tool.py` stays H's, unchanged. |
+| Deployment field: strict parsers and unowned files (MAJOR) | fixed in r5; **[r6] superseded by DECISION_72 (§7.1-§7.3) where it concerns the snapshot executor** | §7.2, §1.1, §8 | As #16. Every infra parser imports one `deployment.ts`; the pool refill after the env change is expected and disclosed. |
+| Lane O IAM: no file named; does a promote need `json-tool.py`? (MINOR) | fixed in r5; **[r6] superseded by DECISION_72 (§7.1-§7.3) where it concerns the snapshot executor** | §7.2, §1.1 | `app-caller.ts`, its tests and snapshots, and the registration in `bin/lifecycle.ts` and `computer-lifecycle.ts` are O's. No promote needs to carry the key (evidence in §7.2), so `json-tool.py` stays H's, unchanged. |
 | §5.5 `commit{verifyOnly}` `other` lacked `worker_conflict` (MINOR) | fixed | §5.5 | Same note as `begin` and `pull`. |
 | Cron still in v1 (MINOR) | fixed | D-5, §3.1, §3.2, §5.9, §5.9.1, §8, §9 | Moved to §9. The 0012 CHECK keeps `'cron'` (digest registered); no v1 code writes it. |
 | §5.2 actor routes unowned (MINOR) | fixed | §1.1, §5.2 | Lane A owns those route and handler files and their tests. |
@@ -1966,7 +1977,7 @@ and §7.3 what is held with lane O.
 | r5 verifier MINOR: §5.4 throughput ignored `claimStale`'s 30 s idle filter (#26 was marked fixed but was not) | §5.4, §5.1.1 step 5b, §5.1.2, §2.5 step 7, §5.3, §5.10 | **Chosen: state the true margin and move the deadline; the claim rule is unchanged.** Drives of one row are at most 3 ticks apart (2 when pass start offsets are steady; the bound needs offset spread `J ≤ 60 s`, logged per pass for T0 (j)). Worst case about 81 min, steady about 53 min. `copying` deadline 60 → **125 min** (1.54× the worst case). Cascade: host life 180 min; host idle-hold cap 120 → 185 min; `leaseUntil` 120 → 200 min; `budgetSeconds` 9300 → 13200; a move runs up to 220 min. Step 5b now counts `flipping`, so "at most 3 rows past `requested`" is true. A tick that starts late costs a row at most 2 extra ticks, and the slack absorbs about 20 of them per move. Changing the claim rule was rejected: under the idle filter two passes could drive one row, and a pull queued in the DO behind the other driver's pull could time out and count as a retry. |
 | r5 verifier MINOR: §5.9 typed the start/retry answer as `ComputerMoveV3` (#12 incomplete) | §5.9 | `{ok: true, move: ComputerReverseMoveV3}`, built by §6.1.1's pure function from the row and this request's placement read, never through the 24 h rule. It has every field §6.2's card reads (`retry`, `openBlocked`, `holdOpenable`, `reason`, `skipped`, …). |
 | r5 verifier MINOR: §1.1 said lane A is the store's sole writer "from r4 on" | §1.1 | Now "from r5 on", as the header and §3.4 say. |
-| r5 verifier MINOR: r4 fixer deviation 5 not recorded | §6.1.1 rule 4 | **Recorded:** with placement reads disabled (`isPlacementReadEnabled()` false), `userPlacement` returns no computer ids (`billing.ts:163`), so there is no move computer: `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`. No move action can be shown where no move can run. |
+| r5 verifier MINOR: r4 fixer deviation 5 not recorded | §6.1.1 rule 4 | **Recorded:** with placement reads disabled (`isPlacementReadEnabled()` false), `userPlacement` returns no computer ids (`billing.ts:164`), so there is no move computer: `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`. No move action can be shown where no move can run. |
 | r5 verifier MINOR: an `aws-ec2` placement with a null region waited as `region_not_configured` and ended `boot_unavailable` (try later) forever | §5.1.1 step 4 and table, §5.4, §5.5, §5.5.1, §6.1.1, §6.3, §6.4 | New per-computer final code **`region_missing`** (`reopen_final`, logged `[reverse-move] anomaly`), decided by `admitExportBoot` step 4 and by the `requested` pass's own read, before `decideAdmission`. It has its own copy, with no Try again and no [Open my AWS computer] (the hold cannot open it either). `operator_cleared`'s list gains it, so an operator who fixes the region can offer Try again; the store's PG suite runs the edited block. |
 
 ### 12.3 Lane A acceptance items: required mutants **[r6]**
