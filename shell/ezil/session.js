@@ -753,6 +753,9 @@ async function openDesktopOnce (computerId, screen, signal) {
         // as any particular size. `apps/desktop-screen.js`'s
         // `readAppliedScreen` is the one validator.
         screen: data.screen,
+        // Round 6 (CR-3): which provider answered ('aws-ec2' for an AWS computer), as the
+        // refusal branch above already carries it. `desktopState.provider` cannot say.
+        computeProvider: data.computeProvider,
     };
 }
 
