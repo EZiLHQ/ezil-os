@@ -188,7 +188,7 @@ describe('a desktop host that returns 500 cannot be reported ready', () => {
             );
             expect(okObserved).toEqual({ confirmed: true, retryable: false, status: 200 });
             // A positive carries no reason (the server omits it on success).
-            expect(okObserved.reason).toBeUndefined();
+            expect((okObserved as { reason?: string }).reason).toBeUndefined();
             expect(
                 computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: okConfirmed }),
             ).toEqual({ kind: 'ready' });
