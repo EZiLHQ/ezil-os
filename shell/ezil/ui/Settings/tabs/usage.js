@@ -70,14 +70,18 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const currentSize = period.currentSize ?? summary?.computer?.size ?? 'std-2';
     const hoursPeriod = Number.isSafeInteger(period.remainingHoursAtCurrent) ? { ...period, currentSize }
         : count(period.remainingStandardSeconds) ? { ...period, currentSize, remainingHoursAtCurrent: Math.floor(period.remainingStandardSeconds / weight / 3600) } : null;
-    const lines = hoursLeftLines(hoursPeriod, choices);
+    // Round 6 (R1-06): Free (also held on AWS) has one size and a calendar-month allowance: "About 5 of 8 hours left this month".
+    const free = plan?.sku === 'free_v3';
+    const lines = hoursLeftLines(hoursPeriod, choices, { monthly: free });
     const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
     const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
+    const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
-        : esc(lines?.equivalents ?? '');
+        : lines?.equivalents ? esc(lines.equivalents)
+        : free && sessionHours ? `Free sessions last up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}.` : '';
     const ai = summary?.ai, grant = ai?.grant;
     // Round 5 D1: an account without EZiL ID has its credits parked; the server says so, never "Unavailable".
     const enrollment = ai ? ai.enrollment ?? 'enrolled' : null;
@@ -90,22 +94,27 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const denominator = included ? included.granted : count(grant?.amount) && grant.amount > 0 ? grant.amount : null;
     const aboveGrant = !included && balance !== null && denominator !== null && balance > denominator;
     // ADV-6: nothing to measure until the account is enrolled — no bar beside "N credits waiting".
-    const aiPercent = enrollment !== 'enrolled' ? null : aboveGrant ? 100 : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
+    // Round 6 (R1-10): a balance above the grant has no denominator to show, so no bar (never a full one by construction).
+    const aiPercent = enrollment !== 'enrolled' || aboveGrant ? null : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
     const aiState = enrollment && enrollment !== 'enrolled' ? 'pending' : balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
         : ai?.state === 'low' ? 'warn' : 'ok';
     const grantLabel = denominator !== null ? creditsLabel(null, denominator) : null;
-    // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
-    const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
-        : grant.per === 'once' ? `Includes ${grantLabel} one-time trial credits` : '' : '';
     // ADV-1 (same rule as Billing): split only from the server's breakdown, and only when it adds up
     // to the balance — never balance minus grant, which assumes the grant is unspent.
     const purchased = ai?.purchased && Number.isSafeInteger(ai.purchased.remaining) && ai.purchased.remaining >= 0 ? ai.purchased.remaining : null;
     const starter = ai?.starter && Number.isSafeInteger(ai.starter.remaining) && ai.starter.remaining >= 0 ? ai.starter.remaining : null;
-    const splitParts = aboveGrant && purchased > 0 && (starter ?? 0) + purchased === balance ? { plan: starter ?? 0, extra: purchased } : null;
+    // Round 6 (R4-05): credits kept from an earlier plan or period (a cancel keeps them until they expire), named and dated.
+    const previous = ai?.previous && Number.isSafeInteger(ai.previous.remaining) && ai.previous.remaining > 0 && validDate(ai.previous.expiresAt) ? ai.previous : null;
+    // "Your plan adds N every month" only when this period's grant is not split out: right after an upgrade it was false.
+    // Round 6 (R1-10): the trial grant is said once, by the starter line when the server reports it.
+    const grantNote = included ? `Resets ${timestamp(included.periodEnd)}` : grantLabel ? grant.per === 'period' ? `Your plan adds ${grantLabel} every month`
+        : grant.per === 'once' && !(starter > 0) ? `Includes ${grantLabel} one-time trial credits` : '' : '';
+    const splitParts = aboveGrant && purchased > 0 && (starter ?? 0) + purchased + (previous?.remaining ?? 0) === balance ? { plan: starter ?? 0, extra: purchased } : null;
     const split = splitParts ? `${esc(creditsLabel(null, splitParts.plan))} from your plan + ${esc(creditsLabel(null, splitParts.extra))} extra` : '';
     const extras = [
         purchased > 0 ? splitParts ? `Extra credits expire ${timestamp(ai.purchased.expiresAt)}` : `+ ${esc(creditsLabel(null, purchased))} purchased · expire ${timestamp(ai.purchased.expiresAt)}` : '',
         starter > 0 && !splitParts ? `${esc(creditsLabel(null, starter))} starter credits left` : '',
+        previous ? `${esc(creditsLabel(null, previous.remaining))} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'your last billing period'} · expire ${timestamp(previous.expiresAt)}` : '',
         ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
     ].filter(Boolean);
     const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
@@ -140,10 +149,16 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
         : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
         : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
+    // Round 6 (CR-2): the open session's deadline is said even while its heartbeat is late (the Free hold's
+    // 1-hour cut comes with a time). A clock time only within a day of the reading; a paid fair-use
+    // deadline weeks away is no time "today".
+    const deadline = summary?.computer?.activeDeadline;
+    const ends = validDate(deadline) && validDate(usage?.asOf) && Date.parse(deadline) - Date.parse(usage.asOf) <= 86_400_000
+        ? ` · ends ${timestamp(deadline, true)}` : '';
     const sessionLine = !['recording', 'stale', 'ended'].includes(current.state) ? 'No session recorded yet.'
         : current.state === 'ended' ? `Last session: ${duration(current.elapsedSeconds)} · ended ${timestamp(current.endedAt)}`
-        : current.state === 'stale' || stale ? measuringLine(current.elapsedSeconds)
-        : `This session: ${duration(current.elapsedSeconds)} · running${validDate(summary?.computer?.activeDeadline) ? ` · ends ${timestamp(summary.computer.activeDeadline, true)}` : ''}`;
+        : current.state === 'stale' || stale ? `${measuringLine(current.elapsedSeconds)}${ends}`
+        : `This session: ${duration(current.elapsedSeconds)} · running${ends}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
     ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}

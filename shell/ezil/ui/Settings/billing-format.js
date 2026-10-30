@@ -144,16 +144,32 @@ export function planBullets (offer, { existingDisk } = {}) {
     ]) };
 }
 
-/** "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it. */
-export function hoursLeftLines (period, machineChoice = []) {
+/**
+ * "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it.
+ * Round 6: an equivalent with the current size's vCPU and weight says nothing new, so it is left out
+ * (R1-07: "Same as 5 hours at 2 vCPU" under "About 5 hours left at 2 vCPU"). `monthly` (Free: one size,
+ * a calendar-month allowance) says the month's allowance instead of the size: "About 5 of 8 hours left
+ * this month" (R1-06).
+ */
+export function hoursLeftLines (period, machineChoice = [], { monthly = false } = {}) {
     if ( ! period || ! Number.isSafeInteger(period.remainingHoursAtCurrent) || period.remainingHoursAtCurrent < 0 ) return null;
     const vcpuOf = size => machineChoice.find(m => m.size === size)?.vcpu ?? { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8, 'free-cf': 2 }[size];
+    const weightOf = size => machineChoice.find(m => m.size === size)?.weight ?? { 'std-2': 1, 'cmp-4': 2, 'cmp-8': 4, 'free-cf': 1 }[size];
     const current = vcpuOf(period.currentSize);
+    const weight = Number.isSafeInteger(period.currentWeight) && period.currentWeight >= 1 ? period.currentWeight : weightOf(period.currentSize) ?? 1;
     const hours = n => `${whole(n)} hour${n === 1 ? '' : 's'}`;
-    const others = (period.equivalents ?? []).filter(e => e && e.size !== period.currentSize && Number.isSafeInteger(e.hours))
+    const others = (period.equivalents ?? []).filter(e => e && e.size !== period.currentSize && Number.isSafeInteger(e.hours)
+        && ! (vcpuOf(e.size) === current && e.weight === weight))
         .sort((a, b) => b.weight - a.weight).map(e => `${hours(e.hours)} at ${vcpuOf(e.size)} vCPU`);
+    const left = period.remainingHoursAtCurrent;
+    const allowance = Number.isSafeInteger(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0
+        ? Math.floor(period.allowanceStandardSeconds / weight / 3600) : null;
+    const underAnHour = left === 0 && Number.isFinite(period.remainingStandardSeconds) && period.remainingStandardSeconds > 0;
+    const main = ! monthly ? `About ${hours(left)} left at ${current} vCPU`
+        : underAnHour ? 'Less than an hour left this month'
+        : allowance !== null && allowance >= left ? `About ${whole(left)} of ${hours(allowance)} left this month` : `About ${hours(left)} left this month`;
     return {
-        main: `About ${hours(period.remainingHoursAtCurrent)} left at ${current} vCPU`,
+        main,
         equivalents: others.length ? `Same as ${others.slice(0, -1).join(', ')}${others.length > 1 ? ' or ' : ''}${others.at(-1)}.` : null,
     };
 }

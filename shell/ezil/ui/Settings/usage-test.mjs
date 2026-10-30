@@ -161,7 +161,8 @@ check('server fair-use state and reset fallback', () => {
 });
 check('AI topups, trial grants, zero grants and microcredits', () => {
     const topup = rendered(sample, withAI({ balance: 1200 }));
-    assert.equal(progress(topup, 'ai').getAttribute('aria-valuenow'), '100');
+    // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).
+    assert.equal(progress(topup, 'ai'), null);
     assert.match(meter(topup, 'ai').textContent, /1,200 left/);
     // ADV-1: no breakdown from the server, so no invented "plan + extra" split.
     assert.doesNotMatch(meter(topup, 'ai').textContent, /from your plan|1,000 extra/);
@@ -249,6 +250,79 @@ check('round 3: storage is the provisioned disk; used only when measured; Free s
     const free = rendered({ ...sample, storage: { state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null }, samples: [] } });
     assert.doesNotMatch(meter(free, 'storage').textContent, /\d+ GB|Limit/);
     assert.match(meter(free, 'storage').textContent, /Your files are saved between sessions\./);
+});
+// Round 6 (R1-06/07/09/10, R4-05, CR-2): the founder's Usage on 10-30. contact@ is Free (every subscription
+// cancelled at once), the files are held on the AWS computer, a std-2 hold session is running with no heartbeat.
+const heldUsage = { ...sample, asOf: '2026-10-30T05:44:00Z',
+    session: { computerId: 'computer-a', state: 'stale', startedAt: '2026-10-30T05:42:01Z', observedAt: '2026-10-30T05:42:01Z', elapsedSeconds: 0, endedAt: null },
+    period: { unit: 'standard_seconds', startsAt: '2026-10-01T00:00:00Z', resetsAt: '2026-11-01T00:00:00Z', usedStandardSeconds: 8640,
+        allowanceStandardSeconds: 28800, remainingStandardSeconds: 20160, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 5,
+        equivalents: [{ size: 'std-2', weight: 1, hours: 5 }] },
+    storage: { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: null, usedGiB: null, growsOnSwitch: false }, samples: [] } };
+const heldSummary = { ...summary,
+    plan: { sku: 'free_v3', name: 'Free', status: 'free', renewal: null, cancelsAt: null, scheduledChange: null, pendingUpgrade: null, paymentIssue: null },
+    computer: { size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: 3600, opening: 'standard', activeDeadline: '2026-10-30T06:42:00Z',
+        machineChoice: [{ size: 'free-cf', vcpu: 2, memoryGiB: 6, weight: 1, arch: 'x86_64' }], standing: 'files_on_aws', filesOn: 'aws' },
+    ai: { grant: { amount: 100, per: 'once' }, balance: 763, state: 'ok', included: null, purchased: null, starter: { remaining: 100 },
+        previous: { remaining: 663, expiresAt: '2026-11-30T12:00:00Z' }, pendingFromRenewal: null, enrollment: 'enrolled', waiting: null },
+    actions: { ...summary.actions, checkout: true, upgrade: false, cancel: false } };
+const clock = iso => new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(iso));
+check('round 6: Free held on AWS — "About 5 of 8 hours left this month", no "Same as", the real 50 GB disk', () => {
+    const el = rendered(heldUsage, heldSummary);
+    assert.match(meter(el, 'compute').querySelector('.usage-value').textContent, /^About 5 of 8 hours left this month$/);
+    assert.doesNotMatch(el.textContent, /Same as/);
+    assert.match(meter(el, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.match(meter(el, 'storage').textContent, /50 GB disk/);
+    assert.doesNotMatch(el.textContent, /Saved with your computer/);
+    // An older server (no hold branch) still sends the Cloudflare equivalent: same vCPU and weight, so no line either.
+    const older = rendered({ ...heldUsage, period: { ...heldUsage.period, equivalents: [{ size: 'free-cf', weight: 1, hours: 5 }] } }, heldSummary);
+    assert.doesNotMatch(older.textContent, /Same as/);
+    // A real equivalent at another weight is still named (Premium).
+    const premium = rendered({ ...heldUsage, period: { ...heldUsage.period, equivalents: [{ size: 'std-2', weight: 1, hours: 5 }, { size: 'cmp-4', weight: 2, hours: 2 }] } });
+    assert.match(meter(premium, 'compute').textContent, /About 5 hours left at 2 vCPU/);
+    assert.match(meter(premium, 'compute').textContent, /Same as 2 hours at 4 vCPU\./);
+    // Under an hour, and an account with the 5-hour Free.
+    assert.match(rendered({ ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } }, heldSummary).textContent, /Less than an hour left this month/);
+    assert.match(rendered({ ...heldUsage, period: { ...heldUsage.period, allowanceStandardSeconds: 18000, remainingStandardSeconds: 9360, remainingHoursAtCurrent: 2 } }, heldSummary)
+        .textContent, /About 2 of 5 hours left this month/);
+});
+check('round 6: AI credits on Free after a cancel — no full bar, the 100 said once, the 663 named with their expiry', () => {
+    const el = rendered(heldUsage, heldSummary);
+    const ai = meter(el, 'ai');
+    assert.match(ai.querySelector('.usage-value').textContent, /^763 left$/);
+    assert.equal(progress(el, 'ai'), null, 'no bar against the 100 trial credits when the balance is above them');
+    assert.equal((ai.textContent.match(/\b100\b/g) ?? []).length, 1, ai.textContent);
+    assert.match(ai.textContent, /100 starter credits left/);
+    assert.doesNotMatch(ai.textContent, /one-time trial credits/);
+    assert.match(ai.textContent, /663 from your previous plan · expire Nov 30, 2026/);
+    // A paid plan's last-period tail is "your last billing period", never "previous plan".
+    const paid = rendered(sample, withAI({ balance: 1012, included: { granted: 1000, remaining: 812, periodEnd: '2026-11-27T00:00:00Z' },
+        previous: { remaining: 200, expiresAt: '2026-10-13T00:00:00Z' } }));
+    assert.match(meter(paid, 'ai').textContent, /200 from your last billing period · expire Oct 13, 2026/);
+    assert.equal(progress(paid, 'ai').getAttribute('aria-valuenow'), '81');
+    // Spent or unknown: no line.
+    for (const previous of [null, undefined, { remaining: 0, expiresAt: '2026-11-30T12:00:00Z' }, { remaining: 5, expiresAt: 'soon' }])
+        assert.doesNotMatch(rendered(heldUsage, { ...heldSummary, ai: { ...heldSummary.ai, previous } }).textContent, /previous plan|Invalid|undefined/);
+    // Under the trial grant the bar stays, against the 100.
+    const trial = rendered(heldUsage, { ...heldSummary, ai: { ...heldSummary.ai, balance: 60, starter: { remaining: 60 }, previous: null } });
+    assert.equal(progress(trial, 'ai').getAttribute('aria-valuenow'), '60');
+    assert.match(meter(trial, 'ai').textContent, /60 starter credits left/);
+    assert.doesNotMatch(meter(trial, 'ai').textContent, /one-time trial credits/);
+});
+check('round 6 (CR-2): a stale hold session still says when it ends; a far-off paid deadline shows no clock time', () => {
+    const el = rendered(heldUsage, heldSummary);
+    assert.match(meter(el, 'session').textContent, new RegExp(`Measuring this session… · ends ${clock('2026-10-30T06:42:00Z')}`));
+    assert.match(meter(rendered({ ...heldUsage, session: { ...heldUsage.session, state: 'recording', elapsedSeconds: 120 } }, heldSummary), 'session').textContent,
+        new RegExp(`running · ends ${clock('2026-10-30T06:42:00Z')}`));
+    // Ended: no deadline.
+    assert.doesNotMatch(meter(rendered({ ...heldUsage, session: { ...heldUsage.session, state: 'ended', endedAt: '2026-10-30T06:42:00Z' } }, heldSummary), 'session').textContent, /ends \d/);
+    // A paid fair-use deadline days away is not a clock time today.
+    const far = rendered(sample, { ...summary, computer: { ...summary.computer, activeDeadline: '2026-11-20T06:40:00Z' } });
+    assert.doesNotMatch(meter(far, 'session').textContent, /ends/);
+    for (const node of [el, far]) {
+        assert.deepEqual(scanCopy(node.textContent), []);
+        assert.doesNotMatch(node.textContent, /mumbai/i);
+    }
 });
 check('session states and null runtime remain honest', () => {
     for (const state of ['stale', 'ended', 'unavailable']) {
