@@ -254,7 +254,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 
 ### 3.4 Store surface (`createProviderReverseStore(db)`)
 
-- **Reads:** `readById`, `readByComputer` (newest, any state), `readActiveByComputer` (holding), **`readByExportBoot(computerId, placementGeneration, leaseEpoch)`** (newest row of ANY state whose `export_boot` claimed exactly that pair; §5.2 keys on it).
+- **Reads:** `readById`, `readByComputer` (newest, any state), `readActiveByComputer` (holding), **`readByExportBoot(computerId, placementGeneration, leaseEpoch, volumeId)`** (the newest row in any state **except `committed`** whose `export_boot` claimed exactly that triple; §5.2 keys on it).
 - **Writes:** `createOrGetActive`, `recordExportBoot`, `advance`, `recordExportHead`, `recordImportProgress`, `recordRetry`, `fail`, `finish`, `recordSnapshot`, `claimStale(limit ≤ 10)`.
   - `claimStale` takes in-flight rows idle for 30 s, oldest first, with `FOR UPDATE SKIP LOCKED`, and bumps `updated_at` only. It mirrors forward `claimStale`. `failed_needs_operator` is never claimed.
 - **Row fields added in r2:** `stateEnteredAt`, `commitSentAt` (DB-clock text).
@@ -295,7 +295,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - Lane W makes it **also block while `ezil:reverseImport` exists**.
   - The hydrate fence already blocks on the flag by prefix (`index.ts:2781-2783`).
 - **Flag:** `P/.ezil-snapshots/migrating.json` = `{startedAt, reverse:{moveId, generation}}` (`workspace-persist.ts:189`).
-  - It goes stale 40 min after `startedAt` (`workspace-persist.ts:201`), so **every `begin`, `pull` and `commit{verifyOnly:true}` rewrites `startedAt`** (at most once per request).
+  - It goes stale 40 min after `startedAt` (`workspace-persist.ts:201`), so **every `begin`, `pull` and `commit` (both kinds, before any other write) rewrites `startedAt`** (at most once per request). Between requests, `checking` (≤ 20 min) plus `flipping` (≤ 30 min) can outlast 40 min; the `ezil:reverseImport` start fence covers any such gap.
   - Garbage collection is already safe: it is suspended under a migrated head and does nothing with no head (`workspace-persist.ts:594-597`).
 - **Errors.** A transient store read or write failure is `503`, never a 409. 409 is only for the closed codes below.
 
@@ -404,7 +404,11 @@ The claim runs under `withAdmission` and then the computer lock (`placement.ts:5
 
 ### 5.2 Export-boot placement path (receipts mode and release; no new placement edges)
 
-**Receipts: an export-boot mode, not a skip.** `applyLifecycleReceipt` (`aws-receipts.ts:247`) keeps running for the export boot. It switches to export-boot mode when `p0.provider === 'aws-ec2'` and `readByExportBoot(p0.computerId, p0.generation, p0.leaseEpoch)` returns a row **in any state**. (A database without 0012 has none: probe `to_regclass` first, as §3.3 does.) Keying on any state means a released row still keeps its own boot out of RUNNING, and the next boot at N+2/E+2 never matches. In this mode exactly two things change:
+**Receipts: an export-boot mode, not a skip.** `applyLifecycleReceipt` (`aws-receipts.ts:247`) keeps running for the export boot. It switches to export-boot mode when `p0.provider === 'aws-ec2'` and `readByExportBoot(p0.computerId, p0.generation, p0.leaseEpoch, p0.volumeId)` returns a row. (A database without 0012 has none: probe `to_regclass` first, as §3.3 does.) The lookup matches every state **except `committed`**, on the same volume:
+- a released (`failed_*`) row still keeps its own boot out of RUNNING, and that placement's next boot at N+2/E+2 never matches;
+- a committed row never matches: the flip deleted that placement row, so a later `aws-ec2` row (a forward move onto a fresh volume) may reach the same counters and must boot normally.
+
+In this mode exactly two things change:
 1. `STARTING → MOUNTING` is written with the receipt fields `done` and **no usage effect**. At base it carries `open` (`aws-receipts.ts:462`): the usage row opens at MOUNTING, not at RUNNING.
 2. **`MOUNTING → RUNNING` is never taken**: not in the enrolled branch for a cleared job (`:290-291`), and not at the tail (`:463-466`). So there is no `meter.ready` and no epoch (`:265-277`), no usage row, and no `sessionLimitFor` lease or hours-cap stop (`:681-690`).
 
@@ -715,7 +719,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 
 ## 10. Changes in r2 (review of `dc362e53`)
 
-1. Export-boot placement path pinned with **no new edges**. The receipts get an export-boot mode, keyed on `readByExportBoot` in any state, instead of a whole-function skip. It suppresses the MOUNTING-time usage open and RUNNING. The release reuses the existing enrollment-host-retire chain, which lands STOPPED/`INSTANCE_LOST` at N+1/E+1 (§5.2).
+1. Export-boot placement path pinned with **no new edges**. The receipts get an export-boot mode, keyed on `readByExportBoot` (any state except `committed`, same volume), instead of a whole-function skip. It suppresses the MOUNTING-time usage open and RUNNING. The release reuses the existing enrollment-host-retire chain, which lands STOPPED/`INSTANCE_LOST` at N+1/E+1 (§5.2).
 2. Capture mechanics pinned. A dedicated export spec: read-only lower root, `/tmp` on a root-volume dir so the codec's own `mkdir` works, read-only `/workspace`, no profiles bind, a new network namespace. Plus a free-space floor, and python3/git as T0 (b2) (§2.5).
 3. `workspace_too_large` reaches the app. The codec's exit 3 now covers `export-capture`, the Worker sends top-level 409 codes, and retry is refused until an AWS session (§2.6, §4.3, §5.5).
 4. The point of no return is durable. `commit_sent_at` is set by `checking → flipping` under the locks with the entitlement re-check. `flipping` never reopens (store and CHECK). The export host is retired before the commit. The Worker serialises commit and abort and adds `commit_in_progress` (§3, §4, §5.6).

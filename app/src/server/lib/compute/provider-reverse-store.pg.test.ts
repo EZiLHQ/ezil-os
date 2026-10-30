@@ -345,20 +345,31 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect(later!.ok).toBe(true);
     });
 
-    it('readByExportBoot finds the row that claimed a placement generation and lease epoch, in any state', async () => {
+    it('readByExportBoot: the non-committed row that claimed this placement generation, lease epoch and volume', async () => {
+        const g = boot.placementGeneration, e = boot.leaseEpoch, v = boot.volumeId;
         const m = await reverse.recordExportBoot(await create(), boot);
-        expect((await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch))!.id).toBe(m.id);
-        expect(await reverse.readByExportBoot(C, boot.placementGeneration + 1, boot.leaseEpoch)).toBeNull();
-        expect(await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch + 1)).toBeNull();
-        expect(await reverse.readByExportBoot(C2, boot.placementGeneration, boot.leaseEpoch)).toBeNull();
+        expect((await reverse.readByExportBoot(C, g, e, v))!.id).toBe(m.id);
+        expect(await reverse.readByExportBoot(C, g + 1, e, v)).toBeNull();
+        expect(await reverse.readByExportBoot(C, g, e + 1, v)).toBeNull();
+        expect(await reverse.readByExportBoot(C, g, e, 'vol-0123456789abcdef0')).toBeNull();
+        expect(await reverse.readByExportBoot(C2, g, e, v)).toBeNull();
         // A released row still owns its boot, so the receipts path keeps that boot out of RUNNING.
         await reverse.fail(m, 'failed_reopened', 'boot_timeout');
-        expect(await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch)).toMatchObject({ id: m.id, state: 'failed_reopened' });
-        // The next move claims N+2/E+2; each boot maps to its own row.
-        const next = await reverse.recordExportBoot(await create(), { ...boot, placementGeneration: boot.placementGeneration + 2, leaseEpoch: boot.leaseEpoch + 2 });
-        expect((await reverse.readByExportBoot(C, boot.placementGeneration + 2, boot.leaseEpoch + 2))!.id).toBe(next.id);
-        expect((await reverse.readByExportBoot(C, boot.placementGeneration, boot.leaseEpoch))!.id).toBe(m.id);
-        await expect(reverse.readByExportBoot(C, 1.5, 7)).rejects.toEqual(conflict('invalid_input'));
+        expect(await reverse.readByExportBoot(C, g, e, v)).toMatchObject({ id: m.id, state: 'failed_reopened' });
+        // The same row's next move claims N+2/E+2; each boot maps to its own row.
+        const next = await reverse.recordExportBoot(await create(), { ...boot, placementGeneration: g + 2, leaseEpoch: e + 2 });
+        expect((await reverse.readByExportBoot(C, g + 2, e + 2, v))!.id).toBe(next.id);
+        expect((await reverse.readByExportBoot(C, g, e, v))!.id).toBe(m.id);
+        // A committed move never matches: a later aws-ec2 row (forward onto a fresh volume) may reach the same counters.
+        let f = await reverse.advance(await reverse.recordExportBoot(next, { ...next.exportBoot!, jobId: JOB, instanceId: 'i-0123456789abcdef0' }), 'exporting');
+        f = await reverse.recordExportHead(f, headFor(f.generation));
+        f = await reverse.recordImportProgress(f, [0, 1, 2]);
+        const done = await reverse.finish(await reverse.advance(await reverse.advance(f, 'checking'), 'flipping'),
+            { awsVolumeId: v, awsFsUuid: null, awsSnapshotId: null });
+        expect(done.state).toBe('committed');
+        expect(await reverse.readByExportBoot(C, g + 2, e + 2, v)).toBeNull();
+        for (const bad of [[1.5, e, v], [g, Number.NaN, v], [g, e, 'vol-NOPE']] as const)
+            await expect(reverse.readByExportBoot(C, bad[0], bad[1], bad[2])).rejects.toEqual(conflict('invalid_input'));
     });
 
     it('RLS is enabled with no policy, and no client role keeps any privilege (defaults granted ALL)', async () => {

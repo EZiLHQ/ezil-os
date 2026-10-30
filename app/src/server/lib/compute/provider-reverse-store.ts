@@ -251,14 +251,19 @@ export function createProviderReverseStore(db: PlacementExecutor, options: { now
         WHERE computer_id = ${computerId}::uuid ORDER BY ezil_compute_reverse_moves.created_at DESC, id DESC LIMIT 1`));
     const readActiveByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
         WHERE computer_id = ${computerId}::uuid AND ${HOLDING}`));
-    /** The newest row (ANY state) that claimed this placement generation and lease epoch for its export boot.
-     * The receipts path keys its export-boot mode on this (contract §5.2), so a released row still keeps its
-     * own boot out of RUNNING, and the next boot (N+2/E+2) never matches. */
-    const readByExportBoot = async (computerId: string, placementGeneration: number, leaseEpoch: number) => {
-        if (!Number.isSafeInteger(placementGeneration) || !Number.isSafeInteger(leaseEpoch)) refuse('invalid_input');
+    /**
+     * The newest NON-committed row (in flight or failed) whose export boot claimed exactly this placement generation,
+     * lease epoch and data volume. The receipts path keys its export-boot mode on this (contract §5.2):
+     * - a released (failed) row still keeps its own boot out of RUNNING, and the same row's next boot (N+2/E+2) never matches;
+     * - a committed row never matches: the flip deleted that placement row, so a later aws-ec2 row (a forward move onto a
+     *   fresh volume) can reach the same counters and must boot normally. The volume match excludes it twice over.
+     */
+    const readByExportBoot = async (computerId: string, placementGeneration: number, leaseEpoch: number, volumeId: string) => {
+        if (!Number.isSafeInteger(placementGeneration) || !Number.isSafeInteger(leaseEpoch) || !VOLUME.test(volumeId)) refuse('invalid_input');
         return one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_reverse_moves
-            WHERE computer_id = ${computerId}::uuid
-              AND export_boot @> jsonb_build_object('placementGeneration', ${placementGeneration}::int, 'leaseEpoch', ${leaseEpoch}::int)
+            WHERE computer_id = ${computerId}::uuid AND state <> 'committed'
+              AND export_boot @> jsonb_build_object('placementGeneration', ${placementGeneration}::int, 'leaseEpoch', ${leaseEpoch}::int,
+                'volumeId', ${volumeId}::text)
             ORDER BY ezil_compute_reverse_moves.created_at DESC, id DESC LIMIT 1`));
     };
     const legal = (from: ReverseMoveState, to: ReverseMoveState) => REVERSE_MOVE_TRANSITIONS[from]?.includes(to) ?? false;
