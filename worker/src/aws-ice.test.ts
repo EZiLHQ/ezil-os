@@ -426,6 +426,15 @@ describe('ensureAwsDesktop: one config push per host boot while the host applies
     expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeGreaterThanOrEqual(120_000);
     expect(AWS_DESKTOP_CONFIG_APPLY_MS).toBeLessThan(215_000);
   });
+  it('a recorded push whose config the host no longer holds (expired) is a past episode: push again, never the terminal code', async () => {
+    // e.g. the desktop crashed long after the first push and restarted without a relay once its config expired.
+    const h = fakeHost({ configured: false, desktop: 'running', ice: 'missing', bootId: BOOT, aiConfigured: false, pushState: 'restart_scheduled' });
+    const o = opener(h, { aiBootId: BOOT, restartPushBootId: BOOT, restartPushAt: NOW - 40 * 60_000 });
+    expect(await o.ask()).toEqual({ state: 'starting', reason: 'restart_scheduled' });
+    expect([o.pushes(), o.reg.writes]).toEqual([1, 1]);
+    expect(o.reg.rec.restartPushAt).toBe(NOW);
+    expect(await o.ask(NOW + 2_000)).toEqual({ state: 'starting', reason: 'config_pending' });
+  });
   it('a new host boot (another bootId) is pushed again; so is an older host that reports no boot id', async () => {
     const h = fakeHost({ configured: true, expiresAt: NOW + 1_700_000, desktop: 'running', ice: 'applied', bootId: BOOT, aiConfigured: false,
       pushState: 'restart_scheduled' });

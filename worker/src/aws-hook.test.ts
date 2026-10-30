@@ -121,7 +121,8 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
     if (url.pathname.startsWith('/__ezil/control/restart-desktop/')) return j({ ok: true, state: 'restart_requested' });
     if (url.pathname === '/__p/8443/healthz') return h.codeUp ? j({ status: 'alive' }) : j({ ok: false, error: 'desktop_unreachable' }, 502);
-    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
+    // Like the host: the held config's expiry once one was pushed (agent.py _desktop_status).
+    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: h.pushed?.expiresAt ?? null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
       h.pushed = JSON.parse(body);

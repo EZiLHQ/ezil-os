@@ -445,7 +445,9 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
     const boot = status.bootId;
     if (!boot || !p.restartPush) return pushDesktopConfig(p, status);
     const { restartPushBootId, restartPushAt } = p.record;
-    if (restartPushBootId === boot && typeof restartPushAt === 'number') {
+    // Pending only while the host still holds a fresh config: one it no longer holds (expired)
+    // belongs to an earlier episode of this boot, so this one gets its own push.
+    if (fresh && restartPushBootId === boot && typeof restartPushAt === 'number') {
       if (now - restartPushAt >= AWS_DESKTOP_CONFIG_APPLY_MS) throw new RelayFailure('aws_desktop_config_unapplied', 502);
       return { state: 'starting', reason: 'config_pending' };
     }
