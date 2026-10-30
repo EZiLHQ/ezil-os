@@ -8,7 +8,9 @@ finding to its section). **r5 dispositions every one of that review's 28 finding
 r4 verifier gap (§12.1).** Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections r4 changed carry
 **[r4]**; sections r5 changed carry **[r5]**.
 
-**Base:** citations are `path:line` at `74ed2c92`. They point to the code each rule is based on.
+**Base [r6]:** citations are `path:line` at `7a1f2ed1` (`r6/integ-20261030`, round 6a, LIVE on os-staging). r6 rebased
+this branch onto it (no conflicts) and re-pinned every citation into a file 6a changed; a file 6a did not change is
+byte-identical to `74ed2c92`, so its citations carry over. They point to the code each rule is based on.
 Citations to `provider-reverse-store.ts`, `0012` and the edited `provider-migrate-store.ts` are to this
 branch (`r6/phaseb-20261030`).
 
@@ -87,7 +89,7 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 | **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`, which lane O does not need to change, §7.2**), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
 | **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
 | **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r4 on)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
-| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the files-held banner, §6.2)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
+| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the Billing tab during a move, §6.2; [r6] its banner copy is 6a's and is not edited)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
 | **O** | `app/src/server/lib/compute/provider-reverse-snapshot.ts` *new* (start the snapshot execution, read its receipt, `recordSnapshot`, `markSnapshotSpent`, and **[r5]** the per-pass `snapshot_missing` line, §7), `app/src/server/lib/compute/retention.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts` *new*, the stack and IAM wiring for that machine: `infra/app-computers/lib/reverse-snapshot.ts` *new* and **[r5]** its registration in `infra/app-computers/bin/lifecycle.ts` and `infra/app-computers/lib/computer-lifecycle.ts`. **[r5] The deployment field `reverseSnapshotStateMachineVersionArn`, end to end (§7.2):** `app/src/server/lib/compute/aws-intent.ts` (the deployment schema only) with `aws-intent.fixtures.json`, `aws-intent.test-support.ts` and the tests that pin that schema; `infra/app-computers/lib/lifecycle/deployment.ts` (the one strict schema every infra parser imports: `intent.ts`, `contract.ts`, `preparation-contract.ts`, `recovery-contract.ts`, `release-manifest.ts` and `identity.ts` take the change through the import and are not edited); `infra/app-computers/test/app-intent-contract.test.ts` and its fixtures; `infra/app-computers/lib/app-caller.ts` (StartExecution, DescribeExecution, GetExecutionHistory and the KMS `EncryptionContext` machine list) with `test/app-caller.test.ts`, `test/iam-exact.test.ts` and `test/__snapshots__/{app-caller,iam-policies}.json`. Also `infra/app-computers/lib/ops.ts` (DLM role), the tests of all of these, and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r5] Not O's:** `release-manifest.ts` and its strict app mirror `aws-rebase-release.ts` stay unchanged, because the field is not a release field (§7.2). |
 
 **[r4] Read-only on purpose:** `app/src/components/desktop/boot-phases.ts` and `boot-phases.shell.js` (drift-guarded
@@ -122,7 +124,7 @@ So the export needs new edge routes, a new agent op and a bake. The bake is the 
 
 ### 2.2 Edge routes (all gw1-verified; each verified request counts as presence)
 
-The signature is unchanged: `x-ezil-gw: gw1.<ts>.<hex>` = HMAC-SHA256(controlKey, `gw1|ts|computerId|generation|leaseEpoch|METHOD|path`), with skew −120/+5 s (`edge.py:1-7,45-46`; Worker signer `aws-origin.ts:165-173`). Here `generation` is the placement's integer, as today. The signature covers the path only, so **every input is in the path, or a body whose sha256 is in the path**, as `ice` does (`edge.py:58-60,408-425`).
+The signature is unchanged: `x-ezil-gw: gw1.<ts>.<hex>` = HMAC-SHA256(controlKey, `gw1|ts|computerId|generation|leaseEpoch|METHOD|path`), with skew −120/+5 s (`edge.py:1-7,45-46`; Worker signer `aws-origin.ts:174-182`). Here `generation` is the placement's integer, as today. The signature covers the path only, so **every input is in the path, or a body whose sha256 is in the path**, as `ice` does (`edge.py:58-60,408-425`).
 
 | Method + path | Body | Served by | Success | Errors (JSON `{ok:false,error}`) |
 |---|---|---|---|---|
@@ -167,7 +169,7 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 - The head JSON fits in 128 KiB (`workspace-persist.ts:235`).
 - `skipped` counts what the codec skips **and counts**: unrepresentable names, sockets, FIFOs, devices, and absolute or escaping links (`workspace-snapshot-script.ts:124,133,138`).
 - **Dropped and not counted:** untracked `node_modules`, `.next`, `.turbo` and `dist` directories (`CACHES`, `workspace-snapshot-script.ts:13,121`), and the codec's internal files. The user copy must say so (§6.3); `skipped` never includes them.
-- The app enforces all of this as `validExportHead` (`provider-reverse-store.ts:214`). The app also checks `v === 1` and `moveId === row.id`, then stores the head without `v` and `moveId`.
+- The app enforces all of this as `validExportHead` (`provider-reverse-store.ts:255`). The app also checks `v === 1` and `moveId === row.id`, then stores the head without `v` and `moveId`.
 - When written to the store as a v1 head, `i` is dropped: `chunks: [{size, sha256}]` (`workspace-persist.ts:26-36`).
 
 ### 2.4 Status JSON
@@ -240,15 +242,15 @@ one owner (§1.1). Sources: the round 6 understand phase (R2-1, R2-4) and the ro
 
 | Item | What is wrong at base | Pinned outcome | Files (lane H) | Acceptance |
 |---|---|---|---|---|
-| **`pool_desktop_not_ready`** (R2-4) | First boot: the pool agent waits 180 s for neko (:8181) and code-server healthz (:8443), else raises `pool_desktop_not_ready` (`pool.py:282-293,355-363`). Each 300 s refresh waits 20 s and tolerates only `pool_retry_exhausted`/`pool_unavailable` (`pool.py:296-316`). `ezil-guard.service` is a oneshot with no `Restart=`, so one miss ends the host's pool agent for good. App side: a dead `booting` host still counts in `spares` (`ready-pool.ts:317`) and is failed only 10 min after `created_at` (`:208`), so no replacement launches meanwhile. | A readiness miss is never fatal. First boot retries `wait_ready` within a bound H pins in the test. A refresh keeps the host on `pool_desktop_not_ready` and tries again next refresh. The unit restarts a failed agent, with a bounded restart rate. App: a `booting` host with `enrolled_at` set and no `ready_at` more than 6 min after `enrolled_at` counts as failed, and not as a spare, so the planner launches its replacement in the same pass. The provision budget (2 per pass) and the region cap are unchanged. | `pool.py`, `ezil-guard.service`, the pool tests under `infra/host-agent/test/`; `ready-pool.ts`, `ready-pool.test.ts`, `ready-pool.pg.test.ts`. **A file outside this set changes this table first (lead), before any edit.** | Unit: a first-boot miss followed by success ends `ready`; a refresh miss keeps the host; the unit file restarts on failure, rate-bounded; the planner test above. Live: no host's `ezil-guard` journal ends on `pool_desktop_not_ready`, and no spare is retired about 11 min after launch for that cause. |
-| **F11** | After every pool adopt, the **first** refill the planner launches enrolls but never posts ready, and is retired about 10 min later (2/2 at 10-30 01:18Z, 2/2 at 07:14/07:18Z). The second refill is ready in 51–84 s. The pool is one spare short for about 10 min after each adopt. The cause is not known. | **Diagnosis first**, read-only on staging: the refill host's `ezil-guard` journal and its `ezil_compute_pool_hosts` timestamps (`enrolled_at`, `ready_at`, `editor_ready_at`), next to the adopt's own timeline. Then fix the cause in the file the diagnosis names. | Provisional: `pool.py`, `guard.py`, `ezil-guard.service` (host); `ready-pool.ts`, `aws-pool-replenish.ts`, `aws-pool-adopt.ts`, and the replenish-after-adopt call sites in `aws-ec2.ts` (`:519-525,627-629,776-779`) (app). **A cause outside this set changes this table first (lead), before any edit.** | Live: two consecutive adopts on staging, and each one's first refill posts ready. |
+| **`pool_desktop_not_ready`** (R2-4) | First boot: the pool agent waits 180 s for neko (:8181) and code-server healthz (:8443), else raises `pool_desktop_not_ready` (`pool.py:282-293,355-363`). Each 300 s refresh waits 20 s and tolerates only `pool_retry_exhausted`/`pool_unavailable` (`pool.py:296-316`). `ezil-guard.service` is a oneshot with no `Restart=`, so one miss ends the host's pool agent for good. **[r6] The app side shipped in round 6a** (`07e3173a`, `0d49c24c`, `3403c33e`): a `booting` spare with `enrolled_at` set, created more than 6 min ago (`POOL_BOOT_STALLED_MS`) and enrolled more than 5 min ago (`POOL_ENROLLED_READY_WAIT_MS`), is failed by `planPool` and no longer counts as a spare (`ready-pool.ts:45-57,224,228,337`), and replenish retires only a boot its own fail mark took (`aws-pool-replenish.ts:158-161`). | A readiness miss is never fatal. First boot retries `wait_ready` within a bound H pins in the test. A refresh keeps the host on `pool_desktop_not_ready` and tries again next refresh. The unit restarts a failed agent, with a bounded restart rate. **[r6]** App: done in 6a, with 6a's predicate (created + 6 min **and** enrolled + 5 min), which supersedes r5's "6 min after `enrolled_at`". The provision budget (2 per pass) and the region cap are unchanged. | `pool.py`, `ezil-guard.service`, the pool tests under `infra/host-agent/test/`. **[r6]** No app file: `ready-pool.ts` and its tests need no change for this item (they stay H's for F11 and C3). **A file outside this set changes this table first (lead), before any edit.** | Unit: a first-boot miss followed by success ends `ready`; a refresh miss keeps the host; the unit file restarts on failure, rate-bounded. (The planner tests shipped in 6a, `ready-pool.test.ts` and `ready-pool.pg.test.ts`.) Live: no host's `ezil-guard` journal ends on `pool_desktop_not_ready`, and no spare is retired about 11 min after launch for that cause. |
+| **F11** | After every pool adopt, the **first** refill the planner launches enrolls but never posts ready, and is retired about 10 min later (2/2 at 10-30 01:18Z, 2/2 at 07:14/07:18Z). The second refill is ready in 51–84 s. The pool is one spare short for about 10 min after each adopt. The cause is not known. | **Diagnosis first**, read-only on staging: the refill host's `ezil-guard` journal and its `ezil_compute_pool_hosts` timestamps (`enrolled_at`, `ready_at`, `editor_ready_at`), next to the adopt's own timeline. Then fix the cause in the file the diagnosis names. | Provisional: `pool.py`, `guard.py`, `ezil-guard.service` (host); `ready-pool.ts`, `aws-pool-replenish.ts`, `aws-pool-adopt.ts`, and the replenish-after-adopt call sites in `aws-ec2.ts` (`:550-556,658-660,816-819`) (app). **A cause outside this set changes this table first (lead), before any edit.** | Live: two consecutive adopts on staging, and each one's first refill posts ready. |
 | **C3** (R2-1) | The first Cloudflare → AWS move with a non-empty R2 workspace is always a cold `provision` (`provider-migrate-runtime.ts:66-110`), never the warm spare. The pool agent cannot take a restore: pool user data rejects `restore`, `parse_claim` whitelists the claim keys and `computer_lease` builds a lease without one (`lease.py:153-162`, `pool.py:60-61,221-239`). | A pool-restore adopt. Host: `parse_claim` accepts an optional restore lease (the existing `RestoreLease` shape) and `computer_lease` copies it into the lease, so the guard restores before the marker (`guard.py:347-358`, unchanged unless the restore path needs it). App: `provision` leases a pool host (`leasePoolHost`) in the same `withAdmission` transaction and runs `validateCapacity`. It records an `adopt` intent with `createVolume` and `dataVolumeGiB` in `_awsProvision`, and the pool claim carries the migration's restore lease. **Order:** the app half ships only after the AMI that accepts a restore claim is promoted. Until then `provision` stays cold, which is today's behaviour. | Host: `pool.py`, `lease.py`, `guard.py` (only if the restore path changes), tests. App: `provider-migrate-runtime.ts`, `provider-migrate-provision.ts`, `provider-migrate-store.ts` (only the `_awsProvision` shape), `aws-pool-claim.ts`, `app/src/app/api/compute/aws/pool/claim/route.ts`, `ready-pool.ts`, tests. **A file outside this set (for example a pool-runtime or enroll helper) changes this table first (lead), before any edit.** | Unit: a claim carrying a restore lease; `provision` leases a pool host under admission; enrollment accepts the adopt path. Live: a Free → Standard upgrade with a non-empty workspace adopts a spare (an `ezil_compute_pool_hosts` row for the instance, EC2 tag `ezil:pool=1`) and the restored workspace opens. |
 
 **Seams (one owner each):**
 - **`aws-receipts.ts` stays lane A's.** C3 needs `readMigrationReadyReceipt` (`aws-receipts.ts:1116-1130`) to accept the
   migration-bound adopt receipt, not only the PROVISIONING path. Lane H writes the exact rule as a sub-row of this table
   before lane A implements it, and A ships it with (or before) H's app half. Lane A's export-boot mode (§5.2) and this
-  path never overlap: a Free export boot is never a pool adopt (`aws-ec2.ts:476`).
+  path never overlap: a Free export boot is never a pool adopt (`aws-ec2.ts:498-500`).
 - **`placement.ts` stays lane A's.** Lane H adds no placement writer; it asks lane A, through this section, for any it needs.
 - **`aws-ec2.ts` is H's.** Lane A's §5.1.2 parity test only drives it. A change to `replaceIntent`'s fields updates
   that parity fixture in the same integration (H tells A first).
@@ -302,7 +304,7 @@ failed_needs_operator ─(operator)─► failed_reopened   only while commit_se
 failed_needs_operator ─(operator)─► committed         only while commit_sent_at IS NOT NULL (finish a stuck flip)
 ```
 
-The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:43`). Every write is a store call. The writer is always the app (lane A), except the operator releases.
+The table is `REVERSE_MOVE_TRANSITIONS` (`provider-reverse-store.ts:44`). Every write is a store call. The writer is always the app (lane A), except the operator releases.
 
 | Edge | Store call | Written by | Precondition the store enforces |
 |---|---|---|---|
@@ -332,12 +334,12 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   2. **the placement per-computer lock**: `pg_advisory_xact_lock(PLACEMENT_LOCK_NAMESPACE, hashtext(computerId::uuid::text))`, the same key as `placement.ts:212-214,542-548`, under READ COMMITTED only;
   3. check the other direction in a new statement;
   4. throw, which rolls back the insert.
-- They run in one transaction when the executor has one (`inMoveTransaction`, `provider-reverse-store.ts:173`).
+- They run in one transaction when the executor has one (`inMoveTransaction`, `provider-reverse-store.ts:205`).
 - The check comes after the lock, so the second creator sees the first's committed row. The PG race test runs 20 rounds with exactly one winner each. A mutant without the lock fails it 3/3.
 - **Forward refuses** (`MigrationConflictError`, `provider-migrate-store.ts:142`) while a reverse row is in a holding state.
   - It first probes `to_regclass('public.ezil_compute_reverse_moves')` as its own statement.
   - A database without 0012 (production, and the forward suites' schemas) therefore behaves exactly as before.
-- **Reverse refuses** (`forward_active`, `provider-reverse-store.ts:197`) while the forward machine still has work. That is an active forward row, or a `failed_*` row whose `_awsProvision` is not released: exactly what forward `claimStale` picks up (`provider-migrate-store.ts:107-118`).
+- **Reverse refuses** (`forward_active`, `provider-reverse-store.ts:351`) while the forward machine still has work. That is an active forward row, or a `failed_*` row whose `_awsProvision` is not released: exactly what forward `claimStale` picks up (`provider-migrate-store.ts:107-118`).
 - **Lock order** stays admission → computer (`placement.ts:30-41`). Never call either `createOrGetActive` on a *different* connection while holding the computer lock: the second call would wait on your own lock. Pass the same `tx`, or call it after commit.
 
 ### 3.4 Store surface (`createProviderReverseStore(db)`)
@@ -383,7 +385,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   reverse machine calls it first and treats `false` as "no reverse move": the forward create (`reverseMoveHolds`, now
   built on it), the receipts' export-boot lookup (§5.2), routing (§5.3), `computer.progress` (§5.10), the summary DTO
   (§6.1) and the open trigger (§5.9). Production has no 0012, and `readComputerProgress` swallows a throw into an empty
-  progress (`progress.ts:154-157`), so a missing probe would blank `computer.progress` for every production computer.
+  progress (`progress.ts:165-168`), so a missing probe would blank `computer.progress` for every production computer.
 - **[0012 probe] Production (no 0012) is a pinned, tested state, not an error:**
   - the sweep's `advanceReverseMoves` and lane O's `advanceReverseSnapshots` return at once when the probe is false. Like
     `advanceStaleMigrations` (`provider-migrate-orchestrator.ts:172-179`), neither ever throws out of the billing handler;
@@ -407,7 +409,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 - **Path:** `POST /sandbox/<name>/migrate/import/{begin,pull,commit,abort}`.
   - The app reuses `migrateRequest` (`cloudflare-guacamole-provider.ts:3365-3401`) with `action = 'import/<op>'`: signed control auth, and a 409 maps to the closed reason enum.
   - **Timeouts are passed per action** (lane A): `import/begin` 60 s, `import/pull` 40 s, `import/commit` 30 s, `import/abort` 60 s. The existing check `action === 'begin' ? 120_000 : 30_000` (`:3382`) does not match `import/begin`.
-  - Extend the route regex next to `index.ts:7827` and authorize with `authorizeSignedControlRequest` exactly as at `index.ts:7828-7830`.
+  - Extend the route regex next to `index.ts:7865` and authorize with `authorizeSignedControlRequest` exactly as at `index.ts:7866-7868`.
 - **`<name>`** = `deriveGuacamoleSandboxId(userId, computerId)` (`cloudflare-guacamole-provider.ts:1273-1277`). Every body carries the full `computerId`. The Worker refuses `400 invalid_body` unless `computerId.replace(/[^a-z0-9]/gi,'').slice(0,16)` equals the name's scope part.
 - **Store (v1 is R2-only).** Every step resolves the store with `selectWorkspaceStore()` (`index.ts:2745-2765`), which honours the DO's pin (`WORKSPACE_STORE_KIND_KEY`, `:1882`) and `EZIL_WORKSPACE_STORE` (`workspace-store-s3.ts:670-690`).
   - Unless the selection is `kind: 'r2'` with a store present → `409 store_unsupported`. The S3 and migrating stores are out of v1: their conditional-put and read-routing semantics for this flow are unproven.
@@ -415,8 +417,8 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - Only the common store surface is used: `get`, `put` (with `onlyIf`), `list` (key, size, etag), `delete` (`workspace-store-s3.ts:58-84`, the `WorkspaceStore` interface at `:78`). No R2 `head()`, no `customMetadata`.
 - **Prefix P.** P is the real key prefix the next Cloudflare hydrate of this computer reads: the derivation in `ensureWorkspaceMount` (`index.ts:1488-1525`), i.e. `realR2KeyPrefix(config.prefix ?? '/<projectId>/branches/<branch>')` (`workspace-seed.ts:94`), with the projectId and branch the app's Cloudflare open sends for this computer.
   - **[minor: P] Pinned value: `P = ${computerId}/branches/main`**, `computerId` being the canonical lowercase uuid of the computer (the `computerId` of every import body). Evidence at base:
-    - `projectId` is the computer id: the app's Cloudflare open sends `projectId: c.computerId` (`cloudflare.ts:97`), the AWS preview sends `projectId: placement.computerId` (`aws-preview.ts:151`; the shared rule is noted at `cloudflare-guacamole-provider.ts:217-224`), and the Worker uses it unchanged as `workspaceProjectId` (`index.ts:4695,4789`).
-    - `branch` is `'main'`: the app sends none, and the Worker defaults it (`index.ts:4790`).
+    - `projectId` is the computer id: the app's Cloudflare open sends `projectId: c.computerId` (`cloudflare.ts:97`), the AWS preview sends `projectId: placement.computerId` (`aws-preview.ts:241`; the shared rule is noted at `cloudflare-guacamole-provider.ts:217-224`), and the Worker uses it unchanged as `workspaceProjectId` (`index.ts:4720,4827`).
+    - `branch` is `'main'`: the app sends none, and the Worker defaults it (`index.ts:4828`).
     - `config.prefix` is `env.SANDBOX_WORKSPACE_S3_PREFIX` (`index.ts:1411`), read in both store branches (`index.ts:1513,1525`). It is a **deployment-wide** value (the same for every computer) and is unset in the deployed Worker; T0 (g) confirms that on canary2's DO.
     - `realR2KeyPrefix` strips the leading slash (`workspace-seed.ts:94-95`); the stored flush context holds that real prefix (`index.ts:1660,3062`).
   - **Env-prefix rule:** if `SANDBOX_WORKSPACE_S3_PREFIX` is set, v1 never imports: every `import/*` answers `409 prefix_mismatch` before any write. Importing into a deployment-wide prefix would overwrite every computer's head.
@@ -424,7 +426,7 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - If the DO has a `WORKSPACE_FLUSH_CONTEXT_KEY` (`index.ts:1872`) **without** `freshProvision`, its `prefix` must equal P, else `409 prefix_mismatch`.
   - A `freshProvision` context with prefix `${name}/branches/main` (`index.ts:3470-3472`) is a fence placeholder for a never-used workspace. It is not compared; commit replaces it (§4.4).
   - System prefix `S = systemPrefixOf(P)` (`system-persist.ts:32-35`). Chunks go to `chunkKey(P, generation, i)` = `P/.ezil-snapshots/<generation>/<i>` (`workspace-persist.ts:304-305`).
-- **Host binding:** the Sandbox DO for `<name>` reaches the host through the AWS tunnel record for the same `<name>`. It uses `lookupAwsTunnel` (`aws-tunnels.ts:565`) and signs every request with `signGatewayHeader` (`aws-origin.ts:165-173`), as `sendAwsControl` does (`aws-origin.ts:443-466`).
+- **Host binding:** the Sandbox DO for `<name>` reaches the host through the AWS tunnel record for the same `<name>`. It uses `lookupAwsTunnel` (`aws-tunnels.ts:600`) and signs every request with `signGatewayHeader` (`aws-origin.ts:174-182`), as `sendAwsControl` does (`aws-origin.ts:487-510`).
   - Every request carries `placementGeneration` and `leaseEpoch`. The tunnel record must match both, or the response is `409 export_host_mismatch`. The Worker only ever pulls from the export boot's host.
   - A tunnel or host transport failure is `503 export_unreachable`.
   - The bytes never pass through the app.
@@ -618,15 +620,15 @@ and the user copy is the §6.3 "try later" row. `computer_busy` is an ordinary `
 (for example a swallowed `meter.stopped` failure, `billing/v2/compute-meter.ts:41-43`), would otherwise be closed by the export
 host's retire receipt (`aws-receipts.ts:416`, `meter.stopped` closes any epoch ready at or before it, `billing/v2/compute-meter.ts:32-40`)
 and bill the whole move as Free hours. The sweep's stale-epoch close cannot help during the move: it needs a stop proof,
-and it treats LEASED, STARTING and MOUNTING as running (`billing-session-sweep/route.ts:34-39`). So, when billing metering
-is active (`billingMeteringActive`, `compute-access.ts:194`), the `requested` pass reads `openEpochFor(computerId)`
-(`compute-access.ts:197`) before the claim. An open epoch makes the placement **not claimable** that pass: wait, so the
+and it treats LEASED, STARTING and MOUNTING as running (`billing-session-sweep/route.ts:48-53`). So, when billing metering
+is active (`billingMeteringActive`, `compute-access.ts:215`), the `requested` pass reads `openEpochFor(computerId)`
+(`compute-access.ts:218`) before the claim. An open epoch makes the placement **not claimable** that pass: wait, so the
 sweep's stale close runs while the placement is still `STOPPED`; at the deadline the outcome is `computer_busy`. The read
 is outside `admitExportBoot` (it is a billing-store read), and that is safe: a `STOPPED` placement under the claim's
 computer lock cannot open a new epoch, which needs `RUNNING` (§5.2).
 
 **Entitlement start-gate admission does not apply**: there is no `admitStart`/`decideStart`, which would refuse a Free
-user's size (`compute-access.ts:210-217`). Free never uses the pool (`aws-ec2.ts:476`), so lane A calls `admitExportBoot`
+user's size (`compute-access.ts:231-244`). Free never uses the pool (`aws-ec2.ts:498-500`), so lane A calls `admitExportBoot`
 directly, not through `reservePoolHostForBoot`.
 
 #### 5.1.2 The lease fields (the wake's cold replace, rebuilt) **[G2]**
@@ -634,33 +636,35 @@ directly, not through `reservePoolHostForBoot`.
 The claim row must be `aws-ec2` and `STOPPED` with no job (step 4). **[G3]** `computer.move.start` already refuses a
 RUNNING or busy computer (§5.9). The `requested` wait therefore covers only races, such as a reconciler's job.
 
-Lane A rebuilds the cold replace from the exported builders, with the same values the wake uses (`aws-ec2.ts:698-742`):
+Lane A rebuilds the cold replace from the exported builders, with the same values the wake uses (`aws-ec2.ts:737-781`):
 - `generation = N+1`, `leaseEpoch = E+1`, `nonce = issueEnrollmentNonce(now, randomBytes)`, `fenceToken = newId()`.
 - `userData = buildEnrollmentUserData({computerId, volumeId, fsUuid, generation: N+1, leaseEpoch: E+1, nonce, provision: false, enrollUrl})`:
   ordinary user data, with no new lease key (`lease.py:45`).
-- The intent copies the private `replaceIntent` field for field (`aws-ec2.ts:270-286`): `{schemaVersion: 1, jobId: newId(),
+- The intent copies the private `replaceIntent` field for field (`aws-ec2.ts:285-301`): `{schemaVersion: 1, jobId: newId(),
   computerId, revision: 1, operation: 'replace', targetGeneration: N+1, fenceToken, providerInstanceId: null, dataVolumeId:
   p.volumeId, previousGeneration: N, previousInstanceId: p.instanceId, previousFenceToken: p.fenceToken, deployment,
   instanceType: p.instanceType, dataVolumeGiB: null, leaseEpoch: E+1, userData}`. `work = buildLifecycleWork(intent)`.
 - `fields = {fenceToken, enrollNonceHash, enrollExpiresAt, enrollConsumedHash: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null}`
-  (`aws-ec2.ts:733-742`).
+  (`aws-ec2.ts:772-781`).
 - `leaseUntil = now + 120 min`. This is the host's own hard hold bound (§2.5 step 7). The boot never reaches RUNNING, so no
   lease-lapse stop reads it.
 - **Parity test:** for the same STOPPED placement, lane A's intent equals the intent the provider's wake builds (drive
   `aws-ec2.ts` with a fake starter). Only `jobId`, `fenceToken` and the nonce inside `userData` may differ.
   **[r5] Fixture:** a `STOPPED` placement with `lastError: INSTANCE_LOST` on a deployment that is not in pool mode. The
   wake builds a replace only for a resize, `ENROLLMENT_FAILED`, `INSTANCE_LOST`, `POOL_RELEASED`, `wakeMode: 'replace'` or
-  pool mode; otherwise it builds a same-generation `start` (`aws-ec2.ts:671,711-716`), which no replace can equal. A second
-  case uses the plain `STOPPED` placement with `wakeMode: 'replace'`.
+  pool mode; otherwise it builds a same-generation `start` (`aws-ec2.ts:709,750-755`), which no replace can equal. A second
+  case uses the plain `STOPPED` placement with `wakeMode: 'replace'`. **[r6]** Both cases inject `grantPending: async () => false`:
+  since 6a a Free open first asks whether a paid period's grant is pending and, if so, answers `computer_starting` without
+  building any intent (`aws-ec2.ts:701-707`; dependency `:152`, default `:339-340`).
 
 **After commit** (never inside the transaction: a Step Functions start issued inside a transaction would be authorized
 against an uncommitted row, `aws-receipts.ts:294-295`):
 - `startLifecycleJob` (`aws-receipts.ts:218`, idempotent);
-- `started` → `transitionPlacement(… to 'STARTING')`, as the wake does (`aws-ec2.ts:774`);
-- `refused` and `unknown` take the wake's undo for a replace, which is **UNCONFIRMED**, not STOPPED (`aws-ec2.ts:759-767`):
+- `started` → `transitionPlacement(… to 'STARTING')`, as the wake does (`aws-ec2.ts:814`);
+- `refused` and `unknown` take the wake's undo for a replace, which is **UNCONFIRMED**, not STOPPED (`aws-ec2.ts:799-807`):
   `markLifecycleStartUnknown`, then `settleUnknownStart` (`aws-receipts.ts:481-517`). The existing recovery settles it, and
   §5.7 waits for STOPPED, bounded by `boot_unsettled`.
-- **[r5] `refused`, exactly as the wake's `launch()` does it** (`aws-ec2.ts:309-313`): first
+- **[r5] `refused`, exactly as the wake's `launch()` does it** (`aws-ec2.ts:324-328`): first
   `settleReplacementGeneration(…, startDefinitelyRefused: true)` (`aws-rebase-generation.ts:86`). With the source pair intact
   it lands `STOPPED` at the **previous generation N**, at lease epoch E+1, through `reconcileReplacementGeneration`
   (`placement.ts:1009-1025`: `casInTx` bump `{0, 0}`, `confirmedGeneration` N). Only when that does not settle does it take
@@ -712,7 +716,7 @@ host retire, and in `flipping`. A reservation taken then makes every ordinary pl
 **Rule (lane A owns `aws-rebase-store.ts` for this one edit, §1.1).** In `reserve`, inside the same `withAdmission`
 transaction, after `lockImagePlacement` (`aws-rebase-store.ts:389`; it takes the computer lock, `placement.ts:445-447`) and
 right after the `ezil_compute_migrations` check (`:405`), call `reverseMoveHolds(tx, j.computerId)`
-(`provider-reverse-store.ts:225-230`). It probes 0012 first (none → no reverse move, so production is unchanged), re-takes the
+(`provider-reverse-store.ts:228-233`). It probes 0012 first (none → no reverse move, so production is unchanged), re-takes the
 same computer lock (re-entrant within the transaction) and reads the holding states. `true` →
 `throw new ImageJobConflictError()`, exactly like the migrations check. A holding row includes `failed_needs_operator`.
 
@@ -757,15 +761,15 @@ Any other kind is unsafe:
 - `computer.delete` retires first only for kind `'aws-ec2'` (`computer.ts:342-350`). For any other kind
   `softDeleteComputer` deletes even after a failed teardown (`computer-store.ts:382-393`), and the flip would later insert
   a Cloudflare row for a deleted computer (§5.6 step 3).
-- `awsStopProof` treats a non-`aws-ec2` kind as running (`billing-session-sweep/route.ts:34-35`).
+- `awsStopProof` treats a non-`aws-ec2` kind as running (`billing-session-sweep/route.ts:48-49`).
 
 The `reverse` marker is set only by `select.ts` for these two providers. Lane A tests the kind and the marker for both.
 
 **[r5] Every open route answers the reverse provider first.** At base each open route calls `routeComputer`, then the
 billing gate `gateComputerStart`, then (two of them) `stopCooldownAnswer`, and only then the provider
-(`cloudflare-guacamole.ts:227-233` previewUrl, `:505-515` appPreviewUrl, `:702-718` codePreviewUrl, and the restart route at
-`:1383-1389`). During a move the routed computer is `aws-ec2` with the placement's `instanceType`, so a held Free user is
-refused by the gate: `files_on_aws` for any size but `HOLD_SIZE` (`compute-access.ts:210-217`, `billing/v3/admission.ts:12`),
+(`cloudflare-guacamole.ts:250-257` previewUrl, `:531-542` appPreviewUrl, `:732-749` codePreviewUrl, and the restart route at
+`:1416-1422`). During a move the routed computer is `aws-ec2` with the placement's `instanceType`, so a held Free user is
+refused by the gate: `files_on_aws` for any size but `HOLD_SIZE` (`compute-access.ts:231-244`, `billing/v3/admission.ts:12`),
 and `decideStart` can refuse a `std-2` one under Free limits. Every re-ask would then answer a `billing_*` refusal, never
 `computeMoving`, and the move overlay would break. So, in all four routes (lane A, `cloudflare-guacamole.ts`):
 - when `routed.reverse` is set, the route returns the provider's own answer through `compute-dispatch.ts` (with
@@ -777,7 +781,7 @@ and `decideStart` can refuse a `std-2` one under Free limits. Every re-ask would
 
 **The reverse waiting answer [G1] (pinned; `provider-reverse-placement.ts`, lane A).** It must not reuse the forward
 answer `computer_migrating`: `compute-dispatch.ts:162-165` turns that into `computeMigrating`, and the shell then
-applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,432-442`) and the 600 s boot hard stop
+applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,464-474`) and the 600 s boot hard stop
 (`boot-progress.js:23,30-31`). A move runs for up to 155 min (§5.10), so every open-triggered move would fail mid-move.
 - `ensure` → `{ok: false, error: 'computer_moving', errorCode: 'sandbox_starting', retryable: true, computeProvider: 'aws-ec2'}`.
 - `status` → the same plus `state: 'starting'`.
@@ -789,13 +793,13 @@ applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,432-442`) and the
   Try again. The move goes on; the next open sees it. The shell that ships with A (lane U) reads `computeMoving` (§6.4).
 
 **The reverse blocked answer [r4] (pinned; `provider-reverse-placement.ts`, lane A).** r3 threw `PRECONDITION_FAILED` from
-`select.ts`. That breaks the shell's rule that the open route answers failures as values on a 200 (`session.js:705-708`).
-The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`). `unknown` is retryable
-(`boot-phases.shell.js:334-340,367-372`), so the shell re-asks once in silence. A throw from routing also reaches every
+`select.ts`. That breaks the shell's rule that the open route answers failures as values on a 200 (`session.js:753-756`).
+The shell flattens an unrecognised tRPC code to `unknown` (`session.js:738-750`). `unknown` is retryable
+(`boot-phases.shell.js:336-342,372-377`), so the shell re-asks once in silence. A throw from routing also reaches every
 `routeComputer` caller. So `select.ts` returns a blocked provider, the same pattern as the waiting provider:
 - `ensure` → `{ok: false, error: 'computer_move_needs_attention', errorCode: 'preconditions_unmet', retryable: false, computeProvider: 'aws-ec2'}`.
   `preconditions_unmet` is an existing deterministic code on both sides (`cloudflare-guacamole-provider.ts:344,391-397`;
-  `boot-phases.shell.js:334-340`). The AWS preview path answers every `ok: false` as a value (`awsPreviewAnswer`,
+  `boot-phases.shell.js:336-342`). The AWS preview path answers every `ok: false` as a value (`awsPreviewAnswer`,
   `compute-dispatch.ts:207-239`), and `shellCodeForAwsEnsure` passes the code through unchanged (`:144-146`). The shell
   therefore never re-asks it, and no new `BootErrorCode` is needed (§1.1).
 - `status` → the same plus `state: 'error'`.
@@ -805,8 +809,8 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`)
   `computer_move_needs_attention`, next to `computeMoving`. (`awsPreviewAnswer` rewrites `error` to the errorCode, so the
   flag is the only carrier.)
 - Lane U reads the flag in `session.js` **before** `classifyFailure` (`openDesktopOnce` and `pendingOrRefused`, which
-  `code.js:209` also uses). It shows the §6.4 needs-attention card, with no retry and no spinner. An old cached shell gets
-  the generic deterministic failure copy (`preconditions_unmet` → `unknown` copy, `boot-phases.ts:506-511`) with no
+  `code.js:219` also uses). It shows the §6.4 needs-attention card, with no retry and no spinner. An old cached shell gets
+  the generic deterministic failure copy (`preconditions_unmet` → `unknown` copy, `boot-phases.ts:516-521`) with no
   silent re-ask. That is disclosed, and acceptable: the state is rare and operator-attended.
 - Every other `routeComputer` caller sees an ordinary refusal value. `computer.delete` gets a `terminate` with `ok: false`
   and refuses with `PRECONDITION_FAILED aws_retire_unavailable: computer_move_needs_attention` (`computer.ts:103-108`; `AWS_RETIREMENT_UNDERWAY` is only the retire outcomes, `aws-ec2.ts:131`),
@@ -819,12 +823,12 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`)
 **Driver [minor: sweep position].** A new `advanceReverseMoves(handlerStartedAt)` runs in `billing-session-sweep`
 **after `drain()`**, as the handler's last step:
 - **Main path:** `advanceStaleMigrations` → `reconcilePaidCloudflareUsers` → `drain()` → **`advanceReverseMoves`**
-  (`billing-session-sweep/handler.ts:169-171`).
-- **Metering-inactive early return:** `drain()` → **`advanceReverseMoves`** → `finish()` (`handler.ts:54`). Forward moves do not
+  (`billing-session-sweep/handler.ts:258-260`).
+- **Metering-inactive early return:** `drain()` → **`advanceReverseMoves`** → `finish()` (`handler.ts:83`). Forward moves do not
   run there at base. Reverse moves must, because only the driver enforces their deadlines (§5.4 table), and a held row with
   no driver would hold the computer indefinitely.
 - **Why after `drain()`:** `reconcilePaidCloudflareUsers` and `drain()` each start no work later than handler start + 40 s
-  (`provider-migrate-reconcile.ts:59`, `handler.ts:46`). A 90 s reverse pass placed before them would starve both on every
+  (`provider-migrate-reconcile.ts:59`, `handler.ts:75`). A 90 s reverse pass placed before them would starve both on every
   tick with a move in flight.
 - It has its **own 90 s budget**, measured from its own start, not the 40 s left over from the handler start that forward
   moves get (`provider-migrate-orchestrator.ts:136-147`). A Worker or AWS call starts only if its own timeout (§4.1)
@@ -838,7 +842,7 @@ The shell flattens an unrecognised tRPC code to `unknown` (`session.js:690-702`)
   rows, then `updated_at, id` as today. With at most `REVERSE_MOVE_MAX_ACTIVE = 3` rows past `requested` (§5.1.1 step 5b),
   every host-bound row is driven on every pass, and up to 7 `requested` rows share the rest. A PG test: 9 old `requested`
   rows and 1 newer `copying` row, then `claimStale(1)` returns the `copying` row.
-- The route's `maxDuration` is 300 s (`billing-session-sweep/route.ts:11`). The worst case is 150 s + 90 s = 240 s.
+- The route's `maxDuration` is 300 s (`billing-session-sweep/route.ts:13`). The worst case is 150 s + 90 s = 240 s.
   Lane A's handler test proves the order and both gates.
 - Within its budget it drives a row step after step. A `copying` row gets back-to-back pulls (`count: 64`).
 - `computer.move.start`, `computer.move.retry` and the open trigger also schedule one immediate 60 s drive with `after()` (pattern `schedulePaidMigration`, `provider-migrate-orchestrator.ts:149-152`), so the first steps do not wait for a cron tick.
@@ -934,7 +938,7 @@ The classes are:
   - **Try later** (r3, §5.1.1): `kill_switch` and `boot_unavailable` only. They are `reopen` codes with their own copy (§6.3).
 - `failed_needs_operator`:
   - Open works: `abort_unconfirmed` only. **[r5]** It is written only after the placement settled (§5.7), so the next open is an ordinary hold replace that never matches `readByExportBoot`;
-  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:652-657`).
+  - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:683-688`).
 - **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`.
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
 
@@ -1034,11 +1038,11 @@ There is no AWS call after the point of no return: the export host is retired in
    **[r5] Settled (pinned):** `provider = 'aws-ec2'`, `state = 'STOPPED'`, `lifecycleJobId` null, the claim's volume,
    `leaseEpoch ≥ E+1`, and `generation` **N or N+1**. r4's "STOPPED at N+1/E+1 (or later)" missed the generation rollback:
    a refused or failed export-boot replace is settled by `settleReplacementGeneration` back to **generation N at lease
-   epoch E+1** (`aws-ec2.ts:311-313`, `aws-receipts.ts:330-332` → `reconcileReplacementGeneration`, `placement.ts:1009-1025`;
+   epoch E+1** (`aws-ec2.ts:326-328`, `aws-receipts.ts:330-332` → `reconcileReplacementGeneration`, `placement.ts:1009-1025`;
    §5.1.2). The host-retire receipt lands N+1/E+1 (`INSTANCE_LOST`, §5.2). Nothing else can move the counters meanwhile:
    the row still holds the computer, so every open meets the waiting provider. The flip's own precondition (§5.6) stays
    strict at N+1/E+1, because its path is always the host retire.
-3. **Write `fail(m, 'failed_reopened', reason)` in a transaction that holds the computer lock and re-reads the placement as settled in the same transaction.** **[r5]** The next Free hold open is the wake's own intent at lease epoch E+2: a replace at the settled generation + 1 (N+1 or N+2), or, after a refused replace that left the source instance stopped (`LIFECYCLE_START_FAILED`, generation N) on a non-pool deployment, a same-generation start at N (the replace conditions, `aws-ec2.ts:671`). Either way E+2 is above the volume marker's E+1, so it satisfies the guard's epoch rule (`guard.py:250-254`), and `readByExportBoot` (N+1/E+1) never matches it.
+3. **Write `fail(m, 'failed_reopened', reason)` in a transaction that holds the computer lock and re-reads the placement as settled in the same transaction.** **[r5]** The next Free hold open is the wake's own intent at lease epoch E+2: a replace at the settled generation + 1 (N+1 or N+2), or, after a refused replace that left the source instance stopped (`LIFECYCLE_START_FAILED`, generation N) on a non-pool deployment, a same-generation start at N (the replace conditions, `aws-ec2.ts:709`). Either way E+2 is above the volume marker's E+1, so it satisfies the guard's epoch rule (`guard.py:250-254`), and `readByExportBoot` (N+1/E+1) never matches it.
 
 **[r5] Which operator code.** If step 2 does not settle within its bound, write `failed_needs_operator('boot_unsettled')`,
 whatever step 1 did. It is **open blocked** (§5.3, §5.5): the placement is in a state no open can use. Otherwise, if step 1
@@ -1094,7 +1098,7 @@ replace) counts as settled.
     the move starts once the computer has stopped. For a computer whose Try again is forbidden, that promise would be
     false: the user would stop the computer only to be told the move is unavailable.
   - Store refusals from step 9 are values too: `forward_active` → `move_busy`; `owner_mismatch` → `move_not_held`;
-    `create_failed` → `move_busy`. Step 2 checks the owner exactly like the forward row (`progress.ts:145`); another
+    `create_failed` → `move_busy`. Step 2 checks the owner exactly like the forward row (`progress.ts:156`); another
     owner's row → `move_not_held`.
   - The closed union, in check order: `move_unsupported`, `move_in_progress` (retry only), `move_not_held`, `move_paused`,
     `move_busy`, `move_unavailable`, `move_computer_running`, `move_computer_unsettled`.
@@ -1108,8 +1112,8 @@ replace) counts as settled.
     `move_computer_unsettled` and `move_unavailable` before `move_computer_running`.
 - **`computer.move.retry`** (new mutation). It is the same as start, except that a holding row answers
   `move_in_progress` (step 2). It exists because the shell's `move-retry` must stop calling `switchTo`
-  (`computers.js:1255-1258`).
-- **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:190-193`), before `routeComputer`, never in reads, `computer.progress`, `status` or the hosted-app routes. The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
+  (`computers.js:1402-1405`).
+- **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:212-216`), before `routeComputer`, never in reads, `computer.progress`, `status` or the hosted-app routes. The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
   - standing `files_on_aws`;
   - the placement is `aws-ec2` `STOPPED` with no lifecycle job and no lease (no transition active);
   - no reverse row holds the computer, and the newest reverse row, if any, is not `failed_*` (after any failure, only a click starts the next move);
@@ -1125,7 +1129,7 @@ replace) counts as settled.
 
 An account is founder-owned for this contract when ANY of these holds:
 1. its email's domain is `ezil.work` (case-insensitive). This covers contact@ezil.work, which STATUS treats as founder-owned (round 6 STATUS lines 19 and 93), and founder@ezil.work.
-2. its email is on the existing operator allow-list read by `isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS)` (`telemetry/admin.ts:15`). That is the same gate `billing.ts:277-280` already uses as the operator identity.
+2. its email is on the existing operator allow-list read by `isTelemetryAdmin(email, env.TELEMETRY_ADMIN_EMAILS)` (`telemetry/admin.ts:15`). That is the same gate `billing.ts:303-306` already uses as the operator identity.
 3. its email is missing or unreadable.
 
 The rule over-excludes on purpose. A founder-owned account never gets an `'open'` row; it moves only on the explicit Move click from its own session. The same helper drives the DTO's `moveOnOpen` (§6.1).
@@ -1134,21 +1138,21 @@ The rule over-excludes on purpose. A founder-owned account never gets an `'open'
 
 ### 5.10 `computer.progress` during a move **[G1]**
 
-**Why.** At base, `describeProgress` reads only forward rows (`progress.ts:70-136`). During a move it would describe the
+**Why.** At base, `describeProgress` reads only forward rows (`progress.ts:79-147`). During a move it would describe the
 export boot's own `aws-ec2` placement, and the user watches that overlay for the whole move (D20 makes the next open the
 main trigger):
-- LEASED, STARTING and MOUNTING become `operation: 'opening'` (`progress.ts:86`). The overlay applies its 240 s expectation and
-  the 600 s budget (`computer-progress.js:149-155`, `boot-progress.js:23,30-31`, `app-spinner.js:252-253`).
-- `releaseExportBoot`'s UNCONFIRMED in every successful `checking` step sets `needsOperator` (`progress.ts:112`), and so does a
-  MOUNTING boot past enrollment grace (`progress.ts:111`). Both are a false "needs attention".
-- RECOVERING and RETIRING read as `stopping` (`progress.ts:87,101-104`).
-- `openingOptions` stamps an opening record for the export boot's epoch (`progress.ts:166-190`, `describeOpening` `:404-412`).
+- LEASED, STARTING and MOUNTING become `operation: 'opening'` (`progress.ts:95`). The overlay applies its 240 s expectation and
+  the 600 s budget (`computer-progress.js:149-159`, `boot-progress.js:23,30-31`, `app-spinner.js:292-293`).
+- `releaseExportBoot`'s UNCONFIRMED in every successful `checking` step sets `needsOperator` (`progress.ts:121`), and so does a
+  MOUNTING boot past enrollment grace (`progress.ts:120`). Both are a false "needs attention".
+- RECOVERING and RETIRING read as `stopping` (`progress.ts:96,110-113`).
+- `openingOptions` stamps an opening record for the export boot's epoch (`progress.ts:177-201`, `describeOpening` `:415-423`).
 
 **Ownership.** Lane A owns the server description (`progress.ts`). Lane U owns its rendering in `computer-progress.js`, the
 open overlay and the Computer tab (§6.4).
 
 **Server rule (lane A).** `readComputerProgress` calls `reverseMovesTablePresent` (§3.4), then reads the newest reverse row
-with `readByComputer`. It checks the owner exactly as for the forward row (`progress.ts:145`). This happens **before**
+with `readByComputer`. It checks the owner exactly as for the forward row (`progress.ts:156`). This happens **before**
 anything placement-derived. With no 0012, or no row, the output is byte-for-byte today's.
 
 | Newest reverse row | `computer.progress` |
@@ -1213,7 +1217,7 @@ move?: null | {
 - **Old cached shells:** `progressView` returns null for the unknown stage `moving` (`computer-progress.js:131-133`), so they
   show no opening bar, no `needs_operator` and no wrong copy. Their open loop sees an ordinary `sandbox_starting` (§5.3).
 - **[r4] Why `lifecycleState` is null.** The Computer tab derives `running`, `stopped`, its chip and the Stop button from
-  `lifecycleState` (`computers.js:429-431,444-449,692,702`) and dismisses on `STOPPED` (`:790`). The export boot's placement
+  `lifecycleState` (`computers.js:458-460,478-482,778,792`) and dismisses on `STOPPED` (`:919`). The export boot's placement
   is `STOPPED` in `requested`, in `checking` after the host retire and in `flipping`, and `MOUNTING` in `booting`. Passed
   through, it would show "Stopped" and offer Open or Start mid-move in old and new shells alike. With `null`, an old
   shell shows no chip, no Stop and no "Now running". Its Open button stays enabled, and opening meets the waiting
@@ -1237,12 +1241,12 @@ move?: null | {
 
 **[r5] The move rides a new additive key, `summary.computer.reverseMove`. `summary.computer.move` stays `null`.** r4 put
 the move in `computer.move`, which an old cached `computers.js` already renders (the dormant `moveView`,
-`computers.js:507-534`). Its failed card always offers [Try again], and that calls `switchTo` (`:1255-1258`), which is an
+`computers.js:571-598`). Its failed card always offers [Try again], and that calls `switchTo` (`:1402-1405`), which is an
 open. After a failed row there is no open trigger (§5.9), so the click boots the AWS computer under the D16 hold and uses
 Free hours; for an open-blocked row it meets the refused open; and its step 4 still says "Starting your desktop"
-(`:503`). With `move` kept null, an old shell never renders a reverse move: it keeps today's files-held banner until the
+(`:567`). With `move` kept null, an old shell never renders a reverse move: it keeps today's files-held banner until the
 commit makes the standing `free`. Only the shell that ships with lane A (lane U) reads `reverseMove`. `ComputerMoveV3`
-(`contract.ts:242-247`) and `summary.ts:262`'s `move: null` stay as they are; the new type is `ComputerReverseMoveV3`.
+(`contract.ts:242-247`) and `summary.ts:282`'s `move: null` stay as they are; the new type is `ComputerReverseMoveV3`.
 Everywhere below, "the summary's move" means `summary.computer.reverseMove`.
 
 ```ts
@@ -1267,28 +1271,28 @@ interface ComputerReverseMoveV3 {   // summary.computer.reverseMove: ComputerRev
 // 0012 today, and its users must never see a button that cannot work.
 ```
 
-- **Stage map** (`REVERSE_MOVE_DTO_STAGE`, `provider-reverse-store.ts:57`): `requested`, `booting` and `exporting` → `saving` (step 0); `copying` → `copying` (1, with bytes); `checking` → `checking` (2); `flipping` → `flipping` (3).
-  - These are keys the dormant `MOVE_STEP_OF` already has (`computers.js:504`), and a unit test pins that.
+- **Stage map** (`REVERSE_MOVE_DTO_STAGE`, `provider-reverse-store.ts:58`): `requested`, `booting` and `exporting` → `saving` (step 0); `copying` → `copying` (1, with bytes); `checking` → `checking` (2); `flipping` → `flipping` (3).
+  - These are keys the dormant `MOVE_STEP_OF` already has (`computers.js:568`), and a unit test pins that.
   - The shell's own `exporting: 1` entry is never sent for `to_cloudflare`.
 - **Visibility [clocks]:** non-null when the newest row for the computer is holding, or is terminal and entered its terminal state within the last 24 h **on the DB clock** (`ages.stateEntered < 86400`, §3.4; r3 replaces "`updated_at` within 24 h", which the snapshot write and the runbook move). Otherwise null, and the standing banner applies. A `failed_needs_operator` row is always visible. `computer.progress`'s `move` uses the same rule (§5.10).
 - Every read here starts with `reverseMovesTablePresent` (§3.4): no 0012 → `reverseMove: null`, `moveOnOpen: false`, `moveAvailable: false`.
-- Lane U's new `reverseMove` view accepts `reason` with the same `/^[a-z0-9_:-]{1,64}$/i` the dormant view uses (`computers.js:511`).
+- Lane U's new `reverseMove` view accepts `reason` with the same `/^[a-z0-9_:-]{1,64}$/i` the dormant view uses (`computers.js:575`).
 - **[r4]** `reason` is null for `committed` and for in-flight rows. A committed row's `last_error` (a §7.1 spent reason) is
   never shown.
 
 #### 6.1.1 The summary's move computer and its reads **[r4]**
 
 **Why this needs pinning.** `billing.summary` takes no input. Its only placement read is `placementAndVolume(ctx.db,
-ctx.user.id)` (`billing.ts:302-311`), which feeds `buildSummaryV3` the provider of "any aws-ec2 placement among the user's
-live computers" (`userPlacement`, `billing.ts:153-180`; builder input `summary.ts:184-200`). `buildSummaryV3` is pure and
-hard-codes `move: null` (`summary.ts:262`). The operator gate is in the router (`telemetryOperator`, `billing.ts:277-280`).
+ctx.user.id)` (`billing.ts:328-338`), which feeds `buildSummaryV3` the provider of "any aws-ec2 placement among the user's
+live computers" (`userPlacement`, `billing.ts:160-191`; builder input `summary.ts:200-219`). `buildSummaryV3` is pure and
+hard-codes `move: null` (`summary.ts:282`). The operator gate is in the router (`telemetryOperator`, `billing.ts:303-306`).
 After a committed move the user has no `aws-ec2` placement, so "the newest row for the computer" needs a computer.
 **Lane A owns `billing.ts` for these reads (§1.1).**
 
 **Reads (router, lane A), with no new store method and no new placement query:**
-- `userPlacement` also returns the live computer ids it already reads (`billing.ts:158-161`) and, for each `aws-ec2`
-  computer, the placement record it already reads (`:168`): `state`, `leaseEpoch` and `lifecycleJobId`. A read that
-  throws (including `ImageJobConflictError`) is no record, as today (`:171-173`).
+- `userPlacement` also returns the live computer ids it already reads (`billing.ts:165-168`) and, for each `aws-ec2`
+  computer, the placement record it already reads (`:176`): `state`, `leaseEpoch` and `lifecycleJobId`. A read that
+  throws (including `ImageJobConflictError`) is no record, as today (`:180-183`).
 - `reverseMovesTablePresent(ctx.db)` once (§3.4). If true, `readByComputer(id)` for each live computer id. Users hold few
   computers (one main computer, round 3), so this is a handful of indexed reads (`computer_id, created_at`, 0012).
 - The kill switch and "AWS enabled" from `aws-config.ts` (the same reads as §5.9). Founder-owned (§5.9.1) from
@@ -1320,10 +1324,16 @@ reverseMove?: {
 **Derived fields (pinned):**
 - `reverseMove`: from `row` when visible (§6.1), else null. `move` is always null (§6.1).
 - **[r5] `holdOpenable`:** the placement is `aws-ec2` and its `instanceType` meters as `HOLD_SIZE`
-  (`meteredSizeForInstanceType(instanceType) === HOLD_SIZE`, the billing gate's own test, `compute-access.ts:203,210-217`;
+  (`meteredSizeForInstanceType(instanceType) === HOLD_SIZE`, the billing gate's own test, `compute-access.ts:224,231-244`;
   `billing/v3/admission.ts:12`). False for a held computer of another size: the gate refuses its opens with
   `files_on_aws`, so the D16 hold can never open it. Null when the placement is not `aws-ec2` (after a commit).
   `computer.progress`'s `move.holdOpenable` uses the same rule (§5.10).
+  **[r6]** It is 6a's "held closed" test (R4-02) for the same computer: `userPlacement` already meters each `aws-ec2`
+  placement's `instanceType` with `meteredSizeForInstanceType` (`billing.ts:179,185`) into `summary.computer.awsSize`
+  (`summary.ts:284-285`), and the Computer tab's `heldClosed` is `current !== HOLD_SIZE` (`computers.js:465,468`). A Free
+  user holds one AWS computer (`user_has_aws_computer`), so `reverseMove.holdOpenable === false` exactly when 6a shows the
+  held-closed card. Lane A's summary test pins `holdOpenable === (awsSize.size === HOLD_SIZE)` for `std-2`, `cmp-4` and
+  `cmp-8`.
 - `retry` (failed rows only): `failed_needs_operator` → `'no'`. For `failed_reopened`, by the §5.5 class of `last_error`:
   `reopen` → `'now'`, except `entitlement_paid` → `'no'` (standing is then paid; nothing to retry). `reopen_after_session`
   → `'now'` when `placement.leaseEpoch > row.exportBoot.leaseEpoch` (an AWS boot since: the next Free hold open is a
@@ -1352,7 +1362,7 @@ computer gives `retry: 'no'`; `boot_unsettled` gives `openBlocked: true`.
 
 - **[r5]** The move card reads `summary.computer.reverseMove` only, never `computer.move` (which stays null for old shells,
   §6.1). The dormant `moveView`/`moveHtml` may be reused for it, with the changes below.
-- The step 4 label changes from "Starting your desktop" to **"Switching to your Free computer"** (`computers.js:503`).
+- The step 4 label changes from "Starting your desktop" to **"Switching to your Free computer"** (`computers.js:567`).
 - `move-retry` calls `computer.move.retry`, and is shown only when `retry === 'now'`.
 - The done, failed and needs-attention cards use the §6.3 copy.
 - Add a pre-move card with the "Move my files…" action on the files-held state, with the variant chosen by `moveOnOpen`.
@@ -1361,37 +1371,42 @@ computer gives `retry: 'no'`; `boot_unsettled` gives `openBlocked: true`.
 - **[r4]** An open answered with `computeMoveNeedsAttention: true` (§5.3, the blocked answer: a value with errorCode
   `preconditions_unmet`) shows the needs-attention card, never a spinner and never a retry. `session.js` reads the flag
   before `classifyFailure`, in `openDesktopOnce` and in `pendingOrRefused` (which the Code app's mint also uses,
-  `code.js:209`). `boot-phases.*` is unchanged (§1.1).
-- **[r4] The files-held banner, both tabs.** `standingCopy('files_on_aws')` drops the region name in **both** copies of the
-  function, `computers.js:499` and `Settings/tabs/billing.js:78`, to exactly: **"Your files are still on your AWS
-  computer. Open it on the Free plan with Free limits, or upgrade to restore full use."** `billing-test.mjs` keeps its
-  cross-tab equality check (`:1014-1015`) and updates its pinned sentence (`:988`). The Billing tab shows only this banner
-  (`billing.js:452`) for files-held and **during a move**: no move card, no move action and no move sentence. During a
-  move the standing stays `files_on_aws` (the placement is `aws-ec2` until the flip); after the commit the standing is
-  `free` and the banner goes. The move lives on the Computer tab. The provider label "AWS (India) · files kept"
-  (`computers.js:468`) and the System tab's "AWS (India)" are the round-4 provider labels (`system-describe.js:33-36`),
-  not move copy, and stay unchanged.
+  `code.js:219`). `boot-phases.*` is unchanged (§1.1).
+- **[r4] [r6] The files-held banner, both tabs.** **[r6] Round 6a settled this banner; lane U leaves it exactly as 6a
+  shipped it.** r4's region-free sentence is superseded by 6a's R1-11 (one provider string, "AWS (India)", on every tab)
+  and R4-02 (a held 4 or 8 vCPU computer cannot open on Free). Both copies of `standingCopy('files_on_aws')`
+  (`computers.js:547-553`, `Settings/tabs/billing.js:78-83`) say exactly **"Your files are still on your AWS (India)
+  computer. It opens on the Free plan with Free limits; upgrade for no session time limit."**, or, when the summary's
+  placed size `computer.awsSize` is `cmp-4`/`cmp-8` (6a's "held closed"), `heldClosedText(vcpu)`: **"Your files are still
+  on your {vcpu} vCPU AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again."**
+  (`billing-format.js:152-161`; the Computer tab's twin `computers.js:557-565`). `billing-test.mjs` pins both sentences
+  (`:988`, `:1023`) and the cross-tab equality (`:1082-1083`). The Billing tab shows only this banner (`billing.js:474`)
+  for files-held and **during a move**: no move card, no move action and no move sentence. During a move the standing
+  stays `files_on_aws` (the placement is `aws-ec2` until the flip); after the commit the standing is `free` and the
+  banner goes. The move lives on the Computer tab. The provider label is "AWS (India)" since 6a (`computers.js:515`, was
+  "AWS (India) · files kept"), like the System tab's "AWS (India)" (`system-describe.js:33-36`); both are provider
+  labels, not move copy, and stay unchanged. The move copy (§6.3, §6.4) still names no city or region.
 - **[G3] [r4]** `computer.move.start`/`retry` answers (§5.9) render as follows. `{ok: true, move}` renders that move's card,
   in any state: a stale pre-move card's click during a move shows the move. `move_in_progress` (retry) re-reads the summary
   and shows the current move's card (`reverseMove`). Every refusal renders its §6.3 row.
 - **[r4] [Stop and move my files]** (shown only after a `move_computer_running` refusal):
   1. It **first calls `computer.move.start` again**. `{ok: true, move}` → show the move card and stop nothing. Any refusal
      other than `move_computer_running` → show that refusal and stop nothing. This way, if a move started in another
-     window in the meantime, `closeSandboxWindows` (`computers.js:939`) never closes a window that shows the move.
-  2. Only on `move_computer_running` again: run the tab's existing Stop (`handleStop`, `computers.js:918-950,1245`, the
+     window in the meantime, `closeSandboxWindows` (`computers.js:1083`) never closes a window that shows the move.
+  2. Only on `move_computer_running` again: run the tab's existing Stop (`handleStop`, `computers.js:1062-1094,1392`, the
      same confirm). Watch `computer.progress` until `stage` is `stopped`, bounded by the existing stop budget
-     (`computer-progress.js:341-342`: 200 polls). Then call `computer.move.start` **once**. If that refuses again, the card
+     (`computer-progress.js:347-348`: 200 polls). Then call `computer.move.start` **once**. If that refuses again, the card
      shows that refusal.
   3. Closing the tab in between starts nothing; the pre-move card returns.
 - **[r4] A stop answered `computer_moving` or `computer_move_needs_attention`** (the waiting or blocked provider's `stop`,
   §5.3; `confirmAwsStop` returns that first answer unchanged, `compute-dispatch.ts:282,292`; `/api/shell/stop` passes the
   `terminate` answer through, `app/api/shell/stop/route.ts:11`) is **not** "couldn't confirm the stop". `handleStop`
   reads `data.outcome`, re-reads the summary and shows the move card (or the needs-attention card) instead of the
-  `computers.js:943` notice.
+  `computers.js:1087` notice.
 - **[G1]** The open overlay and the Computer tab render the moving view of `computer.progress` (§5.10) as §6.4 says.
 - **[minor: too-large]** The cap in copy comes from one constant, `MOVE_LIMIT_BYTES = 536870912`, exported by
   `computer-progress.js` and imported by `computers.js`. It is formatted by the shell's own MB unit (÷ 1,000,000, no decimals,
-  as `formatBytes` at `computer-progress.js:69` and `moveView` at `computers.js:515`), which gives **"537 MB"**. The string
+  as `formatBytes` at `computer-progress.js:69` and `moveView` at `computers.js:579`), which gives **"537 MB"**. The string
   "512 MB" appears nowhere. Lane U's shell test pins "537 MB". Lane A's `provider-reverse-store.test.ts` reads the constant
   from `computer-progress.js` and asserts it equals `EXPORT_MAX_BYTES`, the same cross-file pattern as the `MOVE_STEP_OF` test.
   **Order:** that assertion lands in the same integration as lane U's constant, or after it, never before: the constant does
@@ -1406,6 +1421,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | files held, `moveOnOpen` true | **Your files are on your AWS computer.** The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files now] |
 | files held, `moveAvailable` false (r3) | **Your files are on your AWS computer.** Opening it uses your Free limits. (no move sentence, no button) |
 | files held, `moveOnOpen` false | **Your files are on your AWS computer.** Opening it uses your Free limits. You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer] |
+| **[r6]** files held, `holdOpenable` false (6a's held-closed card, `computers.js:613-616`) | 6a's card stays as its first line: `heldClosedText` (§6.2) and its [Upgrade]. With `moveAvailable` true it continues: You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer]. The `moveOnOpen` variant is never used for it: 6a shows no Open desktop for a held-closed computer (`computers.js:791`). With `moveAvailable` false, 6a's card is unchanged. "Opening it uses your Free limits" is never said for it. |
 | `saving` | Moving your files to your Free computer. Step 1 of 4: Saving your files. |
 | `copying` | Step 2 of 4: Copying your files to your Free computer. "X MB of Y GB copied" (existing `moveView`). |
 | `checking` | Step 3 of 4: Checking your files. |
@@ -1440,7 +1456,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 - The overlay watches `computer.progress` (5 s polls, as today) and re-asks the open **at most every 30 s**. Each ask is
   harmless: the reverse waiting provider never boots anything.
 - The watch ends when, after this open has itself seen `operation: 'moving'` (the `seenInFlight` rule of
-  `watchComputerTransition`, `computer-progress.js:353-370`):
+  `watchComputerTransition`, `computer-progress.js:359-376`):
   - `move.outcome` is `committed`, or the open stops answering `computeMoving` → re-ask the open (it now opens the Free computer);
   - `move.outcome` is `failed_reopened` or `failed_needs_operator` → show the outcome below. **Never auto-open the AWS
     computer**: under the D16 hold that boot uses Free hours at the AWS size, so the user chooses it;
@@ -1479,11 +1495,11 @@ so they agree.
 
 **[r4] Computer tab while a move is in flight** (`computer.progress` `operation: 'moving'`, or `summary.computer.reverseMove`
 in a non-terminal stage):
-- `computerModel` (`computers.js:419-469`): **chip** `{state: 'moving', text: 'Moving files…'}`, which takes precedence
+- `computerModel` (`computers.js:448-517`): **chip** `{state: 'moving', text: 'Moving files…'}`, which takes precedence
   over every chip except `stopping` while the user's own stop is in progress. `busy` is **true** when `operation === 'moving'`
-  (today it is true only for opening and stopping, `:469`). `running` and `stopped` are false (`lifecycleState` is null,
+  (today it is true only for opening and stopping, `:517`). `running` and `stopped` are false (`lifecycleState` is null,
   §5.10).
-- **Actions:** no Open desktop, no Stop and no Start now (`:700-702,642-645`). Rename stays; Delete is disabled (a delete
+- **Actions:** no Open desktop, no Stop and no Start now (`:790-792,728-731`). Rename stays; Delete is disabled (a delete
   is refused during a move, §5.3). Configuration cards stay locked (held).
 - **Body:** the move card only (`moveHtml`, §6.3 copy). No transition, "Now running" or switch-failed card.
 - If `computer.progress` shows `operation: 'moving'` while the summary's `reverseMove` is still null (a move started from an open
@@ -1623,7 +1639,7 @@ The registration passes that version to `AppCaller`; today `bin/lifecycle.ts:28`
 | b | The volume's lower digest equals the baked lower | open | H: the marker's `lowerImageDigest` equals the manifest's; console `guard_result ok` at the export boot |
 | b2 | The promoted lower has `/usr/bin/python3` and `/usr/bin/git`, which the codec needs (`workspace-snapshot-script.ts:1,103`) | open | H: a static check of the lower at bake time, before H ships |
 | c | The export boot enrolls as an ordinary STARTING/MOUNTING row and never reaches RUNNING | code-confirmed (`placement.ts:1408`) | A: enroll log line; the EC2 tag `ezil:generation` = N+1; the row stays MOUNTING until `releaseExportBoot` |
-| d | Wake path for a STOPPED Free row | code: cold replace (`aws-ec2.ts:476`) | A: lifecycle operation `replace`; the volume is `available` before the claim |
+| d | Wake path for a STOPPED Free row | code: cold replace (`aws-ec2.ts:498-500`) | A: lifecycle operation `replace`; the volume is `available` before the claim |
 | e | Idle stop vs poll cadence; capture time for the real workspace and for 512 MiB | open | H: status timestamps; no idle stop while `capturing` or `ready` within the hold |
 | e2 | Host → Worker → R2 throughput ≥ 0.5 MiB/s (§5.4) | open | H+W: bytes per pull and per pass on the T3 move; below the floor → §5.4 changes first |
 | f | Caps, epochs and usage never touch the export boot | design (§5.2) | A: `ezil_billing_compute_epochs` and `ezil_compute_usage` have 0 rows for the computer from the move start |
