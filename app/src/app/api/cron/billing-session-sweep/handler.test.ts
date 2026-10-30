@@ -416,6 +416,21 @@ describe('round 6 R1-04: a paid-era session still open after the drop to Free en
         await f.run(18 * 3600);
         expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'session_max' });
     });
+
+    // A Worker 'start' (processor.ts) opens free-cf with no stored deadline; that is no paid era, so a late sweep never
+    // moves its close past ready + 1 h. Sweeping at the cap itself would not tell the two branches apart.
+    it.each([
+        ['never paid', null],
+        ['canceled', 'canceled'],
+    ] as const)('a Free epoch with no stored deadline (%s) still closes at ready + 1 h when swept late', async (_, history) => {
+        for (const late of [3660, 7200]) {
+            const f = fixture([epoch({ size: 'free-cf', deadlineAt: null, lastHeartbeatAt: iso(late - 60) })], { sku: null });
+            if (history) f.store.subscriptionsFor.mockResolvedValue(canceled(new Date(window.end)));
+            expect(await f.run(late)).toMatchObject({ stopped: 1, closed: 1 });
+            expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'session_max' });
+            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        }
+    });
 });
 
 describe('paid sessions have no time cap', () => {

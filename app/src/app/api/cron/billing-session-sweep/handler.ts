@@ -149,8 +149,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         const stored = storedDeadline === null ? Infinity : Date.parse(storedDeadline);
         // Round 6 R1-04: a session opened on a paid plan with no session cap (its stored deadline lies past this
         // plan's cap) and still open on Free ends at the drop: its recorded time, else now (the sweep runs every
-        // minute), never back-dated to ready + 1 h, and never before the Free hour itself.
-        const paidEra = state.planSku === 'free_v3' && maximum !== Infinity && stored > maximum + 1000;
+        // minute), never back-dated to ready + 1 h, and never before the Free hour itself. Only a STORED deadline says
+        // paid era (openComputeEpochAtReady always stores one): a Worker-opened free-cf epoch has none, and keeps its hour.
+        const paidEra = state.planSku === 'free_v3' && storedDeadline !== null && maximum !== Infinity && stored > maximum + 1000;
         const dropAt = state.freeSince ? Math.min(Date.parse(state.freeSince), now.getTime()) : now.getTime();
         const deadline = paidEra ? Math.max(maximum, dropAt) : Math.min(maximum, stored);
         const due = now.getTime() >= deadline;
