@@ -611,6 +611,7 @@ import {
   parseRepoOpenRequest,
   repoOpenStatus,
   repoOpenWhenRunning,
+  ownSessionExec,
   REPO_OPEN_MAX_BODY_BYTES,
   REPO_OPEN_UNMOUNTED_ROOT,
   type RepoOpenAnswer,
@@ -2695,15 +2696,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `POST /sandbox/:name/repo-open`: clone or fetch one repository into this
    * computer's workspace (`./repo-open.ts`). Checked running under the runtime
    * lock, like `runningContainerFetch`, because an `exec` on a stopped
-   * computer would cold-start it; the git work itself runs outside the lock so
-   * a slow clone never holds up viewer traffic.
+   * computer would cold-start it; the git work itself runs outside the lock,
+   * in a shell session of its own (`ownSessionExec`), so a slow clone holds up
+   * neither viewer traffic nor the probes in the default session.
    */
   async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer> {
     return repoOpenWhenRunning({
       running: () => this.withRuntimeMutation(async () =>
         this.containerIsRunning() && !(await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY))),
       touch: () => this.renewActivityTimeout(),
-      exec: (command, options) => this.exec(command, options),
+      exec: ownSessionExec(this),
     }, request, root);
   }
 

@@ -55,9 +55,15 @@ export const REPO_OPEN_MAX_BODY_BYTES = 8 * 1024;
 export const REPO_OPEN_TOKEN_ENV = 'EZIL_REPO_OPEN_TOKEN';
 /** Works issues every read grant to this user name (`ProjectRepoRedeemResponse.git.username`). */
 export const REPO_OPEN_GIT_USERNAME = 'ezil';
-/** Each git network step is bounded inside the container; the exec bound sits above it. */
+/**
+ * Each git network step is bounded inside the container. The exec bound sits
+ * above the script's worst case (60 s waiting for another open of the same
+ * repository, then 120 s of git plus its 5 s kill grace), so the Worker never
+ * answers while the script is still working.
+ */
 export const REPO_OPEN_GIT_TIMEOUT_S = 120;
-export const REPO_OPEN_EXEC_TIMEOUT_MS = 150_000;
+export const REPO_OPEN_LOCK_WAIT_S = 60;
+export const REPO_OPEN_EXEC_TIMEOUT_MS = 200_000;
 /** A grant with less left than this is refused before git is started. */
 export const REPO_OPEN_MIN_TOKEN_LIFETIME_MS = 5_000;
 /**
@@ -250,7 +256,7 @@ mkdir -p "$parent" 2>/dev/null || fail repo_open_workspace_unavailable
 work=$(mktemp -d /tmp/ezil-repo-open.XXXXXX) || fail repo_open_git_failed
 trap 'rm -rf "$work"' EXIT
 exec 9>"/tmp/ezil-repo-open-$id.lock" || fail repo_open_busy
-flock -w 60 9 || fail repo_open_busy
+flock -w ${REPO_OPEN_LOCK_WAIT_S} 9 || fail repo_open_busy
 [ -L "$folder" ] && fail repo_open_folder_conflict
 if [ -d "$folder" ] && [ -z "$(ls -A "$folder" 2>/dev/null)" ]; then rmdir "$folder" 2>/dev/null || fail repo_open_folder_conflict; fi
 if [ -e "$folder" ]; then
@@ -305,6 +311,33 @@ export type RepoOpenExec = (
   command: string,
   options: { env: Record<string, string>; timeout: number; origin: 'internal' },
 ) => Promise<{ exitCode: number; stdout?: string; stderr?: string }>;
+
+/** The slice of the Sandbox SDK `ownSessionExec` needs (`createSession` / `deleteSession`). */
+export interface RepoOpenSessions {
+  createSession(options: { id: string }): Promise<{ id: string; exec: RepoOpenExec }>;
+  deleteSession(sessionId: string): Promise<unknown>;
+}
+
+/**
+ * An exec in a shell session of its own, deleted afterwards. The container
+ * server runs one session's commands one at a time, and the default session
+ * carries the Durable Object's own probes (load average, terminal keep-alive);
+ * an open can take minutes and must not queue them behind it. Deleting the
+ * session also ends a script the exec bound gave up on.
+ */
+export function ownSessionExec(
+  sandbox: RepoOpenSessions,
+  newId: () => string = () => `ezil-repo-open-${crypto.randomUUID()}`,
+): RepoOpenExec {
+  return async (command, options) => {
+    const session = await sandbox.createSession({ id: newId() });
+    try {
+      return await session.exec(command, options);
+    } finally {
+      await sandbox.deleteSession(session.id).catch(() => undefined);
+    }
+  };
+}
 
 /**
  * Run one open on a computer known to be running. Only `stdout`'s result line

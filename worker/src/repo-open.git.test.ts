@@ -36,6 +36,9 @@ import { join } from 'node:path';
 import { runRepoOpen, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
 
 const which = (bin: string) => Bun.spawnSync(['sh', '-c', `command -v ${bin}`]).exitCode === 0;
+/** The real git the shim hands over to: the host's own, or the image's. */
+const REAL_GIT = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() ? '/usr/bin/git'
+  : Bun.spawnSync(['sh', '-c', 'command -v git']).stdout.toString().trim();
 const IMAGE = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() || '';
 const AVAILABLE = which('git') && which('openssl') && (!IMAGE || which('docker'));
 
@@ -125,7 +128,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     bin = join(dir, 'bin');
     for (const d of [upstream, home, root, bin]) mkdirSync(d, { recursive: true });
     // Records the arguments of every `git` the script runs, then runs the real one.
-    writeFileSync(join(bin, 'git'), '#!/bin/sh\nprintf \'%s\\n\' "git $*" >> "$EZIL_IT_ARGV_LOG"\nexec /usr/bin/git "$@"\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nprintf '%s\\n' "git $*" >> "$EZIL_IT_ARGV_LOG"\nexec ${REAL_GIT} "$@"\n`, { mode: 0o755 });
     // The computer's own git config asks for a credential store. It must never run.
     writeFileSync(join(home, '.gitconfig'), '[credential]\n\thelper = store\n');
     sh(['git', 'init', '-q', '--bare', join(upstream, 'acme', 'site.git')]);

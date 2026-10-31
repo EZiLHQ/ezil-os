@@ -13,6 +13,7 @@ import {
   repoOpenStatus,
   repoOpenWhenRunning,
   runRepoOpen,
+  ownSessionExec,
   REPO_OPEN_ERRORS,
   REPO_OPEN_TOKEN_ENV,
   type RepoOpenExec,
@@ -155,7 +156,8 @@ describe('runRepoOpen', () => {
     expect(command).not.toContain(TOKEN);
     expect(options.env).toEqual({ [REPO_OPEN_TOKEN_ENV]: TOKEN });
     expect(options.origin).toBe('internal');
-    expect(options.timeout).toBeGreaterThan(120_000);
+    // Above the script's worst case: 60 s lock wait + 120 s git + 5 s kill grace.
+    expect(options.timeout).toBeGreaterThan((60 + 120 + 5) * 1000);
     expect(JSON.stringify(answer)).not.toContain(TOKEN);
   });
 
@@ -181,6 +183,47 @@ describe('runRepoOpen', () => {
     expect(touched).toBe(0);
     expect((await repoOpenWhenRunning({ running: async () => true, touch: () => { touched++; }, exec }, parsed(), root)).ok).toBe(true);
     expect(touched).toBe(1);
+  });
+});
+
+describe('ownSessionExec', () => {
+  const recorder = (execImpl: () => Promise<{ exitCode: number; stdout: string }>) => {
+    const log: string[] = [];
+    const sandbox = {
+      createSession: async ({ id }: { id: string }) => {
+        log.push(`create ${id}`);
+        return { id, exec: async (command: string) => { log.push(`exec ${id} ${command}`); return execImpl(); } };
+      },
+      deleteSession: async (id: string) => { log.push(`delete ${id}`); },
+    };
+    return { sandbox, log };
+  };
+
+  it('🔴 runs the open in a session of its own, never the default one the probes use, and deletes it', async () => {
+    const { sandbox, log } = recorder(async () => ({ exitCode: 0, stdout: `ezil-repo-open:ok:cloned:${HEAD}` }));
+    const answer = await runRepoOpen(ownSessionExec(sandbox, () => 'ezil-repo-open-1'), parsed(), { path: '/workspace', requireHydrated: true });
+    expect(answer.ok).toBe(true);
+    expect(log.map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['create ezil-repo-open-1', 'exec ezil-repo-open-1', 'delete ezil-repo-open-1']);
+  });
+
+  it('deletes the session even when the exec throws (an exec timeout), and the open fails closed', async () => {
+    const { sandbox, log } = recorder(async () => { throw new Error('Command timeout after 200000ms'); });
+    const answer = await runRepoOpen(ownSessionExec(sandbox, () => 'ezil-repo-open-2'), parsed(), { path: '/workspace', requireHydrated: true });
+    expect(answer).toEqual({ ok: false, error: 'repo_open_failed' });
+    expect(log.at(-1)).toBe('delete ezil-repo-open-2');
+  });
+
+  it('gives each open a fresh session id by default', async () => {
+    const ids: string[] = [];
+    const sandbox = {
+      createSession: async ({ id }: { id: string }) => { ids.push(id); return { id, exec: async () => ({ exitCode: 0, stdout: '' }) }; },
+      deleteSession: async () => undefined,
+    };
+    await ownSessionExec(sandbox)('true', { env: {}, timeout: 1, origin: 'internal' });
+    await ownSessionExec(sandbox)('true', { env: {}, timeout: 1, origin: 'internal' });
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    for (const id of ids) expect(id).toMatch(/^ezil-repo-open-[0-9a-f-]{36}$/);
   });
 });
 
