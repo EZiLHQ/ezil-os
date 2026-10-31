@@ -6,20 +6,37 @@ import { deriveGuacamoleSandboxId, migrateBegin, migrateAbort, migrateCommit, mi
 import { decideAdmission } from './admission';
 import { AWS_TIER_DATA_GIB, awsTierForSize, instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
 import { sharedAwsSdkCollaborators } from './aws-clients';
-import { buildAwsProvisionUserData } from './aws-ec2';
-import { issueEnrollmentNonce } from './aws-enroll';
-import { buildLifecycleWork, readLifecycleDeployments, type LifecycleWork } from './aws-intent';
-import { lifecycleExecutionArn, readMigrationReadyReceipt, startLifecycleJob } from './aws-receipts';
+import { buildAwsProvisionUserData, type LifecycleStarter } from './aws-ec2';
+import { issueEnrollmentNonce, type Ec2EnrollmentView } from './aws-enroll';
+import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
+import { ENROLL_HOST_RETIRE_RETRY_MS, LifecycleReceiptSchema, lifecycleExecutionArn, readMigrationReadyReceipt, START_SETTLE_MS, startLifecycleJob } from './aws-receipts';
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { cloudflareComputeProvider } from './cloudflare';
 import { finishFreshProvision, flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
 import { advanceMigration, MigrationStepError, type MigrationDeps } from './provider-migrate-orchestrator';
 import { createProviderMigrationStore, type ComputeMigration } from './provider-migrate-store';
-import { provisionFor } from './provider-migrate-provision';
+import { provisionFor, type MigrationProvision } from './provider-migrate-provision';
 import { restoreFetchBase, restoreLeaseFor } from './provider-migrate';
 import { utcMonthStart } from './usage';
 
 const rows = (r: unknown) => (Array.isArray(r) ? r : (r as { rows?: Record<string, unknown>[] })?.rows) as Record<string, unknown>[] ?? [];
+const TERMINAL_EXECUTION: readonly string[] = ['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'];
+
+/** The launch's own receipt, only when it is bound to this exact intent. */
+function launchReceipt(p: Placement, output: string | null | undefined) {
+    let parsed;
+    try { parsed = LifecycleReceiptSchema.safeParse(JSON.parse(output ?? 'null')); } catch { return null; }
+    if (!parsed.success) return null;
+    const r = parsed.data;
+    return r.jobId === p.lifecycleJobId && r.digest === p.lifecycleDigest && r.computerId === p.computerId.toLowerCase()
+        && r.generation === p.generation && r.leaseEpoch === p.leaseEpoch && r.fenceToken === p.fenceToken && r.state === 'running' ? r : null;
+}
+/** Infra `tagsFor`: the tags the provision stamped on this boot's instance. */
+function bootTagsMatch(tags: Readonly<Record<string, string>>, p: Placement, namespace: string): boolean {
+    return tags['ezil:managed-by'] === 'app-computer-platform' && tags['ezil:stage'] === namespace
+        && tags['ezil:computer-id'] === p.computerId.toLowerCase() && tags['ezil:generation'] === String(p.generation)
+        && !!p.fenceToken && tags['ezil:fence-token'] === p.fenceToken;
+}
 export async function migrationStore() {
     const { db } = await import('@/server/db');
     return createProviderMigrationStore(db);
@@ -37,6 +54,39 @@ export function createMigrationRuntime(db: PlacementDb, options: {
     const store = createProviderMigrationStore(db);
     const sandbox = (m: ComputeMigration) => deriveGuacamoleSandboxId(m.userId, m.computerId);
     const sdk = () => options.collaborators ?? sharedAwsSdkCollaborators(options.env ?? process.env);
+    /**
+     * End a failed migration's still-live boot through the lifecycle `retire` job, as
+     * `retireUnenrolledHost` does for a cold boot: the job is recorded by CAS first, so the
+     * authority finds it, then started. The helper stops and terminates the instance and keeps
+     * the data volume (R11); after reopen the Cloudflare copy is authoritative. A refused or
+     * failed retire is re-issued no sooner than `ENROLL_HOST_RETIRE_RETRY_MS` after the last.
+     */
+    async function retireFailedBoot(m: ComputeMigration, intent: MigrationProvision, p: Placement,
+        instance: Ec2EnrollmentView, deployment: LifecycleDeployment | undefined, starter: LifecycleStarter | undefined): Promise<void> {
+        const log = { migrationId: m.id, computerId: m.computerId, instanceId: p.instanceId };
+        if (!starter || !deployment || !p.region || !p.volumeId || !p.fenceToken || !p.instanceType) return;
+        // Never act on an instance this boot did not launch: its tags carry this intent's fence.
+        if (deployment.namespace !== intent.deployment.namespace || !bootTagsMatch(instance.tags, p, intent.deployment.namespace)) {
+            console.warn('[compute.migration.retire]', { ...log, outcome: 'foreign_instance' });
+            return;
+        }
+        if (intent.retire && Date.now() - Date.parse(intent.retire.requestedAt) < ENROLL_HOST_RETIRE_RETRY_MS) return;
+        // The authority reads a published AWS placement first and would refuse this retire.
+        if ((await readPlacement(db, m.computerId)).provider === 'aws-ec2') {
+            console.warn('[compute.migration.retire]', { ...log, outcome: 'aws_placement_published' });
+            return;
+        }
+        let work: LifecycleWork;
+        try {
+            work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: randomUUID(), userData: null, leaseEpoch: p.leaseEpoch }));
+        } catch (error) {
+            if (error instanceof LifecycleIntentInvalidError) return;
+            throw error;
+        }
+        await store.saveProvision(m, { ...intent, retire: { jobId: work.intent.jobId, digest: work.digest, requestedAt: new Date().toISOString() } });
+        const outcome = await startLifecycleJob(starter, p.region, work);
+        console.info('[compute.migration.retire]', { ...log, jobId: work.intent.jobId, outcome });
+    }
     const deps: MigrationDeps & { store: typeof store } = {
         store,
         async exclusive(id, run) {
@@ -112,20 +162,46 @@ export function createMigrationRuntime(db: PlacementDb, options: {
             if (!['failed_reopened', 'failed_needs_operator'].includes(m.state)) return;
             const intent = provisionFor(m);
             if (!intent || intent.released === true) return;
-            const p = intent.placement, { executions, describer } = sdk();
+            const p = intent.placement, { executions, describer, starter } = sdk();
             // A missing job identity is not proof that the launch never started.
             if (!p.region || !p.lifecycleJobId || !executions) return;
+            let launch: Awaited<ReturnType<typeof executions.describe>> | null = null;
             try {
-                const execution = await executions.describe(p.region, lifecycleExecutionArn(intent.deployment, p.lifecycleJobId));
-                if (!['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'].includes(execution.status)) return;
+                launch = await executions.describe(p.region, lifecycleExecutionArn(intent.deployment, p.lifecycleJobId));
+                if (!TERMINAL_EXECUTION.includes(launch.status)) return;
             } catch (error) {
                 // Match restore's visibility grace for an accepted start whose response was lost.
                 if (!isExecutionAbsent(error) || !(Date.now() - Date.parse(intent.reservedAt) >= 5 * 60_000)) return;
             }
-            if (p.instanceId !== null) {
-                if (!describer || !/^i-[a-f0-9]{17}$/.test(p.instanceId)) return;
-                const instance = await describer.describeForEnrollment(p.region, p.instanceId);
-                if (instance !== null && (instance.instanceId !== p.instanceId || !['stopped', 'terminated'].includes(instance.state))) return;
+            const deployments = readLifecycleDeployments(options.env ?? process.env, [p.region]);
+            const deployment = deployments.ok ? deployments.deployments[p.region] : undefined;
+            // A recorded retire settles before anything else: never release under a running retire.
+            if (intent.retire) {
+                try {
+                    const retire = await executions.describe(p.region, lifecycleExecutionArn(deployment ?? intent.deployment, intent.retire.jobId));
+                    if (!TERMINAL_EXECUTION.includes(retire.status)) return;
+                } catch (error) {
+                    if (!isExecutionAbsent(error) || Date.now() - Date.parse(intent.retire.requestedAt) < START_SETTLE_MS) return;
+                }
+            }
+            // Enrollment records the boot's identity; a host that never enrolled is named by the launch receipt.
+            let instanceId = p.instanceId, volumeId = p.volumeId;
+            if (launch?.status === 'SUCCEEDED' && (instanceId === null || volumeId === null)) {
+                const receipt = launchReceipt(p, launch.output);
+                // A succeeded launch whose instance cannot be identified stays reserved for an operator.
+                if (!receipt || (instanceId !== null && receipt.instanceId !== instanceId)) return;
+                instanceId = receipt.instanceId; volumeId = receipt.volumeId;
+            }
+            if (instanceId !== null) {
+                if (!describer || !/^i-[a-f0-9]{17}$/.test(instanceId)) return;
+                const instance = await describer.describeForEnrollment(p.region, instanceId);
+                if (instance !== null && instance.instanceId !== instanceId) return;
+                if (instance !== null && !['stopped', 'terminated'].includes(instance.state)) {
+                    // Only a live boot of THIS intent is retired; anything in transition or unknown waits.
+                    if (!['pending', 'running'].includes(instance.state)) return;
+                    await retireFailedBoot(m, intent, { ...p, instanceId, volumeId }, instance, deployment, starter);
+                    return;
+                }
             }
             // The terminal execution cannot launch again. CAS also rejects any changed boot evidence.
             await store.saveProvision(m, { ...intent, released: true });
@@ -154,7 +230,8 @@ export function createMigrationRuntime(db: PlacementDb, options: {
         async rollback(m) {
             const intent = provisionFor(m);
             if (intent) await rollbackMigrationPlacement(db, m, intent.source);
-            // Retain the non-secret intent/capacity reservation for operator cleanup of a failed AWS boot.
+            // Retain the non-secret intent/capacity reservation: the stale sweep retires a still-live
+            // failed boot through its lifecycle job, then releases it (`releaseProvision`).
             // It is never routed to a user and cannot open a billing epoch.
         },
         commit: (m, input) => migrateCommit(sandbox(m), input),

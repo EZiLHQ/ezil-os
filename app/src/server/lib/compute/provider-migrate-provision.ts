@@ -13,7 +13,15 @@ export interface MigrationProvision {
     reservedAt: string;
     /** The stale sweep releases failed boots only after execution and instance checks. */
     released?: boolean;
+    /** The stale sweep's lifecycle `retire` of a failed boot still running, recorded before its start. */
+    retire?: MigrationProvisionRetire;
 }
+export interface MigrationProvisionRetire {
+    jobId: string;
+    digest: string;
+    requestedAt: string;
+}
+const FAILED_MIGRATION_STATES: readonly string[] = ['failed_reopened', 'failed_needs_operator'];
 function hydrate(p: Placement): Placement {
     return { ...p, updatedAt: new Date(p.updatedAt), enrollExpiresAt: p.enrollExpiresAt && new Date(p.enrollExpiresAt),
         leaseUntil: p.leaseUntil && new Date(p.leaseUntil), presenceAt: p.presenceAt && new Date(p.presenceAt) };
@@ -28,6 +36,21 @@ export async function readEnrollmentPlacement(db: PlacementExecutor, computerId:
     const m = await createProviderMigrationStore(db).readActiveByComputer(computerId);
     const intent = m && !pendingRecovery(m) && ['exported', 'provisioning'].includes(m.state) ? provisionFor(m) : null;
     return intent ? { provider: 'aws-ec2', store: 'ebs', record: intent.placement } : published;
+}
+/**
+ * The lifecycle authority's view. After a failed migration reopened Cloudflare, the published
+ * placement is the source again, so the failed boot's recorded `retire` job is authorised only
+ * through its own unreleased intent, presented as an in-flight RETIRING record of that job.
+ */
+export async function readLifecycleAuthorityPlacement(db: PlacementExecutor, computerId: string, jobId?: string): Promise<ResolvedPlacement> {
+    const resolved = await readEnrollmentPlacement(db, computerId);
+    if (resolved.provider === 'aws-ec2' || !jobId) return resolved;
+    const m = await createProviderMigrationStore(db).readFailedProvisionRetire(computerId, jobId);
+    const intent = m && FAILED_MIGRATION_STATES.includes(m.state) && m.computerId === computerId.toLowerCase() ? provisionFor(m) : null;
+    const retire = intent?.released === true ? undefined : intent?.retire;
+    if (!intent || !retire || retire.jobId !== jobId) return resolved;
+    return { provider: 'aws-ec2', store: 'ebs',
+        record: { ...intent.placement, state: 'RETIRING', lifecycleJobId: retire.jobId, lifecycleDigest: retire.digest } };
 }
 
 async function updateEnrollment(db: PlacementDb, computerId: string, update: (p: Placement) => Placement | null): Promise<TransitionResult | null> {

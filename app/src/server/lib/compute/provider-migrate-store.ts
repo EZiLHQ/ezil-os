@@ -84,8 +84,15 @@ export function createProviderMigrationStore(db: PlacementExecutor, options: { n
         WHERE computer_id = ${computerId}::uuid ORDER BY ezil_compute_migrations.created_at DESC, id DESC LIMIT 1`));
     const readActiveByComputer = async (computerId: string) => one(await db.execute(sql`SELECT ${COLUMNS} FROM public.ezil_compute_migrations
         WHERE computer_id = ${computerId}::uuid AND ${ACTIVE}`));
+    /** A failed migration whose unreleased boot has this exact recorded retire job. */
+    const readFailedProvisionRetire = async (computerId: string, jobId: string) => one(await db.execute(sql`SELECT ${COLUMNS}
+        FROM public.ezil_compute_migrations WHERE computer_id = ${computerId}::uuid
+          AND state IN ('failed_reopened', 'failed_needs_operator')
+          AND workspace_head #>> '{_awsProvision,retire,jobId}' = ${jobId}::text
+          AND COALESCE(workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
+        ORDER BY ezil_compute_migrations.created_at DESC, id DESC LIMIT 1`));
     return {
-        readById, readByComputer, readActiveByComputer,
+        readById, readByComputer, readActiveByComputer, readFailedProvisionRetire,
         async recordRestoreChunk(m: ComputeMigration, kind: 'workspace' | 'system', index: number): Promise<void> {
             const size = snapshotChunkSizes(kind === 'workspace' ? m.workspaceHead : m.systemHead)?.[index];
             if (!m.generation || !Number.isInteger(index) || index < 0 || index > 511 || size === undefined)

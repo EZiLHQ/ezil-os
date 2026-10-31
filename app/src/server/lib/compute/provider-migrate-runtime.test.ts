@@ -83,7 +83,7 @@ describe('failed migration capacity release', () => {
     async function failed(state: ComputeMigration['state'] = 'failed_reopened') {
         const f = fixture(); await f.deps.provision(f.get());
         f.get().state = state;
-        f.store.saveProvision.mockClear();
+        f.store.saveProvision.mockClear(); f.start.mockClear();
         f.deps.exclusive = async (_, run) => run();
         return f;
     }
@@ -117,13 +117,123 @@ describe('failed migration capacity release', () => {
         expect(provisionFor(f.get())?.released).not.toBe(true);
         expect(f.store.saveProvision).not.toHaveBeenCalled();
     });
-    it.each(['pending', 'running', 'stopping', 'shutting-down', 'unknown'])('keeps a launched instance that is %s', async state => {
-        const f = await failed(), intent = provisionFor(f.get())!;
-        intent.placement.instanceId = instance(state).instanceId;
+    /** The incident shape: enrollment recorded the boot, then the tunnel never came up. */
+    function enrolled(f: Awaited<ReturnType<typeof failed>>) {
+        const intent = provisionFor(f.get())!;
+        intent.placement.instanceId = 'i-11111111111111111'; intent.placement.volumeId = 'vol-11111111111111111';
+        intent.placement.lastError = 'enroll_tunnel_pending';
         f.get().workspaceHead!._awsProvision = intent;
-        f.describer.describeForEnrollment.mockResolvedValue(instance(state));
+        return intent;
+    }
+    const bootTags = (p: { fenceToken: string | null }) => ({ 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': D.namespace,
+        'ezil:computer-id': C, 'ezil:generation': '1', 'ezil:fence-token': p.fenceToken! });
+    /** Launch and retire executions are told apart by their `computer-<jobId>` names. */
+    function executionsBy(f: Awaited<ReturnType<typeof failed>>, launch: { status: string; output?: string }, retire: () => Promise<{ status: string }>) {
+        const launchJob = provisionFor(f.get())!.placement.lifecycleJobId!;
+        f.executions.describe.mockImplementation(async (_region, arn) => arn.endsWith(`computer-${launchJob}`) ? launch : retire());
+    }
+    const startedRetires = (f: Awaited<ReturnType<typeof failed>>) => f.start.mock.calls.map(call => {
+        const [region, work] = call as unknown as [string, { name: string; input: string }];
+        return { region, name: work.name, intent: JSON.parse(JSON.parse(work.input).document) };
+    });
+    it('retires a running failed boot through the lifecycle job, then releases it once terminated', async () => {
+        const f = await failed(), intent = enrolled(f), running = { ...instance('running'), tags: bootTags(intent.placement) };
+        let retireStatus = 'RUNNING';
+        executionsBy(f, { status: 'SUCCEEDED' }, async () => ({ status: retireStatus }));
+        f.describer.describeForEnrollment.mockResolvedValue(running);
+        await sweepMigrations({ claimStale: async () => [f.get()], advance: id => advanceMigration(f.deps, id) });
+        const [started] = startedRetires(f), recorded = provisionFor(f.get())!;
+        expect(f.start).toHaveBeenCalledOnce();
+        expect(started).toMatchObject({ region: 'ap-south-1', name: `computer-${recorded.retire!.jobId}`, intent: {
+            operation: 'retire', computerId: C, targetGeneration: 1, fenceToken: intent.placement.fenceToken,
+            providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', userData: null } });
+        // Recorded before the start, so the authority can find it; the launch identity is kept.
+        expect(recorded.placement.lifecycleJobId).toBe(intent.placement.lifecycleJobId);
+        expect(recorded.released).not.toBe(true);
+        // A running retire is followed, never duplicated, and the reservation is held under it.
         await advanceMigration(f.deps, M);
-        expect(f.store.saveProvision).not.toHaveBeenCalled();
+        f.describer.describeForEnrollment.mockResolvedValue({ ...running, state: 'stopped' });
+        await advanceMigration(f.deps, M);
+        expect(f.start).toHaveBeenCalledOnce();
+        expect(provisionFor(f.get())?.released).not.toBe(true);
+        retireStatus = 'SUCCEEDED';
+        f.describer.describeForEnrollment.mockResolvedValue({ ...running, state: 'terminated' });
+        await advanceMigration(f.deps, M);
+        expect(provisionFor(f.get())?.released).toBe(true);
+        expect(provisionFor(f.get())?.retire?.jobId).toBe(recorded.retire!.jobId);
+        expect(f.start).toHaveBeenCalledOnce();
+    });
+    it('retires a host that never enrolled, named by the succeeded launch receipt', async () => {
+        const f = await failed(), p = provisionFor(f.get())!.placement;
+        const receipt = { schemaVersion: 1, jobId: p.lifecycleJobId, digest: p.lifecycleDigest, computerId: C, generation: 1,
+            leaseEpoch: 1, fenceToken: p.fenceToken, instanceId: 'i-22222222222222222', volumeId: 'vol-22222222222222222', state: 'running' };
+        executionsBy(f, { status: 'SUCCEEDED', output: JSON.stringify(receipt) }, async () => { throw { name: 'ExecutionDoesNotExist' }; });
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('pending'), instanceId: receipt.instanceId, tags: bootTags(p) });
+        await advanceMigration(f.deps, M);
+        expect(f.describer.describeForEnrollment).toHaveBeenCalledWith('ap-south-1', receipt.instanceId);
+        expect(startedRetires(f)[0]?.intent).toMatchObject({ operation: 'retire', providerInstanceId: receipt.instanceId, dataVolumeId: receipt.volumeId });
+        expect(provisionFor(f.get())?.released).not.toBe(true);
+    });
+    it.each(['missing', 'malformed', 'another job'])('keeps a succeeded launch with a %s receipt and no enrolled instance', async kind => {
+        const f = await failed(), p = provisionFor(f.get())!.placement;
+        const receipt = { schemaVersion: 1, jobId: kind === 'another job' ? M : p.lifecycleJobId, digest: p.lifecycleDigest, computerId: C,
+            generation: 1, leaseEpoch: 1, fenceToken: p.fenceToken, instanceId: 'i-22222222222222222', volumeId: 'vol-22222222222222222', state: 'running' };
+        f.executions.describe.mockResolvedValue({ status: 'SUCCEEDED', output: kind === 'missing' ? null : kind === 'malformed' ? '{' : JSON.stringify(receipt) });
+        await advanceMigration(f.deps, M);
+        expect(f.describer.describeForEnrollment).not.toHaveBeenCalled();
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each([
+        ['fence token', { 'ezil:fence-token': '33333333-3333-4333-8333-333333333333' }],
+        ['computer', { 'ezil:computer-id': M }],
+        ['generation', { 'ezil:generation': '2' }],
+        ['namespace', { 'ezil:stage': 'other' }],
+        ['untagged', null],
+    ] as const)('never retires or releases a foreign instance (%s)', async (_name, patch) => {
+        const f = await failed(), intent = enrolled(f);
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('running'), tags: patch ? { ...bootTags(intent.placement), ...patch } : {} });
+        await advanceMigration(f.deps, M);
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each(['stopping', 'shutting-down', 'unknown'])('waits on an instance that is %s', async state => {
+        const f = await failed(), intent = enrolled(f);
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance(state), tags: bootTags(intent.placement) });
+        await advanceMigration(f.deps, M);
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each(['RUNNING', 'PENDING_REDRIVE'])('leaves a running instance alone while the launch job is %s', async status => {
+        const f = await failed(), intent = enrolled(f);
+        f.executions.describe.mockResolvedValue({ status });
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('running'), tags: bootTags(intent.placement) });
+        await advanceMigration(f.deps, M);
+        expect(f.describer.describeForEnrollment).not.toHaveBeenCalled();
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each([[0, 0], [11 * 60_000, 1]])('re-issues a failed retire only after the retry interval (%s ms)', async (age, starts) => {
+        const f = await failed(), intent = enrolled(f);
+        intent.retire = { jobId: '44444444-4444-4444-8444-444444444444', digest: 'ab'.repeat(32), requestedAt: new Date(Date.now() - age).toISOString() };
+        f.get().workspaceHead!._awsProvision = intent;
+        executionsBy(f, { status: 'SUCCEEDED' }, async () => ({ status: 'FAILED' }));
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('running'), tags: bootTags(intent.placement) });
+        await advanceMigration(f.deps, M);
+        expect(f.start).toHaveBeenCalledTimes(starts);
+        if (starts) expect(provisionFor(f.get())!.retire!.jobId).not.toBe(intent.retire.jobId);
+        expect(provisionFor(f.get())?.released).not.toBe(true);
+    });
+    it('starts no retire the authority would refuse while an AWS placement is published', async () => {
+        const f = await failed(), intent = enrolled(f);
+        f.db.placements.push(placementRow({ computer_id: C, owner_user_id: C, provider: 'aws-ec2', workspace_store: 'ebs' }));
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('running'), tags: bootTags(intent.placement) });
+        await advanceMigration(f.deps, M);
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
+    });
+    it.each(['starter', 'deployment'])('fails closed on a running instance without a %s', async missing => {
+        const f = await failed(), intent = enrolled(f);
+        f.describer.describeForEnrollment.mockResolvedValue({ ...instance('running'), tags: bootTags(intent.placement) });
+        const deps = createMigrationRuntime(f.db.db, { env: missing === 'deployment' ? { ...env, [LIFECYCLE_DEPLOYMENTS_ENV]: undefined } : env,
+            collaborators: missing === 'starter' ? { executions: f.executions, describer: f.describer } : { starter: { start: f.start }, executions: f.executions, describer: f.describer } });
+        await deps.releaseProvision(f.get());
+        expect(f.start).not.toHaveBeenCalled(); expect(f.store.saveProvision).not.toHaveBeenCalled();
     });
     it.each(['stopped', 'terminated', 'absent'])('releases after the recorded instance is confirmed %s', async state => {
         const f = await failed(), intent = provisionFor(f.get())!;
@@ -135,8 +245,13 @@ describe('failed migration capacity release', () => {
         expect(provisionFor(f.get())?.released).toBe(true);
     });
     it.each(['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'])('accepts terminal execution %s', async status => {
-        const f = await failed(); f.executions.describe.mockResolvedValue({ status });
+        const f = await failed(), p = provisionFor(f.get())!.placement;
+        // A succeeded launch always started an instance: its receipt names it, and it must be gone.
+        const output = JSON.stringify({ schemaVersion: 1, jobId: p.lifecycleJobId, digest: p.lifecycleDigest, computerId: C, generation: 1,
+            leaseEpoch: 1, fenceToken: p.fenceToken, instanceId: 'i-22222222222222222', volumeId: 'vol-22222222222222222', state: 'running' });
+        f.executions.describe.mockResolvedValue({ status, output: status === 'SUCCEEDED' ? output : null });
         await advanceMigration(f.deps, M); expect(provisionFor(f.get())?.released).toBe(true);
+        expect(f.describer.describeForEnrollment).toHaveBeenCalledTimes(status === 'SUCCEEDED' ? 1 : 0);
     });
     it.each([0, 6 * 60_000])('treats absent execution as never started only after visibility grace (%s ms)', async age => {
         const f = await failed(), intent = provisionFor(f.get())!;
