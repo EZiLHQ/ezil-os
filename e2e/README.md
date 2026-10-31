@@ -29,7 +29,7 @@ Browser-free validation: `node --check e2e/live-check.mjs` and `node --test e2e/
 - the HTTP status and body error **code** of every failing `/api/*` response (pathname only, no query, no message text, never a token or cookie). Refusals that arrive as HTTP 200 (`{ ok: false, error: 'computer_stopped' }` from the shell routes) count; the wake loop's expected `sandbox_starting` is flagged `pending` and counted once;
 - console errors and uncaught page errors (redacted, URL queries stripped);
 - the error text the user can see (a failed opening panel, Code's "isn't reachable" panel, alerts, the feedback result);
-- a screenshot of the shell. Remote pixels, frames and form values are hidden; shell text is not, because the error copy is the evidence.
+- a screenshot of the shell. Remote pixels, frames, form values and Settings' Account pane are hidden; shell text is not, because the error copy is the evidence.
 
 ```sh
 EZIL_E2E_APP=https://os-prod.ezil.work EZIL_E2E_EMAIL=… EZIL_E2E_PASSWORD=… \
@@ -48,9 +48,13 @@ EZIL_E2E_JOURNEYS=free-open-apps,feedback-diagnostics,billing-view node e2e/prod
 | `EZIL_E2E_AWS_COMPUTER` | `new` (default) or `reuse` this suite's computer from an earlier run. |
 | `VERCEL_AUTOMATION_BYPASS_SECRET` | Optional, scoped to the app origin by `deployed-target.mjs`. |
 
+"Ready" means what the user sees. Code is ready when `.monaco-workbench` is visible AND no opening overlay covers its window; Browser when its `<video>` (or, with no video element, a visible canvas) has non-blank pixels AND no overlay covers its window. The overlay is any visible `.ezil-app-spinner`, `.ezil-boot`, `.ezil-code-unavailable` or `.ezil-preview-unavailable` in that window, judged by computed style (`hidden`, `display:none`, `visibility:hidden`, opacity near 0 and a collapsed box all count as gone), and the ready state must hold for 700 ms. The viewer streams behind the opening surface before the shell retires it, so pixels alone are not ready. A timeout names what was still on screen (`video pixels present but opening overlay visible ("Opening the window")`).
+
+Each app's evidence has `firstPixelsMs` (Browser) or `firstEditorMs` (Code), `overlaySeenMs`, `overlayGoneMs` and `readyMs`, all from the click. Right after an app is ready the suite brings its window to the front (its title bar, else the window manager's focus) and takes `<journey>-<app>-ready.png` (`free-open-apps-code-ready.png`, `free-open-apps-browser-ready.png`; in the paid journey `-browser-ready`, `-code-ready` and `-browser-wake-ready`). These ready shots show the app's own pixels, so use a dedicated QA account; shots of failures hide remote frames.
+
 Journeys, in this order (each step is `{name, ok, ms, error?}`; time-to-ready is the step's `ms`):
 
-- `free-open-apps`: sign in, `/os` session ready, click **Code** until the editor is visible and no start-failure panel shows, run a nonce `printf` in a new Code terminal, click **Browser** until its `<video>` (or visible canvas) shows non-blank pixels.
+- `free-open-apps`: sign in, `/os` session ready, click **Code**, run a nonce `printf` in a new Code terminal, click **Browser**.
 - `paid-aws-computer`: a paid account only. Checks `billing.summary` is not Free and that no other computer of the account already runs on AWS (the server refuses a second one), creates a **new** computer, makes it the shell's current computer, opens the Browser and waits for pixels (`timeToDesktopMs`), asserts `computer.progress` shows an EC2 placement, opens Code, stops it and waits for `STOPPED`, wakes it through the Browser and waits for pixels again, then stops it. The final stop runs even after a failure and prints the computer id (`{"event":"computer", …}`).
 - `feedback-diagnostics`: Settings → Feedback → send `[QA automated] …` with diagnostics, assert a 2xx and report what the request carried: field names only, whether `traceId` (the correlation id) and server error codes (`api_failure` events) were present. The description is never recorded.
 - `billing-view`: Settings → Billing, read only (no checkout, no `upgrade=` link): plan, AI credits, computer-time allowance, storage as the user sees them.
@@ -66,4 +70,4 @@ Safety:
 - `PLAYWRIGHT_REQUIRE_DIR` must hold a Playwright whose browser is installed (`chromium_headless_shell` for the headless launch); otherwise every journey fails at `browser-launch`.
 - Nothing credential-like is printed or saved: emails are masked as `q***@domain`, and tokens, bearer values, auth cookies, the password and the anon key are scrubbed from every log line and report.
 
-Browser-free validation: `node --check e2e/prod-journeys.mjs` and `node --test e2e/prod-journeys.test.mjs`.
+Browser-free validation: `node --check e2e/prod-journeys.mjs` and `node --test e2e/prod-journeys.test.mjs`. With `PLAYWRIGHT_REQUIRE_DIR` set, one extra test drives the in-page overlay detection in Chromium over markup mirroring the shell's (still offline); without it that test is skipped.

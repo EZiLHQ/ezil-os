@@ -338,6 +338,75 @@ export function describeStartFailure(app, failure) {
 
 export const APP_LABEL = Object.freeze({ code: 'Code', desktop: 'Browser', settings: 'Settings' });
 
+// ── "Ready" is what the user sees ───────────────────────────────────────────
+
+/**
+ * An app is ready when its content is there (Browser: real pixels, Code: the
+ * editor) AND no opening overlay covers it. The viewer starts streaming behind
+ * the opening surface well before the shell retires it (`desktop-window.js`
+ * hides `.ezil-app-spinner` and `.ezil-boot` at reveal), so pixels alone are a
+ * desktop the user cannot yet see.
+ */
+export function userReadiness({ snapshot, contentReady }) {
+  if (!snapshot?.open) return { ready: false, state: 'window_closed' };
+  if (snapshot.windowVisible === false) return { ready: false, state: 'window_hidden' };
+  const overlay = snapshot.overlay ?? null;
+  if (contentReady === true && overlay === null) return { ready: true, state: 'ready' };
+  if (contentReady === true) return { ready: false, state: 'overlay_covering_content', overlay };
+  return { ready: false, state: overlay ? 'opening' : 'content_not_ready', overlay };
+}
+
+/** How long a ready state must hold before it counts: a tick that writes the spinner back is not "ready". */
+export const READY_SETTLE_MS = 700;
+
+export function newReadinessTracker() {
+  return { firstContentMs: null, overlaySeenMs: null, overlayGoneMs: null, readySinceMs: null };
+}
+
+/**
+ * Fold one observation (`elapsedMs` since the click) into the tracker.
+ * `firstContentMs`: first time pixels or the editor existed, overlay or not.
+ * `overlayGoneMs`: when the opening overlay last went away after being seen
+ * (null if it was never seen). `readySinceMs`: start of the current unbroken
+ * stretch of user-ready observations.
+ */
+export function trackReadiness(tracker, { elapsedMs, contentReady, overlayVisible, windowOpen = true }) {
+  const next = { ...tracker };
+  if (contentReady === true && next.firstContentMs === null) next.firstContentMs = elapsedMs;
+  if (overlayVisible) { next.overlaySeenMs ??= elapsedMs; next.overlayGoneMs = null; }
+  else if (windowOpen && next.overlaySeenMs !== null && next.overlayGoneMs === null) next.overlayGoneMs = elapsedMs;
+  const ready = windowOpen && contentReady === true && !overlayVisible;
+  next.readySinceMs = ready ? (next.readySinceMs ?? elapsedMs) : null;
+  return next;
+}
+
+export function readinessSettled(tracker, elapsedMs, settleMs = READY_SETTLE_MS) {
+  return tracker.readySinceMs !== null && elapsedMs - tracker.readySinceMs >= settleMs;
+}
+
+/**
+ * Rounded timings for the report. `contentKey` names the first-content figure
+ * (`firstPixelsMs` for Browser, `firstEditorMs` for Code); `readyMs` is when the
+ * user could first see the app.
+ */
+export function readinessTimings(tracker, contentKey = 'firstContentMs') {
+  const round = value => (value === null ? null : Math.round(value));
+  return { [contentKey]: round(tracker.firstContentMs), overlaySeenMs: round(tracker.overlaySeenMs),
+    overlayGoneMs: round(tracker.overlayGoneMs), readyMs: round(tracker.readySinceMs) };
+}
+
+/** Why an app is not ready yet, for the timeout message: names the overlay still on screen. */
+export function describeReadinessWait(verdict, contentLabel, detail = '') {
+  const overlay = verdict.overlay ? `opening overlay visible${verdict.overlay.text ? ` ("${verdict.overlay.text}")` : ''}` : 'no overlay';
+  const more = detail ? ` [${detail}]` : '';
+  switch (verdict.state) {
+    case 'overlay_covering_content': return `${contentLabel} present but ${overlay}`;
+    case 'opening': case 'content_not_ready': return `${contentLabel} not yet${more}; ${overlay}`;
+    case 'window_hidden': return 'window is not visible';
+    default: return 'window not open';
+  }
+}
+
 // ── Evidence helpers for the individual journeys ────────────────────────────
 
 /** Reject blank frames, a lone cursor, uniform backgrounds. `reason` says which, so a failure is diagnosable. */
@@ -495,16 +564,29 @@ export function readWindowSnapshot(app) {
   }
   const unavailable = win.querySelector('.ezil-code-unavailable');
   const notice = win.querySelector('.ezil-display-notice');
-  const spinner = win.querySelector('.ezil-app-spinner');
   const src = win.querySelector('iframe.window-app-iframe')?.getAttribute('src') ?? '';
+  // An opening overlay the user can see, judged by computed style (a `hidden`
+  // attribute that CSS overrides still paints): not display:none or
+  // visibility:hidden, not faded to nothing (it or any ancestor), real area.
+  const covers = el => {
+    for (let node = el; node && node !== document; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.display === 'none' || Number(style.opacity) < 0.05 || (node === el && style.visibility !== 'visible')) return false;
+    }
+    const box = el.getBoundingClientRect();
+    return box.width >= 8 && box.height >= 8;
+  };
+  const cover = [...win.querySelectorAll('.ezil-app-spinner, .ezil-boot, .ezil-code-unavailable, .ezil-preview-unavailable')].find(covers);
+  const windowBox = win.getBoundingClientRect();
   return {
     open: true,
     computerId: win.getAttribute('data-ezil-computer-id'),
+    windowVisible: getComputedStyle(win).display !== 'none' && windowBox.width > 0 && windowBox.height > 0,
     failed,
     unavailable: shown(unavailable) ? { title: text(unavailable, 'div') } : null,
     notice: shown(notice) ? { title: text(notice, '.ezil-display-notice-title'), body: text(notice, '.ezil-display-notice-body') } : null,
-    spinnerKind: shown(spinner) ? spinner.getAttribute('data-kind') : null,
-    spinnerStatus: shown(spinner) ? text(spinner, '.ezil-opening-status') : '',
+    overlay: cover ? { kind: cover.className.split(/\s+/)[0], dataKind: cover.getAttribute('data-kind'),
+      text: text(cover, '.ezil-opening-status, .ezil-boot-title, div') } : null,
     frame: !src || src === 'about:blank' ? 'blank' : 'navigated',
     alerts: [...document.querySelectorAll('.window-alert .window-alert-message')]
       .map(el => (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 240)).slice(0, 3),
@@ -672,15 +754,20 @@ export async function runProdJourneys({
   const remaining = (limit = 10_000) => remainingMs({ limit, deadline: activeDeadline, stepDeadline, now: performance.now() });
 
   // ── evidence ──
-  const screenshot = async name => {
+  /**
+   * Shell text stays readable (the error copy is the point). Form values and
+   * Settings' Account pane (the address) are always hidden. Remote pixels and
+   * frames are hidden too, except in a `showFrames` shot of an app that is
+   * ready: those exist to show what the user sees, on a dedicated QA account.
+   * A mask box is not used: it would hide the failure panel, which overlays
+   * the app's own iframe.
+   */
+  const screenshot = async (name, { showFrames = false } = {}) => {
     if (!page || page.isClosed()) return null;
     const file = `${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.png`;
     try {
-      // Shell text stays readable (the error copy is the point). Remote pixels,
-      // frames, form values and Settings' Account pane (the address) are hidden.
-      // A mask box would hide the failure panel too: it overlays the app's iframe.
       await page.screenshot({ path: join(config.out, file), timeout: 5000,
-        style: `iframe, video, canvas, object, embed, [data-pane="account"] { visibility: hidden !important; }
+        style: `${showFrames ? '' : 'iframe, video, canvas, object, embed, '}[data-pane="account"] { visibility: hidden !important; }
           input, textarea { color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: transparent !important; }` });
       return file;
     } catch { return null; }
@@ -790,9 +877,15 @@ export async function runProdJourneys({
     await handle?.dispose().catch(() => {});
     return frame;
   }
-  /** Poll one app window until `check` says ready. A failure panel fails it at once, with the copy on screen. */
+  /**
+   * Poll one app window until the user could see the app: `check` says its
+   * content is there AND no opening overlay covers it, held for READY_SETTLE_MS.
+   * A failure panel fails it at once, with the copy on screen.
+   */
   async function waitForApp(app, check, timeoutMs) {
     const began = performance.now();
+    const contentLabel = app === 'code' ? 'editor' : 'video pixels';
+    let tracker = newReadinessTracker();
     let waiting = 'window not open yet';
     for (;;) {
       remaining();
@@ -802,21 +895,24 @@ export async function runProdJourneys({
       const failure = classifyStartFailure(snapshot);
       if (failure) throw new Error(describeStartFailure(app, failure));
       if (!snapshot.open && elapsed > 8000) throw new Error(`${APP_LABEL[app]} window closed before it was ready`);
-      if (snapshot.open) {
-        const verdict = await check(snapshot);
-        if (verdict.ready) return { ...verdict, readyMs: Math.round(performance.now() - began) };
-        waiting = verdict.waiting;
+      const content = snapshot.open ? await check(snapshot) : { contentReady: false };
+      const verdict = userReadiness({ snapshot, contentReady: content.contentReady });
+      const seen = performance.now() - began;
+      tracker = trackReadiness(tracker, { elapsedMs: seen, contentReady: content.contentReady,
+        overlayVisible: !!snapshot.overlay, windowOpen: snapshot.open });
+      if (readinessSettled(tracker, seen)) {
+        return { ...content, ...readinessTimings(tracker, app === 'code' ? 'firstEditorMs' : 'firstPixelsMs') };
       }
-      await sleep(remaining(1000));
+      waiting = describeReadinessWait(verdict, contentLabel, content.detail);
+      await sleep(remaining(tracker.readySinceMs === null ? 1000 : 250));
     }
   }
-  const codeReady = async snapshot => {
+  const codeReady = async () => {
     const frame = await appFrame('code');
     const workbench = frame ? await frame.locator('.monaco-workbench').first().isVisible().catch(() => false) : false;
-    return { ready: workbench && snapshot.spinnerKind === null, frame,
-      waiting: `${snapshot.spinnerStatus || `frame ${snapshot.frame}`}; editor ${workbench ? 'visible' : 'not visible'}` };
+    return { contentReady: workbench, frame, detail: workbench ? '' : 'workbench not visible' };
   };
-  const desktopReady = async snapshot => {
+  const desktopReady = async () => {
     const main = await appFrame('desktop');
     // The streamed viewer (video or canvas) lives in the desktop window's own
     // frame tree. AWS hosts do not match the Cloudflare frame-URL patterns.
@@ -828,11 +924,37 @@ export async function runProdJourneys({
         const sample = await frame.evaluate(sampleFramePixels, { width: 64, height: 36, allowCanvas }).catch(() => null);
         if (!sample) continue;
         last = { ...framePixelVerdict(sample.pixels), source: sample.kind };
-        if (last.ok) return { ready: true, pixels: last };
+        if (last.ok) return { contentReady: true, pixels: last, detail: '' };
       }
     }
-    return { ready: false, waiting: last ? `${last.source} ${last.reason}` : `${snapshot.spinnerStatus || 'no video or canvas yet'}` };
+    return { contentReady: false, detail: last ? `${last.source} ${last.reason}` : 'no video or canvas yet' };
   };
+  const readinessEvidence = (ready, contentKey) => ({ [contentKey]: ready[contentKey], overlaySeenMs: ready.overlaySeenMs,
+    overlayGoneMs: ready.overlayGoneMs, readyMs: ready.readyMs });
+  /** Bring an app window to the front the way a user does (its title bar), then confirm nothing sits above it. */
+  async function bringToFront(app) {
+    const selector = `.window[data-app="${app}"]:not([data-closing="1"])`;
+    const title = page.locator(`${selector} .window-head .window-head-title`).first();
+    let clicked = false;
+    try {
+      if (await title.isVisible()) { await title.click({ timeout: remaining(3000) }); clicked = true; }
+    } catch { clicked = false; }
+    // Full-bleed windows hide their title bar: focus through the window manager, as registry.js does.
+    if (!clicked) await page.evaluate(selector => { window.$(document.querySelector(selector)).focusWindow(); }, selector).catch(() => {});
+    const top = await page.evaluate(selector => {
+      const z = el => Number.parseInt(getComputedStyle(el).zIndex, 10) || 0;
+      const win = document.querySelector(selector);
+      return !!win && ![...document.querySelectorAll('.window')].some(other => other !== win && other.getClientRects().length > 0 && z(other) > z(win));
+    }, selector).catch(() => false);
+    return { clicked, top };
+  }
+  /** Screenshot of an app right after it is user-ready, in front, showing the app itself. */
+  async function readyShot(journey, label, app) {
+    const front = await bringToFront(app).catch(() => ({ clicked: false, top: false }));
+    await sleep(500);   // let the repaint after the focus change land
+    const file = await screenshot(`${journey.name}-${label}-ready`, { showFrames: true });
+    (journey.evidence.readyScreenshots ??= {})[label] = { file, titleBarClicked: front.clicked, inFront: front.top };
+  }
   async function closeWindows(selector = '.window') {
     await page.evaluate(selector => { for (const win of document.querySelectorAll(selector)) window.$(win).close(); }, selector);
     await page.waitForFunction(selector => document.querySelectorAll(selector).length === 0, selector, { timeout: remaining(10_000) });
@@ -896,13 +1018,18 @@ export async function runProdJourneys({
     // Code and Browser are measured independently: one run says which of them fails.
     const code = await step(journey, 'open-code', config.appTimeoutMs + 15 * SECOND, async () => {
       await clickDock('code');
-      return waitForApp('code', codeReady, config.appTimeoutMs);
+      const ready = await waitForApp('code', codeReady, config.appTimeoutMs);
+      journey.evidence.code = readinessEvidence(ready, 'firstEditorMs');
+      await readyShot(journey, 'code', 'code');
+      return ready;
     }, { soft: true });
     if (code) await step(journey, 'terminal-echo', TERMINAL_MS, () => terminalEcho(code.frame), { soft: true });
     await step(journey, 'open-browser', config.appTimeoutMs + 15 * SECOND, async () => {
       await clickDock('desktop');
       const ready = await waitForApp('desktop', desktopReady, config.appTimeoutMs);
+      journey.evidence.browser = readinessEvidence(ready, 'firstPixelsMs');
       journey.evidence.browserPixels = ready.pixels;
+      await readyShot(journey, 'browser', 'desktop');
     });
   }
 
@@ -979,9 +1106,11 @@ export async function runProdJourneys({
         await clickDock('desktop');
         const ready = await waitForApp('desktop', async snapshot => {
           if (snapshot.computerId && snapshot.computerId !== computer.id) throw new Error('The Browser window opened on a different computer');
-          return desktopReady(snapshot);
+          return desktopReady();
         }, config.awsTimeoutMs);
         journey.evidence.timeToDesktopMs = ready.readyMs;
+        journey.evidence.desktop = readinessEvidence(ready, 'firstPixelsMs');
+        await readyShot(journey, 'browser', 'desktop');
       });
       await step(journey, 'assert-aws', MINUTE, async () => {
         const facts = await progressOf(computer.id);
@@ -993,6 +1122,8 @@ export async function runProdJourneys({
         await clickDock('code');
         const ready = await waitForApp('code', codeReady, config.appTimeoutMs);
         journey.evidence.timeToCodeMs = ready.readyMs;
+        journey.evidence.code = readinessEvidence(ready, 'firstEditorMs');
+        await readyShot(journey, 'code', 'code');
       }, { soft: true });   // a broken Code must not skip the stop and wake checks: a boot costs minutes
       await step(journey, 'stop', FINAL_STOP_TIMEOUT_MS + 30 * SECOND, async () => {
         // Like Settings → Stop: windows close first and nothing may re-ask ensure() afterwards.
@@ -1017,9 +1148,11 @@ export async function runProdJourneys({
         await clickDock('desktop');
         const ready = await waitForApp('desktop', async snapshot => {
           if (snapshot.computerId && snapshot.computerId !== computer.id) throw new Error('The Browser window opened on a different computer');
-          return desktopReady(snapshot);
+          return desktopReady();
         }, config.awsWakeTimeoutMs);
         journey.evidence.timeToWakeMs = ready.readyMs;
+        journey.evidence.wake = readinessEvidence(ready, 'firstPixelsMs');
+        await readyShot(journey, 'browser-wake', 'desktop');
       });
       await step(journey, 'running-again', MINUTE, async () => {
         const facts = await progressOf(computer.id);

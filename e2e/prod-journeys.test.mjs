@@ -1,17 +1,19 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { FINAL_STOP_TIMEOUT_MS, parseTerminalMarker } from './live-check.mjs';
 import {
-  COMPUTER_NAME_PREFIX, DEFAULT_JOURNEYS, JOURNEYS, MAX_COMPUTERS_PER_USER, REQUIRED_ENV,
+  COMPUTER_NAME_PREFIX, DEFAULT_JOURNEYS, JOURNEYS, MAX_COMPUTERS_PER_USER, READY_SETTLE_MS, REQUIRED_ENV,
   addApiFailure, addUnique, apiPathOf, assertSuiteComputer, awsFacts, capText, classifyStartFailure,
-  describeCreateRefusal, describeError, describeStartFailure, describeStopFailure, echoProbeCommand,
-  errorCodesOf, exitCodeFor, framePixelVerdict, isPaidPlan, journeyBudgetMs, makeReport,
-  normalizeVisibleText, parseAppOrigin, parseEnv, pickSuiteComputers, redactDeep, redactEmail,
-  redactText, remainingMs, runDeadlines, runProdJourneys, selectJourneys, shapeApiFailure,
-  shapeConsoleError, shapeVisibleErrors, stepRecord, summarizeFeedbackRequest, wantsBody,
+  describeCreateRefusal, describeError, describeReadinessWait, describeStartFailure, describeStopFailure,
+  echoProbeCommand, errorCodesOf, exitCodeFor, framePixelVerdict, isPaidPlan, journeyBudgetMs, makeReport,
+  newReadinessTracker, normalizeVisibleText, parseAppOrigin, parseEnv, pickSuiteComputers, readWindowSnapshot,
+  readinessSettled, readinessTimings, redactDeep, redactEmail, redactText, remainingMs, runDeadlines,
+  runProdJourneys, selectJourneys, shapeApiFailure, shapeConsoleError, shapeVisibleErrors, stepRecord,
+  summarizeFeedbackRequest, trackReadiness, userReadiness, wantsBody,
 } from './prod-journeys.mjs';
 
 const APP = 'https://os-prod.ezil.work';
@@ -257,6 +259,130 @@ test('the pixel verdict agrees with the deployed smoke test at the visible-area 
   const edge = count => frame(i => (i < count ? [255, 255, 255] : [0, 0, 0]));
   assert.equal(framePixelVerdict(edge(46)).ok, false);
   assert.equal(framePixelVerdict(edge(47)).ok, true);
+});
+
+// ── user-ready: content AND no opening overlay ─────────────────────────────
+
+const OPEN = Object.freeze({ open: true, windowVisible: true, overlay: null });
+const OVERLAY = Object.freeze({ kind: 'ezil-app-spinner', dataKind: 'progress', text: 'Opening the window' });
+
+test('an app is ready only when its content is there and no opening overlay covers it', () => {
+  assert.deepEqual(userReadiness({ snapshot: OPEN, contentReady: true }), { ready: true, state: 'ready' });
+  // Overlay hidden, nothing painted yet: not ready.
+  assert.deepEqual(userReadiness({ snapshot: OPEN, contentReady: false }), { ready: false, state: 'content_not_ready', overlay: null });
+  // Overlay visible, nothing painted yet: still opening.
+  assert.deepEqual(userReadiness({ snapshot: { ...OPEN, overlay: OVERLAY }, contentReady: false }),
+    { ready: false, state: 'opening', overlay: OVERLAY });
+});
+
+test('pixels behind a visible opening overlay are not ready: the user sees the spinner, not the desktop', () => {
+  const covered = userReadiness({ snapshot: { ...OPEN, overlay: OVERLAY }, contentReady: true });
+  assert.equal(covered.ready, false);
+  assert.equal(covered.state, 'overlay_covering_content');
+  assert.deepEqual(covered.overlay, OVERLAY);
+  assert.equal(userReadiness({ snapshot: { ...OPEN, overlay: { kind: 'ezil-boot', dataKind: 'progress', text: 'Opening the window' } }, contentReady: true }).ready, false);
+});
+
+test('readiness is strict: only contentReady === true, only an open and visible window', () => {
+  for (const contentReady of [undefined, null, 'yes', 1, {}]) assert.equal(userReadiness({ snapshot: OPEN, contentReady }).ready, false);
+  assert.equal(userReadiness({ snapshot: { open: false }, contentReady: true }).state, 'window_closed');
+  assert.equal(userReadiness({ snapshot: null, contentReady: true }).ready, false);
+  assert.equal(userReadiness({ snapshot: { ...OPEN, windowVisible: false }, contentReady: true }).state, 'window_hidden');
+  assert.equal(userReadiness({ snapshot: { open: true, overlay: null }, contentReady: true }).ready, true, 'visibility unknown is not hidden');
+});
+
+test('the readiness timeline separates first pixels from the overlay going away, and waits for a stable ready state', () => {
+  // The production case: the video paints at 3 s behind the overlay; the shell retires the overlay at 12 s.
+  let tracker = newReadinessTracker();
+  const observe = (elapsedMs, contentReady, overlayVisible) => { tracker = trackReadiness(tracker, { elapsedMs, contentReady, overlayVisible }); };
+  observe(0, false, true);
+  observe(3000, true, true);
+  assert.equal(readinessSettled(tracker, 3000), false);
+  observe(11000, true, true);
+  assert.equal(tracker.readySinceMs, null, 'pixels under the overlay never start the ready clock');
+  assert.equal(readinessSettled(tracker, 11000 + READY_SETTLE_MS * 10), false);
+  observe(12000, true, false);
+  assert.equal(readinessSettled(tracker, 12000), false, 'ready this instant is not yet settled');
+  observe(12000 + READY_SETTLE_MS, true, false);
+  assert.equal(readinessSettled(tracker, 12000 + READY_SETTLE_MS), true);
+  assert.deepEqual(readinessTimings(tracker, 'firstPixelsMs'), { firstPixelsMs: 3000, overlaySeenMs: 0, overlayGoneMs: 12000, readyMs: 12000 });
+});
+
+test('an overlay that comes back resets the ready clock and the gone time', () => {
+  let tracker = newReadinessTracker();
+  for (const [at, content, overlay] of [[0, true, true], [1000, true, false], [1400, true, true], [2000, true, false], [2300, true, false]]) {
+    tracker = trackReadiness(tracker, { elapsedMs: at, contentReady: content, overlayVisible: overlay });
+    if (at === 1000) assert.equal(tracker.overlayGoneMs, 1000);
+    if (at === 1400) assert.deepEqual([tracker.overlayGoneMs, tracker.readySinceMs], [null, null]);
+  }
+  assert.deepEqual(readinessTimings(tracker), { firstContentMs: 0, overlaySeenMs: 0, overlayGoneMs: 2000, readyMs: 2000 });
+  assert.equal(readinessSettled(tracker, 2300, 400), false);
+  assert.equal(readinessSettled(tracker, 2400, 400), true);
+});
+
+test('content that appears only after the overlay is gone is ready then, and an overlay never seen is reported as null', () => {
+  let tracker = newReadinessTracker();
+  tracker = trackReadiness(tracker, { elapsedMs: 500, contentReady: false, overlayVisible: false });
+  tracker = trackReadiness(tracker, { elapsedMs: 4000, contentReady: true, overlayVisible: false });
+  assert.deepEqual(readinessTimings(tracker, 'firstEditorMs'), { firstEditorMs: 4000, overlaySeenMs: null, overlayGoneMs: null, readyMs: 4000 });
+  tracker = trackReadiness(tracker, { elapsedMs: 4500, contentReady: true, overlayVisible: false, windowOpen: false });
+  assert.equal(tracker.readySinceMs, null, 'a closed window is not ready');
+  assert.deepEqual(readinessTimings(newReadinessTracker()), { firstContentMs: null, overlaySeenMs: null, overlayGoneMs: null, readyMs: null });
+});
+
+test('a readiness timeout names the overlay that is still on screen', () => {
+  const covered = userReadiness({ snapshot: { ...OPEN, overlay: OVERLAY }, contentReady: true });
+  assert.equal(describeReadinessWait(covered, 'video pixels'), 'video pixels present but opening overlay visible ("Opening the window")');
+  const opening = userReadiness({ snapshot: { ...OPEN, overlay: { ...OVERLAY, text: 'Opening Code…' } }, contentReady: false });
+  assert.equal(describeReadinessWait(opening, 'editor', 'workbench not visible'), 'editor not yet [workbench not visible]; opening overlay visible ("Opening Code…")');
+  assert.equal(describeReadinessWait(userReadiness({ snapshot: OPEN, contentReady: false }), 'video pixels', 'video black'), 'video pixels not yet [video black]; no overlay');
+  assert.equal(describeReadinessWait({ state: 'window_hidden' }, 'editor'), 'window is not visible');
+  assert.equal(describeReadinessWait({ state: 'window_closed' }, 'editor'), 'window not open');
+});
+
+// The overlay selectors run in the page. This drives the real function in Chromium over markup that mirrors
+// the shell's (`.ezil-app-spinner` / `.ezil-boot` overlays in a `.window-body`, retired with `hidden`).
+// Offline, but it needs a Playwright with a browser: set PLAYWRIGHT_REQUIRE_DIR, as for the live run.
+test('the in-page snapshot sees an opening overlay only while the user can see it', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    // The rules that matter, copied from shell/ezil/ui/ezil-shell.css.
+    const css = `.window{position:absolute;width:600px;height:300px}.window-body{position:relative;width:100%;height:100%}
+      .ezil-app-spinner,.ezil-boot{position:absolute;inset:0;z-index:2;display:flex}
+      .ezil-app-spinner[hidden],.ezil-boot[hidden]{display:none}`;
+    const surface = (cls, attrs = '', kind = 'progress') => `<div class="${cls}" data-kind="${kind}" ${attrs}>
+      <h1 class="ezil-opening-status ezil-boot-title">Opening the window</h1></div>`;
+    const snap = async (body, app = 'desktop') => {
+      await page.setContent(`<style>${css}</style><div class="window" data-app="${app}"><div class="window-body">${body}
+        <iframe class="window-app-iframe" src="about:blank"></iframe></div></div>`);
+      return page.evaluate(readWindowSnapshot, app);
+    };
+    const visible = await snap(surface('ezil-app-spinner'));
+    assert.deepEqual([visible.overlay.kind, visible.overlay.dataKind, visible.overlay.text], ['ezil-app-spinner', 'progress', 'Opening the window']);
+    assert.equal(visible.windowVisible, true);
+    assert.equal((await snap(surface('ezil-boot'))).overlay.kind, 'ezil-boot');
+    // Retired the way desktop-window.js retires them, or hidden by any other means: no overlay.
+    for (const hidden of [
+      surface('ezil-app-spinner', 'hidden'), surface('ezil-boot', 'hidden') + surface('ezil-app-spinner', 'hidden'),
+      surface('ezil-app-spinner', 'style="display:none"'), surface('ezil-app-spinner', 'style="opacity:0"'),
+      surface('ezil-app-spinner', 'style="visibility:hidden"'), surface('ezil-app-spinner', 'style="width:2px;height:2px;inset:auto"'),
+      `<div style="display:none">${surface('ezil-app-spinner')}</div>`, `<div style="opacity:0">${surface('ezil-app-spinner')}</div>`,
+      '',
+    ]) assert.equal((await snap(hidden)).overlay, null, hidden);
+    // What counts is what paints: a `hidden` attribute that CSS overrides still shows the overlay.
+    assert.equal((await snap(surface('ezil-app-spinner', 'hidden style="display:flex"'))).overlay.kind, 'ezil-app-spinner');
+    // One retired surface does not hide the other that is still showing.
+    assert.equal((await snap(surface('ezil-boot', 'hidden') + surface('ezil-app-spinner'))).overlay.kind, 'ezil-app-spinner');
+    // A failed panel is an overlay too (it also reads as a start failure).
+    const failed = await snap(surface('ezil-app-spinner', '', 'failed'));
+    assert.equal(failed.failed.title, 'Opening the window');
+    assert.equal(failed.overlay.dataKind, 'failed');
+    assert.deepEqual(await page.evaluate(readWindowSnapshot, 'code'), { open: false });
+  } finally { await browser.close(); }
 });
 
 // ── terminal probe ─────────────────────────────────────────────────────────
