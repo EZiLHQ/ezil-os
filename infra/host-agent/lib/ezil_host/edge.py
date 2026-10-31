@@ -13,6 +13,11 @@ Routing is by the signed path only:
   POST /__ezil/control/stop[/<warn>] -> the agent's `stop` (warn 0..900 s);
   POST /__ezil/control/fence         -> the agent's `fence`.
   POST /__ezil/control/restart-desktop/<requestId> -> the desktop unit only.
+  POST /__ezil/control/ice/<sha256(body)>, GET /__ezil/control/desktop -> GW-5 (aws-ice.ts);
+  POST /__ezil/control/export/<sha256(body)> -> the agent's `export` (REVERSE-MOVE-CONTRACT §2.2),
+                                       then the job's status from disk;
+  GET /__ezil/control/export/{status,head,chunk/<i>} -> served by the edge FROM DISK
+                                       (export.py's state and staged chunks), never the agent.
 Anything else is 404.
 
 One request per connection (the upstream gets `Connection: close`), so a second request on
@@ -40,6 +45,7 @@ import time
 
 from . import agent as agentmod
 from . import desktop
+from . import export
 from .fsops import Refused
 
 GW_HEADER = "x-ezil-gw"
@@ -61,6 +67,20 @@ ICE_RE = re.compile(r"^/__ezil/control/ice/([0-9a-f]{64})$")
 DESKTOP_STATUS_PATH = "/__ezil/control/desktop"
 RESTART_RE = re.compile(r"^/__ezil/control/restart-desktop/([0-9a-f]{64})$")
 MAX_ICE_BODY = 16384
+# Reverse move export (§2.2). The signature covers the path only, so the POST body's sha256 is in
+# the signed path; status, head and chunk take no input but the chunk index in the path.
+EXPORT_POST_RE = re.compile(r"^/__ezil/control/export/([0-9a-f]{64})$")
+EXPORT_STATUS_PATH = "/__ezil/control/export/status"
+EXPORT_HEAD_PATH = "/__ezil/control/export/head"
+EXPORT_CHUNK_RE = re.compile(r"^/__ezil/control/export/chunk/(.*)$")
+CHUNK_INDEX_RE = re.compile(r"0|[1-9][0-9]{0,2}")   # decimal, no leading zeros, below 512 chunks
+EXPORT_CL_RE = re.compile(r"[0-9]{1,4}")
+MAX_EXPORT_BODY = 1024
+STREAM_BLOCK = 65536
+# The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
+# answer that is not ok, an empty one included, is 503 agent_unavailable.
+AGENT_REFUSALS = frozenset({"export_invalid", "bad_json", "bad_mac", "wrong_epoch", "bad_ts", "stale_request",
+                            "bad_seq", "replayed"})
 FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
                       "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
@@ -224,7 +244,7 @@ def read_head(sock):
 
 
 def _reply(sock, status, body, extra=()):
-    reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 409: "Conflict",
+    reason = {200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 409: "Conflict",
               502: "Bad Gateway", 503: "Service Unavailable"}.get(status, "Error")
     data = json.dumps(body).encode()
     head = [f"HTTP/1.1 {status} {reason}", "Content-Type: application/json", f"Content-Length: {len(data)}",
@@ -357,6 +377,13 @@ class Edge:
                 return
             self._agent(client, "restart-desktop", requestId=restart.group(1))
             return
+        m = EXPORT_POST_RE.match(path)
+        if m:
+            self._export_post(client, head, m.group(1), query)
+            return
+        if path in (EXPORT_STATUS_PATH, EXPORT_HEAD_PATH) or EXPORT_CHUNK_RE.match(path):
+            self._export_get(client, head, path, query)
+            return
         m = CONTROL_RE.match(path)
         if m:
             self._control(client, head, m)
@@ -432,6 +459,118 @@ class Edge:
             _reply(client, 400, {"ok": False, "error": "ice_config_invalid"})
             return
         self._agent(client, "ice", config=config)
+
+    # ------------------------------------------------------------ reverse move export (§2.2)
+    def _export_post(self, client, head, digest, query):
+        """POST /__ezil/control/export/<sha256>: exactly Content-Length bytes (1..1024, no
+        chunking), hashed BEFORE parsing and compared with the signed digest; the bytes are then
+        parsed once (export.parse_request) and relayed as the agent's `export`. 202 with the
+        job's status read from disk. Idempotent for the same {moveId, generation}."""
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if head.method != "POST" or query:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        if te or len(cl) != 1 or not EXPORT_CL_RE.fullmatch(cl[0]) or not 0 < int(cl[0]) <= MAX_EXPORT_BODY:
+            _reply(client, 400, {"ok": False, "error": "export_body_invalid"})
+            return
+        try:
+            body, _ = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "export_body_invalid"})
+            return
+        if not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+            _reply(client, 400, {"ok": False, "error": "export_digest_mismatch"})
+            return
+        req = export.parse_request(body)
+        if req is None:
+            _reply(client, 400, {"ok": False, "error": "export_body_invalid"})
+            return
+        try:
+            resp = self.seq.send("export", moveId=req["moveId"], importGeneration=req["generation"])
+        except (OSError, ValueError, AttributeError):    # AttributeError: a reply that is not an object
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        if not isinstance(resp, dict) or resp.get("ok") is not True:
+            # 409 only for a refusal the agent actually sent (the Worker makes it final, §4.2, §5.5).
+            # Anything else is the agent failing, not the message, and stays retryable: an empty
+            # reply (it closed the socket unanswered: died or restarted mid-request), `internal`,
+            # `stopping` (a committed stop or shutdown) or a reply without a known error.
+            error = resp.get("error") if isinstance(resp, dict) else None
+            if error == "export_busy":
+                _reply(client, 409, {"ok": False, "error": "export_busy"})
+            elif error in AGENT_REFUSALS:
+                _reply(client, 409, {"ok": False, "error": "export_invalid"})
+            else:
+                _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        try:
+            record = export.read_state(self.cfg)
+        except Refused:
+            _reply(client, 503, {"ok": False, "error": "export_state_unreadable"})
+            return
+        _reply(client, 202, export.status(record))
+
+    def _served(self):
+        try:
+            export.note_served(self.cfg, self.clock())
+        except (OSError, Refused) as e:
+            self.log(f"edge: export lastServedAt not written: {type(e).__name__}")
+
+    def _export_get(self, client, head, path, query):
+        """GET status | head | chunk/<i>, from disk. Each served GET is the idle hold's
+        lastServedAt (and, like every verified request, presence)."""
+        if head.method != "GET" or query or head.get("content-length") or head.get("transfer-encoding"):
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        if path == EXPORT_STATUS_PATH:
+            self._served()
+            try:
+                record = export.read_state(self.cfg)
+            except Refused:
+                _reply(client, 503, {"ok": False, "error": "export_state_unreadable"})
+                return
+            _reply(client, 200, export.status(record))
+            return
+        index = None
+        if path != EXPORT_HEAD_PATH:
+            index = EXPORT_CHUNK_RE.match(path).group(1)
+            if not CHUNK_INDEX_RE.fullmatch(index):
+                _reply(client, 400, {"ok": False, "error": "bad_chunk_index"})
+                return
+        try:
+            record = export.read_state(self.cfg)
+        except Refused:
+            record = None
+        if record is None or record["state"] != "ready":
+            _reply(client, 409, {"ok": False, "error": "export_not_ready"})
+            return
+        if index is None:
+            self._served()
+            _reply(client, 200, record["head"])
+            return
+        if int(index) >= len(record["head"]["chunks"]):
+            _reply(client, 400, {"ok": False, "error": "bad_chunk_index"})
+            return
+        opened = export.open_chunk(self.cfg, record, int(index))
+        if opened is None:
+            _reply(client, 404, {"ok": False, "error": "export_chunk_missing"})
+            return
+        self._served()
+        fd, size = opened
+        try:
+            client.sendall(("\r\n".join(["HTTP/1.1 200 OK", "Content-Type: application/octet-stream",
+                                          f"Content-Length: {size}", "Connection: close"]) + "\r\n\r\n").encode())
+            sent = 0
+            while sent < size:
+                data = os.read(fd, min(STREAM_BLOCK, size - sent))
+                if not data:
+                    break                          # truncated under us: the client sees a short body
+                client.sendall(data)
+                sent += len(data)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _desktop_status(self, client, head, query):
         if head.method != "GET" or query or head.get("content-length") or head.get("transfer-encoding"):

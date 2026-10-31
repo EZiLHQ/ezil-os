@@ -12,11 +12,12 @@ import os
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import time
 
 from . import canary, config as cfgmod
-from .fsops import DIR_FLAGS, Refused, clear_dir, read_regular_at, remove_singletons
+from .fsops import DIR_FLAGS, Refused, clear_dir, open_dir_below, read_regular_at, remove_singletons
 
 # Docker's default set MINUS CAP_NET_RAW: no raw/packet sockets, so no forged packets
 # (the anti-spoof rule is the network-side fence). The desktop boots without it (test-boot).
@@ -523,6 +524,10 @@ def host_limits(cfg):
     return cpus * 100000, memory
 
 
+def _hosts_file(host):
+    return f"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n"
+
+
 def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     """desktop_config: a validated relay config (relay mode) puts Cloudflare's neko ICE env
     and the derived neko credentials in place of local mode's direct-connect settings and
@@ -534,7 +539,7 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     gen_dir = os.path.join(cfg.runDir, "gen")
     os.makedirs(gen_dir, mode=0o755, exist_ok=True)
     files = {"hostname": host + "\n",
-             "hosts": f"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n",
+             "hosts": _hosts_file(host),
              "resolv.conf": "# managed by ezil-host-agent\n" + (f"nameserver {HOST_IP}\n" if cfg.networkMode == "veth-nat" else ""),
              "ezil-history.sh": HISTORY_PROFILE}
     for n, body in files.items():
@@ -611,6 +616,123 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     os.makedirs(bundle, mode=0o700, exist_ok=True)
     _write_private_atomic(os.path.join(bundle, "config.json"), json.dumps(spec, indent=1).encode())
     _write_private_atomic(_run_file(cfg, AI_STATE), json.dumps({"configured": bool(ai)}).encode())
+    return bundle
+
+
+# ---------------------------------------------------------------- export spec
+# Reverse move export (REVERSE-MOVE-CONTRACT §2.5 step 4; export.py runs it). The Worker's own
+# snapshot codec, committed next to the agent (ami/sync-codec.py; test_codec_parity).
+EXPORT_CONTAINER_ID = "ezil-export"
+EXPORT_CODEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace-snapshot-script.py")
+EXPORT_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Mount destinations that must already exist in the lower: runc creates a missing one inside the
+# root BEFORE it remounts the root read-only, which here would write into the shared promoted
+# lower (the desktop overlay's lowerdir). Checked at bake time too (ami/validate-lowers.py).
+EXPORT_LOWER_DIRS = ("proc", "dev", "tmp", "workspace")
+EXPORT_LOWER_FILES = ("etc/hosts", "etc/hostname")
+
+
+def check_export_lower(lower):
+    """Refused unless every export mount destination exists in the lower as a real directory
+    or regular file (no-follow)."""
+    for rel in EXPORT_LOWER_DIRS:
+        try:
+            os.close(open_dir_below(lower, rel))
+        except (Refused, OSError):
+            raise Refused("export_lower_mountpoint_missing", rel)
+    for rel in EXPORT_LOWER_FILES:
+        parent, leaf = rel.rsplit("/", 1)
+        try:
+            fd = open_dir_below(lower, parent)
+        except (Refused, OSError):
+            raise Refused("export_lower_mountpoint_missing", rel)
+        try:
+            ok = stat.S_ISREG(os.stat(leaf, dir_fd=fd, follow_symlinks=False).st_mode)
+        except OSError:
+            ok = False
+        finally:
+            os.close(fd)
+        if not ok:
+            raise Refused("export_lower_mountpoint_missing", rel)
+
+
+def build_export_spec(cfg, lease, export_dir):
+    """A throwaway container that runs the codec's `export-capture` over the user's /workspace.
+    Never build_spec's: that root is the merged overlay (the user's AWS upper would execute), its
+    /tmp is a 1 GiB RAM tmpfs, its /workspace and profiles binds are read-write and its network
+    is the host-wide netns. Here:
+      * root: the promoted lower, read-only;
+      * /tmp: a bind of <export_dir>/tmp (root volume, empty, 0700), so the codec's own
+        mkdir('/tmp/ezil-snapshot-<g>') works and its path assertion holds; nothing else at /tmp;
+      * /workspace: <dataMount>/workspace, ro,nosuid,nodev,noexec; no profiles bind; of gen_dir
+        only /etc/hosts and /etc/hostname, read-only;
+      * network: a NEW namespace (loopback only), never cfg.networkMode's;
+      * the desktop's caps, seccomp, AppArmor, noNewPrivileges, memory and pids limits.
+    <export_dir> is stateDir/export/<importGeneration>. Returns the bundle (runDir, never the
+    desktop's own: a desktop restart can never launch this spec)."""
+    generation = os.path.basename(os.path.normpath(export_dir))
+    if not EXPORT_UUID_RE.fullmatch(generation):
+        raise Refused("export_dir_invalid", generation)
+    lower = cfgmod.lower_dir(cfg, cfgmod.host_digest(cfg))
+    check_export_lower(lower)
+    tmp = os.path.join(export_dir, "tmp")
+    try:
+        os.close(os.open(tmp, DIR_FLAGS))
+    except OSError:
+        raise Refused("export_tmp_missing", tmp)
+    cpu_quota, memory_limit = host_limits(cfg)
+    host = f"ezil-gen-{lease['generation']}-e{lease['leaseEpoch']}"
+    gen_dir = os.path.join(cfg.runDir, "gen")
+    os.makedirs(gen_dir, mode=0o755, exist_ok=True)
+    for n, body in (("hostname", host + "\n"), ("hosts", _hosts_file(host))):
+        with open(os.path.join(gen_dir, n), "w") as f:
+            f.write(body)
+    with open(EXPORT_CODEC, encoding="utf-8") as f:
+        codec = f.read()
+    params = json.dumps({"op": "export-capture", "root": "/workspace", "work": f"/tmp/ezil-snapshot-{generation}"})
+
+    def bind(src, dst, opts):
+        return {"destination": dst, "type": "bind", "source": src, "options": ["bind"] + opts}
+    with open(cfg.seccompProfile, encoding="utf-8") as f:
+        seccomp = json.load(f)
+    seccomp.pop("_comment", None)
+    spec = {
+        "ociVersion": "1.2.0",
+        "process": {
+            "terminal": False, "user": {"uid": 0, "gid": 0},
+            "args": ["/usr/bin/python3", "-I", "-c", codec, params],
+            "env": ["PATH=/usr/bin:/bin", "LANG=C.UTF-8"], "cwd": "/",
+            "capabilities": {"bounding": CAPS, "effective": CAPS, "permitted": CAPS},
+            "rlimits": [{"type": "RLIMIT_NOFILE", "hard": 1048576, "soft": 1048576}],
+            "noNewPrivileges": True,
+            "apparmorProfile": cfg.apparmorProfile,
+        },
+        "root": {"path": lower, "readonly": True},
+        "hostname": host,
+        "mounts": [
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+            bind(tmp, "/tmp", ["rw", "nosuid", "nodev", "noexec"]),
+            bind(f"{cfg.dataMount}/workspace", "/workspace", ["ro", "nosuid", "nodev", "noexec"]),
+            bind(f"{gen_dir}/hosts", "/etc/hosts", ["ro"]),
+            bind(f"{gen_dir}/hostname", "/etc/hostname", ["ro"]),
+        ],
+        "linux": {
+            "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}, {"type": "cgroup"},
+                           {"type": "network"}],
+            "cgroupsPath": cfg.cgroupsPath + "-export",
+            "resources": {"cpu": {"quota": cpu_quota, "period": 100000}, "memory": {"limit": memory_limit},
+                          "pids": {"limit": cfg.pidsLimit}, "devices": [{"allow": False, "access": "rwm"}]},
+            "seccomp": seccomp,
+            "maskedPaths": ["/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
+                            "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
+                            "/sys/firmware", "/sys/devices/virtual/powercap"],
+            "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
+        },
+    }
+    bundle = _run_file(cfg, "export-bundle")
+    os.makedirs(bundle, mode=0o700, exist_ok=True)
+    _write_private_atomic(os.path.join(bundle, "config.json"), json.dumps(spec, indent=1).encode())
     return bundle
 
 
