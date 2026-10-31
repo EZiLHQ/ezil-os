@@ -53,7 +53,8 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  *                          than being killed mid-hold (PLATFORM-NOTES §13).
  *   POST { computerId }  — the long one. Starts/attaches the desktop and
  *                          resolves only at the end, success or a specific
- *                          error.
+ *                          error. `intent: 'warm'` (the Browser icon's warm,
+ *                          Phase B r8) is forwarded to the procedure.
  *
  * Input is deliberately NOT re-validated here: it is forwarded as given and
  * the procedures' own zod schemas reject anything malformed, surfacing as a
@@ -130,7 +131,7 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', sessionId, screen } = (body ?? {}) as {
+        const { computerId = '', sessionId, screen, intent } = (body ?? {}) as {
             computerId?: string;
             sessionId?: string;
             /**
@@ -144,6 +145,13 @@ export async function POST(req: Request) {
              * own comment on why the schema is `unknown` rather than an object.
              */
             screen?: unknown;
+            /**
+             * Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C): `'warm'` on
+             * the Browser icon's warm (`shell/ezil/warm.js`), which is not an
+             * open. Forwarded VERBATIM, like `screen`: the procedure types it
+             * `z.unknown()` and reads only `=== 'warm'`.
+             */
+            intent?: unknown;
         };
 
         const preview = await caller.cloudflareGuacamole.previewUrl({
@@ -153,6 +161,7 @@ export async function POST(req: Request) {
             sessionId: sessionId ?? computerId,
             computerId,
             screen,
+            intent,
         });
 
         return shellJson(preview);

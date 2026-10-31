@@ -657,7 +657,9 @@ check('Phase B pre-move (§6.3): moveAvailable false keeps 6a\'s banner exactly;
     assert.doesNotMatch(text(plain), /Move my files|Workspace folder|14 days|Opening it uses/);
     assert.doesNotMatch(plain, /data-role="move-|data-action="move-/);
     const onOpen = render(held({ moveAvailable: true, moveOnOpen: true })).html;
-    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
+    // r8 (§6.3, §5.9): the copy names the two opens that start the move, the desktop and Code (Preview and a hover never do).
+    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
+    assert.doesNotMatch(text(onOpen), /open your computer/);
     assert.match(onOpen, /data-action="move-start">Move my files now<\/button>/);
     assert.ok(onOpen.includes(BANNER.replace(/'/g, '&#39;')), '6a\'s banner stays');
     const later = render(held({ moveAvailable: true, moveOnOpen: false })).html;

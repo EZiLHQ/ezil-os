@@ -241,6 +241,16 @@ export async function stopCooldownAnswer(db: PlacementExecutor, computer: Comput
     } catch {
         return null;
     }
+    return computerStoppedAnswer();
+}
+
+/**
+ * The stop hold's refusal value (`computer_stopped`): deterministic for the client (boot-phases' AWS refusals, so no
+ * silent re-ask and no telemetry), with no move flag. Phase B r8 (§5.9, Option C): also the answer to the Browser icon's
+ * warm on a computer whose next open would start the move. `previewUrl` never answers it otherwise (the desktop open is
+ * never held), so the shell's `warm.js` can tell it apart, drop it, and give a claiming window a real open instead.
+ */
+export function computerStoppedAnswer() {
     return { ok: false as const, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
         provider: 'cloudflare-guacamole' as const, computeProvider: 'aws-ec2' as const };
 }
@@ -739,10 +749,15 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
     return { ok: true, move: reverseMoveView(m, view) };
 }
 
+/** r8 (§5.9, Option C): what `reverseMoveOnOpen` answers a warm whose open WOULD have started the move (no row was created). */
+export const REVERSE_WARM_HELD = 'warm_held' as const;
+
 /**
- * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` (the desktop, and so also the Browser icon's
- * warm, which sends the same open) and, **[r7 fixer]**, by `codePreviewUrl` before `routeComputer`; never by reads,
- * `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl`. Creates a row only when ALL hold: the placement is aws-ec2
+ * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` (the desktop) and, **[r7 fixer]**, by
+ * `codePreviewUrl` before `routeComputer`; never by reads, `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl`.
+ * **[r8, Option C]** With `warm` (the Browser icon's warm, `intent: 'warm'`) it runs every check below and creates NOTHING:
+ * when all hold it answers `REVERSE_WARM_HELD` (the caller then answers without routing, so the warm neither moves nor boots
+ * the computer), otherwise null exactly as for an open. Creates a row only when ALL hold: the placement is aws-ec2
  * STOPPED with no job and no switch/restart transition (§5.9's "no lease (no transition active)"; `lease_until` itself is not
  * read: a stop never clears it, so a STOPPED row's lease is always stale); **[r7 fixer]** its size is `HOLD_SIZE` (a held-closed
  * computer keeps 6a's `files_on_aws` refusal: its card offers the move as a click only); no reverse row holds it and the newest
@@ -750,11 +765,12 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
  * founder-owned (§5.9.1); no forward work; standing `files_on_aws`. **[r7 fixer]** With `stopCooldown` (Code), not within
  * `STOP_COOLDOWN_MS` of the last run's end: a leftover poll never starts anything the owner just stopped (the route then
  * answers `computer_stopped`, as before). Cheap checks first: a Cloudflare open adds one placement read.
- * 🔴 Fails closed: any throw means no trigger, and the open proceeds as the D16 hold (today's open). The caller then routes,
- * and routing answers the reverse waiting provider for the row created here. Returns the row, or null.
+ * 🔴 Fails closed: any throw means no trigger, and the open proceeds as the D16 hold (today's open; for a warm, today's warm).
+ * The caller then routes, and routing answers the reverse waiting provider for the row created here. Returns the row,
+ * `REVERSE_WARM_HELD` (a warm only), or null.
  */
 export async function reverseMoveOnOpen(db: PlacementDb, computer: ComputerRef, user: { email?: unknown },
-    deps: ReverseTriggerDeps = {}, options: { stopCooldown?: boolean } = {}): Promise<ComputeReverseMove | null> {
+    deps: ReverseTriggerDeps = {}, options: { stopCooldown?: boolean; warm?: boolean } = {}): Promise<ComputeReverseMove | typeof REVERSE_WARM_HELD | null> {
     const env = deps.env ?? process.env;
     const userId = computer.userId.toLowerCase(), computerId = computer.computerId.toLowerCase();
     try {
@@ -784,6 +800,8 @@ export async function reverseMoveOnOpen(db: PlacementDb, computer: ComputerRef, 
         if (await reverseFounderOwned(user.email, deps.isOperator ?? defaultIsOperator)) return null;
         if (await forwardMoveBusy(db, computerId)) return null;
         if (await heldStanding(deps.billing ? deps.billing() : await defaultBilling(), userId) !== 'files_on_aws') return null;
+        // r8 (Option C): a warm is never the open. It only learns that the open would move the files, and creates nothing.
+        if (options.warm) return REVERSE_WARM_HELD;
         const m = await store.createOrGetActive({ computerId, userId, startedBy: 'open' });
         try { await (deps.schedule ?? defaultScheduleMove)(m.id); } catch { /* the sweep takes the row */ }
         console.info(JSON.stringify({ event: 'reverse-move', trigger: 'open', moveId: m.id, computer: computerId.slice(0, 8) }));

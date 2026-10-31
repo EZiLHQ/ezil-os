@@ -699,11 +699,12 @@ export function moveCardCopy (view) {
 
 /**
  * §6.3 the pre-move sentences (after the files-held words): `onOpen` is the `moveOnOpen` variant ("the next time
- * you open your computer"). `lead`: the card's own first sentence; a held-closed card continues 6a's instead.
+ * you open your desktop or Code": r8, the two opens that start the move; Preview and a hover never do, §5.9).
+ * `lead`: the card's own first sentence; a held-closed card continues 6a's instead.
  */
 export function moveOfferCopy ({ onOpen = false, lead = true } = {}) {
     const kept = `Not moved: ${MOVE_NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
-    if ( onOpen ) return { lead: 'Your files are on your AWS computer.', text: `The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files now' };
+    if ( onOpen ) return { lead: 'Your files are on your AWS computer.', text: `The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files now' };
     return { lead: lead ? 'Your files are on your AWS computer.' : '', text: `${lead ? 'Opening it uses your Free limits. ' : ''}You can move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files to my Free computer' };
 }
 

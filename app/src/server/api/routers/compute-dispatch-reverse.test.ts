@@ -15,6 +15,8 @@ type Row = Record<string, unknown>;
 const h = vi.hoisted(() => ({
     gate: vi.fn(), sync: vi.fn(), preview: vi.fn(), prepare: vi.fn(), schedule: vi.fn(),
     subs: [] as unknown[], billingFails: false, tabEnabled: true,
+    /** r8: the database the shell desktop route's context carries (the U → A seam through `POST /api/shell/desktop`). */
+    routeDb: null as unknown,
 }));
 vi.mock('@/server/api/trpc', async () => {
     // superjson, as the real `@/server/api/trpc`: the HTTP seam below speaks the app's real wire format (createCaller ignores it).
@@ -23,7 +25,14 @@ vi.mock('@/server/api/trpc', async () => {
     return { createTRPCRouter: t.router, protectedProcedure: t.procedure.use(({ ctx, next }) => {
         if (!ctx.user) throw new TRPCError({ code: 'UNAUTHORIZED' });
         return next({ ctx: { ...ctx, user: ctx.user } });
-    }) };
+    }), createTRPCContext: async () => ({ user: { id: '11111111-1111-4111-8111-111111111111', email: 'person@example.com' }, db: h.routeDb }) };
+});
+// r8: the real shell desktop route, over the real cloudflareGuacamole router only (the app root would load every router).
+vi.mock('@/server/api/root', async () => {
+    const { cloudflareGuacamoleRouter } = await import('@/server/api/routers/cloudflare-guacamole');
+    return { appRouter: { createCaller: (ctx: Parameters<typeof cloudflareGuacamoleRouter.createCaller>[0]) => ({
+        cloudflareGuacamole: cloudflareGuacamoleRouter.createCaller(ctx),
+    }) } };
 });
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/env', () => ({ env: { TELEMETRY_ADMIN_EMAILS: 'ops@example.com' } }));
@@ -55,7 +64,8 @@ import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
 import { createTRPCRouter } from '@/server/api/trpc';
 import { cloudflareGuacamoleRouter } from './cloudflare-guacamole';
 import { computerRouter } from './computer';
-import { awsPreviewAnswer, awsStatusAnswer, reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, REVERSE_WARM_HELD, reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
+import { POST as shellDesktopPost } from '@/app/api/shell/desktop/route';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 import { reverseBlockedProvider, reverseWaitingProvider } from '@/server/lib/compute/provider-reverse-placement';
 import { REVERSE_MOVE_IN_FLIGHT } from '@/server/lib/compute/provider-reverse-store';
@@ -171,6 +181,7 @@ beforeEach(() => {
     h.subs = [];
     h.billingFails = false;
     h.tabEnabled = true;
+    h.routeDb = null;
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -272,12 +283,93 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         await guac(quiet.db).status({ computerId: C });
         expect(quiet.moves).toEqual([]);
     });
-    it('r7 fixer (§5.9): the Browser icon\'s warm sends the same open (its measured screen) and counts as one', async () => {
-        // shell warm.js → session.openDesktop → POST /api/shell/desktop {computerId, sessionId, screen} → previewUrl: nothing in it
-        // tells a hover from a click, and today it already boots the computer under the D16 hold. Option A: it starts the move.
+    /** The stop hold's refusal value, reused as the warm's answer (r8, Option C). */
+    const warmHeld = { ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
+        provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' };
+    const screen = { width: 1280, height: 800 };
+    const writes = (w: ReturnType<typeof world>) => w.fake.statements.filter(s => /^\s*(UPDATE|INSERT|DELETE)/i.test(s.sql));
+    it('r8 (§5.9, Option C): the Browser icon\'s warm on a held STOPPED std-2 computer creates no row and starts nothing; the click after it moves', async () => {
+        // With the gate open, a warm that fell through to routing would reach the credential sync and the AWS ensure (a boot).
+        h.gate.mockResolvedValue({ allowed: true });
         const w = stopped();
-        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen: { width: 1280, height: 800 } })).toEqual(moving);
+        const answer = await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'warm' });
+        expect(w.moves).toEqual([]); // first: the mutant without the warm skip fails HERE, on the row it created
+        expect(answer).toEqual(warmHeld);
+        expect(h.schedule).not.toHaveBeenCalled();
+        expect(h.gate).not.toHaveBeenCalled();
+        expect(h.sync).not.toHaveBeenCalled();
+        expect(h.preview).not.toHaveBeenCalled();
+        expect(h.prepare).not.toHaveBeenCalled();
+        expect(fetch).not.toHaveBeenCalled();
+        expect(writes(w)).toEqual([]);
+        expect(w.fake.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null });
+        expect(lines()).toEqual([]);
+        // Another hover answers the same, still with no row.
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(warmHeld);
+        expect(w.moves).toEqual([]);
+        // The click (the same body, no intent) is the open: it starts the move and answers the waiting value.
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen })).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+        expect(h.schedule).toHaveBeenCalledTimes(1);
+        expect(h.gate).not.toHaveBeenCalled();
+    });
+    it('r8 (§5.9): reverseMoveOnOpen with warm runs the same checks and answers REVERSE_WARM_HELD instead of creating', async () => {
+        const w = stopped();
+        expect(await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: 'person@example.com' }, {}, { warm: true }))
+            .toBe(REVERSE_WARM_HELD);
+        expect(w.moves).toEqual([]);
+        expect(h.schedule).not.toHaveBeenCalled();
+        // Any failed check is null for a warm too (the warm then routes exactly as today).
+        const paid = stopped();
+        h.subs = [paidSub];
+        expect(await reverseMoveOnOpen(paid.db as never, { userId: U, computerId: C }, { email: 'person@example.com' }, {}, { warm: true })).toBeNull();
+    });
+    it('r8 (§5.9): an intent other than \'warm\' is an ordinary open (tolerant like `screen`, never a 400 of the boot)', async () => {
+        for (const intent of ['WARM', 'click', 1, null, {}]) {
+            const w = stopped();
+            expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, intent })).toEqual(moving);
+            expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
+        }
+    });
+    it('r8 (§5.9): a warm on a computer with a move in flight still answers computeMoving (routing unchanged), with no new row', async () => {
+        const w = world([openable({ state: 'MOUNTING', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'warm' })).toEqual(moving);
+        expect(w.moves).toHaveLength(1);
+        expect(h.gate).not.toHaveBeenCalled();
+        expect(lines()).toEqual([expect.objectContaining({ surface: 'desktop', error: 'sandbox_starting', reason: 'computer_moving' })]);
+        const stuck = world([openable()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
+        expect(await guac(stuck.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(blocked);
+    });
+    it.each([
+        ['a paid standing', { subs: [paidSub] }],
+        ['a founder-owned account', { email: 'founder@ezil.work' }],
+        ['a held-closed computer (cmp-4)', { placement: { instance_type: 'm6i.xlarge' } }],
+        ['a failed_reopened newest row', { moves: [moveRow({ state: 'failed_reopened', last_error: 'copy_stalled' })] }],
+        ['a Cloudflare computer', { cloudflare: true }],
+    ] as const)('r8 (§5.9): a warm on %s is exactly today\'s open (same answer, same gate call, no row)', async (_name, setup: Row) => {
+        if (setup.subs) h.subs = setup.subs as unknown[];
+        const make = () => world([setup.cloudflare
+            ? placementRow({ computer_id: C, owner_user_id: U, provider: 'cloudflare', workspace_store: 'r2' })
+            : openable(setup.placement as Row)], { moves: setup.moves as Row[] });
+        const email = (setup.email as string | undefined) ?? 'person@example.com';
+        const warm = make();
+        // The gate's own input, without its deps object (a fresh one per request).
+        const gateCalls = () => h.gate.mock.calls.map(([call]) => {
+            const input = { ...(call as Row) };
+            delete input.deps;
+            return input;
+        });
+        const warmAnswer = await guac(warm.db, email).previewUrl({ sessionId: C, computerId: C, screen, intent: 'warm' });
+        const warmGate = gateCalls();
+        h.gate.mockClear();
+        const click = make();
+        const clickAnswer = await guac(click.db, email).previewUrl({ sessionId: C, computerId: C, screen });
+        expect(warmAnswer).toEqual(clickAnswer);
+        expect(warmAnswer).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
+        expect(warmGate).toHaveLength(1);
+        expect(warmGate).toEqual(gateCalls());
+        expect(warm.moves.filter(r => r.started_by === 'open')).toEqual([]);
+        expect(click.moves.filter(r => r.started_by === 'open')).toEqual([]);
     });
     it('r7 fixer (§5.9): Code is an open too: a held STOPPED std-2 computer gets an open row and the waiting value', async () => {
         const w = stopped();
@@ -563,6 +655,41 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         const old = world([held()], { present: false });
         serve(old.db);
         expect(await trpc.mutate('computer.move.retry', { computerId: C })).toEqual({ ok: true, data: { ok: false, reason: 'move_unsupported' } });
+    });
+
+    /**
+     * r8 (§5.9, Option C): the shell's REAL warm (`warm.js` → `session.openDesktop` → `POST /api/shell/desktop`) through the
+     * REAL route into the real `previewUrl`. The hover's ask carries the marker and gets the stop hold's value (no row, no
+     * gate, no boot); the window that claims that warm asks a real open with no marker, which starts the move.
+     */
+    it('warm.js → POST /api/shell/desktop → previewUrl: the hover moves nothing; the claiming click starts the move', async () => {
+        const w = world([held({ instance_type: 'm6i.large' })]);
+        h.routeDb = w.db;
+        h.gate.mockResolvedValue({ allowed: true });
+        const seen: { body: Row; answer: Row }[] = [];
+        vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+            const url = new URL(String(input), 'https://os.example');
+            if (url.pathname !== '/api/shell/desktop' || init?.method !== 'POST') throw new Error(`unexpected request ${init?.method} ${url.pathname}`);
+            const res = await shellDesktopPost(new Request(url, init));
+            seen.push({ body: JSON.parse(String(init.body)) as Row, answer: await res.clone().json() as Row });
+            return res;
+        });
+        const warmJs = await import('../../../../../shell/ezil/warm.js') as {
+            warm(id: string): void; claim(id: string): Promise<Row>; _resetForTests(): void };
+        warmJs._resetForTests();
+        warmJs.warm(C); // the hover: its first ask leaves now, with the marker
+        const res = await warmJs.claim(C); // the click, while the warm is in flight
+        expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'warm' }, { computerId: C }]);
+        expect(seen[0]!.answer).toEqual({ ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
+            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });
+        expect(seen[1]!.answer).toEqual(moving);
+        // The window gets the move (its own open then takes the wait over), never the warm's answer.
+        expect(res).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeMoving: true });
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+        expect(h.schedule).toHaveBeenCalledTimes(1);
+        expect(h.gate).not.toHaveBeenCalled();
+        expect(h.sync).not.toHaveBeenCalled();
+        warmJs._resetForTests();
     });
 
     it('the session loop\'s computer.progress GET (readMoveAsk) reaches the procedure and reads the moving view', async () => {

@@ -80,7 +80,8 @@ import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
 import {
-    awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, reverseMoveAnswer, reverseMoveOnOpen, routeComputer, stopCooldownAnswer,
+    awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, computerStoppedAnswer, REVERSE_WARM_HELD, reverseMoveAnswer, reverseMoveOnOpen,
+    routeComputer, stopCooldownAnswer,
 } from './compute-dispatch';
 import type { PlacementDb } from '@/server/lib/compute/placement';
 import type { ComputeProvider } from '@/server/lib/compute/provider';
@@ -223,6 +224,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                  * OLD cached bundle keep working against this server.
                  */
                 screen: z.unknown().optional(),
+                /**
+                 * Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C): `'warm'` marks the Browser icon's warm (shell
+                 * `warm.js`, a hover or press), which is not an open. `z.unknown()` for the same reason as `screen`:
+                 * any other value, or none, is an ordinary open, never a 400 of the whole desktop boot.
+                 */
+                intent: z.unknown().optional(),
             }),
         )
         .query(async ({ ctx, input, signal }) => {
@@ -264,9 +271,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             // Phase B (D20, REVERSE-MOVE-CONTRACT §5.9): the next open of a held Free computer starts the move to the Free
             // computer. It runs here, before routing, and fails closed; routing then answers the reverse waiting provider.
-            // r7 fixer: the Browser icon's warm (hover or press, shell warm.js) sends this same open and counts as one, as it
-            // already boots the computer under the D16 hold today (§5.9).
-            await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user);
+            // r8 (Option C): the Browser icon's warm (hover or press, shell warm.js, `intent: 'warm'`) is not an open. On a
+            // computer whose open would start the move it creates no row and boots nothing: it gets the stop hold's
+            // `computer_stopped` value, which the warm drops and no window is handed (`warm.js` claim() asks a real open).
+            // Any other warm runs exactly as before: an in-flight row still answers the move right after routing.
+            const warm = input.intent === 'warm';
+            const triggered = await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { warm });
+            if (triggered === REVERSE_WARM_HELD) return computerStoppedAnswer();
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): a computer in a move answers the move right after routing: before the billing gate (a held
@@ -757,9 +768,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
-            // Phase B (D20, §5.9, r7 fixer): Code is an open of the computer too, so it starts the move as the desktop does
-            // ("the next time you open your computer"). Never within the stop hold: a leftover poll still answers
-            // `computer_stopped` below, and no row is created for it.
+            // Phase B (D20, §5.9, r7 fixer, ratified r8): Code is an open of the computer too, so it starts the move as the
+            // desktop does ("the next time you open your desktop or Code"). Never within the stop hold: a leftover poll still
+            // answers `computer_stopped` below, and no row is created for it.
             await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { stopCooldown: true });
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).

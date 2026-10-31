@@ -745,10 +745,14 @@ export function openSession () {
  *   `measureDesktopBox`. OPTIONAL in both directions: an older server ignores
  *   an unknown body field, and this client omits the field entirely when it
  *   has nothing to measure, so neither side has to know about the other.
+ * @param {{signal?: AbortSignal, movingAnswer?: object, warm?: boolean | (() => boolean)}} [opts] Phase B r8
+ *   (§5.9, Option C): `warm` marks the Browser icon's warm (`warm.js` only), read before EACH ask: while it is true the
+ *   ask carries `intent: 'warm'`, so the server never starts a move (or boots a held computer) for a hover. A real open
+ *   never sets it, and its body stays byte-identical.
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId, screen, { signal, movingAnswer } = {}) {
+export async function openDesktop (computerId, screen, { signal, movingAnswer, warm } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
@@ -757,7 +761,9 @@ export async function openDesktop (computerId, screen, { signal, movingAnswer } 
     // did not start itself (the paint-time warm, via `warm.js`) — and by
     // `cancelComputerOpens` (Stop/Delete, after the windows close).
     // Phase B: only an open with a `signal` waits on a move; `movingAnswer` (the claimed warm's) starts it inside one.
-    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s), { signal, movingAnswer });
+    const isWarm = typeof warm === 'function' ? warm : () => warm === true;
+    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s, isWarm() === true),
+        { signal, movingAnswer });
 }
 
 /**
@@ -877,20 +883,25 @@ export async function ensureLocalDesktop (computerId) {
     return localStarts.get(computerId);
 }
 
-/** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId, screen, signal) {
+/**
+ * One `POST /api/shell/desktop`. The loop that may call it more than once is above. `warm`: this ask is the Browser
+ * icon's warm (Phase B r8): the body adds `intent: 'warm'`, and only then.
+ */
+async function openDesktopOnce (computerId, screen, signal, warm = false) {
     // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
     // for. The server treats absent and malformed identically, but a body that
     // is byte-identical to the pre-change one is the strongest form of "an old
-    // server sees exactly what it always saw".
+    // server sees exactly what it always saw". `intent` follows the same rule.
     const usable = screen
         && Number.isInteger(screen.width) && Number.isInteger(screen.height)
         && screen.width > 0 && screen.height > 0;
     const res = await request(endpoint('desktop'), {
         method: 'POST',
-        body: usable
-            ? { computerId, screen: { width: screen.width, height: screen.height } }
-            : { computerId },
+        body: {
+            computerId,
+            ...(usable ? { screen: { width: screen.width, height: screen.height } } : {}),
+            ...(warm === true ? { intent: 'warm' } : {}),
+        },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
         signal,
     });
