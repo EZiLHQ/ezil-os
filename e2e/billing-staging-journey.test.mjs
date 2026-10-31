@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 import { aggregateResults, classifyHost, createRedactor, guardPlaywright,
   isAIAccountError, parseResources, redactEvidence, terminalBlock, command, ensureTerminal,
-  closeApp, restartPane, restartUnavailableReason } from './billing-staging-journey.mjs';
+  closeApp, persistence, restartUnavailableReason, terminalCommand, terminalResult,
+  RESTART_COMPUTER_UI, RESTART_COMPUTER_WAIT_MS } from './billing-staging-journey.mjs';
 
 const credentials = { email: 'qa+staging@example.test', password: 'P@ss word!"\\$?&' };
 
@@ -208,63 +213,316 @@ test('failed command click and non-timeout lookup errors propagate without anoth
   }
 });
 
-test('restart skips only explicit deployment/stack limitations, never missing prerequisites or failures', () => {
-  assert.equal(restartUnavailableReason('Not available in this deployment yet.'), 'restart_not_supported_by_deployment');
-  assert.equal(restartUnavailableReason("This deployment hasn't turned on desktop restarts yet."), 'restart_not_supported_by_deployment');
-  assert.equal(restartUnavailableReason('This desktop runs on an older stack that cannot be restarted in place.'), 'restart_not_supported_by_desktop_stack');
-  for (const text of ['', 'Open a desktop first, then come back here.', 'Restarting…', 'Your session expired — sign in again.',
-    "Your desktop isn't answering", 'Could not reach the server.', 'Something went wrong. Please try again.']) assert.equal(restartUnavailableReason(text), null);
+const UI = RESTART_COMPUTER_UI;
+const SETTINGS = '.window[data-app="settings"]:not([data-closing="1"])';
+const PANE = `${SETTINGS} [data-pane="troubleshoot"]`;
+// Restart computer's DOM (troubleshoot.js render() and confirmRestartComputer(),
+// sheet-frame.js), spelled out apart from the step's own RESTART_COMPUTER_UI so
+// the fake below does not follow the step if the step drifts.
+const DOM = {
+  control: '[data-action="restart-computer"]',
+  status: '[data-role="restart-computer-status"]',
+  failed: '.ezil-settings-error[data-role="restart-computer-status"]',
+  sheet: '[role="dialog"][data-sheet="confirm-restart-computer"]',
+  confirm: 'Restart computer',
+};
+// Restart computer's own lines (troubleshoot.js render() and reasonCopy()). The
+// source pin below proves each is in the tab, so the fake draws what the tab draws.
+const COPY = {
+  restarting: 'Restarting your computer… this usually takes 1–4 minutes. Your files stay.',
+  restarted: 'Your computer restarted. Open the desktop to continue.',
+  unavailable: 'Not available in this deployment yet.',
+  needsDesktop: 'Open a desktop first, then come back here.',
+  notRunning: "Your computer isn't running. Open the desktop to start it.",
+  transitionFailed: "We couldn't restart your computer. Your files are safe. Try again in a moment.",
+};
+const RUN = '6f1d1c2e-5d0e-4c1b-9f43-1f4b2a7d9e10';
+
+test('Restart computer skips only on its explicit unavailable line, never on prerequisites or failures', () => {
+  assert.equal(restartUnavailableReason(COPY.unavailable), 'restart_not_supported_by_deployment');
+  assert.equal(restartUnavailableReason(` ${COPY.unavailable}\n`), 'restart_not_supported_by_deployment');
+  // The removed Restart desktop's own limitation lines are no longer skips either.
+  for (const text of ['', "This deployment hasn't turned on desktop restarts yet.",
+    'This desktop runs on an older stack that cannot be restarted in place.', COPY.needsDesktop,
+    COPY.restarting, COPY.restarted, COPY.notRunning, COPY.transitionFailed, 'Your session expired — sign in again.',
+    'Could not reach the server. Check your connection and try again.', 'Something went wrong. Please try again.',
+    `${COPY.unavailable} ${COPY.needsDesktop}`]) assert.equal(restartUnavailableReason(text), null, text);
 });
 
-function restartFixture({ unsupported = false, expanded = false } = {}) {
+/** The computer behind the terminal: the step's real scripts, wrapped by the
+ * real terminalCommand(), run in bash against a scratch directory standing in
+ * for ~, /workspace and the kernel's boot id. Shell functions stand in for
+ * tmux, hostname, free and nproc. A restart (reboot) ends every tmux session
+ * unless told otherwise, changes the boot id, and deletes the files in `lose`.
+ */
+function fakeComputer({ lose = [], tmuxSurvives = false, workspace = true } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'e2e-persistence-'));
+  for (const dir of ['home', 'tmp']) mkdirSync(join(root, dir));
+  // Without a workspace directory, writing the /workspace marker fails.
+  if (workspace) mkdirSync(join(root, 'workspace')); else writeFileSync(join(root, 'workspace'), '');
+  writeFileSync(join(root, 'boot_id'), 'boot-1\n');
+  writeFileSync(join(root, 'tmux'), '');
   const calls = [];
-  let checks = 0;
-  const locator = (selector, parent = '') => ({
-    last() { return this; }, locator(child) {
-      const scope = parent + selector;
-      if (child.startsWith('.dashboard-app-drawer')) assert.equal(scope, '.window[data-app="desktop"]:not([data-closing="1"])');
-      else if (child === '[data-action="restart"]') assert.equal(scope,
-        '.window[data-app="settings"]:not([data-closing="1"])[data-pane="troubleshoot"]');
-      else assert.equal(scope, '.window[data-app="settings"]:not([data-closing="1"])');
-      return locator(child, scope);
-    },
-    async count() { return 1; },
-    async getAttribute(name) {
-      if (selector.includes('drawer-toggle')) { assert.equal(name, 'aria-expanded'); return String(expanded); }
-      assert.equal(name, 'data-ezil-computer-id'); return 'fixture-computer';
-    },
-    async isVisible() { return true; },
-    async isEnabled() { return !unsupported && ++checks >= 2; },
-    async click() { calls.push(selector); },
-    async waitFor() {},
-    async evaluate(callback) {
-      const hr = { tagName: 'HR' };
-      return callback({ nextElementSibling: { tagName: 'P', matches: () => true,
-        textContent: unsupported ? 'Not available in this deployment yet.' : '', nextElementSibling: hr } });
-    },
-  });
-  return { page: { locator }, calls };
+  let rebooted = false;
+  const prelude = [
+    'tmux() { case "$1" in',
+    '  ls) if [ -s "$FAKE/tmux" ]; then cat "$FAKE/tmux"; else echo "no server running on /tmp/tmux-0/default" >&2; return 1; fi ;;',
+    '  new) printf \'%s: 1 windows (created today)\\n\' "$4" >> "$FAKE/tmux" ;;',
+    '  kill-session) grep -v "^$3:" "$FAKE/tmux" > "$FAKE/tmux.next"; mv "$FAKE/tmux.next" "$FAKE/tmux" ;;',
+    '  *) return 2 ;;',
+    'esac; }',
+    'hostname() { echo computer-a; }',
+    'free() { printf \'%s\\n\' "               total        used        free" "Mem:            7680         123        7000" "Swap:              0           0           0"; }',
+    'nproc() { echo 2; }',
+  ].join('\n');
+  const terminal = async (script, runId, phase) => {
+    calls.push(`terminal:${phase}`);
+    if (phase === 'after') assert.ok(rebooted, 'the markers are read back only after the restart finished');
+    const { begin, end, out, line } = terminalCommand(script, runId, phase);
+    const file = join(root, 'tmp', basename(out));
+    // The computer's own paths, moved into this run's directory; ~ is $HOME.
+    const local = line.replaceAll(out, file).replaceAll('/workspace/', `${root}/workspace/`)
+      .replaceAll('/proc/sys/kernel/random/boot_id', join(root, 'boot_id'));
+    execFileSync('bash', ['-c', `${prelude}\n${local}`],
+      { env: { PATH: process.env.PATH, HOME: join(root, 'home'), FAKE: root }, timeout: 10_000 });
+    const result = terminalResult(readFileSync(file, 'utf8'), begin, end);
+    assert.ok(result, 'the output file holds both markers');
+    return result;
+  };
+  const reboot = () => {
+    calls.push('reboot');
+    rebooted = true;
+    writeFileSync(join(root, 'boot_id'), 'boot-2\n');
+    if (!tmuxSurvives) writeFileSync(join(root, 'tmux'), '');
+    // No force: the marker must have been written before it can be lost.
+    for (const path of lose) rmSync(join(root, path));
+  };
+  return { calls, terminal, reboot, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test('restart uses the open Browser drawer and waits for the control to enable', async () => {
-  for (const expanded of [false, true]) {
-    const { page, calls } = restartFixture({ expanded });
+/** Settings → Troubleshoot as troubleshoot.js draws it, behind the Playwright
+ * calls the step makes, over a fakeComputer(). Any other selector or call throws,
+ * so the removed Restart desktop control or a page-wide button lookup cannot pass.
+ * The server's transition settles on the `polls`-th read of the status line.
+ */
+function restartFixture({ supported = true, desktop = true, outcome = 'done', polls = 3,
+  failure = COPY.transitionFailed, ...machine } = {}) {
+  const computer = fakeComputer(machine);
+  const { calls } = computer;
+  const ui = { open: false, tab: false, status: 'idle', sheet: false, reads: 0 };
+  const line = () => ({ restarting: COPY.restarting, restarted: COPY.restarted, failed: failure })[ui.status]
+    ?? (!supported ? COPY.unavailable : !desktop ? COPY.needsDesktop : null);
+  const disabled = () => ui.status === 'restarting' || !supported || !desktop;
+  const settle = () => {
+    if (ui.status !== 'restarting' || ++ui.reads < polls) return;
+    if (outcome === 'done') { ui.status = 'restarted'; computer.reboot(); }
+    if (outcome === 'failed') ui.status = 'failed';
+  };
+  const handlers = {
+    '.taskbar-item[data-app="settings"]': {
+      isVisible: () => true,
+      click: () => { calls.push('dock:settings'); ui.open = true; },
+    },
+    [`${SETTINGS} [data-tab="troubleshoot"]`]: {
+      click: () => { assert.ok(ui.open, 'Settings is open'); calls.push('tab:troubleshoot'); ui.tab = true; },
+    },
+    [PANE]: { waitFor: ({ state }) => { assert.equal(state, 'visible'); assert.ok(ui.tab, 'Troubleshoot is showing'); } },
+    [`${PANE} ${DOM.control}`]: {
+      isVisible: () => ui.tab,
+      isEnabled: () => !disabled(),
+      click: () => { assert.ok(!disabled(), 'a disabled control is never clicked'); calls.push('control'); ui.sheet = true; },
+    },
+    [`${PANE} ${DOM.status}`]: {
+      count: () => { settle(); return Number(line() !== null); },
+      innerText: () => line() ?? assert.fail('no status line to read'),
+    },
+    [`${PANE} ${DOM.failed}`]: { count: () => Number(ui.status === 'failed') },
+    [DOM.sheet]: { waitFor: ({ state }) => { assert.equal(state, 'visible'); assert.ok(ui.sheet, 'the confirm sheet is open'); } },
+    [`${DOM.sheet} button "${DOM.confirm}"`]: {
+      click: () => { assert.ok(ui.sheet); calls.push('confirm'); ui.sheet = false; ui.status = 'restarting'; },
+    },
+  };
+  const node = key => {
+    const call = method => async (...args) => {
+      const handler = handlers[key]?.[method];
+      if (!handler) throw new Error(`Unexpected ${method}() on ${key}`);
+      return handler(...args);
+    };
+    return {
+      first() { return this; }, last() { return this; },
+      locator: child => node(`${key} ${child}`),
+      getByRole(role, { name, exact } = {}) {
+        assert.equal(exact, true, 'an exact name');
+        return node(`${key} ${role} "${name}"`);
+      },
+      ...Object.fromEntries(['isVisible', 'isEnabled', 'click', 'waitFor', 'count', 'innerText'].map(name => [name, call(name)])),
+    };
+  };
+  const steps = {
+    terminal: computer.terminal,
+    closeApp: async id => {
+      calls.push(`close:${id}`);
+      // A fresh Settings window re-runs the tab's init: status back to idle.
+      if (id === 'settings') Object.assign(ui, { open: false, tab: false, status: 'idle', sheet: false, reads: 0 });
+    },
+    openApp: async (id, evidence) => { calls.push(`open:${id}`); evidence.ttiMs = 0; },
+  };
+  return { page: { locator: node }, steps, calls, cleanup: computer.cleanup };
+}
+
+/** The step through guardPlaywright, on node:test's mocked clock: until()'s
+ * polls and its real 15 s and 360 s budgets pass in simulated time. The status
+ * is main()'s record() verdict: a throw FAILs, a returned reason SKIPs.
+ */
+async function runStep(t, fixture, evidence) {
+  t.after(fixture.cleanup);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  try {
+    let settled = false;
+    const status = persistence(guardPlaywright(fixture.page, createRedactor()), RUN, evidence, { steps: fixture.steps })
+      .then(reason => reason ? `SKIP:${reason}` : 'PASS', error => `FAIL:${error.message}`)
+      .finally(() => { settled = true; });
+    while (!settled) {
+      assert.ok(Date.now() < 3_600_000, 'the step settles within a simulated hour');
+      await new Promise(resolve => setImmediate(resolve));
+      t.mock.timers.tick(100);
+    }
+    return { status: await status, ms: Date.now() };
+  } finally { t.mock.timers.reset(); }
+}
+
+test('persistence: Restart computer through its sheet keeps both markers; a lost tmux session is evidence only', async t => {
+  for (const tmuxSurvives of [false, true]) {
+    const fixture = restartFixture({ tmuxSurvives });
     const evidence = {};
-    assert.equal((await restartPane(page, evidence)).reason, null);
-    assert.deepEqual(calls, [...(expanded ? [] : ['.dashboard-app-drawer-toggle']),
-      '.dashboard-app-drawer-settings', '[data-tab="troubleshoot"]']);
-    assert.equal(evidence.desktopHasComputerId, true);
-    assert.equal(evidence.enabled, true);
-    assert.ok(!JSON.stringify(evidence).includes('fixture-computer'));
+    const { status, ms } = await runStep(t, fixture, evidence);
+    assert.equal(status, 'PASS', tmuxSurvives);
+    assert.ok(ms < 5_000, ms);
+    assert.deepEqual(fixture.calls, ['terminal:before', 'close:settings', 'dock:settings', 'tab:troubleshoot',
+      'control', 'confirm', 'reboot', 'close:settings', 'open:desktop', 'open:code', 'terminal:after']);
+    assert.deepEqual(evidence.restartControl, { path: 'Settings → Troubleshoot → Restart computer', visible: true,
+      enabled: true, explanation: '', unavailableReason: null, status: COPY.restarted, restartingSeen: true });
+    assert.equal(evidence.filePersisted, true);
+    assert.equal(evidence.workspaceFilePersisted, true);
+    // The session was started before the restart; whether it is back is recorded either way.
+    assert.match(evidence.beforeTerminal, /^E2E_RC=0$/m);
+    assert.equal(evidence.tmuxSessionPresent, tmuxSurvives);
+    assert.equal(evidence.tmuxExitCode, tmuxSurvives ? 0 : 1);
+    assert.equal(evidence.bootIdChanged, true);
+    assert.deepEqual([evidence.host, evidence.hostAfter], ['computer-a', 'computer-a']);
+    assert.deepEqual(evidence.resources, { ramMiB: 7680, vcpus: 2 });
+    assert.deepEqual([evidence.priorMarker, evidence.priorWorkspaceMarker, evidence.priorTmux], [null, null, null]);
+    assert.equal(typeof evidence.restartComputerMs, 'number');
+    assert.deepEqual([evidence.desktopAfterRestart, evidence.codeAfterRestart], [{ ttiMs: 0 }, { ttiMs: 0 }]);
+    for (const gone of ['restartMs', 'desktopBeforeRestart']) assert.ok(!(gone in evidence), gone);
   }
 });
 
-test('restart retains the disabled explanation when deployment support is absent', async () => {
-  const { page } = restartFixture({ unsupported: true });
+test('persistence FAILs, never SKIPs, when either marker is lost across the restart', async t => {
+  for (const [lose, path] of [['home/e2e-persist.txt', '~/e2e-persist.txt'],
+    ['workspace/.e2e-persist.txt', '/workspace/.e2e-persist.txt']]) {
+    const fixture = restartFixture({ lose: [lose] });
+    const evidence = {};
+    assert.equal((await runStep(t, fixture, evidence)).status, `FAIL:Persistence marker was not restored after restart: ${path}`);
+    assert.equal(evidence.filePersisted, lose.startsWith('workspace'), lose);
+    assert.equal(evidence.workspaceFilePersisted, lose.startsWith('home'), lose);
+    assert.equal(fixture.calls.at(-1), 'terminal:after');
+  }
+});
+
+test('persistence FAILs before restarting when a marker could not be written', async t => {
+  const fixture = restartFixture({ workspace: false });
+  assert.equal((await runStep(t, fixture, {})).status, 'FAIL:Persistence marker was not written: /workspace/.e2e-persist.txt');
+  assert.deepEqual(fixture.calls, ['terminal:before']);
+});
+
+test('persistence FAILs on Restart computer\'s failure copy and reads nothing back', async t => {
+  // A refused request shows at the first read; a failed transition after a few.
+  for (const [failure, polls] of [[COPY.notRunning, 1], [COPY.transitionFailed, 3]]) {
+    const fixture = restartFixture({ outcome: 'failed', failure, polls });
+    const evidence = {};
+    assert.equal((await runStep(t, fixture, evidence)).status, `FAIL:Restart computer failed: ${failure}`);
+    assert.equal(evidence.restartControl.status, failure);
+    assert.deepEqual(fixture.calls.slice(-2), ['control', 'confirm']);
+  }
+});
+
+test('persistence SKIPs on the explicit unavailable line without touching the control or the sheet', async t => {
+  const fixture = restartFixture({ supported: false });
   const evidence = {};
-  assert.equal((await restartPane(page, evidence)).reason, 'restart_not_supported_by_deployment');
-  assert.equal(evidence.enabled, false);
-  assert.equal(evidence.explanation, 'Not available in this deployment yet.');
+  assert.equal((await runStep(t, fixture, evidence)).status, 'SKIP:restart_not_supported_by_deployment');
+  assert.deepEqual(fixture.calls, ['terminal:before', 'close:settings', 'dock:settings', 'tab:troubleshoot']);
+  assert.deepEqual(evidence.restartControl, { path: 'Settings → Troubleshoot → Restart computer', visible: true,
+    enabled: false, explanation: COPY.unavailable, unavailableReason: 'restart_not_supported_by_deployment' });
+});
+
+test('persistence FAILs with the missing prerequisite\'s own copy after the 15 s control wait', async t => {
+  const fixture = restartFixture({ desktop: false });
+  const evidence = {};
+  const { status, ms } = await runStep(t, fixture, evidence);
+  assert.equal(status, `FAIL:Restart computer did not enable: ${COPY.needsDesktop}`);
+  assert.ok(ms >= 15_000 && ms < 16_000, ms);
+  assert.equal(evidence.restartControl.unavailableReason, null);
+  assert.ok(!fixture.calls.includes('control'));
+});
+
+test('persistence FAILs when the restart never settles, at a budget that covers the promised 1–4 minutes', async t => {
+  assert.ok(RESTART_COMPUTER_WAIT_MS >= 300_000, RESTART_COMPUTER_WAIT_MS);
+  const fixture = restartFixture({ outcome: 'stuck' });
+  const evidence = {};
+  const { status, ms } = await runStep(t, fixture, evidence);
+  assert.equal(status, 'FAIL:Timed out: Restart computer outcome');
+  assert.ok(ms >= RESTART_COMPUTER_WAIT_MS && ms < RESTART_COMPUTER_WAIT_MS + 1_000, ms);
+  assert.equal(evidence.restartControl.status, COPY.restarting);
+  assert.equal(evidence.restartControl.restartingSeen, true);
+  assert.deepEqual(fixture.calls.slice(-2), ['control', 'confirm']);
+});
+
+test('source pin: every Restart computer selector and line the step uses is in the tab; Restart desktop is not', () => {
+  const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
+  const tab = read('../shell/ezil/ui/Settings/tabs/troubleshoot.js');
+  const sheet = read('../shell/ezil/ui/Settings/sheet-frame.js');
+  const journey = read('./billing-staging-journey.mjs');
+  const statusLine = copy => assert.ok(tab.includes(`data-role="restart-computer-status">${copy}`), copy);
+  const escapeRegex = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pins = {
+    path: () => {
+      assert.ok(tab.includes("label: 'Troubleshoot'"));
+      assert.ok(tab.includes('<h3>Restart computer</h3>'));
+    },
+    control: () => assert.match(tab, new RegExp(`<button [^>]*${escapeRegex(DOM.control.slice(1, -1))}`)),
+    status: () => assert.ok(tab.includes(DOM.status.slice(1, -1))),
+    failed: () => assert.ok(tab.includes(`<p class="ezil-settings-error" ${DOM.status.slice(1, -1)}>`)),
+    sheet: () => {
+      assert.equal(DOM.sheet, '[role="dialog"][data-sheet="confirm-restart-computer"]');
+      assert.ok(tab.includes("sheet: 'confirm-restart-computer'"));
+      assert.ok(sheet.includes('<div class="ezil-upgrade-sheet" role="dialog"'));
+      assert.ok(sheet.includes('dialog.dataset.sheet = sheet;'));
+    },
+    confirm: () => {
+      assert.ok(tab.includes(`confirmLabel: '${DOM.confirm}'`));
+      assert.ok(sheet.includes('primary.textContent = confirmLabel;'));
+    },
+    restarting: () => statusLine(UI.restarting),
+    restarted: () => statusLine(UI.restarted),
+    unavailable: () => statusLine(`${UI.unavailable}<`),
+  };
+  assert.deepEqual(Object.keys(pins).sort(), Object.keys(UI).sort(), 'every value the step relies on is pinned');
+  for (const pin of Object.values(pins)) pin();
+  // The step uses the DOM pinned here.
+  for (const [key, value] of Object.entries(DOM)) assert.equal(UI[key], value, key);
+  // The fake's lines are the tab's own.
+  for (const copy of [COPY.restarting, COPY.restarted, COPY.unavailable, COPY.needsDesktop]) statusLine(`${copy}<`);
+  for (const copy of [COPY.notRunning, COPY.transitionFailed]) assert.ok(tab.includes(`"${copy}"`), copy);
+  assert.ok(COPY.restarting.startsWith(UI.restarting) && COPY.restarted.startsWith(UI.restarted));
+  // Restart desktop is gone from the tab and from the step. The same files carry
+  // the restart-computer spellings (the pins above), so these reads are live.
+  for (const [name, source] of [['troubleshoot.js', tab], ['billing-staging-journey.mjs', journey]]) {
+    assert.ok(source.includes('data-action="restart-computer"'), name);
+    assert.ok(!source.includes('data-action="restart"'), name);
+    assert.ok(!source.includes('Restart requested.'), name);
+  }
+  assert.ok(!journey.includes("name: 'Restart', exact: true"));
 });
 
 function windowFixture({ fullpage = true, expanded = false, codeOpen = true } = {}) {
@@ -322,7 +580,7 @@ test('post-restart Code reopen uncovers its Close button through the Browser dra
   }
 });
 
-test('closing Settings above the full-bleed Browser preserves the restart computer identity', async () => {
+test('closing Settings above the full-bleed Browser leaves the Browser open', async () => {
   const { page, calls, windows } = windowFixture();
   await closeApp(page, 'settings');
   assert.equal(windows.desktop.open, true);
