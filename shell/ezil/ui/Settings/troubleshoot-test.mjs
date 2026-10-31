@@ -68,8 +68,10 @@ check('the restart copy passes scanCopy; Troubleshoot offers Restart computer an
 });
 // Round 6a: the terminal desktop copy (boot-phases BOOT_FAILURE_COPY desktop_config_unapplied / desktop_failed) sends a
 // Code or app preview open to Restart computer. That is only honest if Restart computer is ENABLED with no desktop
-// window open, where Restart desktop is not.
-check('🔴 with no desktop window open, Restart computer is enabled and Restart desktop is not', () => {
+// window open. Merged with app-code lane A2 (2026-10-31): Restart desktop no longer exists at all (check 4 above), so
+// this asserts its absence rather than a disabled button, and no "Open a desktop first" note (that note is shown
+// only when there is no computer to restart).
+check('🔴 with no desktop window open, Restart computer is enabled and there is no Restart desktop', () => {
     let painted = '';
     const body = { length: 1, html: h => { painted = h; }, on () { return body; } };
     const $win = { find: sel => (sel === '[data-role="troubleshoot-body"]' ? Object.assign(body, { 0: { isConnected: true } }) : { length: 0 }) };
@@ -81,9 +83,10 @@ check('🔴 with no desktop window open, Restart computer is enabled and Restart
     });
     troubleshootTab.init($win);
     const button = action => painted.match(new RegExp(`<button[^>]*data-action="${action}"[^>]*>`))?.[0] ?? '';
-    assert.ok(button('restart') && button('restart-computer'), painted);
-    assert.match(button('restart'), /\sdisabled\b/, 'Restart desktop needs an open desktop window');
+    assert.ok(button('restart-computer'), painted);
     assert.doesNotMatch(button('restart-computer'), /\sdisabled\b/, 'Restart computer needs only a computer');
-    assert.match(painted, /Open a desktop first/);
+    assert.ok(! button('restart') && ! /data-action="restart"/.test(painted), 'no Restart desktop control');
+    assert.doesNotMatch(painted, /Restart desktop/);
+    assert.doesNotMatch(painted, /Open a desktop first/, 'a computer to restart is all Restart computer needs');
 });
 console.log(`\n${passed}/5 Troubleshoot checks passed`);
