@@ -8,6 +8,7 @@ import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
+import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
 import { GET, maxDuration } from './route';
 
@@ -23,6 +24,7 @@ vi.mock('@/server/billing/store', () => ({ runningAwsComputersAfterEpochs: vi.fn
 vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation' }));
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
+vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
@@ -75,6 +77,22 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(maxDuration).toBe(300);
         // Phase B (§5.4): the held pass's reverse-move read is built over the app database, once per sweep.
         expect(reverseMoveInFlightFor).toHaveBeenCalledExactlyOnceWith(db);
+        // The handler runs the reverse pass itself; the route never runs a second one.
+        expect(advanceReverseMoves).not.toHaveBeenCalled();
+    });
+
+    // r7 fixer (§5.4): a billing fault before the handler (its deps or their clock) still drives the reverse moves once,
+    // then fails the request as before.
+    it.each([
+        ['getBillingDeps', () => vi.mocked(getBillingDeps).mockImplementation(() => { throw new Error('deps down'); })],
+        ['the deps clock', () => vi.mocked(getBillingDeps).mockReturnValue({ ...deps, now: () => { throw new Error('clock down'); } })],
+    ])('Phase B (§5.4): the reverse pass runs once when %s throws, and the request still fails', async (_what, breakIt) => {
+        breakIt();
+        vi.spyOn(Date, 'now').mockReturnValue(5555);
+        await expect(GET(request('Bearer cron'))).rejects.toThrow(/down/);
+        expect(advanceReverseMoves).toHaveBeenCalledExactlyOnceWith(5555);
+        expect(handleBillingSessionSweep).not.toHaveBeenCalled();
+        vi.mocked(Date.now).mockRestore();
     });
 
     it('wires no held bound where placement reads are off (no placement table to read, as sandbox-reap)', async () => {

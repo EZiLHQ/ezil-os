@@ -520,6 +520,24 @@ describe('paid sessions have no time cap', () => {
         expect(advanceStaleMigrations).not.toHaveBeenCalled(); // forward moves do not run there (unchanged)
         expect(f.store.openEpochsForSweep).not.toHaveBeenCalled();
     });
+
+    // r7 fixer: the reverse pass is the only driver of a move's deadlines (§5.4). A billing fault earlier in the tick (the epoch
+    // read, one user's billing state, an epoch close) still fails the sweep, but never before the pass ran, exactly once.
+    it.each([
+        ['the epoch read', (f: ReturnType<typeof fixture>) => f.store.openEpochsForSweep.mockRejectedValue(new Error('epochs down'))],
+        ['a user\'s billing state', (f: ReturnType<typeof fixture>) => f.store.subscriptionsFor.mockRejectedValue(new Error('state down'))],
+        ['an epoch close', (f: ReturnType<typeof fixture>) => f.store.closeEpoch.mockRejectedValue(new Error('close down'))],
+    ])('Phase B (§5.4): the reverse pass still runs once when %s throws, and the sweep still fails', async (_what, breakIt) => {
+        const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
+        vi.mocked(advanceReverseMoves).mockClear(); vi.mocked(advanceStaleMigrations).mockClear();
+        vi.spyOn(Date, 'now').mockReturnValue(9876);
+        const f = fixture();
+        breakIt(f);
+        await expect(f.run(21600)).rejects.toThrow(/down/);
+        expect(advanceReverseMoves).toHaveBeenCalledExactlyOnceWith(9876);
+        expect(advanceStaleMigrations).not.toHaveBeenCalled(); // the steps after the fault are skipped, as before
+        expect(console.info).not.toHaveBeenCalledWith(expect.stringMatching(/^\{"event":"billing-sweep"/));
+    });
 });
 
 describe('round 6 R1-01: a held host is bounded by its session alone', () => {
