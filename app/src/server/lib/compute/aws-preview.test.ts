@@ -15,8 +15,13 @@ const computerId = 'abcdefab-abcd-4abc-8abc-abcdefabcdef';
 const sandboxId = deriveGuacamoleSandboxId(userId, computerId);
 const config = { workerUrl: 'https://worker.preview.example/', isConfigured: true, hasHmacSecret: true };
 const options = { sessionId: 'session', desktopMode: 'neko' as const };
-const failure = { ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable' };
-const waking = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting' };
+// FEEDBACK-DIAG: every refusal names its category in an allowlisted `reason`
+// (exact values are pinned in the dedicated tests below).
+const failure = {
+    ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable',
+    reason: expect.stringMatching(/^aws_preview_unavailable:[a-z0-9_]+(?::[a-z0-9_]+)?$/),
+};
+const waking = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', reason: 'sandbox_starting' };
 const row = (over: Record<string, unknown> = {}) => placementRow({
     computer_id: computerId, owner_user_id: userId, state: 'RUNNING', generation: 7, lease_epoch: 11, ...over,
 });
@@ -338,7 +343,7 @@ describe('AWS preview handoff', () => {
     it.each(['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'])('maps only HTTP 503 %s to waking', async (error) => {
         fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status: 503 }));
         await expect(setup().open()).resolves.toEqual({
-            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+            ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', reason: 'sandbox_starting',
         });
         fetchMock.mockResolvedValue(Response.json({ ok: false, error }, { status: 502 }));
         await expect(setup().open()).resolves.toEqual(failure);
@@ -359,8 +364,28 @@ describe('AWS preview handoff', () => {
         [503, 'unknown_starting'], [409, 'aws_desktop_unreachable'],
     ])('keeps the invalid Worker state %s %s unavailable', async (status, error) => {
         fetchMock.mockResolvedValue(Response.json({ ok: false, error, reason: 'LEAK' }, { status }));
-        await expect(setup().open()).resolves.toEqual(failure);
-        expect(console.warn).toHaveBeenCalledExactlyOnceWith(`[aws-preview] unavailable reason=worker_status_${status}`);
+        // FEEDBACK-DIAG: the Worker's own public code names WHICH refusal; its
+        // other body fields (`reason: 'LEAK'`) never travel.
+        await expect(setup().open()).resolves.toEqual({
+            ...failure, reason: `aws_preview_unavailable:worker_status_${status}:${error}`,
+        });
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith(
+            `[aws-preview] unavailable reason=worker_status_${status} worker_error=${error}`);
+    });
+
+    it.each([
+        ['a URL', 'https://worker.example/x?token=abc'], ['a JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig'],
+        ['a hex token', 'a3f9'.repeat(8)], ['mixed case', 'Hmac_Mismatch'], ['a long string', 'x'.repeat(200)],
+        ['a non-string', 401],
+    ])('FEEDBACK-DIAG: drops a Worker error that is %s from the reason and the log', async (_name, error) => {
+        fetchMock.mockResolvedValue(Response.json({ ok: false, error }, { status: 401 }));
+        await expect(setup().open()).resolves.toEqual({ ...failure, reason: 'aws_preview_unavailable:worker_status_401' });
+        expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-preview] unavailable reason=worker_status_401');
+    });
+
+    it('FEEDBACK-DIAG: a failed enrollment names itself', async () => {
+        await expect(setup([row({ last_error: ENROLLMENT_FAILED })]).open())
+            .resolves.toEqual({ ...failure, reason: 'aws_preview_unavailable:enrollment_failed' });
     });
 
     it.each(['success', 'epoch refusal'] as const)('discards a %s for an epoch replaced during the Worker request and signs the current pair next time', async (answer) => {

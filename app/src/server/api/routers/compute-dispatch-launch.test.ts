@@ -176,7 +176,7 @@ describe('capacity_attempt_expired passthrough', () => {
     it('carries capacityAttemptId as a value, never retryable, without asking the preview', async () => {
         expect(await awsPreviewAnswer(expired, preview)).toEqual({ ok: false, error: 'capacity_attempt_expired',
             errorCode: 'capacity_attempt_expired', retryable: false, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
-            capacityAttemptId: ATTEMPT });
+            capacityAttemptId: ATTEMPT, reason: 'capacity_attempt_expired' });
         expect(preview).not.toHaveBeenCalled();
     });
     it.each(['capacity_unavailable', 'computer_starting', 'region_capacity'])('never attaches an attempt id to %s', async errorCode => {

@@ -1529,6 +1529,9 @@ export async function openDesktopWindow (ctx = {}) {
                 // production failures could not be told apart. `detail` is
                 // redacted and capped at 200 chars by `telemetry.js`.
                 detail: res.message,
+                // FEEDBACK-DIAG: the server's bounded cause and its log line's id,
+                // into the local mirror only, so a feedback report carries them.
+                reason: res.reason, serverCorrelationId: res.correlationId,
             });
             const failed = computeBootUiState({
                 requestStatus: 'error',

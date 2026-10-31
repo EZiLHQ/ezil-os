@@ -130,7 +130,8 @@ window.fetch = async (url, opts = {}) => {
 
     if ( u.startsWith(ENDPOINTS.codePreviewUrl) ) {
         if ( codePreviewUrlMode === 'unavailable' ) {
-            return json({ ok: false, errorCode: 'code_preview_unavailable', error: 'no port' });
+            return json({ ok: false, errorCode: 'code_preview_unavailable', error: 'no port',
+                reason: 'code_preview_port_not_exposed', correlationId: 'srv_0123456789ab' });
         }
         mintSeq++;
         // The real shape: a bridge-host bootstrap URL whose token is the
@@ -403,13 +404,24 @@ confirmAnswer = true;
 
 // Direction C: the deployment genuinely cannot serve code-server.
 codePreviewUrlMode = 'unavailable';
+// FEEDBACK-DIAG: spy on the one recorder the branch calls (calling through);
+// `session-failure-diagnostics-test.mjs` proves it puts both fields in the mirror.
+const unavailableCaptures = [];
+const captureUnavailable = ezil.session.captureUnavailable;
+ezil.session.captureUnavailable = (site, res) => { unavailableCaptures.push({ site, res }); return captureUnavailable(site, res); };
 await window.$(win3).close();
 await settle(6);
 await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
 await settle(20);
+ezil.session.captureUnavailable = captureUnavailable;
 const win4 = q('.window[data-app="code"]');
 push('an unreachable code-server says so, honestly',
     /isn.t reachable right now/i.test(win4?.textContent ?? ''), (win4?.textContent ?? '').slice(0, 90));
+push('FEEDBACK-DIAG: …and records the server\'s reason + correlation id for a feedback report',
+    unavailableCaptures.length === 1 && unavailableCaptures[0].site === 'ezil-os:apps/code#mint'
+    && unavailableCaptures[0].res.reason === 'code_preview_port_not_exposed'
+    && unavailableCaptures[0].res.correlationId === 'srv_0123456789ab',
+    JSON.stringify(unavailableCaptures));
 // 🔴 THE ASSERTION THAT EXISTS BECAUSE OF A REAL INCIDENT. The panel used to
 // read "hasn't been turned on for this deployment" — a claim about
 // CONFIGURATION — for an error code whose three producers are all RUNTIME

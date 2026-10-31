@@ -316,6 +316,8 @@ export async function openPreviewWindow (ctx = {}) {
             // panel's own copy makes.
             if ( res.errorCode === 'app_preview_unavailable' ) {
                 console.warn(`[${PHASE}] this computer cannot serve an app preview: ${res.errorCode}`);
+                // FEEDBACK-DIAG: the server's reason and log-line id, for a feedback report.
+                session.captureUnavailable('ezil-os:apps/preview#mint', res);
                 show_unavailable();
                 // Terminal: an honest, known "this deployment does not
                 // support it" state — the same reasoning as `not_configured`
@@ -328,6 +330,8 @@ export async function openPreviewWindow (ctx = {}) {
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/preview#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
+                // FEEDBACK-DIAG: into the local mirror only (`diagnostics.js`).
+                reason: res.reason, serverCorrelationId: res.correlationId,
             });
             progress.render(computeBootUiState({
                 requestStatus: 'error',

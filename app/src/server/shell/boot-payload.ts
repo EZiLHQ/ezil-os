@@ -304,7 +304,18 @@ export interface ShellDesktopState {
     status: 'idle';
     endpoints: Partial<typeof SHELL_API_ROUTES>;
     /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
-    ui?: { floatingControls: boolean; feedbackScreenshots: boolean };
+    ui?: {
+        floatingControls: boolean;
+        feedbackScreenshots: boolean;
+        /**
+         * FEEDBACK-DIAG: this server's feedback schema accepts
+         * `diagnostics.recentEvents[].reason`/`.correlationId`. Not a switch: a
+         * capability, always `true` here. The shell sends the two keys ONLY when
+         * it reads `true`, because an older server parses `recentEvents` strictly
+         * and 400s the whole report on either key.
+         */
+        feedbackEventDiagnostics: boolean;
+    };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -374,7 +385,8 @@ export function toShellDesktopState(
         hasHmacSecret: provider?.hasHmacSecret === true,
         status: 'idle',
         endpoints,
-        ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots },
+        ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
+            feedbackEventDiagnostics: true },
     };
 }
 

@@ -70,6 +70,7 @@
 // `boot.js` depends on — see `trace.js`'s own header for the full account of
 // why the dependency runs this direction and not the other.
 import { newEventId, ambientCorrelationId } from './trace.js';
+import { isCorrelationId, isFailureReason } from './failure-diagnostics.js';
 
 function bootPayload () {
     const raw = typeof window === 'undefined' ? null : window.__EZIL_BOOT__;
@@ -432,6 +433,11 @@ function pushRecent (entry) {
  * has been through `redact()`. There is nothing in here that is not already
  * permitted to cross the wire, which is what makes it safe for
  * Settings → Troubleshoot to show and for a user to copy.
+ *
+ * FEEDBACK-DIAG: an entry may also carry `reason` (the server's bounded
+ * failure code) and `serverCorrelationId` (the id on the server's log line).
+ * Both are allowlisted by `./failure-diagnostics.js` before they get here, and
+ * both live ONLY in this mirror — they are not put on the telemetry wire.
  */
 export function recentEvents () {
     return recent.slice();
@@ -530,6 +536,10 @@ function flush () {
  * @param {Record<string, string|number|boolean>} [input.attrs] Bounded extras;
  *   the ingest route strips anything not on its per-class allow-list, so this
  *   file does not need its own copy of that list.
+ * @param {string} [input.reason] The server's bounded failure code
+ *   (`worker_http_401:hmac_signature_mismatch`). LOCAL MIRROR ONLY.
+ * @param {string} [input.serverCorrelationId] The id on the server's log line
+ *   for this failure. LOCAL MIRROR ONLY; distinct from `correlationId` above.
  */
 export function capture (input) {
     if ( reentering ) return;
@@ -551,7 +561,14 @@ export function capture (input) {
         // precisely the deployment where a user asking "what went wrong" has
         // no other source. It never leaves the browser on its own; only the
         // user's own copy action moves it anywhere.
-        pushRecent({ t: Date.now(), eventClass, site, code, outcome, detail });
+        // FEEDBACK-DIAG: the server's `reason` and log-line id for a failed
+        // call, allowlisted (dropped, never repaired) and kept HERE only — the
+        // wire event below is unchanged. Named `serverCorrelationId` because
+        // `input.correlationId` is this shell's own app-open trace id.
+        const entry = { t: Date.now(), eventClass, site, code, outcome, detail };
+        if ( isFailureReason(input.reason) ) entry.reason = input.reason;
+        if ( isCorrelationId(input.serverCorrelationId) ) entry.serverCorrelationId = input.serverCorrelationId;
+        pushRecent(entry);
 
         if ( ! isArmed() ) return;
 

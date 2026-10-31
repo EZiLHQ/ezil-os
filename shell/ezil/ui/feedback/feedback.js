@@ -115,6 +115,31 @@ function listen_online () {
 function retryable (status) { return status === 0 || status === 408 || status >= 500; }
 
 /**
+ * FEEDBACK-DIAG: `body` without `diagnostics.recentEvents[].reason`/`.correlationId`,
+ * or null when it carries neither. Only ever removes those two keys.
+ */
+function without_event_diagnostics (body) {
+    try {
+        const sent = JSON.parse(body);
+        const events = sent?.diagnostics?.recentEvents;
+        if ( ! Array.isArray(events) || ! events.some(event => event && ('reason' in event || 'correlationId' in event)) ) return null;
+        for ( const event of events ) { delete event.reason; delete event.correlationId; }
+        return JSON.stringify(sent, null, 2);
+    } catch { return null; }
+}
+
+/** One POST. Never throws; `{ status, data }` with status 0 = no usable answer. */
+async function post (body) {
+    try {
+        const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body });
+        if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null };
+        const data = await response.json();
+        return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data } : { status: 0, data: null };
+    } catch { return { status: 0, data: null }; }
+}
+
+/**
  * POST one submitted body and settle the local state from the answer. Never
  * throws; resolves `{ status, data }` (status 0 = no response).
  */
@@ -124,14 +149,14 @@ async function deliver (clientRequestId, body) {
     let status = 0, data = null;
     try {
         // The exact, visible preview string is also the request body.
-        const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body });
-        status = response.status;
-        if ( status === 200 || status === 201 ) {
-            data = await response.json();
-            if ( typeof data?.id !== 'string' || ! UUID.test(data.id) ) { status = 0; data = null; }
-        }
-    } catch { status = 0; data = null; } finally {
+        ({ status, data } = await post(body));
+        // FEEDBACK-DIAG rollback window: a tab that booted on a server advertising
+        // `ui.feedbackEventDiagnostics` keeps that payload after the server is
+        // rolled back, and the older strict schema 400s a report carrying the two
+        // keys. Send it once more without them: it costs two fields, not the report.
+        const lean = status === 400 ? without_event_diagnostics(body) : null;
+        if ( lean ) ({ status, data } = await post(lean));
+    } finally {
         inflight.delete(clientRequestId);
     }
     if ( data ) {

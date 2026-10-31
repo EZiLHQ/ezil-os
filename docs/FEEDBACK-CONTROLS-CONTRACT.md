@@ -16,10 +16,10 @@ as recommended).
 | `FEEDBACK_ADMIN_EMAILS` | comma list; `/admin/feedback` fail-closed when unset |
 
 `app/src/server/shell/features.ts` → `shellFeaturesFor(email)` is the only reader.
-Shell side: features are feature-detected exactly like `endpoints.focus`.
+Shell side: features are feature-detected exactly like `endpoints.focus`. `ui.feedbackEventDiagnostics` is no env switch: always `true` on a server whose schema accepts `recentEvents[].reason`/`.correlationId` (§3), absent on an older one; the shell sends those two keys only on `true`.
 
 ```
-desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean }
+desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean, feedbackEventDiagnostics: boolean }
 desktopState.endpoints.feedback?: '/api/shell/feedback'
 ```
 
@@ -139,8 +139,27 @@ Diagnostics (strict, every field optional):
 { shellVersion ≤64, appCommit ≤64, browser {family ≤32, major int}, os ≤32,
   deviceClass 'phone'|'tablet'|'desktop', viewport {w,h int, dpr number},
   fullscreen bool, fullbleed bool, computerStatus ≤32, traceId ≤64, phases string[≤24]≤40,
-  recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int} }
+  recentEvents {eventClass ≤40, site ≤80, code ≤80, reason? ≤96, correlationId? ≤64}[≤50],
+  stream {state ≤24, kbps int, rttMs int} }
 ```
+`recentEvents[].reason` / `.correlationId` (FEEDBACK-DIAG): for a failed start/mint, the server's bounded
+machine code for the underlying cause (e.g. `code: 'unauthorized'` with
+`reason: 'worker_http_401:hmac_signature_mismatch'`) and the correlation id on the server log line for
+that failure (`[cloudflareGuacamole.*] worker error`, `[*] aws preview refused`, `[shell] * failed`).
+The schema bounds only their length; `sanitizeDiagnostics` ALLOWLISTS their shape
+(`app/src/server/lib/failure-diagnostics.ts`: 1-3 snake_case segments joined by `:`, no opaque/hex/long-digit
+words; a correlation id is a lowercase `randomUUID`, `cid_…` or `srv_…`) and drops — never repairs — a
+mismatch, so a charset drift costs a field, not the report. `correlationId` is the one diagnostics field
+exempt from UUID masking: it names a request, not a person or computer, and is dropped if it equals the
+reporter's user or computer id. Only the newest 10 events keep either field. On a new report the server logs
+`[feedback] report carries server failures {reportId, failures:[{correlationId, reason}]}` and nothing else
+from it. The shell keeps both values in telemetry's local mirror only; they are not on the telemetry wire.
+Rollback: a server from before these keys parses `recentEvents[]` as `{eventClass, site, code}.strict()` and
+400s a report carrying either. So the shell emits them only when the boot payload says
+`ui.feedbackEventDiagnostics: true` (§1). A tab that booted on a newer server keeps that payload after a
+rollback; on a 400 for a body carrying the keys it re-sends once without them (§4a). Not covered: an
+outbox entry with the keys that a pre-FEEDBACK-DIAG bundle replays after a reload. That build re-sends it
+byte-for-byte, gets 400 and drops it, and the text returns to the draft only when no draft exists.
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).
@@ -174,9 +193,13 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   or not an app window is open) and on a back/forward-cache restore (`pageshow` with
   `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
   dropped on a definitive 4xx (the text then returns to the draft). Storage failures
-  (blocked, quota, private mode) only lose the convenience.
+  (blocked, quota, private mode) only lose the convenience. One exception to byte-for-byte,
+  for live submits and replays alike: a 400 for a body carrying `recentEvents[].reason`/`.correlationId`
+  is followed at once by one re-send with only those keys removed (§3 rollback). Its answer settles
+  the entry.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
 clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
-exact JSON that is sent; nothing hits the network before Submit.
+exact JSON that is sent (a §3 rollback re-send only removes two keys from it); nothing hits the network
+before Submit.

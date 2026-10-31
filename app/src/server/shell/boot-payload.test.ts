@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '@/server/billing/config';
 import type { Computer } from '@/server/db/schema';
+import { feedbackSubmitSchema } from '@/server/feedback/types';
 import {
     SHELL_API_ROUTES,
     SHELL_APPS,
@@ -249,16 +250,27 @@ describe('buildShellBootPayload', () => {
             'status',
             'ui',
         ]);
-        // `ui` carries booleans only, and is all-off unless features are passed.
-        expect(desktopState.ui).toEqual({ floatingControls: false, feedbackScreenshots: false });
+        // `ui` carries booleans only; the switches are all-off unless features
+        // are passed. `feedbackEventDiagnostics` is a schema capability, not a switch.
+        expect(desktopState.ui).toEqual({ floatingControls: false, feedbackScreenshots: false, feedbackEventDiagnostics: true });
     });
 
     it('exposes endpoints.feedback ONLY when the feedback feature is on', () => {
         expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
         const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
         expect(on.endpoints.feedback).toBe('/api/shell/feedback');
-        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true });
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true });
         expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
+    });
+
+    it('advertises that its feedback schema accepts recentEvents[].reason/.correlationId (FEEDBACK-DIAG)', () => {
+        // The shell sends the two keys only when it reads this `true`; an older
+        // server omits it, and its strict schema would 400 a report carrying them.
+        expect(toShellDesktopState(null, { floatingControls: false, feedback: true, feedbackScreenshots: false }).ui?.feedbackEventDiagnostics).toBe(true);
+        const body = { v: 1, clientRequestId: '44444444-4444-4444-8444-444444444444', category: 'bug', description: 'x',
+            diagnostics: { recentEvents: [{ eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: 'unauthorized',
+                reason: 'worker_http_401:hmac_signature_mismatch', correlationId: 'srv_0123456789ab' }] } };
+        expect(feedbackSubmitSchema.safeParse(body).success).toBe(true);
     });
 });
 

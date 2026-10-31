@@ -6,7 +6,7 @@ import { computers } from '@/server/db/schema';
 import { feedbackAttachments, feedbackReports } from '@/server/db/schema/feedback';
 import { decodeScreenshot } from './image';
 import { fitsAttachmentBudget, isFeedbackRateLimited } from './rate-limit';
-import { redactDescription, sanitizeDiagnostics } from './redact';
+import { feedbackFailureRefs, redactDescription, sanitizeDiagnostics } from './redact';
 import { FEEDBACK_CATEGORIES, FEEDBACK_LIMITS, type FeedbackCreated, type FeedbackReportSummary, type FeedbackSubmit } from './types';
 
 export type FeedbackDb = Pick<
@@ -27,8 +27,9 @@ export async function ingestFeedback(
 ): Promise<FeedbackIngestResult> {
     const image = input.screenshot ? decodeScreenshot(input.screenshot) : null;
     const description = redactDescription(input.description);
-    const diagnostics = sanitizeDiagnostics(input.diagnostics);
-    return db.transaction(async (tx) => {
+    // A correlation id equal to the reporter's own user or computer id is not one.
+    const diagnostics = sanitizeDiagnostics(input.diagnostics, { excludeIds: [userId, input.computerId] });
+    const result = await db.transaction(async (tx): Promise<FeedbackIngestResult> => {
         await tx.execute(sql`select pg_advisory_xact_lock(${USER_LOCK}::int4, hashtext(${userId}::uuid::text))`);
         const [existing] = await tx.select({ id: feedbackReports.id, createdAt: feedbackReports.createdAt, hasScreenshot: feedbackReports.hasScreenshot })
             .from(feedbackReports).where(and(eq(feedbackReports.userId, userId), eq(feedbackReports.clientRequestId, input.clientRequestId))).limit(1);
@@ -64,6 +65,14 @@ export async function ingestFeedback(
         });
         return { status: 201, created: { id, createdAt: now.toISOString(), screenshotAccepted } };
     }, { isolationLevel: 'read committed' });
+    // FEEDBACK-DIAG: after commit, so a logged report id always exists. Report
+    // id plus the validated server correlation ids and reason codes only —
+    // never the description, the user, the computer or anything else submitted.
+    const refs = result.status === 201 ? feedbackFailureRefs(diagnostics) : [];
+    if (result.status === 201 && refs.length) {
+        console.info('[feedback] report carries server failures', { reportId: result.created.id, failures: refs });
+    }
+    return result;
 }
 
 export async function listFeedback(db: FeedbackDb, userId: string): Promise<FeedbackReportSummary[]> {

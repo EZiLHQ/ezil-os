@@ -34,6 +34,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
 import { cookieHeaderFor, getFollowingSameOriginCookies, storeSetCookies, type ProbeCookieJar } from './compute/aws-preview-cookies';
 import { readAwsBrowserZone } from './compute/aws-config';
+import { failureReason, leadingCode, workerBodyCode } from './failure-diagnostics';
 
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
@@ -519,6 +520,16 @@ export interface GuacamolePreviewError {
      * Always set by `previewError` below; never hand-written.
      */
     retryable: boolean;
+    /**
+     * The UNDERLYING cause as a bounded machine code, e.g.
+     * `worker_http_401:hmac_signature_mismatch` where `errorCode` says only
+     * `unauthorized`. Allowlisted by `failureReason` (`./failure-diagnostics`),
+     * so it is safe to hand to a browser and to store in a feedback report;
+     * `error` (raw Worker text) is neither. Always set by `previewError`;
+     * optional on the type because a hand-built failure (a test double, a
+     * Worker body read as a wire shape) may lack it.
+     */
+    reason?: string;
 }
 
 export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewError;
@@ -538,9 +549,18 @@ export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewE
  * unknown; the difference is that somebody has to type it, and a reviewer can
  * see them do it. See `previewError refuses to build an unlabelled failure` in
  * `cloudflare-guacamole-provider.test.ts` for the compile-time proof.
+ *
+ * `reason` is computed by the caller from what it actually observed (status,
+ * the Worker's own body code). It is allowlisted here and falls back to the
+ * leading code of `error`, then to `errorCode` — never to free text.
+ * `errorCode` is allowlisted too: on a 200 `{ok:false}` it is the Worker's
+ * untrusted `wire.errorCode`, typed as ours but not checked against the union.
  */
-function previewError(error: string, errorCode: GuacamolePreviewErrorCode): GuacamolePreviewError {
-    return { ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode) };
+function previewError(error: string, errorCode: GuacamolePreviewErrorCode, reason?: string): GuacamolePreviewError {
+    return {
+        ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode),
+        reason: failureReason(reason) ?? failureReason(leadingCode(error)) ?? failureReason(errorCode) ?? 'unknown',
+    };
 }
 
 /**
@@ -631,6 +651,9 @@ export async function requestGuacamolePreview(
             return previewError(
                 `worker_http_${res.status}: ${text.slice(0, 300)}`,
                 classifyWorkerHttpFailure(res.status, text),
+                // Read from the WHOLE body, before the 300-char log slice can
+                // cut the JSON: `worker_http_401:hmac_signature_mismatch`.
+                failureReason(`worker_http_${res.status}`, workerBodyCode(text)),
             );
         }
 
@@ -691,7 +714,8 @@ export async function requestGuacamolePreview(
             errorCode = 'fetch_failed';
         }
 
-        return previewError(msg, errorCode);
+        // The exception text is for the server log only; the reason is the classification.
+        return previewError(msg, errorCode, errorCode);
     }
 }
 

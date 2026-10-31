@@ -23,7 +23,7 @@ const computerId = '11111111-1111-4111-8111-111111111111';
 const reportId = '22222222-2222-4222-8222-222222222222';
 const accountId = '33333333-3333-4333-8333-333333333333';
 window.__EZIL_BOOT__ = { computer: { id: computerId }, user: { id: accountId, email: 'BOOT_SECRET@example.test' },
-    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true } } };
+    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true, feedbackEventDiagnostics: true } } };
 globalThis.ezil = { version: '1' };
 document.cookie = '__Host-ezil-os-auth=SECRET; Secure; Path=/';
 assert.match(document.cookie, /SECRET/);
@@ -76,6 +76,10 @@ const telemetry = await import('../../telemetry.js');
 const { beginTrace, ambientTraceRef } = await import('../../trace.js');
 const { default: log } = await import('../../log.js');
 const { feedbackSubmitSchema, diagnosticsSchema } = await import('../../../../app/src/server/feedback/types.ts');
+// FEEDBACK-DIAG: the server allowlist itself (no `@/` imports, erasable TS only), to pin the shell twin to it.
+const serverFailure = await import('../../../../app/src/server/lib/failure-diagnostics.ts');
+const shellFailure = await import('../../failure-diagnostics.js');
+const session = await import('../../session.js');
 log.debug('LOG_SECRET');
 // Seed the real ring, then make any attempted read fail immediately.
 assert.ok(log.ringBuffer().some(entry => entry.msg.includes('LOG_SECRET')));
@@ -172,6 +176,78 @@ try {
         assert.deepEqual(data.stream, { kbps: 124, rttMs: 24 });
         vitals.remove();
         document.body.classList.remove('device-phone');
+    });
+    await check('FEEDBACK-DIAG: the shell allowlist answers exactly as the server allowlist', () => {
+        const values = [
+            'worker_http_401', 'worker_http_401:hmac_signature_mismatch', 'aws_preview_unavailable:enrollment_failed',
+            'aws_preview_unavailable:worker_status_401:hmac_signature_mismatch', 'sandbox_starting', 'session_missing',
+            'desktop_frame_http_error_404', 'http2_v2_ec2', 'a:b:c', 'a:b:c:d', '', ':a', 'a:', 'a__b', '_a', 'a_',
+            'x'.repeat(48), 'x'.repeat(49), `${'abcde_'.repeat(15)}x`, 'https://worker.example.test/?token=abc',
+            'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature', 'Bearer abc', 'a3f9c0d1'.repeat(4), 'deadbeefcafe', 'deadbee',
+            'Worker_HTTP_401', 'ts_1730367000000', 'http_40100', 'abc1234', 'abcdefghijklmnop', 'alice@example.com',
+            '7c9e6679-7425-40de-944b-e07fc1f90ae7', '7C9E6679-7425-40DE-944B-E07FC1F90AE7', 'cid_lq2x8k9a3f8d7c6b', 'cid_',
+            'srv_0123456789ab', 'srv_0123456789', serverFailure.newShortCorrelationId(), undefined, null, 401, {}, ['worker_http_401'],
+        ];
+        for ( const value of values ) {
+            const label = JSON.stringify(value) ?? String(value);
+            assert.equal(shellFailure.isReasonSegment(value), serverFailure.isReasonSegment(value), `segment ${label}`);
+            assert.equal(shellFailure.isFailureReason(value), serverFailure.isFailureReason(value), `reason ${label}`);
+            assert.equal(shellFailure.isCorrelationId(value), serverFailure.isCorrelationId(value), `correlation ${label}`);
+        }
+        assert.equal(shellFailure.FAILURE_REASON_MAX, serverFailure.FAILURE_REASON_MAX);
+        assert.equal(shellFailure.FAILURE_REASON_MAX_SEGMENTS, serverFailure.FAILURE_REASON_MAX_SEGMENTS);
+    });
+    await check('FEEDBACK-DIAG: a simulated Worker HMAC 401 reaches the diagnostics as {code, reason, correlationId}', async () => {
+        const corr = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+        const realFetch = globalThis.fetch;
+        // The server's answer to POST /api/shell/desktop, exactly as the router now builds it.
+        globalThis.fetch = window.fetch = async () => ({ ok: true, status: 200, json: async () => ({
+            ok: false, errorCode: 'unauthorized', provider: 'cloudflare-guacamole',
+            error: 'worker_http_401: {"ok":false,"error":"hmac_signature_mismatch"}',
+            reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr,
+        }) });
+        let res;
+        try { res = await session.openDesktop(computerId); } finally { globalThis.fetch = window.fetch = realFetch; }
+        assert.equal(res.errorCode, 'unauthorized');
+        // Exactly the `apps/desktop#mint` capture in `apps/desktop-window.js`.
+        telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
+            detail: res.message, reason: res.reason, serverCorrelationId: res.correlationId });
+        const data = build_diagnostics();
+        diagnosticsSchema.parse(data);
+        assert.deepEqual(data.recentEvents.at(-1), { eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint',
+            code: 'unauthorized', reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr });
+        // `detail` (the raw Worker text) stays out of feedback, as before.
+        assert.doesNotMatch(JSON.stringify(data.recentEvents), /detail|"error"|\{"ok"/);
+        console.log(`EXAMPLE diagnostics.recentEvents tail: ${JSON.stringify(data.recentEvents.slice(-2))}`);
+        assert.equal(calls.length, 0, 'no feedback request was sent by building diagnostics');
+    });
+    await check('FEEDBACK-DIAG: secret-shaped fields never reach the diagnostics; only the newest ten events are annotated', () => {
+        for ( const secret of ['https://worker.example.test/?token=SECRET', 'Bearer SECRET', 'a3f9c0d1'.repeat(4)] ) {
+            telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'c', reason: secret, serverCorrelationId: secret });
+        }
+        for ( let i = 0; i < 15; i++ ) {
+            telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'c', reason: `worker_http_${500 + i}`, serverCorrelationId: 'srv_0123456789ab' });
+        }
+        const data = build_diagnostics();
+        diagnosticsSchema.parse(data);
+        assert.doesNotMatch(JSON.stringify(data), /SECRET|a3f9c0d1a3f9/);
+        const annotated = data.recentEvents.filter(event => 'reason' in event || 'correlationId' in event);
+        assert.equal(annotated.length, 10);
+        assert.equal(annotated.at(-1).reason, 'worker_http_514');
+        assert.equal(annotated[0].reason, 'worker_http_505');
+    });
+    await check('FEEDBACK-DIAG: the worst-case annotated report still fits the 32 KiB no-screenshot body', () => {
+        for ( let i = 0; i < 60; i++ ) {
+            telemetry.capture({ eventClass: 'e'.repeat(40), site: 's'.repeat(96), code: `c${i}`.padEnd(64, 'x'),
+                reason: ['abcdefghijklmno_abcdefghijklmno_abcdefghijklmn', 'bbcdefghijklmno_abcdefghijklmno_abcdefghijklmn'].join(':'),
+                serverCorrelationId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' });
+        }
+        const diagnostics = build_diagnostics();
+        diagnosticsSchema.parse(diagnostics);
+        const body = JSON.stringify({ v: 1, clientRequestId: '44444444-4444-4444-8444-444444444444', category: 'bug',
+            description: '\u{20AC}'.repeat(4000), computerId, diagnostics });
+        feedbackSubmitSchema.parse(JSON.parse(body));
+        assert.ok(new TextEncoder().encode(body).byteLength < 32 * 1024, `${new TextEncoder().encode(body).byteLength} bytes`);
     });
     await check('in-app icon: mounted once, icon only, hidden on the home screen, shown only while an app window is open', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();
@@ -388,6 +464,87 @@ try {
         setDescription('');
         assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
         close();
+    });
+    // FEEDBACK-DIAG rollback safety. A server from before these keys parses each
+    // `recentEvents[]` entry as `{eventClass, site, code}.strict()`: emulated exactly.
+    const oldServerAccepts = body => (JSON.parse(body).diagnostics?.recentEvents ?? [])
+        .every(event => Object.keys(event).every(key => ['eventClass', 'site', 'code'].includes(key)));
+    const oldServer = async (url, options) => oldServerAccepts(options.body)
+        ? { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) } : { status: 400 };
+    const hmacFailure = { eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: 'unauthorized' };
+    const recordHmacFailure = () => telemetry.capture({ ...hmacFailure,
+        reason: 'worker_http_401:hmac_signature_mismatch', serverCorrelationId: 'srv_0123456789ab' });
+    const posts = from => calls.slice(from).filter(c => c.method === 'POST');
+    await check('FEEDBACK-DIAG: new shell + old server (no ui.feedbackEventDiagnostics): no reason/correlationId in preview or body', async () => {
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+        try {
+            recordHmacFailure();
+            assert.deepEqual(build_diagnostics().recentEvents.at(-1), hmacFailure);
+            open(); setDescription('Old server report'); change('diagnostics', true);
+            assert.ok(oldServerAccepts(current().querySelector('pre').textContent), 'the preview carries neither key');
+            respond = oldServer;
+            const count = calls.length;
+            send(); await until(() => status().includes(reportId));
+            assert.equal(posts(count).length, 1, 'accepted first time: no 400, no second request');
+            assert.ok(oldServerAccepts(posts(count)[0].body));
+            assert.deepEqual(JSON.parse(posts(count)[0].body).diagnostics.recentEvents.at(-1), hmacFailure, 'the event itself is still sent');
+            close();
+        } finally {
+            window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics = true;
+        }
+    });
+    await check('FEEDBACK-DIAG: new shell + new server (ui.feedbackEventDiagnostics): {code, reason, correlationId} in preview and body', async () => {
+        recordHmacFailure();
+        open(); setDescription('New server report'); change('diagnostics', true);
+        const before = current().querySelector('pre').textContent;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        send(); await until(() => status().includes(reportId));
+        assert.equal(posts(count).length, 1);
+        assert.equal(posts(count)[0].body, before);
+        assert.deepEqual(JSON.parse(before).diagnostics.recentEvents.at(-1), { ...hmacFailure,
+            reason: 'worker_http_401:hmac_signature_mismatch', correlationId: 'srv_0123456789ab' });
+        close();
+    });
+    await check('FEEDBACK-DIAG: server rolled back under a tab that still advertises the keys: one lean re-send, report kept', async () => {
+        recordHmacFailure();
+        open(); setDescription('Rolled back report'); change('diagnostics', true);
+        const before = current().querySelector('pre').textContent;
+        assert.equal(oldServerAccepts(before), false, 'the stale payload still says the keys are accepted');
+        respond = oldServer;
+        let count = calls.length;
+        flushing = true; // the lean re-send is, by design, not the preview
+        send(); await until(() => status().includes(reportId));
+        flushing = false;
+        assert.equal(posts(count).length, 2);
+        assert.equal(posts(count)[0].body, before);
+        const [sent, lean] = posts(count).map(c => JSON.parse(c.body));
+        for ( const event of sent.diagnostics.recentEvents ) { delete event.reason; delete event.correlationId; }
+        assert.deepEqual(lean, sent, 'only the two keys were removed');
+        assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
+        close();
+        // A report the new shell queued offline and replays after the rollback.
+        const queuedId = crypto.randomUUID();
+        window.localStorage.setItem(outboxKey, JSON.stringify([{ clientRequestId: queuedId,
+            body: JSON.stringify({ ...JSON.parse(before), clientRequestId: queuedId }, null, 2) }]));
+        count = calls.length;
+        flushing = true;
+        await feedback.flush_feedback_outbox();
+        flushing = false;
+        assert.deepEqual(posts(count).map(c => oldServerAccepts(c.body)), [false, true]);
+        assert.equal(stored(outboxKey), null, 'delivered, not dropped');
+        // A 400 the keys did not cause is still final: no third request, text back in the draft.
+        open(); setDescription('Refused for another reason'); change('diagnostics', true);
+        respond = async () => ({ status: 400 });
+        count = calls.length;
+        flushing = true;
+        send(); await until(() => ! current().querySelector('[type="submit"]').disabled);
+        flushing = false;
+        assert.equal(posts(count).length, 2);
+        assert.match(status(), /could not be accepted/);
+        close();
+        assert.equal(stored(draftKey).description, 'Refused for another reason');
+        open(); setDescription(''); close();
     });
     await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
         open(); setDescription('Queued report 10');

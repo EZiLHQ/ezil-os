@@ -132,7 +132,8 @@ window.fetch = async (url, opts = {}) => {
 
     if ( u.startsWith(ENDPOINTS.previewUrl) ) {
         if ( previewUrlMode === 'unavailable' ) {
-            return json({ ok: false, errorCode: 'app_preview_unavailable', error: 'no port' });
+            return json({ ok: false, errorCode: 'app_preview_unavailable', error: 'no port',
+                reason: 'app_preview_expose_failed', correlationId: 'srv_0123456789ab' });
         }
         mintSeq++;
         // The real shape: a bridge-host bootstrap URL whose token is the
@@ -337,13 +338,24 @@ confirmAnswer = true;
 
 // Direction C: the deployment genuinely cannot serve a preview.
 previewUrlMode = 'unavailable';
+// FEEDBACK-DIAG: spy on the one recorder the branch calls (calling through);
+// `session-failure-diagnostics-test.mjs` proves it puts both fields in the mirror.
+const unavailableCaptures = [];
+const captureUnavailable = ezil.session.captureUnavailable;
+ezil.session.captureUnavailable = (site, res) => { unavailableCaptures.push({ site, res }); return captureUnavailable(site, res); };
 await window.$(win3).close();
 await settle(6);
 await ezil.registry.launch('preview', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
 await settle(20);
+ezil.session.captureUnavailable = captureUnavailable;
 const win4 = q('.window[data-app="preview"]');
 push('an unavailable preview says so, honestly',
     /isn.t available yet/i.test(win4?.textContent ?? ''), (win4?.textContent ?? '').slice(0, 80));
+push('FEEDBACK-DIAG: …and records the server\'s reason + correlation id for a feedback report',
+    unavailableCaptures.length === 1 && unavailableCaptures[0].site === 'ezil-os:apps/preview#mint'
+    && unavailableCaptures[0].res.reason === 'app_preview_expose_failed'
+    && unavailableCaptures[0].res.correlationId === 'srv_0123456789ab',
+    JSON.stringify(unavailableCaptures));
 push('🔴 …and NEVER navigates the frame to an invented URL',
     (win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '') === 'about:blank',
     win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '(none)');
