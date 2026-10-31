@@ -68,8 +68,8 @@ describe('staging Worker resources and routes', () => {
     expect(staging.vars).toMatchObject({ AWS_ORIGIN_ZONE: 'ezil.work', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work' });
   });
 
-  it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
-    expect(config.vars.SANDBOX_AI_PROXY).toBe('off');
+  it('serves the EZiL Chat AI proxy in production against the production Gateway', () => {
+    expect(config.vars.SANDBOX_AI_PROXY).toBe('on');
     expect(config.vars.EZIL_AI_GATEWAY_URL).toBe('https://ai.ezil.work');
   });
 

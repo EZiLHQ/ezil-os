@@ -139,7 +139,9 @@ local_protocol = "http"
 AWS_ROUTING_ENABLED = "on"
 AWS_ORIGIN_ZONE = "ezil.org"
 AWS_ORIGIN_ZONE_ALLOWLIST = "ezil.org"
-SANDBOX_AI_PROXY = "off"
+# EZiL Chat in Code reaches ai.ezil.work through this Worker's /ai proxy (os-prod enrolls
+# users there, #234). Off answers every /ai call 503 os_ai_unavailable.
+SANDBOX_AI_PROXY = "on"
 EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"
 # ── The default desktop mode ─────────────────────────────────────────────────
 #
