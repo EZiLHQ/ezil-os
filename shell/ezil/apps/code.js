@@ -85,7 +85,7 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 // `route-auth.test.ts`'s equivalent both pass. See the wave-b-t7 report for
 // the exact commands run.
 //
-// ── Full view, the top bar, and the stopped/reconnecting state ──────────────
+// ── Full view, its strip, and the stopped/reconnecting state ────────────────
 // ADDED 2026-10-30 (app-code lane A2). See `docs/APP-CODE-FULL-VIEW.md`.
 //   - Full view is the Browser's full-bleed, shared through
 //     `../ui/full-view.js`: no taskbar, no head, the window at the viewport.
@@ -95,9 +95,11 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 //     opens in it; a launch with no view opens windowed 980x680 unless the
 //     user's last explicit choice in this tab was full (`VIEW_STORAGE_KEY`).
 //     Never the browser Fullscreen API.
-//   - In full view a compact top bar replaces the head: the control drawer on
-//     the left, the title in the middle, minimise / restore / close on the
-//     right, clear of the small Feedback icon in the top-right corner.
+//   - In full view a compact dark strip replaces the head. It holds two
+//     things: the control drawer's grab notch, centred, and the small
+//     Feedback icon in its top-right corner. The title, Show desktop,
+//     Restore window and Close live in the notch's expanded tray (gate G3,
+//     2026-10-31; until then a top bar carried its own title and buttons).
 //   - The shell never calls a history API from here. Each change of view is
 //     announced as `ezil:app-view-changed` for the router to record.
 //   - When the shell sees the computer go away (a restart/switch transition,
@@ -123,8 +125,9 @@ const PHASE = 'ezil-os:code';
 /**
  * sessionStorage: the user's last EXPLICIT view choice for Code in this tab
  * (`'full'` | `'window'`) — written only by a gesture (green button, title
- * double-click, context menu, the top bar's or drawer's restore), never by a
- * route-driven launch or relaunch. Read only when a launch names no view.
+ * double-click, context menu, the drawer's restore, a double-click on the
+ * strip), never by a route-driven launch or relaunch. Read only when a launch
+ * names no view.
  */
 export const VIEW_STORAGE_KEY = 'ezil-os:view.code';
 /** Window event announcing a change of view; the router records it (contract item 5). */
@@ -146,8 +149,6 @@ const MINIMISE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 const RESTORE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
     + ' stroke-linejoin="round" aria-hidden="true"><rect x="5" y="8" width="11" height="11" rx="1.5"/>'
     + '<path d="M9 8V5.5A.5.5 0 0 1 9.5 5H18.5a.5.5 0 0 1 .5.5V14.5a.5.5 0 0 1-.5.5H16"/></svg>';
-const CLOSE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
-    + ' stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
 
 /** How often the UI re-derives its phase from elapsed time. */
 const TICK_MS = 250;
@@ -855,16 +856,19 @@ export async function openCodeWindow (ctx = {}) {
         }, TRANSITION_GUARD_MS);
     };
 
-    // ── full view and its top bar (lane A2) ──────────────────────────────
+    // ── full view and its strip (lane A2; gate G3) ───────────────────────
     // The mechanism is `../ui/full-view.js`, shared with the Browser. What is
     // Code's own: the view is a TOGGLE (the Browser's expand only enters), it
     // is chosen at launch (`ctx.view`, else the remembered choice), and the
-    // chrome full view hides is replaced by a compact top bar plus the
-    // control drawer at its left. Visual values are provisional — see
-    // `docs/APP-CODE-FULL-VIEW.md`.
+    // chrome full view hides is replaced by a compact strip whose only
+    // controls are the drawer's centred grab notch and the Feedback icon.
+    // Visual values are provisional — see `docs/APP-CODE-FULL-VIEW.md` §3.
     const full_view = createFullView(el_window);
 
-    // The control drawer: the Browser's tray, at the bar's left edge (CSS).
+    // The control drawer: the Browser's tray, centred in the strip as the
+    // Browser's is. Its expanded tray carries the title and every window
+    // action. "Show desktop" is the one minimise: until G3 the top bar also
+    // had a "Minimise" that called the same `full_view.minimise()`.
     // Hidden while windowed (`.ezil-full-view-host:not(.ezil-fullbleed)`).
     const drawer = attach_app_drawer(el_window, {
         title,
@@ -876,37 +880,15 @@ export async function openCodeWindow (ctx = {}) {
         ],
     });
 
-    // The top bar. Real buttons, so every control is in the tab order with
-    // the shared focus ring; the title is text, never markup.
+    // The strip itself: an empty, presentational band (the window's own dark
+    // background shows through it) that keeps the head's two mouse gestures.
+    // Nothing in it is focusable or announced; the notch is the controls.
     const el_bar = document.createElement('div');
     el_bar.className = 'ezil-full-view-bar';
-    el_bar.setAttribute('role', 'group');
-    el_bar.setAttribute('aria-label', 'Code window controls');
-    const el_bar_title = document.createElement('span');
-    el_bar_title.className = 'ezil-full-view-title';
-    const el_bar_controls = document.createElement('div');
-    el_bar_controls.className = 'ezil-full-view-controls';
-    const bar_button = (action, label, svg, on_click) => {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'ezil-full-view-btn';
-        b.dataset.action = action;
-        b.title = label;
-        b.setAttribute('aria-label', label);
-        b.innerHTML = svg;
-        b.addEventListener('click', (e) => { e.stopPropagation(); on_click(); });
-        el_bar_controls.appendChild(b);
-    };
-    bar_button('minimize', 'Minimise', MINIMISE_SVG, () => { full_view.minimise(); });
-    bar_button('restore', 'Restore window', RESTORE_SVG, () => { set_view('window', { remember: true }); });
-    bar_button('close', 'Close', CLOSE_SVG, () => { $(el_window).close(); });
-    el_bar.append(el_bar_title, el_bar_controls);
-    // Double-clicking the bar is the head's double-click: back to a window.
-    el_bar.addEventListener('dblclick', (e) => {
-        if ( e.target?.closest?.('button') ) return;
-        set_view('window', { remember: true });
-    });
-    // Pressing the bar activates the window, as pressing a head would (the
+    el_bar.setAttribute('aria-hidden', 'true');
+    // Double-clicking the strip is the head's double-click: back to a window.
+    el_bar.addEventListener('dblclick', () => { set_view('window', { remember: true }); });
+    // Pressing the strip activates the window, as pressing a head would (the
     // iframe only takes pointer events in an active window). Same latch as the
     // drawer's: `pointerdown` then its synthesized `mousedown` focus once.
     let bar_press_pending = false;
@@ -915,7 +897,8 @@ export async function openCodeWindow (ctx = {}) {
         if ( bar_press_pending ) { bar_press_pending = false; return; }
         setTimeout(() => $(el_window).focusWindow(), 0);
     });
-    // DOM order is tab order: the drawer, then the bar, then the editor.
+    // DOM order is tab order: the drawer (its toggle, then the tray's
+    // buttons), then the editor. The strip has nothing to focus.
     el_window.insertBefore(el_bar, el_body);
     if ( drawer ) el_window.insertBefore(drawer, el_bar);
     if ( ! drawer ) {
@@ -927,14 +910,12 @@ export async function openCodeWindow (ctx = {}) {
     }
 
     /**
-     * The window's title everywhere it is shown — the head, the top bar and
-     * the drawer — as TEXT (`textContent`), never markup. A later lane names
-     * the project/repo here. Empty input falls back to the app's name.
+     * The window's title everywhere it is shown — the head and the drawer's
+     * tray — as TEXT (`textContent`), never markup. A later lane names the
+     * project/repo here. Empty input falls back to the app's name.
      */
     const set_title = (text) => {
         const t = String(text ?? '').trim() || title;
-        el_bar_title.textContent = t;
-        el_bar_title.title = t;
         const el_head_title = el_window.querySelector(':scope > .window-head .window-head-title');
         if ( el_head_title ) el_head_title.textContent = t;
         const el_drawer_title = drawer?.querySelector('.dashboard-app-drawer-title');
@@ -977,8 +958,8 @@ export async function openCodeWindow (ctx = {}) {
     // callers, the head's minimise button and the head's context menu
     // (`minimize_window`, UIWindow.js), are hidden whenever this window is in
     // full view, so they can only ever minimise a WINDOWED Code — which
-    // upstream's `hideWindow()` already does exactly. In full view the top bar
-    // and the drawer call `full_view.minimise()` themselves.
+    // upstream's `hideWindow()` already does exactly. In full view the
+    // drawer's Show desktop calls `full_view.minimise()` itself.
     // `seam-minimise-browser-test.mjs` pins one provider of that hook.
     /**
      * Single-instance relaunch (contract item 4): the registry calls this on the

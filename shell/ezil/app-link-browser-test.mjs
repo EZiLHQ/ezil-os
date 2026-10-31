@@ -97,6 +97,14 @@ const px = a => a.map(Math.round);
 // Full view: the window IS the viewport, the body runs from the strip to the bottom edge, opaque, on top.
 const fills = g => g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
     && near(g.rect, [0, 0, ...g.vp]) && near(g.body, [0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+// Code's window actions, in its drawer's tray (gate G3, docs/APP-CODE-FULL-VIEW.md
+// §3): 'minimize' (Show desktop), 'restore' (Restore window) or 'close'. Focus
+// opens the tray whatever state its intro flash or a hover left it in (a click
+// on the notch toggles, so it could shut it); then a real click on the action.
+const tray = async (page, action) => {
+    await page.locator('.window[data-app="code"] > .ezil-app-drawer .dashboard-app-drawer-toggle').focus();
+    await page.locator(`.window[data-app="code"] > .ezil-app-drawer .dashboard-app-drawer-${action}`).click();
+};
 const resize = async (page, width, height) => {
     await page.setViewportSize({ width, height });
     await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [width, height]);
@@ -109,10 +117,10 @@ try {
     await page.reload(); await page.locator('.window[data-app="code"]').waitFor();
     assert.equal(await windows(page).count(), 1);
     // The route opens Code in full view (APP-ROUTES §3), which hides the
-    // dock; Code's own "Restore window" control gives it back.
+    // dock; Code's own "Restore window" control (in its tray) gives it back.
     await page.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
     assert.equal(await page.locator('.taskbar').isVisible(), false, 'the Code link opens in full view, without the dock');
-    await page.locator('.window[data-app="code"] > .ezil-full-view-bar [data-action="restore"]').click();
+    await tray(page, 'restore');
     await page.locator('.taskbar-item[data-app="settings"]').waitFor({ state: 'visible' });
     await page.locator('.taskbar-item[data-app="settings"]').click();
     await page.locator('[data-pane="account"].active').waitFor();
@@ -216,7 +224,7 @@ try {
         const now = () => tab.evaluate(() => [location.pathname, history.length, history.state?.ezilView ?? null,
             document.querySelector('.window[data-app="code"]')?.classList.contains('ezil-fullbleed') ?? null, window.__reloadingPops]);
         const fullCode = tab.locator('.window[data-app="code"].ezil-fullbleed');
-        const bar = action => tab.locator(`.window[data-app="code"] > .ezil-full-view-bar [data-action="${action}"]`).click();
+        const bar = action => tray(tab, action);
         const at = pathname => tab.waitForFunction(p => location.pathname === p, pathname);
         await tab.goto(`${origin}/app/code`);
         await fullCode.waitFor();
@@ -275,7 +283,7 @@ try {
         const tab = await context.newPage();
         const at = pathname => tab.waitForFunction(p => location.pathname === p, pathname);
         const code = tab.locator('.window[data-app="code"]');
-        const bar = action => tab.locator(`.window[data-app="code"] > .ezil-full-view-bar [data-action="${action}"]`).click();
+        const bar = action => tray(tab, action);
         await tab.goto(`${origin}/app/code`);
         await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
         await bar('minimize');

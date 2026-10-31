@@ -572,36 +572,41 @@ body.device-phone {
     display: none;
 }
 
-/* ── Code in full view: the compact top bar ("notch") ─────────────────────
- * App-code lane A2, 2026-10-30. 🔴 PROVISIONAL VISUALS: no reference
- * screenshots were available; every number below is recorded in
- * docs/APP-CODE-FULL-VIEW.md and is to be refined after a pixel review.
+/* ── Code in full view: the compact strip and its centred notch ───────────
+ * App-code lane A2, 2026-10-30; reshaped by gate G3, 2026-10-31.
+ * 🔴 PROVISIONAL VISUALS: the founder's reference screenshots describe "a
+ * centred compact grab notch in a dark full-view strip; a tiny circular
+ * outlined speech-bubble Feedback icon flush top-right", but their pixels were
+ * not readable here. Every number below is recorded in
+ * docs/APP-CODE-FULL-VIEW.md §3 and is to be refined after a pixel review.
  *
- * The bar sits in the same control strip as the Browser's
- * (`--ezil-control-strip-height`, 43px / 59px coarse, set by the shared rule
- * above), so the small Feedback icon's fixed full-bleed position
- * (feedback.css: `top: 9.5px` / `7.5px`, right edge) is centred in it with no
- * Code-specific rule. Left: the control drawer, moved from the strip's centre
- * to its left edge. Middle: the title. Right: minimise / restore / close,
- * ending `--ezil-fv-chip-reserve` short of the edge so they never sit under the
- * Feedback icon (24px at right 6px; 44px at right 0 under `pointer: coarse`).
+ * The strip holds exactly two things while the drawer is shut: the drawer's
+ * grab notch, centred as the Browser's is, and the Feedback icon (a fixed
+ * body-level button, feedback.css), flush right. The title and every window
+ * action live in the notch's expanded tray, which may overlay the editor while
+ * it is open. `.ezil-full-view-bar` is the strip itself: empty, presentational,
+ * there for its hairline and the head's double-click / press gestures.
  *
- * Specificity: `.ezil-code-window.ezil-fullbleed > …` is (0,3,0) against the
- * shared `.ezil-full-view-host.ezil-fullbleed > .ezil-app-drawer` (0,3,0), and
- * comes later — so only the drawer's horizontal placement changes for Code. */
+ * Code's strip is LOWER than the Browser's (43px / 59px, set by the shared rule
+ * above): 28px on a fine pointer, which fits the 18px notch and the Feedback
+ * icon's 20px disc with 4px to spare, and 44px under `pointer: coarse`, the
+ * touch target both controls get there. The shared body offset and the
+ * Feedback icon both read `--ezil-control-strip-height`, so redefining it here
+ * moves them too (feedback.js mirrors the front full view's value onto the
+ * icon). Specificity: `.ezil-code-window.ezil-fullbleed` is (0,2,0), the same
+ * as the shared rule and its coarse override, and comes later — so the coarse
+ * value below must come after the fine one here, or coarse would get 28px. */
 .ezil-code-window > .ezil-full-view-bar {
     display: none;
 }
 .ezil-code-window.ezil-fullbleed {
-    --ezil-fv-chip-reserve: 40px;
-    --ezil-fv-btn: 28px;
-    --ezil-fv-side: 150px;
+    --ezil-control-strip-height: 28px;
+    /* Read by feedback.js (`mount_feedback_chip`): the icon's look in this strip. */
+    --ezil-feedback-look: outline;
 }
 @media (pointer: coarse) {
     .ezil-code-window.ezil-fullbleed {
-        --ezil-fv-chip-reserve: 50px;
-        --ezil-fv-btn: 44px;
-        --ezil-fv-side: 200px;
+        --ezil-control-strip-height: 44px;
     }
 }
 .ezil-code-window.ezil-fullbleed > .ezil-full-view-bar {
@@ -610,69 +615,29 @@ body.device-phone {
     left: 0;
     right: 0;
     height: var(--ezil-control-strip-height);
-    /* Below the drawer (600), so an expanded drawer covers the title, and
-       above the window body, which starts under the strip anyway. */
+    /* Below the drawer (600), and above the window body, which starts under
+       the strip anyway. */
     z-index: 550;
     display: flex;
-    align-items: center;
     box-sizing: border-box;
-    padding: 0 var(--ezil-fv-chip-reserve) 0 78px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    color: var(--color-offwhite, #f5f5f4);
     -webkit-user-select: none;
     user-select: none;
 }
-.ezil-code-window.ezil-fullbleed > .ezil-app-drawer {
-    left: 8px;
-    transform: none;
+/* The shut notch, centred vertically INCLUDING its 1px border (the shared rule
+ * centres the content box and leaves the Browser's notch 1px low; it is left
+ * as it is). Horizontally the shared centring applies: `left: 50%` and
+ * dashboard.css's `translateX(-50%)`. */
+.ezil-code-window.ezil-fullbleed > .ezil-app-drawer.collapsed {
+    top: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2 - 1px);
 }
-.ezil-full-view-title {
-    position: absolute;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
-    max-width: calc(100% - 2 * var(--ezil-fv-side));
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    font-size: 13px;
-    font-weight: 600;
-    line-height: 1.2;
-    opacity: 0.86;
-}
-.ezil-full-view-controls {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    margin-left: auto;
-}
-.ezil-full-view-btn {
-    box-sizing: border-box;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: var(--ezil-fv-btn);
-    height: var(--ezil-fv-btn);
-    padding: 0;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: inherit;
-    opacity: 0.8;
-    cursor: pointer;
-}
-.ezil-full-view-btn svg {
-    width: 16px;
-    height: 16px;
-}
-.ezil-full-view-btn:hover {
-    background: rgba(255, 255, 255, 0.12);
-    opacity: 1;
-}
-.ezil-full-view-btn:focus-visible {
-    outline: 2px solid var(--ezil-accent, #00adb5);
-    outline-offset: 2px;
-    opacity: 1;
+/* The shut notch's hit pad runs the strip's full height (44px under
+ * `pointer: coarse`): from the strip's top edge to its bottom edge, never
+ * below it, so it can never take a click meant for the editor. Sideways it
+ * keeps dashboard.css's 14px / 16px. */
+.ezil-code-window.ezil-fullbleed > .ezil-app-drawer.collapsed .dashboard-app-drawer-toggle::after {
+    top: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2);
+    bottom: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2);
 }
 
 /* ── Code: "Reconnecting…" / "Computer stopped" ───────────────────────────

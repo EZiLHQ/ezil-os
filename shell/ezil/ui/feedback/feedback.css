@@ -167,10 +167,33 @@
         padding-top: 5px;
     }
 }
-/* Full-bleed desktop (plan §6.8): centred in the top control strip
- * (`--ezil-control-strip-height` in ezil-shell.css: 43px, 59px under
- * `pointer: coarse`), right of the centred drawer, never over the stream. */
-.ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 9.5px; }
+/* Full-bleed desktop (plan §6.8): centred in the top control strip, right of
+ * the centred drawer, never over the stream. Gate G3, 2026-10-31: the strip
+ * height is the FRONT full view's `--ezil-control-strip-height`, which
+ * feedback.js mirrors onto the icon as `--ezil-feedback-strip-h` (the Browser's
+ * 43px / 59px coarse, Code's 28px / 44px; ezil-shell.css). The fallbacks are
+ * the Browser's strip, so its icon stays where it was (9.5px / 7.5px). */
+.ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: calc((var(--ezil-feedback-strip-h, 43px) - 24px) / 2); }
 @media (pointer: coarse) {
-    .ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 7.5px; align-items: center; padding-top: 0; }
+    .ezil-feedback-chip.ezil-feedback-chip-fullbleed {
+        top: calc((var(--ezil-feedback-strip-h, 59px) - 44px) / 2);
+        align-items: center;
+        padding-top: 0;
+    }
 }
+/* Gate G3, 2026-10-31 (PROVISIONAL, docs/APP-CODE-FULL-VIEW.md §3): in a strip
+ * that declares `--ezil-feedback-look: outline` (Code's full view), the icon is
+ * a low-emphasis OUTLINED speech bubble in a thin ring: no glass, no shadow,
+ * the same stroked glyph drawn smaller inside the same 20px disc. The strip is
+ * always dark, so the ink stays white in either theme. The focus ring is drawn
+ * tighter (2px, 1px out) so it stays inside a 28px strip. Every other place
+ * keeps the glass disc above. */
+.ezil-feedback-chip[data-look="outline"] { opacity: .62; }
+.ezil-feedback-chip[data-look="outline"]:hover,
+.ezil-feedback-chip[data-look="outline"]:focus-visible { opacity: 1; }
+.ezil-feedback-chip[data-look="outline"] svg {
+    padding: 4px;
+    background: transparent;
+    box-shadow: inset 0 0 0 1px currentColor;
+}
+.ezil-feedback-chip[data-look="outline"]:focus-visible svg { outline-width: 2px; outline-offset: 1px; }

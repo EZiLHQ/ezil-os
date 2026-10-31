@@ -13,6 +13,9 @@ const DRAFT_KEY = 'ezil:feedback:draft:v1:';
 const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
 const OUTBOX_MAX = 10;
 let chipObserver = null;
+/** `matchMedia('(pointer: coarse)')` and the icon's sync it calls on a change. */
+let chipPointer = null;
+let chipPointerSync = null;
 let activeDialog = null;
 let onlineListening = false;
 const inflight = new Set();
@@ -20,6 +23,9 @@ const inflight = new Set();
 function unmount_feedback_chip () {
     chipObserver?.disconnect();
     chipObserver = null;
+    chipPointer?.removeEventListener?.('change', chipPointerSync);
+    chipPointer = null;
+    chipPointerSync = null;
     document.querySelector('button.ezil-feedback-chip')?.remove();
     window.removeEventListener('ezil:teardown', unmount_feedback_chip);
     window.removeEventListener('pagehide', suspend_feedback_chip);
@@ -177,9 +183,25 @@ function shown (el) {
     return true;
 }
 
-function fullbleed_visible () {
-    return [...document.querySelectorAll('.window.ezil-fullbleed')].some(shown);
+/**
+ * The full view in front: of the rendered `.ezil-fullbleed` windows, the one
+ * with the highest z-index (the later one in the document on a tie), or null.
+ * Every full view fills the viewport, so only that one's strip is on screen.
+ */
+function front_fullbleed () {
+    let front = null;
+    let front_z = -Infinity;
+    for ( const el of document.querySelectorAll('.window.ezil-fullbleed') ) {
+        if ( ! shown(el) ) continue;
+        const z = Number.parseInt(window.getComputedStyle(el).zIndex, 10);
+        const zz = Number.isFinite(z) ? z : 0;
+        if ( zz >= front_z ) { front = el; front_z = zz; }
+    }
+    return front;
 }
+
+/** A plain px length (`43px`, `28.5px`), as the strip height is written in ezil-shell.css. */
+const PX = /^\d+(?:\.\d+)?px$/;
 
 /**
  * At least one app window is open: a `.window` that names its app (alerts carry
@@ -233,14 +255,40 @@ export function mount_feedback_chip () {
         // Shown only while an app window is open: never on the home screen.
         // In a full-bleed desktop it sits inside the top control strip (plan
         // §6.8); with the floating-controls pill on, the pill offers Feedback.
-        const fullbleed = fullbleed_visible();
+        const front = front_fullbleed();
+        const fullbleed = !! front;
         const pill = window.__EZIL_BOOT__?.desktopState?.ui?.floatingControls === true;
         const display = ! feedback_enabled() || ! app_window_open() || (fullbleed && pill) ? 'none' : '';
         if ( chip.style.display !== display ) chip.style.display = display;
         if ( chip.classList.contains('ezil-feedback-chip-fullbleed') !== fullbleed ) chip.classList.toggle('ezil-feedback-chip-fullbleed', fullbleed);
+        // Gate G3, 2026-10-31: the strips differ (the Browser's is 43px, Code's
+        // 28px; ezil-shell.css), so the icon takes the FRONT full view's strip
+        // height and the look it declares (`--ezil-feedback-look`), never one
+        // strip's fixed offset. Nothing declared (jsdom, no full view): the
+        // CSS fallbacks, which are the Browser's strip and the glass disc.
+        // Written only when it changes: `style` is observed below.
+        const css = front ? window.getComputedStyle(front) : null;
+        const strip = css?.getPropertyValue('--ezil-control-strip-height').trim() ?? '';
+        const want_strip = PX.test(strip) ? strip : '';
+        if ( chip.style.getPropertyValue('--ezil-feedback-strip-h') !== want_strip ) {
+            if ( want_strip ) chip.style.setProperty('--ezil-feedback-strip-h', want_strip);
+            else chip.style.removeProperty('--ezil-feedback-strip-h');
+        }
+        const look = css?.getPropertyValue('--ezil-feedback-look').trim() ?? '';
+        const want_look = /^[a-z]+$/.test(look) ? look : '';
+        if ( (chip.dataset.look ?? '') !== want_look ) {
+            if ( want_look ) chip.dataset.look = want_look;
+            else delete chip.dataset.look;
+        }
     };
     chipObserver?.disconnect();
     chipObserver = new MutationObserver(sync);
+    // The strip's height is a `pointer: coarse` media query: re-read it when
+    // the pointer changes (no element mutates when a media query flips).
+    chipPointer?.removeEventListener?.('change', chipPointerSync);
+    chipPointer = window.matchMedia?.('(pointer: coarse)') ?? null;
+    chipPointerSync = sync;
+    chipPointer?.addEventListener?.('change', chipPointerSync);
     // Windows opening, closing, minimising and restoring all show up here.
     chipObserver.observe(document.body, { subtree: true, childList: true, attributes: true,
         attributeFilter: ['class', 'style', 'hidden', 'data-is_minimized', 'data-closing'] });

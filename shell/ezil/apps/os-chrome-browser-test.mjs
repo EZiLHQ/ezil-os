@@ -151,15 +151,17 @@ setInterval(() => {
 </script></body></html>`;
 
 // ════════════════════════════════════════════════════════════════════════════
-// SCENARIO 5 — Code's full view and its top bar (app-code lane A2, 2026-10-30)
+// SCENARIO 5 — Code's full view, its strip and its tray (app-code lane A2,
+// 2026-10-30; the strip reshaped by gate G3, 2026-10-31)
 // ════════════════════════════════════════════════════════════════════════════
-// 🔴 PROVISIONAL visuals (docs/APP-CODE-FULL-VIEW.md; no reference screenshots
-// existed). So these checks pin RELATIONSHIPS, not pixel values: the bar is the
-// control strip, the title is centred, the drawer is at the left, the three
-// controls are ordered, on top, unobstructed and clear of the Feedback corner,
-// nothing overlaps, keyboard focus is visible — at the two sizes the brief
-// names (900x700, 1440x1000). Plus the two-window case: the Browser stays
+// 🔴 PROVISIONAL visuals (docs/APP-CODE-FULL-VIEW.md §3). So these checks pin
+// RELATIONSHIPS, not pixel values: the strip is the control strip and holds no
+// control of its own, the shut notch is centred inside it, the tray carries the
+// title and Show desktop / Restore window / Close in order, on top and
+// unobstructed, keyboard focus is visible — at the two sizes the brief names
+// (900x700, 1440x1000). Plus the two-window case: the Browser stays
 // full-bleed, untouched, while Code enters and leaves full view and closes.
+// The Feedback icon's place in the strip: code-full-view-browser-test.mjs.
 async function scenarioCodeFullView () {
     for ( const viewport of [{ width: 900, height: 700 }, { width: 1440, height: 1000 }] ) {
         const L = `[code-full-view ${viewport.width}x${viewport.height}]`;
@@ -177,22 +179,48 @@ async function scenarioCodeFullView () {
             if ( ! w ) return null;
             const box = (el) => { if ( ! el ) return null; const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; };
             const bar = w.querySelector(':scope > .ezil-full-view-bar');
+            const drawer = w.querySelector(':scope > .ezil-app-drawer');
+            const toggle = drawer.querySelector('.dashboard-app-drawer-toggle');
             const hit = (el) => { const b = el.getBoundingClientRect(); return document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2)?.closest('button') === el; };
-            const btns = [...bar.querySelectorAll('button')];
+            const btns = [...drawer.querySelectorAll('.dashboard-app-drawer-btn')];
             return {
                 full: w.classList.contains('ezil-fullbleed'),
                 win: box(w), body: box(w.querySelector(':scope > .window-body')),
                 head: getComputedStyle(w.querySelector(':scope > .window-head')).display,
                 taskbar: getComputedStyle(document.querySelector('.taskbar')).display,
                 barDisplay: getComputedStyle(bar).display, bar: box(bar),
+                barEmpty: bar.children.length === 0 && bar.textContent === '',
                 strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
-                title: box(w.querySelector('.ezil-full-view-title')), titleText: w.querySelector('.ezil-full-view-title').textContent,
-                drawer: box(w.querySelector(':scope > .ezil-app-drawer')),
-                drawerDisplay: getComputedStyle(w.querySelector(':scope > .ezil-app-drawer')).display,
-                btns: btns.map(b => ({ action: b.dataset.action, ...box(b), hit: hit(b) })),
+                drawer: box(drawer), drawerDisplay: getComputedStyle(drawer).display,
+                collapsed: drawer.classList.contains('collapsed'), toggleHit: hit(toggle),
+                title: box(drawer.querySelector('.dashboard-app-drawer-title')),
+                titleText: drawer.querySelector('.dashboard-app-drawer-title').textContent,
+                btns: btns.map(b => ({ action: b.getAttribute('aria-label'), ...box(b), hit: hit(b) })),
             };
         }, CODE);
         const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+        // The notch shut, and still: the mouse parked over the editor (a hover
+        // opens it), its intro flash over, no transition running.
+        const shut = async () => {
+            await page.mouse.move(Math.round(vw / 2), Math.round(vh * 0.7));
+            await page.waitForFunction((sel) => {
+                const d = document.querySelector(`${sel} > .ezil-app-drawer`);
+                return !! d && d.classList.contains('collapsed') && d.getAnimations({ subtree: true }).length === 0;
+            }, CODE, { timeout: 10_000 });
+        };
+        // The tray open, and still. Focus opens it whatever state it is in (a
+        // click on the toggle would toggle it).
+        const openTray = async () => {
+            await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
+            await page.waitForFunction((sel) => {
+                const d = document.querySelector(`${sel} > .ezil-app-drawer`);
+                return !! d && ! d.classList.contains('collapsed') && d.getAnimations({ subtree: true }).length === 0;
+            }, CODE, { timeout: 10_000 });
+        };
+        const tray = async (label) => {
+            await openTray();
+            await page.click(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-btn[aria-label="${label}"]`);
+        };
 
         const b0 = await browserBox();
         push(`${L} setup: the Browser is full-bleed`, b0.full, JSON.stringify(b0));
@@ -221,58 +249,66 @@ async function scenarioCodeFullView () {
         push(`${L} 🔴 the green button takes the whole viewport (no head, no taskbar)`,
             m2.full && m2.head === 'none' && m2.taskbar === 'none' && m2.win.x === 0 && m2.win.y === 0
             && Math.round(m2.win.w) === vw && Math.round(m2.win.h) === vh, JSON.stringify(m2.win));
-        push(`${L} the top bar IS the control strip: top edge, full width, strip height; the editor starts below it`,
+        push(`${L} the strip is the control strip: top edge, full width, strip height; the editor starts below it`,
             m2.barDisplay === 'flex' && m2.bar.y === 0 && Math.round(m2.bar.w) === vw && Math.round(m2.bar.h) === m2.strip
             && m2.strip > 0 && Math.round(m2.body.y) === m2.strip, JSON.stringify({ bar: m2.bar, strip: m2.strip, body: m2.body }));
-        push(`${L} the title is centred in the bar and inside it`,
-            Math.abs(m2.title.x + m2.title.w / 2 - vw / 2) <= 1 && m2.title.y >= 0 && m2.title.y + m2.title.h <= m2.strip
-            && m2.titleText === 'Code', JSON.stringify(m2.title));
-        push(`${L} the drawer sits at the bar's left edge, inside the strip`,
-            m2.drawerDisplay !== 'none' && Math.round(m2.drawer.x) === 8 && m2.drawer.y >= 0 && m2.drawer.y + m2.drawer.h <= m2.strip,
-            JSON.stringify(m2.drawer));
-        push(`${L} minimise / restore / close sit at the right, in that order, inside the strip`,
-            m2.btns.map(b => b.action).join() === 'minimize,restore,close'
-            && m2.btns.every((b, i) => b.y >= 0 && b.y + b.h <= m2.strip && (i === 0 || b.x > m2.btns[i - 1].x + m2.btns[i - 1].w - 0.5))
-            && m2.btns[0].x > vw / 2, JSON.stringify(m2.btns));
-        push(`${L} 🔴 the controls end clear of the Feedback corner (24px icon at right 6px: they stop at least 36px from the edge)`,
-            m2.btns[2].x + m2.btns[2].w <= vw - 36, JSON.stringify(m2.btns[2]));
-        const parts = [{ n: 'title', ...m2.title }, { n: 'drawer', ...m2.drawer }, ...m2.btns.map(b => ({ n: b.action, ...b }))];
+        push(`${L} 🔴 the strip holds no control or text of its own (gate G3: the title and actions are the tray's)`,
+            m2.barEmpty && ! (await page.$(`${CODE} .ezil-full-view-title, ${CODE} .ezil-full-view-btn`)));
+        await shut();
+        const ms = await measure();
+        push(`${L} 🔴 the shut notch is centred in the strip, inside it, and is what a click at its centre hits`,
+            ms.collapsed && ms.drawerDisplay !== 'none' && Math.abs(ms.drawer.x + ms.drawer.w / 2 - vw / 2) <= 1
+            && ms.drawer.y >= 0 && ms.drawer.y + ms.drawer.h <= ms.strip && ms.toggleHit, JSON.stringify(ms.drawer));
+        await openTray();
+        const mt = await measure();
+        push(`${L} the open tray carries the title and Show desktop / Restore window / Close, in that order, centred`,
+            mt.titleText === 'Code' && mt.title.w > 0
+            && mt.btns.map(b => b.action).join() === 'Show desktop,Restore window,Close'
+            && mt.btns.every((b, i) => b.w > 0 && (i === 0 ? b.x >= mt.title.x + mt.title.w : b.x > mt.btns[i - 1].x + mt.btns[i - 1].w - 0.5))
+            && Math.abs(mt.drawer.x + mt.drawer.w / 2 - vw / 2) <= 1, JSON.stringify({ title: mt.title, btns: mt.btns, tray: mt.drawer }));
+        const parts = [{ n: 'title', ...mt.title }, ...mt.btns.map(b => ({ n: b.action, ...b }))];
         const clashes = parts.flatMap((a, i) => parts.slice(i + 1).filter(b => overlap(a, b)).map(b => `${a.n}/${b.n}`));
-        push(`${L} 🔴 nothing in the bar overlaps (drawer, title, three controls)`, clashes.length === 0, clashes.join(', '));
-        push(`${L} each control is what a click at its centre hits (nothing on top)`, m2.btns.every(b => b.hit), JSON.stringify(m2.btns.map(b => b.hit)));
+        push(`${L} 🔴 nothing in the tray overlaps (title, three actions)`, clashes.length === 0, clashes.join(', '));
+        push(`${L} each action is what a click at its centre hits (nothing on top)`, mt.btns.every(b => b.hit), JSON.stringify(mt.btns.map(b => b.hit)));
 
         // ── the keyboard ──
-        // DOM order is tab order: the drawer (focus opens it, so its own
-        // Show desktop / Restore window / Close come first), then the bar.
-        await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
+        // DOM order is tab order: the tray's toggle (focus opens it), then its
+        // Show desktop / Restore window / Close; the strip has nothing to focus.
+        const where = () => page.evaluate(() => {
+            const el = document.activeElement;
+            const at = el?.closest('.ezil-full-view-bar') ? 'bar' : el?.closest('.ezil-app-drawer') ? 'drawer' : 'other';
+            const action = el?.classList.contains('dashboard-app-drawer-toggle') ? 'toggle' : el?.getAttribute('aria-label');
+            return { where: at, action, ring: el ? getComputedStyle(el).outlineStyle : 'none', visible: !! el?.matches(':focus-visible') };
+        });
         const order = [];
-        for ( let i = 0; i < 6; i++ ) {
+        for ( let i = 0; i < 3; i++ ) {
             await page.keyboard.press('Tab');
-            order.push(await page.evaluate(() => {
-                const el = document.activeElement;
-                const where = el?.closest('.ezil-full-view-bar') ? 'bar' : el?.closest('.ezil-app-drawer') ? 'drawer' : 'other';
-                const action = el?.dataset?.action ?? [...(el?.classList ?? [])].find(c => /^dashboard-app-drawer-(minimize|restore|close)$/.test(c))?.slice(21);
-                return { where, action, ring: el ? getComputedStyle(el).outlineStyle : 'none' };
-            }));
+            order.push(await where());
         }
-        push(`${L} 🔴 Tab walks the drawer's Show desktop / Restore / Close, then the bar's minimise / restore / close, each with a visible focus ring`,
-            order.map(o => `${o.where}:${o.action}`).join() === 'drawer:minimize,drawer:restore,drawer:close,bar:minimize,bar:restore,bar:close'
-            && order.every(o => o.ring !== 'none'), JSON.stringify(order));
-        await page.keyboard.press('Shift+Tab');
+        push(`${L} 🔴 Tab walks the tray's Show desktop / Restore window / Close, each with a visible focus ring`,
+            order.map(o => `${o.where}:${o.action}`).join() === 'drawer:Show desktop,drawer:Restore window,drawer:Close'
+            && order.every(o => o.ring !== 'none' && o.visible), JSON.stringify(order));
+        for ( let i = 0; i < 3; i++ ) await page.keyboard.press('Shift+Tab');
+        const back = await where();
+        push(`${L} Shift+Tab walks back to the tray's toggle, with a visible focus ring`,
+            back.where === 'drawer' && back.action === 'toggle' && back.ring !== 'none' && back.visible, JSON.stringify(back));
+        await page.keyboard.press('Tab');
+        await page.keyboard.press('Tab');
         await page.keyboard.press('Enter');
         await sleep(500);
         const m3 = await measure();
-        push(`${L} 🔴 Enter on restore returns to the EXACT previous window box`,
+        push(`${L} 🔴 Enter on the tray's Restore window returns to the EXACT previous window box`,
             ! m3.full && JSON.stringify(m3.win) === windowedBox && m3.taskbar !== 'none' && m3.head !== 'none', `${JSON.stringify(m3.win)} vs ${windowedBox}`);
 
         // ── double-clicks ──
         await page.dblclick(`${CODE} > .window-head .window-head-title`);
         await sleep(500);
         push(`${L} a title double-click enters full view`, (await measure()).full);
-        await page.dblclick(`${CODE} .ezil-full-view-title`);
+        // An empty point of the strip: a quarter of the way across.
+        await page.mouse.dblclick(Math.round(vw / 4), Math.round(m2.strip / 2));
         await sleep(500);
         const m4 = await measure();
-        push(`${L} a double-click on the top bar returns to the previous box`, ! m4.full && JSON.stringify(m4.win) === windowedBox);
+        push(`${L} a double-click on the strip returns to the previous box`, ! m4.full && JSON.stringify(m4.win) === windowedBox);
 
         // ── two full windows: the Browser stays full-bleed through all of it ──
         await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
@@ -281,8 +317,8 @@ async function scenarioCodeFullView () {
         await page.evaluate((sel) => window.scale_window(document.querySelector(sel)), CODE);
         await sleep(500);
         const both = await measure();
-        push(`${L} setup: Code full view over a full-bleed Browser`, both.full && (await browserBox()).full && both.btns.every(b => b.hit));
-        await page.click(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
+        push(`${L} setup: Code full view over a full-bleed Browser`, both.full && (await browserBox()).full && both.toggleHit);
+        await tray('Restore window');
         await sleep(500);
         const m5 = await measure(), b5 = await browserBox();
         push(`${L} 🔴 Code back to a window while the Browser is full-bleed: the taskbar stays hidden, the Browser is untouched`,
@@ -290,7 +326,7 @@ async function scenarioCodeFullView () {
             JSON.stringify({ code: m5.win, taskbar: m5.taskbar, browser: b5 }));
         await page.evaluate((sel) => window.scale_window(document.querySelector(sel)), CODE);
         await sleep(400);
-        await page.click(`${CODE} > .ezil-full-view-bar [data-action="close"]`);
+        await tray('Close');
         await page.waitForSelector(CODE, { state: 'detached', timeout: 5_000 });
         await sleep(300);
         const b6 = await browserBox();
@@ -318,7 +354,7 @@ async function scenarioCodeFullView () {
         await sleep(900);
         const m7 = await measure();
         push(`${L} 🔴 a launch with view "full" (the /app/code route) opens straight into full view, on top`,
-            !! m7 && m7.full && m7.barDisplay === 'flex' && m7.btns.every(b => b.hit), JSON.stringify(m7?.win));
+            !! m7 && m7.full && m7.barDisplay === 'flex' && m7.toggleHit, JSON.stringify(m7?.win));
         // 🔴 The class alone is how a 980x680 "full view" shipped: UIWindow's
         // opening `show(0)` animation wrote the windowed box back over it.
         const g7 = await settledGeometry(page, CODE);
@@ -335,7 +371,7 @@ async function scenarioCodeFullView () {
         const g8 = await settledGeometry(page, CODE);
         push(`${L} 🔴 a viewport resize while full: it keeps filling (${vw - 140}x${vh - 100})`,
             fillsViewport(g8) && g8.vp[0] === vw - 140, JSON.stringify(g8));
-        await page.click(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
+        await tray('Restore window');
         await page.waitForSelector(`${CODE}:not(.ezil-fullbleed)`);
         const g9 = await settledGeometry(page, CODE);
         push(`${L} positive control: Restore window leaves it at the box it had before full view, to the pixel (980x680, not the viewport)`,

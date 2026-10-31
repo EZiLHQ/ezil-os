@@ -546,8 +546,9 @@ async function viewBoot(entry, state = NEXT_STATE) {
     };
     // A click (a dock icon), then its window's delayed focuses.
     const click = async id => { await w.ezil.registry.launch(id, ctx); await timers(); };
-    // Code's own top bar: 'restore' (Restore window) or 'minimize'.
-    const bar = action => win('code').querySelector(`:scope > .ezil-full-view-bar [data-action="${action}"]`).click();
+    // Code's own controls, in its drawer's tray (gate G3): 'restore' (Restore
+    // window) or 'minimize' (Show desktop).
+    const bar = action => win('code').querySelector(`:scope > .ezil-app-drawer .dashboard-app-drawer-${action}`).click();
     // Back/Forward, resolved by the popstate itself, then by Code's window
     // when the entry names it (a closed Code is built anew). `during` runs
     // right after the shell's own popstate handler, before its launch

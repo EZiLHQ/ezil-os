@@ -634,8 +634,9 @@ await settle(4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. FULL VIEW, THE TOP BAR, RELAUNCH, AND "RECONNECTING…" / "COMPUTER
-//    STOPPED" (app-code lane A2, 2026-10-30; docs/APP-CODE-FULL-VIEW.md).
+// 7. FULL VIEW, ITS STRIP AND TRAY, RELAUNCH, AND "RECONNECTING…" /
+//    "COMPUTER STOPPED" (app-code lane A2, 2026-10-30; the strip reshaped by
+//    gate G3, 2026-10-31; docs/APP-CODE-FULL-VIEW.md).
 //    jsdom: classes, attributes, inline geometry (what "restore the previous
 //    bounds" restores), computed `display` from the built CSS, events and
 //    storage. Pixels and hit-testing are os-chrome / feedback-browser's job.
@@ -657,7 +658,10 @@ await settle(4);
     const isWindowed = (el) => !! el && ! el.classList.contains('ezil-fullbleed') && el.getAttribute('data-is_fullpage') !== '1'
         && taskbarShown() && shown(el.querySelector(':scope > .window-head')) && ! shown(el.querySelector(':scope > .ezil-full-view-bar'));
     const dblclick = (el) => el?.dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
-    const barBtn = (el, action) => el?.querySelector(`:scope > .ezil-full-view-bar [data-action="${action}"]`);
+    // Gate G3: every window action is in the drawer's tray (Show desktop is
+    // `minimize`); the strip (`.ezil-full-view-bar`) is empty.
+    const trayBtn = (el, action) => el?.querySelector(`:scope > .ezil-app-drawer .dashboard-app-drawer-${action}`);
+    const bar = (el) => el?.querySelector(':scope > .ezil-full-view-bar');
     const closeCode = async () => { if ( codeWin() ) { await window.$(codeWin()).close(); await settle(8); } };
     const launchCode = async (extra = {}) => {
         await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState, ...extra });
@@ -692,10 +696,22 @@ await settle(4);
     push('7b 🔴 the green button enters full view (class, data-is_fullpage, no taskbar, no head, top bar shown)', isFull(w),
         JSON.stringify({ cls: w.className, taskbar: taskbarShown() }));
     push('7b the window takes the viewport', w.style.width === '100%' && w.style.height === '100%', geom(w));
-    push('7b the top bar carries the title and minimise / restore / close, in that order',
-        w.querySelector('.ezil-full-view-title')?.textContent === 'Code'
-        && [...w.querySelectorAll(':scope > .ezil-full-view-bar button')].map(b => b.dataset.action).join() === 'minimize,restore,close'
-        && [...w.querySelectorAll(':scope > .ezil-full-view-bar button')].every(b => b.type === 'button' && b.getAttribute('aria-label')));
+    // Gate G3: the strip holds nothing of its own (the notch is the drawer, the
+    // Feedback icon is the body's); the tray carries the title and the actions.
+    push('7b 🔴 the strip is empty and presentational: no element, no text, aria-hidden, no role',
+        bar(w)?.children.length === 0 && bar(w).textContent === '' && bar(w).getAttribute('aria-hidden') === 'true'
+        && ! bar(w).hasAttribute('role') && ! w.querySelector('.ezil-full-view-title, .ezil-full-view-btn'),
+        bar(w)?.outerHTML);
+    push('7b 🔴 the tray carries the title and Show desktop / Restore window / Close, in that order, as labelled buttons',
+        w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-title')?.textContent === 'Code'
+        && [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].map(b => b.getAttribute('aria-label')).join()
+            === 'Show desktop,Restore window,Close'
+        && [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].every(b => b.type === 'button'),
+        [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].map(b => b.getAttribute('aria-label')).join());
+    push('7b the tray toggle is a real, named button that reports its state',
+        w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-toggle')?.type === 'button'
+        && w.querySelector('.dashboard-app-drawer-toggle').getAttribute('aria-label') === 'Window controls'
+        && ['true', 'false'].includes(w.querySelector('.dashboard-app-drawer-toggle').getAttribute('aria-expanded')));
     push('7b the drawer is shown in full view and sits before the bar in tab order',
         shown(w.querySelector(':scope > .ezil-app-drawer'))
         && w.querySelector(':scope > .ezil-app-drawer').nextElementSibling === w.querySelector(':scope > .ezil-full-view-bar')
@@ -712,47 +728,38 @@ await settle(4);
     push('7c 🔴 the green button toggles back to the window at the EXACT previous bounds', isWindowed(w) && geom(w) === windowed, `${geom(w)} vs ${windowed}`);
     push('7c …announced {view:"window"} and remembered', views.length === 2 && views[1].view === 'window' && store.getItem(VIEW_KEY) === 'window');
 
-    // 7d. Title double-click -> full; a double-click on the top bar -> window.
+    // 7d. Title double-click -> full; a double-click on the strip -> window.
     dblclick(w.querySelector(':scope > .window-head'));
     await settle(4);
     push('7d a title double-click enters full view', isFull(w));
-    dblclick(w.querySelector('.ezil-full-view-title'));
+    dblclick(w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-toggle'));
     await settle(4);
-    push('7d a double-click on the top bar returns to the window, previous bounds', isWindowed(w) && geom(w) === windowed);
+    push('7d a double-click on the notch is not a strip double-click (still full)', isFull(w));
+    dblclick(bar(w));
+    await settle(4);
+    push('7d positive control: a double-click on the strip returns to the window, previous bounds', isWindowed(w) && geom(w) === windowed);
     dblclick(w.querySelector(':scope > .window-head'));
     await settle(4);
-    dblclick(barBtn(w, 'minimize'));
-    await settle(4);
-    push('7d a double-click ON a bar button is not a bar double-click', isFull(w));
 
-    // 7e. The bar's restore and minimise; back from the taskbar; the drawer's restore.
-    click(barBtn(w, 'restore'));
+    // 7e. The tray's Restore window and Show desktop; back from the taskbar.
+    click(trayBtn(w, 'restore'));
     await settle(4);
-    push('7e the top bar\'s restore returns to the window at the previous bounds', isWindowed(w) && geom(w) === windowed);
+    push('7e the tray\'s "Restore window" returns to the window at the previous bounds', isWindowed(w) && geom(w) === windowed);
     window.scale_window(w);
     await settle(4);
-    click(barBtn(w, 'minimize'));
+    click(trayBtn(w, 'minimize'));
     await settle(8);
-    push('7e the top bar\'s minimise hides the window and gives the taskbar back',
+    push('7e the tray\'s "Show desktop" hides the window and gives the taskbar back',
         ['true', '1'].includes(w.getAttribute('data-is_minimized')) && taskbarShown() && ! w.classList.contains('ezil-fullbleed'));
     push('7e 🔴 _ezil_view() still reports "full" while minimised from full view (no full-view class: the desire, not the class)',
         w._ezil_view() === 'full' && ! w.classList.contains('ezil-fullbleed'));
     window.$(w).showWindow();
     await settle(24);
     push('7e 🔴 back from the taskbar it is in full view again (the desire outlived the minimise)', isFull(w));
-    click(w.querySelector('.ezil-app-drawer .dashboard-app-drawer-restore'));
+    click(trayBtn(w, 'restore'));
     await settle(4);
-    push('7e the drawer\'s "Restore window" returns to the window too', isWindowed(w) && geom(w) === windowed);
+    push('7e …and the tray\'s "Restore window" then returns to the window, previous bounds', isWindowed(w) && geom(w) === windowed);
     push('7e positive control: _ezil_view() reports "window" once restored to the window', w._ezil_view() === 'window');
-    window.scale_window(w);
-    await settle(4);
-    click(w.querySelector('.ezil-app-drawer .dashboard-app-drawer-minimize'));
-    await settle(8);
-    push('7e the drawer\'s "Show desktop" minimises with the taskbar back', ['true', '1'].includes(w.getAttribute('data-is_minimized')) && taskbarShown());
-    window.$(w).showWindow();
-    await settle(24);
-    window.scale_window(w);
-    await settle(4);
     push('setup: windowed again before the relaunch checks', isWindowed(w) && geom(w) === windowed);
 
     // 7f. The single-instance relaunch hook (contract item 4).
@@ -802,14 +809,14 @@ await settle(4);
     const evil = '<img src=x onerror="window.__ezilTitleInjected=1">';
     w._ezil_set_title(evil);
     await settle(2);
-    push('7g 🔴 _ezil_set_title writes text: bar, head and drawer show the string verbatim and contain no element',
-        w.querySelector('.ezil-full-view-title').textContent === evil
-        && w.querySelector(':scope > .window-head .window-head-title').textContent === evil
+    push('7g 🔴 _ezil_set_title writes text: head and tray show the string verbatim and contain no element',
+        w.querySelector(':scope > .window-head .window-head-title').textContent === evil
         && w.querySelector('.dashboard-app-drawer-title').textContent === evil
-        && ! w.querySelector('.ezil-full-view-title *, .window-head-title *, .dashboard-app-drawer-title *')
+        && ! w.querySelector('.window-head-title *, .dashboard-app-drawer-title *')
         && ! window.__ezilTitleInjected);
+    push('7g …and the strip still carries no title (gate G3: the title is the tray\'s)', bar(w)?.textContent === '' && bar(w).children.length === 0);
     w._ezil_set_title('  ');
-    push('7g an empty title falls back to the app\'s name', w.querySelector('.ezil-full-view-title').textContent === 'Code'
+    push('7g an empty title falls back to the app\'s name', w.querySelector('.dashboard-app-drawer-title').textContent === 'Code'
         && w.querySelector(':scope > .window-head .window-head-title').textContent === 'Code');
 
     // 7h. A launch with view "full" (the /app/code route).
