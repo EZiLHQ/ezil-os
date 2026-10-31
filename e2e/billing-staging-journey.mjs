@@ -15,7 +15,7 @@
  * settings: shell/ezil/ui/Settings/index.js:107,120
  * billing: ui/Settings/tabs/billing.js:205,209; billing-sheets.js:250
  * Stripe: ui/Settings/upgrade-sheet.js:149 (secure child DOM is external)
- * restart: ui/Settings/tabs/troubleshoot.js:264-276,304,341-347; ui/Settings/sheet-frame.js:12-20,261-265
+ * restart: ui/Settings/tabs/troubleshoot.js:288-300,328,365-371; ui/Settings/sheet-frame.js:12-20,261-265
  * chat: worker/copilot-chat/PATCHES.md:95 preserves workbench.action.chat.*;
  *       e2e/copilot-ezil.mjs:145,216 uses the interactive chat/Monaco input.
  * terminal: e2e/live-check.mjs:262 (accessibility mode and xterm tree).
