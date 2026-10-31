@@ -333,6 +333,19 @@ describe('requestGuacamolePreview — the failure carries an allowlisted reason'
         expect(result.reason).toBe('connection_refused');
     });
 
+    it('never copies an untrusted Worker `errorCode` from a 200 {ok:false} into the reason', async () => {
+        const secret = 'https://x.test/?token=SECRET';
+        stubWorkerResponse(200, JSON.stringify({ ok: false, error: `Something ${secret}`, errorCode: secret }));
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.reason).toBe('unknown');
+    });
+
+    it('keeps a well-formed Worker `errorCode` from a 200 {ok:false} as the reason', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: false, error: 'Container failed to start', errorCode: 'sandbox_start_failed' }));
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.reason).toBe('sandbox_start_failed');
+    });
+
     it('names a missing configuration by its own code', async () => {
         vi.stubGlobal('fetch', vi.fn());
         const result = (await requestGuacamolePreview(

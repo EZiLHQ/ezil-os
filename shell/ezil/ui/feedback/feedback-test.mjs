@@ -23,7 +23,7 @@ const computerId = '11111111-1111-4111-8111-111111111111';
 const reportId = '22222222-2222-4222-8222-222222222222';
 const accountId = '33333333-3333-4333-8333-333333333333';
 window.__EZIL_BOOT__ = { computer: { id: computerId }, user: { id: accountId, email: 'BOOT_SECRET@example.test' },
-    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true } } };
+    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true, feedbackEventDiagnostics: true } } };
 globalThis.ezil = { version: '1' };
 document.cookie = '__Host-ezil-os-auth=SECRET; Secure; Path=/';
 assert.match(document.cookie, /SECRET/);
@@ -464,6 +464,87 @@ try {
         setDescription('');
         assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
         close();
+    });
+    // FEEDBACK-DIAG rollback safety. A server from before these keys parses each
+    // `recentEvents[]` entry as `{eventClass, site, code}.strict()`: emulated exactly.
+    const oldServerAccepts = body => (JSON.parse(body).diagnostics?.recentEvents ?? [])
+        .every(event => Object.keys(event).every(key => ['eventClass', 'site', 'code'].includes(key)));
+    const oldServer = async (url, options) => oldServerAccepts(options.body)
+        ? { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) } : { status: 400 };
+    const hmacFailure = { eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: 'unauthorized' };
+    const recordHmacFailure = () => telemetry.capture({ ...hmacFailure,
+        reason: 'worker_http_401:hmac_signature_mismatch', serverCorrelationId: 'srv_0123456789ab' });
+    const posts = from => calls.slice(from).filter(c => c.method === 'POST');
+    await check('FEEDBACK-DIAG: new shell + old server (no ui.feedbackEventDiagnostics): no reason/correlationId in preview or body', async () => {
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+        try {
+            recordHmacFailure();
+            assert.deepEqual(build_diagnostics().recentEvents.at(-1), hmacFailure);
+            open(); setDescription('Old server report'); change('diagnostics', true);
+            assert.ok(oldServerAccepts(current().querySelector('pre').textContent), 'the preview carries neither key');
+            respond = oldServer;
+            const count = calls.length;
+            send(); await until(() => status().includes(reportId));
+            assert.equal(posts(count).length, 1, 'accepted first time: no 400, no second request');
+            assert.ok(oldServerAccepts(posts(count)[0].body));
+            assert.deepEqual(JSON.parse(posts(count)[0].body).diagnostics.recentEvents.at(-1), hmacFailure, 'the event itself is still sent');
+            close();
+        } finally {
+            window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics = true;
+        }
+    });
+    await check('FEEDBACK-DIAG: new shell + new server (ui.feedbackEventDiagnostics): {code, reason, correlationId} in preview and body', async () => {
+        recordHmacFailure();
+        open(); setDescription('New server report'); change('diagnostics', true);
+        const before = current().querySelector('pre').textContent;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        send(); await until(() => status().includes(reportId));
+        assert.equal(posts(count).length, 1);
+        assert.equal(posts(count)[0].body, before);
+        assert.deepEqual(JSON.parse(before).diagnostics.recentEvents.at(-1), { ...hmacFailure,
+            reason: 'worker_http_401:hmac_signature_mismatch', correlationId: 'srv_0123456789ab' });
+        close();
+    });
+    await check('FEEDBACK-DIAG: server rolled back under a tab that still advertises the keys: one lean re-send, report kept', async () => {
+        recordHmacFailure();
+        open(); setDescription('Rolled back report'); change('diagnostics', true);
+        const before = current().querySelector('pre').textContent;
+        assert.equal(oldServerAccepts(before), false, 'the stale payload still says the keys are accepted');
+        respond = oldServer;
+        let count = calls.length;
+        flushing = true; // the lean re-send is, by design, not the preview
+        send(); await until(() => status().includes(reportId));
+        flushing = false;
+        assert.equal(posts(count).length, 2);
+        assert.equal(posts(count)[0].body, before);
+        const [sent, lean] = posts(count).map(c => JSON.parse(c.body));
+        for ( const event of sent.diagnostics.recentEvents ) { delete event.reason; delete event.correlationId; }
+        assert.deepEqual(lean, sent, 'only the two keys were removed');
+        assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
+        close();
+        // A report the new shell queued offline and replays after the rollback.
+        const queuedId = crypto.randomUUID();
+        window.localStorage.setItem(outboxKey, JSON.stringify([{ clientRequestId: queuedId,
+            body: JSON.stringify({ ...JSON.parse(before), clientRequestId: queuedId }, null, 2) }]));
+        count = calls.length;
+        flushing = true;
+        await feedback.flush_feedback_outbox();
+        flushing = false;
+        assert.deepEqual(posts(count).map(c => oldServerAccepts(c.body)), [false, true]);
+        assert.equal(stored(outboxKey), null, 'delivered, not dropped');
+        // A 400 the keys did not cause is still final: no third request, text back in the draft.
+        open(); setDescription('Refused for another reason'); change('diagnostics', true);
+        respond = async () => ({ status: 400 });
+        count = calls.length;
+        flushing = true;
+        send(); await until(() => ! current().querySelector('[type="submit"]').disabled);
+        flushing = false;
+        assert.equal(posts(count).length, 2);
+        assert.match(status(), /could not be accepted/);
+        close();
+        assert.equal(stored(draftKey).description, 'Refused for another reason');
+        open(); setDescription(''); close();
     });
     await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
         open(); setDescription('Queued report 10');

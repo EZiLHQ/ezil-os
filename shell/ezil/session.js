@@ -802,6 +802,18 @@ export function pendingOrRefused (data) {
         ...capacityAttemptOf(data), ...failureFields(data) };
 }
 
+/**
+ * FEEDBACK-DIAG: record an honest "not available" answer (`app_preview_unavailable`,
+ * `code_preview_unavailable`). It is not a failure to retry, but the server's
+ * `reason` (port not exposed, origin unresolvable) and its log line's id must
+ * still reach a feedback report, which reads them from telemetry's LOCAL mirror.
+ * `outcome: 'skipped'`, like the window's own trace, so it never counts as an error.
+ */
+export function captureUnavailable (site, res) {
+    telemetry.capture({ eventClass: 'api_failure', site, code: res?.errorCode, outcome: 'skipped',
+        reason: res?.reason, serverCorrelationId: res?.correlationId });
+}
+
 /** RETRY-118: only a `capacity_attempt_expired` answer carries the attempt an explicit Retry may reset. */
 function capacityAttemptOf (data) {
     return data?.errorCode === 'capacity_attempt_expired' && typeof data.capacityAttemptId === 'string'
@@ -1506,7 +1518,7 @@ export default {
     payload, currentComputer, setCurrentComputer,
     readSession, openSession,
     openDesktop, cancelOpenDesktop, cancellableWake, cancelComputerOpens, holdAfterStop, releaseStopHold, stoppedByUser, ensureLocalDesktop, desktopRunning, confirmFrame, observeFrame, confirmDisplay,
-    previewUrl, pendingOrRefused, focusApp,
+    previewUrl, pendingOrRefused, captureUnavailable, focusApp,
     restartEndpoint, restartDesktop,
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,

@@ -11,6 +11,16 @@ import { isCorrelationId, isFailureReason } from '../../failure-diagnostics.js';
  */
 const MAX_ANNOTATED_EVENTS = 10;
 
+/**
+ * FEEDBACK-DIAG: does THIS server's feedback schema accept
+ * `recentEvents[].reason`/`.correlationId`? Read fresh every call; absent means
+ * no — the `activityEndpoint()` contract in `../../session.js`. An older server
+ * parses `recentEvents` strictly and would 400 the whole report on either key.
+ */
+export function event_diagnostics_accepted () {
+    return globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackEventDiagnostics === true;
+}
+
 const integer = value => Math.min(1_000_000_000, Math.max(0, Math.round(value)));
 
 function visible (el) {
@@ -77,9 +87,11 @@ export function build_diagnostics () {
         .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'));
     // FEEDBACK-DIAG: `{code, reason, correlationId}` of a failed API call. Both
     // extra fields are re-checked against the allowlist, emitted only when
-    // present, and only on the newest MAX_ANNOTATED_EVENTS that have them.
+    // present, only on the newest MAX_ANNOTATED_EVENTS that have them, and only
+    // to a server that advertises them (`event_diagnostics_accepted`).
     const annotated = new Set();
-    for ( let i = events.length - 1; i >= 0 && annotated.size < MAX_ANNOTATED_EVENTS; i-- ) {
+    const accepted = event_diagnostics_accepted();
+    for ( let i = events.length - 1; accepted && i >= 0 && annotated.size < MAX_ANNOTATED_EVENTS; i-- ) {
         if ( isFailureReason(events[i].reason) || isCorrelationId(events[i].serverCorrelationId) ) annotated.add(i);
     }
     result.recentEvents = events.map((event, i) => {

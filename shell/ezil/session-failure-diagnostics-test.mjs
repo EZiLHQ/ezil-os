@@ -8,7 +8,7 @@
 // mint path in `session.js`, and records them in telemetry's LOCAL mirror only.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { openDesktop, previewUrl, withWakeAndOneRetry } from './session.js';
+import { captureUnavailable, openDesktop, pendingOrRefused, previewUrl, withWakeAndOneRetry } from './session.js';
 import telemetry, { recentEvents } from './telemetry.js';
 import { failureFields, isCorrelationId, isFailureReason } from './failure-diagnostics.js';
 
@@ -105,6 +105,27 @@ await test('the wake loop records reason + server correlation id in the LOCAL mi
     assert.equal(retry.reason, 'worker_http_502');
     assert.equal(retry.serverCorrelationId, 'srv_0123456789ab');
     assert.equal('correlationId' in retry, false, 'the trace correlation id field is not reused');
+});
+
+await test('an honest "not available" answer still records its reason + server correlation id, as skipped', async () => {
+    for ( const [site, errorCode, reason] of [
+        ['ezil-os:apps/code#mint', 'code_preview_unavailable', 'code_preview_port_not_exposed'],
+        ['ezil-os:apps/preview#mint', 'app_preview_unavailable', 'app_preview_expose_failed'],
+    ] ) {
+        // The router's 200 value, through the same parse both windows use.
+        const res = pendingOrRefused({ ok: false, errorCode, error: 'x', reason, correlationId: CORR });
+        const before = recentEvents().length;
+        assert.equal(await withWakeAndOneRetry(async () => res, 'codePreviewUrl'), res);
+        assert.equal(recentEvents().length, before, 'not retried by the wake loop, so nothing there records it');
+        captureUnavailable(site, res);
+        assert.deepEqual(recentEvents().slice(before).map(({ eventClass, site: s, code, outcome, reason: r, serverCorrelationId }) =>
+            ({ eventClass, site: s, code, outcome, reason: r, serverCorrelationId })),
+        [{ eventClass: 'api_failure', site, code: errorCode, outcome: 'skipped', reason, serverCorrelationId: CORR }]);
+    }
+    const before = recentEvents().length;
+    captureUnavailable('ezil-os:apps/code#mint', pendingOrRefused({ ok: false, errorCode: 'code_preview_unavailable' }));
+    const [entry] = recentEvents().slice(before);
+    assert.equal('reason' in entry || 'serverCorrelationId' in entry, false, 'an older server: the event, nothing more');
 });
 
 await test('capture() drops a reason or id that fails the allowlist, and keeps the event', () => {

@@ -553,11 +553,13 @@ export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewE
  * `reason` is computed by the caller from what it actually observed (status,
  * the Worker's own body code). It is allowlisted here and falls back to the
  * leading code of `error`, then to `errorCode` — never to free text.
+ * `errorCode` is allowlisted too: on a 200 `{ok:false}` it is the Worker's
+ * untrusted `wire.errorCode`, typed as ours but not checked against the union.
  */
 function previewError(error: string, errorCode: GuacamolePreviewErrorCode, reason?: string): GuacamolePreviewError {
     return {
         ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode),
-        reason: failureReason(reason) ?? failureReason(leadingCode(error)) ?? errorCode,
+        reason: failureReason(reason) ?? failureReason(leadingCode(error)) ?? failureReason(errorCode) ?? 'unknown',
     };
 }
 
