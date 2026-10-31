@@ -16,8 +16,10 @@ const h = vi.hoisted(() => ({
     gate: vi.fn(), sync: vi.fn(), preview: vi.fn(), prepare: vi.fn(), schedule: vi.fn(),
     subs: [] as unknown[], billingFails: false, tabEnabled: true,
 }));
-vi.mock('@/server/api/trpc', () => {
-    const t = initTRPC.context<{ user: { id: string; email?: string } | null; db: unknown }>().create();
+vi.mock('@/server/api/trpc', async () => {
+    // superjson, as the real `@/server/api/trpc`: the HTTP seam below speaks the app's real wire format (createCaller ignores it).
+    const superjson = (await import('superjson')).default;
+    const t = initTRPC.context<{ user: { id: string; email?: string } | null; db: unknown }>().create({ transformer: superjson });
     return { createTRPCRouter: t.router, protectedProcedure: t.procedure.use(({ ctx, next }) => {
         if (!ctx.user) throw new TRPCError({ code: 'UNAUTHORIZED' });
         return next({ ctx: { ...ctx, user: ctx.user } });
@@ -47,6 +49,10 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', async original => ({
 }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ scheduleReverseMove: h.schedule }));
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
+import { createTRPCRouter } from '@/server/api/trpc';
 import { cloudflareGuacamoleRouter } from './cloudflare-guacamole';
 import { computerRouter } from './computer';
 import { awsPreviewAnswer, awsStatusAnswer, reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
@@ -472,5 +478,51 @@ describe('compute-dispatch flags (§5.3): computeMoving / computeMoveNeedsAttent
             expect(status, error).not.toHaveProperty('computeMoveNeedsAttention');
         }
         expect(awsStatusAnswer({ ok: true, error: 'computer_moving' } as never)).not.toHaveProperty('computeMoving');
+    });
+});
+
+/**
+ * Seam harness, lane U → lane A (§5.9, §5.10, §6.2; r7 integration). The shell's OWN tRPC client
+ * (shell/ezil/ui/Settings/trpc.js, what computers.js calls `computer.move.${kind}` with `{ computerId }`) and the session
+ * loop's raw `computer.progress` GET (readMoveAsk's URL, pinned to session.js's source) over HTTP into the REAL computer
+ * router through tRPC's fetch adapter, with the app's superjson wire format. Only the database is the fake above.
+ */
+describe('seam U → A: the shell\'s requests reach the real computer router over HTTP', () => {
+    const serve = (db: unknown) => vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => fetchRequestHandler({
+        endpoint: '/api/trpc', req: new Request(new URL(String(input), 'https://os.example'), init),
+        router: createTRPCRouter({ computer: computerRouter }), createContext: () => ({ user: { id: U, email: 'person@example.com' }, db }) as never,
+    }));
+    const shellTrpc = async () => (await import('../../../../../shell/ezil/ui/Settings/trpc.js')).default as {
+        mutate(path: string, input: unknown): Promise<{ ok: boolean; data?: unknown; code?: string }> };
+
+    it('computer.move.start / retry with the shell\'s { computerId }: the procedure runs and its values come back as the tab reads them', async () => {
+        const trpc = await shellTrpc();
+        const w = world([held()]);
+        serve(w.db);
+        expect(await trpc.mutate('computer.move.start', { computerId: C })).toEqual({ ok: true,
+            data: { ok: true, move: expect.objectContaining({ direction: 'to_cloudflare', stage: 'saving' }) } });
+        expect(await trpc.mutate('computer.move.retry', { computerId: C })).toEqual({ ok: true, data: { ok: false, reason: 'move_in_progress' } });
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'user', computer_id: C })]);
+        // The router really parses that body: another key is the zod refusal, never a move.
+        expect(await trpc.mutate('computer.move.start', { id: C })).toMatchObject({ ok: false, code: 'BAD_REQUEST' });
+        // Without 0012: move_unsupported, as a value.
+        const old = world([held()], { present: false });
+        serve(old.db);
+        expect(await trpc.mutate('computer.move.retry', { computerId: C })).toEqual({ ok: true, data: { ok: false, reason: 'move_unsupported' } });
+    });
+
+    it('the session loop\'s computer.progress GET (readMoveAsk) reaches the procedure and reads the moving view', async () => {
+        const session = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/session.js'), 'utf8');
+        // The URL readMoveAsk builds, pinned to its source so the two cannot drift apart.
+        expect(session).toContain("const input = encodeURIComponent(JSON.stringify({ json: { computerId } }));");
+        expect(session).toContain('`${TRPC_ENDPOINT}/computer.progress?input=${input}`');
+        expect(session).toMatch(/const TRPC_ENDPOINT = '\/api\/trpc';/);
+        const w = world([held({ state: 'MOUNTING', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
+        serve(w.db);
+        const input = encodeURIComponent(JSON.stringify({ json: { computerId: C } }));
+        const res = await fetch(`/api/trpc/computer.progress?input=${input}`, { method: 'GET' });
+        expect(res.status).toBe(200);
+        const body = await res.json() as { result: { data: { json: Record<string, unknown> } } };
+        expect(body.result.data.json).toMatchObject({ operation: 'moving', stage: 'moving', move: expect.objectContaining({ phase: 'importing' }) });
     });
 });
