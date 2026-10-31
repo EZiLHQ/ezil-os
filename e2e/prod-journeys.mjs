@@ -407,6 +407,31 @@ export function describeReadinessWait(verdict, contentLabel, detail = '') {
   }
 }
 
+// ── Reaching the dock ───────────────────────────────────────────────────────
+
+/**
+ * What to do about a dock icon, from `readDockProbe`. A full-bleed Browser
+ * (`go_fullbleed`, desktop-window.js) hides the taskbar and its window head
+ * (`enter_fullpage_mode`, UIDesktopFullpage.js), so the icon exists but
+ * nothing can click it. The one way back is the window's own control drawer:
+ * its Minimise button restores the taskbar first (`minimise_to_taskbar`).
+ */
+export function decideDockAction(probe) {
+  const apps = (probe?.apps ?? []).join(', ') || 'nothing';
+  if (!probe?.present) return { action: 'missing', reason: `the dock has: ${apps}` };
+  if (probe.actionable) return { action: 'click' };
+  // A full-bleed window is minimised through its drawer's Minimise button, or, when that is absent,
+  // through the window's own minimise hook (the function the button calls).
+  const target = (probe.fullbleed ?? []).find(item => item?.drawer === true || item?.hook === true);
+  if (target) {
+    return { action: 'minimise', app: target.app, drawer: target.drawer === true,
+      reason: 'the dock is hidden behind a full-bleed window' };
+  }
+  const why = probe.fullbleed?.length ? 'a full-bleed window has no Minimise control'
+    : probe.taskbar === 'shown' ? 'the icon is covered' : `the taskbar is ${probe.taskbar ?? 'unknown'} and no full-bleed window can be minimised`;
+  return { action: 'wait', reason: why };
+}
+
 // ── Evidence helpers for the individual journeys ────────────────────────────
 
 /** Reject blank frames, a lone cursor, uniform backgrounds. `reason` says which, so a failure is diagnosable. */
@@ -640,6 +665,31 @@ export function sampleFramePixels({ width, height, allowCanvas }) {
   return { kind, pixels: Array.from(ctx.getImageData(0, 0, width, height).data) };
 }
 
+/**
+ * Can the user click this dock icon right now? Present, painted, and the
+ * topmost element at its centre. Also names the full-bleed windows and whether
+ * each has a Minimise control, which is what `decideDockAction` needs.
+ */
+export function readDockProbe(app) {
+  const shown = el => !!el && getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+  const items = [...document.querySelectorAll('.taskbar-item')];
+  const item = items.find(el => el.dataset.app === app) ?? null;
+  const taskbar = document.querySelector('.taskbar');
+  let actionable = false;
+  if (item && shown(item)) {
+    const box = item.getBoundingClientRect();
+    const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    actionable = !!hit && (hit === item || item.contains(hit));
+  }
+  const fullbleed = [...document.querySelectorAll('.window.ezil-fullbleed:not([data-closing="1"])')]
+    .filter(win => shown(win) && !['1', 'true'].includes(win.getAttribute('data-is_minimized')))
+    .map(win => ({ app: win.getAttribute('data-app'),
+      drawer: !!win.querySelector('.ezil-app-drawer button[aria-label="Minimise"]'),
+      hook: typeof win._ezil_minimise === 'function' }));
+  return { present: !!item, actionable, taskbar: !taskbar ? 'absent' : shown(taskbar) ? 'shown' : 'hidden',
+    fullbleed, apps: items.map(el => el.dataset.app ?? '') };
+}
+
 /** The app's own non-batched tRPC wire format (shell/ezil/ui/Settings/trpc.js), same-origin with the session cookie. */
 export async function trpcInPage({ method, path, input }) {
   let url = `/api/trpc/${path}`;
@@ -662,6 +712,49 @@ export async function trpcInPage({ method, path, input }) {
   }
   const data = parsed?.result?.data;
   return { ok: true, status: res.status, data: data && typeof data === 'object' && 'json' in data ? data.json : data };
+}
+
+/**
+ * Make `app`'s dock icon clickable the way a user would. Usually it already is
+ * (`path: 'direct'`). When a full-bleed window hides the dock: open the
+ * window's control drawer (its handle, aria-label "Window controls") and press
+ * Minimise (`path: 'drawer-minimise'`); if the drawer cannot be driven, call the
+ * window's own minimise hook, the function that button calls
+ * (`path: 'minimise-hook'`). Returns once the icon is actionable, or throws
+ * saying why not. Never closes a window.
+ */
+export async function revealDock(page, app, { timeoutMs = 12_000, nap = ms => sleep(ms) } = {}) {
+  const began = performance.now();
+  let path = 'direct', minimised = null, attempts = 0;
+  for (;;) {
+    const probe = await page.evaluate(readDockProbe, app);
+    const decision = decideDockAction(probe);
+    if (decision.action === 'click') return { path, minimised };
+    if (decision.action === 'missing') throw new Error(`${APP_LABEL[app] ?? app} icon is not in the dock (${decision.reason})`);
+    if (performance.now() - began > timeoutMs) {
+      throw new Error(`${APP_LABEL[app] ?? app} icon is not clickable (${decision.reason}${minimised ? `; ${minimised} was minimised via ${path}` : ''})`);
+    }
+    if (decision.action === 'minimise' && attempts < 2) {
+      attempts++;
+      const selector = `.window[data-app="${decision.app}"].ezil-fullbleed:not([data-closing="1"])`;
+      const win = page.locator(selector).first();
+      const toggle = win.locator('.ezil-app-drawer .dashboard-app-drawer-toggle');
+      const button = win.locator('.ezil-app-drawer button[aria-label="Minimise"]');
+      let used = 'drawer-minimise';
+      try {
+        if (!decision.drawer) throw new Error('no Minimise button');
+        // The drawer shuts itself after a few seconds; only open it if it is shut
+        // (clicking the handle of an open drawer would close it).
+        if (await toggle.getAttribute('aria-expanded', { timeout: 1000 }) !== 'true') await toggle.click({ timeout: 3000 });
+        await button.click({ timeout: 3000 });
+      } catch {
+        used = 'minimise-hook';
+        await page.evaluate(selector => document.querySelector(selector)?._ezil_minimise?.(), selector).catch(() => {});
+      }
+      path = used; minimised = decision.app;
+    }
+    await nap(300);   // the window shrinks toward the dock; the dock repaints
+  }
 }
 
 // ── The live run ────────────────────────────────────────────────────────────
@@ -716,7 +809,7 @@ export async function runProdJourneys({
   const nonce = randomBytes(10).toString('hex');
   const owned = new Set();           // computers this run created (or recognised as its own)
   let browser, context, page, target, deployment, signIn, stopIsolatedComputer;
-  let signedIn = null, stepDeadline, activeDeadline = deadline, active = null, finished = false;
+  let signedIn = null, stepDeadline, activeDeadline = deadline, active = null, finished = false, currentJourney = null;
   let buffers;
   const inflight = new Set();
   const resetBuffers = () => { buffers = { apiFailures: [], consoleErrors: [], pageErrors: [] }; };
@@ -864,11 +957,16 @@ export async function runProdJourneys({
     return page.evaluate(() => window.ezil.session.payload().computer.id);
   }
   async function clickDock(app) {
-    const item = page.locator(`.taskbar-item[data-app="${app}"]`).first();
-    try { await item.click({ timeout: remaining(12_000) }); } catch (error) {
-      const apps = await page.evaluate(() => [...document.querySelectorAll('.taskbar-item')].map(el => el.dataset.app)).catch(() => []);
-      throw new Error(`${APP_LABEL[app] ?? app} icon not clickable (dock has: ${apps.join(', ') || 'nothing'}): ${describeError(error, { secrets })}`);
+    let reveal;
+    try { reveal = await revealDock(page, app, { timeoutMs: remaining(12_000) }); } catch (error) {
+      throw new Error(describeError(error, { secrets }));
     }
+    const item = page.locator(`.taskbar-item[data-app="${app}"]`).first();
+    try { await item.click({ timeout: remaining(5000) }); } catch (error) {
+      throw new Error(`${APP_LABEL[app] ?? app} icon not clickable: ${describeError(error, { secrets })}`);
+    }
+    // Which way in was used, per click: a full-bleed Browser forces the drawer.
+    if (currentJourney) (currentJourney.evidence.dock ??= []).push({ app, path: reveal.path, ...(reveal.minimised ? { minimised: reveal.minimised } : {}) });
   }
   async function appFrame(app) {
     const handle = await page.locator(`.window[data-app="${app}"]:not([data-closing="1"]) iframe.window-app-iframe`)
@@ -1252,6 +1350,7 @@ export async function runProdJourneys({
   async function runJourney(name) {
     const journey = { name, ok: false, ms: 0, steps: [], evidence: {} };
     report.journeys.push(journey);
+    currentJourney = journey;
     resetBuffers();
     const began = performance.now();
     try { await runners[name](journey); } catch (error) {

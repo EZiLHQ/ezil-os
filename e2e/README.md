@@ -52,6 +52,8 @@ EZIL_E2E_JOURNEYS=free-open-apps,feedback-diagnostics,billing-view node e2e/prod
 
 Each app's evidence has `firstPixelsMs` (Browser) or `firstEditorMs` (Code), `overlaySeenMs`, `overlayGoneMs` and `readyMs`, all from the click. Right after an app is ready the suite brings its window to the front (its title bar, else the window manager's focus) and takes `<journey>-<app>-ready.png` (`free-open-apps-code-ready.png`, `free-open-apps-browser-ready.png`; in the paid journey `-browser-ready`, `-code-ready` and `-browser-wake-ready`). These ready shots show the app's own pixels, so use a dedicated QA account; shots of failures hide remote frames.
 
+Every dock click goes through one routine. A ready Browser goes full-bleed (`go_fullbleed`), which hides the taskbar and the window head, so the next dock icon (the paid journey's Code) cannot be clicked. The suite checks that the icon is painted and topmost at its centre; if not, and a full-bleed window is the cause, it reveals the dock as a user does: open that window's control drawer (the handle labelled "Window controls") and press **Minimise**, which restores the taskbar before it hides the window. If the drawer cannot be driven it calls the window's own minimise hook, the function that button calls. It never closes a window. `evidence.dock` lists each click as `{app, path, minimised?}` with `path` one of `direct`, `drawer-minimise`, `minimise-hook`; a dock that cannot be reached fails the step with the reason (`Code icon is not clickable (the dock is hidden behind a full-bleed window; desktop was minimised via drawer-minimise)`).
+
 Journeys, in this order (each step is `{name, ok, ms, error?}`; time-to-ready is the step's `ms`):
 
 - `free-open-apps`: sign in, `/os` session ready, click **Code**, run a nonce `printf` in a new Code terminal, click **Browser**.
@@ -70,4 +72,4 @@ Safety:
 - `PLAYWRIGHT_REQUIRE_DIR` must hold a Playwright whose browser is installed (`chromium_headless_shell` for the headless launch); otherwise every journey fails at `browser-launch`.
 - Nothing credential-like is printed or saved: emails are masked as `q***@domain`, and tokens, bearer values, auth cookies, the password and the anon key are scrubbed from every log line and report.
 
-Browser-free validation: `node --check e2e/prod-journeys.mjs` and `node --test e2e/prod-journeys.test.mjs`. With `PLAYWRIGHT_REQUIRE_DIR` set, one extra test drives the in-page overlay detection in Chromium over markup mirroring the shell's (still offline); without it that test is skipped.
+Browser-free validation: `node --check e2e/prod-journeys.mjs` and `node --test e2e/prod-journeys.test.mjs`. With `PLAYWRIGHT_REQUIRE_DIR` set, extra tests drive the in-page overlay detection and the dock reveal in Chromium over markup mirroring the shell's (still offline); without it they are skipped.

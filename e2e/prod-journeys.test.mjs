@@ -8,10 +8,10 @@ import { FINAL_STOP_TIMEOUT_MS, parseTerminalMarker } from './live-check.mjs';
 import {
   COMPUTER_NAME_PREFIX, DEFAULT_JOURNEYS, JOURNEYS, MAX_COMPUTERS_PER_USER, READY_SETTLE_MS, REQUIRED_ENV,
   addApiFailure, addUnique, apiPathOf, assertSuiteComputer, awsFacts, capText, classifyStartFailure,
-  describeCreateRefusal, describeError, describeReadinessWait, describeStartFailure, describeStopFailure,
+  decideDockAction, describeCreateRefusal, describeError, describeReadinessWait, describeStartFailure, describeStopFailure,
   echoProbeCommand, errorCodesOf, exitCodeFor, framePixelVerdict, isPaidPlan, journeyBudgetMs, makeReport,
   newReadinessTracker, normalizeVisibleText, parseAppOrigin, parseEnv, pickSuiteComputers, readWindowSnapshot,
-  readinessSettled, readinessTimings, redactDeep, redactEmail, redactText, remainingMs, runDeadlines,
+  readDockProbe, readinessSettled, readinessTimings, redactDeep, revealDock, redactEmail, redactText, remainingMs, runDeadlines,
   runProdJourneys, selectJourneys, shapeApiFailure, shapeConsoleError, shapeVisibleErrors, stepRecord,
   summarizeFeedbackRequest, trackReadiness, userReadiness, wantsBody,
 } from './prod-journeys.mjs';
@@ -383,6 +383,145 @@ test('the in-page snapshot sees an opening overlay only while the user can see i
     assert.equal(failed.overlay.dataKind, 'failed');
     assert.deepEqual(await page.evaluate(readWindowSnapshot, 'code'), { open: false });
   } finally { await browser.close(); }
+});
+
+// ── reaching the dock when a full-bleed window hides it ────────────────────
+
+const probe = (over = {}) => ({ present: true, actionable: false, taskbar: 'hidden', fullbleed: [], apps: ['', 'desktop', 'code', 'settings'], ...over });
+
+test('a clickable dock icon is clicked; nothing else is touched', () => {
+  assert.deepEqual(decideDockAction(probe({ actionable: true, taskbar: 'shown' })), { action: 'click' });
+  assert.deepEqual(decideDockAction(probe({ actionable: true, fullbleed: [{ app: 'desktop', drawer: true, hook: true }] })), { action: 'click' });
+});
+
+test('a dock hidden behind a full-bleed window is revealed by minimising that window, never by closing it', () => {
+  const decision = decideDockAction(probe({ fullbleed: [{ app: 'desktop', drawer: true, hook: true }] }));
+  assert.deepEqual(decision, { action: 'minimise', app: 'desktop', drawer: true, reason: 'the dock is hidden behind a full-bleed window' });
+  // A taskbar that is shown but covered by the full-bleed window is the same case.
+  assert.equal(decideDockAction(probe({ taskbar: 'shown', fullbleed: [{ app: 'desktop', drawer: true }] })).action, 'minimise');
+  // Without a drawer button the window's own minimise hook is used; without either there is nothing safe to do.
+  assert.deepEqual(decideDockAction(probe({ fullbleed: [{ app: 'desktop', drawer: false, hook: true }] })),
+    { action: 'minimise', app: 'desktop', drawer: false, reason: 'the dock is hidden behind a full-bleed window' });
+  assert.equal(decideDockAction(probe({ fullbleed: [{ app: 'desktop', drawer: false, hook: false }] })).action, 'wait');
+  // With several full-bleed windows the one that can be minimised is chosen.
+  assert.equal(decideDockAction(probe({ fullbleed: [{ app: 'a', drawer: false, hook: false }, { app: 'b', drawer: true }] })).app, 'b');
+});
+
+test('a dock that is hidden for no reason the suite can act on waits, and says why', () => {
+  assert.deepEqual(decideDockAction(probe()), { action: 'wait', reason: 'the taskbar is hidden and no full-bleed window can be minimised' });
+  assert.equal(decideDockAction(probe({ taskbar: 'shown' })).reason, 'the icon is covered');
+  assert.equal(decideDockAction(probe({ taskbar: 'absent' })).reason, 'the taskbar is absent and no full-bleed window can be minimised');
+  assert.equal(decideDockAction(probe({ fullbleed: [{ app: 'desktop', drawer: false, hook: false }] })).reason, 'a full-bleed window has no Minimise control');
+});
+
+test('an app that is not in the dock is reported with what the dock does have', () => {
+  const decision = decideDockAction(probe({ present: false }));
+  assert.deepEqual(decision, { action: 'missing', reason: 'the dock has: , desktop, code, settings' });
+  assert.equal(decideDockAction(null).action, 'missing');
+  assert.equal(decideDockAction({ present: false, apps: [] }).reason, 'the dock has: nothing');
+  assert.equal(decideDockAction({ present: true, actionable: true }).action, 'click');
+});
+
+// The dock probe and the reveal run in the page. This drives the real functions in Chromium over markup that
+// behaves like the shell's full-bleed Browser (taskbar hidden, a control drawer whose handle opens it and whose
+// Minimise button restores the taskbar). Offline; needs PLAYWRIGHT_REQUIRE_DIR like the overlay test above.
+const BROWSER_SKIP = process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set';
+async function withPage(run) {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try { await run(await browser.newPage()); } finally { await browser.close(); }
+}
+/**
+ * `mode`: 'windowed' (no full-bleed window), 'hidden' (taskbar display:none, as `enter_fullpage_mode` leaves it),
+ * 'covered' (taskbar shown under the full-bleed window). `drawer`: the Minimise button exists. `expanded`: the
+ * drawer is already open. `works`: minimising restores the taskbar.
+ */
+function dockMarkup({ mode = 'hidden', drawer = true, hook = true, expanded = false, works = true } = {}) {
+  const fullbleed = mode !== 'windowed';
+  return `<style>
+    .taskbar{position:fixed;bottom:0;left:0;right:0;height:50px;${mode === 'hidden' ? 'display:none' : ''}}
+    .taskbar-item{display:inline-block;width:40px;height:40px;margin:5px;background:#468}
+    .window{position:fixed;top:0;left:0;width:300px;height:200px;background:#222}
+    .window.ezil-fullbleed{inset:0;width:auto;height:auto;z-index:100}
+    .ezil-app-drawer{position:absolute;top:0;left:40%;z-index:101}.ezil-app-drawer.collapsed .dashboard-app-drawer-clip{display:none}
+    .dashboard-app-drawer-toggle{width:60px;height:14px}.dashboard-app-drawer-btn{width:36px;height:36px}</style>
+    <div class="taskbar"><div class="taskbar-item" data-app=""></div><div class="taskbar-item" data-app="desktop"></div><div class="taskbar-item" data-app="code"></div></div>
+    <div class="window ezil-desktop-window ${fullbleed ? 'ezil-fullbleed' : ''}" data-app="desktop">
+      <div class="dashboard-app-drawer ezil-app-drawer ${expanded ? '' : 'collapsed'}">
+        <button class="dashboard-app-drawer-toggle" aria-expanded="${expanded}" aria-label="Window controls"></button>
+        <div class="dashboard-app-drawer-clip">${drawer ? '<button class="dashboard-app-drawer-btn" aria-label="Minimise">–</button>' : ''}<button class="dashboard-app-drawer-btn" aria-label="Close">x</button></div>
+      </div></div>
+    <script>(() => {
+      const win = document.querySelector('.window'), drawer = document.querySelector('.ezil-app-drawer');
+      window.__toggleClicks = 0; window.__minimised = 0;
+      document.querySelector('.dashboard-app-drawer-toggle').onclick = event => {
+        window.__toggleClicks++;
+        const open = drawer.classList.toggle('collapsed') === false; event.target.setAttribute('aria-expanded', String(open));
+      };
+      const minimise = () => { window.__minimised++; if (!${works}) return true; win.classList.remove('ezil-fullbleed'); win.setAttribute('data-is_minimized', '1'); win.style.display = 'none'; document.querySelector('.taskbar').style.display = 'block'; return true; };
+      document.querySelector('[aria-label="Minimise"]')?.addEventListener('click', minimise);
+      ${hook ? 'win._ezil_minimise = minimise;' : ''}
+    })();</script>`;
+}
+
+test('the dock probe reports a clickable icon only when nothing covers it', { skip: BROWSER_SKIP }, async () => {
+  await withPage(async page => {
+    await page.setContent(dockMarkup({ mode: 'windowed' }));
+    assert.deepEqual(await page.evaluate(readDockProbe, 'code'), { present: true, actionable: true, taskbar: 'shown', fullbleed: [], apps: ['', 'desktop', 'code'] });
+    await page.setContent(dockMarkup({ mode: 'hidden' }));
+    const hidden = await page.evaluate(readDockProbe, 'code');
+    assert.deepEqual([hidden.present, hidden.actionable, hidden.taskbar], [true, false, 'hidden']);
+    assert.deepEqual(hidden.fullbleed, [{ app: 'desktop', drawer: true, hook: true }]);
+    await page.setContent(dockMarkup({ mode: 'covered' }));
+    const covered = await page.evaluate(readDockProbe, 'code');
+    assert.deepEqual([covered.actionable, covered.taskbar], [false, 'shown'], 'a painted icon under a full-bleed window is not clickable');
+    assert.equal((await page.evaluate(readDockProbe, 'nope')).present, false);
+  });
+});
+
+test('revealDock leaves a clickable dock alone, and opens the drawer then presses Minimise when a full-bleed window hides it', { skip: BROWSER_SKIP }, async () => {
+  await withPage(async page => {
+    await page.setContent(dockMarkup({ mode: 'windowed' }));
+    assert.deepEqual(await revealDock(page, 'code'), { path: 'direct', minimised: null });
+    assert.equal(await page.evaluate(() => window.__minimised), 0);
+    for (const mode of ['hidden', 'covered']) {
+      await page.setContent(dockMarkup({ mode }));
+      assert.deepEqual(await revealDock(page, 'code', { timeoutMs: 5000 }), { path: 'drawer-minimise', minimised: 'desktop' }, mode);
+      assert.deepEqual(await page.evaluate(() => [window.__toggleClicks, window.__minimised]), [1, 1], 'one handle click, one Minimise');
+      assert.equal((await page.evaluate(readDockProbe, 'code')).actionable, true);
+      await page.locator('.taskbar-item[data-app="code"]').click({ timeout: 2000 });
+    }
+  });
+});
+
+test('revealDock does not close an already open drawer by clicking its handle', { skip: BROWSER_SKIP }, async () => {
+  await withPage(async page => {
+    await page.setContent(dockMarkup({ expanded: true }));
+    assert.equal((await revealDock(page, 'code', { timeoutMs: 5000 })).path, 'drawer-minimise');
+    assert.equal(await page.evaluate(() => window.__toggleClicks), 0);
+  });
+});
+
+test('revealDock falls back to the window\'s own minimise hook when the drawer has no Minimise button', { skip: BROWSER_SKIP }, async () => {
+  await withPage(async page => {
+    await page.setContent(dockMarkup({ drawer: false }));
+    assert.deepEqual(await revealDock(page, 'code', { timeoutMs: 5000 }), { path: 'minimise-hook', minimised: 'desktop' });
+    assert.equal(await page.evaluate(() => window.__minimised), 1);
+  });
+});
+
+test('revealDock fails with the reason when nothing reveals the dock, and when the app is not in it', { skip: BROWSER_SKIP }, async () => {
+  await withPage(async page => {
+    // Minimise "works" but the taskbar never comes back: tried at most twice, then the timeout names what was done.
+    await page.setContent(dockMarkup({ works: false }));
+    await assert.rejects(revealDock(page, 'code', { timeoutMs: 1500 }), /Code icon is not clickable \(the dock is hidden behind a full-bleed window; desktop was minimised via drawer-minimise\)/);
+    assert.ok(await page.evaluate(() => window.__minimised) <= 2, 'never loops on Minimise');
+    await page.setContent(dockMarkup({ drawer: false, hook: false }));
+    await assert.rejects(revealDock(page, 'code', { timeoutMs: 800 }), /Code icon is not clickable \(a full-bleed window has no Minimise control\)/);
+    assert.equal(await page.evaluate(() => window.__minimised), 0, 'nothing is minimised without a control to use');
+    await page.setContent(dockMarkup({ mode: 'windowed' }));
+    await assert.rejects(revealDock(page, 'files'), /files icon is not in the dock \(the dock has: , desktop, code\)/);
+  });
 });
 
 // ── terminal probe ─────────────────────────────────────────────────────────
