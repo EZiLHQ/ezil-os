@@ -2,13 +2,12 @@ import { TRPCError } from '@trpc/server';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
-import type { RetainedIdentity } from '@/server/auth/retained-identity';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { requestRepoOpen, withRepositoryFolder } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
-import type { ProjectRepoGrant } from '@/server/works/project-repo';
+import { projectIds, projectInvalid, retainedIdentityOrRefusal, shellRefusal, worksGrantOrRefusal } from '@/server/works/shell-project';
 
 /**
  * `/api/shell/code-preview-url` — mint a fresh code-server window URL for one
@@ -106,27 +105,7 @@ export async function POST(req: Request) {
 type ProjectCtx = Awaited<ReturnType<typeof createTRPCContext>> & { user: { id: string } };
 type ShellCaller = Awaited<ReturnType<typeof shellCaller>>['caller'];
 
-const refused = (status: number, code: string, message: string) => shellJson({ error: { code, message } }, status);
-const identityRefresh = () => refused(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this project.');
-const unsupportedProvider = () => refused(409, 'repo_open_unsupported_provider', 'Projects open on this computer type soon. Your files are safe.');
-
-/**
- * Loaded on use, like `cloudflare-guacamole.ts`'s Supabase client: the identity module reads the Supabase server env
- * and both are `server-only`, none of which a Code open without a project should pay for or depend on.
- */
-const identityModule = () => import('@/server/auth/retained-identity');
-const worksModule = () => import('@/server/works/project-repo');
-
-/** Lowercase canonical UUIDs only: the same rule as `shell/ezil/app-link.js` (`UUID`, `parseProject`). */
-const PROJECT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-/** The ids, or null. */
-function projectIds(value: unknown): { projectId: string; repoId: string } | null {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-    const { projectId, repoId } = value as { projectId?: unknown; repoId?: unknown };
-    if (typeof projectId !== 'string' || typeof repoId !== 'string' || !PROJECT_UUID.test(projectId) || !PROJECT_UUID.test(repoId)) return null;
-    return { projectId, repoId };
-}
+const unsupportedProvider = () => shellRefusal(409, 'repo_open_unsupported_provider', 'Projects open on this computer type soon. Your files are safe.');
 
 /** The computer's control target, NOT_FOUND for another owner's placement (as `routeComputer`). */
 async function target(ctx: ProjectCtx, computerId: string): Promise<ControlTarget> {
@@ -158,35 +137,20 @@ const isAws = (t: ControlTarget) => t.auth.kind === 'v2' && t.auth.claims.provid
  */
 async function openProject(ctx: ProjectCtx, caller: ShellCaller, computerId: string, intent: unknown, project: unknown) {
     const ids = projectIds(project);
-    if (!ids) return refused(400, 'project_invalid', 'That project link is not valid.');
+    if (!ids) return projectInvalid();
 
     await caller.computer.get({ id: computerId });
 
-    const { clearProjectIdentity, retainedIdentity } = await identityModule();
-    let identity: RetainedIdentity;
-    try { identity = await retainedIdentity(ctx.user.id); } catch { return identityRefresh(); }
+    const identity = await retainedIdentityOrRefusal(ctx.user.id);
+    if (identity instanceof Response) return identity;
 
     if (isAws(await target(ctx, computerId))) return unsupportedProvider();
 
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
 
-    const { openProjectRepository, WorksProjectRepoError } = await worksModule();
-    let grant: ProjectRepoGrant;
-    try {
-        grant = await openProjectRepository({
-            userIdToken: identity.token, projectId: ids.projectId, repositoryId: ids.repoId, identityExpiresAt: identity.expiresAt,
-        });
-    } catch (err) {
-        const code = err instanceof WorksProjectRepoError ? err.code : 'unavailable';
-        console.warn('[shell] code-preview-url project refused', { code });
-        if (code === 'identity_refused') {
-            try { await clearProjectIdentity(); } catch { /* the 409 already asks for a fresh one */ }
-            return identityRefresh();
-        }
-        if (code === 'not_authorized') return refused(403, 'project_not_authorized', "You don't have access to this project's repository.");
-        return refused(503, 'project_repo_unavailable', 'EZiL Works could not be reached. Try again in a moment.');
-    }
+    const grant = await worksGrantOrRefusal(identity, ids, 'code-preview-url');
+    if (grant instanceof Response) return grant;
 
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
     const controls = await target(ctx, computerId);
@@ -199,7 +163,7 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, computerId: str
         }, { correlationId: newCorrelationId() });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
-        return refused(502, 'repo_open_failed', "This project's files could not be opened. Try again.");
+        return shellRefusal(502, 'repo_open_failed', "This project's files could not be opened. Try again.");
     }
 
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
