@@ -18,7 +18,14 @@ const requests = [];
 // Anything the page asked for that this host does not serve. The shell is
 // served at `/os` AND at `/app/<id>`, so a URL resolved against the
 // document instead of being absolute shows up here as a 404.
+// Only the browser's requests count. This loopback port is reachable by
+// other processes on the host, and one did probe it: `HEAD /` with only
+// `host` and `connection: keep-alive`, no user-agent (2 of 30 runs at 4x
+// CPU throttling, and once in ordinary runs). Chromium sends its
+// user-agent on every request.
 const missing = [];
+const fromBrowser = req => /Chrome\//.test(req.headers['user-agent'] ?? '');
+const miss = (req, pathname) => { if ( fromBrowser(req) ) missing.push(pathname); };
 const TYPES = { '.js': 'application/javascript', '.mjs': 'application/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
 const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -29,7 +36,7 @@ const server = createServer((req, res) => {
             res.setHeader('content-type', TYPES[path.extname(file)] ?? 'application/octet-stream');
             res.end(readFileSync(file)); return;
         }
-        missing.push(url.pathname); res.statusCode = 404; res.end(); return;
+        miss(req, url.pathname); res.statusCode = 404; res.end(); return;
     }
     if (url.pathname === '/favicon.ico') { res.statusCode = 204; res.end(); return; }
     requests.push(url.pathname);
@@ -45,7 +52,7 @@ const server = createServer((req, res) => {
     }
     if (url.pathname.startsWith('/api/')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ result: { data: { json: [] } } })); return; }
     // The two document routes, as the Next app serves them; nothing else.
-    if (url.pathname !== '/os' && !/^\/app\/[a-z0-9-]+$/.test(url.pathname)) { missing.push(url.pathname); res.statusCode = 404; res.end(); return; }
+    if (url.pathname !== '/os' && !/^\/app\/[a-z0-9-]+$/.test(url.pathname)) { miss(req, url.pathname); res.statusCode = 404; res.end(); return; }
     res.setHeader('content-type', 'text/html');
     res.end('<!doctype html><html><head><link rel="stylesheet" href="/os/bundle.min.css"></head><body><div id="ezil-os-root"></div><script src="/os/icons.js"></script><script src="/os/bundle.min.js"></script></body></html>');
 });
