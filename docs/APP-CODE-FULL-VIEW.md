@@ -113,12 +113,12 @@ transient menu and may cover the editor's top rows while it is open.
 
 | Element | Value (PROVISIONAL) | Notes |
 |---|---|---|
-| Strip height | `--ezil-control-strip-height` on `.ezil-code-window.ezil-fullbleed`: **28px** fine, **44px** `pointer: coarse` | Lower than the Browser's 43px / 59px, which is unchanged. 28px is the lowest height that fits the 18px notch and the icon's 20px disc with 4px to spare; 44px keeps 44px targets. The shared body offset reads the same property, so the editor starts at the strip's bottom. |
+| Strip height | `--ezil-control-strip-height` on `.ezil-code-window.ezil-fullbleed`: **28px** fine, **44px** `pointer: coarse` | Lower than the Browser's 43px / 59px, which is unchanged. 28px fits the 16px notch and the icon's 20px disc with 4px to spare; 44px keeps 44px targets. The shared body offset reads the same property, so the editor starts at the strip's bottom. |
 | Strip background | The window's own `#11151f` (shared full-view rule), bottom hairline `1px rgba(255,255,255,0.08)` | The same dark strip in both themes, matching the dark editor. |
 | `.ezil-full-view-bar` | Empty, `aria-hidden="true"`, no role | The strip itself. It keeps the head's double-click (back to a window) and press-to-activate. Nothing in it is focusable. |
-| Notch (shut) | dashboard.css's tongue: 56×16 fine, 68×20 coarse, plus a 1px border (58×18, 70×22). Centred horizontally (`left: 50%`, `translateX(-50%)`, as the Browser's) and vertically including its border | Code's `top` subtracts the border's 1px. The shared rule centres the content box and leaves the Browser's notch 1px low; that rule is left alone so the Browser does not move. |
-| Notch hit area | The toggle's `::after` runs from the strip's top edge to its bottom edge (28px fine, 44px coarse), 14px / 16px wider than the notch on each side | It never extends below the strip, so it never takes a click meant for the editor. |
-| Tray (open) | dashboard.css's tray: icon, title (12px / 500), **Show desktop**, **Restore window**, **Close**; 290×43 at 1440 | Opens on hover (mouse), tap, or keyboard focus; covers the editor's top ~15px while open. At ≤500px wide dashboard.css hides the title, as in the Browser. |
+| Notch (shut) | dashboard.css's tongue, **56×16** fine, **68×20** coarse, its 1px border inside (Code's drawer states `box-sizing: border-box`). Centred horizontally (`left: 50%`, `translateX(-50%)`, as the Browser's) and vertically by the shared `top: (strip − shut-h) / 2` | The Next pages' global preflight already makes the drawer border-box. Measured on real Next, the first cut's content-box `− 1px` correction left the notch 1px high there (56×16 at y=5). Stating border-box makes a page without that preflight, such as the test fixtures, lay it out the same. The Browser's drawer is untouched: content-box (58×18) in the fixtures, border-box on Next. |
+| Notch hit area | The toggle's `::after` runs from the strip's top edge to its bottom edge (28px fine, 44px coarse), 14px / 16px wider than the notch on each side | It never extends below the strip, so it never takes a click meant for the editor. Measured on real Next: 28 / 44 rows at the notch's centre, and the window body 1px below. |
+| Tray (open) | dashboard.css's tray: icon, title (12px / 500), **Show desktop**, **Restore window**, **Close**; 288×42 at 1440 | Opens on hover (mouse), tap, or keyboard focus; covers the editor's top 14px while open. At ≤500px wide dashboard.css hides the title, as in the Browser. |
 | Feedback icon | `feedback.css`: a 24px button (44px coarse), `right: 6px` (0 coarse), its `top` derived from the strip: `calc((strip − 24px) / 2)`, `calc((strip − 44px) / 2)` coarse | 2px / 0px in Code's strip; 9.5px / 7.5px in the Browser's, as before. |
 | Feedback look in Code's strip | Outlined: the 20px disc becomes a 1px `currentColor` ring with no glass and no shadow; the same stroked speech-bubble glyph at 12px (4px padding); opacity 0.62 (1 on hover/focus); focus ring 2px, 1px out (inside the 28px strip) | Code's strip declares `--ezil-feedback-look: outline`. Everywhere else (a windowed app, the Browser's full-bleed) the icon keeps its glass disc. |
 | Focus | Tray toggle and actions: dashboard.css's `2px solid rgba(255,255,255,0.9)` ring, 1px out. Feedback: the accent ring | Keyboard focus on the toggle opens the tray; its ring is drawn around the tray's dismiss strip. |
@@ -151,10 +151,11 @@ the frame's top-left; `x, y, width × height`):
 
 | View | Strip | Notch (shut) | Feedback button / disc | Editor frame |
 |---|---|---|---|---|
-| 1440×900 fine | 0,0 1440×28 | 691,5 58×18 | 1410,2 24×24 / 1412,4 20×20 | 0,28 1440×872 |
-| 900×700 fine | 0,0 900×28 | 421,5 58×18 | 870,2 24×24 / 872,4 20×20 | 0,28 900×672 |
-| 390×844 coarse | 0,0 390×44 | 160,11 70×22 | 346,0 44×44 / 358,12 20×20 | 0,44 390×800 |
-| 1024×768 coarse | 0,0 1024×44 | 477,11 70×22 | 980,0 44×44 / 992,12 20×20 | 0,44 1024×724 |
+| 1440×900 fine | 0,0 1440×28 | 692,6 56×16 | 1410,2 24×24 / 1412,4 20×20 | 0,28 1440×872 |
+| 900×700 fine | 0,0 900×28 | 422,6 56×16 | 870,2 24×24 / 872,4 20×20 | 0,28 900×672 |
+| 390×844 coarse | 0,0 390×44 | 161,12 68×20 | 346,0 44×44 / 358,12 20×20 | 0,44 390×800 |
+| 1024×768 coarse | 0,0 1024×44 | 478,12 68×20 | 980,0 44×44 / 992,12 20×20 | 0,44 1024×724 |
+| Real local Next, 1440×900 / 390×844 coarse | 1440×28 / 390×44 | 692,6 56×16 / 161,12 68×20 | (no feedback endpoint locally) | 0,28 / 0,44 |
 | Browser full-bleed, 1440×900 (unchanged) | 0,0 1440×43 | 691,13.5 58×18 | 1410,9.5 24×24 / 1412,11.5 20×20 | body 0,43 |
 
 The Browser's full-bleed screenshot at 1440×900 is pixel-identical to 83078df5
@@ -162,7 +163,8 @@ The Browser's full-bleed screenshot at 1440×900 is pixel-identical to 83078df5
 
 **Tests.** `shell/ezil/apps/code-full-view-browser-test.mjs` (ci.yml's geometry
 family, Linux only, because it measures pixels) checks the relationships at
-1440×900 and 900×700 fine and 390×844 and 1024×768 coarse:
+1440×900 and 900×700 fine and 390×844 and 1024×768 coarse, plus 1440×900 again
+with the Next pages' border-box preflight on the fixture page:
 
 - the strip is empty;
 - the notch is inside it, centred both ways, at most 72px wide;
