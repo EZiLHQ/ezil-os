@@ -20,6 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
 import { summaryV3 } from './billing-v3-fixtures.mjs';
 import { honestyBans } from './billing-copy-test-helpers.mjs';
+// Phase B: the one cap constant (the tab imports it; Part A stubs it with the real value) and the overlay's words.
+import { MOVE_LIMIT_BYTES, moveTooLargeText } from '../computer-progress.js';
+import { reverseMove, movingProgress, blockedProgress, terminalProgress, PHASES } from '../reverse-move-fixtures.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let passed = 0;
@@ -44,10 +47,11 @@ const src = fs.readFileSync(new URL('./tabs/computers.js', import.meta.url), 'ut
     .replace("import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };')
     .replace("import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };')
     .replace("import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;')
-    .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
+    .replace("import { TRANSITION_EVENT, MOVE_LIMIT_BYTES } from '../../computer-progress.js';", `const TRANSITION_EVENT = 'ezil:computer-transition', MOVE_LIMIT_BYTES = ${MOVE_LIMIT_BYTES};`);
 assert.ok(! /^import /m.test(src), 'every import of the tab is stubbed');
 const tab = await import(moduleUrl(src));
-const { computerModel, computerHtml, switchSteps, switchRatio, switchRequestId, clearSwitchRequestId, refusalCopy, sizeForInstanceType, AWS_CAP_COPY, moveView, standingOf } = tab;
+const { computerModel, computerHtml, switchSteps, switchRatio, switchRequestId, clearSwitchRequestId, refusalCopy, sizeForInstanceType, AWS_CAP_COPY, moveView, standingOf,
+    moveCardCopy, moveTooLargeCopy, moveOfferCopy, moveRefusalCopy, moveSummaryLags, MOVE_NOT_MOVED } = tab;
 
 const me = { id: 'c-1', name: 'My computer', slot: 1, createdAt: '2026-10-01T00:00:00Z', lastOpenedAt: null };
 const running = (type = 'm6i.large', extra = {}) => ({ version: 2, computerId: 'c-1', operation: 'none', lifecycleState: 'RUNNING', needsOperator: false,
@@ -494,27 +498,209 @@ check('Round 4: Free on Cloudflare and an unknown standing keep the round-3 card
     assert.equal(standingOf({ computer: { standing: 'moved' } }), null);
 });
 
-check('Round 4 move (Phase B): dormant while move is null or another direction; progress, done and failed from server stages', () => {
-    for ( const move of [null, undefined, { direction: 'to_aws', stage: 'exporting', bytesDone: '1', bytesTotal: '2' }] ) {
-        assert.equal(moveView(move), null);
-        const html = computerHtml(computerModel({ computer: me, data: withStanding(free(), 'files_on_aws', { move }), prog: stoppedAws() }), stoppedAws(), []);
-        assert.ok(! /data-role="move-/.test(html), JSON.stringify(move));
+// ── Phase B (reverse move contract §6.1-§6.4): the Computer tab before, during and after a move ─────────────
+const SIZE = { 'std-2': { size: 'std-2', vcpu: 2, memoryGiB: 8 }, 'cmp-4': { size: 'cmp-4', vcpu: 4, memoryGiB: 16 }, 'cmp-8': { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } };
+const held = (extra = {}, size = 'std-2') => withStanding(free(), 'files_on_aws', { awsSize: SIZE[size], reverseMove: null, moveAvailable: false, moveOnOpen: false, ...extra });
+const afterCommit = extra => withStanding(free(), 'free', { filesOn: 'cloudflare', reverseMove: null, moveAvailable: false, moveOnOpen: false, ...extra });
+const tabProg = data => ({ ...data, computerId: 'c-1' });
+const render = (data, prog = stoppedAws()) => { const model = computerModel({ computer: me, data, prog }); return { model, html: scan(computerHtml(model, prog, [])) }; };
+const BANNER = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+const NOT_MOVED = 'settings and programs you added on your AWS computer, saved browser sign-ins, installed packages, and build folders you can recreate (node_modules, .next, .turbo and dist, unless Git tracks them)';
+const KEPT = `Not moved: ${NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
+
+check('Phase B: the move card reads summary.computer.reverseMove only; computer.move (kept null for old shells) is never rendered', () => {
+    for ( const move of [null, undefined, { direction: 'to_aws', stage: 'exporting', bytesDone: '1', bytesTotal: '2' }] ) assert.equal(moveView(move), null);
+    for ( const stage of ['saving', 'copying', 'failed_reopened', 'failed_needs_operator', 'committed'] ) {
+        const legacy = { direction: 'to_cloudflare', stage, bytesDone: '1', bytesTotal: '2', reason: 'copy_stalled', openBlocked: true };
+        const { model, html } = render(held({ move: legacy }));
+        assert.ok(! /data-role="move-/.test(html), stage);
+        assert.equal(model.moving || model.blocked, false, stage);
+        assert.doesNotMatch(html, /data-action="move-retry"/);
     }
-    const moving = withStanding(free(), 'files_on_aws', { move: { direction: 'to_cloudflare', stage: 'exporting', bytesDone: '120000000', bytesTotal: '2400000000' } });
-    const html = scan(computerHtml(computerModel({ computer: me, data: moving, prog: stoppedAws() }), stoppedAws(), []));
-    assert.ok(html.includes('data-role="move-progress"'));
-    assert.match(text(html), /Moving your files to your Free computer 120 MB of 2\.4 GB copied/);
-    assert.match(html, /<li data-step="1" data-state="done">Saving your files<\/li><li data-step="2" data-state="active">Copying your files to your Free computer<\/li>/);
-    const percent = Number(html.match(/aria-valuenow="(\d+)"/)[1]);
-    assert.ok(percent > 25 && percent < 50, String(percent));
-    const done = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'free', { filesOn: 'cloudflare', move: { direction: 'to_cloudflare', stage: 'committed', bytesDone: '1', bytesTotal: '1' } }) }), null, []));
-    assert.match(text(done), /Your files are on your Free computer\. Open your desktop to continue\./);
-    assert.ok(done.includes('data-role="move-done"'));
-    assert.doesNotMatch(done.split('data-role="move-done"')[1].split('</div>')[0], /data-action="open"/, 'Open desktop is the header\'s only');
-    const failed = scan(computerHtml(computerModel({ computer: me, data: withStanding(free(), 'files_on_aws', { move: { direction: 'to_cloudflare', stage: 'failed_reopened', bytesDone: '0', bytesTotal: null, reason: 'move_copy_failed' } }), prog: stoppedAws() }), stoppedAws(), []));
-    assert.match(text(failed), /We couldn't move your files\. They're still on your AWS computer and nothing was deleted\./);
-    assert.match(failed, /data-action="move-retry">Try again<\/button>/);
-    assert.match(failed, /data-action="move-feedback" data-code="move_copy_failed">Send feedback/);
+    assert.equal(NOT_MOVED, MOVE_NOT_MOVED);
+});
+
+check('Phase B: MOVE_STEP_OF keeps the keys lane A reads; step 4 says "Switching to your Free computer"', () => {
+    const src = fs.readFileSync(new URL('./tabs/computers.js', import.meta.url), 'utf8');
+    const table = src.match(/const MOVE_STEP_OF = \{([^}]+)\}/)?.[1];
+    const steps = Object.fromEntries(table.split(',').map(entry => entry.split(':').map(part => part.trim())));
+    assert.deepEqual(['saving', 'copying', 'checking', 'flipping'].map(s => steps[s]), ['0', '1', '2', '3']);
+    const { html } = render(held({ reverseMove: reverseMove({ stage: 'flipping' }) }));
+    assert.match(html, /<li data-step="4" data-state="active">Switching to your Free computer<\/li>/);
+    assert.doesNotMatch(html, /Starting your desktop/);
+    assert.match(src, /import \{ TRANSITION_EVENT, MOVE_LIMIT_BYTES \} from '\.\.\/\.\.\/computer-progress\.js';/, 'the cap comes from computer-progress.js');
+    assert.doesNotMatch(src, /5(12|37) MB/, 'no literal cap in the tab');
+});
+
+const STEP_TEXT = { saving: 'Step 1 of 4: Saving your files.', copying: 'Step 2 of 4: Copying your files to your Free computer.',
+    checking: 'Step 3 of 4: Checking your files.', flipping: 'Step 4 of 4: Switching to your Free computer.' };
+// Every progress read the tab can hold during a move: the moving view (lifecycleState null), a stale read from
+// before it (STOPPED, MOUNTING opening, RUNNING), none yet.
+const STALE = [null, stoppedAws(), running('m6i.large', { lifecycleState: 'MOUNTING', operation: 'opening', stage: 'mounting' }), running(), running('m6i.large', { lifecycleState: 'UNCONFIRMED', needsOperator: true, stage: 'needs_operator' })];
+for ( const [stage, sentence] of Object.entries(STEP_TEXT) ) {
+    check(`Phase B in flight (${stage}): chip "Moving files…", the move card only, no Open/Stop/Start now, Delete disabled — with every progress read`, () => {
+        const data = held({ reverseMove: reverseMove({ stage, bytesDone: stage === 'copying' ? '120000000' : '0', bytesTotal: stage === 'saving' ? null : '2400000000' }),
+            moveAvailable: true, moveOnOpen: true, sessionMaxSeconds: 3600, activeDeadline: '2999-01-01T00:00:00Z' });
+        const phase = Object.keys(PHASES).find(p => ({ export_boot: 'saving', exporting: 'saving', importing: 'copying', checking: 'checking', committing: 'flipping' })[p] === stage);
+        for ( const prog of [...STALE, tabProg(movingProgress({ phase, bytesDone: stage === 'copying' ? 120_000_000 : undefined, bytesTotal: stage === 'saving' ? null : 2_400_000_000 }))] ) {
+            const { model, html } = render(data, prog);
+            const label = prog?.lifecycleState ?? prog?.operation ?? 'none';
+            assert.deepEqual(model.chip, { state: 'moving', text: 'Moving files…' }, label);
+            assert.equal(model.busy, true, label);
+            assert.ok(html.includes('data-role="move-progress"'), label);
+            assert.match(text(html), new RegExp(`Moving your files to your Free computer ${sentence.replace(/\./g, '\\.')}`), label);
+            if ( stage === 'copying' ) assert.match(text(html), /120 MB of 2\.4 GB copied/, label);
+            assert.doesNotMatch(html, /data-action="(open|stop|move-start|move-retry|switch-config)"/, label);
+            assert.match(html, /data-action="delete" hidden disabled/, label);
+            assert.doesNotMatch(html, /data-role="(files-held|hold-time|session-ends|move-offer|switch-progress|switch-done|switch-failed|next-start)"/, label);
+            assert.doesNotMatch(text(html), /Now running|Stopped|Running|Starting…/, label);
+            assert.equal(model.provider, 'AWS (India)');
+        }
+    });
+}
+
+check('Phase B: a move from an open in another window (progress moving, reverseMove still null) shows from computer.progress, live bytes', () => {
+    for ( const [phase, sentence] of [['export_boot', STEP_TEXT.saving], ['importing', STEP_TEXT.copying], ['committing', STEP_TEXT.flipping]] ) {
+        const prog = tabProg(movingProgress({ phase }));
+        const data = held({ moveAvailable: true });
+        const { model, html } = render(data, prog);
+        assert.equal(model.chip.text, 'Moving files…');
+        assert.match(text(html), new RegExp(sentence.replace(/\./g, '\\.')));
+        if ( phase === 'importing' ) assert.match(text(html), /120 MB of 0\.4 GB copied/);
+        assert.equal(moveSummaryLags(prog, data), true, 'the tab re-reads the summary');
+        assert.equal(moveSummaryLags(prog, held({ reverseMove: reverseMove({ stage: 'copying' }) })), false);
+        assert.doesNotMatch(html, /data-role="move-offer"|data-action="open"/);
+    }
+    assert.equal(moveSummaryLags(tabProg(terminalProgress({ outcome: 'committed' })), held({ reverseMove: reverseMove({ stage: 'flipping' }) })), true, 'ended, summary behind');
+    assert.equal(moveSummaryLags(stoppedAws(), held()), false);
+    assert.equal(moveSummaryLags(null, null), false);
+});
+
+check('Phase B open blocked: chip "Needs attention", no Open, the needs-attention card (summary or progress), no Try again', () => {
+    for ( const [data, prog] of [
+        [held({ reverseMove: reverseMove({ stage: 'failed_needs_operator', reason: 'flip_stuck', retry: 'no', openBlocked: true }) }), stoppedAws()],
+        [held({ reverseMove: reverseMove({ stage: 'failed_needs_operator', reason: 'flip_stuck', retry: 'no', openBlocked: true }) }), tabProg(blockedProgress())],
+        [held(), tabProg(blockedProgress())],
+        [held({ reverseMove: reverseMove({ stage: 'flipping' }) }), tabProg(blockedProgress())],
+    ] ) {
+        const { model, html } = render(data, prog);
+        assert.deepEqual(model.chip, { state: 'attention', text: 'Needs attention' });
+        assert.equal(model.blocked, true);
+        assert.doesNotMatch(html, /data-action="(open|stop|move-retry|move-start)"/);
+        assert.ok(html.includes('data-role="move-attention"'));
+        assert.match(text(html), /We're finishing moving your files to your Free computer\. Your files are safe and nothing was deleted\. Your computer can't open until we've checked this; we're looking into it\./);
+        assert.match(html, /data-action="move-feedback"/);
+        assert.doesNotMatch(html, /data-role="files-held"/);
+    }
+    const unsettled = render(held({ reverseMove: reverseMove({ stage: 'failed_needs_operator', reason: 'boot_unsettled', retry: 'no', openBlocked: true }) })).html;
+    assert.match(text(unsettled), /We couldn't finish moving your files\. They're safe on your AWS computer and nothing was deleted\. Your computer can't open until we've checked it; we're looking into it\./);
+});
+
+// §6.3 every terminal row, with every stage/lifecycle the row's progress can carry (§5.10: the placement's own).
+const failedRow = (reason, retry, holdOpenable = true, stage = 'failed_reopened') => reverseMove({ stage, reason, retry, holdOpenable });
+const ROWS = [
+    ['default reopen, Try again', failedRow('copy_stalled', 'now'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted.", { retry: true }],
+    // r7 integration (verifier mutant C2): §6.2 "move-retry is shown only when retry === 'now'", pinned on the default
+    // row with a retry the server never sends there ('after_aws_session' comes only with workspace_too_large).
+    ['default reopen, retry not now', failedRow('copy_stalled', 'after_aws_session'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted.", {}],
+    ['workspace_too_large, after an AWS session', failedRow('workspace_too_large', 'after_aws_session'),
+        'Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Remove some files on your AWS computer and try again, or upgrade to keep using them.', { upgrade: true }],
+    ['workspace_too_large, Try again now', failedRow('workspace_too_large', 'now'), null, { upgrade: true, retry: true }],
+    ['workspace_too_large, hold cannot open', failedRow('workspace_too_large', 'no', false),
+        'Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Upgrade to use them again.', { upgrade: true }],
+    ['kill_switch (try later)', failedRow('kill_switch', 'now'), "We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again later.", { retry: true }],
+    ['boot_unavailable (try later)', failedRow('boot_unavailable', 'now'), "We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again later.", { retry: true }],
+    ['entitlement_paid', failedRow('entitlement_paid', 'no'), 'Your plan is active again, so your files stay on your AWS computer.', {}],
+    ['region_missing', failedRow('region_missing', 'no'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted. This computer needs a fix on our side before it can open or move; we're looking into it.", {}],
+    ['reopen_final', failedRow('head_moved', 'no'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it.", {}],
+    ['reopen_final, hold cannot open', failedRow('worker_conflict', 'no', false), "We couldn't move your files. They're still on your AWS computer and nothing was deleted. We're looking into it.", {}],
+    ['abort_unconfirmed (open works)', failedRow('abort_unconfirmed', 'no', true, 'failed_needs_operator'),
+        "We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it.", { feedback: true }],
+    ['abort_unconfirmed, hold cannot open', failedRow('abort_unconfirmed', 'no', false, 'failed_needs_operator'),
+        "We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted. We're looking into it.", { feedback: true }],
+];
+for ( const [label, row, want, actions] of ROWS ) {
+    check(`Phase B §6.3 ${label}: the row's copy and only its actions, whatever stage the progress read says`, () => {
+        for ( const prog of [stoppedAws(), running(), running('m6i.large', { lifecycleState: 'UNCONFIRMED', needsOperator: true, stage: 'needs_operator' }), null,
+            tabProg(terminalProgress({ outcome: row.stage, reason: row.reason, retry: row.retry, holdOpenable: row.holdOpenable, stage: 'stopped' }))] ) {
+            const { model, html } = render(held({ reverseMove: row, moveAvailable: row.retry === 'now' }, row.holdOpenable === false ? 'cmp-8' : 'std-2'), prog);
+            const card = html.split(/data-role="move-(failed|attention)"/)[2]?.split('</div></div>')[0] ?? '';
+            if ( want ) assert.match(text(html), new RegExp(want.replace(/[.()?]/g, '\\$&')), `${label} / ${prog?.stage}`);
+            assert.equal(/data-action="move-retry"/.test(card), !! actions.retry, `${label}: Try again only when retry is 'now'`);
+            assert.equal(/data-action="move-upgrade"/.test(card), !! actions.upgrade, `${label}: Upgrade`);
+            assert.equal(/data-action="move-feedback"/.test(card), !! actions.feedback, `${label}: Send feedback`);
+            assert.doesNotMatch(card, /data-action="(open|move-start)"/);
+            assert.equal(model.moving, false);
+            assert.doesNotMatch(html, /data-role="move-offer"/, 'a failed row has its own card, never the pre-move one');
+            assert.notEqual(model.chip?.text, 'Moving files…');
+        }
+    });
+}
+
+check('Phase B §6.3 committed: the files are on the Free computer, what was not moved, the skipped items, the retained disk date', () => {
+    const at = '2026-11-13T10:00:00.000Z';
+    const done = n => render(afterCommit({ reverseMove: reverseMove({ stage: 'committed', bytesDone: '400000000', bytesTotal: '400000000', skipped: n, retainUntil: at }) }), null).html;
+    assert.equal(text(done(0)).match(/Your files are on your Free computer\.[^]*?kept until [A-Z][a-z]{2} \d+, \d{4}\./)?.[0],
+        `Your files are on your Free computer. Not moved: ${NOT_MOVED}. Your AWS disk is kept until Nov 13, 2026.`);
+    assert.match(text(done(3)), new RegExp(`Not moved: ${NOT_MOVED.replace(/[.()]/g, '\\$&')}, and 3 items that can't be copied, like links that point outside your Workspace folder\\. Your AWS disk is kept until Nov 13, 2026\\.`));
+    assert.match(text(done(1)), /, and 1 item that can't be copied, like links that point outside your Workspace folder\./);
+    const html = done(0);
+    assert.ok(html.includes('data-role="move-done"'));
+    assert.doesNotMatch(html.split('data-role="move-done"')[1].split('</div>')[0], /data-action="open"/, 'Open desktop is the header\'s only');
+    assert.match(html, /data-role="computer-actions">\s*<button[^>]*data-action="open"/);
+    assert.equal(moveCardCopy(moveView(reverseMove({ stage: 'committed', retainUntil: null }))).text, `Your files are on your Free computer. Not moved: ${NOT_MOVED}.`);
+});
+
+check('Phase B pre-move (§6.3): moveAvailable false keeps 6a\'s banner exactly; true adds the card, its variant chosen by moveOnOpen', () => {
+    const plain = render(held()).html;
+    assert.equal(text(plain.match(/<div[^>]*data-role="files-held"[^>]*>[\s\S]*?<\/div>/)[0]).replace(/ Free sessions[^]*$/, ''), BANNER);
+    assert.doesNotMatch(text(plain), /Move my files|Workspace folder|14 days|Opening it uses/);
+    assert.doesNotMatch(plain, /data-role="move-|data-action="move-/);
+    const onOpen = render(held({ moveAvailable: true, moveOnOpen: true })).html;
+    // r8 (§6.3, §5.9): the copy names the two opens that start the move, the desktop and Code (Preview and a hover never do).
+    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
+    assert.doesNotMatch(text(onOpen), /open your computer/);
+    assert.match(onOpen, /data-action="move-start">Move my files now<\/button>/);
+    assert.ok(onOpen.includes(BANNER.replace(/'/g, '&#39;')), '6a\'s banner stays');
+    const later = render(held({ moveAvailable: true, moveOnOpen: false })).html;
+    assert.match(text(later), new RegExp(`Your files are on your AWS computer\\. Opening it uses your Free limits\\. You can move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files to my Free computer`));
+    assert.match(later, /data-action="move-start">Move my files to my Free computer<\/button>/);
+    for ( const html of [onOpen, later] ) assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
+});
+
+check('Phase B pre-move, held closed (6a\'s card first, then the move; never the next-open variant, never "Opening it uses your Free limits")', () => {
+    for ( const size of ['cmp-4', 'cmp-8'] ) {
+        for ( const moveOnOpen of [false, true] ) {
+            const { html } = render(held({ moveAvailable: true, moveOnOpen }, size), stoppedAws(size === 'cmp-4' ? 'm6i.xlarge' : 'm6i.2xlarge'));
+            const card = text(html.match(/<div[^>]*data-role="files-held"[\s\S]*?<\/div><\/div>/)[0]);
+            const vcpu = SIZE[size].vcpu;
+            assert.ok(card.startsWith(`Your files are still on your ${vcpu} vCPU AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again. Upgrade You can move the files in your Workspace folder to your Free computer. ${KEPT} Move my files to my Free computer`), card);
+            assert.doesNotMatch(text(html), /Opening it uses your Free limits|The next time you open|Move my files now/);
+            assert.doesNotMatch(html, /data-action="open"/);
+            assert.doesNotMatch(html, /data-role="move-offer" role/, 'no second card');
+        }
+        const closed = render(held({}, size), stoppedAws(size === 'cmp-4' ? 'm6i.xlarge' : 'm6i.2xlarge')).html;
+        assert.doesNotMatch(text(closed), /Move my files|Workspace folder/, 'moveAvailable false: 6a\'s card unchanged');
+    }
+});
+
+check('Phase B: "537 MB" is MOVE_LIMIT_BYTES in the shell\'s MB unit, the same words on the overlay and the tab', () => {
+    assert.equal(MOVE_LIMIT_BYTES, 536_870_912);
+    for ( const h of [true, false, null] ) assert.equal(moveTooLargeCopy(h), moveTooLargeText(h));
+    assert.match(moveTooLargeCopy(true), /\(537 MB\)/);
+});
+
+check('Phase B start/retry refusals (§6.3): stop first, try later, or no card (the re-read summary shows the truth)', () => {
+    assert.deepEqual(moveRefusalCopy('move_computer_running'), { lead: 'Your AWS computer is open.',
+        text: 'Stop it first, and your files start moving to your Free computer as soon as it has stopped.', action: 'stop-and-move' });
+    for ( const reason of ['move_paused', 'move_busy', 'move_computer_unsettled', 'error'] ) {
+        assert.equal(moveRefusalCopy(reason).text, "We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again later.");
+        assert.equal(moveRefusalCopy(reason).action, 'try-again');
+    }
+    for ( const reason of ['move_in_progress', 'move_unavailable', 'move_not_held', 'move_unsupported'] ) assert.equal(moveRefusalCopy(reason), null);
+    for ( const copy of [moveRefusalCopy('move_computer_running'), moveRefusalCopy('move_busy'), moveOfferCopy({ onOpen: true }), moveOfferCopy(), moveOfferCopy({ lead: false })] ) {
+        scanned.push(`<p>${copy.lead ?? ''} ${copy.text}</p>`);
+    }
 });
 
 check('Round 4/6: every rendered state passes the copy guard and names no region code or city (R1-11: never "Mumbai")', () => {
@@ -546,13 +732,21 @@ if ( haveBundle ) {
     if ( ! window.crypto?.getRandomValues ) window.crypto = { getRandomValues: a => { for ( let i = 0; i < a.length; i++ ) a[i] = (Math.random() * 256) | 0; return a; } };
     const calls = [];
     let data = premium(), progress = running(), switchReply = null, held = null, usageData = null;
+    // Phase B: `computer.move.start`/`retry` answers (in order) and the stop route's answer; the move section turns on
+    // fast 5 s timers (the move's poll and the stop watch).
+    let moveReplies = [], stopReply = { ok: true, terminated: true }, fastFive = false, summaryFails = false;
+    const realSetTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, fastFive && ms === 5000 ? 30 : ms, ...args);
     window.fetch = async (url, opts = {}) => {
         const u = String(url);
         const call = { url: u, method: opts.method ?? 'GET', body: opts.body ? JSON.parse(opts.body) : null, at: window.performance.now() };
         calls.push(call);
         const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) });
         if ( u.includes('/api/trpc/computer.list') ) return json({ result: { data: { json: [me] } } });
-        if ( u.includes('/api/trpc/billing.summary') ) return json({ result: { data: { json: data } } });
+        if ( u.includes('/api/trpc/billing.summary') ) {
+            if ( summaryFails ) return json({ error: { json: { message: 'stub', data: { code: 'INTERNAL_SERVER_ERROR' } } } }, 500);
+            return json({ result: { data: { json: data } } });
+        }
         if ( u.includes('/api/trpc/billing.history') ) return json({ result: { data: { json: [] } } });
         if ( u.includes('/api/trpc/computer.progress') ) return json({ result: { data: { json: progress } } });
         if ( u.includes('/api/trpc/billing.usage') && usageData ) return json({ result: { data: { json: usageData } } });
@@ -560,6 +754,8 @@ if ( haveBundle ) {
             if ( switchReply ) return json(switchReply);
             return new Promise(resolve => { held = body => resolve(json(body)); });
         }
+        if ( u.includes('/api/trpc/computer.move.') ) return json({ result: { data: { json: moveReplies.shift() ?? { ok: false, reason: 'move_busy' } } } });
+        if ( u.endsWith('/api/shell/stop') ) return json(typeof stopReply === 'function' ? stopReply() : stopReply);
         return json({ error: { json: { message: 'stub', data: { code: 'INTERNAL_SERVER_ERROR' } } } }, 500);
     };
     window.eval(fs.readFileSync(`${OS}/icons.js`, 'utf8'));
@@ -805,6 +1001,160 @@ if ( haveBundle ) {
         assert.match(pane()?.querySelector('[data-role="files-held"]')?.textContent ?? '', /The Free plan can't open it at that size/);
         assert.ok(pane()?.querySelector('[data-role="files-held"] [data-action="held-upgrade"]'));
         assert.doesNotMatch(pane()?.textContent ?? '', /mumbai/i);
+    });
+
+    // ── Phase B (reverse move contract §6.2): the move's actions on the real click path ─────────────────────
+    fastFive = true;
+    const reopen = async () => {
+        click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="about"]'));
+        await settle(3);
+        click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
+        await settle();
+    };
+    const moves = () => calls.filter(c => c.url.includes('/api/trpc/computer.move.'));
+    const stops = () => calls.filter(c => c.url.endsWith('/api/shell/stop'));
+    const role = name => pane()?.querySelector(`[data-role="${name}"]`);
+    const heldMove = (extra = {}) => { const d = heldData(); Object.assign(d.computer, { reverseMove: null, moveAvailable: true, moveOnOpen: false, activeDeadline: null }, extra); return d; };
+    const startedMove = stage => ({ ok: true, move: reverseMove({ stage }) });
+
+    data = heldMove(); progress = { ...stoppedAws(), stage: 'stopped' };
+    await reopen();
+    check('bundle: Phase B the pre-move card offers [Move my files to my Free computer] beside 6a\'s banner', () => {
+        assert.match(role('move-offer')?.textContent ?? '', /Opening it uses your Free limits\. You can move the files in your Workspace folder/);
+        assert.equal(role('move-offer')?.querySelector('[data-action="move-start"]')?.textContent, 'Move my files to my Free computer');
+        assert.match(role('files-held')?.textContent ?? '', /Your files are still on your AWS \(India\) computer\./);
+    });
+    moveReplies = [startedMove('saving')];
+    data = heldMove({ reverseMove: reverseMove({ stage: 'saving' }) });
+    const startsBefore = moves().length;
+    click(role('move-offer')?.querySelector('[data-action="move-start"]'));
+    await settle(8);
+    check('bundle: Phase B a start answered with the move shows the move card; the request names the computer', () => {
+        const sent = moves().at(-1);
+        assert.equal(moves().length, startsBefore + 1);
+        assert.match(sent.url, /\/api\/trpc\/computer\.move\.start$/);
+        assert.equal(sent.method, 'POST');
+        assert.deepEqual(sent.body, { json: { computerId: 'c-1' } });
+        assert.match(role('move-progress')?.textContent ?? '', /Step 1 of 4: Saving your files\./);
+        assert.equal(role('computer-chip')?.textContent.trim(), 'Moving files…');
+        assert.equal(pane().querySelector('[data-action="open"], [data-action="stop"], [data-role="move-offer"], [data-role="files-held"]'), null);
+    });
+
+    // A move started from an open in another window: progress moves before the summary carries it.
+    data = heldMove(); progress = { ...movingProgress({ phase: 'importing' }), computerId: 'c-1' };
+    const summariesBefore = summaryReads().length;
+    await reopen();
+    await settle(20, 30);
+    check('bundle: Phase B progress moving while reverseMove is null: the card from progress; the summary re-read at most 6 times', () => {
+        assert.match(role('move-progress')?.textContent ?? '', /Step 2 of 4: Copying your files to your Free computer\./);
+        assert.match(role('move-bytes')?.textContent ?? '', /120 MB of 0\.4 GB copied/);
+        assert.equal(summaryReads().length - summariesBefore, 1 + 6, 'one activation read, then six re-reads, no more');
+    });
+    data = heldMove({ reverseMove: reverseMove({ stage: 'copying', bytesDone: '120000000', bytesTotal: '400000000' }) });
+
+    // move_computer_running → [Stop and move my files]: start again first, then Stop (the same confirmation), wait for stopped, start once.
+    data = heldMove(); progress = running();
+    await reopen();
+    moveReplies = [{ ok: false, reason: 'move_computer_running' }];
+    click(role('move-offer')?.querySelector('[data-action="move-start"]'));
+    await settle(8);
+    check('bundle: Phase B move_computer_running: "Your AWS computer is open." with [Stop and move my files]', () => {
+        assert.match(role('move-refused')?.textContent ?? '', /Your AWS computer is open\. Stop it first, and your files start moving to your Free computer as soon as it has stopped\./);
+        assert.ok(role('move-refused')?.querySelector('[data-action="move-stop-start"]'));
+        assert.equal(role('move-offer'), null, 'the refusal answers the click in its place');
+    });
+    moveReplies = [{ ok: false, reason: 'move_computer_running' }, startedMove('saving')];
+    stopReply = () => { progress = { ...stoppedAws(), stage: 'stopped' }; return { ok: true, terminated: true }; };
+    const stopFlow = { moves: moves().length, stops: stops().length };
+    click(role('move-refused')?.querySelector('[data-action="move-stop-start"]'));
+    await settle(6);
+    const stopSheet = q('[role="dialog"][data-sheet="confirm-stop"]');
+    check('bundle: Phase B [Stop and move my files] asks start again first, then confirms the stop (nothing stopped yet)', () => {
+        assert.equal(moves().length, stopFlow.moves + 1);
+        assert.ok(stopSheet, 'the same Stop confirmation');
+        assert.equal(stops().length, stopFlow.stops);
+    });
+    data = heldMove({ reverseMove: reverseMove({ stage: 'saving' }) });
+    click(stopSheet?.querySelector('[data-action="confirm"]'));
+    await settle(20, 30);
+    check('bundle: Phase B after the confirmed stop and a stopped read, the move starts once and shows', () => {
+        assert.equal(stops().length, stopFlow.stops + 1);
+        assert.equal(moves().length, stopFlow.moves + 2);
+        assert.match(role('move-progress')?.textContent ?? '', /Step 1 of 4: Saving your files\./);
+    });
+
+    // A move another window started meanwhile: the re-check answers the move, and nothing is stopped.
+    data = heldMove(); progress = running(); stopReply = { ok: true, terminated: true };
+    await reopen();
+    moveReplies = [{ ok: false, reason: 'move_computer_running' }];
+    click(role('move-offer')?.querySelector('[data-action="move-start"]'));
+    await settle(8);
+    moveReplies = [startedMove('copying')];
+    data = heldMove({ reverseMove: reverseMove({ stage: 'copying' }) });
+    const noStop = stops().length;
+    click(role('move-refused')?.querySelector('[data-action="move-stop-start"]'));
+    await settle(8);
+    check('bundle: Phase B [Stop and move my files] when a move already started: the move, no stop', () => {
+        assert.equal(q('[role="dialog"][data-sheet="confirm-stop"]'), null);
+        assert.equal(stops().length, noStop);
+        assert.match(role('move-progress')?.textContent ?? '', /Step 2 of 4/);
+    });
+
+    // Try later, then Try again; a failed row's Try again is computer.move.retry (never an open).
+    data = heldMove(); progress = { ...stoppedAws(), stage: 'stopped' };
+    await reopen();
+    moveReplies = [{ ok: false, reason: 'move_busy' }];
+    click(role('move-offer')?.querySelector('[data-action="move-start"]'));
+    await settle(8);
+    check('bundle: Phase B move_busy: try later, with Try again', () => {
+        assert.match(role('move-refused')?.textContent ?? '', /We can't start moving your files right now\. They're still on your AWS computer and nothing was deleted\. Try again later\./);
+        assert.ok(role('move-refused')?.querySelector('[data-action="move-start"]'));
+    });
+    data = heldMove({ moveAvailable: true, reverseMove: reverseMove({ stage: 'failed_reopened', reason: 'copy_stalled', retry: 'now' }) });
+    await reopen();
+    moveReplies = [{ ok: false, reason: 'move_in_progress' }];
+    data = heldMove({ reverseMove: reverseMove({ stage: 'checking' }) });
+    const opens = calls.filter(c => c.url.includes('/api/shell/desktop')).length;
+    click(role('move-failed')?.querySelector('[data-action="move-retry"]'));
+    await settle(8);
+    check('bundle: Phase B a failed card\'s Try again calls computer.move.retry; move_in_progress re-reads and shows the current move', () => {
+        assert.match(moves().at(-1).url, /\/api\/trpc\/computer\.move\.retry$/);
+        assert.equal(calls.filter(c => c.url.includes('/api/shell/desktop')).length, opens, 'no open: after a failure that is a D16 hold boot');
+        assert.equal(q('.window[data-app="desktop"]'), null);
+        assert.match(role('move-progress')?.textContent ?? '', /Step 3 of 4: Checking your files\./);
+    });
+
+    // A stop that meets the move is not "couldn't confirm the stop".
+    data = heldMove(); progress = running();
+    await reopen();
+    stopReply = () => { data = heldMove({ reverseMove: reverseMove({ stage: 'saving' }) }); return { ok: false, terminated: false, outcome: 'computer_moving' }; };
+    click(pane().querySelector('[data-action="stop"]'));
+    await settle(6);
+    click(q('[role="dialog"][data-sheet="confirm-stop"] [data-action="confirm"]'));
+    await settle(10);
+    check('bundle: Phase B a stop answered computer_moving shows the move card, never "We couldn\'t confirm the stop"', () => {
+        assert.equal(role('computer-notice'), null);
+        assert.doesNotMatch(pane().textContent, /couldn't confirm the stop/);
+        assert.match(role('move-progress')?.textContent ?? '', /Step 1 of 4: Saving your files\./);
+    });
+    // r7 integration (verifier mutant C3): the same stop answer, but the summary re-read fails, so no move card can hide a
+    // notice: handleStop's computer_moving branch alone keeps "We couldn't confirm the stop" off the tab.
+    data = heldMove(); progress = running();
+    await reopen();
+    stopReply = () => { summaryFails = true; return { ok: false, terminated: false, outcome: 'computer_moving' }; };
+    click(pane().querySelector('[data-action="stop"]'));
+    await settle(6);
+    click(q('[role="dialog"][data-sheet="confirm-stop"] [data-action="confirm"]'));
+    await settle(10);
+    check('bundle: Phase B a stop answered computer_moving with a failed summary re-read is still never "We couldn\'t confirm the stop"', () => {
+        assert.equal(role('computer-notice'), null);
+        assert.doesNotMatch(pane().textContent, /couldn't confirm the stop/);
+    });
+    summaryFails = false;
+    fastFive = false; stopReply = { ok: true, terminated: true };
+    check('bundle: Phase B every move state names no city and passes the copy guards', () => {
+        assert.doesNotMatch(pane().textContent, /mumbai|ap-south-1/i);
+        assert.deepEqual(scanCopy(pane().textContent), []);
     });
     check('bundle: no uncaught page errors', () => assert.deepEqual(uncaught, []));
     dom.window.close();

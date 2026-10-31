@@ -499,7 +499,9 @@ describe('routers: AWS previews use their own Worker route', () => {
         expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month')
             // The image-job reservation check (rebase contract §8) is a read too.
             || s.sql.includes('placement:image-reservation')
-            || (s.sql.startsWith('SELECT') && s.sql.includes('FROM public.ezil_compute_migrations')))).toBe(true);
+            || (s.sql.startsWith('SELECT') && s.sql.includes('FROM public.ezil_compute_migrations'))
+            // Phase B (REVERSE-MOVE-CONTRACT §5.3): routing's 0012 probe for an aws-ec2 placement, a read.
+            || s.sql.startsWith("SELECT to_regclass('public.ezil_compute_reverse_moves')"))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {

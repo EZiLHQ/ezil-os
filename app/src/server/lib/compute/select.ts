@@ -34,6 +34,7 @@ import { cloudflareComputeProvider, type CloudflareComputeProvider } from './clo
 import { pinCloudflarePlacement, PlacementOwnerError, readCanaryComputer, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 import { providerForPendingMigration } from './provider-migrate-placement';
+import { providerForReverseMove } from './provider-reverse-placement';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -83,6 +84,12 @@ export interface ResolveOptions {
      * never pin: a computer that never ran stays eligible.
      */
     pinCloudflare?: boolean;
+    /**
+     * Phase B (REVERSE-MOVE-CONTRACT §5.3): the computer is in an AWS → Cloudflare move and the returned provider is one of
+     * the two reverse providers (`'moving'` waits, `'blocked'` refuses as a value). Called only here, so the marker
+     * `routeComputer` returns is set by routing alone, never inferred from a provider's identity.
+     */
+    onReverse?: (reverse: 'moving' | 'blocked') => void;
 }
 
 export async function resolveComputeProvider(
@@ -100,6 +107,16 @@ export async function resolveComputeProvider(
     options.onPlacement?.(placement);
     const migrating = await providerForPendingMigration(db, computer);
     if (migrating) return migrating;
+    // 🔴 Phase B (§5.3): a reverse move owns the computer before its placement does. Opens wait (or are refused as a value)
+    // and never boot, stop or adopt the export boot. Only an aws-ec2 placement can be in a move: the flip replaces the
+    // aws-ec2 row with the Cloudflare one in the transaction that commits the move, so a Cloudflare computer adds no read.
+    if (placement.record?.provider === 'aws-ec2') {
+        const reverse = await providerForReverseMove(db, computer);
+        if (reverse) {
+            options.onReverse?.(reverse.reverse);
+            return reverse.provider;
+        }
+    }
     const entitlement = !placement.record && options.resolveEntitlement
         ? await options.resolveEntitlement()
         : options.entitlement !== undefined ? options.entitlement : aws.entitlement;

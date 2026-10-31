@@ -27,6 +27,10 @@ import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../n
 // `/api/shell/restart` (Restart computer posts `scope: 'computer'` to it),
 // `session.restartDesktop` (unused here; `session.js` is not this lane's), and
 // the `ezil:desktop-restarted` listeners in the Code and Browser windows.
+// Merged with Round 6 Phase B (2026-10-31): `restartMoveReason` and its
+// `MOVE_COPY` import are kept too, exported with no caller in this tab: they
+// word the move flags `session.restartDesktop` passes through (see the
+// function's own comment for why Restart computer never meets them).
 //
 // 🔴 FEATURE-DETECTED, not assumed. The chain behind this button is three
 // independently-deployed pieces: `SHELL_API_ROUTES.restart` ->
@@ -78,7 +82,7 @@ import trpc from '../trpc.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
 import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
-import { TRANSITION_EVENT } from '../../computer-progress.js';
+import { MOVE_COPY, TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -251,6 +255,26 @@ export function reasonCopy (errorCode) {
         case 'provider_not_configured': return "This deployment hasn't turned on desktop restarts yet.";
         default: return 'Something went wrong. Please try again.';
     }
+}
+
+/**
+ * Phase B (§5.3, §6.4; r7 fixer): the restart route's `scope: 'desktop'` answer during a move comes from the reverse
+ * provider, which restarts nothing and answers the move itself (`computeMoving`, or the open-blocked
+ * `computeMoveNeedsAttention`), and `session.restartDesktop` passes both flags through. That is no failure of the
+ * restart: these are the move's own words (§6.4's status line, or the open-blocked sentence), and such an answer is no
+ * `api_failure`. Null otherwise.
+ *
+ * Merged with app-code lane A2 (2026-10-31): its caller in this tab, Restart desktop's handler, is gone (see the
+ * header), so nothing here calls it. Restart computer never meets these flags: `computer.restartComputer` ->
+ * `restartWholeComputer` reads the placement directly and, during a move, answers `busy` or `not_running` (an export
+ * boot never reaches RUNNING; contract §6.4), and the route forwards only `restart_<reason>`
+ * (`app/src/app/api/shell/restart/route.ts`), which `reasonCopy` already words. Kept, exported and pinned
+ * (`troubleshoot-test.mjs`) for the kept `session.restartDesktop` answer shape.
+ */
+export function restartMoveReason (res) {
+    if ( res?.computeMoveNeedsAttention === true ) return MOVE_COPY.blockedBody;
+    if ( res?.computeMoving === true ) return `${MOVE_COPY.moving}.`;
+    return null;
 }
 
 function render ($win) {

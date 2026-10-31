@@ -1,7 +1,7 @@
 import { initTRPC } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ owned: true, signedIn: true }));
+const state = vi.hoisted(() => ({ owned: true, signedIn: true, previewUrl: null as null | ((input: unknown) => Promise<unknown>) }));
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('Unexpected billing operation'); } }));
@@ -13,9 +13,12 @@ vi.mock('@/server/api/trpc', () => {
 });
 vi.mock('@/server/api/root', async () => {
     const { cloudflareGuacamoleRouter } = await import('@/server/api/routers/cloudflare-guacamole');
-    return { appRouter: { createCaller: (ctx: Parameters<typeof cloudflareGuacamoleRouter.createCaller>[0]) => ({
-        cloudflareGuacamole: cloudflareGuacamoleRouter.createCaller(ctx),
-    }) } };
+    return { appRouter: { createCaller: (ctx: Parameters<typeof cloudflareGuacamoleRouter.createCaller>[0]) => {
+        const real = cloudflareGuacamoleRouter.createCaller(ctx);
+        // r8: a POST test records what the route hands `previewUrl` (`state.previewUrl`); every other call is the real router's.
+        return { cloudflareGuacamole: new Proxy(real, { get: (target, key) =>
+            key === 'previewUrl' && state.previewUrl ? state.previewUrl : (target as unknown as Record<PropertyKey, unknown>)[key] }) };
+    } } };
 });
 vi.mock('@/server/lib/cloudflare-guacamole-provider', async original => ({
     ...await original<Record<string, unknown>>(),
@@ -23,14 +26,14 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', async original => ({
 }));
 
 import { deriveGuacamoleSandboxId, resetNekoAdminTokenCacheForTests } from '@/server/lib/cloudflare-guacamole-provider';
-import { GET } from './route';
+import { GET, POST } from './route';
 
 const origin = `https://aws-8181-${deriveGuacamoleSandboxId(userId, computerId)}-aws.preview.example`;
 const frameUrl = `${origin}/preview-bootstrap?token=test-bootstrap&path=%2F`;
 const request = (confirm = 'frame', candidate = frameUrl) => new Request(`https://app.example/api/shell/desktop?${new URLSearchParams({ computerId, confirm, frameUrl: candidate })}`);
 
 beforeEach(() => {
-    state.owned = true; state.signedIn = true;
+    state.owned = true; state.signedIn = true; state.previewUrl = null;
     resetNekoAdminTokenCacheForTests();
     vi.stubEnv('EZIL_AWS_BROWSER_ZONE', 'preview.example');
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'synthetic-test-key');
@@ -87,5 +90,32 @@ describe('shell desktop route through the real router and provider', () => {
         state.signedIn = false;
         expect((await GET(request())).status).toBe(401);
         expect(fetch).not.toHaveBeenCalled();
+    });
+});
+
+describe('POST: the route hands the body to previewUrl as given (Phase B r8 Option C, r9 opt-in trigger; REVERSE-MOVE-CONTRACT §5.9)', () => {
+    const post = (body: unknown) => POST(new Request('https://app.example/api/shell/desktop', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+    it('forwards `intent` verbatim: the r9 open\'s \'open\', the warm\'s \'warm\', none when the body has none (a pre-r9 tab)', async () => {
+        const seen: unknown[] = [];
+        state.previewUrl = async input => { seen.push(input); return { ok: false, errorCode: 'computer_stopped' }; };
+        const screen = { width: 1280, height: 800 };
+        expect(await (await post({ computerId, screen, intent: 'warm' })).json()).toEqual({ ok: false, errorCode: 'computer_stopped' });
+        await post({ computerId });
+        await post({ computerId, sessionId: computerId, intent: 'other' });
+        await post({ computerId, screen, intent: 'open' });
+        expect(seen).toStrictEqual([
+            { sessionId: computerId, computerId, screen, intent: 'warm' },
+            { sessionId: computerId, computerId, screen: undefined, intent: undefined },
+            { sessionId: computerId, computerId, screen: undefined, intent: 'other' },
+            { sessionId: computerId, computerId, screen, intent: 'open' },
+        ]);
+    });
+    it('an unsigned POST is rejected before the body is read or previewUrl runs', async () => {
+        state.signedIn = false;
+        const seen: unknown[] = [];
+        state.previewUrl = async input => { seen.push(input); return { ok: true }; };
+        expect((await post({ computerId, intent: 'warm' })).status).toBe(401);
+        expect(seen).toEqual([]);
     });
 });

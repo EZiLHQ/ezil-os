@@ -27,6 +27,9 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  * URL.
  *
  *   POST { computerId } — mint a fresh code-server preview URL + bootstrap token.
+ *                         `intent: 'open'` (the r9 shell's Code mint, Phase B
+ *                         REVERSE-MOVE-CONTRACT §5.9) is forwarded to the
+ *                         procedure: the only Code ask that may start the move.
  *
  * Called PER WINDOW-OPEN — never cached, never folded into
  * `/api/shell/session`'s boot payload, for the identical 5-minute-token
@@ -63,9 +66,16 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '' } = (body ?? {}) as { computerId?: string };
+        const { computerId = '', intent } = (body ?? {}) as {
+            computerId?: string;
+            /**
+             * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` on the r9 shell's Code mint. Forwarded
+             * VERBATIM, like the desktop route's `intent`: the procedure types it `z.unknown()` and reads only `=== 'open'`.
+             */
+            intent?: unknown;
+        };
 
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId });
+        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent });
 
         return shellJson(preview);
     } catch (err) {

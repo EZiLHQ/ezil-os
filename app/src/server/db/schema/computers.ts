@@ -1,7 +1,10 @@
 import { relations, sql } from 'drizzle-orm';
 import {
+    bigint,
     check,
     foreignKey,
+    index,
+    integer,
     jsonb,
     pgTable,
     smallint,
@@ -96,3 +99,63 @@ export const computerUpdateSchema = createUpdateSchema(computers);
 
 export type Computer = typeof computers.$inferSelect;
 export type NewComputer = typeof computers.$inferInsert;
+
+/**
+ * AWS → Cloudflare moves (Phase B). Mirrors `app/drizzle/0012_compute_reverse_moves.sql` column for
+ * column (constraint names are PostgreSQL's own column-CHECK names); the SQL file is authoritative and
+ * `provider-reverse-store.pg.test.ts` compares the two. Staging-only: written by
+ * `server/lib/compute/provider-reverse-store.ts` through raw SQL, like the forward
+ * `ezil_compute_migrations` table (0006), which has no Drizzle model.
+ * Contract: docs/compute/REVERSE-MOVE-CONTRACT.md.
+ */
+export const computeReverseMoves = pgTable(
+    'ezil_compute_reverse_moves',
+    {
+        id: uuid('id').primaryKey().defaultRandom(),
+        userId: uuid('user_id').notNull(),
+        computerId: uuid('computer_id').notNull(),
+        startedBy: text('started_by').notNull(),
+        state: text('state').notNull().default('requested'),
+        /** The Cloudflare import generation (chunk owner, new v1 head generation). Immutable per row. */
+        generation: uuid('generation').notNull().defaultRandom(),
+        exportBoot: jsonb('export_boot'),
+        exportHead: jsonb('export_head'),
+        importProgress: jsonb('import_progress'),
+        bytesTotal: bigint('bytes_total', { mode: 'number' }),
+        skipped: integer('skipped'),
+        awsVolumeId: text('aws_volume_id'),
+        awsFsUuid: uuid('aws_fs_uuid'),
+        awsSnapshotId: text('aws_snapshot_id'),
+        retainUntil: timestamp('retain_until', { withTimezone: true }),
+        attempts: integer('attempts').notNull().default(0),
+        lastError: text('last_error'),
+        /** Set on every state change (never by claimStale or a retry): the anchor of every per-state timeout. */
+        stateEnteredAt: timestamp('state_entered_at', { withTimezone: true }).notNull().defaultNow(),
+        /** The point of no return (checking → flipping): the Worker commit may have been sent. */
+        commitSentAt: timestamp('commit_sent_at', { withTimezone: true }),
+        createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (t) => [
+        uniqueIndex('ezil_compute_reverse_moves_one_active_per_computer')
+            .on(t.computerId)
+            .where(sql`state NOT IN ('committed', 'failed_reopened')`),
+        index('ezil_compute_reverse_moves_computer_created').on(t.computerId, t.createdAt),
+        check('ezil_compute_reverse_moves_started_by_check', sql`started_by IN ('user', 'open', 'cron')`),
+        check('ezil_compute_reverse_moves_state_check', sql`state IN ('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping', 'committed', 'failed_reopened', 'failed_needs_operator')`),
+        check('ezil_compute_reverse_moves_export_boot_check', sql`export_boot IS NULL OR jsonb_typeof(export_boot) = 'object'`),
+        check('ezil_compute_reverse_moves_export_head_check', sql`export_head IS NULL OR jsonb_typeof(export_head) = 'object'`),
+        check('ezil_compute_reverse_moves_import_progress_check', sql`import_progress IS NULL OR jsonb_typeof(import_progress) = 'object'`),
+        check('ezil_compute_reverse_moves_bytes_total_check', sql`bytes_total IS NULL OR bytes_total BETWEEN 0 AND 536870912`),
+        check('ezil_compute_reverse_moves_skipped_check', sql`skipped IS NULL OR skipped >= 0`),
+        check('ezil_compute_reverse_moves_aws_volume_id_check', sql`aws_volume_id IS NULL OR aws_volume_id ~ '^vol-[0-9a-f]{8,17}$'`),
+        check('ezil_compute_reverse_moves_aws_snapshot_id_check', sql`aws_snapshot_id IS NULL OR aws_snapshot_id ~ '^snap-[0-9a-f]{8,17}$'`),
+        check('ezil_compute_reverse_moves_retain_until_check', sql`retain_until IS NULL OR state = 'committed'`),
+        check('ezil_compute_reverse_moves_attempts_check', sql`attempts BETWEEN 0 AND 5`),
+        check('ezil_compute_reverse_moves_last_error_check', sql`last_error IS NULL OR length(last_error) <= 200`),
+        check('ezil_compute_reverse_moves_commit_sent_at_check',
+            sql`commit_sent_at IS NULL OR state IN ('flipping', 'committed', 'failed_needs_operator')`),
+    ],
+).enableRLS();
+
+export type ComputeReverseMoveRow = typeof computeReverseMoves.$inferSelect;

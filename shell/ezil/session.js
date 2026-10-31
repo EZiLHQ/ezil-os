@@ -30,6 +30,9 @@ import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boo
 // `RELEASE_PRESENCE_AGO_MS` below so a release and a heartbeat cannot drift
 // apart about what "nobody is here" means.
 import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
+// Phase B: what one `computer.progress` read says about a moving open (the moving view's one reader), and the notes
+// this loop leaves the opening surface (Code and Preview hand it plain failures).
+import { moveAskOf, moveOf, noteMoveAnswer, noteMoveRead, MOVE_BUDGET_SECONDS, MOVE_WATCH_MARGIN_SECONDS } from './ui/computer-progress.js';
 
 const NS = 'ezil-os:';
 
@@ -262,11 +265,31 @@ const MIGRATION_MAX_ISSUES = Math.ceil(MIGRATION_DEADLINE_MS / WAKE_REASK_MS) + 
  */
 export const PREPARE_DEADLINE_MS = 180_000;
 const PREPARE_MAX_ISSUES = Math.ceil(PREPARE_DEADLINE_MS / WAKE_REASK_MS) + 2;
+/**
+ * 🔴 PHASE B (reverse move contract §5.3, §6.4): A MOVE IS NOT A BOOT. While a held computer's files move from its
+ * AWS computer to its Free computer, every open is answered by the server's reverse waiting provider
+ * (`computeMoving`), which never boots anything, for as long as the move runs: up to `budgetSeconds` (13 200 s, the
+ * sum of the server's own step deadlines). The wake, migration, launch and prepare clocks (215 s to ten minutes) would
+ * fail every move half way, so a moving answer REPLACES the loop's deadline and cap with these, from the first moving
+ * answer: `budgetSeconds` + `MOVE_WATCH_MARGIN_SECONDS` (2400 s: a late-observed success can overrun each state's deadline by
+ * about one drive gap), re-asked at most every 30 s.
+ * Only the server's outcome ends a move; this clock running out is "still working on it", never a failure.
+ */
+export const MOVE_WATCH_MS = (MOVE_BUDGET_SECONDS + MOVE_WATCH_MARGIN_SECONDS) * 1000;
+export const MOVE_REASK_MS = 30_000;
+const MOVE_MAX_ISSUES = Math.ceil(MOVE_WATCH_MS / MOVE_REASK_MS) + 2;
+/** tRPC's GET route (`ui/Settings/trpc.js` documents the wire shape); here with this file's timeout and cancel. */
+const TRPC_ENDPOINT = '/api/trpc';
 
 // Per-request observations let a window show a warm request's progress too.
 // Concurrent opens cannot clear one another's still-active migration signal.
 const migratingRequests = new Map();
 const launchingRequests = new Map();
+/**
+ * Phase B: in-flight asks whose last answer said the computer's files are moving (`computeMoving`), each with the
+ * signal its caller passed (`owner`), so a window can ask about its own loop only.
+ */
+const movingRequests = new Map();
 /**
  * Round 6 (seam C): in-flight asks whose server answer said the computer's desktop is taking this host
  * boot's config (one push, then a container restart; the Worker bounds it at 150 s) or code-server is
@@ -282,6 +305,32 @@ export function isComputePreparing (computerId) {
 }
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
+}
+/**
+ * Phase B. `owner`: the signal a caller passed `openDesktop` (or `cancellableWake`); only that caller's own loop then
+ * counts. A per-computer answer is not "this open met a move": a Code mint still pausing on a move that has just
+ * failed must not make a fresh desktop open (an ordinary hold open) look like one that watched the move.
+ */
+export function isComputeMoving (computerId, owner) {
+    return !!computerId && [...movingRequests.values()]
+        .some(entry => entry.computerId === computerId && (owner === undefined || entry.owner === owner));
+}
+
+/**
+ * Phase B (§6.4 rule 3): one `computer.progress` read for a moving loop. 'ask' only when it shows this computer's move
+ * in flight or committed; 'stop' on a failed outcome; 'unauthorized' when the read was refused for the session (an
+ * ask would be refused the same way, so the loop answers it itself and never asks); 'wait' for anything else, a failed
+ * read included. The move it saw is noted for the opening surface (`noteMoveRead`).
+ */
+async function readMoveAsk (computerId, signal) {
+    const input = encodeURIComponent(JSON.stringify({ json: { computerId } }));
+    const res = await request(`${TRPC_ENDPOINT}/computer.progress?input=${input}`, { timeoutMs: STATUS_TIMEOUT_MS, signal });
+    // A tRPC GET nests its code under `error.json.data`, so `request()` reports `HTTP_401`: the status is the signal.
+    if ( ! res.ok ) return res.status === 401 || res.code === 'UNAUTHORIZED' ? 'unauthorized' : 'wait';
+    const raw = res.data?.result?.data;
+    const data = raw && typeof raw === 'object' && 'json' in raw ? raw.json : raw;
+    noteMoveRead(computerId, moveOf(data, computerId));
+    return moveAskOf(data, computerId);
 }
 
 /**
@@ -404,13 +453,32 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  * is consumed by (1) and never reaches (2), so a long wake cannot silently
  * spend the one retry that a genuine failure is owed.
  *
+ *   3. PHASE B, TESTED FIRST: A MOVE. A `computeMoving` answer (the computer's
+ *      files are moving to its Free computer) is not a wake. It runs on the
+ *      move's own clocks (`MOVE_WATCH_MS`, `MOVE_REASK_MS`), and it is re-asked
+ *      only after a `computer.progress` read shows the move in flight or
+ *      committed: after a failed move an ordinary open boots the AWS computer
+ *      under the Free hold, which the user must choose. The first answer
+ *      without the flag re-anchors the wake clocks. A
+ *      `computeMoveNeedsAttention` answer is deterministic and returns at once.
+ *      🔴 Only a loop its caller can cancel waits on a move (`owner`): the
+ *      paint-time warm (`warm.js`, no window, no signal) hands a moving answer
+ *      straight back, or it would ask for hours behind no window and open the
+ *      Free computer at the commit for nobody. The window that claims it takes
+ *      the wait over (`movingAnswer`) on its own signal.
+ *
  * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
  *   Sends the request once. Must never throw.
  * @param {string} what For the log line only.
  * @param {string} [computerId] Scopes migration progress to this computer.
+ * @param {AbortSignal} [signal] Stops the loop.
+ * @param {{owner?: AbortSignal | null, movingAnswer?: object | null}} [opts] `owner`: the caller's own signal (default
+ *   `signal`; null: no caller can cancel this loop). `movingAnswer`: a `computeMoving` answer this open already got
+ *   (the claimed warm's): the loop starts inside that move's wait, so its first request is a read, never a second ask.
  */
-async function withWakeAndOneRetry (issue, what, computerId, signal) {
-    const t0 = Date.now();
+async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = signal, movingAnswer = null } = {}) {
+    // `let`: the first answer after a move re-anchors it (rule 4 of contract §6.4).
+    let t0 = Date.now();
     let retried = false;
     let asks = 0;
     let maxIssues = MAX_ISSUES;
@@ -419,6 +487,14 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
     let launchStartedAt = null;
     let prepareStartedAt = null;
     let wakeResumed = false;
+    // Phase B: the first moving answer (the move's own clock), the cap it set, whether the wake clocks were
+    // re-anchored since the last moving answer, and the reads that asked nothing (bounded like the asks).
+    let moveStartedAt = null;
+    let moveMaxIssues = 0;
+    let moveResumed = true;
+    let moveReads = 0;
+    // The claimed warm's moving answer, taken as this loop's first answer (its ask is counted: the warm made it).
+    let carried = movingAnswer?.ok !== true && movingAnswer?.computeMoving === true ? movingAnswer : null;
     const progressKey = Symbol();
     // 🔴 A CANCELLED LOOP NEVER ASKS AGAIN. Every ask runs the server's ensure,
     // and on an UNCONFIRMED + ENROLLMENT_FAILED placement that ensure launches a
@@ -428,6 +504,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
         migratingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
         preparingRequests.delete(progressKey);
+        movingRequests.delete(progressKey);
         console.info(`[ezil-os:session] ${what}: cancelled by the caller after ${asks} ask(s); not asking again`);
         return { ok: false, errorCode: 'cancelled', message: 'Stopped asking: the caller cancelled.' };
     };
@@ -457,11 +534,95 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                 return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
             }
             asks++;
-            const res = await issue();
+            const res = carried ?? await issue();
+            carried = null;
             // Checked before anything reads `res`: an aborted request surfaces as a
             // transport failure, which would otherwise buy the one silent re-ask.
             if ( signal?.aborted ) return cancelled();
             const now = Date.now();
+            // Phase B: the latest answer for this computer, for the opening surface (the blocked card at once).
+            noteMoveAnswer(computerId, res);
+            // 🔴 PHASE B FIRST (§6.4 rules 2 and 6), before the migrating, launching and preparing branches and the
+            // `sandbox_starting` deadline: none of their clocks may end a move. Keyed on the flags only, never `error`.
+            if ( res.ok !== true && res.computeMoveNeedsAttention === true ) {
+                // The blocked answer is deterministic (`preconditions_unmet`): no silent re-ask, no wait.
+                movingRequests.delete(progressKey);
+                console.info(`[ezil-os:session] ${what}: the computer's move needs attention; not asking again`);
+                return res;
+            }
+            if ( res.ok !== true && res.computeMoving === true ) {
+                migratingRequests.delete(progressKey);
+                launchingRequests.delete(progressKey);
+                preparingRequests.delete(progressKey);
+                if ( computerId ) movingRequests.set(progressKey, { computerId, owner });
+                if ( moveStartedAt === null ) {
+                    moveStartedAt = now;
+                    moveMaxIssues = asks - 1 + MOVE_MAX_ISSUES;
+                    console.info(`[ezil-os:session] ${what}: the computer's files are moving to its Free computer;`
+                        + ` asking again at most every ${MOVE_REASK_MS}ms while the move runs`);
+                }
+                // Replaced, never raised from a wake clock: the move's own bound, from its first answer.
+                deadline = moveStartedAt + MOVE_WATCH_MS;
+                maxIssues = moveMaxIssues;
+                moveResumed = false;
+                // Rule 3: only a progress read says whether asking is safe. Without the computer there is none.
+                if ( ! computerId ) return res;
+                // 🔴 No caller can cancel this loop (the paint-time warm): it never waits on a move. The window
+                // that claims it takes the wait over on its own signal, so closing that window ends it.
+                if ( ! owner ) {
+                    console.info(`[ezil-os:session] ${what}: the computer's files are moving and no window owns this open; handing the answer back`);
+                    return res;
+                }
+                for (;;) {
+                    if ( Date.now() >= deadline ) {
+                        // Rule 5: "still working on it", never a failure. The caller reads the move itself.
+                        console.warn(`[ezil-os:session] ${what}: the move is still running after ${Date.now() - moveStartedAt}ms; handing back its last answer`);
+                        telemetry.capture({
+                            eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'computer_moving',
+                            durationMs: Date.now() - moveStartedAt, detail: `move watch spent after ${asks} asks`,
+                        });
+                        return res;
+                    }
+                    await pause(MOVE_REASK_MS, signal);
+                    if ( signal?.aborted ) return cancelled();
+                    // The same structural backstop as `maxIssues`, for the reads that ask nothing.
+                    if ( ++moveReads > MOVE_MAX_ISSUES ) {
+                        console.error(`[ezil-os:session] ${what}: refusing to read the move a ${moveReads}th time; stopping`);
+                        telemetry.capture({
+                            eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'move_read_cap_reached',
+                            durationMs: Date.now() - t0, detail: `${moveReads - 1} reads`,
+                        });
+                        return res;
+                    }
+                    const next = await readMoveAsk(computerId, signal);
+                    if ( signal?.aborted ) return cancelled();
+                    if ( next === 'ask' ) break;
+                    if ( next === 'unauthorized' ) {
+                        // Signed out mid-move: the open route refuses an ask the same way, so answer it here and ask
+                        // nothing (no ask can race a failure into a hold boot). Its sign-in copy, never the move's.
+                        console.info(`[ezil-os:session] ${what}: the move's progress read was refused for the session; not asking again`);
+                        return { ok: false, errorCode: 'unauthorized', message: 'Signed out while the files were moving.' };
+                    }
+                    if ( next === 'stop' ) {
+                        // Never auto-open the AWS computer: the caller shows the outcome and the user chooses.
+                        console.info(`[ezil-os:session] ${what}: the move ended without moving the files; not asking again`);
+                        return res;
+                    }
+                    // 'wait': the read is no evidence the move is in flight, so it is never an ask.
+                }
+                continue;
+            }
+            movingRequests.delete(progressKey);
+            if ( ! moveResumed ) {
+                // Rule 4: the first answer without the flag after a moving one (the commit's open of the Free
+                // computer) re-anchors the loop, as `wakeResumed` does after a forward migration.
+                moveResumed = true;
+                t0 = now;
+                deadline = now + WAKE_DEADLINE_MS;
+                maxIssues = asks - 1 + AWS_MAX_ISSUES;
+                prepareStartedAt = null;
+                launchStartedAt = null;
+            }
             const migrating = res.ok !== true && res.errorCode === 'sandbox_starting'
                 && res.computeProvider === 'aws-ec2' && res.computeMigrating === true;
             if (migrating) {
@@ -553,6 +714,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
         migratingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
         preparingRequests.delete(progressKey);
+        movingRequests.delete(progressKey);
     }
 }
 
@@ -583,10 +745,17 @@ export function openSession () {
  *   `measureDesktopBox`. OPTIONAL in both directions: an older server ignores
  *   an unknown body field, and this client omits the field entirely when it
  *   has nothing to measure, so neither side has to know about the other.
+ * @param {{signal?: AbortSignal, movingAnswer?: object, warm?: boolean | (() => boolean)}} [opts] Phase B (§5.9):
+ *   every ask carries an `intent`. **r9 (opt-in trigger):** a real open (no `warm`, or `warm` false) sends
+ *   `intent: 'open'`, the only ask that may start the move; the server treats an ask with no intent (a tab still running
+ *   a pre-r9 bundle) as the D16 hold, never a move. **r8 (Option C):** `warm` marks the Browser icon's warm (`warm.js`
+ *   only), read before EACH ask: while it is true the ask carries `intent: 'warm'` instead, so the server never starts a
+ *   move (or boots a held computer) for a hover; once it reads false (a window claimed the warm) the asks are the
+ *   click's and carry `'open'`.
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId, screen, { signal } = {}) {
+export async function openDesktop (computerId, screen, { signal, movingAnswer, warm } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
@@ -594,7 +763,10 @@ export async function openDesktop (computerId, screen, { signal } = {}) {
     // `cancelOpenDesktop(computerId)` — which also reaches an open the caller
     // did not start itself (the paint-time warm, via `warm.js`) — and by
     // `cancelComputerOpens` (Stop/Delete, after the windows close).
-    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s), { signal });
+    // Phase B: only an open with a `signal` waits on a move; `movingAnswer` (the claimed warm's) starts it inside one.
+    const isWarm = typeof warm === 'function' ? warm : () => warm === true;
+    return cancellableWake(computerId, 'openDesktop',
+        (s) => openDesktopOnce(computerId, screen, s, isWarm() === true ? 'warm' : 'open'), { signal, movingAnswer });
 }
 
 /**
@@ -615,9 +787,10 @@ const openCancels = new Map();
  * @param {string} computerId
  * @param {string} what The loop's name ('openDesktop' | 'previewUrl' | 'codePreviewUrl').
  * @param {(signal: AbortSignal) => Promise<any>} issue One request. Must never throw.
- * @param {{signal?: AbortSignal}} [opts]
+ * @param {{signal?: AbortSignal, movingAnswer?: object}} [opts] Phase B: without `signal` no caller can cancel the
+ *   loop, so it never waits on a move (`withWakeAndOneRetry`'s `owner`); `movingAnswer` as there.
  */
-export function cancellableWake (computerId, what, issue, { signal } = {}) {
+export function cancellableWake (computerId, what, issue, { signal, movingAnswer } = {}) {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     if ( signal?.aborted ) cancel(); else signal?.addEventListener?.('abort', cancel, { once: true });
@@ -626,7 +799,8 @@ export function cancellableWake (computerId, what, issue, { signal } = {}) {
     openCancels.set(key, entry);
     entry.done = (async () => {
         try {
-            return await withWakeAndOneRetry(() => issue(controller.signal), what, computerId, controller.signal);
+            return await withWakeAndOneRetry(() => issue(controller.signal), what, computerId, controller.signal,
+                { owner: signal ?? null, movingAnswer });
         } finally {
             openCancels.delete(key);
             signal?.removeEventListener?.('abort', cancel);
@@ -712,20 +886,28 @@ export async function ensureLocalDesktop (computerId) {
     return localStarts.get(computerId);
 }
 
-/** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId, screen, signal) {
-    // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
-    // for. The server treats absent and malformed identically, but a body that
-    // is byte-identical to the pre-change one is the strongest form of "an old
-    // server sees exactly what it always saw".
+/**
+ * One `POST /api/shell/desktop`. The loop that may call it more than once is above. `intent` (Phase B §5.9): `'open'` on
+ * a real open (r9: the opt-in trigger, the only ask that may start the move) or `'warm'` on the Browser icon's warm (r8,
+ * Option C). Always sent: the server treats a body without it (a pre-r9 bundle's) as the D16 hold, never a move.
+ */
+async function openDesktopOnce (computerId, screen, signal, intent) {
+    // 🔴 The screen field is OMITTED, not sent as null, when there is nothing to
+    // ask for. The server treats absent and malformed identically, but a body
+    // that is byte-identical to the pre-change one is the strongest form of "an
+    // old server sees exactly what it always saw". `intent` is the exception on
+    // purpose (r9): an old server ignores it, and the new one starts a move only
+    // when it is present.
     const usable = screen
         && Number.isInteger(screen.width) && Number.isInteger(screen.height)
         && screen.width > 0 && screen.height > 0;
     const res = await request(endpoint('desktop'), {
         method: 'POST',
-        body: usable
-            ? { computerId, screen: { width: screen.width, height: screen.height } }
-            : { computerId },
+        body: {
+            computerId,
+            ...(usable ? { screen: { width: screen.width, height: screen.height } } : {}),
+            intent: intent === 'warm' ? 'warm' : 'open',
+        },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
         signal,
     });
@@ -769,6 +951,9 @@ async function openDesktopOnce (computerId, screen, signal) {
             computeProvider: data.computeProvider,
             ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
             ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
+            // Phase B (§6.4 rule 1): `previewUrl` is where the next-open move starts; its answers carry the move.
+            ...(data.computeMoving === true ? { computeMoving: true } : {}),
+            ...(data.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}),
             ...capacityAttemptOf(data),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
@@ -835,12 +1020,15 @@ async function openDesktopOnce (computerId, screen, signal) {
 /**
  * A not-ok preview body for the wake loop. Preserve the provider and explicit
  * migration or fresh-launch signal so fast AWS replies receive the appropriate bounded budget.
+ * Phase B: and the move flags, so Code's mint (`apps/code.js`) and Preview wait on a move as the desktop does.
  */
 export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
         ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
         ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
         ...(data?.computePreparing === true ? { computePreparing: true } : {}),
+        ...(data?.computeMoving === true ? { computeMoving: true } : {}),
+        ...(data?.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}),
         ...capacityAttemptOf(data) };
 }
 
@@ -1130,7 +1318,11 @@ export async function restartDesktop (computerId) {
     }
     const data = res.data ?? {};
     if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message };
+        // Phase B (§5.3, r7 fixer): during a move the route answers the move itself, bare; its flags reach the caller
+        // (only when boolean true, as `pendingOrRefused`), so Troubleshoot can say so instead of a generic failure.
+        return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message,
+            ...(data.computeMoving === true ? { computeMoving: true } : {}),
+            ...(data.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}) };
     }
     return { ok: true };
 }
@@ -1552,7 +1744,7 @@ export default {
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching, isComputePreparing,
+    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching, isComputePreparing, isComputeMoving,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

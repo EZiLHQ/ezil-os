@@ -160,6 +160,36 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         await client!.unsafe(`INSERT INTO ${schema}.ezil_compute_migrations (id, computer_id, state) VALUES ($1,$2,'requested')`, [randomUUID(), job().computerId]);
         await expect(store.reserve(job(), repository)).rejects.toThrow('image_job_conflict');
     });
+    it('a holding reverse move refuses the reservation (REVERSE-MOVE-CONTRACT §5.2.1); a released one and a schema without 0012 do not', async () => {
+        // This suite's schema has no 0012 (as production): every other test here proves the probe answers "no reverse move".
+        const j = job();
+        const reset = async () => {
+            await client!.unsafe(`DELETE FROM ${schema}.ezil_computer_image_jobs`);
+            await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET image_upgrade_job_id = NULL`);
+        };
+        expect((await store.reserve(job(), repository)).phase).toBe('reserved');
+        await reset();
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0012_compute_reverse_moves.sql'), 'utf8')));
+        try {
+            const row = (state: string) => client!.unsafe(`INSERT INTO ${schema}.ezil_compute_reverse_moves (computer_id, user_id, started_by, state, commit_sent_at, retain_until)
+                VALUES ($1, $2, 'user', $3, ${state === 'flipping' || state === 'committed' ? 'now()' : 'NULL'}, ${state === 'committed' ? "now() + interval '14 days'" : 'NULL'})`,
+            [j.computerId, j.ownerUserId, state]);
+            for (const state of ['requested', 'booting', 'exporting', 'copying', 'checking', 'flipping', 'failed_needs_operator']) {
+                await client!.unsafe(`DELETE FROM ${schema}.ezil_compute_reverse_moves`);
+                await row(state);
+                await expect(store.reserve(job(), repository), state).rejects.toThrow('image_job_conflict');
+                const [placement] = await client!.unsafe(`SELECT image_upgrade_job_id FROM ${schema}.ezil_computer_placements`);
+                expect(placement!.image_upgrade_job_id, state).toBeNull();
+                expect((await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_computer_image_jobs`))[0]!.n, state).toBe(0);
+            }
+            for (const state of ['committed', 'failed_reopened']) {
+                await client!.unsafe(`DELETE FROM ${schema}.ezil_compute_reverse_moves`);
+                await row(state);
+                expect((await store.reserve(job(), repository)).phase, state).toBe('reserved');
+                await reset();
+            }
+        } finally { await client!.unsafe(`DROP TABLE ${schema}.ezil_compute_reverse_moves`); }
+    });
     it('actual test writer can write, while anon/authenticated have no table privilege and RLS is enabled', async () => {
         await store.reserve(job(), repository);
         const r = await client!.unsafe(`SELECT relrowsecurity AS rls,

@@ -226,7 +226,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ computerId }),
+            // Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and
+            // only an ask that says so may start moving a held computer's files. An older server ignores the field.
+            body: JSON.stringify({ computerId, intent: 'open' }),
             signal: mintSignal(cancel),
         });
     } catch ( err ) {

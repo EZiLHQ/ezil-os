@@ -7,8 +7,9 @@ import { newCorrelationId } from '@/server/lib/cloudflare-guacamole-provider';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
+import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
-import { handleBillingSessionSweep, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, reverseMoveInFlightFor, RUNNING_GRACE_MS } from './handler';
 
 export const maxDuration = 300;
 
@@ -56,8 +57,16 @@ async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; 
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
-    const deps = getBillingDeps();
-    const now = deps.now();
+    let deps: ReturnType<typeof getBillingDeps>, now: Date;
+    try {
+        deps = getBillingDeps();
+        now = deps.now();
+    } catch (error) {
+        // Phase B (§5.4, r7 fixer): the reverse pass is the only driver of a move's deadlines, so a billing fault before the
+        // handler still runs it (it never throws); the sweep then fails as before.
+        await advanceReverseMoves(Date.now());
+        throw error;
+    }
     const counts = await handleBillingSessionSweep({
         deps, now,
         // There is no session user in a cron: the epoch records the checked owner.
@@ -66,7 +75,8 @@ export async function GET(req: Request): Promise<Response> {
         awsStopProof,
         // The held bound reads placements (C-2, through placement.ts): only where placement reads are on, as sandbox-reap.
         ...(isPlacementReadEnabled(process.env)
-            ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit) }
+            ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit),
+                reverseMoveInFlight: reverseMoveInFlightFor(db as unknown as PlacementExecutor) }
             : {}),
     });
     return Response.json(counts);

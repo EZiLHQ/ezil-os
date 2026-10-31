@@ -260,6 +260,11 @@ push('🔴 opening the window REQUESTS a URL (it did not have one already)',
     mintCalls.length === 1, `${mintCalls.length} mint call(s) after the click`);
 push('the mint is a POST carrying the computer id',
     mintCalls[0]?.method === 'POST' && mintCalls[0]?.body?.computerId === COMPUTER.id);
+// Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and only an ask
+// that says so may start moving a held computer's files. The body is exactly this; nothing else rides on the mint.
+push('🔴 r9: the mint body is exactly { computerId, intent: \'open\' }',
+    JSON.stringify(mintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+    JSON.stringify(mintCalls[0]?.body));
 push('🔴 it minted from `/api/shell/code-preview-url`, NOT `/api/shell/preview-url`',
     ! calls.slice(callsBeforeOpen).some(c => c.url.startsWith(ENDPOINTS.previewUrl)));
 
@@ -295,6 +300,9 @@ push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     `${remintCalls.length} mint(s); src changed: ${iframe2?.getAttribute('src') !== firstUrl}`);
 push('and the fresh URL is the one the SECOND call returned',
     iframe2?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]);
+push('r9: the re-open\'s mint says intent \'open\' too',
+    JSON.stringify(remintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+    JSON.stringify(remintCalls[0]?.body));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. FRAME HONESTY, BOTH DIRECTIONS, inside the shell.

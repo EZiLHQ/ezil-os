@@ -480,6 +480,83 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
 }
 
 /**
+ * GW-5 `export` (docs/compute/REVERSE-MOVE-CONTRACT.md §2.2): the export boot's host stages
+ * `/workspace` as a v1 snapshot; the reverse import (./workspace-migration-import) starts the job
+ * and pulls its status, head and chunks. Same gw1 signer as every other host call, bound to the
+ * tunnel record's placement generation and lease epoch.
+ */
+export const EXPORT_CONTROL_PATH = '/__ezil/control/export';
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The host's chunk-index grammar: decimal, no leading zeros, below the 512-chunk cap. */
+const MAX_EXPORT_CHUNKS = 512;
+
+/**
+ * The export POST's exact bytes, built ONCE (this key order, no whitespace). The signature covers
+ * the path only, so the body's sha256 travels in the signed path and the host compares it with
+ * the bytes it read before parsing (§2.2 "Body bytes"): never re-serialize between hash and send.
+ */
+export function awsExportBody(moveId: string, generation: string): string {
+  if (!LOWER_UUID.test(moveId) || !LOWER_UUID.test(generation)) throw new Error('gw_invalid_control_op');
+  return JSON.stringify({ v: 1, moveId, generation });
+}
+
+async function sha256HexOf(text: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+  return [...digest].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function exportOrigin(record: AwsTunnelRecord, zone: string): { host: string; key: Uint8Array } {
+  const key = decodeControlKey(record.controlKey);
+  if (!key) throw new Error('gw_invalid_binding');
+  return { host: awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone), key };
+}
+
+/** `POST /__ezil/control/export/<sha256hex(body)>`: start (or resume, idempotently) this move's export. */
+export async function startAwsExport(
+  record: AwsTunnelRecord,
+  zone: string,
+  moveId: string,
+  generation: string,
+  fetchFn: FetchLike,
+  nowSeconds: number,
+  timeoutMs: number,
+): Promise<Response> {
+  const body = awsExportBody(moveId, generation);
+  const { host, key } = exportOrigin(record, zone);
+  const path = `${EXPORT_CONTROL_PATH}/${await sha256HexOf(body)}`;
+  const header = await signGatewayHeader(key, record, 'POST', path, nowSeconds);
+  return fetchFn(`https://${host}${path}`, {
+    method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header, 'content-type': 'application/json' }, body,
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** What the import reads from the host edge: served from disk, never through the agent socket. */
+export type AwsExportRead = 'status' | 'head' | { chunk: number };
+
+/** `GET /__ezil/control/export/{status,head,chunk/<i>}`: no body, no query, so the signed path is the whole request. */
+export async function readAwsExport(
+  record: AwsTunnelRecord,
+  zone: string,
+  read: AwsExportRead,
+  fetchFn: FetchLike,
+  nowSeconds: number,
+  timeoutMs: number,
+): Promise<Response> {
+  if (typeof read === 'object' && (!Number.isSafeInteger(read.chunk) || read.chunk < 0 || read.chunk >= MAX_EXPORT_CHUNKS)) {
+    throw new Error('gw_invalid_control_op');
+  }
+  const { host, key } = exportOrigin(record, zone);
+  const path = `${EXPORT_CONTROL_PATH}/${typeof read === 'object' ? `chunk/${read.chunk}` : read}`;
+  const header = await signGatewayHeader(key, record, 'GET', path, nowSeconds);
+  // Identity: the chunk's Content-Length is checked against the export head.
+  return fetchFn(`https://${host}${path}`, {
+    method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header, 'accept-encoding': 'identity' },
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/**
  * GW-5 (proposed): a control-plane command relayed to the host agent through the edge.
  * Every parameter is in the SIGNED path (`/__ezil/control/<op>[/<warnSeconds>]`), the
  * body is empty, so the contract's path-only signature covers the whole command.

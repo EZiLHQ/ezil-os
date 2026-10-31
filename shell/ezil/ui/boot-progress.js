@@ -40,6 +40,12 @@ const awsBudgetSpent = (observation, bootElapsedMs) => bootElapsedMs >= AWS_BOOT
  *                    or the session's own launch/migration clock (the failure
  *                    carried `computeLaunching`/`computeMigrating`: its ten-minute
  *                    loop already ran out) has been reached: failure + Try again.
+ *   'move'         — Phase B: the open met a MOVE (`moving`: the answer carried
+ *                    `computeMoving`/`computeMoveNeedsAttention`), or timed out
+ *                    while the observation is the moving view. Not a failure and
+ *                    not a reopen: the window shows the move (its steps, its
+ *                    outcome, or "still working on it"). The ten-minute stop and
+ *                    the reopen cap never apply to a move (contract §6.4).
  *   'fail'         — anything else, including no observation at all: exactly
  *                    the failure the window rendered before this existed.
  *
@@ -47,10 +53,11 @@ const awsBudgetSpent = (observation, bootElapsedMs) => bootElapsedMs >= AWS_BOOT
  * window's clock after the launch's, and a reopen would keep asking past the
  * server's enrollment expiry, where an ask replaces the host.
  *
- * @param {{reason?: string, observation?: any, bootElapsedMs: number, reopens?: number, sessionClockSpent?: boolean}} input
- * @returns {'reopen' | 'budget_spent' | 'fail'}
+ * @param {{reason?: string, observation?: any, bootElapsedMs: number, reopens?: number, sessionClockSpent?: boolean, moving?: boolean}} input
+ * @returns {'reopen' | 'budget_spent' | 'move' | 'fail'}
  */
-export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reopens = 0, sessionClockSpent = false }) {
+export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reopens = 0, sessionClockSpent = false, moving = false }) {
+    if ( moving === true || (reason === 'timeout' && observation?.moving === true) ) return 'move';
     if ( reason !== 'timeout' || ! observation || observation.activeAws !== true ) return 'fail';
     if ( AWS_STOP_STAGES.includes(observation.stage) ) return 'fail';
     return sessionClockSpent || awsBudgetSpent(observation, bootElapsedMs) || reopens >= AWS_BOOT_MAX_REOPENS
@@ -63,10 +70,15 @@ export function awsBootTimeoutVerdict ({ reason, observation, bootElapsedMs, reo
  * still bounds it. `clock: false` (the first request, whose own wake loop owns
  * the deadline) lets only the observed stage stop it.
  *
+ * Phase B: the moving view (`observation.moving`, contract §5.10) always waits.
+ * The open's own loop runs on the move's clocks and ends with the move's
+ * outcome; neither the ten-minute stop nor a stage here may end it first.
+ *
  * @param {{observation?: any, bootElapsedMs: number, clock?: boolean}} input
  * @returns {'wait' | 'budget_spent' | 'fail'}
  */
 export function awsBootWaitVerdict ({ observation, bootElapsedMs, clock = true }) {
+    if ( observation?.moving === true ) return 'wait';
     if ( observation && AWS_WAIT_STOP_STAGES.includes(observation.stage) ) return 'fail';
     return clock && awsBudgetSpent(observation, bootElapsedMs) ? 'budget_spent' : 'wait';
 }

@@ -16,7 +16,7 @@ import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB } from '@/server/billing/v3/summary';
+import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
 import { deriveStanding } from '@/server/billing/v3/standing';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
@@ -28,6 +28,7 @@ import {
     type CancelAtPeriodEndOutput, type SetOverageOutput, type SelectSizeOutput,
 } from '@/server/billing/v2/contract';
 import { buildSummaryV2, hasOveragePaymentFailure, summaryMeters } from '@/server/billing/v2/summary';
+import type { ReverseMovePlacementView } from '@/server/lib/compute/provider-reverse';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -145,7 +146,15 @@ export interface AwsVolumeRef { computerId: string; region: string; volumeId: st
  * round 6 (R4-02), the metered size every aws-ec2 placement is on; omitted when there is none, any type is
  * unreadable or unlisted, or they differ.
  */
-export interface UserPlacement { provider: PlacementProvider; awsVolumes: AwsVolumeRef[]; awsSize?: SizeCode }
+export interface UserPlacement {
+    provider: PlacementProvider; awsVolumes: AwsVolumeRef[]; awsSize?: SizeCode;
+    /**
+     * Phase B (REVERSE-MOVE-CONTRACT §6.1.1): the live computers this read already lists, each with its provider and, for an
+     * aws-ec2 one, the placement record it already reads (null when that read threw, as for the volume). Omitted by
+     * injected doubles and with placement reads off: then there is no move computer.
+     */
+    computers?: { computerId: string; provider: string | null; placement: ReverseMovePlacementView | null }[];
+}
 type DbReader = { execute(query: SQL): Promise<unknown> };
 
 /**
@@ -159,17 +168,24 @@ type DbReader = { execute(query: SQL): Promise<unknown> };
  */
 export async function userPlacement(db: DbReader, userId: string): Promise<UserPlacement> {
     try {
-        const [{ isPlacementReadEnabled, meteredSizeForInstanceType }, { readPlacement, readPlacementProvider }, { computers }] = await Promise.all([
-            import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
-        if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [] };
-        const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
-            WHERE ${computers.userId} = ${userId}::uuid AND ${computers.deletedAt} IS NULL`);
+        const [{ isPlacementReadEnabled, meteredSizeForInstanceType }, { readPlacement, readPlacementProvider }, { computers: computersTable },
+            { reversePlacementView }] = await Promise.all([
+            import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema'),
+            import('@/server/lib/compute/provider-reverse')]);
+        // Phase B (§6.1.1 rule 4): with placement reads off there are no computer ids, so there is no move computer.
+        if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [], computers: [] };
+        const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computersTable.id}::text AS id FROM ${computersTable}
+            WHERE ${computersTable.userId} = ${userId}::uuid AND ${computersTable.deletedAt} IS NULL`);
         const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
         const ids = rows.map(row => row.id).filter((id): id is string => typeof id === 'string');
         const providers = await Promise.all(ids.map(id => readPlacementProvider(db, id)));
         const provider = providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(p => p !== null) ? 'cloudflare' : null;
         const awsVolumes: AwsVolumeRef[] = [];
         const awsSizes: (SizeCode | null)[] = [];
+        // Phase B (§6.1.1): no new placement query; the records read below, for the summary's move computer.
+        const computers: NonNullable<UserPlacement['computers']> = ids.map((computerId, index) => ({ computerId: computerId.toLowerCase(),
+            provider: providers[index] ?? null,
+            placement: providers[index] === 'cloudflare' ? { provider: 'cloudflare' as const, state: null, leaseEpoch: null, lifecycleJobId: null, instanceType: null } : null }));
         for (const [index, id] of ids.entries()) {
             if (providers[index] !== 'aws-ec2') continue;
             try {
@@ -177,16 +193,60 @@ export async function userPlacement(db: DbReader, userId: string): Promise<UserP
                 if (record?.provider === 'aws-ec2' && record.region && record.volumeId)
                     awsVolumes.push({ computerId: record.computerId, region: record.region, volumeId: record.volumeId });
                 awsSizes.push(record?.provider === 'aws-ec2' ? meteredSizeForInstanceType(record.instanceType) : null);
+                computers[index]!.placement = record?.provider === 'aws-ec2' ? reversePlacementView(record) : null;
             } catch {
                 console.warn('[billing.summary] volume placement unavailable');
                 awsSizes.push(null);
             }
         }
         const awsSize = awsSizes[0] ?? null;
-        return { provider, awsVolumes, ...(awsSize !== null && awsSizes.every(size => size === awsSize) ? { awsSize } : {}) };
+        return { provider, awsVolumes, ...(awsSize !== null && awsSizes.every(size => size === awsSize) ? { awsSize } : {}), computers };
     } catch {
         console.warn('[billing.summary] placement unavailable');
         return { provider: null, awsVolumes: [] };
+    }
+}
+
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1.1): the summary's move computer and its newest reverse row, from the
+ * live computers `userPlacement` already read (no new placement query, no new store method). First match wins:
+ * 1. the computer whose newest row HOLDS (in flight or `failed_needs_operator`; a holding row is always the newest);
+ * 2. else the user's aws-ec2 computer (a Free user holds at most one; with several, the lowest id);
+ * 3. else the computer whose newest row is terminal and visible (24 h, DB clock), the most recent: after a commit;
+ * 4. else none (no keys' worth of move: `reverseMove` null, `moveOnOpen` and `moveAvailable` false).
+ * 🔴 Probes 0012 first: a database without it (production today) gives `undefined`, today's summary exactly. Any read that
+ * fails gives `undefined` too: no move action is ever shown from a read that did not complete.
+ */
+export async function reverseMoveSummaryInput(db: DbReader, placement: UserPlacement, user: { id: string; email?: unknown },
+    isOperator: (email: string) => boolean | Promise<boolean>, env: Record<string, string | undefined> = process.env)
+    : Promise<ReverseMoveSummaryInput | undefined> {
+    const computers = placement.computers;
+    if (!computers) return undefined;
+    try {
+        const [{ createProviderReverseStore, REVERSE_MOVE_HOLDING, reverseMovesTablePresent }, { reverseFounderOwned, reverseMoveVisible },
+            { readAwsAdmissionConfig }] = await Promise.all([
+            import('@/server/lib/compute/provider-reverse-store'), import('@/server/lib/compute/provider-reverse'), import('@/server/lib/compute/aws-config')]);
+        const executor = db as unknown as Parameters<typeof reverseMovesTablePresent>[0];
+        if (!(await reverseMovesTablePresent(executor))) return undefined;
+        const store = createProviderReverseStore(executor);
+        const userId = user.id.toLowerCase();
+        const newest = await Promise.all(computers.map(c => store.readByComputer(c.computerId)));
+        // Another owner's row (a re-keyed computer) is never this user's move.
+        const entries = computers.map((c, i) => ({ ...c, row: newest[i]?.userId === userId ? newest[i]! : null }));
+        const holding = entries.find(e => e.row && REVERSE_MOVE_HOLDING.includes(e.row.state));
+        const aws = entries.filter(e => e.provider === 'aws-ec2').sort((a, b) => a.computerId < b.computerId ? -1 : a.computerId > b.computerId ? 1 : 0)[0];
+        const ended = entries.filter(e => e.row && !REVERSE_MOVE_HOLDING.includes(e.row.state) && reverseMoveVisible(e.row))
+            .sort((a, b) => a.row!.ages.stateEntered - b.row!.ages.stateEntered)[0];
+        const pick = holding ?? aws ?? ended ?? null;
+        const config = readAwsAdmissionConfig(env);
+        return {
+            tablePresent: true, row: pick?.row ?? null, placement: pick?.placement ?? null,
+            awsEnabled: config.enabled, killSwitchOn: config.enabled && config.killSwitch,
+            founderOwned: await reverseFounderOwned(user.email, isOperator),
+        };
+    } catch {
+        console.warn('[billing.summary] reverse move unavailable');
+        return undefined;
     }
 }
 
@@ -334,7 +394,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             placement = { provider: null, awsVolumes: [] };
         }
         const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
-        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null };
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement };
     };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
@@ -393,6 +453,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 ezilIdSignInUrl(),
             ]);
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
+            const reverseMove = await reverseMoveSummaryInput(ctx.db, placement.placement, ctx.user,
+                email => isOperator(email));
             let renewal = null;
             if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
                 try {
@@ -411,6 +474,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
                 ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
                 volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
+                ...(reverseMove ? { reverseMove } : {}),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
