@@ -134,6 +134,37 @@ describe('the claim\'s start after commit (the wake\'s undo for a replace)', () 
             .toEqual({ admitted: false, reason: 'region_not_configured' });
         expect(x.placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 7 });
     });
+    it('an intent the deployment refuses (its type is not listed) or an incomplete row is a wait value: nothing leased, no job, no throw', async () => {
+        for (const [over, reason] of [[{ instance_type: 'm6i.2xlarge' }, 'intent_invalid'], [{ fs_uuid: null }, 'placement_incomplete']] as const) {
+            const x = reverseDb({ placements: [stopped({ ...over, last_error: INSTANCE_LOST })], computers: [{ id: C1, user_id: U1 }] });
+            const start = recordingStarter();
+            const runtime = createReverseRuntime(x.db, { env: env(), aws: { starter: start.starter }, sleep: async () => {} });
+            expect(await runtime.claim(move(), (await readPlacement(x.db, C1)).record!), reason).toEqual({ admitted: false, reason });
+            expect(x.placements[0], reason).toMatchObject({ state: 'STOPPED', generation: 3, lease_epoch: 7, lifecycle_job_id: null });
+            expect(start.intents, reason).toEqual([]);
+            expect(x.recorded, reason).toEqual([]);
+        }
+    });
+    it('a write that fails after the claim committed still answers admitted (the row is booting; the boot pass hands it to the receipts)', async () => {
+        const x = reverseDb({ placements: [stopped({ last_error: INSTANCE_LOST })], computers: [{ id: C1, user_id: U1 }] });
+        const start = recordingStarter();
+        let leased = false;
+        const db: PlacementDb = { execute: q => x.db.execute(q), transaction: async fn => {
+            // The admission transaction commits; the next one (the STARTING transition after the start) fails.
+            if (leased) throw new Error('connection reset');
+            const result = await x.db.transaction(fn);
+            leased = true;
+            return result;
+        } };
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const outcome = await createReverseRuntime(db, { env: env(), aws: { starter: start.starter }, sleep: async () => {} })
+            .claim(move(), (await readPlacement(x.db, C1)).record!);
+        expect(outcome).toMatchObject({ admitted: true, move: { state: 'booting' } });
+        expect(start.intents).toHaveLength(1);
+        expect(x.placements[0]).toMatchObject({ state: 'LEASED', generation: 4, lease_epoch: 8 });
+        expect(warn).toHaveBeenCalledWith('[reverse-move] error', expect.objectContaining({ step: 'claim_start', error: 'connection reset' }));
+        warn.mockRestore();
+    });
 });
 
 describe('advanceReverseMoves: the sweep\'s last step (§5.4, §7.2)', () => {

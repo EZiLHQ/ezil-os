@@ -8,7 +8,9 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { MIGRATE_ACTION_TIMEOUT_MS } from '../cloudflare-guacamole-provider';
-import { ENROLLMENT_FAILED, ENROLLMENT_HOST_RETIRE, ENROLLMENT_SUCCEEDED, ImageJobConflictError, INSTANCE_LOST, type Placement } from './placement';
+import {
+    ENROLLMENT_FAILED, ENROLLMENT_HOST_RETIRE, ENROLLMENT_SUCCEEDED, ImageJobConflictError, INSTANCE_LOST, PlacementIntegrityError, type Placement,
+} from './placement';
 import {
     advanceReverseMove, classifyWorkerFailure, exportHeadFor, REVERSE_CALL_FIT_MS, REVERSE_DEADLINE_SECONDS, REVERSE_MOVE_BUDGET_SECONDS,
     REVERSE_OPERATOR_CODES, REVERSE_REOPEN_FINAL_CODES, reverseBootSettled, reverseCompensation, reverseDeadlineFailure, reverseFailureClass,
@@ -499,6 +501,81 @@ describe('the row\'s pass', () => {
         const w = world({}, held());
         w.ports.claim = async () => { throw new ReverseMoveConflictError('lost_race'); };
         expect(await w.pass()).toMatchObject({ state: 'requested' });
+    });
+});
+
+/**
+ * 🔴 Only the driver bounds a move (§5.4). A step that throws on every pass (an unreadable placement row, a claim whose
+ * intent the deployment refuses, a Worker call that throws) must still end at its state's deadline; before it, the throw
+ * goes to the sweep (errors++) and nothing is written.
+ */
+describe('a step that throws still meets its deadline (§5.4)', () => {
+    const integrity = () => new PlacementIntegrityError('duplicate_placement', C);
+    it('requested: a claim that throws waits with no write, logged; the deadline pass ends it boot_unavailable (claim attempted)', async () => {
+        const w = world({}, held());
+        w.ports.claim = async () => { throw new Error('connection reset'); };
+        expect(await w.pass()).toMatchObject({ state: 'requested', attempts: 0, lastError: null });
+        expect(w.writes).toEqual([]);
+        expect(w.logs).toEqual([expect.objectContaining({ event: 'error', step: 'claim', error: 'connection reset' })]);
+        w.age({ created: 600 });
+        expect(await w.pass()).toMatchObject({ state: 'failed_reopened', lastError: 'boot_unavailable' });
+        expect(w.writes).toEqual(['failed_reopened:boot_unavailable']);
+    });
+    it('requested: an intent the deployment refuses, or an incomplete placement, waits with an anomaly line, then boot_unavailable', async () => {
+        for (const reason of ['intent_invalid', 'placement_incomplete']) {
+            const w = world({}, held(), { claim: reason });
+            expect(await w.pass(), reason).toMatchObject({ state: 'requested', attempts: 0, lastError: null });
+            expect(w.writes, reason).toEqual([]);
+            expect(w.logs, reason).toEqual([expect.objectContaining({ event: 'anomaly', code: reason })]);
+            w.age({ created: 600 });
+            expect(await w.pass(), reason).toMatchObject({ state: 'failed_reopened', lastError: 'boot_unavailable' });
+        }
+    });
+    it('requested: a placement read that throws (not an image reservation) is not claimable: no claim, then computer_busy at 600 s', async () => {
+        const w = world({}, held());
+        w.ports.readPlacement = async () => { throw integrity(); };
+        expect(await w.pass()).toMatchObject({ state: 'requested', lastError: null });
+        expect(w.calls).not.toContain('claim');
+        expect(w.logs).toEqual([expect.objectContaining({ event: 'error', step: 'placement', error: 'placement_integrity:duplicate_placement' })]);
+        w.age({ created: 600 });
+        expect(await w.pass()).toMatchObject({ state: 'failed_reopened', lastError: 'computer_busy' });
+    });
+    it('booting: every read throws; before 15 min the pass throws with no write; past it boot_timeout compensates; past + 30 min boot_unsettled', async () => {
+        const w = world({ state: 'booting', exportBoot: BOOT, ages: { created: 9000, stateEntered: 899, commitSent: null, lastChunk: null } },
+            bootAt({ state: 'MOUNTING', instanceId: I_NEW }));
+        w.ports.readPlacement = async () => { throw integrity(); };
+        await expect(w.pass()).rejects.toThrow('placement_integrity:duplicate_placement');
+        expect(w.writes).toEqual([]);
+        w.age({ stateEntered: 900 });
+        expect(await w.pass()).toMatchObject({ state: 'booting', lastError: 'compensate:boot_timeout:host' });
+        expect(w.logs).toContainEqual(expect.objectContaining({ event: 'error', step: 'deadline', to: 'booting' }));
+        // The compensation reads the placement too: it throws until the bound, then the operator code (open blocked).
+        w.age({ stateEntered: 900 + 1799 });
+        await expect(w.pass()).rejects.toThrow('placement_integrity');
+        w.age({ stateEntered: 900 + 1800 });
+        expect(await w.pass()).toMatchObject({ state: 'failed_needs_operator', lastError: 'boot_unsettled' });
+        expect(w.writes).toEqual(['compensate:boot_timeout:host', 'failed_needs_operator:boot_unsettled']);
+    });
+    it('copying: a pull that throws past the copy deadline aborts the import first (compensation), like any deadline', async () => {
+        const w = world({ state: 'copying', exportBoot: { ...BOOT, instanceId: I_NEW }, exportHead: HEAD,
+            ages: { created: 0, stateEntered: 7500, commitSent: null, lastChunk: 1 } }, bootAt({ state: 'MOUNTING', instanceId: I_NEW }),
+        { worker: { pull: () => { throw new Error('fetch failed'); } } });
+        expect(await w.pass()).toMatchObject({ state: 'copying', lastError: 'compensate:copy_timeout' });
+    });
+    it('flipping: a commit that throws is never reopened; flip_stuck at 30 min after commit_sent_at', async () => {
+        const w = world({ state: 'flipping', exportBoot: { ...BOOT, instanceId: I_NEW }, exportHead: HEAD, commitSentAt: 'sent',
+            ages: { created: 0, stateEntered: 0, commitSent: 1799, lastChunk: null } }, bootAt({ state: 'STOPPED', instanceId: I_NEW, lastError: INSTANCE_LOST }),
+        { worker: { commit: () => { throw new Error('fetch failed'); } } });
+        await expect(w.pass()).rejects.toThrow('fetch failed');
+        w.age({ commitSent: 1800 });
+        expect(await w.pass()).toMatchObject({ state: 'failed_needs_operator', lastError: 'flip_stuck', commitSentAt: 'sent' });
+        expect(w.calls).not.toContain('abort');
+    });
+    it('a deadline write that loses its race hands the original error to the sweep', async () => {
+        const w = world({ state: 'booting', exportBoot: BOOT, ages: { created: 9000, stateEntered: 900, commitSent: null, lastChunk: null } }, null);
+        w.ports.readPlacement = async () => { throw integrity(); };
+        w.ports.store.recordCompensation = async () => { throw new ReverseMoveConflictError('lost_race'); };
+        await expect(w.pass()).rejects.toThrow('placement_integrity');
     });
 });
 

@@ -350,12 +350,21 @@ const wait = (m: ComputeReverseMove): Progress => ({ wait: m });
 const ADMISSION_TRY_LATER = ['aws_disabled', 'aws_config_invalid', 'kill_switch'];
 const ADMISSION_REFUSED = ['user_has_aws_computer', 'computer_not_owned', 'computer_deleted'];
 const ADMISSION_FLEET_WAIT = ['duplicate_placement', 'region_not_configured'];
+/**
+ * The runtime's own waits for THIS computer (contract gap, reported): a placement the deployment cannot build a lifecycle
+ * intent for (`intent_invalid`), or a legacy row missing a field the replace needs (`placement_incomplete`, the wake's
+ * `aws_placement_incomplete`). §5.5 pins no code for either, so each waits like a refusal (no `last_error`) with an
+ * anomaly line, and the deadline pass ends it `boot_unavailable`.
+ */
+export const CLAIM_COMPUTER_WAIT = ['intent_invalid', 'placement_incomplete'];
 const REACHED_EXPORT: readonly ReverseMoveState[] = ['exporting', 'copying', 'checking'];
+const errorText = (error: unknown) => error instanceof Error ? error.message.slice(0, 80) : 'unknown';
 
 /**
  * Drive one claimed row, step after step, until it waits, ends, or the pass is out of time (`deadlineMs`, the pass's
  * start + 90 s). Returns the last copy of the row. A lost compare-and-swap ends this row's pass (another driver moved it;
- * both are safe: the Worker serialises per DO and every write is a CAS). Other errors propagate to the driver.
+ * both are safe: the Worker serialises per DO and every write is a CAS). Any other throw still meets the row's deadline
+ * (`overdue`); when none is due it propagates to the driver, and the next pass tries again.
  */
 export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverseMove, deadlineMs: number): Promise<ComputeReverseMove> {
     const fits = (ms: number) => deadlineMs - ports.clock() >= ms;
@@ -383,19 +392,27 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
 
     async function requested(m: ComputeReverseMove): Promise<Progress> {
         if (ports.killSwitchOn()) return next(await startFailure(m, 'kill_switch'));
-        let p: Placement | null = null, reserved = false;
+        let p: Placement | null = null, unread = false;
         try { p = await placement(m.computerId); } catch (error) {
-            if (!(error instanceof ImageJobConflictError)) throw error;
-            reserved = true;
+            // An image reservation (§5.2.1), or a read that fails (a duplicate or unreadable placement row): not claimable
+            // this pass, so the deadline pass ends it `computer_busy`. Never a throw past this state's own deadline.
+            if (!(error instanceof ImageJobConflictError)) ports.log('error', { moveId: m.id, state: m.state, step: 'placement', error: errorText(error) });
+            unread = true;
         }
         if (p && p.provider === 'aws-ec2' && p.ownerUserId === m.userId && (typeof p.region !== 'string' || !AWS_REGION_PATTERN.test(p.region)))
             return next(await startFailure(m, 'region_missing'));
-        let claimable = !reserved && !!p && p.provider === 'aws-ec2' && p.ownerUserId === m.userId && p.state === 'STOPPED' && p.lifecycleJobId === null;
+        let claimable = !unread && !!p && p.provider === 'aws-ec2' && p.ownerUserId === m.userId && p.state === 'STOPPED' && p.lifecycleJobId === null;
         if (claimable) claimable = !(await ports.openEpoch(m.computerId).catch(() => true));
         if (claimable) {
             // The deadline's outcome is decided only from a pass that attempted the claim (§5.1.1): no attempt, no decision.
             if (!fits(REVERSE_CALL_FIT_MS.aws)) return wait(m);
-            const outcome = await ports.claim(m, p!);
+            let outcome: ReverseClaimOutcome;
+            try { outcome = await ports.claim(m, p!); } catch (error) {
+                if (error instanceof ReverseMoveConflictError) throw error;
+                // Attempted and not admitted: a wait like any refusal, so the deadline pass ends it `boot_unavailable`.
+                ports.log('error', { moveId: m.id, state: m.state, step: 'claim', error: errorText(error) });
+                outcome = { admitted: false, reason: 'claim_failed' };
+            }
             if (outcome.admitted) return next(outcome.move);
             if (ADMISSION_TRY_LATER.includes(outcome.reason)) return next(await startFailure(m, 'kill_switch'));
             if (ADMISSION_REFUSED.includes(outcome.reason)) {
@@ -403,7 +420,7 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
                 return next(await ports.store.fail(m, 'failed_reopened', 'boot_refused'));
             }
             if (outcome.reason === 'region_missing') return next(await startFailure(m, 'region_missing'));
-            if (ADMISSION_FLEET_WAIT.includes(outcome.reason)) anomaly(m, outcome.reason);
+            if (ADMISSION_FLEET_WAIT.includes(outcome.reason) || CLAIM_COMPUTER_WAIT.includes(outcome.reason)) anomaly(m, outcome.reason);
         }
         if (m.ages.created >= REVERSE_DEADLINE_SECONDS.requested) return next(await startFailure(m, claimable ? 'boot_unavailable' : 'computer_busy'));
         return wait(m);
@@ -552,6 +569,23 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
         }
     }
 
+    /**
+     * 🔴 The deadline a THROWING step still meets (§5.4). Only the driver bounds a move, so a step that throws on every pass
+     * (a placement row that cannot be read, a receipt or Worker call that throws, a store write that fails) must not hold
+     * the computer past its state's deadline. Decided on a fresh copy of the row (its `ages` and CAS token), one write:
+     * `flipping` → `flip_stuck` (never reopened); a compensation past its bound → `boot_unsettled`; `requested` → the
+     * not-claimable outcome `computer_busy`; any other state → its own deadline, compensated first. Null when none is due.
+     */
+    const overdue = async (moveId: string): Promise<ComputeReverseMove | null> => {
+        const m = await ports.store.readById(moveId);
+        if (!m || !REVERSE_MOVE_IN_FLIGHT.includes(m.state)) return null;
+        if (m.state !== 'flipping' && reverseCompensation(m))
+            return m.exportBoot && reverseCompensationExpired(m) ? ports.store.fail(m, 'failed_needs_operator', 'boot_unsettled') : null;
+        const late = m.state === 'requested' ? (m.ages.created >= REVERSE_DEADLINE_SECONDS.requested ? 'computer_busy' : null) : reverseDeadlineFailure(m);
+        if (!late) return null;
+        return m.state === 'flipping' ? ports.store.fail(m, 'failed_needs_operator', late) : startFailure(m, late);
+    };
+
     let m = m0;
     try {
         // §5.8: the entitlement is re-read at every pre-flip pass (and once more in transaction 1, under the locks).
@@ -568,7 +602,11 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
         }
     } catch (error) {
         if (error instanceof ReverseMoveConflictError && error.reason === 'lost_race') return m;
-        throw error;
+        // A lost race on the deadline write, or a re-read that fails too: the original error goes to the sweep (errors++).
+        const bounded = await overdue(m.id).catch(() => null);
+        if (!bounded) throw error;
+        ports.log('error', { moveId: m.id, state: m.state, step: 'deadline', to: bounded.state, error: errorText(error) });
+        return bounded;
     }
     return m;
 }

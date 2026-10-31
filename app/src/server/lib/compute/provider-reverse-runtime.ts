@@ -20,7 +20,9 @@ import { buildEnrollmentUserData, issueEnrollmentNonce, type TunnelClient } from
 import type { Ec2ComputerResourceFinder, Ec2ReplacementDescriber, Ec2VolumeDescriber } from './aws-clients';
 import type { Ec2EnrollmentDescriber } from './aws-enroll';
 import type { LifecycleStarter } from './aws-ec2';
-import { buildLifecycleWork, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent } from './aws-intent';
+import {
+    buildLifecycleWork, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleWork,
+} from './aws-intent';
 import { settleReplacementGeneration } from './aws-rebase-generation';
 import { applyLifecycleReceipt, retireUnenrolledHost, startLifecycleJob, type LifecycleExecutionReader, type PoolDeps, type ReceiptDeps } from './aws-receipts';
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
@@ -140,14 +142,21 @@ export function createReverseRuntime(db: PlacementDb, options: {
             if (!deployments.ok || !aws.starter || !readAwsEnrollUrl(e)) return { admitted: false, reason: 'aws_config_invalid' };
             const deployment = deployments.deployments[p.region ?? ''];
             if (!deployment) return { admitted: false, reason: 'region_not_configured' };
-            // An incomplete legacy row cannot be replaced (the wake answers aws_placement_incomplete): a wait, never a guess.
-            if (!p.volumeId || !p.fsUuid || !p.fenceToken || !p.instanceType || !p.instanceId) return { admitted: false, reason: 'cas_conflict' };
+            // An incomplete legacy row cannot be replaced (the wake answers aws_placement_incomplete): a wait with an anomaly
+            // line, never a guess (contract gap: no pinned code; the deadline pass ends it boot_unavailable).
+            if (!p.volumeId || !p.fsUuid || !p.fenceToken || !p.instanceType || !p.instanceId) return { admitted: false, reason: 'placement_incomplete' };
             const now = new Date();
             const nonce = issueEnrollmentNonce(now, options.randomBytes ?? nodeRandomBytes);
             const fenceToken = newId(), leaseEpoch = p.leaseEpoch + 1;
             const userData = buildEnrollmentUserData({ computerId: p.computerId, volumeId: p.volumeId, fsUuid: p.fsUuid, generation: p.generation + 1,
                 leaseEpoch, nonce: nonce.nonce, provision: false, enrollUrl: readAwsEnrollUrl(e)! });
-            const work = buildLifecycleWork(exportBootIntent(p, deployment, { jobId: newId(), fenceToken, leaseEpoch, userData }));
+            let work: LifecycleWork;
+            // Built BEFORE admission, so an intent the deployment refuses (say, its instanceTypes no longer list this
+            // computer's type) leases nothing and starts nothing: a wait, never a throw that skips the row's deadline.
+            try { work = buildLifecycleWork(exportBootIntent(p, deployment, { jobId: newId(), fenceToken, leaseEpoch, userData })); } catch (error) {
+                if (error instanceof LifecycleIntentInvalidError) return { admitted: false, reason: 'intent_invalid' };
+                throw error;
+            }
             let recorded: ComputeReverseMove | null = null;
             const outcome = await admitExportBoot(db, {
                 userId: m.userId, computerId: m.computerId, expected: { generation: p.generation, leaseEpoch: p.leaseEpoch },
@@ -161,15 +170,21 @@ export function createReverseRuntime(db: PlacementDb, options: {
             if (!outcome.admitted) return { admitted: false, reason: outcome.reason };
             // After commit: the wake's own start and undo (aws-ec2.ts `launch`), a replace's undo being UNCONFIRMED.
             const leased = outcome.placement;
-            const started = await startLifecycleJob(aws.starter, leased.region!, work, options.sleep);
-            if (started === 'started') {
-                await transitionPlacement(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, to: 'STARTING' });
-            } else if (started === 'refused') {
-                if (await settleReplacementGeneration(receiptDeps(), leased, { ...work, intent: work.intent }, true) !== 'settled')
-                    await transitionPlacement(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, to: 'UNCONFIRMED',
-                        fields: { enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null } });
-            } else {
-                await markLifecycleStartUnknown(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, undo: 'UNCONFIRMED' });
+            try {
+                const started = await startLifecycleJob(aws.starter, leased.region!, work, options.sleep);
+                if (started === 'started') {
+                    await transitionPlacement(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, to: 'STARTING' });
+                } else if (started === 'refused') {
+                    if (await settleReplacementGeneration(receiptDeps(), leased, { ...work, intent: work.intent }, true) !== 'settled')
+                        await transitionPlacement(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, to: 'UNCONFIRMED',
+                            fields: { enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null } });
+                } else {
+                    await markLifecycleStartUnknown(db, { computerId: leased.computerId, ownerUserId: m.userId, expected: leased, undo: 'UNCONFIRMED' });
+                }
+            } catch (error) {
+                // The claim committed (the row is `booting`): a failed write after it leaves the boot LEASED with its job,
+                // which the `booting` pass hands to the receipts, bounded by boot_timeout (§5.4). Never "not admitted".
+                console.warn('[reverse-move] error', { moveId: m.id, step: 'claim_start', error: error instanceof Error ? error.message.slice(0, 80) : 'unknown' });
             }
             return { admitted: true, move: recorded! };
         },
