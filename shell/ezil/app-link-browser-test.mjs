@@ -256,7 +256,14 @@ try {
             assert.deepEqual([near(windowed, stash), px(windowed.slice(2)), g.stable], [true, [980, 680], true],
                 'positive control: Restore window lands on the 980x680 box Code had before full view (to the pixel), not the viewport');
         }
+        // Wait for Back to bring Settings in front before the next Back. Code
+        // is still the active window until then, so without this wait the
+        // `.window-active` wait below is met before either Back's 80ms focus
+        // lands, and Settings can come in front between the two geometry
+        // reads (Chromium at 4x and 6x CPU throttling: 10 of 12 runs). Code is
+        // in front again once both focuses land.
         await tab.goBack(); await at('/app/settings');
+        await tab.locator('.window[data-app="settings"].window-active').waitFor();
         await tab.goBack(); await at('/app/code');
         assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
             restore ? '🔴 Back to E1: Code stays windowed, and E1 takes its view' : `${label}: Back to E1, full`);
