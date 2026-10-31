@@ -4,13 +4,13 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 mock.module('cloudflare:workers', () => ({ DurableObject: class {}, WorkerEntrypoint: class {}, RpcTarget: class {}, RpcStub: class {}, env: {} }));
 import { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD } from './hmac';
-import { EXPORT_CONTROL_PATH, verifyGatewayHeader, type AwsTunnelRecord } from './aws-origin';
+import { EXPORT_CONTROL_PATH, readAwsExport, verifyGatewayHeader, type AwsTunnelRecord } from './aws-origin';
 import { REGISTRY_PATHS } from './aws-tunnels';
 import { MIGRATING_FLAG, SNAPSHOT_HEAD, chunkKey } from './workspace-persist';
 import {
   EXPORT_CHUNK_TIMEOUT_MS, EXPORT_READ_TIMEOUT_MS, IMPORT_CONFLICT_CODES, PULL_CHUNK_DEADLINE_MS, PULL_CONCURRENCY,
   PULL_TRANSFER_WINDOW_MS, REVERSE_IMPORT_HEAD_KEY, REVERSE_IMPORT_KEY, REVERSE_IMPORT_PUT_PREFIX, chunkTimeoutMs,
-  parseImportRequest, runReverseImport, type ExportHostAccess, type ReverseImportDeps,
+  parseExportHead, parseImportRequest, runReverseImport, type ExportHostAccess, type ReverseImportDeps,
 } from './workspace-migration-import';
 
 const SECRET = 'reverse-import-tests-only';
@@ -1316,5 +1316,83 @@ describe('reverse import: the no-push pin (§4.1 [r6])', () => {
     expect(f.fetches.filter(({ url }) => new URL(url).hostname !== host || !new URL(url).pathname.startsWith(`${EXPORT_CONTROL_PATH}/`))).toEqual([]);
     expect(f.host.requests.filter(({ path }) => !path.startsWith(`${EXPORT_CONTROL_PATH}/`))).toEqual([]);
     expect(new Set(f.registryPaths)).toEqual(new Set([REGISTRY_PATHS.get]));
+  });
+});
+
+// r7 integration: the four guards the lane's own tests left unpinned (verifier mutants W20, W21, W22,
+// W24), ported from the verifier's probe. Each drives the real module with the smallest fake it needs.
+describe('reverse import: guards the verifier found unpinned (W20, W21, W22, W24)', () => {
+  const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+  function kv(initial: Record<string, unknown>) {
+    const map = new Map<string, unknown>(Object.entries(initial));
+    return { map, api: {
+      get: async (k: string) => structuredClone(map.get(k)),
+      put: async (k: string, v: unknown) => { map.set(k, structuredClone(v)); },
+      delete: async (keys: string[]) => { let n = 0; for (const k of keys) if (map.delete(k)) n++; return n; },
+      list: async ({ prefix }: { prefix: string }) => new Map([...map].filter(([k]) => k.startsWith(prefix))),
+    } };
+  }
+  const bareDeps = (over: Record<string, unknown>) => ({ sandboxName: NAME, prefixOverride: undefined, flushContext: async () => undefined,
+    containerRunning: () => false, withStartQueue: (op: () => Promise<unknown>) => op(), adoptImportedWorkspace: async () => {},
+    host: null, now: Date.now, ...over }) as unknown as ReverseImportDeps;
+
+  it('W24 (§2.3, §4.3 step 3): a head whose middle chunk is short but whose bytes add up is refused', () => {
+    const head = { v: 1, moveId: MOVE, generation: GEN, sha256: sha('a'), entries: 1, skipped: 0, bytes: 5 + MIB,
+      chunks: [{ i: 0, size: 5, sha256: sha('b') }, { i: 1, size: MIB, sha256: sha('c') }] };
+    expect(parseExportHead(head, { moveId: MOVE, generation: GEN })).toBeNull();
+    // Control: the same chunks in the legal order are accepted.
+    expect(parseExportHead({ ...head, chunks: [{ i: 0, size: MIB, sha256: sha('c') }, { i: 1, size: 5, sha256: sha('b') }] },
+      { moveId: MOVE, generation: GEN })).not.toBeNull();
+  });
+
+  it('W20 (§4.1): a freshProvision context for another prefix is compared (prefix_mismatch), never taken as the placeholder', async () => {
+    const st = kv({});
+    const bucket = { get: async () => null, put: async () => ({ etag: 'x' }), list: async () => ({ objects: [], truncated: false }), delete: async () => {} };
+    const d = bareDeps({ storage: st.api, selectStore: async () => ({ kind: 'r2', bucket }),
+      flushContext: async () => ({ prefix: '99999999-9999-4999-8999-999999999999/branches/main', freshProvision: true }) });
+    const r = await runReverseImport(parseImportRequest('begin', beginBody, NAME)!, d);
+    expect(r).toEqual({ status: 409, body: { ok: false, error: 'prefix_mismatch' } });
+    expect(st.map.size).toBe(0);
+  });
+
+  it('W21 (§4.4 step 3): a system save landing between step 3\'s read and its put loses the CAS (system_head_moved)', async () => {
+    const previous = { version: 1, generation: '55555555-5555-4555-8555-555555555555', chunkGeneration: '66666666-6666-4666-8666-666666666666',
+      sha256: sha('p'), entries: 2, chunks: [{ size: 20, sha256: sha('q') }] };
+    const marker = { version: 2, kind: 'migrated', targetProvider: 'aws-ec2', migratedAt: '2026-10-22T10:00:00.000Z',
+      exported: { generation: previous.generation, chunkGeneration: previous.chunkGeneration, sha256: previous.sha256, entries: 2 }, previous };
+    const own = { version: 1, generation: GEN, chunkGeneration: GEN, sha256: sha('o'), entries: 1, chunks: [{ size: 7, sha256: sha('r') }] };
+    const objects = new Map<string, { body: string; etag: string }>([[HEAD, { body: JSON.stringify(own), etag: 'w1' }],
+      [SYS, { body: JSON.stringify(marker), etag: 'E1' }]]);
+    const bucket = {
+      get: async (k: string) => {
+        const o = objects.get(k);
+        if (!o) return null;
+        // A concurrent system save lands right after this read.
+        if (k === SYS) objects.set(SYS, { body: JSON.stringify({ ...own, generation: '77777777-7777-4777-8777-777777777777' }), etag: 'E2' });
+        return { etag: o.etag, size: o.body.length, arrayBuffer: async () => new TextEncoder().encode(o.body).buffer };
+      },
+      put: async (k: string, v: Uint8Array, opts?: { onlyIf?: { etagMatches?: string } }) => {
+        if (opts?.onlyIf?.etagMatches !== undefined && objects.get(k)?.etag !== opts.onlyIf.etagMatches) return null;
+        objects.set(k, { body: new TextDecoder().decode(v), etag: 'E3' });
+        return { etag: 'E3' };
+      },
+      list: async () => ({ objects: [], truncated: false }), delete: async (keys: string[]) => { for (const k of keys) objects.delete(k); },
+    };
+    const st = kv({ [REVERSE_IMPORT_KEY]: { ...ids, ...PLACEMENT, store: 'r2', prefix: P, headKind: 'migrated',
+      migratedEtag: 'w0', systemMigratedEtag: 'E1', startedAt: new Date().toISOString(), committing: true } });
+    const d = bareDeps({ storage: st.api, selectStore: async () => ({ kind: 'r2', bucket }) });
+    const r = await runReverseImport(parseImportRequest('commit', { ...ids, sha256: own.sha256, chunkCount: 1, verifyOnly: false }, NAME)!, d);
+    expect(r).toEqual({ status: 409, body: { ok: false, error: 'system_head_moved' } });
+    expect(objects.get(SYS)!.etag).toBe('E2');
+  });
+
+  it('W22: every export GET asks the edge for identity encoding, so the chunk Content-Length stays checkable', async () => {
+    const seen: Array<string | null> = [];
+    const record = { computerId: COMPUTER, sandboxId: NAME, generation: 7, leaseEpoch: 3, controlKey: CONTROL_KEY } as unknown as AwsTunnelRecord;
+    const fetchFn = async (_u: string, init?: RequestInit) => { seen.push(new Headers(init?.headers).get('accept-encoding')); return new Response('{}'); };
+    for (const read of ['status', 'head', { chunk: 0 }] as const) {
+      await readAwsExport(record, 'ezil.work', read, fetchFn as never, Math.floor(Date.now() / 1000), 1000);
+    }
+    expect(seen).toEqual(['identity', 'identity', 'identity']);
   });
 });
