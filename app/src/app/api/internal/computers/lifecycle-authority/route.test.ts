@@ -223,8 +223,8 @@ describe('placement is the authority', () => {
     ])('refuses mismatched %s', async (_name, overrides) => {
         seed([row(overrides)]);
         await refused();
-        // A Cloudflare row also gets the read-only active-migration lookup; never a write.
-        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 3 : 2);
+        // A Cloudflare row also gets the read-only active- and failed-migration lookups; never a write.
+        expect(execute).toHaveBeenCalledTimes('provider' in overrides ? 4 : 2);
     });
 
     it('refuses another computer', async () => {
@@ -249,6 +249,69 @@ describe('placement is the authority', () => {
     it('returns uncertain on database failure', async () => {
         execute.mockRejectedValue(new Error('database unavailable'));
         await refused(request(), 503);
+    });
+});
+
+describe('failed migration boot retire', () => {
+    const MIGRATION_RETIRE = "workspace_head #>> '{_awsProvision,retire,jobId}'";
+    /** The failed migration's unreleased intent, after reopen restored the Cloudflare placement. */
+    function failedMigration(patch: { state?: string; released?: boolean; retireJobId?: string } = {}) {
+        const placement = { computerId: authority.computerId, ownerUserId: authority.computerId, provider: 'aws-ec2', store: 'ebs',
+            state: 'PROVISIONING', generation: 1, leaseEpoch: authority.leaseEpoch, region: 'ap-south-1', zoneId: 'aps1-az1',
+            instanceId: 'i-11111111111111111', volumeId: 'vol-11111111111111111', instanceType: 'm6i.large',
+            fsUuid: '33333333-3333-4333-8333-333333333333', fenceToken: '44444444-4444-4444-8444-444444444444',
+            enrollNonceHash: null, enrollExpiresAt: null, enrollConsumedHash: 'ef'.repeat(32), tunnelId: null, leaseUntil: null,
+            presenceAt: null, lifecycleJobId: '55555555-5555-4555-8555-555555555555', lifecycleDigest: 'ef'.repeat(32),
+            lastError: 'enroll_tunnel_pending', updatedAt: new Date(0).toISOString() };
+        return { id: '66666666-6666-4666-8666-666666666666', user_id: authority.computerId, computer_id: authority.computerId,
+            from_provider: 'cloudflare', to_provider: 'aws-ec2', to_size: 'standard', state: patch.state ?? 'failed_reopened',
+            attempts: 1, last_error: 'recovery:abort:restore', created_at: '2026-10-31 08:17:00+00', updated_at: '2026-10-31 10:04:00+00',
+            workspace_head: { _awsProvision: { placement, deployment: {}, source: null, reservedAt: new Date(0).toISOString(),
+                ...(patch.released ? { released: true } : {}),
+                retire: { jobId: patch.retireJobId ?? authority.jobId, digest: authority.digest, requestedAt: new Date(0).toISOString() } } } };
+    }
+    async function seedMigration(migration: ReturnType<typeof failedMigration> | null, rows = [row({ provider: 'cloudflare', workspace_store: 'r2' })]) {
+        const fake = seed(rows), { PgDialect } = await import('drizzle-orm/pg-core'), dialect = new PgDialect();
+        const lookups: { sql: string; params: unknown[] }[] = [];
+        execute.mockImplementation(async (q: Parameters<InstanceType<typeof PgDialect>['sqlToQuery']>[0]) => {
+            const query = dialect.sqlToQuery(q);
+            if (!query.sql.includes(MIGRATION_RETIRE)) return fake.db.execute(q);
+            lookups.push(query);
+            return { rows: migration ? [migration] : [] };
+        });
+        return lookups;
+    }
+
+    it.each([['the restored Cloudflare row', undefined], ['no placement row', []]] as const)('authorizes the recorded retire over %s', async (_name, rows) => {
+        const lookups = await seedMigration(failedMigration(), rows === undefined ? undefined : [...rows]);
+        const res = await POST(request());
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ authorized: true, ...authority });
+        // Bound in SQL to this computer, this exact job, a failed state and an unreleased boot.
+        expect(lookups).toHaveLength(1);
+        expect(lookups[0]!.params).toEqual([authority.computerId, authority.jobId]);
+        expect(lookups[0]!.sql).toContain("state IN ('failed_reopened', 'failed_needs_operator')");
+        expect(lookups[0]!.sql).toContain("COALESCE(workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'");
+    });
+
+    it.each([
+        ['another retire job', failedMigration({ retireJobId: '77777777-7777-4777-8777-777777777777' }), {}],
+        ['a released boot', failedMigration({ released: true }), {}],
+        ['an active migration', failedMigration({ state: 'provisioning' }), {}],
+        ['a committed migration', failedMigration({ state: 'committed' }), {}],
+        ['a mismatched digest', failedMigration(), { digest: 'ab'.repeat(32) }],
+        ['a mismatched lease epoch', failedMigration(), { leaseEpoch: authority.leaseEpoch + 1 }],
+        ['no failed migration', null, {}],
+    ] as const)('refuses %s', async (_name, migration, patch) => {
+        await seedMigration(migration);
+        await refused(request(JSON.stringify(Object.fromEntries(Object.entries({ ...authority, ...patch })
+            .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)))));
+    });
+
+    it('never consults a failed migration while an AWS placement is published', async () => {
+        const lookups = await seedMigration(failedMigration(), [row({ state: 'RUNNING', lifecycle_job_id: null, lifecycle_digest: null })]);
+        await refused();
+        expect(lookups).toHaveLength(0);
     });
 });
 
