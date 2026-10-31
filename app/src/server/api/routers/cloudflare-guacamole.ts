@@ -75,11 +75,12 @@ import {
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
+import { failureFields, failureReason, FailureDiagnosticsError } from '@/server/lib/failure-diagnostics';
 import { prepareAwsPoolSession, requestAwsPreview, waitForAwsPreviewPlacement } from '@/server/lib/compute/aws-preview';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
-import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer, stopCooldownAnswer } from './compute-dispatch';
+import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer, stopCooldownAnswer, withAwsFailureDiagnostics } from './compute-dispatch';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -239,13 +240,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
             });
             if (routed.kind === 'aws-ec2') {
-                return awsPreviewAnswer(
+                return withAwsFailureDiagnostics(await awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
-                );
+                ), correlationId, 'cloudflareGuacamole.previewUrl');
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             const migrating = cloudflareMigrationAnswer(result);
@@ -264,12 +265,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
+                // FEEDBACK-DIAG: the allowlisted underlying cause, on this log
+                // line AND on the answer, beside the id that names this line.
+                const reason = failureReason(result.reason) ?? failureReason(result.errorCode);
                 console.error('[cloudflareGuacamole.previewUrl] worker error', {
                     correlationId,
                     computerId: input.computerId,
                     error: logSafe,
                     errorCode: result.errorCode,
                     retryable: result.retryable,
+                    reason,
                 });
 
                 // Throwing is not neutral: a thrown error is the only thing
@@ -288,12 +293,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                         error: logSafe,
                         errorCode: result.errorCode,
                         provider: 'cloudflare-guacamole' as const,
+                        ...failureFields({ reason, correlationId }),
                     };
                 }
 
                 throw new TRPCError({
                     code: 'BAD_GATEWAY',
                     message: `Desktop Worker returned an error (correlationId=${correlationId}). Check server logs for details.`,
+                    // The 5xx message is replaced with a generic one on the way
+                    // out (`shellErrorResponse`); the cause carries what survives.
+                    cause: new FailureDiagnosticsError({ reason, correlationId }),
                 });
             }
 
@@ -345,10 +354,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // hammering a broken edge route three times before the user
                 // hears anything helps nobody. `desktop_unreachable` has its
                 // own honest copy and its own Retry button.
+                const frameError = `desktop_frame_${frame.reason}${frame.status ? `_${frame.status}` : ''}`;
                 return {
                     ok: false as const,
-                    error: `desktop_frame_${frame.reason}${frame.status ? `_${frame.status}` : ''}`,
+                    error: frameError,
                     errorCode: 'desktop_unreachable' as const,
+                    // FEEDBACK-DIAG: the line logged above carries this id.
+                    ...failureFields({ reason: failureReason(frameError), correlationId }),
                     // 🔴 THE OBSERVATION, ON THE WIRE. Before this, ten
                     // production failures were indistinguishable: every one
                     // arrived as a bare `desktop_unreachable` and nobody could
@@ -514,11 +526,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
                 const held = await stopCooldownAnswer(ctx.db, computer);
                 if (held) return held;
-                return awsPreviewAnswer(
+                return withAwsFailureDiagnostics(await awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
-                );
+                ), correlationId, 'cloudflareGuacamole.appPreviewUrl');
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             const migrating = cloudflareMigrationAnswer(result);
@@ -537,12 +549,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
+                // FEEDBACK-DIAG: the allowlisted underlying cause, on this log
+                // line AND on the answer, beside the id that names this line.
+                const reason = failureReason(result.reason) ?? failureReason(result.errorCode);
                 console.error('[cloudflareGuacamole.appPreviewUrl] worker error', {
                     correlationId,
                     computerId: input.computerId,
                     error: logSafe,
                     errorCode: result.errorCode,
                     retryable: result.retryable,
+                    reason,
                 });
 
                 // Same value-vs-throw split as `previewUrl` above — a thrown
@@ -555,12 +571,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                         error: logSafe,
                         errorCode: result.errorCode,
                         provider: 'cloudflare-guacamole' as const,
+                        ...failureFields({ reason, correlationId }),
                     };
                 }
 
                 throw new TRPCError({
                     code: 'BAD_GATEWAY',
                     message: `Desktop Worker returned an error (correlationId=${correlationId}). Check server logs for details.`,
+                    // The 5xx message is replaced with a generic one on the way
+                    // out (`shellErrorResponse`); the cause carries what survives.
+                    cause: new FailureDiagnosticsError({ reason, correlationId }),
                 });
             }
 
@@ -584,6 +604,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: result.appPreviewExpose.error ?? 'app_preview_expose_failed',
                     errorCode: 'app_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'app_preview_expose_failed', correlationId }),
                 };
             }
 
@@ -617,6 +638,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: 'app_preview_port_not_exposed',
                     errorCode: 'app_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'app_preview_port_not_exposed', correlationId }),
                 };
             }
             if (verdict.kind === 'use') {
@@ -640,6 +662,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: 'app_preview_origin_unresolvable',
                     errorCode: 'app_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'app_preview_origin_unresolvable', correlationId }),
                 };
             }
 
@@ -722,13 +745,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
                 const [ensured] = await Promise.allSettled([routed.provider.ensure({ correlationId }, computer, ensureOptions), syncCredential()]);
                 if (ensured.status === 'rejected') throw ensured.reason;
-                return awsPreviewAnswer(
+                return withAwsFailureDiagnostics(await awsPreviewAnswer(
                     ensured.value,
                     () => requestAwsPreview(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
-                );
+                ), correlationId, 'cloudflareGuacamole.codePreviewUrl');
             }
             await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -748,12 +771,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
+                // FEEDBACK-DIAG: the allowlisted underlying cause, on this log
+                // line AND on the answer, beside the id that names this line.
+                const reason = failureReason(result.reason) ?? failureReason(result.errorCode);
                 console.error('[cloudflareGuacamole.codePreviewUrl] worker error', {
                     correlationId,
                     computerId: input.computerId,
                     error: logSafe,
                     errorCode: result.errorCode,
                     retryable: result.retryable,
+                    reason,
                 });
 
                 if (surfacePreviewErrorAsValue(result.errorCode, result.retryable)) {
@@ -762,12 +789,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                         error: logSafe,
                         errorCode: result.errorCode,
                         provider: 'cloudflare-guacamole' as const,
+                        ...failureFields({ reason, correlationId }),
                     };
                 }
 
                 throw new TRPCError({
                     code: 'BAD_GATEWAY',
                     message: `Desktop Worker returned an error (correlationId=${correlationId}). Check server logs for details.`,
+                    // The 5xx message is replaced with a generic one on the way
+                    // out (`shellErrorResponse`); the cause carries what survives.
+                    cause: new FailureDiagnosticsError({ reason, correlationId }),
                 });
             }
 
@@ -789,6 +820,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: result.codePreviewExpose.error ?? 'code_preview_expose_failed',
                     errorCode: 'code_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'code_preview_expose_failed', correlationId }),
                 };
             }
 
@@ -807,6 +839,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: 'code_preview_port_not_exposed',
                     errorCode: 'code_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'code_preview_port_not_exposed', correlationId }),
                 };
             }
             if (verdict.kind === 'use') {
@@ -830,6 +863,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     error: 'code_preview_origin_unresolvable',
                     errorCode: 'code_preview_unavailable' as const,
                     provider: 'cloudflare-guacamole' as const,
+                    ...failureFields({ reason: 'code_preview_origin_unresolvable', correlationId }),
                 };
             }
 

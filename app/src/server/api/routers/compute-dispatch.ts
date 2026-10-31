@@ -30,6 +30,7 @@ import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 import { planFromSubscriptions } from '@/server/billing/v3/catalog';
 import type { SwitchConfigurationOutputV3, SwitchPhaseV3 } from '@/server/billing/v3/contract';
 import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
+import { failureFields, failureReason, leadingCode } from '@/server/lib/failure-diagnostics';
 import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
 import { recordComputeTiming } from '@/server/lib/compute/aws-pool-timing';
 import {
@@ -215,6 +216,9 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
         }
     }
     if (!result.ok) {
+        // FEEDBACK-DIAG: the provider's own code (and its `error`, when that is
+        // a different code) — `sandbox_starting` alone cannot say which wait.
+        const reason = failureReason(result.errorCode, leadingCode(result.error));
         return {
             ok: false as const,
             error: result.errorCode,
@@ -222,6 +226,7 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             retryable: result.retryable,
             provider: 'cloudflare-guacamole' as const,
             computeProvider: 'aws-ec2' as const,
+            ...(reason ? { reason } : {}),
             ...awsMigrationAnswer(result),
             // RETRY-118: the expired attempt an explicit user Retry may reset; nothing else carries it.
             ...(result.errorCode === 'capacity_attempt_expired' && result.capacityAttemptId
@@ -235,6 +240,33 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
         provider: 'cloudflare-guacamole' as const,
         computeProvider: 'aws-ec2' as const,
     };
+}
+
+/**
+ * FEEDBACK-DIAG: diagnostics for an AWS preview answer, applied by the router.
+ *
+ * Every not-ok answer gets an allowlisted `reason`. A REFUSAL (anything but
+ * `sandbox_starting`) is also logged here with the request's correlation id
+ * and carries that id, so a feedback report can be matched to this line.
+ * `sandbox_starting` is progress the shell re-asks every ~1.5 s for up to ten
+ * minutes: it is neither logged nor given an id, because an id no log line
+ * holds cannot be grepped for and would only look like it could. Only codes
+ * and the random request id are logged — never the computer, user, URL or body.
+ */
+export function withAwsFailureDiagnostics<T extends { ok: boolean; error?: unknown; errorCode?: unknown; reason?: unknown }>(
+    answer: T, correlationId: string, label: string,
+): T {
+    if (answer.ok) return answer;
+    const reason = failureReason(answer.reason) ?? failureReason(leadingCode(answer.error)) ?? failureReason(answer.errorCode);
+    const waiting = answer.errorCode === 'sandbox_starting';
+    const fields = failureFields({ reason, correlationId: waiting ? undefined : correlationId });
+    if (!waiting) console.warn(`[${label}] aws preview refused`, fields);
+    // Whatever `reason`/`correlationId` the answer already had is REPLACED by the
+    // validated fields — a value that fails the allowlist must not ride along.
+    const out: Record<string, unknown> = { ...answer };
+    delete out.reason;
+    delete out.correlationId;
+    return { ...out, ...fields } as unknown as T;
 }
 
 /** How long the shell's stop waits for an AWS stop to be confirmed (its route allows 300 s). */

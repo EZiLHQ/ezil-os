@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/pg-proxy';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as schema from '@/server/db/schema';
 import { deleteFeedback, ingestFeedback, listFeedback, type FeedbackDb } from './ingest';
 import { FEEDBACK_LIMITS, type FeedbackSubmit } from './types';
@@ -92,6 +92,40 @@ describe('feedback ingest SQL and persisted values', () => {
             shell_version: '[redacted:email]', deploy_sha: null,
         });
         expect(JSON.parse(String(reports[0]!.diagnostics))).toEqual({ shellVersion: '[redacted:email]', appCommit: '[redacted:jwt]' });
+    });
+
+    it('FEEDBACK-DIAG: persists validated failure annotations and logs only the report id with them, after commit', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const corr = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+        const { db, reports } = database({ ownedComputer: true });
+        const result = await ingestFeedback(db, USER, { ...input, computerId: COMPUTER, diagnostics: { recentEvents: [
+            { eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'unauthorized',
+                reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr },
+            // The reporter's own ids are never accepted as correlation ids.
+            { eventClass: 'api_failure', site: 's', code: 'c', reason: 'worker_http_502', correlationId: USER },
+            { eventClass: 'api_failure', site: 's', code: 'c', correlationId: COMPUTER.toUpperCase() },
+            { eventClass: 'api_failure', site: 's', code: 'c', reason: 'https://x.test/?token=abc' },
+        ] } }, NOW);
+        expect(result.status).toBe(201);
+        expect(JSON.parse(String(reports[0]!.diagnostics)).recentEvents).toEqual([
+            { eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'unauthorized',
+                reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr },
+            { eventClass: 'api_failure', site: 's', code: 'c', reason: 'worker_http_502' },
+            { eventClass: 'api_failure', site: 's', code: 'c' },
+            { eventClass: 'api_failure', site: 's', code: 'c' },
+        ]);
+        expect(info).toHaveBeenCalledExactlyOnceWith('[feedback] report carries server failures', {
+            reportId: result.status === 201 ? result.created.id : '',
+            failures: [{ correlationId: corr, reason: 'worker_http_401:hmac_signature_mismatch' }, { reason: 'worker_http_502' }],
+        });
+        const logged = JSON.stringify(info.mock.calls);
+        expect(logged).not.toContain(USER);
+        expect(logged).not.toContain('button');
+        info.mockClear();
+        // A replay is not a new report: nothing new is logged.
+        await ingestFeedback(db, USER, { ...input, computerId: COMPUTER }, NOW);
+        expect(info).not.toHaveBeenCalled();
+        info.mockRestore();
     });
 
     it('stores the server-stamped deploy SHA on the report row', async () => {

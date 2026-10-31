@@ -76,6 +76,10 @@ const telemetry = await import('../../telemetry.js');
 const { beginTrace, ambientTraceRef } = await import('../../trace.js');
 const { default: log } = await import('../../log.js');
 const { feedbackSubmitSchema, diagnosticsSchema } = await import('../../../../app/src/server/feedback/types.ts');
+// FEEDBACK-DIAG: the server allowlist itself (no `@/` imports, erasable TS only), to pin the shell twin to it.
+const serverFailure = await import('../../../../app/src/server/lib/failure-diagnostics.ts');
+const shellFailure = await import('../../failure-diagnostics.js');
+const session = await import('../../session.js');
 log.debug('LOG_SECRET');
 // Seed the real ring, then make any attempted read fail immediately.
 assert.ok(log.ringBuffer().some(entry => entry.msg.includes('LOG_SECRET')));
@@ -172,6 +176,78 @@ try {
         assert.deepEqual(data.stream, { kbps: 124, rttMs: 24 });
         vitals.remove();
         document.body.classList.remove('device-phone');
+    });
+    await check('FEEDBACK-DIAG: the shell allowlist answers exactly as the server allowlist', () => {
+        const values = [
+            'worker_http_401', 'worker_http_401:hmac_signature_mismatch', 'aws_preview_unavailable:enrollment_failed',
+            'aws_preview_unavailable:worker_status_401:hmac_signature_mismatch', 'sandbox_starting', 'session_missing',
+            'desktop_frame_http_error_404', 'http2_v2_ec2', 'a:b:c', 'a:b:c:d', '', ':a', 'a:', 'a__b', '_a', 'a_',
+            'x'.repeat(48), 'x'.repeat(49), `${'abcde_'.repeat(15)}x`, 'https://worker.example.test/?token=abc',
+            'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature', 'Bearer abc', 'a3f9c0d1'.repeat(4), 'deadbeefcafe', 'deadbee',
+            'Worker_HTTP_401', 'ts_1730367000000', 'http_40100', 'abc1234', 'abcdefghijklmnop', 'alice@example.com',
+            '7c9e6679-7425-40de-944b-e07fc1f90ae7', '7C9E6679-7425-40DE-944B-E07FC1F90AE7', 'cid_lq2x8k9a3f8d7c6b', 'cid_',
+            'srv_0123456789ab', 'srv_0123456789', serverFailure.newShortCorrelationId(), undefined, null, 401, {}, ['worker_http_401'],
+        ];
+        for ( const value of values ) {
+            const label = JSON.stringify(value) ?? String(value);
+            assert.equal(shellFailure.isReasonSegment(value), serverFailure.isReasonSegment(value), `segment ${label}`);
+            assert.equal(shellFailure.isFailureReason(value), serverFailure.isFailureReason(value), `reason ${label}`);
+            assert.equal(shellFailure.isCorrelationId(value), serverFailure.isCorrelationId(value), `correlation ${label}`);
+        }
+        assert.equal(shellFailure.FAILURE_REASON_MAX, serverFailure.FAILURE_REASON_MAX);
+        assert.equal(shellFailure.FAILURE_REASON_MAX_SEGMENTS, serverFailure.FAILURE_REASON_MAX_SEGMENTS);
+    });
+    await check('FEEDBACK-DIAG: a simulated Worker HMAC 401 reaches the diagnostics as {code, reason, correlationId}', async () => {
+        const corr = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+        const realFetch = globalThis.fetch;
+        // The server's answer to POST /api/shell/desktop, exactly as the router now builds it.
+        globalThis.fetch = window.fetch = async () => ({ ok: true, status: 200, json: async () => ({
+            ok: false, errorCode: 'unauthorized', provider: 'cloudflare-guacamole',
+            error: 'worker_http_401: {"ok":false,"error":"hmac_signature_mismatch"}',
+            reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr,
+        }) });
+        let res;
+        try { res = await session.openDesktop(computerId); } finally { globalThis.fetch = window.fetch = realFetch; }
+        assert.equal(res.errorCode, 'unauthorized');
+        // Exactly the `apps/desktop#mint` capture in `apps/desktop-window.js`.
+        telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
+            detail: res.message, reason: res.reason, serverCorrelationId: res.correlationId });
+        const data = build_diagnostics();
+        diagnosticsSchema.parse(data);
+        assert.deepEqual(data.recentEvents.at(-1), { eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint',
+            code: 'unauthorized', reason: 'worker_http_401:hmac_signature_mismatch', correlationId: corr });
+        // `detail` (the raw Worker text) stays out of feedback, as before.
+        assert.doesNotMatch(JSON.stringify(data.recentEvents), /detail|"error"|\{"ok"/);
+        console.log(`EXAMPLE diagnostics.recentEvents tail: ${JSON.stringify(data.recentEvents.slice(-2))}`);
+        assert.equal(calls.length, 0, 'no feedback request was sent by building diagnostics');
+    });
+    await check('FEEDBACK-DIAG: secret-shaped fields never reach the diagnostics; only the newest ten events are annotated', () => {
+        for ( const secret of ['https://worker.example.test/?token=SECRET', 'Bearer SECRET', 'a3f9c0d1'.repeat(4)] ) {
+            telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'c', reason: secret, serverCorrelationId: secret });
+        }
+        for ( let i = 0; i < 15; i++ ) {
+            telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'c', reason: `worker_http_${500 + i}`, serverCorrelationId: 'srv_0123456789ab' });
+        }
+        const data = build_diagnostics();
+        diagnosticsSchema.parse(data);
+        assert.doesNotMatch(JSON.stringify(data), /SECRET|a3f9c0d1a3f9/);
+        const annotated = data.recentEvents.filter(event => 'reason' in event || 'correlationId' in event);
+        assert.equal(annotated.length, 10);
+        assert.equal(annotated.at(-1).reason, 'worker_http_514');
+        assert.equal(annotated[0].reason, 'worker_http_505');
+    });
+    await check('FEEDBACK-DIAG: the worst-case annotated report still fits the 32 KiB no-screenshot body', () => {
+        for ( let i = 0; i < 60; i++ ) {
+            telemetry.capture({ eventClass: 'e'.repeat(40), site: 's'.repeat(96), code: `c${i}`.padEnd(64, 'x'),
+                reason: ['abcdefghijklmno_abcdefghijklmno_abcdefghijklmn', 'bbcdefghijklmno_abcdefghijklmno_abcdefghijklmn'].join(':'),
+                serverCorrelationId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' });
+        }
+        const diagnostics = build_diagnostics();
+        diagnosticsSchema.parse(diagnostics);
+        const body = JSON.stringify({ v: 1, clientRequestId: '44444444-4444-4444-8444-444444444444', category: 'bug',
+            description: '\u{20AC}'.repeat(4000), computerId, diagnostics });
+        feedbackSubmitSchema.parse(JSON.parse(body));
+        assert.ok(new TextEncoder().encode(body).byteLength < 32 * 1024, `${new TextEncoder().encode(body).byteLength} bytes`);
     });
     await check('in-app icon: mounted once, icon only, hidden on the home screen, shown only while an app window is open', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();

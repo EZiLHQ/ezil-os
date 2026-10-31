@@ -139,8 +139,21 @@ Diagnostics (strict, every field optional):
 { shellVersion ≤64, appCommit ≤64, browser {family ≤32, major int}, os ≤32,
   deviceClass 'phone'|'tablet'|'desktop', viewport {w,h int, dpr number},
   fullscreen bool, fullbleed bool, computerStatus ≤32, traceId ≤64, phases string[≤24]≤40,
-  recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int} }
+  recentEvents {eventClass ≤40, site ≤80, code ≤80, reason? ≤96, correlationId? ≤64}[≤50],
+  stream {state ≤24, kbps int, rttMs int} }
 ```
+`recentEvents[].reason` / `.correlationId` (FEEDBACK-DIAG): for a failed start/mint, the server's bounded
+machine code for the underlying cause (e.g. `code: 'unauthorized'` with
+`reason: 'worker_http_401:hmac_signature_mismatch'`) and the correlation id on the server log line for
+that failure (`[cloudflareGuacamole.*] worker error`, `[*] aws preview refused`, `[shell] * failed`).
+The schema bounds only their length; `sanitizeDiagnostics` ALLOWLISTS their shape
+(`app/src/server/lib/failure-diagnostics.ts`: 1-3 snake_case segments joined by `:`, no opaque/hex/long-digit
+words; a correlation id is a lowercase `randomUUID`, `cid_…` or `srv_…`) and drops — never repairs — a
+mismatch, so a charset drift costs a field, not the report. `correlationId` is the one diagnostics field
+exempt from UUID masking: it names a request, not a person or computer, and is dropped if it equals the
+reporter's user or computer id. Only the newest 10 events keep either field. On a new report the server logs
+`[feedback] report carries server failures {reportId, failures:[{correlationId, reason}]}` and nothing else
+from it. The shell keeps both values in telemetry's local mirror only; they are not on the telemetry wire.
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).

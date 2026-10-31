@@ -328,6 +328,8 @@ export async function openPreviewWindow (ctx = {}) {
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/preview#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
+                // FEEDBACK-DIAG: into the local mirror only (`diagnostics.js`).
+                reason: res.reason, serverCorrelationId: res.correlationId,
             });
             progress.render(computeBootUiState({
                 requestStatus: 'error',

@@ -286,6 +286,62 @@ describe('requestGuacamolePreview — the failure carries its own retryability',
  * Two properties are proven here, and the second is the one that makes the
  * first safe: it answers EARLY, and it answers with a LABEL.
  */
+/**
+ * FEEDBACK-DIAG: production feedback said `unauthorized` while the server log
+ * said `worker_http_401 hmac_signature_mismatch`. The failure now carries the
+ * underlying cause as an allowlisted `reason`, computed where it is observed.
+ */
+describe('requestGuacamolePreview — the failure carries an allowlisted reason', () => {
+    it('names the HMAC mismatch behind `unauthorized`', async () => {
+        stubWorkerResponse(401, '{"ok":false,"error":"hmac_signature_mismatch"}');
+        const result = (await requestGuacamolePreview(CONFIG, 'wrong-secret', INPUT)) as GuacamolePreviewError;
+        expect(result.errorCode).toBe('unauthorized');
+        expect(result.reason).toBe('worker_http_401:hmac_signature_mismatch');
+    });
+
+    it('reads the Worker code from the whole body, past the 300-char log slice', async () => {
+        stubWorkerResponse(401, JSON.stringify({ ok: false, detail: 'x'.repeat(400), error: 'hmac_signature_mismatch' }));
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.error.length).toBeLessThan(330);
+        expect(result.reason).toBe('worker_http_401:hmac_signature_mismatch');
+    });
+
+    it.each([
+        ['a URL with a token', 'https://worker.example.test/sandbox/preview?token=abc123'],
+        ['a JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature'],
+        ['a 32-char hex HMAC', 'a3f9c0d1'.repeat(4)],
+        ['mixed case text', 'HMAC signature mismatch for key abc'],
+    ])('keeps only the status when the Worker error is %s', async (_name, error) => {
+        stubWorkerResponse(401, JSON.stringify({ ok: false, error }));
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.reason).toBe('worker_http_401');
+        expect(result.reason).not.toContain(error);
+    });
+
+    it('keeps only the status for a non-JSON body', async () => {
+        stubWorkerResponse(502, '<html>Bad gateway at https://edge.example.test/?sig=abc</html>');
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.reason).toBe('worker_http_502');
+    });
+
+    it('uses the classification, never the exception text, for a transport failure', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new TypeError('connect: ECONNREFUSED 10.0.0.1:443 https://worker.example.test/?token=abc');
+        }));
+        const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
+        expect(result.errorCode).toBe('connection_refused');
+        expect(result.reason).toBe('connection_refused');
+    });
+
+    it('names a missing configuration by its own code', async () => {
+        vi.stubGlobal('fetch', vi.fn());
+        const result = (await requestGuacamolePreview(
+            { workerUrl: '', hasHmacSecret: false, isConfigured: false }, '', INPUT,
+        )) as GuacamolePreviewError;
+        expect(result.reason).toBe('cloudflare_guacamole_not_configured');
+    });
+});
+
 describe('🔴 requestGuacamolePreview answers a hibernation wake early, and labels it', () => {
     afterEach(() => {
         vi.useRealTimers();
@@ -321,6 +377,8 @@ describe('🔴 requestGuacamolePreview answers a hibernation wake early, and lab
         // 🔴 AND RETRYABLE — asking again is the entire point of this answer.
         expect(result.retryable).toBe(true);
         expect(result.error).toContain('sandbox_starting');
+        // FEEDBACK-DIAG: the reason is the code, not the sentence after it.
+        expect(result.reason).toBe('sandbox_starting');
     });
 
     it('the budget is well inside the client budget and nowhere near the Worker ceiling it replaces', () => {

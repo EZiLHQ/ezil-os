@@ -87,6 +87,7 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
+import { failureFields } from '../failure-diagnostics.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
@@ -186,7 +187,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
 
     if ( ! res.ok ) {
         const code = data?.error?.code;
-        if ( code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: data?.error?.message };
+        // FEEDBACK-DIAG: keep the server's validated `reason`/`correlationId` on every branch.
+        const diagnostics = failureFields(data?.error);
+        if ( code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: data?.error?.message, ...diagnostics };
         // 🔴 A 502/504 IS A CLASSIFIED FAILURE, NOT AN UNKNOWN ONE. Identical
         // defect, identical treatment, to the one fixed in
         // `session.js#openDesktopOnce` — see the long note there. This route
@@ -201,9 +204,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
         // case `data` is `null` and the body code is the thing that is missing.
         if ( code === 'BAD_GATEWAY' || code === 'GATEWAY_TIMEOUT'
              || res.status === 502 || res.status === 504 ) {
-            return { ok: false, errorCode: 'fetch_failed', message: data?.error?.message };
+            return { ok: false, errorCode: 'fetch_failed', message: data?.error?.message, ...diagnostics };
         }
-        return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.' };
+        return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.', ...diagnostics };
     }
 
     if ( data?.ok !== true ) return session.pendingOrRefused(data);
@@ -447,6 +450,8 @@ export async function openCodeWindow (ctx = {}) {
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
+                // FEEDBACK-DIAG: into the local mirror only (`diagnostics.js`).
+                reason: res.reason, serverCorrelationId: res.correlationId,
             });
             progress.render(computeBootUiState({
                 requestStatus: 'error',

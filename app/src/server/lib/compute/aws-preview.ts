@@ -5,6 +5,7 @@ import {
     deriveGuacamoleSandboxId,
     type CloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { failureReason, isReasonSegment } from '@/server/lib/failure-diagnostics';
 
 import { readAwsBrowserZone, type Env } from './aws-config';
 import {
@@ -20,17 +21,26 @@ type UnavailableReason = 'config_missing' | 'zone_invalid' | 'endpoint_invalid' 
     | 'placement_integrity' | 'placement_reserved' | 'placement_read_failed' | 'enrollment_failed'
     | 'sign_failed' | 'parse_failed' | `worker_status_${number}`;
 
-const unavailable = (reason: UnavailableReason) => {
+/** A refusal value. `reason` is optional on the type: a test double or an older caller may omit it. */
+type AwsPreviewRefusal = { ok: false; error: string; errorCode: string; reason?: string };
+
+const unavailable = (reason: UnavailableReason, workerCode?: string): AwsPreviewRefusal => {
     // One bounded category per refusal. Never log bodies, URLs, tokens, IDs or exceptions.
-    console.warn(`[aws-preview] unavailable reason=${reason}`);
+    // `workerCode` is the Worker's own public error code, and only when it passes the
+    // reason allowlist (`hmac_signature_mismatch`), so a 401 can say WHICH 401.
+    const worker = isReasonSegment(workerCode) ? workerCode : undefined;
+    console.warn(`[aws-preview] unavailable reason=${reason}${worker ? ` worker_error=${worker}` : ''}`);
     return {
         ok: false as const,
         error: 'aws_preview_unavailable',
         errorCode: 'aws_preview_unavailable',
+        // FEEDBACK-DIAG: the same category, on the answer. The router adds the
+        // request's correlation id when it logs the refusal.
+        reason: failureReason('aws_preview_unavailable', reason, worker) ?? 'aws_preview_unavailable',
     };
 };
 
-const starting = () => ({ ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting' });
+const starting = (): AwsPreviewRefusal => ({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', reason: 'sandbox_starting' });
 
 function placementRefusal(p: Placement | null, preparePool = false) {
     if (!p) return unavailable('placement_missing');
@@ -178,7 +188,9 @@ export async function requestAwsPreview(
         failureReason = 'parse_failed';
         const data: unknown = await response.json();
         const retryable = workerStarting(response.status, data);
-        if (response.status !== 200 && !retryable) return unavailable(`worker_status_${response.status}`);
+        if (response.status !== 200 && !retryable) {
+            return unavailable(`worker_status_${response.status}`, (data as { error?: unknown } | null)?.error as string | undefined);
+        }
         // Enrollment/receipt, stop or replacement may win while the Worker is answering.
         // Discard the old handoff and let the next request sign the newly confirmed pair.
         failureReason = 'placement_read_failed';

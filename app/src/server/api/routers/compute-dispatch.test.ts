@@ -52,7 +52,7 @@ import { cloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 import { ImageJobConflictError } from '@/server/lib/compute/placement';
 
-import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure } from './compute-dispatch';
+import { awsDepsFor, awsPreviewAnswer, awsStatusAnswer, confirmAwsStop, defaultAwsCollaborators, routeComputer, shellCodeForAwsEnsure, withAwsFailureDiagnostics } from './compute-dispatch';
 import { appCallerRoleEnv } from '@/server/lib/compute/aws-clients';
 import { readBillingConfig } from '@/server/billing/config';
 import type { BillingDeps, BillingStore } from '@/server/billing/ports';
@@ -383,6 +383,37 @@ describe('shell-facing AWS answers', () => {
         expect(preview).toHaveBeenCalledTimes(1);
     });
 
+    it('FEEDBACK-DIAG: an ensure refusal names the provider\'s own code(s)', async () => {
+        const preview = vi.fn();
+        await expect(awsPreviewAnswer({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false }, preview))
+            .resolves.toMatchObject({ errorCode: 'capacity_unavailable', reason: 'capacity_unavailable:region_capacity' });
+        await expect(awsPreviewAnswer({ ok: false, error: 'https://x.test/?token=abc', errorCode: 'kill_switch', retryable: false }, preview))
+            .resolves.toMatchObject({ reason: 'kill_switch' });
+    });
+
+    it('FEEDBACK-DIAG: a refusal is logged with the request id it carries; a wait is not', () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const corr = '550e8400-e29b-41d4-a716-446655440000';
+        const refused = withAwsFailureDiagnostics(
+            { ok: false, error: 'aws_preview_unavailable', errorCode: 'aws_preview_unavailable', reason: 'aws_preview_unavailable:enrollment_failed' },
+            corr, 'cloudflareGuacamole.codePreviewUrl');
+        expect(refused).toMatchObject({ reason: 'aws_preview_unavailable:enrollment_failed', correlationId: corr });
+        expect(warn).toHaveBeenCalledExactlyOnceWith('[cloudflareGuacamole.codePreviewUrl] aws preview refused',
+            { reason: 'aws_preview_unavailable:enrollment_failed', correlationId: corr });
+
+        warn.mockClear();
+        const waiting = withAwsFailureDiagnostics({ ok: false, error: 'computer_starting', errorCode: 'sandbox_starting' }, corr, 'x');
+        expect(waiting).toEqual({ ok: false, error: 'computer_starting', errorCode: 'sandbox_starting', reason: 'computer_starting' });
+        expect(warn).not.toHaveBeenCalled();
+
+        const ready = { ok: true, url: 'https://x.test/' };
+        expect(withAwsFailureDiagnostics(ready, corr, 'x')).toBe(ready);
+        // A reason that fails the allowlist is dropped, never repaired; the id still names the line.
+        expect(withAwsFailureDiagnostics({ ok: false, error: 'Bearer abc', errorCode: 'Bad Code', reason: 'eyJ.x.y' }, corr, 'x'))
+            .toEqual({ ok: false, error: 'Bearer abc', errorCode: 'Bad Code', correlationId: corr });
+        expect(warn).toHaveBeenLastCalledWith('[x] aws preview refused', { correlationId: corr });
+    });
+
     it('status: guacamoleRunning is true only for a running AWS computer', () => {
         expect(awsStatusAnswer({ ok: true, state: 'running' } as never)).toMatchObject({ guacamoleRunning: true, computeProvider: 'aws-ec2' });
         expect(awsStatusAnswer({ ok: true, state: 'starting' } as never).guacamoleRunning).toBe(false);
@@ -437,6 +468,8 @@ describe('routers: AWS previews use their own Worker route', () => {
             ? [placementRow({ computer_id: C1, owner_user_id: U1, provider: 'cloudflare', workspace_store: 'r2' })] : []);
         expect(await caller(db).previewUrl({ computerId: C1, sessionId: '33333333-3333-4333-8333-333333333333' })).toEqual({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole',
+            // FEEDBACK-DIAG: the router's `worker error` line logs this id.
+            reason: 'sandbox_starting', correlationId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-/),
         });
         expect(ensure).toHaveBeenCalledTimes(1);
         expect(access).not.toHaveBeenCalled();
@@ -482,7 +515,7 @@ describe('routers: AWS previews use their own Worker route', () => {
             : caller(db)[surface]({ computerId: C1 });
         await expect(open()).resolves.toEqual({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
-            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
+            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', reason: 'sandbox_starting',
         });
         const out = await open();
         expect(out).toMatchObject({ ...ready, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });

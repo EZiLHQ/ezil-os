@@ -16,6 +16,11 @@ export const FEEDBACK_LIMITS = Object.freeze({
     bodyBytesWithScreenshot: Math.floor(2.5 * 1024 * 1024),
     imageBytesMax: Math.floor(1.5 * 1024 * 1024),
     imageSideMax: 4096,
+    /** FEEDBACK-DIAG: per recent event; see `sanitizeDiagnostics` for the shape allowlist. */
+    recentEventReasonMax: 96,
+    recentEventCorrelationIdMax: 64,
+    /** At most this many recent events (the newest) keep a reason/correlation id. */
+    recentEventsAnnotatedMax: 10,
     perUserPerHour: 10,
     perUserPerDay: 30,
     globalAttachmentBytesPerDay: 500 * 1024 * 1024,
@@ -41,7 +46,15 @@ export const diagnosticsSchema = z
         computerStatus: short(32),
         traceId: short(64),
         phases: z.array(short(40)).max(24),
-        recentEvents: z.array(z.object({ eventClass: short(40), site: short(80), code: short(80) }).strict()).max(50),
+        // `reason`/`correlationId` (FEEDBACK-DIAG) are LENGTH-bounded here and
+        // SHAPE-allowlisted by `sanitizeDiagnostics`, which drops a mismatch: a
+        // charset drift between shell and server must cost one field, not 400
+        // the user's whole report.
+        recentEvents: z.array(z.object({
+            eventClass: short(40), site: short(80), code: short(80),
+            reason: short(FEEDBACK_LIMITS.recentEventReasonMax).optional(),
+            correlationId: short(FEEDBACK_LIMITS.recentEventCorrelationIdMax).optional(),
+        }).strict()).max(50),
         stream: z.object({ state: short(24).optional(), kbps: int.optional(), rttMs: int.optional() }).strict(),
     })
     .partial()

@@ -25,6 +25,7 @@
 // render honestly (see `boot-phases.js`).
 
 import telemetry from './telemetry.js';
+import { failureFields } from './failure-diagnostics.js';
 import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boot-phases.js';
 // The shell's own "long enough ago to count as absent" threshold. Read by
 // `RELEASE_PRESENCE_AGO_MS` below so a release and a heartbeat cannot drift
@@ -216,6 +217,9 @@ async function request (url, { method = 'GET', body, timeoutMs, signal } = {}) {
             code: data?.error?.code ?? `HTTP_${res.status}`,
             status: res.status,
             message: data?.error?.message ?? 'Something went wrong.',
+            // FEEDBACK-DIAG: the server's bounded `reason` and the correlation
+            // id on its log line, when it sent them — allowlisted, never copied raw.
+            ...failureFields(data?.error),
         };
     }
     return { ok: true, data };
@@ -469,6 +473,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                     telemetry.capture({
                         eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
                         durationMs: waited, detail: `gave up after ${asks} asks`,
+                        reason: res.reason, serverCorrelationId: res.correlationId,
                     });
                     // The honest code for "it never finished waking within our
                     // budget". `classifyFailure` in boot-phases.js turns it into
@@ -491,6 +496,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                 telemetry.capture({
                     eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
                     durationMs: Date.now() - t0,
+                    reason: res.reason, serverCorrelationId: res.correlationId,
                 });
                 // Measured: without this the second ask landed 405-1636ms after
                 // the first and returned the same answer 10 times out of 10. See
@@ -683,12 +689,14 @@ async function openDesktopOnce (computerId, screen, signal) {
     });
 
     if ( ! res.ok ) {
-        if ( res.code === 'CANCELLED' ) return { ok: false, errorCode: 'cancelled', message: res.message };
+        // FEEDBACK-DIAG: every branch keeps the server's `reason`/`correlationId`.
+        const failed = errorCode => ({ ok: false, errorCode, message: res.message, ...failureFields(res) });
+        if ( res.code === 'CANCELLED' ) return failed('cancelled');
         // Transport/HTTP failure. `TIMEOUT` is the one code `previewUrl`
         // itself can never produce and the boot UI has real copy for.
-        if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
-        if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
-        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
+        if ( res.code === 'TIMEOUT' ) return failed('timeout');
+        if ( res.code === 'NETWORK' ) return failed('fetch_failed');
+        if ( res.code === 'UNAUTHORIZED' ) return failed('unauthorized');
         // 🔴 A 502/504 IS A CLASSIFIED FAILURE, NOT AN UNKNOWN ONE. The route
         // handler re-emits tRPC's own code verbatim (`shellErrorResponse`), so
         // `previewUrl`'s `BAD_GATEWAY` throw — "the desktop Worker returned an
@@ -697,9 +705,9 @@ async function openDesktopOnce (computerId, screen, signal) {
         // `BootErrorCode` that `classifyFailure` maps to `worker_unreachable`,
         // which is what actually happened and what the user can act on.
         if ( res.code === 'BAD_GATEWAY' || res.code === 'GATEWAY_TIMEOUT' ) {
-            return { ok: false, errorCode: 'fetch_failed', message: res.message };
+            return failed('fetch_failed');
         }
-        return { ok: false, errorCode: 'unknown', message: res.message };
+        return failed('unknown');
     }
 
     // `previewUrl` returns operational + deterministic failures as VALUES on
@@ -723,6 +731,8 @@ async function openDesktopOnce (computerId, screen, signal) {
             ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
             ...capacityAttemptOf(data),
             message: typeof data.error === 'string' ? data.error : undefined,
+            // FEEDBACK-DIAG: e.g. `unauthorized` + `worker_http_401:hmac_signature_mismatch`.
+            ...failureFields(data),
         };
     }
     if ( typeof data.guacamoleUrl !== 'string' || data.guacamoleUrl === '' ) {
@@ -789,7 +799,7 @@ export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
         ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
         ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
-        ...capacityAttemptOf(data) };
+        ...capacityAttemptOf(data), ...failureFields(data) };
 }
 
 /** RETRY-118: only a `capacity_attempt_expired` answer carries the attempt an explicit Retry may reset. */
@@ -818,11 +828,12 @@ async function previewUrlOnce (computerId, signal) {
     });
 
     if ( ! res.ok ) {
-        if ( res.code === 'CANCELLED' ) return { ok: false, errorCode: 'cancelled', message: res.message };
-        if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
-        if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
-        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
-        return { ok: false, errorCode: 'unknown', message: res.message };
+        const failed = errorCode => ({ ok: false, errorCode, message: res.message, ...failureFields(res) });
+        if ( res.code === 'CANCELLED' ) return failed('cancelled');
+        if ( res.code === 'TIMEOUT' ) return failed('timeout');
+        if ( res.code === 'NETWORK' ) return failed('fetch_failed');
+        if ( res.code === 'UNAUTHORIZED' ) return failed('unauthorized');
+        return failed('unknown');
     }
 
     const data = res.data ?? {};
