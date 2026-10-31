@@ -340,6 +340,35 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       await deps.storage.put(RECORD_KEY, { ...rec, aiBootId: bootId, aiProxyNonce: nonce });
       return nonce;
     }),
+    // Internal Worker RPC only. The config push to the RUNNING desktop of this host boot (the
+    // host applies it only by restarting the desktop, so the open path pushes it once and then
+    // waits: aws-ice.ts ensureAwsDesktopConfig). Compare-and-set: it applies only while the
+    // record still shows the push the caller read (`expectAt`, that push's time; null for none),
+    // so of overlapping asks exactly one claims the push. No `expiresAt` claims it (the push is
+    // in flight); an `expiresAt` records the config the host holds (its expiry identifies it);
+    // `release` drops a claim whose push failed. Answers the record's new time (0 once
+    // released), null when refused. Same epoch checks as aiNonce.
+    restartPush: (generation: number, leaseEpoch: number, bootId: string, expectAt: number | null,
+      next: { expiresAt?: number; release?: boolean } = {}): Promise<number | null> => serial(async () => {
+      if (!/^[0-9a-f-]{36}$/.test(bootId) || (expectAt !== null && (!Number.isSafeInteger(expectAt) || expectAt < 0))) return null;
+      if (next.expiresAt !== undefined && (!Number.isSafeInteger(next.expiresAt) || next.expiresAt <= 0)) return null;
+      const rec = await liveRecord();
+      if (!rec || rec.generation !== generation || rec.leaseEpoch !== leaseEpoch) return null;
+      const current = rec.restartPushBootId === bootId && typeof rec.restartPushAt === 'number' ? rec.restartPushAt : null;
+      if (current !== expectAt) return null;
+      const out: AwsTunnelRecord = { ...rec };
+      delete out.restartPushBootId;
+      delete out.restartPushExpiresAt;
+      delete out.restartPushAt;
+      if (next.release === true) {
+        await deps.storage.put(RECORD_KEY, out);
+        return 0;
+      }
+      const at = now();
+      await deps.storage.put(RECORD_KEY, { ...out, restartPushBootId: bootId, restartPushAt: at,
+        ...(next.expiresAt === undefined ? {} : { restartPushExpiresAt: next.expiresAt }) });
+      return at;
+    }),
     // Keep unverified records available to the open path's explicit verdict check.
     get: (): Promise<AwsTunnelRecord | null> => serial(async () => {
       const rec = await liveRecord();
@@ -481,7 +510,7 @@ export interface AwsTunnelEnv {
 }
 
 /** Internal protocol between the Worker and its registry object (never exposed to clients). */
-export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', getForBrowser: '/get-for-browser', verifyOrigin: '/verify-origin', aiNonce: '/ai-nonce' } as const;
+export const REGISTRY_PATHS = { create: '/create', remove: '/remove', get: '/get', getForBrowser: '/get-for-browser', verifyOrigin: '/verify-origin', aiNonce: '/ai-nonce', restartPush: '/restart-push' } as const;
 
 /**
  * One per sandbox (`idFromName(sandboxId)`). Classic Durable Object `fetch` interface, so
@@ -517,6 +546,12 @@ export class AwsTunnelRegistry {
       const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string };
       const nonce = await this.service.aiNonce(b.generation, b.leaseEpoch, b.bootId);
       return reply({ status: nonce ? 200 : 409, body: { nonce } });
+    }
+    if (request.method === 'POST' && path === REGISTRY_PATHS.restartPush) {
+      const b = await request.json() as { generation: number; leaseEpoch: number; bootId: string; expectAt?: number | null; expiresAt?: number; release?: boolean };
+      const at = await this.service.restartPush(b.generation, b.leaseEpoch, b.bootId, b.expectAt ?? null,
+        { expiresAt: b.expiresAt, release: b.release === true });
+      return reply({ status: at === null ? 409 : 200, body: { at } });
     }
     if (request.method === 'GET' && path === REGISTRY_PATHS.get) {
       return new Response(JSON.stringify({ record: await this.service.get() }), { headers: { 'content-type': 'application/json' } });

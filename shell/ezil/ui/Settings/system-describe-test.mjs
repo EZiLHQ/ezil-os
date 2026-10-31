@@ -145,8 +145,23 @@ push('no code, no message → unavailable', describeScreenError(undefined, undef
     push('Round 4: 🔴 no plan field is still "Not reported", never a guessed Free', describePlan(held).value === 'Not reported');
     push('Round 4: an unknown standing value is ignored', standingOf({ standing: 'moved' }) === null && describePlan({ ...held, standing: 'moved' }).value === 'Not reported');
     push('Round 4: a paid standing keeps the paid plan line', describePlan({ ...held, plan: { standing: 'paid', vcpu: 2, memoryGB: 8, status: 'ready', current: 'std-2', selected: 'std-2' } }).value === '2 vCPU / 8 GB on AWS (India)');
-    const copy = [running, ...shapes.map(([, info]) => describePlan(info)), freeCf, describeProvider(held)].map(d => `${d.value} ${d.hint}`).join(' ');
-    push('Round 4: copy guard, no region code and no city', scanCopy(copy).length === 0 && ! /ap-south-1|mumbai|moved/i.test(copy), copy);
+    // Round 6 (R1-08/R4-02): the hint says what Free allows, as Computer and Billing do; a held 4 or 8 vCPU
+    // computer cannot open on Free (the hold opens only 2 vCPU and never resizes).
+    for ( const [name, info] of shapes ) {
+        const plan = describePlan(info);
+        push(`Round 6: files_on_aws via ${name} → the Free limits hint`, plan.hint === 'It opens on the Free plan with Free limits; upgrade for no session time limit.', plan);
+    }
+    const bigMachine = { ...held, machine: { ...held.machine, vcpu: 4, memoryMiB: 16384, instanceType: 'm6i.xlarge' } };
+    const closed = [
+        describePlan({ ...held, plan: { name: 'Free', provider: 'aws', standing: 'files_on_aws', vcpu: 2, memoryGB: 8, status: 'ready', current: 'cmp-8', selected: null, transition: null } }),
+        describePlan({ ...bigMachine, plan: { standing: 'files_on_aws' } }),
+    ];
+    for ( const plan of closed ) {
+        push('Round 6 (R4-02): a held 4 or 8 vCPU computer says the Free plan cannot open it', plan.value === 'Plan: Free · files kept on this computer'
+            && plan.hint === "The Free plan can't open it at this size; upgrade to open it again.", plan);
+    }
+    const copy = [running, ...shapes.map(([, info]) => describePlan(info)), ...closed, freeCf, describeProvider(held)].map(d => `${d.value} ${d.hint}`).join(' ');
+    push('Round 4: copy guard, no region code and no city', scanCopy(copy).length === 0 && ! /ap-south-1|mumbai|moved|restore full use/i.test(copy), copy);
 }
 
 let failed = 0;

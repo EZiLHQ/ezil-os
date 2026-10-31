@@ -1056,8 +1056,15 @@ export async function openDesktopWindow (ctx = {}) {
     // only as focus moving into it (window `blur` with the iframe active), unless
     // the viewer posts `input_accepted`. Times run from this window's open.
     let tti = { url: null, frame: null, input: null };
-    const opening_path = () => aws_observation?.path ?? spinner.computerProgress()?.path
-        ?? (desktop_state.provider === 'cloudflare-guacamole' ? 'cloudflare' : 'unknown');
+    // Round 6 (CR-3, live 10-30 06:37Z: first_frame_cloudflare on an AWS computer). An AWS
+    // observation carries no `path` once the computer is RUNNING (nothing is opening any more),
+    // so the last path this attempt saw is kept; an AWS answer that never saw one opened a
+    // computer that was already running. `desktop_state.provider` is 'cloudflare-guacamole'
+    // for every computer, so it names the path only when the answer was not AWS.
+    let tti_path = null;
+    let tti_aws = false;
+    const opening_path = () => tti_path ?? aws_observation?.path ?? spinner.computerProgress()?.path
+        ?? (tti_aws ? 'running' : desktop_state.provider === 'cloudflare-guacamole' ? 'cloudflare' : 'unknown');
     function stamp_milestone (key) {
         if ( disposed ) return;
         const slot = { url_received: 'url', first_frame: 'frame', first_input: 'input' }[key];
@@ -1158,6 +1165,7 @@ export async function openDesktopWindow (ctx = {}) {
         onProgressChange: () => {
             const seen = spinner.computerProgress();
             if ( seen ) aws_observation = seen;
+            if ( seen?.path ) tti_path = seen.path;
             if ( seen?.activeAws === true ) aws_seen_active = true;
             // A switch or restart is in flight: re-open again once it settles, and a
             // failure it caused (the old machine stopped under a live desktop) becomes
@@ -1298,6 +1306,8 @@ export async function openDesktopWindow (ctx = {}) {
         aws_seen_active = aws_observation?.activeAws === true;
         spinner.stamp(null);
         tti = { url: null, frame: null, input: null };
+        tti_path = aws_observation?.path ?? null;
+        tti_aws = false;
 
 
         if ( desktop_state.configured !== true ) {
@@ -1474,6 +1484,7 @@ export async function openDesktopWindow (ctx = {}) {
             return;
         }
 
+        tti_aws = res.computeProvider === 'aws-ec2';
         stamp_milestone('url_received');
         console.info(`[${PHASE}] desktop URL in ${Math.round(performance.now() - t0)}ms`
             + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`

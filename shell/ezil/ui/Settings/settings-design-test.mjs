@@ -196,18 +196,19 @@ await check('Billing: every meter means "left" (time, AI credits, storage)', () 
     assert.match(clean(el.querySelector('[data-role="meter-storage"]')), /11\.2 GB used of your 50 GB disk/);
     assert.doesNotMatch(summaryV3Html(s, usageDto()), /progressbar/i, 'Billing never renders progressbar (ui-copy.qa)');
 });
-await check('Billing: a balance above the plan grant fills the bar and splits "from your plan + extra" from the server breakdown', () => {
+await check('Billing: a balance above the plan grant has no bar and splits "from your plan + extra" from the server breakdown', () => {
     // ADV-1: 20 starter credits left of the 100 granted, 500 purchased. The plan part is 20, never 100.
+    // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).
     const s = billingState('free'); Object.assign(s.ai, { balance: 520, included: null, starter: { remaining: 20 }, purchased: { remaining: 500, expiresAt: '2027-04-01T00:00:00Z' } });
     const row = fragment(summaryV3Html(s)).querySelector('[data-role="meter-ai"]');
-    assert.equal(row.querySelector('[role="meter"]')?.getAttribute('aria-valuenow'), '100');
+    assert.equal(row.querySelector('[role="meter"]'), null);
     assert.match(clean(row), /520 left/);
     assert.match(clean(row), /20 from your plan \+ 500 extra/);
     assert.doesNotMatch(clean(row), /100 from your plan|420 extra|520 of 100/);
     // No breakdown: the total only, never an invented split.
     const t = billingState('free'); Object.assign(t.ai, { balance: 1264, included: null });
     const plain = fragment(summaryV3Html(t)).querySelector('[data-role="meter-ai"]');
-    assert.equal(plain.querySelector('[role="meter"]')?.getAttribute('aria-valuenow'), '100');
+    assert.equal(plain.querySelector('[role="meter"]'), null);
     assert.match(clean(plain), /1,264 left/);
     assert.doesNotMatch(clean(plain), /from your plan|extra|1,264 of 100/);
 });
@@ -308,13 +309,14 @@ await check('Usage: the computer-time bar is the share LEFT', () => {
     const el = fragment(usageHtml(uSample, uSummary()));
     assert.equal(el.querySelector('[data-usage="compute"] [role="progressbar"]')?.getAttribute('aria-valuenow'), '40');
 });
-await check('Usage: whole-number credits; a balance above the grant is "N left" with a full bar, never "x of 100"', () => {
+await check('Usage: whole-number credits; a balance above the grant is "N left" with no bar, never "x of 100"', () => {
     const s = billingState('free'); s.ai.balance = 1041.67; s.ai.balanceMicro = '1041670000'; s.ai.included = null;
     const row = fragment(usageHtml(uSample, s)).querySelector('[data-usage="ai"]');
     assert.doesNotMatch(clean(row), /1,041\.67|\d\.\d|1,041 of 100/);
     assert.match(clean(row), /1,041 left/);
     assert.doesNotMatch(clean(row), /941 extra/, 'no invented split without a breakdown');
-    assert.equal(row.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow'), '100');
+    // Round 6 (R1-10): no denominator above the grant, so no bar (it was full by construction).
+    assert.equal(row.querySelector('[role="progressbar"]'), null);
 });
 await check('Usage: low credits come from the server state only', () => {
     const s = uSummary(); s.ai.balance = 30; s.ai.state = 'ok';
@@ -425,7 +427,8 @@ await check('Computer: tiles sell — title, one benefit line, the weight note, 
 await check('Computer: the header names the computer, where it runs, its configuration and its real disk', () => {
     const el = render({ data: plan('premium'), prog: running('m6i.xlarge') });
     const header = clean(el.querySelector('[data-role="computer-header"]'));
-    assert.match(header, /My computer/); assert.match(header, /AWS · Mumbai/);
+    // Round 6 (R1-11): one provider string on every tab, "AWS (India)", never a city.
+    assert.match(header, /My computer/); assert.match(header, /AWS \(India\)/); assert.doesNotMatch(header, /mumbai/i);
     assert.match(clean(el.querySelector('[data-role="computer-summary"]')), /4 vCPU · 16 GB memory · 50 GB disk/);
     assert.match(clean(render({ data: plan('free'), prog: null, streaming: true }).querySelector('[data-role="computer-header"]')), /Cloudflare/);
 });
@@ -436,6 +439,7 @@ await check('Computer: at most ONE primary in every state, and it is Open deskto
     const grace = plan('premium'); grace.computer.standing = 'grace'; grace.plan.graceEndsAt = '2026-11-05T00:00:00Z';
     const nextStart = plan('premium'); nextStart.computer.size = 'cmp-4';
     const moved = state => { const s = plan('free'); Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', move: { direction: 'to_cloudflare', stage: state, bytesDone: '1', bytesTotal: '2' } }); return s; };
+    const held = () => { const s = plan('free'); Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', move: null }); return s; };
     const cases = {
         idle: { data: plan('premium'), prog: running() },
         stopped: { data: plan('premium'), prog: running('m6i.large', { lifecycleState: 'STOPPED' }) },
@@ -447,6 +451,9 @@ await check('Computer: at most ONE primary in every state, and it is Open deskto
         grace: { data: grace, prog: running() },
         moveDone: { data: moved('done'), prog: running() },
         moveFailed: { data: moved('failed'), prog: running() },
+        // Round 6: held on AWS — std-2 opens under Free limits; a 4 vCPU computer cannot open (no Open, no primary).
+        heldStd2: { data: held(), prog: running() },
+        heldCmp4: { data: held(), prog: running('m6i.xlarge', { lifecycleState: 'STOPPED' }) },
     };
     for ( const [name, args] of Object.entries(cases) ) {
         const el = render(args);

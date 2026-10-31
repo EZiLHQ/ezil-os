@@ -293,6 +293,13 @@ export interface BillingSummaryV3 {
         heldSince?: string | null;
         /** Round 4 (additive): always null until Phase B moves files (D20/D21). */
         move?: ComputerMoveV3 | null;
+        /**
+         * Round 6 (additive; R4-02): the user's AWS computer as placed now (its instance type), whatever `size`
+         * says: under the D16 hold only a 2 vCPU one opens (it is never resized), so a 4 or 8 vCPU one stays
+         * closed. null when there is no AWS computer, its type is unreadable or unlisted, or the user's AWS
+         * computers differ.
+         */
+        awsSize?: { size: SizeCode; vcpu: number; memoryGiB: number } | null;
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {
@@ -315,6 +322,12 @@ export interface BillingSummaryV3 {
         purchased?: { remaining: number; expiresAt: string } | null;
         /** The Free starter grant still live; null when none or unknown. */
         starter?: { remaining: number } | null;
+        /**
+         * Round 6 (additive; R1-10/R4-05): credits still live from an EARLIER paid period or plan (on Free after
+         * a cancel, or a paid period's 3-day tail); they are kept until they expire. `expiresAt` = the earliest
+         * expiry. null when none or unknown.
+         */
+        previous?: { remaining: number; expiresAt: string } | null;
         /** The plan's period amount the next renewal adds when this period has no grant of it yet (e.g. right after an upgrade). */
         pendingFromRenewal?: { credits: number; at: string } | null;
         /**
@@ -354,7 +367,11 @@ export interface PublicOfferV3 {
     /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
     sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
-    /** Shown in the FAQ only: "Fair use: about N hours a month". */
+    /**
+     * Shown in the FAQ only: "Fair use: about N hours a month". Round 6 (R1-06): in billing.summary the Free
+     * offer carries the hours the viewer's account gets on Free (8 for accounts created before
+     * FREE_V2_EFFECTIVE_AT); `publicOffers()` without a viewer keeps the catalog's figure.
+     */
     fairUseHours: number;
     highlighted: boolean;
     badge: 'Most popular' | null;

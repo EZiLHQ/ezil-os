@@ -365,6 +365,26 @@ describe('Stripe response mapping', () => {
         expect(sent.init?.body).toBeUndefined();
     });
 
+    // Round 6 (R4-04): a cancel scheduled as a DATE (Dashboard "cancel on a custom date", portal or API cancel_at)
+    // arrives with cancel_at_period_end false. At or before the period end it ends the plan, so it reads as a
+    // cancel at period end (plan_ending), never "Active / renews" followed by a silent drop to Free.
+    it.each([
+        { name: 'cancel_at at the period end', shape: { cancel_at: end }, expected: true },
+        { name: 'cancel_at before the period end', shape: { cancel_at: end - 86_400 }, expected: true },
+        { name: 'cancel_at on the item period end (modern shape)', shape: { cancel_at: end, current_period_end: null,
+            items: { data: [{ current_period_start: start, current_period_end: end }] } }, expected: true },
+        { name: 'cancel_at after the period end (a later renewal still bills)', shape: { cancel_at: end + 86_400 }, expected: false },
+        { name: 'no cancel_at', shape: { cancel_at: null }, expected: false },
+        { name: 'cancel_at with no known period end', shape: { cancel_at: end, current_period_end: null }, expected: false },
+    ])('maps $name to cancelAtPeriodEnd=$expected', async ({ shape, expected }) => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: false, current_period_start: start, current_period_end: end, ...shape });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(expected);
+    });
+    it('keeps cancel_at_period_end true whatever cancel_at says', async () => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: true, cancel_at: null, current_period_start: start, current_period_end: end });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(true);
+    });
+
     it('preserves epoch dates and leaves absent subscription periods and SKU null', async () => {
         const { client, fetcher } = fixture({ ...subscription, current_period_start: 0, current_period_end: end });
         expect(await client.retrieveSubscription('sub_fixture')).toMatchObject({ ...expectedSubscription, currentPeriodStart: new Date(0) });
@@ -1088,12 +1108,32 @@ describe('endive plan changes', () => {
     it.each([
         { cancel: true, cancelAt: end + 10, expected: end + 10 },
         { cancel: true, cancelAt: null, expected: end },
-        { cancel: false, cancelAt: end + 10, expected: null },
+        { cancel: false, cancelAt: null, expected: null },
     ])('sets cancellation=$cancel with cancel_at=$cancelAt', async ({ cancel, cancelAt, expected }) => {
         const { client, fetcher } = sequence({ ...planSubscription, cancel_at: cancelAt });
         expect(await client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel, idempotencyKey: 'cancel_fixture' }))
             .toEqual({ cancelsAt: expected === null ? null : new Date(expected * 1000) });
         expectRequest(fetcher, 0, '/subscriptions/sub_fixture', { cancel_at_period_end: String(cancel) }, 'cancel_fixture');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    // Round 6 review (R4-04): a dated cancel (Dashboard custom date) reads as plan_ending, so Billing offers Resume.
+    it('resume unsets a dated cancel_at the flag alone leaves, under its own idempotency key', async () => {
+        const dated = { ...planSubscription, cancel_at_period_end: false, cancel_at: end - 86_400 * 10 };
+        const { client, fetcher } = sequence(dated, { ...dated, cancel_at: null });
+        expect(await client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel: false, idempotencyKey: 'resume_fixture' }))
+            .toEqual({ cancelsAt: null });
+        // The first request is the in-app resume, byte for byte; the second only unsets cancel_at (Stripe's empty-string unset).
+        expectRequest(fetcher, 0, '/subscriptions/sub_fixture', { cancel_at_period_end: 'false' }, 'resume_fixture');
+        expectRequest(fetcher, 1, '/subscriptions/sub_fixture', { cancel_at: '' }, 'resume_fixture:cancel_at');
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('a resume that leaves a cancel_at is refused, never reported as resumed', async () => {
+        const dated = { ...planSubscription, cancel_at_period_end: false, cancel_at: end - 86_400 * 10 };
+        const { client } = sequence(dated, dated);
+        await expect(client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel: false, idempotencyKey: 'resume_fixture' }))
+            .rejects.toMatchObject({ name: 'BillingProviderError' });
     });
 });
 

@@ -152,9 +152,13 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
                 }
                 if (changed) poolGuard('replenish_demand_cleanup', await updateDemandCleanup(locked, lock, d, cleanup), 503);
             }
-            for (const id of plan.fail) await deps.data.markPoolHost(db, id, ['booting'], 'failed', now);
+            // Round 6 (codeopen review): only a stalled boot this pass actually marked failed is retired as one. A spare
+            // that committed ready between readPoolDemand and this mark keeps its ready state (the mark updates nothing)
+            // and is left to the aged/obsolete rules, never terminated as a stalled boot.
+            const failedNow: string[] = [];
+            for (const id of plan.fail) if (await deps.data.markPoolHost(db, id, ['booting'], 'failed', now)) failedNow.push(id);
             const failed = await deps.store.retirementCandidates?.(db, c, 'failed') ?? [];
-            for (const id of new Set([...failed, ...plan.fail, ...plan.retire])) {
+            for (const id of new Set([...failed, ...failedNow, ...plan.retire])) {
                 if (retireBudget === 0) break;
                 if (await reserve('pool-retire', id)) retireBudget--;
             }

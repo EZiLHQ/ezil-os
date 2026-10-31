@@ -168,6 +168,16 @@ const FRAME_CONFIRM_ATTEMPTS = FRAME_CONFIRM_DELAYS_MS.length;
 const FRAME_RECOVERY_ATTEMPTS = 12;
 
 /**
+ * Round 6 (R3-1/R3-2, live 10-30 05:42-05:44Z): the mint gave up (its existing wake deadline) while the
+ * computer was observed RUNNING with nothing opening. The generic `timeout` copy ("Starting your computer is
+ * taking longer than it should") is false there: the computer is up and Code did not answer. Same Try again.
+ */
+const CODE_UNREACHABLE_COPY = {
+    title: "Code isn't reachable right now",
+    body: "Your computer is running, but Code didn't answer in time. It may still be starting up — try again.",
+};
+
+/**
  * Mint a fresh code-server window URL. Mirrors `session.js`'s `previewUrl()`
  * exactly (same request shape, same error-code taxonomy) against
  * `/api/shell/code-preview-url` instead of `/api/shell/preview-url` — see
@@ -369,6 +379,15 @@ export async function openCodeWindow (ctx = {}) {
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
+    /**
+     * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
+     * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
+     */
+    let last_progress = null;
+    /** The mint's timeout give-up while it is on screen with the generic copy (no running answer yet). */
+    let generic_timeout = null;
+    /** A timeout give-up over a computer last seen running with nothing opening is Code's, not the computer's. */
+    const code_timeout = failed => last_progress?.connect === true ? { ...failed, copy: CODE_UNREACHABLE_COPY } : failed;
 
     const stop_timers = () => {
         stop_confirmation(); stop_confirmation = () => {};
@@ -380,7 +399,16 @@ export async function openCodeWindow (ctx = {}) {
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
+        // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
+        isPreparing: () => session.isComputePreparing(computer.id),
+        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy,
+        onProgressChange: () => {
+            const seen = progress.computerProgress();
+            if ( ! seen ) return;
+            last_progress = seen;
+            // A give-up painted before any running answer (tab hidden, polls failing) takes Code's words once one arrives.
+            if ( generic_timeout && seen.connect === true ) { progress.render(code_timeout(generic_timeout)); generic_timeout = null; }
+        } });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -503,6 +531,7 @@ export async function openCodeWindow (ctx = {}) {
 
     async function start_boot () {
         last_failure = null;
+        last_progress = null; generic_timeout = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -575,11 +604,16 @@ export async function openCodeWindow (ctx = {}) {
                 eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
             });
-            progress.render(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            // A give-up over a computer last seen running (and opening nothing) is Code's, not the computer's.
+            const timed_out = failed.kind === 'failed' && failed.reason === 'timeout';
+            const shown = timed_out ? code_timeout(failed) : failed;
+            generic_timeout = timed_out && ! shown.copy ? failed : null;
+            progress.render(shown);
             // Terminal: the mint failed for real.
             trace.step('mint_error');
             trace.end('error');

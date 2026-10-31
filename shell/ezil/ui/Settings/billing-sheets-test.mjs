@@ -474,6 +474,56 @@ test('v3 change and cancel use only v3 summary dates and period-end mutations', 
     h.handle.close(); await h.ready('cancel'); assert.match(h.text(), /Cancel Premium/);
     h.click('[data-action="confirm"]'); await settle(); assert.deepEqual(h.calls.at(-1).input, { cancel: true });
 });
+// Round 6 (R4-13, plan A6): the cancel and downgrade sheets say what happens to the computer.
+test('v3 cancel states the computer outcome: Free limits on 2 vCPU, cannot open on 4/8 vCPU, plain line on Cloudflare', async h => {
+    // Round 6 review: the outcome follows the computer's PLACED size (`awsSize`), never the next-start preference (`size`).
+    const placed = { 'std-2': { size: 'std-2', vcpu: 2, memoryGiB: 8 }, 'cmp-4': { size: 'cmp-4', vcpu: 4, memoryGiB: 16 }, 'cmp-8': { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } };
+    const premium = (computer = {}) => { const s = summaryV3('premium'); Object.assign(s.computer, { filesOn: 'aws', standing: 'paid', awsSize: placed['std-2'], ...computer }); return s; };
+    h.summary = premium(); await h.ready('cancel');
+    assert.match(h.text(), /Your plan stays active until Nov 1, then moves to Free\. After Nov 1 your computer opens under Free limits \(sessions up to 1 hour\); your files stay on your AWS computer\./);
+    const texts = [h.text()];
+    for ( const [size, vcpu] of [['cmp-4', 4], ['cmp-8', 8]] ) {
+        h.handle.close(); h.summary = premium({ awsSize: placed[size] }); await h.ready('cancel');
+        assert.match(h.text(), new RegExp(`After Nov 1 your ${vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer\\.`));
+        assert.doesNotMatch(h.text(), /Free limits/);
+        texts.push(h.text());
+    }
+    // Placed on 8 vCPU with "Next start: 2 vCPU": the hold never resizes, so it can't open on Free.
+    h.handle.close(); h.summary = premium({ size: 'std-2', awsSize: placed['cmp-8'] }); await h.ready('cancel');
+    assert.match(h.text(), /After Nov 1 your 8 vCPU computer can't open on the Free plan/);
+    texts.push(h.text());
+    // Placed on 2 vCPU with an 8 vCPU preference: it opens under Free limits.
+    h.handle.close(); h.summary = premium({ size: 'cmp-8', awsSize: placed['std-2'] }); await h.ready('cancel');
+    assert.match(h.text(), /After Nov 1 your computer opens under Free limits/);
+    assert.doesNotMatch(h.text(), /can't open/);
+    // Placed size unknown (an older server, an unreadable or mixed placement): only that the files stay.
+    for ( const awsSize of [null, undefined] ) {
+        h.handle.close(); h.summary = premium({ size: 'cmp-8', awsSize }); await h.ready('cancel');
+        assert.match(h.text(), /then moves to Free\. Your files stay on your AWS computer\./);
+        assert.doesNotMatch(h.text(), /Free limits|can't open/);
+        texts.push(h.text());
+    }
+    h.handle.close(); h.summary = premium({ filesOn: 'cloudflare' }); await h.ready('cancel');
+    assert.match(h.text(), /then moves to Free\. Your files and installed tools stay\./);
+    assert.doesNotMatch(h.text(), /AWS computer/);
+    h.handle.close(); const older = summaryV3('standard'); h.summary = older; await h.ready('cancel');
+    assert.match(h.text(), /Your files and installed tools stay\./, 'an older server without filesOn keeps the plain line');
+    texts.push(h.text());
+    for ( const text of texts ) { assert.doesNotMatch(text, banned); assert.doesNotMatch(text, honestyBans); assert.doesNotMatch(text, /mumbai|ap-south-1/i); }
+});
+test('v3 downgrade states the computer outcome (A6): from the date the computer starts on 2 vCPU · 8 GB', async h => {
+    h.summary = summaryV3('premium'); h.summary.computer.size = 'cmp-8'; await h.ready('downgrade');
+    assert.match(h.text(), /You keep Premium until Nov 1\. Standard starts then\./);
+    assert.match(h.text(), /From Nov 1 your computer starts on 2 vCPU · 8 GB\. Your files and installed tools stay\./);
+    assert.doesNotMatch(h.text(), banned);
+});
+test('v3 plan picker: the Free card says the viewer\'s own Free hours (legacy accounts keep 8)', async h => {
+    h.summary = summaryV3('free'); h.summary.catalog.offers = h.summary.catalog.offers.map(offer => offer.sku === 'free_v3' ? { ...offer, fairUseHours: 8 } : offer);
+    h.window.api.openPlanPickerSheet({ ...h.options(), checkout: () => {} });
+    const bullets = [...h.doc.querySelectorAll('.ezil-billing-choice[data-plan="free_v3"] li')].map(li => li.textContent);
+    assert.ok(bullets.includes('8 hours of computer time each month'), bullets.join(' | '));
+    assert.doesNotMatch(bullets.join(' '), /\b5 hours/);
+});
 for ( const tier of ['free'] ) test(`v3 ${tier} limit stop opens one session-end offer`, async h => {
     h.summary = summaryV3(tier); const chosen = [];
     const opts = { ...h.options(), reason: 'session_max', checkout: options => chosen.push(options) };

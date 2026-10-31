@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
+import { planFromSubscriptions } from './catalog';
 import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
@@ -220,6 +221,27 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         expect(summary('premium_monthly_v3', [standard, topup], [grant(500, 400, topup.expiresAt)], M(400)))
             .toMatchObject({ included: { granted: 200, remaining: null }, purchased: null });
     });
+    it('round 6 (R1-10/R4-05): on Free after an immediate cancel, the paid period\'s remainder is its own bucket with its expiry', () => {
+        // contact@ on 10-30: 100 starter credits plus 663 left of a cancelled Premium period (kept to periodEnd + 3 days).
+        const cancelled = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-27T12:00:00.000Z', 1000, '2026-11-30T12:00:00.000Z');
+        const starter = receipt('ezil-os:v1:free-once:u', 100, '2027-10-27T00:00:00.000Z');
+        const ai = summary(undefined, [cancelled, starter], [grant(1000, 663, cancelled.expiresAt), grant(100, 100, starter.expiresAt)]);
+        expect(ai).toMatchObject({ balance: 763, state: 'ok', included: null, purchased: null, starter: { remaining: 100 },
+            previous: { remaining: 663, expiresAt: '2026-11-30T12:00:00.000Z' } });
+        // Two earlier grants (a period and an upgrade): one total, the EARLIEST expiry.
+        const upgradeEarlier = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-28T00:00:00.000Z:upgrade', 300, '2026-11-29T00:00:00.000Z');
+        expect(summary(undefined, [cancelled, upgradeEarlier], [grant(1000, 663, cancelled.expiresAt), grant(300, 37, upgradeEarlier.expiresAt)]).previous)
+            .toEqual({ remaining: 700, expiresAt: '2026-11-29T00:00:00.000Z' });
+    });
+    it('round 6: previous is the paid plan\'s 3-day tail of the last period; null when spent, none, or unknown', () => {
+        const last = receipt(`ezil-os:v1:premium_monthly_v3:sub:${prev.toISOString()}`, 1000, expiry(start));
+        const renewal = receipt(`ezil-os:v1:premium_monthly_v3:sub:${start.toISOString()}`, 1000, expiry(end));
+        expect(summary('premium_monthly_v3', [renewal, last], [grant(1000, 200, last.expiresAt), grant(1000, 1000, renewal.expiresAt)]).previous)
+            .toEqual({ remaining: 200, expiresAt: last.expiresAt });
+        expect(summary('premium_monthly_v3', [renewal, last], [grant(1000, 0, last.expiresAt), grant(1000, 1000, renewal.expiresAt)]).previous).toBeNull();
+        expect(summary('premium_monthly_v3', [renewal], [grant(1000, 1000, renewal.expiresAt)]).previous).toBeNull();
+        expect(summary('premium_monthly_v3', [renewal, last], null, M(1200)).previous).toBeNull();
+    });
     it('ignores revoked or foreign-subscription grants and announces no renewal for a canceling plan', () => {
         const foreign = receipt(`ezil-os:v1:premium_monthly_v3:sub_other:${start.toISOString()}`, 1000, expiry(end));
         const ai = summary('premium_monthly_v3', [{ ...standard, deliveredAt: null }, foreign],
@@ -274,6 +296,58 @@ describe('round 4: standing fields (additive)', () => {
             computer: { standing: 'grace' }, fairUse: { status: 'ok' } });
         expect(buildSummaryV3({ ...args, grants: [{ ...input('premium_monthly_v3').grants[0]!, amount: BigInt(0) }] }).fairUse.status).toBe('paused');
         expect(buildSummaryV3({ ...args, now: new Date('2026-10-22T00:00:00Z') }).computer).toMatchObject({ standing: 'files_on_aws', heldSince: '2026-10-22T00:00:00Z' });
+    });
+    it('round 6 review (dunning into the hold): after grace the computer is rated as Free, as the start gate rates it', () => {
+        // A Premium renewal failed on 11-01, grace ended 11-08, the files are on AWS; a std-2 hold session runs at 11-12 12:00.
+        const at = new Date('2026-11-12T12:00:00Z');
+        const lapsed: Input = { ...input('premium_monthly_v3'), now: at, userCreatedAt: new Date('2026-09-01T00:00:00Z'), grants: [],
+            placementProvider: 'aws-ec2', volumeGiB: 50,
+            subs: [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'past_due', currentPeriodStart: new Date('2026-11-01T00:00:00Z'),
+                currentPeriodEnd: new Date('2026-12-01T00:00:00Z'), cancelAtPeriodEnd: false }],
+            paymentIssues: [{ stripeInvoiceId: 'in', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed',
+                hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-11-01T01:00:00Z'), resolvedAt: null, updatedAt: at }],
+            epochs: [epoch({ size: 'std-2', weight: 1, readyAt: '2026-11-12T11:30:00Z', deadlineAt: '2026-11-12T12:29:59Z' })] };
+        const free = planFromSubscriptions({ subs: [], now: at, userCreatedAt: lapsed.userCreatedAt });
+        const summary = buildSummaryV3(lapsed);
+        // The plan block still names the unpaid subscription; the computer runs under Free's limits and month.
+        expect(summary.plan).toMatchObject({ sku: 'premium_monthly_v3', status: 'past_due', paymentIssue: 'payment_failed' });
+        expect(summary.computer).toMatchObject({ standing: 'files_on_aws', size: 'std-2', sessionMaxSeconds: 3600,
+            activeDeadline: '2026-11-12T12:29:59Z', machineChoice: [{ size: 'free-cf' }] });
+        expect(summary.fairUse).toEqual({ status: 'ok', resetsAt: free.window.end });
+        // Without an AWS placement (standing free) it is still Free's limits, at Free's size.
+        expect(buildSummaryV3({ ...lapsed, placementProvider: null, epochs: [] }).computer).toMatchObject({ standing: 'free', size: 'free-cf', sessionMaxSeconds: 3600 });
+        // Still in grace (11-05): the paid plan's limits stand (no session cap, the paid period).
+        const grace = buildSummaryV3({ ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] });
+        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: null });
+        expect(grace.fairUse).toMatchObject({ status: 'ok', resetsAt: '2026-12-01T00:00:00Z' });
+        // A never-paid (incomplete) subscription is Free too.
+        expect(buildSummaryV3({ ...lapsed, subs: [{ ...lapsed.subs[0]!, status: 'incomplete' }], paymentIssues: [] }).computer)
+            .toMatchObject({ sessionMaxSeconds: 3600 });
+    });
+    it('round 6 (R1-06): the Free offer in the summary says the hours THIS account gets on Free; paid offers and publicOffers() are unchanged', () => {
+        // FREE_V2_EFFECTIVE_AT is null: every account keeps the legacy 8 hours.
+        const legacy = buildSummaryV3({ ...input(), placementProvider: 'aws-ec2' });
+        expect(legacy.catalog.offers.map(offer => [offer.sku, offer.fairUseHours])).toEqual([['free_v3', 8], ['standard_monthly_v3', 40], ['premium_monthly_v3', 500]]);
+        expect(buildSummaryV3(input('premium_monthly_v3')).catalog.offers[0]!.fairUseHours).toBe(8);
+        const newer = { ...input(), userCreatedAt: now, freeEffectiveAt: '2026-10-01T00:00:00Z' };
+        expect(buildSummaryV3(newer).catalog.offers[0]!.fairUseHours).toBe(5);
+    });
+    it('round 6 review (R4-02): awsSize is the PLACED AWS size (any standing), apart from the hold size and the preference', () => {
+        // A Premium cmp-8 computer cancelled at once: held, the size that would open is std-2, the placement is cmp-8.
+        const held = buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize: 'cmp-8' }).computer;
+        expect(held).toMatchObject({ standing: 'files_on_aws', size: 'std-2', vcpu: 2, awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } });
+        expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize: 'cmp-4' }).computer.awsSize).toEqual({ size: 'cmp-4', vcpu: 4, memoryGiB: 16 });
+        // Paid: the preference (next start) and the placement are separate facts.
+        const paid = buildSummaryV3({ ...input('premium_monthly_v3'), placementProvider: 'aws-ec2', sizePreference: 'std-2', awsSize: 'cmp-8' }).computer;
+        expect(paid).toMatchObject({ standing: 'paid', size: 'std-2', awsSize: { size: 'cmp-8' } });
+        // Unknown, mixed or a non-AWS size: null, never a guess.
+        for (const awsSize of [undefined, null, 'free-cf'] as const)
+            expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize }).computer.awsSize).toBeNull();
+    });
+    it('round 6 (CR-2): a running hold session carries its stored deadline (ready + 1 h) for "This session ends at HH:MM"', () => {
+        const held = { ...input(), placementProvider: 'aws-ec2' as const, epochs: [epoch({ size: 'std-2', weight: 1, readyAt: '2026-10-19T11:30:00Z',
+            deadlineAt: '2026-10-19T12:29:59Z' })] };
+        expect(buildSummaryV3(held).computer).toMatchObject({ standing: 'files_on_aws', sessionMaxSeconds: 3600, activeDeadline: '2026-10-19T12:29:59Z' });
     });
     it('cancel at period end reads plan_ending with planEndsAt', () => {
         const args = input('premium_monthly_v3');

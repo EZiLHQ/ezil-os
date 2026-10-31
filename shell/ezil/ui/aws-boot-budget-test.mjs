@@ -452,3 +452,87 @@ test('desktop: no surface swap past the old 4 s phase-list deadline', async t =>
     assert.doesNotMatch(h.spinner.textContent, /Getting your workspace|Loading your files|Starting your apps|Opening the window/,
         'no timer-estimated phase labels');
 });
+
+// ── Round 6 (CR-3): the desktop TTI path label ──────────────────────────────
+// Live 10-30 06:37Z an AWS computer opened while RUNNING sent first_frame_cloudflare /
+// first_input_cloudflare: the observation carries no `path` once nothing is opening, and the
+// fallback read `desktopState.provider`, which is 'cloudflare-guacamole' for every computer. The
+// label is now the path this open was seen opening by, else 'running' for an AWS answer, and
+// 'cloudflare' only for a computer the server did not answer as AWS.
+const VIEWER = 'https://viewer.example';
+async function ttiOpen(t, { progress, computeProvider }) {
+    const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', {
+        url: 'https://app.example/os', runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
+    });
+    const { window: w } = dom;
+    t.after(() => w.close());
+    const logs = [], codes = [];
+    w.console.info = (...a) => logs.push(a.join(' '));
+    const timeout = w.setTimeout.bind(w), interval = w.setInterval.bind(w);
+    w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 5000 ? 5 : ms === 1500 ? 5 : ms === 4000 ? 15 : ms > 1000 && ms <= 60_000 ? 20 : ms, ...args);
+    w.setInterval = (fn, ms, ...args) => interval(fn, ms === 250 ? 5 : ms, ...args);
+    w.AbortSignal = { timeout: () => undefined };
+    let observed = progress[0];
+    w.fetch = async (raw, init = {}) => {
+        const path = String(raw);
+        let body = { ok: true };
+        if (path.includes('/api/trpc/computer.progress')) {
+            body = observed ? { result: { data: { json: { version: 2, computerId: 'computer-1', recordedStage: observed.stage, ...observed } } } }
+                : { result: { data: { json: { version: 2, computerId: 'computer-1', stage: 'unavailable', active: false, operation: 'none' } } } };
+        } else if (path === '/api/shell/desktop' && init.method === 'POST') {
+            // The open answers once the observation has moved through its stages (a cold open reaches RUNNING first).
+            for (const next of progress.slice(1)) { await wait(15); observed = next; }
+            await wait(15);
+            body = { ok: true, guacamoleUrl: `${VIEWER}/?embed=1`, frame: { confirmed: true }, ...(computeProvider ? { computeProvider } : {}) };
+        } else if (path.includes('confirm=frame')) body = { ok: true, confirmed: true, status: 200 };
+        else if (path.startsWith('/api/shell/telemetry')) { for (const e of JSON.parse(init.body ?? '{}').events ?? []) codes.push(e.code); }
+        else if (path.startsWith('/api/shell/desktop')) body = { ok: true, guacamoleRunning: true };
+        return { ok: true, status: 200, json: async () => body };
+    };
+    w.__EZIL_BOOT__ = {
+        user: { id: 'user-1', email: 'test@example.invalid' },
+        computer: { id: 'computer-1', name: 'My Computer', slot: 1, isNew: false },
+        apps: [{ id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop' }],
+        desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
+            endpoints: { session: '/api/shell/session', desktop: '/api/shell/desktop', telemetry: '/api/shell/telemetry' } },
+    };
+    w.eval(icons); w.eval(bundle);
+    await until(() => w.document.querySelector('.taskbar-item[data-app="desktop"]'), 'taskbar');
+    await w.ezil.registry.launch('desktop', { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
+    const win = await until(() => w.document.querySelector('.window[data-app="desktop"]'), 'window');
+    const frame = win.querySelector('.window-app-iframe');
+    let frames = 0;
+    await until(() => { try { return new URL(frame.src).origin === VIEWER; } catch { return false; } }, 'viewer navigated');
+    await until(() => {
+        frames += 10;
+        w.dispatchEvent(new w.MessageEvent('message', { origin: VIEWER, source: frame.contentWindow, data: { source: 'ezil-mobile', type: 'stream_vitals',
+            attempt: new URL(frame.src).searchParams.get('ezilAttempt'),
+            vitals: { connectionState: 'connected', bytesReceived: frames * 1000, framesDecoded: frames, width: 1280, height: 720 } } }));
+        return logs.find(l => l.startsWith('[desktop] tti='));
+    }, 'first frame');
+    // The boot_phase event (`first_frame_<path>`) leaves on the next telemetry flush.
+    await until(() => codes.some(c => String(c).startsWith('first_frame_')), 'telemetry flush');
+    return { tti: logs.find(l => l.startsWith('[desktop] tti=')), url: logs.find(l => l.startsWith('[desktop] url_received=')),
+        frameCode: codes.find(c => String(c).startsWith('first_frame_')) };
+}
+const runningNow = { stage: 'running', operation: 'none', active: false, path: null, transition: null, expectedSeconds: 30 };
+
+test('CR-3: an AWS computer opened while RUNNING is labelled path=running, never cloudflare', async t => {
+    const h = await ttiOpen(t, { progress: [runningNow], computeProvider: 'aws-ec2' });
+    assert.match(h.tti, /^\[desktop\] tti=\d+ path=running$/);
+    assert.match(h.url, /path=running$/);
+    assert.equal(h.frameCode, 'first_frame_running');
+});
+
+test('CR-3: a cold AWS open keeps its own path after the observation reaches RUNNING (no path) before the first frame', async t => {
+    const h = await ttiOpen(t, { progress: [{ stage: 'starting', operation: 'opening', active: true, path: 'cold', transition: null, expectedSeconds: 240 }, runningNow],
+        computeProvider: 'aws-ec2' });
+    assert.match(h.tti, /^\[desktop\] tti=\d+ path=cold$/);
+    assert.equal(h.frameCode, 'first_frame_cold');
+});
+
+test('CR-3: a computer the server did not answer as AWS keeps the cloudflare label', async t => {
+    const h = await ttiOpen(t, { progress: [null] });
+    assert.match(h.tti, /^\[desktop\] tti=\d+ path=cloudflare$/);
+    assert.equal(h.frameCode, 'first_frame_cloudflare');
+});
