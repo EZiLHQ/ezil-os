@@ -47,7 +47,9 @@ async function open (t, app, { progress, answer, launch = true, reaskMs = 5 }) {
         let body = { ok: true };
         if ( path.includes('/api/trpc/computer.progress') ) {
             h.reads++;
-            body = { result: { data: { json: { ...progress(h), computerId: COMPUTER } } } };
+            const read = progress(h);
+            if ( read instanceof Error ) throw read; // a read that fails (network)
+            body = { result: { data: { json: { ...read, computerId: COMPUTER } } } };
         } else if ( Object.values(OPEN_PATHS).includes(path) && init.method === 'POST' ) {
             if ( path === OPEN_PATHS[app] ) { h.asks++; h.log.push(h.now); body = answer(h); } else body = { ok: false, errorCode: 'sandbox_starting' };
         } else if ( path.includes('confirm=frame') ) body = { ok: true, confirmed: true, status: 200 };
@@ -239,3 +241,18 @@ test('desktop: the window that claims the warm owns the wait; closing it mid-mov
     await wait(150);
     assert.equal(h.asks, asks, 'a closed window\'s move wait asks nothing, and opens nothing at the commit');
 });
+
+// R1-M2 end to end: Code and Preview hand the surface their own plain failure for the blocked answer. With every
+// progress read failing, only the open loop's note can say it was the blocked answer: the card shows at once, with no
+// retry and no generic failure copy, and nothing is asked again.
+for ( const app of ['desktop', 'code', 'preview'] ) {
+    test(`${app}: the blocked answer with every progress read failing: the needs-attention card, no retry, one ask`, async t => {
+        const h = await open(t, app, { progress: () => new Error('network'), answer: () => blockedAnswer() });
+        await until(() => label(h.spinner) === "We're finishing moving your files", 'the needs-attention card');
+        await wait(60);
+        assert.equal(h.asks, 1);
+        assert.equal(h.spinner.querySelector('.ezil-boot-retry').hidden, true);
+        assert.doesNotMatch(h.spinner.textContent, /Something went wrong|couldn't start your computer|Your computer needs attention/i); // a hidden button keeps its words
+        assert.equal(line(h.spinner), "Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.");
+    });
+}
