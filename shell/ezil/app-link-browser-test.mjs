@@ -318,6 +318,47 @@ try {
         assert.ok(fills(g), `🔴 a dock launch remembering full opens straight into full view, FILLING the viewport: ${JSON.stringify(g)}`);
         await tab.close();
     }
+    // ── a rapid Back, Back ends with the newest target in front ─────────────
+    // Each Back focuses its window 80ms after `showWindow`. Here the second
+    // Back is sent from the first one's `popstate`, so it always comes before
+    // the first focus lands, and Settings comes in front for a moment. Once
+    // that late focus has landed (Settings seen active), Code must be in front
+    // again and own the address bar: the newest Back's focus, or its
+    // `ensureOnTop` re-focus, lands after it. No timed waits. Measured in
+    // Chromium: the second popstate lands about 6ms after the first, so the
+    // two 80ms focuses land in Back order. This checks the end state; it does
+    // not reorder the focuses, so it cannot exercise `ensureOnTop`'s
+    // superseded check (`app-history-test.mjs` covers that rule).
+    {
+        const tab = await context.newPage();
+        const at = pathname => tab.waitForFunction(p => location.pathname === p, pathname);
+        await tab.goto(`${origin}/app/code`);
+        await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
+        await tray(tab, 'minimize');
+        await tab.locator('.taskbar-item[data-app="settings"]').click();
+        await tab.locator('.window[data-app="settings"].window-active').waitFor(); await at('/app/settings');
+        await tab.locator('.taskbar-item[data-app="code"]').click();
+        await at('/app/code'); await tab.locator('.window[data-app="code"].ezil-fullbleed.window-active').waitFor();
+        await tab.evaluate(() => {
+            window.__activeSeq = [];
+            new MutationObserver(() => {
+                const active = document.querySelector('.window.window-active')?.dataset.app;
+                if ( active && window.__activeSeq.at(-1) !== active ) window.__activeSeq.push(active);
+            }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+            addEventListener('popstate', () => history.back(), { once: true });
+            history.back();
+        });
+        await at('/app/code');
+        await tab.waitForFunction(() => {
+            const seq = window.__activeSeq, code = document.querySelector('.window[data-app="code"]');
+            const front = (x, y) => document.elementFromPoint(x, y)?.closest('.window') === code;
+            return seq.includes('settings') && seq.at(-1) === 'code' && code.classList.contains('window-active')
+                && front(innerWidth / 2, innerHeight / 2) && front(1, innerHeight - 1) && front(innerWidth - 1, innerHeight - 1);
+        });
+        assert.deepEqual(await tab.evaluate(() => [location.pathname, history.state?.ezilApp, window.__activeSeq.at(-1)]), ['/app/code', 'code', 'code'],
+            '🔴 a rapid Back, Back: once the first Back\'s late focus has landed, Code is in front and names the address bar');
+        await tab.close();
+    }
     // 🔴 PRE-EXISTING, NOT A ROUTE ARTIFACT: `bundle.min.css` carries jQuery
     // UI's theme sprites as `url("images/ui-icons_*.png")`, which resolve
     // against the STYLESHEET (`/os/bundle.min.css`), and `build-shell.sh`
