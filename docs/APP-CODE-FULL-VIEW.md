@@ -230,21 +230,21 @@ These files are not this lane's to edit.
 
 > **Status at integration (`feat/os-app-code-20261030`, 2026-10-30).** Done:
 > the troubleshoot-test check 4 rewrite (4/4) and the three "Stale wording"
-> items. Still open: the `e2e/billing-staging-journey.mjs` persistence step
-> and the `shell/ezil/runtime-recheck.js:21-22` header.
+> items. The `e2e/billing-staging-journey.mjs` persistence step was done by
+> gate G4b (2026-10-31, below). Still open: the
+> `shell/ezil/runtime-recheck.js:21-22` header.
 
 - **Merge blocker: `shell/ezil/ui/Settings/troubleshoot-test.mjs` check 4 (lines 48-61).** CI runs this file (ci.yml node-suite list). Check 4 still requires `RESTART_DESKTOP_TIME` and the Restart desktop copy, so it fails as soon as this lane lands. Rewrite it to test both sides:
   - Present: the Restart computer heading, copy and `data-action="restart-computer"`, and that copy passes `scanCopy`.
   - Absent: `RESTART_DESKTOP_TIME`, "Restarts the desktop and its apps", `<h3>Restart desktop</h3>`, `data-action="restart"` and `sheet: 'confirm-restart'`.
   - The integrator must apply this in the same merge.
-- **`e2e/billing-staging-journey.mjs` persistence step (lines 576, 614-630, 643; fixture `billing-staging-journey.test.mjs:226`).** The step drives `[data-action="restart"]`, so it would time out and FAIL. It is not a SKIP, because `restartUnavailableReason('')` is null.
-  - **Minimal fix:** pass the skip reason `'restart_desktop_removed'` to `record('persistence', …)` at line 783.
-  - **Full fix:** rewrite the step for Restart computer, which needs all of these:
-    - selector `[data-action="restart-computer"]`;
-    - confirm through `[role="dialog"][data-sheet="confirm-restart-computer"]`, using the button "Restart computer" scoped to that sheet, because the pane's own button has the same name;
-    - success copy "Your computer restarted.";
-    - a wait of at least 300 s;
-    - assert the `/workspace/.e2e-persist.txt` marker, not `~/e2e-persist.txt`, because a computer restart stops the machine.
+- **Done (G4b): `e2e/billing-staging-journey.mjs` persistence step.** It drove `[data-action="restart"]`, so it would have timed out and FAILed. It now drives Restart computer (`persistence()`, `restartPane()`, `RESTART_COMPUTER_UI`):
+  - path Settings → Troubleshoot → Restart computer. No open Browser is needed first, because the tab takes the page's current computer;
+  - `[data-action="restart-computer"]`, then the button "Restart computer" inside `[role="dialog"][data-sheet="confirm-restart-computer"]` (the pane's own button has the same name);
+  - `[data-role="restart-computer-status"]` until "Your computer restarted.", for up to 360 s (`RESTART_COMPUTER_WAIT_MS`). That status line with `.ezil-settings-error` is a FAIL;
+  - only "Not available in this deployment yet." is a SKIP. "Open a desktop first, then come back here." stays a FAIL;
+  - both markers must come back: `/workspace/.e2e-persist.txt` and `~/e2e-persist.txt`. This corrects the earlier note here, which said to drop `~`: `/root` sits in the root overlay's upper layer on the data disk, and boot clears only its `tmp` and `run` (`infra/host-agent/lib/ezil_host/desktop.py` `host_clean`). The tmux session and the kernel boot id are recorded, not asserted.
+  - `e2e/billing-staging-journey.test.mjs` (now in ci.yml's cloud-release-contract node list) runs the real step against a fake Settings pane and a bash-backed fake computer, and pins every selector and line the step uses against `troubleshoot.js` and `sheet-frame.js`.
 - **Stale wording:**
   - `docs/aws-computers/LEGACY-REBASE-OPERATOR-PRESERVATION.md:43` lists "restart desktop" as an acceptance step. It should be "restart computer".
   - `shell/ezil/apps/relay-renewal.js:4` names "Restart desktop" as a cause. Only Restart computer and a switch remain.
