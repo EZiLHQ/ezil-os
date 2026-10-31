@@ -2,6 +2,8 @@
  * The enroll route is a thin wrapper: JSON parsing, no-store, and the
  * fail-closed wiring (no EC2 describer yet → 503, nothing consumed).
  */
+import { randomUUID } from 'node:crypto';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const handle = vi.fn();
@@ -84,45 +86,49 @@ describe('POST /api/compute/aws/enroll', () => {
         const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
         const NONCE = Buffer.alloc(32, 5).toString('base64url');
         const SIGNATURE = 'MIAGCSqGSIb3DQEHAqCAMIACAQExCzAJBgUrDgMCGgUAMIAGCSqGSIb3DQEHAaCAJIAEggHa';
-        const host = JSON.stringify({
-            computerId: C1.toUpperCase(), generation: 2, leaseEpoch: 3, nonce: NONCE, signature: SIGNATURE,
+        const hostBody = (computerId: string) => JSON.stringify({
+            computerId, generation: 2, leaseEpoch: 3, nonce: NONCE, signature: SIGNATURE,
             identityDocument: JSON.stringify({ accountId: '123456789012', instanceId: 'i-0123456789abcdef0', privateIp: '10.0.0.12' }),
         });
+        const host = hostBody(C1.toUpperCase());
+        // What the handler attaches to a refusal once the request presented the epoch's nonce (aws-enroll.ts).
+        const subject = { computerId: C1, generation: 2, leaseEpoch: 3 };
+        const anonymous = { computerId: null, generation: null, leaseEpoch: null };
         const consoleOutput = () => (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
 
         it('a Worker tunnel failure: one bounded line with its detail; the host body carries none of it', async () => {
             const spies = consoleOutput();
-            handle.mockResolvedValue({ status: 503, body: { error: 'tunnel_unavailable', retryable: true },
+            handle.mockResolvedValue({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, subject,
                 tunnel: { code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' } });
             const r = await post(host);
             expect(r.status).toBe(503);
             expect(await r.json()).toEqual({ error: 'tunnel_unavailable', retryable: true });
             expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-enroll] refused', {
-                status: 503, error: 'tunnel_unavailable', retryable: true, computerId: C1, generation: 2, leaseEpoch: 3,
+                status: 503, error: 'tunnel_unavailable', retryable: true, ...subject,
                 tunnel: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403',
             });
             const logged = JSON.stringify(spies.flatMap((s) => s.mock.calls));
             for (const secret of [NONCE, SIGNATURE, '123456789012', 'i-0123456789abcdef0', '10.0.0.12']) expect(logged).not.toContain(secret);
         });
 
-        it('a host retrying every few seconds logs once per (computer, error) per minute', async () => {
+        it('a host retrying every few seconds logs once per distinct refusal per minute', async () => {
             consoleOutput();
             vi.useFakeTimers({ toFake: ['Date'] });
             vi.setSystemTime(new Date('2026-10-31T00:00:00Z'));
-            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true } });
+            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true }, subject });
             for (let i = 0; i < 10; i++) { await post(host); vi.setSystemTime(Date.now() + 5_000); }
             expect(console.warn).toHaveBeenCalledTimes(1);
-            handle.mockResolvedValue({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true } });
+            handle.mockResolvedValue({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true }, subject });
             await post(host);
             expect(console.warn).toHaveBeenCalledTimes(2);
-            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true } });
+            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true }, subject });
             vi.setSystemTime(new Date('2026-10-31T00:01:00Z'));
             await post(host);
             expect(console.warn).toHaveBeenCalledTimes(3);
             expect(vi.mocked(console.warn).mock.calls[2]).toEqual(['[aws-enroll] refused', expect.objectContaining({ error: 'enroll_instance_not_running', suppressed: 9 })]);
         });
 
-        it('invalid JSON and an unexpected throw are logged too; a 200 never is', async () => {
+        it('invalid JSON and an unexpected throw are logged too, anonymously; a 200 never is', async () => {
             consoleOutput();
             await post('{');
             handle.mockRejectedValue(new Error(`connection terminated ${NONCE}`));
@@ -130,8 +136,29 @@ describe('POST /api/compute/aws/enroll', () => {
             handle.mockResolvedValue({ status: 200, body: { tunnelToken: 'test-token' } });
             await post(host);
             expect(vi.mocked(console.warn).mock.calls).toEqual([
-                ['[aws-enroll] refused', { status: 400, error: 'enroll_request_invalid', retryable: false, computerId: null, generation: null, leaseEpoch: null }],
-                ['[aws-enroll] refused', { status: 503, error: 'enroll_unavailable', retryable: true, computerId: C1, generation: 2, leaseEpoch: 3 }],
+                ['[aws-enroll] refused', { status: 400, error: 'enroll_request_invalid', retryable: false, ...anonymous }],
+                ['[aws-enroll] refused', { status: 503, error: 'enroll_unavailable', retryable: true, ...anonymous }],
+            ]);
+        });
+
+        it('the body never names a line or its key: callers rotating computer ids before any nonce check get one line per error', async () => {
+            consoleOutput();
+            handle.mockResolvedValue({ status: 400, body: { error: 'enroll_request_invalid' } });
+            for (let i = 0; i < 500; i++) await post(JSON.stringify({ computerId: randomUUID() }));
+            handle.mockResolvedValue({ status: 404, body: { error: 'not_found', retryable: true } });
+            for (let i = 0; i < 500; i++) await post(hostBody(randomUUID()));
+            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+            for (let i = 0; i < 500; i++) await post(hostBody(randomUUID()));
+            expect(vi.mocked(console.warn).mock.calls).toEqual([
+                ['[aws-enroll] refused', { status: 400, error: 'enroll_request_invalid', retryable: false, ...anonymous }],
+                ['[aws-enroll] refused', { status: 404, error: 'not_found', retryable: true, ...anonymous }],
+                ['[aws-enroll] refused', { status: 403, error: 'enroll_nonce_invalid', retryable: false, ...anonymous }],
+            ]);
+            // A proven host interleaved with that flood is still logged under its own computer, once.
+            handle.mockResolvedValue({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, subject, tunnel: { code: 'tunnel_http_502', detail: 'cf_api_403' } });
+            for (let i = 0; i < 3; i++) await post(host);
+            expect(vi.mocked(console.warn).mock.calls.slice(3)).toEqual([
+                ['[aws-enroll] refused', { status: 503, error: 'tunnel_unavailable', retryable: true, ...subject, tunnel: 'tunnel_http_502', detail: 'cf_api_403' }],
             ]);
         });
     });

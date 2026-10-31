@@ -304,7 +304,16 @@ export interface EnrollResponse {
     poolRelay?: PoolRelayEnrollment;
     /** Server-only diagnostic of a failed Worker tunnel call (the route logs it), never in the body. */
     tunnel?: TunnelFailure;
+    /**
+     * Server-only, on a refusal only: the placement's computer and epoch, once the request presented
+     * that epoch's nonce. The route's refusal log names a computer only through this, never from the
+     * (unauthenticated) body; never in the host's body.
+     */
+    subject?: EnrollSubjectProof;
 }
+
+/** The computer and epoch whose nonce an enrollment request presented. */
+export type EnrollSubjectProof = Pick<Placement, 'computerId' | 'generation' | 'leaseEpoch'>;
 
 export type PoolRelayEnrollment = Pick<Placement, 'computerId' | 'ownerUserId' | 'generation' | 'leaseEpoch' | 'instanceId' | 'fenceToken'>;
 
@@ -380,9 +389,18 @@ const carries = (tags: Readonly<Record<string, string>>, want: Record<string, st
  * non-200 and final. Before the swap, a refusal that may clear on its own carries
  * `retryable: true` (`retryLater`): the host keeps that nonce and retries, bounded;
  * on any other answer it wipes the nonce and never re-sends it (enroll.py).
+ * A refusal after the nonce matched carries the placement's computer and epoch, server-only
+ * (`subject`), for the route's refusal log; an earlier one carries nothing a caller chose.
  * 🔴 Never logs or echoes the nonce, the control key or the tunnel token.
  */
 export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promise<EnrollResponse> {
+    const proven: { subject?: EnrollSubjectProof } = {};
+    const result = await enroll(deps, raw, proven);
+    return result.status !== 200 && proven.subject ? { ...result, subject: proven.subject } : result;
+}
+
+/** `handleAwsEnrollment`'s checks; sets `proven.subject` once the request presented the epoch's nonce. */
+async function enroll(deps: EnrollDeps, raw: unknown, proven: { subject?: EnrollSubjectProof }): Promise<EnrollResponse> {
     if (!isAwsComputersEnabled(deps.env)) return retryLater(404, 'not_found');
     if (!deps.describer) return retryLater(503, 'enroll_unavailable');
     const parsed = EnrollBodySchema.safeParse(raw);
@@ -433,6 +451,8 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (!sameHash(nonceHash, p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
         if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
     }
+    // This epoch's own nonce: from here on a refusal may name the computer in the route's log.
+    proven.subject = { computerId: p.computerId.toLowerCase(), generation: p.generation, leaseEpoch: p.leaseEpoch };
 
     // The signed identity document, against the region's configured AWS certificate.
     const cert = readIdentityCertificate(deps.env, p.region);

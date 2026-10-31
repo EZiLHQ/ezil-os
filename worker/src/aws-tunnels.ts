@@ -361,7 +361,9 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       await deps.storage.put(RECORD_KEY, { ...rec, originVerified: true, originVerifiedAt: checkedAt });
       return 'verified';
     }
-    await destroy(deps.api, rec).catch((err: unknown) => logTunnelFailure('origin_fence_failed', 'fence', tunnelErrorCode(err), rec));
+    // The record holds the control key, AI nonce, address and hostname: only its ids reach the log.
+    const subject = { computerId: rec.computerId, generation: rec.generation, leaseEpoch: rec.leaseEpoch };
+    await destroy(deps.api, rec).catch((err: unknown) => logTunnelFailure('origin_fence_failed', 'fence', tunnelErrorCode(err), subject));
     return 'mismatch';
   }
 

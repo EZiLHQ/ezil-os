@@ -44,6 +44,8 @@ const DOC = JSON.parse(fx.document) as { instanceId: string; availabilityZone: s
 const CONTROL_SECRET = 'control-key-secret-for-tests';
 /** The derived control key of the default boot (generation 2, epoch 3, NONCE). */
 const KEY = deriveControlKey(CONTROL_SECRET, { computerId: C1, generation: 2, leaseEpoch: 3, nonceHash: nonceHashOf(NONCE) });
+/** What a refusal after the default boot's nonce matched carries, server-only, for the route's log. */
+const SUBJECT = { computerId: C1, generation: 2, leaseEpoch: 3 };
 const TOKEN = 'tunnel-token-' + 'x'.repeat(40);
 const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 
@@ -220,7 +222,7 @@ describe('a valid enrollment', () => {
         t += TUNNEL_REPLAY_WINDOW_MS + 1;
         // The Worker's own refusal is kept server-side for the route's log; the host sees only the body.
         expect(await enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' },
-            tunnel: { code: 'tunnel_http_409', workerError: 'tunnel_replay_refused' } });
+            tunnel: { code: 'tunnel_http_409', workerError: 'tunnel_replay_refused' }, subject: SUBJECT });
         expect(w.created).toHaveLength(1);
     });
 
@@ -229,7 +231,7 @@ describe('a valid enrollment', () => {
         const s = setup([booting()], { tunnels: w.client });
         expect((await s.enroll()).status).toBe(200);
         s.placements[0]!.instance_id = 'i-33333333333333333';
-        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' } });
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' }, subject: SUBJECT });
         expect(w.created).toHaveLength(1);
     });
 
@@ -282,7 +284,7 @@ describe('a valid enrollment', () => {
     it('a second unexplained miss is bounded and is not reported as a consumed nonce', async () => {
         const s = setup();
         const consume = vi.spyOn(placement, 'consumeEnrollmentNonce').mockResolvedValue({ ok: false, reason: 'cas_conflict' });
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_conflict', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_conflict', retryable: true }, subject: SUBJECT });
         expect(consume).toHaveBeenCalledTimes(2);
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
         expect(s.tunnels).toEqual([]);
@@ -295,7 +297,7 @@ describe('a valid enrollment', () => {
             return liveView();
         } };
         const consume = vi.spyOn(placement, 'consumeEnrollmentNonce');
-        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_stale_epoch' } });
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_stale_epoch' }, subject: SUBJECT });
         expect(consume).toHaveBeenCalledTimes(1);
         expect(s.tunnels).toEqual([]);
     });
@@ -360,10 +362,17 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
         'data volume not attached', "instance still pending in EC2's view", 'provision: data volume not visible yet',
     ]);
 
+    // Refused before the nonce matched: anyone may send these, so nothing names the computer.
+    const BEFORE_PROOF = new Set([
+        'flag off', 'no describe client', 'no tunnel client', 'malformed body', 'short nonce', 'unknown computer', 'a Cloudflare computer',
+        'wrong state (RUNNING)', 'wrong state (STOPPED)', 'stale epoch', 'stale generation', 'wrong nonce', 'expired nonce',
+    ]);
+
     it.each(cases)('%s → %i %s', async (name, args, body, status, error) => {
         const { enroll, placements, tunnels, described } = setup(...args);
         const before = placements.map((r) => ({ ...r }));
-        expect(await enroll(body)).toEqual({ status, body: RETRYABLE.has(name) ? { error, retryable: true } : { error } });
+        expect(await enroll(body)).toEqual({ status, body: RETRYABLE.has(name) ? { error, retryable: true } : { error },
+            ...(BEFORE_PROOF.has(name) ? {} : { subject: SUBJECT }) });
         if (error === 'instance_mismatch') expect(described).toEqual([]);
         expect(placements).toEqual(before);
         expect(tunnels).toEqual([]);
@@ -387,21 +396,21 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
             s.placements[0]!.instance_id = 'i-33333333333333333';
             return liveView();
         } };
-        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' } });
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' }, subject: SUBJECT });
         expect(s.placements[0]).toMatchObject({ instance_id: 'i-33333333333333333', enroll_nonce_hash: nonceHashOf(NONCE) });
         expect(s.tunnels).toEqual([]);
     });
 
     it.each([undefined, '', '   '])('no control-key secret (%j) leaves the nonce intact', async (controlKeySecret) => {
         const s = setup([booting()], { controlKeySecret });
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true }, subject: SUBJECT });
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
         expect(s.tunnels).toEqual([]);
     });
 
     it('a describe failure is 503 and changes nothing', async () => {
         const { enroll, placements } = setup([booting()], { describer: { describeForEnrollment: async () => { throw new Error('throttled'); } } });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true }, subject: SUBJECT });
         expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE) });
     });
 });
@@ -414,7 +423,7 @@ describe('the browser zone the host is told (EZIL_AWS_BROWSER_ZONE)', () => {
             if (zone === undefined) delete (e as Record<string, string>)[AWS_BROWSER_ZONE_ENV];
             else e[AWS_BROWSER_ZONE_ENV] = zone;
             const { enroll, placements, tunnels } = setup([booting()], { e });
-            expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true } });
+            expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true }, subject: SUBJECT });
             expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE), instance_id: null });
             expect(tunnels).toEqual([]);
         },
@@ -429,7 +438,7 @@ describe('the browser zone the host is told (EZIL_AWS_BROWSER_ZONE)', () => {
 describe('after the nonce is consumed', () => {
     it('a tunnel failure is non-200, the nonce stays consumed, and no control key is returned', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status: 409, code: 'tunnel_exists' }) });
-        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: 'tunnel_exists' } });
+        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: 'tunnel_exists' }, subject: SUBJECT });
         expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
         // The host never re-sends it (enroll.py), and a replay is refused.
         expect((await enroll()).status).toBe(403);
@@ -437,7 +446,7 @@ describe('after the nonce is consumed', () => {
 
     it('a thrown tunnel call is ambiguous: retryable 503, still pending, the consumed proof kept', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' }, subject: SUBJECT });
         expect(placements[0]).toMatchObject({ state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE) });
     });
 
@@ -458,7 +467,7 @@ describe('after the nonce is consumed', () => {
         const w = workerBackedTunnels();
         const s = setup([booting()], { tunnels: w.client });
         failTransaction(s.deps.db, 2);
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true }, subject: SUBJECT });
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
         // The host kept its nonce (retryable) and re-sends it.
         const again = await s.enroll();
@@ -476,10 +485,10 @@ describe('after the nonce is consumed', () => {
         w.client.createTunnel = async (owner, req) => { if (first) { first = false; throw new Error('socket'); } return real(owner, req); };
         failTransaction(s.deps.db, 2);
         // An ambiguous create attempts no finish at all (Codex 4277613521): still pending.
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' }, subject: SUBJECT });
         expect(w.created).toHaveLength(0);
         // The retry creates the tunnel; its completion write fails: still retryable.
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true }, subject: SUBJECT });
         expect(w.created).toHaveLength(1);
         const again = await s.enroll();
         expect(again.status).toBe(200);
@@ -565,7 +574,7 @@ describe('after the nonce is consumed', () => {
             },
             deleteTunnel: async () => ({ ok: true }),
         };
-        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_conflict' } });
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_conflict' }, subject: SUBJECT });
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
     });
 
@@ -625,12 +634,12 @@ describe('a Cloudflare API refusal is diagnosable from both logs (production: a 
         const w = workerBackedTunnels(undefined, cloudflare);
         const s = setup([booting()], { tunnels: w.client });
         const refused = { status: 503, body: { error: 'tunnel_unavailable', retryable: true },
-            tunnel: { code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' } };
+            tunnel: { code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' }, subject: SUBJECT };
         // The first attempt, then the host's retry (pending: replay → tunnel_absent → create again).
         for (let i = 0; i < 2; i++) {
             const r = await s.enroll();
             expect(r).toEqual(refused);
-            logEnrollRefusal(r, hostBody()); // what the route does with every non-200
+            logEnrollRefusal(r); // what the route does with every non-200
         }
         const warn = vi.mocked(console.warn).mock.calls;
         const subject = { computerId: C1, generation: 2, leaseEpoch: 3 };
@@ -733,7 +742,7 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
     ];
     it.each(ambiguous)('%s: retryable 503, no finish, still ENROLLMENT_PENDING with the consumed proof', async (_label, tunnel, code) => {
         const { enroll, placements } = setup([booting()], { tunnel });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code }, subject: SUBJECT });
         expect(placements[0]).toMatchObject({
             state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null,
             enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId,
@@ -742,7 +751,7 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
 
     it.each([400, 401, 403, 409])('an answered %i is a definite refusal: 502, UNCONFIRMED, proof cleared', async (status) => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status, code: `tunnel_http_${status}` }) });
-        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: `tunnel_http_${status}` } });
+        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: `tunnel_http_${status}` }, subject: SUBJECT });
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED, enroll_consumed_hash: null });
     });
 
@@ -760,7 +769,7 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
             deleteTunnel: w.client.deleteTunnel,
         };
         const s = setup([booting()], { tunnels: lossy });
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' }, subject: SUBJECT });
         expect(w.created).toHaveLength(1);
         const retry = await s.enroll();
         expect(retry.status).toBe(200);

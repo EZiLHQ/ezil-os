@@ -915,6 +915,21 @@ describe('failure diagnosis: one bounded log line and the same code as detail (p
     for (const r of [replayed, fenced, removed]) for (const secret of neverLogged) expect(r.text).not.toContain(secret);
   });
 
+  it('a failed origin fence logs only the record\'s ids: never its control key, AI nonce, address or hostname', async () => {
+    const s = memStorage(); const f = fakeApi();
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    const nonce = await svc.aiNonce(1, 2, '11111111-1111-4111-8111-111111111111');
+    const rec = (await svc.get())!;
+    expect(rec.aiProxyNonce).toBe(nonce!);
+    f.api.listConnectorOrigins = async () => ['13.200.1.2', '203.0.113.9'];
+    f.api.deleteTunnel = async () => { throw new TunnelApiError('cf_api_403'); };
+    const { result, warn, text } = await captureConsole(() => svc.verifyOrigin());
+    expect(result).toBe('mismatch');
+    expect(warn).toEqual([['[aws-tunnels] origin_fence_failed', { leg: 'fence', code: 'cf_api_403', ...subject }]]);
+    for (const secret of [rec.controlKey, nonce!, rec.publicIp, rec.hostname, rec.tunnelId, rec.instanceId, ZONE]) expect(text).not.toContain(secret);
+  });
+
   it('the detail crosses the registry and the internal route unchanged (what the app reads)', async () => {
     const env = { AWS_TUNNEL_CF_ACCOUNT_ID: 'acct', AWS_TUNNEL_CF_ZONE_ID: 'zone', AWS_TUNNEL_CF_API_TOKEN: API_TOKEN, AWS_ORIGIN_ZONE: ZONE, AWS_ORIGIN_ZONE_ALLOWLIST: ZONE };
     const f: FetchLike = async (url, init) => (init?.method === 'POST' && url.endsWith('/cfd_tunnel')
