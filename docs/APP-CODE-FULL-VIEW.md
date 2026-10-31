@@ -135,8 +135,13 @@ shared by every window. On every window mutation (and when the
 full view (the rendered `.ezil-fullbleed` window with the highest z-index, the
 later one on a tie) and copies its computed `--ezil-control-strip-height` onto
 the icon as `--ezil-feedback-strip-h`, and its `--ezil-feedback-look` onto
-`data-look`. It writes only when a value changes, since `style` is one of the
-attributes it observes. With no full view, or nothing declared, the CSS
+`data-look`. It writes only when a value changes, so a window mutation that
+moves nothing costs the icon no style write. (A same-value write would not
+loop: Chromium and jsdom queue no mutation record for an unchanged CSSOM
+write, and `data-look` is not an observed attribute. Measured: a mutant that
+re-wrote the strip property on every sync left `code-full-view-browser-test`
+green, and `feedback-test` too until it counted the calls.) With no full view,
+or nothing declared, the CSS
 fallbacks are the Browser's strip and the glass disc. So Code full over a
 full-bleed Browser puts the icon in Code's strip, and minimising Code puts it
 back at the Browser's 9.5px, glass.

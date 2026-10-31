@@ -266,7 +266,8 @@ export function mount_feedback_chip () {
         // height and the look it declares (`--ezil-feedback-look`), never one
         // strip's fixed offset. Nothing declared (jsdom, no full view): the
         // CSS fallbacks, which are the Browser's strip and the glass disc.
-        // Written only when it changes: `style` is observed below.
+        // Written only when a value changes, so a window mutation that moves
+        // nothing costs the icon no style write.
         const css = front ? window.getComputedStyle(front) : null;
         const strip = css?.getPropertyValue('--ezil-control-strip-height').trim() ?? '';
         const want_strip = PX.test(strip) ? strip : '';

@@ -267,14 +267,23 @@ try {
         codeWin.style.setProperty('--ezil-feedback-look', 'outline');
         await tick();
         assert.deepEqual([strip(), look()], ['28px', 'outline']);
-        // No ping-pong: `style` is observed, so an unchanged value is never re-written.
+        // Writes only on a change: a window mutation that changes nothing sets
+        // no style property and no attribute on the icon. (A same-value CSSOM
+        // write queues no mutation record, so the style writes are counted at
+        // the call; an attribute set queues one even when the value is equal.)
         const writes = [];
-        const watch = new MutationObserver(records => writes.push(...records));
+        const watch = new MutationObserver(records => writes.push(...records.map(r => `attribute ${r.attributeName}`)));
         watch.observe(chip, { attributes: true });
+        for ( const method of ['setProperty', 'removeProperty'] ) {
+            const real = chip.style[method].bind(chip.style);
+            chip.style[method] = (...args) => { writes.push(`${method} ${args[0]}`); return real(...args); };
+        }
         parent.setAttribute('class', 'unrelated');
         await tick(); await tick();
         watch.disconnect();
-        assert.deepEqual(writes.map(r => r.attributeName), [], 'nothing changed, nothing written to the icon');
+        delete chip.style.setProperty;
+        delete chip.style.removeProperty;
+        assert.deepEqual(writes, [], 'nothing changed, nothing written to the icon');
         // The strip height is a `pointer: coarse` media query; flipping one
         // mutates nothing, so the icon also re-reads it on the query's change.
         const query = new window.EventTarget();
