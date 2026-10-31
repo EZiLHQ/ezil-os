@@ -17,6 +17,7 @@ import {
 import { createProviderReverseStore, EXPORT_CHUNK_BYTES, type ComputeReverseMove } from './provider-reverse-store';
 import { readComputerProgress } from './progress';
 import { reverseMoveView, reversePlacementView } from './provider-reverse';
+import { createReverseRuntime, type ReverseBilling } from './provider-reverse-runtime';
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const schema = `placement_reverse_test_${randomUUID().replaceAll('-', '')}`;
@@ -173,6 +174,56 @@ describe.skipIf(!PG)('reverse-move placement writers on production Drizzle Postg
             expect(cf).toMatchObject({ provider: 'cloudflare', generation: 1, leaseEpoch: 0 });
             expect(done).toMatchObject({ state: 'committed', awsVolumeId: volumeId, awsFsUuid: fsUuid, awsSnapshotId: null });
             expect((await reverse.readById(m.id))!).toMatchObject({ state: 'committed', retainUntil: expect.any(Date) });
+        });
+    });
+    /**
+     * §5.6 step 1 / §5.8 rule 2 (r7 integration, verifier mutant E8): the runtime's transaction 1, `toFlipping`, on real rows.
+     * Under the admission and computer locks it re-reads the row and the placement, then re-checks the entitlement BEFORE
+     * `advance('flipping')` sets commit_sent_at. A paid standing there answers 'paid' and writes nothing.
+     */
+    describe('the runtime\'s transaction 1, toFlipping (§5.6 step 1, §5.8)', () => {
+        const billing = (paid: boolean): ReverseBilling & { reads: number } => {
+            const b = { reads: 0, async standing() { b.reads++; return { paid, sku: paid ? 'standard_monthly_v3' : null }; },
+                async openEpoch() { return false; } };
+            return b;
+        };
+        const checkingRow = async () => {
+            const reverse = createProviderReverseStore(db);
+            let m: ComputeReverseMove = await reverse.createOrGetActive({ computerId, userId: ownerUserId, startedBy: 'user' });
+            m = await reverse.recordExportBoot(m, { placementGeneration: N1, leaseEpoch: E1, region: 'ap-south-1', volumeId, jobId,
+                instanceId: 'i-0123456789abcdef0', fsUuid, claimedAt: new Date().toISOString() });
+            m = await reverse.advance(m, 'exporting');
+            m = await reverse.recordExportHead(m, { generation: m.generation, sha256: 'f'.repeat(64), entries: 1, skipped: 0, bytes: EXPORT_CHUNK_BYTES,
+                chunks: [{ i: 0, size: EXPORT_CHUNK_BYTES, sha256: '0'.repeat(64) }] });
+            m = await reverse.recordImportProgress(m, [0]);
+            m = await reverse.advance(m, 'checking');
+            await seed('STOPPED');
+            return { reverse, m };
+        };
+        it('a paid standing under the locks answers paid: commit_sent_at stays NULL, the row stays checking, the placement is untouched', async () => {
+            const { reverse, m } = await checkingRow();
+            const before = await current();
+            const paid = billing(true);
+            expect(await createReverseRuntime(db, { billing: paid }).toFlipping(m)).toBe('paid');
+            expect(paid.reads).toBe(1);
+            const row = (await reverse.readById(m.id))!;
+            expect(row).toMatchObject({ state: 'checking', commitSentAt: null, updatedAt: m.updatedAt });
+            expect(Number((await q(`SELECT count(*)::int AS n FROM $S.ezil_compute_reverse_moves WHERE commit_sent_at IS NOT NULL`))[0]!.n)).toBe(0);
+            expect(await current()).toEqual(before);
+        });
+        it('control: an unpaid standing flips the row to flipping with commit_sent_at set (DB clock)', async () => {
+            const { reverse, m } = await checkingRow();
+            const out = await createReverseRuntime(db, { billing: billing(false) }).toFlipping(m);
+            expect(out).toMatchObject({ id: m.id, state: 'flipping', commitSentAt: expect.any(String) });
+            expect((await reverse.readById(m.id))!).toMatchObject({ state: 'flipping', commitSentAt: expect.any(String) });
+        });
+        it('a stale copy or a placement that is not the settled export boot is not_ready, and never reads the standing', async () => {
+            const { m } = await checkingRow();
+            const paid = billing(true);
+            expect(await createReverseRuntime(db, { billing: paid }).toFlipping({ ...m, updatedAt: '1999-01-01 00:00:00+00' })).toBe('not_ready');
+            await q(`UPDATE $S.ezil_computer_placements SET state = 'RUNNING'`);
+            expect(await createReverseRuntime(db, { billing: paid }).toFlipping(m)).toBe('not_ready');
+            expect(paid.reads).toBe(0);
         });
     });
     /**

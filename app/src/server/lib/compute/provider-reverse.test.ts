@@ -281,6 +281,18 @@ describe('requested (§5.1.1, the deadline rule)', () => {
             expect(w.calls, name).not.toContain('claim');
         }
     });
+    it('an openEpoch read that fails counts as open (fail closed, §5.1.1): no claim, no write, then computer_busy at 600 s', async () => {
+        // r7 integration (verifier mutant E18): `.catch(() => true)` is the fail-closed read; a refused read never claims.
+        const w = world({}, held());
+        let reads = 0;
+        w.ports.openEpoch = async () => { reads++; throw new Error('billing store unavailable'); };
+        expect(await w.pass()).toMatchObject({ state: 'requested', attempts: 0, lastError: null });
+        expect(w.writes).toEqual([]);
+        w.age({ created: 600 });
+        expect(await w.pass()).toMatchObject({ state: 'failed_reopened', lastError: 'computer_busy' });
+        expect(w.calls).not.toContain('claim');
+        expect(reads).toBe(2);
+    });
     it('a capacity, fleet or move-cap refusal waits (no retry count), then boot_unavailable (try later) at the deadline pass', async () => {
         for (const reason of ['max_running', 'region_capacity', 'global_hours_cap', 'move_capacity', 'cas_conflict', 'duplicate_placement', 'region_not_configured']) {
             const w = world({}, held(), { claim: reason });

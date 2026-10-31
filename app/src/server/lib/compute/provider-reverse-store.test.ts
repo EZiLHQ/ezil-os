@@ -45,6 +45,14 @@ describe('reverse move states', () => {
         expect(['requested', 'booting', 'exporting'].map(s => steps[REVERSE_MOVE_DTO_STAGE[s as 'booting']])).toEqual(['0', '0', '0']);
         expect(['copying', 'checking', 'flipping'].map(s => steps[REVERSE_MOVE_DTO_STAGE[s as 'copying']])).toEqual(['1', '2', '3']);
     });
+    it('the shell\'s MOVE_LIMIT_BYTES (the cap in the too-large copy) is EXPORT_MAX_BYTES (§6.2, the same cross-file pattern)', () => {
+        // r7 integration: lands with lane U's constant (§6.2 order: never before it).
+        const shell = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/ui/computer-progress.js'), 'utf8');
+        const value = shell.match(/^export const MOVE_LIMIT_BYTES = (\d+);$/m)?.[1];
+        expect(value).toBeDefined();
+        expect(Number(value)).toBe(EXPORT_MAX_BYTES);
+        expect(EXPORT_MAX_BYTES).toBe(536_870_912);
+    });
 });
 
 describe('export head validation', () => {
