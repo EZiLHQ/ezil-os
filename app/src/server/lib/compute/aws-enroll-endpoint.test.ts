@@ -31,7 +31,8 @@ import * as placement from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { verifyPreviewTokenV2 } from '../../../../../worker/src/hmac';
-import { createAwsTunnelService, TUNNEL_REPLAY_WINDOW_MS, type CloudflareTunnelApi } from '../../../../../worker/src/aws-tunnels';
+import { createAwsTunnelService, createCloudflareTunnelApi, TUNNEL_REPLAY_WINDOW_MS, type CloudflareTunnelApi } from '../../../../../worker/src/aws-tunnels';
+import { logEnrollRefusal, resetEnrollRefusalLogForTests } from './aws-enroll-log';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
@@ -122,7 +123,7 @@ afterEach(() => vi.restoreAllMocks());
  * service (aws-tunnels.ts), v2-verified by the Worker's own hmac.ts, over a fake Cloudflare
  * API that counts the tunnels it is asked to create.
  */
-function workerBackedTunnels(clockMs: () => number = () => NOW.getTime()) {
+function workerBackedTunnels(clockMs: () => number = () => NOW.getTime(), cloudflare?: CloudflareTunnelApi) {
     const map = new Map<string, unknown>();
     const storage = {
         async get<T>(k: string) { return map.get(k) as T | undefined; },
@@ -144,7 +145,7 @@ function workerBackedTunnels(clockMs: () => number = () => NOW.getTime()) {
         async deleteTunnel(id) { for (const [k, v] of named) if (v === id) named.delete(k); },
         async listConnectorOrigins() { return []; },
     };
-    const service = createAwsTunnelService({ api, storage, zone: 'origin.example.net', nowMs: clockMs });
+    const service = createAwsTunnelService({ api: cloudflare ?? api, storage, zone: 'origin.example.net', nowMs: clockMs });
     const secret = 'worker-hmac-secret-for-tests';
     const client = createWorkerTunnelClient({
         workerUrl: 'https://w.example.test', secret, now: () => new Date(clockMs()),
@@ -217,7 +218,9 @@ describe('a valid enrollment', () => {
         placements[0]!.state = 'RUNNING';
         expect(await enroll()).toEqual(first);
         t += TUNNEL_REPLAY_WINDOW_MS + 1;
-        expect(await enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        // The Worker's own refusal is kept server-side for the route's log; the host sees only the body.
+        expect(await enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' },
+            tunnel: { code: 'tunnel_http_409', workerError: 'tunnel_replay_refused' } });
         expect(w.created).toHaveLength(1);
     });
 
@@ -426,7 +429,7 @@ describe('the browser zone the host is told (EZIL_AWS_BROWSER_ZONE)', () => {
 describe('after the nonce is consumed', () => {
     it('a tunnel failure is non-200, the nonce stays consumed, and no control key is returned', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status: 409, code: 'tunnel_exists' }) });
-        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
+        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: 'tunnel_exists' } });
         expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
         // The host never re-sends it (enroll.py), and a replay is refused.
         expect((await enroll()).status).toBe(403);
@@ -434,7 +437,7 @@ describe('after the nonce is consumed', () => {
 
     it('a thrown tunnel call is ambiguous: retryable 503, still pending, the consumed proof kept', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => { throw new Error('socket'); } });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
         expect(placements[0]).toMatchObject({ state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE) });
     });
 
@@ -473,7 +476,7 @@ describe('after the nonce is consumed', () => {
         w.client.createTunnel = async (owner, req) => { if (first) { first = false; throw new Error('socket'); } return real(owner, req); };
         failTransaction(s.deps.db, 2);
         // An ambiguous create attempts no finish at all (Codex 4277613521): still pending.
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
         expect(w.created).toHaveLength(0);
         // The retry creates the tunnel; its completion write fails: still retryable.
         expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_finish_unavailable', retryable: true } });
@@ -607,6 +610,43 @@ describe('after the nonce is consumed', () => {
     });
 });
 
+describe('a Cloudflare API refusal is diagnosable from both logs (production: a Worker token without "Cloudflare Tunnel: Edit")', () => {
+    it('the Worker logs leg + code, the app carries the code server-side and logs it once per minute; nothing secret is logged', async () => {
+        const CF_TOKEN = 'SECRET-CF-API-TOKEN-0123456789abcdef';
+        const output = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
+        resetEnrollRefusalLogForTests();
+        // The REAL Cloudflare REST client: lookups answer, the tunnel POST is refused with a body naming the token.
+        const cloudflare = createCloudflareTunnelApi({
+            accountId: 'acct', zoneId: 'zone', apiToken: CF_TOKEN,
+            fetch: async (url, init) => (init?.method === 'POST' && url.endsWith('/cfd_tunnel')
+                ? new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: `Authentication error ${CF_TOKEN}` }] }), { status: 403 })
+                : new Response(JSON.stringify({ success: true, result: [] }), { status: 200 })),
+        });
+        const w = workerBackedTunnels(undefined, cloudflare);
+        const s = setup([booting()], { tunnels: w.client });
+        const refused = { status: 503, body: { error: 'tunnel_unavailable', retryable: true },
+            tunnel: { code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' } };
+        // The first attempt, then the host's retry (pending: replay → tunnel_absent → create again).
+        for (let i = 0; i < 2; i++) {
+            const r = await s.enroll();
+            expect(r).toEqual(refused);
+            logEnrollRefusal(r, hostBody()); // what the route does with every non-200
+        }
+        const warn = vi.mocked(console.warn).mock.calls;
+        const subject = { computerId: C1, generation: 2, leaseEpoch: 3 };
+        expect(warn).toEqual([
+            ['[aws-tunnels] create_failed', { leg: 'create', code: 'cf_api_403', ...subject }],
+            ['[aws-enroll] refused', { status: 503, error: 'tunnel_unavailable', retryable: true, ...subject,
+                tunnel: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' }],
+            ['[aws-tunnels] create_failed', { leg: 'create', code: 'cf_api_403', ...subject }],
+        ]);
+        expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_consumed_hash: nonceHashOf(NONCE) });
+        const logged = JSON.stringify(output.flatMap((o) => o.mock.calls));
+        for (const secret of [NONCE, fx.pkcs7_rsa_detached.slice(0, 64), KEY.toString('base64'), CF_TOKEN, 'Authentication error',
+            '13.0.0.5', '10.0.0.12', DOC.instanceId, 'origin.example.net', SID]) expect(logged).not.toContain(secret);
+    });
+});
+
 describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
     const SECRET = 's'.repeat(32);
     const req: TunnelRequest = {
@@ -634,6 +674,11 @@ describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
 
     it.each([
         ['a 409', new Response('{}', { status: 409 }), { ok: false, status: 409, code: 'tunnel_http_409' }],
+        ['a Worker 502 naming the Cloudflare leg', new Response(JSON.stringify({ ok: false, error: 'tunnel_create_failed', detail: 'cf_api_403' }), { status: 502 }),
+            { ok: false, status: 502, code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' }],
+        ['an edge HTML 502', new Response('<html>Bad gateway</html>', { status: 502 }), { ok: false, status: 502, code: 'tunnel_http_502' }],
+        ['free-form Worker fields (dropped, never logged)', new Response(JSON.stringify({ error: 'Bad Thing', detail: 'x'.repeat(65) }), { status: 503 }),
+            { ok: false, status: 503, code: 'tunnel_http_503' }],
         ['a short token', new Response(JSON.stringify({ tunnelToken: 'x' }), { status: 200 }), { ok: false, status: 502, code: 'tunnel_response_malformed' }],
         ['not JSON', new Response('nope', { status: 200 }), { ok: false, status: 502, code: 'tunnel_response_malformed' }],
     ])('%s is a failure', async (_n, response, want) => {
@@ -678,17 +723,17 @@ describe('consumeEnrollmentNonce SQL', () => {
 });
 
 describe('an ambiguous Worker answer to the tunnel create keeps the enrollment recoverable (Codex 4277613521)', () => {
-    const ambiguous: [string, TunnelClient['createTunnel']][] = [
-        ['a thrown call (transport, timeout)', async () => { throw new Error('ETIMEDOUT'); }],
-        ['status 0 (no answer)', async () => ({ ok: false, status: 0, code: 'tunnel_transport' })],
-        ['429 (throttled)', async () => ({ ok: false, status: 429, code: 'tunnel_http_429' })],
-        ['500', async () => ({ ok: false, status: 500, code: 'tunnel_http_500' })],
-        ['502 (the Worker\'s own Cloudflare call failed, or an unreadable 200)', async () => ({ ok: false, status: 502, code: 'tunnel_response_malformed' })],
-        ['503', async () => ({ ok: false, status: 503, code: 'tunnel_http_503' })],
+    const ambiguous: [string, TunnelClient['createTunnel'], string][] = [
+        ['a thrown call (transport, timeout)', async () => { throw new Error('ETIMEDOUT'); }, 'tunnel_transport'],
+        ['status 0 (no answer)', async () => ({ ok: false, status: 0, code: 'tunnel_transport' }), 'tunnel_transport'],
+        ['429 (throttled)', async () => ({ ok: false, status: 429, code: 'tunnel_http_429' }), 'tunnel_http_429'],
+        ['500', async () => ({ ok: false, status: 500, code: 'tunnel_http_500' }), 'tunnel_http_500'],
+        ['502 (the Worker\'s own Cloudflare call failed, or an unreadable 200)', async () => ({ ok: false, status: 502, code: 'tunnel_response_malformed' }), 'tunnel_response_malformed'],
+        ['503', async () => ({ ok: false, status: 503, code: 'tunnel_http_503' }), 'tunnel_http_503'],
     ];
-    it.each(ambiguous)('%s: retryable 503, no finish, still ENROLLMENT_PENDING with the consumed proof', async (_label, tunnel) => {
+    it.each(ambiguous)('%s: retryable 503, no finish, still ENROLLMENT_PENDING with the consumed proof', async (_label, tunnel, code) => {
         const { enroll, placements } = setup([booting()], { tunnel });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code } });
         expect(placements[0]).toMatchObject({
             state: 'STARTING', last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null,
             enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId,
@@ -697,7 +742,7 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
 
     it.each([400, 401, 403, 409])('an answered %i is a definite refusal: 502, UNCONFIRMED, proof cleared', async (status) => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status, code: `tunnel_http_${status}` }) });
-        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' } });
+        expect(await enroll()).toEqual({ status: 502, body: { error: 'tunnel_unavailable' }, tunnel: { code: `tunnel_http_${status}` } });
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED, enroll_consumed_hash: null });
     });
 
@@ -715,7 +760,7 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
             deleteTunnel: w.client.deleteTunnel,
         };
         const s = setup([booting()], { tunnels: lossy });
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true }, tunnel: { code: 'tunnel_transport' } });
         expect(w.created).toHaveLength(1);
         const retry = await s.enroll();
         expect(retry.status).toBe(200);

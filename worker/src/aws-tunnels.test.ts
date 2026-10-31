@@ -3,7 +3,7 @@
  * only by the Worker, claims bound to the body, the connector-origin check, serialization,
  * and the Cloudflare REST client's request shapes (against a fake fetch; no real calls).
  */
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
 import { handleAwsBrowserHost, handleAwsPreview, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import { mintPreviewCookie, type PreviewTokenV2Claims } from './hmac';
@@ -16,7 +16,10 @@ import {
   lookupAwsTunnelForBrowser,
   verifyAwsTunnelOrigin,
   routeAwsTunnels,
+  TunnelApiError,
+  tunnelErrorCode,
   type CloudflareTunnelApi,
+  type TunnelLeg,
   type TunnelStorage,
   TUNNEL_REPLAY_WINDOW_MS,
 } from './aws-tunnels';
@@ -211,7 +214,7 @@ describe('create overlaps only the work after the durable pending marker and tun
             expect(s.map.has('pending_create')).toBe(true); expect(s.map.has('tunnel')).toBe(false);
             expect({ calls: f.calls, lookups: f.lookups, state: s.map }).toEqual(beforeQueue);
             outstanding.resolve();
-            expect(await creating).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed' } });
+            expect(await creating).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed', detail: 'unexpected' } });
             expect(completed).toEqual([heldLeg]);
             if (followup === 'restart retry') {
               expect(s.map.get('pending_create')).toMatchObject({ leaseEpoch: 2 });
@@ -288,7 +291,7 @@ describe('create (fence-first, once per epoch)', () => {
     await svc.create(claims(), body());
     api.deleteTunnel = async () => { throw new Error('cf down'); };
     calls.length = 0;
-    expect(await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).toEqual({ status: 502, body: { ok: false, error: 'tunnel_fence_failed' } });
+    expect(await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).toEqual({ status: 502, body: { ok: false, error: 'tunnel_fence_failed', detail: 'unexpected' } });
     expect(calls.some((c) => c.startsWith('createTunnel'))).toBe(false);
     expect((s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch).toBe(2);
   });
@@ -824,6 +827,112 @@ describe('Cloudflare REST client (fake fetch only)', () => {
   it('connector origins come from every connection of every connector', async () => {
     const { api } = capture([{ conns: [{ origin_ip: '1.2.3.4' }, { origin_ip: '5.6.7.8' }] }, { conns: [] }, {}]);
     expect(await api.listConnectorOrigins('tid')).toEqual(['1.2.3.4', '5.6.7.8']);
+  });
+  it('a fetch that never answers is cf_api_transport, without the token or the cause', async () => {
+    const api = createCloudflareTunnelApi({ accountId: 'acct', zoneId: 'zone', apiToken: 'SECRET-TOKEN', fetch: async () => { throw new TypeError('connect ECONNRESET SECRET-TOKEN'); } });
+    const err = await api.createTunnel('x').catch((e: Error) => e);
+    expect(err).toBeInstanceOf(TunnelApiError);
+    expect(String(err)).toContain('cf_api_transport');
+    expect(String(err)).not.toContain('SECRET-TOKEN');
+  });
+});
+
+/** Every console method, captured for `fn` and restored afterwards. */
+async function captureConsole<T>(fn: () => Promise<T>): Promise<{ result: T; warn: unknown[][]; text: string }> {
+  const methods = ['log', 'info', 'warn', 'error', 'debug'] as const;
+  const spies = methods.map((m) => spyOn(console, m).mockImplementation(() => {}));
+  try {
+    const result = await fn();
+    const calls = spies.map((s) => s.mock.calls.map((c) => [...c]));
+    return { result, warn: calls[methods.indexOf('warn')]!, text: JSON.stringify(calls) };
+  } finally {
+    for (const s of spies) s.mockRestore();
+  }
+}
+
+describe('failure diagnosis: one bounded log line and the same code as detail (production: a token without Tunnel Edit)', () => {
+  const API_TOKEN = 'SECRET-CF-API-TOKEN-0123456789abcdef';
+  const subject = { computerId: CID, generation: 1, leaseEpoch: 2 };
+  /** The real REST client over a fake Cloudflare: `refuse(method, url)` answers that call with a status and a body naming the token. */
+  function cloudflare(refuse: (method: string, url: string) => number | null) {
+    const f: FetchLike = async (url, init) => {
+      const status = refuse(String(init?.method), url);
+      if (status) return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: `Authentication error for ${API_TOKEN}` }] }), { status });
+      const result = url.endsWith('/token') ? 'tunnel-token-0123456789' : url.includes('?') ? [] : { id: 'tid' };
+      return new Response(JSON.stringify({ success: true, result }), { status: 200 });
+    };
+    return createCloudflareTunnelApi({ accountId: 'acct', zoneId: 'zone', apiToken: API_TOKEN, fetch: f });
+  }
+  const neverLogged = [API_TOKEN, vectors.controlKeyBase64, 'tunnel-token-0123456789', '13.200.1.2', ZONE, 'Authentication error'];
+
+  it('a 403 on the tunnel create: 502 tunnel_create_failed with detail cf_api_403, logged once with its leg; nothing secret logged', async () => {
+    const api = cloudflare((method, url) => (method === 'POST' && url.endsWith('/cfd_tunnel') ? 403 : null));
+    const svc = createAwsTunnelService({ api, storage: memStorage(), zone: ZONE });
+    const { result, warn, text } = await captureConsole(() => svc.create(claims(), body()));
+    expect(result).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed', detail: 'cf_api_403' } });
+    expect(warn).toEqual([['[aws-tunnels] create_failed', { leg: 'create', code: 'cf_api_403', ...subject }]]);
+    for (const secret of neverLogged) expect(text).not.toContain(secret);
+    expect(JSON.stringify(result.body)).not.toContain(API_TOKEN);
+  });
+
+  it('each leg is named: find, ingress, dns, token; a non-API error is only "unexpected"', async () => {
+    const cases: [TunnelLeg, (method: string, url: string) => number | null][] = [
+      ['find', (m, u) => (m === 'GET' && u.includes('/cfd_tunnel?') ? 403 : null)],
+      ['ingress', (m, u) => (m === 'PUT' && u.endsWith('/configurations') ? 403 : null)],
+      ['dns', (m, u) => (m === 'POST' && u.endsWith('/dns_records') ? 403 : null)],
+      ['token', (m, u) => (u.endsWith('/token') ? 500 : null)],
+    ];
+    for (const [leg, refuse] of cases) {
+      const svc = createAwsTunnelService({ api: cloudflare(refuse), storage: memStorage(), zone: ZONE });
+      const { result, warn } = await captureConsole(() => svc.create(claims(), body()));
+      const code = leg === 'token' ? 'cf_api_500' : 'cf_api_403';
+      expect(result.body).toEqual({ ok: false, error: 'tunnel_create_failed', detail: code });
+      expect(warn).toEqual([['[aws-tunnels] create_failed', { leg, code, ...subject }]]);
+    }
+    const s = memStorage();
+    s.put = async () => { throw new Error(`storage down ${vectors.controlKeyBase64}`); };
+    const { result, warn, text } = await captureConsole(() => createAwsTunnelService({ api: fakeApi().api, storage: s, zone: ZONE }).create(claims(), body()));
+    expect(result.body).toEqual({ ok: false, error: 'tunnel_create_failed', detail: 'unexpected' });
+    expect(warn).toEqual([['[aws-tunnels] create_failed', { leg: 'store', code: 'unexpected', ...subject }]]);
+    expect(text).not.toContain(vectors.controlKeyBase64);
+  });
+
+  it('fence, replay-token and removal failures are logged with their code too', async () => {
+    const s = memStorage(); const f = fakeApi();
+    const svc = createAwsTunnelService({ api: f.api, storage: s, zone: ZONE, nowMs: () => 0 });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    f.api.getTunnelToken = async () => { throw new TunnelApiError('cf_api_403'); };
+    const replayed = await captureConsole(() => svc.create(claims(), JSON.stringify({ ...JSON.parse(body()), replay: true })));
+    expect(replayed.result).toEqual({ status: 502, body: { ok: false, error: 'tunnel_create_failed', detail: 'cf_api_403' } });
+    expect(replayed.warn).toEqual([['[aws-tunnels] create_failed', { leg: 'token', code: 'cf_api_403', ...subject }]]);
+    f.api.deleteTunnel = async () => { throw new TunnelApiError('cf_api_403'); };
+    const fenced = await captureConsole(() => svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 })));
+    expect(fenced.result).toEqual({ status: 502, body: { ok: false, error: 'tunnel_fence_failed', detail: 'cf_api_403' } });
+    expect(fenced.warn).toEqual([['[aws-tunnels] fence_failed', { leg: 'fence', code: 'cf_api_403', ...subject, leaseEpoch: 3 }]]);
+    const removed = await captureConsole(() => svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 })));
+    expect(removed.result).toEqual({ status: 502, body: { ok: false, error: 'tunnel_fence_failed', detail: 'cf_api_403' } });
+    expect(removed.warn).toEqual([['[aws-tunnels] remove_failed', { leg: 'fence', code: 'cf_api_403', ...subject }]]);
+    for (const r of [replayed, fenced, removed]) for (const secret of neverLogged) expect(r.text).not.toContain(secret);
+  });
+
+  it('the detail crosses the registry and the internal route unchanged (what the app reads)', async () => {
+    const env = { AWS_TUNNEL_CF_ACCOUNT_ID: 'acct', AWS_TUNNEL_CF_ZONE_ID: 'zone', AWS_TUNNEL_CF_API_TOKEN: API_TOKEN, AWS_ORIGIN_ZONE: ZONE, AWS_ORIGIN_ZONE_ALLOWLIST: ZONE };
+    const f: FetchLike = async (url, init) => (init?.method === 'POST' && url.endsWith('/cfd_tunnel')
+      ? new Response(JSON.stringify({ success: false, errors: [{ message: API_TOKEN }] }), { status: 403 })
+      : new Response(JSON.stringify({ success: true, result: [] }), { status: 200 }));
+    const reg = new AwsTunnelRegistry({ storage: memStorage() }, env, f);
+    const { result: res, text } = await captureConsole(() => routeAwsTunnels('POST', claims(), body(), () => reg));
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, error: 'tunnel_create_failed', detail: 'cf_api_403' });
+    for (const secret of neverLogged) expect(text).not.toContain(secret);
+  });
+
+  it('tunnelErrorCode passes only the client\'s own codes', () => {
+    expect(tunnelErrorCode(new TunnelApiError('cf_api_403'))).toBe('cf_api_403');
+    expect(tunnelErrorCode(new TunnelApiError('cf_api_duplicate_dns'))).toBe('cf_api_duplicate_dns');
+    expect(tunnelErrorCode(new TunnelApiError(`cf_api_403 ${API_TOKEN}`))).toBe('unexpected');
+    expect(tunnelErrorCode(new Error('cf_api_403'))).toBe('unexpected');
+    expect(tunnelErrorCode('cf_api_403')).toBe('unexpected');
   });
 });
 

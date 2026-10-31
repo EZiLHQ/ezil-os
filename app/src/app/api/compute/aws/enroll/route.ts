@@ -4,6 +4,7 @@ import { after, NextResponse } from 'next/server';
 import { db } from '@/server/db';
 import { awsEnrollmentDescriber } from '@/server/lib/compute/aws-describer';
 import { handleAwsEnrollment, workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
+import { logEnrollRefusal } from '@/server/lib/compute/aws-enroll-log';
 import { primePoolRelay } from '@/server/lib/compute/aws-pool-session';
 
 /**
@@ -17,6 +18,10 @@ import { primePoolRelay } from '@/server/lib/compute/aws-pool-session';
  * While the AWS flag is off or the caller is unconfigured,
  * `awsEnrollmentDescriber` is null and every enrollment answers 503
  * `enroll_unavailable`; nothing is consumed. Never fake this check.
+ *
+ * Every non-200 answer is logged once per (computer, error) per minute as `[aws-enroll] refused`
+ * (aws-enroll-log.ts): bounded codes and the named computer/epoch only, never the nonce, the
+ * identity document, its signature, a key, a token or an address.
  */
 export const dynamic = 'force-dynamic';
 
@@ -27,6 +32,7 @@ export async function POST(req: Request): Promise<Response> {
     try {
         body = parseRebaseJson(await req.text(), 32768);
     } catch {
+        logEnrollRefusal({ status: 400, body: { error: 'enroll_request_invalid' } }, null);
         return NextResponse.json({ error: 'enroll_request_invalid' }, { status: 400, headers: NO_STORE });
     }
     let result;
@@ -45,6 +51,7 @@ export async function POST(req: Request): Promise<Response> {
         // path finishes the same enrollment (aws-enroll.ts). The host keeps its nonce.
         result = { status: 503, body: { error: 'enroll_unavailable', retryable: true } };
     }
+    if (result.status !== 200) logEnrollRefusal(result, body);
     if (result.status === 200 && result.poolRelay) {
         const enrollment = result.poolRelay;
         try { after(() => primePoolRelay({ db, env: process.env }, enrollment)); }

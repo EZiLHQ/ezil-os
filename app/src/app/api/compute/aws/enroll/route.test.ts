@@ -2,7 +2,7 @@
  * The enroll route is a thin wrapper: JSON parsing, no-store, and the
  * fail-closed wiring (no EC2 describer yet → 503, nothing consumed).
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const handle = vi.fn();
 const deferred = vi.hoisted(() => vi.fn());
@@ -17,10 +17,12 @@ vi.mock('@/server/lib/compute/aws-enroll', () => ({
 
 const { POST } = await import('./route');
 const { awsEnrollmentDescriber } = await import('@/server/lib/compute/aws-describer');
+const { resetEnrollRefusalLogForTests } = await import('@/server/lib/compute/aws-enroll-log');
 
 const post = (body: string) => POST(new Request('https://app.example.test/api/compute/aws/enroll', { method: 'POST', body, headers: { 'content-type': 'application/json' } }));
 
-afterEach(() => { handle.mockReset(); deferred.mockReset(); prime.mockReset(); });
+beforeEach(() => resetEnrollRefusalLogForTests());
+afterEach(() => { handle.mockReset(); deferred.mockReset(); prime.mockReset(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('POST /api/compute/aws/enroll', () => {
     const enrollment = { computerId: 'computer', ownerUserId: 'owner', generation: 4, leaseEpoch: 9,
@@ -76,6 +78,62 @@ describe('POST /api/compute/aws/enroll', () => {
         await post('{}');
         expect(awsEnrollmentDescriber({})).toBeNull();
         expect(handle.mock.calls[0]![0]).toMatchObject({ describer: null });
+    });
+
+    describe('[aws-enroll] refused log', () => {
+        const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+        const NONCE = Buffer.alloc(32, 5).toString('base64url');
+        const SIGNATURE = 'MIAGCSqGSIb3DQEHAqCAMIACAQExCzAJBgUrDgMCGgUAMIAGCSqGSIb3DQEHAaCAJIAEggHa';
+        const host = JSON.stringify({
+            computerId: C1.toUpperCase(), generation: 2, leaseEpoch: 3, nonce: NONCE, signature: SIGNATURE,
+            identityDocument: JSON.stringify({ accountId: '123456789012', instanceId: 'i-0123456789abcdef0', privateIp: '10.0.0.12' }),
+        });
+        const consoleOutput = () => (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
+
+        it('a Worker tunnel failure: one bounded line with its detail; the host body carries none of it', async () => {
+            const spies = consoleOutput();
+            handle.mockResolvedValue({ status: 503, body: { error: 'tunnel_unavailable', retryable: true },
+                tunnel: { code: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403' } });
+            const r = await post(host);
+            expect(r.status).toBe(503);
+            expect(await r.json()).toEqual({ error: 'tunnel_unavailable', retryable: true });
+            expect(console.warn).toHaveBeenCalledExactlyOnceWith('[aws-enroll] refused', {
+                status: 503, error: 'tunnel_unavailable', retryable: true, computerId: C1, generation: 2, leaseEpoch: 3,
+                tunnel: 'tunnel_http_502', workerError: 'tunnel_create_failed', detail: 'cf_api_403',
+            });
+            const logged = JSON.stringify(spies.flatMap((s) => s.mock.calls));
+            for (const secret of [NONCE, SIGNATURE, '123456789012', 'i-0123456789abcdef0', '10.0.0.12']) expect(logged).not.toContain(secret);
+        });
+
+        it('a host retrying every few seconds logs once per (computer, error) per minute', async () => {
+            consoleOutput();
+            vi.useFakeTimers({ toFake: ['Date'] });
+            vi.setSystemTime(new Date('2026-10-31T00:00:00Z'));
+            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true } });
+            for (let i = 0; i < 10; i++) { await post(host); vi.setSystemTime(Date.now() + 5_000); }
+            expect(console.warn).toHaveBeenCalledTimes(1);
+            handle.mockResolvedValue({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true } });
+            await post(host);
+            expect(console.warn).toHaveBeenCalledTimes(2);
+            handle.mockResolvedValue({ status: 403, body: { error: 'enroll_instance_not_running', retryable: true } });
+            vi.setSystemTime(new Date('2026-10-31T00:01:00Z'));
+            await post(host);
+            expect(console.warn).toHaveBeenCalledTimes(3);
+            expect(vi.mocked(console.warn).mock.calls[2]).toEqual(['[aws-enroll] refused', expect.objectContaining({ error: 'enroll_instance_not_running', suppressed: 9 })]);
+        });
+
+        it('invalid JSON and an unexpected throw are logged too; a 200 never is', async () => {
+            consoleOutput();
+            await post('{');
+            handle.mockRejectedValue(new Error(`connection terminated ${NONCE}`));
+            await post(host);
+            handle.mockResolvedValue({ status: 200, body: { tunnelToken: 'test-token' } });
+            await post(host);
+            expect(vi.mocked(console.warn).mock.calls).toEqual([
+                ['[aws-enroll] refused', { status: 400, error: 'enroll_request_invalid', retryable: false, computerId: null, generation: null, leaseEpoch: null }],
+                ['[aws-enroll] refused', { status: 503, error: 'enroll_unavailable', retryable: true, computerId: C1, generation: 2, leaseEpoch: 3 }],
+            ]);
+        });
     });
 
     it('the describer exists only with AWS on AND a caller role for every configured region', () => {

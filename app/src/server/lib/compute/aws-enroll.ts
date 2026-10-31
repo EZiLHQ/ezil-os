@@ -21,6 +21,7 @@ import { createHash, createHmac, randomBytes as nodeRandomBytes, timingSafeEqual
 import { z } from 'zod';
 
 import { isAwsComputersEnabled, readAwsBrowserZone, type Env as AwsEnv } from './aws-config';
+import { boundedCode } from './aws-enroll-log';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
@@ -158,7 +159,13 @@ export interface TunnelRequest {
      */
     replay?: true;
 }
-export type TunnelResult = { ok: true; tunnelToken: string } | { ok: false; status: number; code: string };
+/**
+ * A failure carries the app's own `code` and, when the Worker answered with JSON, its bounded
+ * `error` (`workerError`) and `detail` (the Cloudflare API leg's code, e.g. `cf_api_403`).
+ */
+export type TunnelResult = { ok: true; tunnelToken: string } | { ok: false; status: number; code: string; workerError?: string; detail?: string };
+/** Why the Worker's tunnel call failed: server-only, for the route's refusal log. */
+export type TunnelFailure = { code: string; workerError?: string; detail?: string };
 
 /** Injected: the Worker's tunnel API (GW-1). The app never holds a Cloudflare token. */
 export interface TunnelClient {
@@ -215,7 +222,18 @@ export function createWorkerTunnelClient(cfg: { workerUrl: string; secret: strin
             } catch {
                 return { ok: false, status: 0, code: 'tunnel_transport' };
             }
-            if (res.status !== 200) return { ok: false, status: res.status, code: `tunnel_http_${res.status}` };
+            if (res.status !== 200) {
+                const failure: Extract<TunnelResult, { ok: false }> = { ok: false, status: res.status, code: `tunnel_http_${res.status}` };
+                try {
+                    // The Worker's `{ ok: false, error, detail? }`; anything else (an edge HTML page) adds nothing.
+                    const json = (await res.json()) as { error?: unknown; detail?: unknown } | null;
+                    const workerError = boundedCode(json?.error);
+                    const detail = boundedCode(json?.detail);
+                    if (workerError) failure.workerError = workerError;
+                    if (detail) failure.detail = detail;
+                } catch { /* no readable body: the status alone */ }
+                return failure;
+            }
             try {
                 const json = (await res.json()) as { tunnelToken?: unknown };
                 if (typeof json.tunnelToken !== 'string' || json.tunnelToken.length < 16) return { ok: false, status: 502, code: 'tunnel_response_malformed' };
@@ -284,6 +302,8 @@ export interface EnrollResponse {
     body: Record<string, unknown>;
     /** Server-only trigger, never included in the host's response body. */
     poolRelay?: PoolRelayEnrollment;
+    /** Server-only diagnostic of a failed Worker tunnel call (the route logs it), never in the body. */
+    tunnel?: TunnelFailure;
 }
 
 export type PoolRelayEnrollment = Pick<Placement, 'computerId' | 'ownerUserId' | 'generation' | 'leaseEpoch' | 'instanceId' | 'fenceToken'>;
@@ -317,6 +337,11 @@ const refuse = (status: number, error: string): EnrollResponse => ({ status, bod
  * The host keeps its nonce and retries, bounded (enroll.py); every other answer is final.
  */
 const retryLater = (status: number, error: string): EnrollResponse => ({ status, body: { error, retryable: true } });
+/** Attach why the Worker's tunnel call failed, server-only; the host's body is unchanged. */
+const withTunnel = (r: EnrollResponse, t: TunnelResult): EnrollResponse => (t.ok ? r : {
+    ...r,
+    tunnel: { code: t.code, ...(t.workerError ? { workerError: t.workerError } : {}), ...(t.detail ? { detail: t.detail } : {}) },
+});
 
 /**
  * A Worker tunnel answer that does not prove the Worker created NO tunnel: no answer (transport
@@ -525,7 +550,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         if (replayed.ok) return success(replayed.tunnelToken);
         // 409: not this epoch's key (another nonce) or past the window; 404: no tunnel for this
         // epoch any more (stopped, fenced). Final either way.
-        return replayed.status === 409 || replayed.status === 404 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
+        return withTunnel(replayed.status === 409 || replayed.status === 404 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable'), replayed);
     }
 
     if (pending) {
@@ -548,10 +573,10 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
             // A concurrent completion of this same pending enrollment won the create: replay it.
             if (!t.ok && t.status === 409) t = await call({ ...request, replay: true });
         }
-        if (!t.ok && (t.status === 409 || t.status === 404)) return refuse(409, 'enroll_nonce_consumed');
+        if (!t.ok && (t.status === 409 || t.status === 404)) return withTunnel(refuse(409, 'enroll_nonce_consumed'), t);
         // Ambiguous answers stay pending and retryable; so does any other refusal here, which leaves the
         // epoch exactly as it was (the host's bounded retry ends it, keeping its nonce).
-        if (!t.ok) return retryLater(503, 'tunnel_unavailable');
+        if (!t.ok) return withTunnel(retryLater(503, 'tunnel_unavailable'), t);
         let done: Awaited<ReturnType<typeof finishEnrollment>>;
         try {
             done = await finishBoot(deps.db, { computerId: p.computerId, expected: p, success: true });
@@ -597,7 +622,7 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     }
     // Ambiguous (the Worker may have committed the tunnel): no finish at all. The placement keeps
     // ENROLLMENT_PENDING and the consumed-nonce proof, and the retryable answer keeps the host's nonce.
-    if (tunnelOutcomeUnknown(tunnel)) return retryLater(503, 'tunnel_unavailable');
+    if (tunnelOutcomeUnknown(tunnel)) return withTunnel(retryLater(503, 'tunnel_unavailable'), tunnel);
     let finished: Awaited<ReturnType<typeof finishEnrollment>>;
     try {
         finished = await finishBoot(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
@@ -606,9 +631,9 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         // the placement keeps ENROLLMENT_PENDING. A structured retryable answer keeps the host's
         // nonce (enroll.py), and its retry finishes through `pending` above, against the exact
         // tunnel this call created (or creating it, if this call's create failed too).
-        return retryLater(503, 'enroll_finish_unavailable');
+        return withTunnel(retryLater(503, 'enroll_finish_unavailable'), tunnel);
     }
-    if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
+    if (!tunnel.ok) return withTunnel(refuse(502, 'tunnel_unavailable'), tunnel);
     if (!finished.ok) return refuse(409, 'enroll_conflict');
     return success(tunnel.tunnelToken);
 }
