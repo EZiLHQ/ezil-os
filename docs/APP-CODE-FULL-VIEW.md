@@ -122,7 +122,7 @@ transient menu and may cover the editor's top rows while it is open.
 | Feedback icon | `feedback.css`: a 24px button (44px coarse), `right: 6px` (0 coarse), its `top` derived from the strip: `calc((strip − 24px) / 2)`, `calc((strip − 44px) / 2)` coarse | 2px / 0px in Code's strip; 9.5px / 7.5px in the Browser's, as before. |
 | Feedback look in Code's strip | Outlined: the 20px disc becomes a 1px `currentColor` ring with no glass and no shadow; the same stroked speech-bubble glyph at 12px (4px padding); opacity 0.62 (1 on hover/focus); focus ring 2px, 1px out (inside the 28px strip) | Code's strip declares `--ezil-feedback-look: outline`. Everywhere else (a windowed app, the Browser's full-bleed) the icon keeps its glass disc. |
 | Focus | Tray toggle and actions: dashboard.css's `2px solid rgba(255,255,255,0.9)` ring, 1px out. Feedback: the accent ring | Keyboard focus on the toggle opens the tray; its ring is drawn around the tray's dismiss strip. |
-| Tab order | Tray toggle → Show desktop → Restore window → Close → editor; the Feedback icon is the body's last button | DOM order. |
+| Tab order | Editor → Send feedback → tray toggle → Show desktop → Restore window → Close | DOM order: the Feedback icon is a body child placed before the window's tray toggle, not the body's last button. Measured from a fresh 1440×900 fixture page: IFRAME, BODY, Send feedback, Window controls, Show desktop, Restore window, Close. |
 
 **Show desktop is the one minimise.** The old bar's "Minimise" and the tray's
 "Show desktop" both called `full_view.minimise()`. The tray keeps one button,
