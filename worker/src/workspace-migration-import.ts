@@ -504,11 +504,15 @@ async function requestExport(deps: ReverseImportDeps, to: ExportTarget, ids: Imp
     if (!status) throw unreachable();
     return status;
   }
-  // §4.2 step 7's list, and only it: another move holds the host, or the host refused the body.
-  // Retrying cannot help. Anything else is retried, including a 409 the agent answers for the
-  // message (`export_invalid`; at base the edge relays a replayed or stale message as a 409 too).
+  // §4.2 step 7's list (r7), and only it: another move holds the host (`export_busy`), the agent
+  // refused the message (`export_invalid`: the edge sends it only for a refusal the agent itself
+  // answered after the Sequencer's one retry, bad_mac/wrong_epoch/stale/replayed, which a retry on
+  // the same host cannot clear), or the host refused the body (any 400). Anything else is retried,
+  // including any other 409 (a relayed raw agent error) and the edge's 503 agent_unavailable.
   const error = (answer as { error?: unknown } | undefined)?.error;
-  if (response.status === 400 || (response.status === 409 && error === 'export_busy')) throw refuse('export_refused');
+  if (response.status === 400 || (response.status === 409 && (error === 'export_busy' || error === 'export_invalid'))) {
+    throw refuse('export_refused');
+  }
   throw unreachable();
 }
 

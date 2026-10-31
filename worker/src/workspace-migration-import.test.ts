@@ -503,13 +503,14 @@ describe('reverse import: begin (§4.2)', () => {
     expect((await placeholder.begin()).status).toBe(200);
   });
 
-  it('the host: export_busy or a 400 is export_refused; any other answer (an agent refusal, a 503, none) is export_unreachable', async () => {
+  it('the host: export_busy, export_invalid or a 400 is export_refused; any other answer (another 409, a 503, none) is export_unreachable', async () => {
     const cases: Array<[(f: Awaited<ReturnType<typeof fixture>>) => void, number, string]> = [
       [f => { f.host.job = { moveId: uuid(), generation: uuid() }; }, 409, 'export_refused'],
       [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_body_invalid' }, { status: 400 }); }, 409, 'export_refused'],
-      // §4.2 step 7 names only export_busy and a 400. The agent's refusal of the message may be a
-      // replayed or stale sequence after a restart: retried (§5.5 `unavailable`), never final.
-      [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_invalid' }, { status: 409 }); }, 503, 'export_unreachable'],
+      // r7 (§4.2 step 7, lead decision): the edge answers 409 export_invalid only for a refusal the
+      // agent itself sent (lane H's AGENT_REFUSALS), which a retry on the same host cannot clear.
+      [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_invalid' }, { status: 409 }); }, 409, 'export_refused'],
+      // Any other 409 (a raw agent error the edge relays) is still retried.
       [f => { f.host.answer = () => Response.json({ ok: false, error: 'replayed' }, { status: 409 }); }, 503, 'export_unreachable'],
       [f => { f.host.answer = () => Response.json({ ok: false, error: 'agent_unavailable' }, { status: 503 }); }, 503, 'export_unreachable'],
       [f => { f.host.answer = () => { throw new Error('tunnel down'); }; }, 503, 'export_unreachable'],
