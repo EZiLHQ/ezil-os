@@ -12,7 +12,9 @@ r4 changed carry **[r4]**; sections r5 changed carry **[r5]**; sections r6 chang
 integration of Phase B: it ratifies what the five lanes shipped and the lead's integration decisions, H-1 among them
 (§2.5 step 3); sections it changed carry **[r7]**, and §12.4 maps each item.** **[r7 fixer] (2026-10-31) applies the
 integration review's findings (§12.5); text it changed carries **[r7 fixer]**; its three "lead decision" choices are marked
-for the lead's ratification.**
+for the lead's ratification.** **[r8] (2026-10-31) records the lead's rulings on them (§12.6): the Browser icon's warm is
+not an open (Option C, §5.9, replacing the fixer's Option A); Code triggers and Preview never does, and the §6.3 `moveOnOpen`
+copy says so; a held-closed computer moves by click only; two residuals are accepted. Text it changed carries **[r8]**.**
 
 **Base [r6]:** citations are `path:line` at `7a1f2ed1` (`r6/integ-20261030`, round 6a, LIVE on os-staging). r6 rebased
 this branch onto it (no conflicts) and re-pinned every citation into a file 6a changed; a file 6a did not change is
@@ -94,8 +96,8 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 |---|---|
 | **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, **[r7] `infra/host-agent/lib/ezil_host/cli.py` (the export's quiesce marker, §2.5 step 3) and `infra/host-agent/systemd/ezil-desktop.service` (its refusal comment)**, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`** (**[r6]** v1 adds no deployment field, §7.2)), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r7]** `infra/host-agent/lib/ezil_host/workspace-snapshot-script.py` *new* (the committed generated codec copy, §2.6), `infra/host-agent/ami/sync-codec.py` *new* (its generator, `--check`), `infra/host-agent/test/test_unit_restart_policy.py`, and `infra/host-agent/test/export_edge_seam_server.py` *new* (the W ↔ H seam server). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
 | **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test), **[r7] `worker/src/export-edge-seam.test.ts` *new* (the W ↔ H seam harness)**. |
-| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r5 on, **[r6]** as the header and §3.4 say)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). **[r7]** `app/src/server/lib/compute/fake-placement-db.test-support.ts` (shared test support: its 0012 probe answers "absent"), and the integration's seam harnesses `app/src/server/lib/compute/reverse-import-worker-seam.test.ts` *new* (A ↔ W) and `app/src/server/billing/v3/summary-shell-seam.test.ts` *new* (A → U); the U → A harness lives in `compute-dispatch-reverse.test.ts`. |
-| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js` (**[r7 fixer]** including `restartDesktop`'s reader), `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r7 fixer] `shell/ezil/ui/Settings/tabs/troubleshoot.js` and `shell/ezil/ui/Settings/troubleshoot-test.mjs` (Restart desktop during a move, §6.4)**, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the Billing tab during a move, §6.2; [r6] its banner copy is 6a's and is not edited)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
+| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r5 on, **[r6]** as the header and §3.4 say)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), **[r8] `app/src/app/api/shell/desktop/route.ts` and its `route.test.ts` (the shell's desktop route forwards the warm's `intent`, §5.9 Option C)**, `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). **[r7]** `app/src/server/lib/compute/fake-placement-db.test-support.ts` (shared test support: its 0012 probe answers "absent"), and the integration's seam harnesses `app/src/server/lib/compute/reverse-import-worker-seam.test.ts` *new* (A ↔ W) and `app/src/server/billing/v3/summary-shell-seam.test.ts` *new* (A → U); the U → A harness lives in `compute-dispatch-reverse.test.ts`. |
+| **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js` (**[r7 fixer]** including `restartDesktop`'s reader; **[r8]** `openDesktop`'s `warm` option), **[r8] `shell/ezil/warm.js` (the warm's `intent: 'warm'` and `claim()`, §5.9 Option C) and `shell/ezil/warm-intent-test.mjs` *new***, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r7 fixer] `shell/ezil/ui/Settings/tabs/troubleshoot.js` and `shell/ezil/ui/Settings/troubleshoot-test.mjs` (Restart desktop during a move, §6.4)**, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the Billing tab during a move, §6.2; [r6] its banner copy is 6a's and is not edited)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
 | **O** | **[r6] Held for v1 (DECISION_72, §7).** v1: `app/src/server/lib/compute/reverse-snapshot.ts` *new* (the no-op seam, §7.2) and its unit test, nothing else. Post-v1 (each needs its own contract revision first, §7.3): the executor of the chosen §7.2 candidate, `app/src/server/lib/compute/retention.ts` (the listing's caller) and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r6] Withdrawn:** r5's `provider-reverse-snapshot.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts`, `infra/app-computers/lib/reverse-snapshot.ts`, the deployment field in `aws-intent.ts` (and its fixtures and tests) and `infra/app-computers/lib/lifecycle/deployment.ts`, and the edits to `app-caller.ts` (and its tests and snapshots), `bin/lifecycle.ts`, `computer-lifecycle.ts` and `ops.ts`. v1 needs none of them, and those files are read-only for every lane. |
 
 **[r4] Read-only on purpose:** `app/src/components/desktop/boot-phases.ts` and `boot-phases.shell.js` (drift-guarded
@@ -870,7 +872,7 @@ applies its 10-minute `MIGRATION_DEADLINE_MS` (`session.js:239,464-474`) and the
   `computer_moving`, next to `awsMigrationAnswer` (`compute-dispatch.ts:161-165`).
 - An old cached shell sees an ordinary retryable `sandbox_starting`: it re-asks under its wake deadline, then shows
   Try again. The move goes on; the next open sees it. The shell that ships with A (lane U) reads `computeMoving` (§6.4).
-- **[r7 fixer] Disclosed residual: the legacy `/computer/[id]` React canvas.** It is a current client, not an old cached
+- **[r7 fixer; accepted by the lead, r8] Disclosed residual: the legacy `/computer/[id]` React canvas.** It is a current client, not an old cached
   shell, and it calls `previewUrl` (`cloudflare-guacamole-canvas.tsx:183`), so it is also a trigger surface (§5.9). It has
   no move handling: it treats `computeMoving` as `sandbox_starting` (re-asks until `wakeExpired`, 215 s, then the `timeout`
   copy) and the blocked answer as the generic `unknown` copy. It is reachable from `/computers` (the row's Open,
@@ -1088,7 +1090,7 @@ The classes are:
 - **[r7] Claim wait reasons** (decide only the deadline pass's outcome; never written to `last_error`): the admission waits above,
   plus `intent_invalid`, `placement_incomplete` and `claim_failed`.
 
-**[r7 fixer] Disclosed residual: deterministic capture refusals retry as `export_failed`.** The codec exits 1 for workspace
+**[r7 fixer; accepted by the lead, r8] Disclosed residual: deterministic capture refusals retry as `export_failed`.** The codec exits 1 for workspace
 shapes that can never capture on the same volume (a stale `.git/*.lock` left by a stop mid-commit, an external `.git` file,
 `git ls-files` failing, an escaping symlink chain or an unsupported file type inside `.git`). The host maps every exit 1 to
 `capture_failed` (§2.4), W to `export_capture_failed`, and the table above to `reopen` → `export_failed` with Try again
@@ -1282,13 +1284,13 @@ replace) counts as settled.
 - **`computer.move.retry`** (new mutation). It is the same as start, except that a holding row answers
   `move_in_progress` (step 2). It exists because the shell's `move-retry` must stop calling `switchTo`
   (`computers.js:1402-1405`).
-- **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:212-216`) **and, [r7 fixer], `codePreviewUrl`**, before `routeComputer`, never in reads, `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl` (hosted-app polls). The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
+- **Next open (`startedBy:'open'`, D20, in v1).** In the open path, `previewUrl` in `app/src/server/api/routers/cloudflare-guacamole.ts` (lane A; it already stamps the open there, `cloudflare-guacamole.ts:212-216`) **and, [r7 fixer, ratified r8], `codePreviewUrl`**, before `routeComputer`, never in reads, `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl` (hosted-app polls), **and [r8] never for the Browser icon's warm (Option C, below)**. The open creates a row and returns the reverse waiting answer (§5.3) when ALL of these hold:
   - standing `files_on_aws`;
   - the placement is `aws-ec2` `STOPPED` with no lifecycle job and no lease (no transition active);
-  - **[r7 fixer]** the placement meters as `HOLD_SIZE` (`holdOpenable`, §6.1.1; an unknown size is not): a held-closed
+  - **[r7 fixer, ratified r8]** the placement meters as `HOLD_SIZE` (`holdOpenable`, §6.1.1; an unknown size is not): a held-closed
     computer (cmp-4, cmp-8) never gets an `'open'` row. Its opens keep 6a's `files_on_aws` refusal, and its card offers the
     move as a click only (`moveOnOpen` is false for it, §6.1.1);
-  - **[r7 fixer]** for `codePreviewUrl` only: not within `STOP_COOLDOWN_MS` (60 s) of the last run's end (the same read as
+  - **[r7 fixer, ratified r8]** for `codePreviewUrl` only: not within `STOP_COOLDOWN_MS` (60 s) of the last run's end (the same read as
     `stopCooldownAnswer`). A leftover Code poll after a stop never starts a move; the route still answers `computer_stopped`.
     The desktop open is never held, as before;
   - no reverse row holds the computer, and the newest reverse row, if any, is not `failed_*` (after any failure, only a click starts the next move);
@@ -1297,18 +1299,51 @@ replace) counts as settled.
   - the account is **not founder-owned** (§5.9.1).
   - Otherwise the open proceeds as the D16 hold (a cold Free boot).
   - Lock order (§3.3): create on the same `tx`, or after commit.
-  - **[r7 fixer, for lead ratification] The Browser icon's warm is an open (Option A).** `boot.js` `bind_warm_intent` warms
-    the desktop on `pointerenter`/`pointerdown` over the Browser dock icon and its Start-menu entry; `warm.js` then sends
-    the same `POST /api/shell/desktop` → `previewUrl` as an open. That request already boots the AWS computer under the D16
-    hold today, so it counts as the next open: a hover on a held std-2 computer starts the move, and the next surface the
-    user opens (desktop or Code) shows it. Option B (a marker that skips the trigger for a warm) was rejected: the warm
-    would then boot the AWS computer, `claim()` hands that same in-flight answer to the desktop window, and the click would
-    find it RUNNING, so D20 would never fire for a mouse user. A warm that skipped both the trigger and the boot needs a
-    new marker across `warm.js`, `/api/shell/desktop` and `previewUrl` (unowned files) and its own revision. Lane A's
-    test sends the warm's body (with its measured screen) and gets the row.
-  - **[r7 fixer] Disclosed residual: Preview first.** `appPreviewUrl` never triggers (hosted-app polls must not start a
-    move). A held computer whose first open is Preview gets an ordinary D16 hold boot; once that session ends and the
-    held pass stops it, the next desktop or Code open moves it.
+  - **[r8, lead ruling] The Browser icon's warm is not an open (Option C).** `boot.js` `bind_warm_intent` warms the desktop
+    on `pointerenter`/`pointerdown` over the Browser dock icon and its Start-menu entry, and `warm.js` sends
+    `POST /api/shell/desktop` → `previewUrl`. A hover must never start an irreversible move, so the warm marks itself:
+    - **Shell (lane U).** `warm()` mints with `session.openDesktop(id, screen, { warm })`, and every ask of that loop adds
+      `intent: 'warm'` to the body until a window claims it. A real open (the desktop window's own open, `claim()`'s own
+      mint, Settings → Open desktop) never sends the field, and its body stays byte-identical to the pre-r8 one.
+    - **Route (lane A).** `/api/shell/desktop` forwards `intent` verbatim, like `screen`.
+    - **`previewUrl` (lane A).** It takes `intent: z.unknown().optional()`, tolerant like `screen` (any value other than
+      `'warm'` is an ordinary open, never a 400 of the boot). With `'warm'` it calls `reverseMoveOnOpen(…, { warm: true })`,
+      which runs every check above unchanged and, where an open would create the row, returns `REVERSE_WARM_HELD` and
+      creates nothing. `previewUrl` then answers at once, before `routeComputer`, the billing gate, the credential sync
+      and any `ensure`: no row, no schedule, no boot, no placement write.
+    - **The answer: the stop hold's refusal value, reused** (`computerStoppedAnswer()`, the value `stopCooldownAnswer`
+      returns): `{ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false, computeProvider:
+      'aws-ec2'}`. Why that one: `computer_stopped` is in boot-phases' AWS refusals (`isRetryableBootErrorCode` false), so
+      the warm's loop returns it at once, with no silent re-ask and no telemetry; it carries no move flag, so no move
+      branch reads it; `warm.js` drops a non-ok entry; and `previewUrl` never answered it before (the desktop open is never
+      held), so `warm.js` can tell it apart (`isWarmHeld`) from every real desktop answer. It is not logged as an
+      `aws-preview` line (it is not a refusal of an open).
+    - **No window ever shows it.** `claim()` of a warm entry sets `claimed`, so the loop's later asks carry no marker
+      (they are the click's now). If the warm's answer was `computer_stopped`, `claim()` asks a real open
+      (`mint(computerId)`, no marker) and hands the window that answer instead: the click creates the row and answers
+      `computeMoving`, and `desktop-window.js` takes the wait over as before. Only that one code is re-asked; every other
+      warm answer reaches a claiming window unchanged.
+    - **Any other warm is today's warm.** When a check fails, `reverseMoveOnOpen` returns null for the warm exactly as for
+      an open, and the warm routes as before: a computer with an in-flight row still gets `computeMoving` (or the blocked
+      value), and a paid, founder-owned, held-closed, failed-row or Cloudflare computer gets the same answer and the same
+      gate call as a click. A throw in the checks is null too (fail-closed: the warm then runs as today's warm).
+    - **Why not r7 fixer's Option A** (the warm counts as an open): a hover crossing the dock on the way to another icon
+      started an irreversible move of up to 13 200 s that the user never asked for. **Why not Option B** (skip only the
+      trigger): the warm would then boot the AWS computer under the D16 hold and `claim()` would hand that boot to the
+      click, which would find it RUNNING, so D20 would never fire for a mouse user. Option C skips both the trigger and the
+      boot, so the click is the first open.
+    - Tests: lane A (`compute-dispatch-reverse.test.ts`) pins the warm on a held STOPPED std-2 computer (no row, no gate,
+      sync, preview, Worker call or placement write, with the gate open), the click after it (the row), the warm on an
+      in-flight and a blocked computer, the warm on paid, founder-owned, held-closed, failed-row and Cloudflare computers
+      (same answer and gate call as a click), the tolerant `intent`, and the U → A seam: the shell's real `warm.js` through
+      the real route into `previewUrl`. `route.test.ts` pins the forwarding. Lane U (`warm-intent-test.mjs`) pins the
+      marker, the byte-identical real-open body, and the claim rules. Mutants: the `warm` skip removed (the warm creates
+      a `started_by 'open'` row), the early answer removed (the warm reaches the gate and the sync), the route's forwarding
+      removed, and in the shell the claim chain removed, the marker kept after a claim, and the marker never sent.
+  - **[r7 fixer, ratified r8] Preview never triggers; disclosed residual: Preview first.** `appPreviewUrl` never triggers
+    (hosted-app polls must not start a move). A held computer whose first open is Preview gets an ordinary D16 hold boot;
+    once that session ends and the held pass stops it, the next desktop or Code open moves it. The §6.3 `moveOnOpen` copy
+    names the desktop and Code only.
 - **[r5] No cron trigger in v1** (§9). r4's "Cron (after canary2 acceptance)" bullet is withdrawn: a scheduled scan that
   creates rows needs its own decision and its own contract revision.
 
@@ -1619,7 +1654,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 
 | State | Copy |
 |---|---|
-| files held, `moveOnOpen` true | **Your files are on your AWS computer.** The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files now] |
+| files held, `moveOnOpen` true | **Your files are on your AWS computer.** The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files now] (**[r8]** "your desktop or Code", was "your computer": the two opens that start the move, §5.9) |
 | files held, `moveAvailable` false (r3) | **[r7]** 6a's files-held banner only, unchanged (§6.2 r6, `standingCopy('files_on_aws')`): no move sentence, no button. (r3's "Your files are on your AWS computer. Opening it uses your Free limits." is superseded.) |
 | files held, `moveOnOpen` false | **Your files are on your AWS computer.** Opening it uses your Free limits. You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer] |
 | **[r6]** files held, `holdOpenable` false (6a's held-closed card, `computers.js:613-616`) | 6a's card stays as its first line: `heldClosedText` (§6.2) and its [Upgrade]. With `moveAvailable` true it continues: You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer]. The `moveOnOpen` variant is never used for it: **[r7 fixer]** `moveOnOpen` is false for it (§6.1.1) and the trigger never fires for it (§5.9), so the dock, the Start menu and Code keep 6a's refusal (6a's card also shows no Open desktop, `computers.js:791`; the shell's own `!heldClosed` guard stays). With `moveAvailable` false, 6a's card is unchanged. "Opening it uses your Free limits" is never said for it. |
@@ -1642,10 +1677,13 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 **[r7]** In every files-held row the banner above the card is 6a's (§6.2 r6). The pre-move card's copy (the `moveOnOpen` rows)
 follows it as shipped, so its first sentence restates the banner's (a known copy residual, not a lane defect).
 
-**[r7 fixer, for the lead] The `moveOnOpen` wording is unchanged.** "The next time you open your computer" now holds for the
-desktop (including the Browser icon's warm, §5.9 Option A) and for Code; Preview first is a disclosed residual (§5.9). If the
-lead prefers to name the surfaces, the pinned string changes here first (lane U), for example "the next time you open your
-desktop or Code".
+**[r8, lead ruling] The `moveOnOpen` wording names what triggers.** r7 fixer kept "The next time you open your computer" and
+flagged it. The lead ratified the triggers (the desktop and Code, outside Code's stop hold; never Preview; never the Browser
+icon's warm, §5.9 Option C), so the pinned string now says "The next time you open your desktop or Code"; the rest of the
+sentence is unchanged. It is the only §6.3 string that names a trigger: the `moveOnOpen` false row ("Opening it uses your
+Free limits") and the held-closed row name none and are unchanged. Lane U's `moveOfferCopy({onOpen: true})` (`computers.js`)
+carries the same words, and `computers-test.mjs` pins them (and that "open your computer" is gone). Copy rules hold: no city
+or region, no speed or duration claim, `scanCopy` clean.
 
 **Start/retry refusals (§5.9) [G3]:**
 
@@ -2154,14 +2192,27 @@ decision"; the fixer chose and marks each for the lead's ratification.
 
 | Finding | Section(s) | Resolution |
 |---|---|---|
-| MAJOR: a hover on the Browser icon starts a move (the warm sends the same `previewUrl` open) | §5.9 | **Lead decision taken: Option A.** The warm counts as an open: it already boots the AWS computer under the D16 hold, and Option B (skip the trigger for a warm) would let the warm boot it and hand that answer to the click through `claim()`, so D20 would never fire for a mouse user. A lane A test pins the warm's body creating the row. The pinned §6.3 wording is unchanged and flagged for the lead. |
-| MAJOR: the `moveOnOpen` copy promises a move on the next open, but Code and Preview never trigger | §5.9, §6.3 | **Lead decision taken:** `codePreviewUrl` runs the trigger before routing (not within `STOP_COOLDOWN_MS`, so a leftover poll still answers `computer_stopped` with no row). `appPreviewUrl` still never triggers; Preview first is a disclosed residual. Lane A tests: Code creates the row and the waiting value; Code within the stop hold creates none; the desktop open is never held. |
+| MAJOR: a hover on the Browser icon starts a move (the warm sends the same `previewUrl` open) | §5.9 | **[r8] Superseded: the lead rejected Option A and ruled Option C (§5.9, §12.6).** *Was:* **Lead decision taken: Option A.** The warm counts as an open: it already boots the AWS computer under the D16 hold, and Option B (skip the trigger for a warm) would let the warm boot it and hand that answer to the click through `claim()`, so D20 would never fire for a mouse user. A lane A test pins the warm's body creating the row. The pinned §6.3 wording is unchanged and flagged for the lead. |
+| MAJOR: the `moveOnOpen` copy promises a move on the next open, but Code and Preview never trigger | §5.9, §6.3 | **[r8] Ratified by the lead; the §6.3 string now names the desktop and Code (§12.6).** *Was:* **Lead decision taken:** `codePreviewUrl` runs the trigger before routing (not within `STOP_COOLDOWN_MS`, so a leftover poll still answers `computer_stopped` with no row). `appPreviewUrl` still never triggers; Preview first is a disclosed residual. Lane A tests: Code creates the row and the waiting value; Code within the stop hold creates none; the desktop open is never held. |
 | MAJOR: a throw before the sweep's last statement skips the reverse pass | §5.4 | Fixed: `try { … } finally { advanceReverseMoves }` in the handler; the route runs the pass when `getBillingDeps()` or its clock throws, then rethrows. Tests for each throw (epoch read, billing state, epoch close, deps, clock) fail on the old code. |
-| MINOR: the legacy `/computer/[id]` canvas triggers and has no move handling | §5.3 | **Rejected for v1, disclosed.** The canvas and `boot-phases.ts` belong to no lane, and pointing `/computers` at `/os` changes navigation for every user; it needs its own lane. |
-| MINOR: a held-closed computer starts a move from the dock | §5.9, §6.1.1, §6.3 | **Lead decision taken:** the trigger requires `holdOpenable` (an unknown size is not), and `moveOnOpen` is false when it is false. The dock, Start menu and Code keep 6a's `files_on_aws` refusal; the card offers the move as a click only. Lane A tests cmp-4, cmp-8 and an unknown size on both open routes and in the summary. |
+| MINOR: the legacy `/computer/[id]` canvas triggers and has no move handling | §5.3 | **Rejected for v1, disclosed; [r8] accepted by the lead (§12.6).** The canvas and `boot-phases.ts` belong to no lane, and pointing `/computers` at `/os` changes navigation for every user; it needs its own lane. |
+| MINOR: a held-closed computer starts a move from the dock | §5.9, §6.1.1, §6.3 | **[r8] Ratified by the lead (§12.6).** *Was:* **Lead decision taken:** the trigger requires `holdOpenable` (an unknown size is not), and `moveOnOpen` is false when it is false. The dock, Start menu and Code keep 6a's `files_on_aws` refusal; the card offers the move as a click only. Lane A tests cmp-4, cmp-8 and an unknown size on both open routes and in the summary. |
 | MINOR: the shell's move watch can end before the server's bound | §5.10, §6.4 | Fixed, partly as the review proposed: the cross-file assertion and the recomputed margin are taken; the loop does **not** extend its deadline from the read's `budgetSeconds`/`startedAtMs` (one shell constant already drives both the loop and the spinner, and the assertion catches drift from the server). The lag is per state (a late-observed success still advances), so the margin is one drive gap (≤ 360 s) per deadline state. `MOVE_WATCH_MARGIN_SECONDS = 2400` is one shell constant used by the loop and the spinner; lane A's test reads `MOVE_BUDGET_SECONDS` (must equal `REVERSE_MOVE_BUDGET_SECONDS`) and the margin from the shell file. |
 | MINOR: Troubleshoot's Restart desktop during a move says "Something went wrong" and records `api_failure` | §1.1, §6.4 | Fixed: `troubleshoot.js` joins lane U; `session.restartDesktop` passes the move flags through; the tab shows §6.4's status line or open-blocked sentence, with no telemetry row. |
 | MINOR: an unreadable export record on POST is a final 409 `export_busy` | §2.2 | Fixed (lane H): `accept` returns `unreadable`, the agent answers `export_state_unreadable`, the edge a retryable `503 export_state_unreadable` (W: `export_unreachable`), as its own reads of the same record do. The record is never overwritten. |
 | MINOR: `read_state` races a writer's rename | §2.2, §2.5 | Fixed (lane H): the read retries while the name moved under it (`READ_TRIES = 3`); a shared flock was rejected because `accept` and `note_served` call it under `LOCK_EX` on another fd, which would deadlock. A test renames the record between the stat and the open. |
-| MINOR: deterministic capture refusals retry as `export_failed` forever | §5.5 | **Rejected for v1, disclosed.** The fix is a cross-lane wire change (codec exit code, host status, W code, A class, U copy, runbook); it is user-driven and the files stay intact. |
+| MINOR: deterministic capture refusals retry as `export_failed` forever | §5.5 | **Rejected for v1, disclosed; [r8] accepted by the lead (§12.6).** The fix is a cross-lane wire change (codec exit code, host status, W code, A class, U copy, runbook); it is user-driven and the files stay intact. |
 | MINOR: a copying `import_not_started` after a recorded chunk cannot recover by re-begin | §5.5 | Fixed: in `copying`, once a chunk is recorded, it is `reopen` → `import_lost` (as verify's own); before any chunk the retry and re-begin stand. A machine test, and the A ↔ W seam harness deletes the DO key mid-copy and shows verify refusing after a fresh begin. |
+
+### 12.6 r8: the lead's rulings on the r7 fixer's choices **[r8]**
+
+r8 (on `r6/integb-20261031`, from `d8c87f56`) implements the lead's rulings on the three choices §12.5 marked for
+ratification, and accepts its two disclosed residuals. One change set with its tests; the shell bundle is rebuilt last.
+
+| Item | Section(s) | Ruling and what changed |
+|---|---|---|
+| A hover on the Browser icon starts a move (r7 fixer: Option A) | §1.1, §5.9 | **Option A rejected; Option C.** The warm marks its asks `intent: 'warm'` (`warm.js` → `session.openDesktop`'s `warm` option); `/api/shell/desktop` forwards it; `previewUrl` takes `intent: z.unknown().optional()`. On a computer whose open would start the move (`reverseMoveOnOpen`'s own checks, `{ warm: true }` → `REVERSE_WARM_HELD`) the warm creates no row and boots nothing, and answers the stop hold's `computer_stopped` value, which the warm drops and no window is handed (`claim()` drops the marker on its later asks and asks a real open in its place). Any other warm is today's warm; an in-flight row still answers `computeMoving`. `warm.js` (and `warm-intent-test.mjs` *new*) join lane U; `app/src/app/api/shell/desktop/route.ts` and its `route.test.ts` join lane A (the ruling's "`shell/api/shell/desktop/route.ts`" is this file). Tests and mutants in §5.9. |
+| Code triggers, Preview never (r7 fixer) | §5.9, §6.3 | **Ratified.** Code triggers outside its 60 s stop hold; Preview never does (Preview first stays a disclosed residual). The pinned §6.3 `moveOnOpen` string now names the triggers: "The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer." The rest of the string is unchanged, and so is the shell's (`moveOfferCopy`, `computers.js`); `computers-test.mjs` pins the new words. It is the only §6.3 string that names a trigger: the `moveOnOpen` false row and the held-closed row name none and are unchanged. |
+| A held-closed computer (cmp-4, cmp-8, unknown size) never auto-triggers (r7 fixer) | §5.9, §6.1.1, §6.3 | **Ratified.** Its move is a click only (`moveOnOpen` false; its opens keep 6a's `files_on_aws` refusal). No code change in r8; a warm on it is today's warm (r8 test). |
+| Legacy `/computer/[id]` canvas has no move handling (r7 fixer: disclosed) | §5.3 | **Accepted as a disclosed residual for v1.** Closing it needs its own lane and a §1.1 row. |
+| Deterministic capture refusals retry as `export_failed` (r7 fixer: disclosed) | §5.5 | **Accepted as a disclosed residual for v1.** Closing it is a cross-lane wire change, post-v1, its own revision. |
