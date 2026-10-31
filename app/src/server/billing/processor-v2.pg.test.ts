@@ -99,6 +99,7 @@ function fakeStripe() {
         retrieveInvoicePaymentState: async id => paymentStates.get(id) ?? 'failed',
         retrieveCharge: async id => read(charges, id), retrieveCheckoutSession: unused, createCustomer: unused,
         createCheckoutSession: unused, createPortalSession: unused, listInvoices: unused,
+        listCustomerSubscriptions: unused, listOpenCheckoutSessions: unused, expireCheckoutSession: unused,
     };
     return { api, subscriptions, invoices, charges, paymentStates };
 }

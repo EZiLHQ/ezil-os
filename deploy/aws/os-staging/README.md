@@ -112,6 +112,50 @@ Timers match Vercel UTC schedules: telemetry 03:17 daily, reap 04:08 daily,
 billing sweep every minute. Persistent timers catch up once after downtime.
 Each curl has a 50-second limit; cancellation does not cancel server-side work.
 
+## Reading the web logs
+
+Run these on the host through SSM (Session Manager or `AWS-RunShellScript`) as root. The names below are
+staging's; a production host (`OS_ENV=production`) uses `ezil-os-production-web-1` and
+`/var/log/ezil-os-production` (install-host.sh derives both from the environment).
+
+**Live log** (the current container, since its last recreate):
+```bash
+docker logs --timestamps --since 2h ezil-os-staging-web-1 2>&1 | less
+docker logs --timestamps ezil-os-staging-web-1 2>&1 | grep '"event":"pool-replenish"'
+```
+Compose keeps json-file logs of 50 MB x 5 files per container. Every
+`--force-recreate` deletes them: install, plus the release-gate close and open
+re-renders.
+
+**Snapshots** (earlier containers):
+- `install-host.sh` writes the outgoing web container's log to
+  `/var/log/ezil-os-staging/web-<UTC yyyymmddThhmmssZ>.log.gz` just before it
+  recreates the container. The file is root-only (mode 0600).
+- The lead's release-gate re-renders (`deploy-app.sh`) do the same before each of
+  their recreates, once `deploy-app.r5.patch` is applied. Until then, the gate
+  windows are not snapshotted.
+- Snapshots older than 7 days are pruned at the next snapshot.
+- A failed snapshot prints `Web log snapshot skipped` and never blocks the install.
+- Each snapshot covers one container's lifetime, so read them in order with the
+  live log to follow a whole day:
+```bash
+ls -l /var/log/ezil-os-staging/
+zcat /var/log/ezil-os-staging/web-20261029T080003Z.log.gz | grep '"event":"pool-host-readiness"'
+zcat /var/log/ezil-os-staging/web-*.log.gz | grep 'ai-outbox'   # files sort by time
+```
+
+**Pool lines** are single-line JSON. Steady state is quiet:
+- `pool-replenish`: one line per minute pass only when something changed. That
+  means a dispatch, a retirement, slow hosts, a failed pass (`"failed":true`),
+  the first good pass after a failed one (the recovery line), or a per-class
+  target/spares change. Otherwise at most one `"heartbeat":true` line every
+  15 minutes.
+- `pool-host-readiness`: an `enrolled` line for each enroll while the host row
+  is still `booting` (normally once; a host that re-enrolls before it is ready
+  logs again), and one `ready` line for the host's first ready. Once a host is
+  ready, its five-minute heartbeat refreshes and re-enrolls are silent. Every
+  `*_rejected` line is kept, as a warning.
+
 ## Health, rollback and teardown
 
 `/api/health` now returns `{"ok":true,"sha":...}`. Staging smoke requires HTTP 200

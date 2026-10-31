@@ -7,7 +7,7 @@ vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: {
 
 import { bridgeAuth0Identity } from './bridge';
 const identity = { sub: 'auth0|one', email: 'Test@example.com' };
-const user = { id: 'supabase-user', email: 'test@example.com', app_metadata: { auth0_sub: identity.sub } };
+const user = { id: 'supabase-user', email: 'test@example.com', email_confirmed_at: '2026-10-01T00:00:00Z', app_metadata: { auth0_sub: identity.sub } };
 beforeEach(() => {
     vi.resetAllMocks();
     stub.adminClient.mockReturnValue({ auth: { admin: stub } });

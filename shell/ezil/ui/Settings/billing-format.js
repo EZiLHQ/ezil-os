@@ -66,16 +66,15 @@ export function webUrl (value) {
 
 export const BANNED_COPY = ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour'];
 
-/** Format the canonical microcredit string without passing it through Number. */
+/**
+ * Credits are whole numbers on every user surface (founder 2026-10-29): the
+ * canonical microcredit string is floored without passing it through Number,
+ * and a plain balance is floored too. Never a fraction, never dollars.
+ */
 export function creditsLabel (micro, balance = null) {
-    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) {
-        const value = BigInt(micro);
-        const fraction = String(value % 1000000n).padStart(6, '0').replace(/0+$/, '');
-        return `${(value / 1000000n).toLocaleString('en-US')}${fraction ? `.${fraction}` : ''}`;
-    }
+    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) return (BigInt(micro) / 1000000n).toLocaleString('en-US');
     return typeof balance === 'number' && Number.isFinite(balance) && balance >= 0 && balance <= Number.MAX_SAFE_INTEGER
-        && Number(balance.toFixed(6)) === balance
-        ? balance.toLocaleString('en-US', { maximumFractionDigits: 6 }) : 'Not reported';
+        ? Math.floor(balance).toLocaleString('en-US') : 'Not reported';
 }
 
 // ── Round 3 (plan §6.3/§6.4, contract v3 D1/D3/D4) ───────────────────────────
@@ -106,7 +105,7 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
  * credits → computer time. Built from the offer's numbers, never from
  * `offer.bullets` (catalog copy that predates round 3).
  */
-export function planBullets (offer) {
+export function planBullets (offer, { existingDisk } = {}) {
     // A field the offer lacks drops its bullet rather than printing "undefined".
     const known = value => Number.isSafeInteger(value) && value > 0;
     const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
@@ -119,9 +118,16 @@ export function planBullets (offer) {
         credits && `${credits} AI credits to start`,
         hours && `${hours} hours of computer time each month`,
     ]) };
+    // Round 5 D3: the plan's disk for a NEW computer (`offer.storageGiB`); 50 GB when an older server omits it.
+    // An existing AWS computer (an upgrade or a change to a lower plan) keeps its own disk until the
+    // server can grow it (`computer.disk.growsOnSwitch`), so its bullet names that disk, never the plan's.
+    const disk = known(offer.storageGiB) ? offer.storageGiB : PAID_DISK_GB;
+    const keeps = existingDisk && existingDisk.growsOnSwitch !== true;
+    const diskBullet = ! keeps ? `${disk} GB disk for your projects`
+        : known(existingDisk.provisionedGiB) ? `Your computer keeps its ${existingDisk.provisionedGiB} GB disk` : 'Your computer keeps its disk';
     if ( offer.sku === 'standard_monthly_v3' ) return { lead: 'Everything in Free, plus:', bullets: keep([
         `Your own AWS computer${size}`,
-        `${PAID_DISK_GB} GB disk for your projects`,
+        diskBullet,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time each month`,
     ]) };
@@ -132,22 +138,54 @@ export function planBullets (offer) {
     const most = Math.max(offer.memoryGiB ?? 0, ...choices.map(code => memory[code] ?? 0));
     return { lead: 'Everything in Standard, plus:', bullets: keep([
         listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
-        `${PAID_DISK_GB} GB disk for your projects`,
+        diskBullet,
         credits && `${credits} AI credits every month`,
         hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
     ]) };
 }
 
-/** "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it. */
-export function hoursLeftLines (period, machineChoice = []) {
+/**
+ * Round 6 (R4-02): the user's AWS computer as placed (summary `computer.awsSize`) when it is a 4 or 8 vCPU
+ * one: the D16 hold opens only 2 vCPU and never resizes, so on Free it stays closed. null otherwise (none,
+ * 2 vCPU, unknown or an older server), and the plain hold copy stands.
+ */
+export function heldClosedSize (computer) {
+    const aws = computer?.awsSize;
+    // The same test as `computers.js` `standingCopy` (billing-test pins the two copies equal).
+    return aws && (aws.size === 'cmp-4' || aws.size === 'cmp-8') && Number.isSafeInteger(aws.vcpu) && aws.vcpu > 2 ? aws : null;
+}
+
+/** Round 6 (R4-02): the hold copy for a held 4 or 8 vCPU computer, the same words on Computer, Billing and Usage. */
+export function heldClosedText (vcpu) {
+    return `Your files are still on your ${Number.isSafeInteger(vcpu) && vcpu > 0 ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
+}
+
+/**
+ * "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it.
+ * Round 6: an equivalent with the current size's vCPU and weight says nothing new, so it is left out
+ * (R1-07: "Same as 5 hours at 2 vCPU" under "About 5 hours left at 2 vCPU"). `monthly` (Free: one size,
+ * a calendar-month allowance) says the month's allowance instead of the size: "About 5 of 8 hours left
+ * this month" (R1-06).
+ */
+export function hoursLeftLines (period, machineChoice = [], { monthly = false } = {}) {
     if ( ! period || ! Number.isSafeInteger(period.remainingHoursAtCurrent) || period.remainingHoursAtCurrent < 0 ) return null;
     const vcpuOf = size => machineChoice.find(m => m.size === size)?.vcpu ?? { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8, 'free-cf': 2 }[size];
+    const weightOf = size => machineChoice.find(m => m.size === size)?.weight ?? { 'std-2': 1, 'cmp-4': 2, 'cmp-8': 4, 'free-cf': 1 }[size];
     const current = vcpuOf(period.currentSize);
+    const weight = Number.isSafeInteger(period.currentWeight) && period.currentWeight >= 1 ? period.currentWeight : weightOf(period.currentSize) ?? 1;
     const hours = n => `${whole(n)} hour${n === 1 ? '' : 's'}`;
-    const others = (period.equivalents ?? []).filter(e => e && e.size !== period.currentSize && Number.isSafeInteger(e.hours))
+    const others = (period.equivalents ?? []).filter(e => e && e.size !== period.currentSize && Number.isSafeInteger(e.hours)
+        && ! (vcpuOf(e.size) === current && e.weight === weight))
         .sort((a, b) => b.weight - a.weight).map(e => `${hours(e.hours)} at ${vcpuOf(e.size)} vCPU`);
+    const left = period.remainingHoursAtCurrent;
+    const allowance = Number.isSafeInteger(period.allowanceStandardSeconds) && period.allowanceStandardSeconds > 0
+        ? Math.floor(period.allowanceStandardSeconds / weight / 3600) : null;
+    const underAnHour = left === 0 && Number.isFinite(period.remainingStandardSeconds) && period.remainingStandardSeconds > 0;
+    const main = ! monthly ? `About ${hours(left)} left at ${current} vCPU`
+        : underAnHour ? 'Less than an hour left this month'
+        : allowance !== null && allowance >= left ? `About ${whole(left)} of ${hours(allowance)} left this month` : `About ${hours(left)} left this month`;
     return {
-        main: `About ${hours(period.remainingHoursAtCurrent)} left at ${current} vCPU`,
+        main,
         equivalents: others.length ? `Same as ${others.slice(0, -1).join(', ')}${others.length > 1 ? ' or ' : ''}${others.at(-1)}.` : null,
     };
 }

@@ -157,7 +157,7 @@ const click = (el) => el?.dispatchEvent(new window.MouseEvent('click', { bubbles
 const ctx = { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState };
 const asksTo = (route, from = 0) => calls.filter(c => c.at >= from && ensureRoute(c) && new URL(c.url, 'https://ezil.local').pathname === route);
 
-/** Settings → Computer → Stop → the confirm alert's Stop. Returns the stop call (or undefined). */
+/** Settings → Computer → Stop → the sheet's Stop. Returns the stop call (or undefined). */
 async function stopFromSettings ({ onConfirm } = {}) {
     if ( q('.window[data-app="settings"]') ) { $('.window[data-app="settings"]').close(); await settle(6); }
     await ezil.registry.launch('settings', ctx);
@@ -167,8 +167,7 @@ async function stopFromSettings ({ onConfirm } = {}) {
     const before = calls.length;
     click(q('.window[data-app="settings"] [data-action="stop"]'));
     await settle(6);
-    // main confirms Stop with a UIAlert (the r5 confirm sheet is not on main).
-    click(qa('.window button').find(b => b.textContent.trim() === 'Stop' && b.closest('.window')?.querySelector('.window-alert-message')));
+    click(q('[role="dialog"][data-sheet="confirm-stop"] [data-action="confirm"]'));
     onConfirm?.();
     for ( let i = 0; i < 240 && ! calls.slice(before).some(c => c.url.endsWith('/api/shell/stop')); i++ ) await tick(25);
     return calls.slice(before).find(c => c.url.endsWith('/api/shell/stop'));

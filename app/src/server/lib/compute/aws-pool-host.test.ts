@@ -6,6 +6,13 @@ import { poolFixture, NOW, OTHER } from './aws-pool-test-support';
 
 beforeEach(() => { vi.spyOn(console, 'info').mockImplementation(() => {}); vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 afterEach(() => vi.restoreAllMocks());
+/** D4: every readiness line is ONE single-line JSON string tagged pool-host-readiness. */
+function lines(spy: unknown): Record<string, unknown>[] {
+    return vi.mocked(spy as typeof console.info).mock.calls.map(([line, ...rest]) => {
+        expect(rest).toEqual([]); expect(typeof line).toBe('string'); expect(line).not.toContain('\n');
+        return JSON.parse(line as string) as Record<string, unknown>;
+    });
+}
 
 describe('pool host authentication and transactional enrollment', () => {
     it.each(['m6i.large','m6i.xlarge','m6i.2xlarge'])('authenticates configured %s through enroll and ready', async instanceType => {
@@ -25,19 +32,19 @@ describe('pool host authentication and transactional enrollment', () => {
             return row;
         };
         expect((await handlePoolHost(f.request(action), f.deps, action)).status).toBe(200);
-        expect(console.info).toHaveBeenCalledExactlyOnceWith('pool-host-readiness', {
-            event: action === 'enroll' ? 'enrolled' : 'ready', poolHostId: f.row.poolHostId, poolGeneration: 1,
+        expect(lines(console.info)).toEqual([{ event: 'pool-host-readiness',
+            result: action === 'enroll' ? 'enrolled' : 'ready', poolHostId: f.row.poolHostId, poolGeneration: 1,
             instanceId: f.row.instanceId, state: f.row.state, enrolledAt: f.row.enrolledAt!.toISOString(),
             readyAt: NOW.toISOString(), observedAt: NOW.toISOString(), ...(action === 'ready' ? { reportedHealth: { editorOk: true } } : {}),
-        });
+        }]);
     });
     it('logs the authenticated host and reported component health when readiness is rejected', async () => {
         const f = poolFixture(); const health = { ok: false, desktop: true, editor: false };
         expect((await handlePoolHost(f.request('ready', { health }), f.deps, 'ready')).status).toBe(403);
-        expect(console.warn).toHaveBeenCalledExactlyOnceWith('pool-host-readiness', {
-            event: 'ready_rejected', poolHostId: f.row.poolHostId, poolGeneration: 1,
+        expect(lines(console.warn)).toEqual([{ event: 'pool-host-readiness',
+            result: 'ready_rejected', poolHostId: f.row.poolHostId, poolGeneration: 1,
             instanceId: f.row.instanceId, reportedHealth: health, reason: 'ready_health',
-        });
+        }]);
         expect(console.info).not.toHaveBeenCalled();
     });
     it('does not log success on commit failure or expose raw database errors', async () => {
@@ -45,8 +52,25 @@ describe('pool host authentication and transactional enrollment', () => {
         f.deps.db.transaction = async run => { await run({ execute: vi.fn() }); throw new Error('private database failure'); };
         expect((await handlePoolHost(f.request('enroll'), f.deps, 'enroll')).status).toBe(503);
         expect(console.info).not.toHaveBeenCalled();
-        expect(console.warn).toHaveBeenCalledWith('pool-host-readiness', expect.objectContaining({ event: 'enroll_rejected', reason: 'pool_unavailable' }));
+        expect(lines(console.warn)).toEqual([expect.objectContaining({ event: 'pool-host-readiness', result: 'enroll_rejected', reason: 'pool_unavailable' })]);
         expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain('private database failure');
+    });
+    it('D4: a heartbeat enroll of an already-ready spare is silent', async () => {
+        const f = poolFixture(); f.row.state = 'ready';
+        expect((await handlePoolHost(f.request('enroll'), f.deps, 'enroll')).status).toBe(200);
+        expect(f.deps.data.recordPoolEnrollment).toHaveBeenCalledOnce();
+        expect(console.info).not.toHaveBeenCalled(); expect(console.warn).not.toHaveBeenCalled();
+    });
+    it('D4: a heartbeat ready of a host whose readyAt predates this report is silent', async () => {
+        const f = poolFixture(); f.row.state = 'ready'; f.row.readyAt = new Date(NOW.getTime() - 5 * 60_000);
+        expect((await handlePoolHost(f.request('ready'), f.deps, 'ready')).status).toBe(200);
+        expect(f.deps.data.recordPoolReady).toHaveBeenCalledOnce();
+        expect(console.info).not.toHaveBeenCalled(); expect(console.warn).not.toHaveBeenCalled();
+    });
+    it('D4: the first ready (readyAt set by this report) is logged once even when the row was already enrolled', async () => {
+        const f = poolFixture(); f.row.state = 'ready'; f.row.readyAt = NOW;
+        expect((await handlePoolHost(f.request('ready'), f.deps, 'ready')).status).toBe(200);
+        expect(lines(console.info)).toEqual([expect.objectContaining({ event: 'pool-host-readiness', result: 'ready', readyAt: NOW.toISOString() })]);
     });
     it.each(['enroll', 'ready'] as const)('%s records the authenticated host via P8', async action => {
         const f = poolFixture();

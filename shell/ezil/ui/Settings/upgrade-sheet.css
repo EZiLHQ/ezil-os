@@ -187,3 +187,50 @@
 .ezil-billing-next dl > div { display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr); gap: 8px; }
 .ezil-billing-next dt { font-weight: 600; color: var(--accent); }
 .ezil-billing-next dd { margin: 0; }
+
+/* Round 5 (D6): the confirmation sheet for Switch and Stop (sheet-frame.js
+ * `openConfirmSheet`). Same dark frame and tokens as the billing sheets: a
+ * title, a short "what happens" list, Cancel and one accent primary. */
+.ezil-confirm-sheet {
+    width: min(440px, calc(100vw - 32px));
+    padding: 24px;
+    color: var(--text);
+    background: var(--surface);
+}
+.ezil-confirm-sheet h2 { margin: 4px 36px 16px 0; font-size: 18px; line-height: 1.35; font-weight: 600; }
+.ezil-confirm-lines { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; color: var(--muted); }
+.ezil-confirm-lines li { position: relative; padding-left: 18px; line-height: 1.45; }
+.ezil-confirm-lines li::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 0.55em;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+}
+.ezil-confirm-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+/* Cancel is a quiet secondary: it overrides the sheet's accent button fill, so the primary is the only accent. */
+.ezil-confirm-actions .ezil-settings-btn { min-height: 44px; padding: 8px 16px; font-size: 13px; background: transparent; border-color: var(--border); color: var(--text); }
+.ezil-confirm-actions .ezil-settings-btn:hover:not(:disabled) { background: var(--surface-2); }
+.ezil-confirm-actions .ezil-settings-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.ezil-upgrade-backdrop.is-compact .ezil-confirm-sheet { padding: 48px 16px 20px; }
+@media (any-pointer: coarse) {
+    .ezil-confirm-actions .ezil-settings-btn, .ezil-confirm-sheet .ezil-upgrade-close { min-height: 44px; min-width: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .ezil-upgrade-backdrop, .ezil-upgrade-backdrop * { transition: none !important; animation: none !important; }
+}
+/* Light values apply only where a page opts in (data-theme="light"); dark is the default. */
+:root[data-theme="light"] .ezil-upgrade-backdrop {
+    --bg: #f6f7f7;
+    --surface: #ffffff;
+    --surface-2: #f2f4f6;
+    --border: rgba(0, 0, 0, 0.1);
+    --text: #161616;
+    --muted: #5f6666;
+    --warn: #a86a00;
+    --danger: #b42318;
+    background: rgba(22, 22, 22, 0.45);
+}

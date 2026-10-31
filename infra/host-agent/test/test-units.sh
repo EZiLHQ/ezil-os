@@ -87,6 +87,9 @@ check "enroll: a 200 retires the nonce only after its credentials are durable; m
 check "guard: waits, bounded, for the late-attached data volume (wake link, provision disk)" pyunit test_boot_retries.VolumeWait
 check "lease: IMDS transport errors retried, bounded; HTTP refusals final" pyunit test_boot_retries.ImdsRetry
 check "pool: tagged claim, serial disk, nonce, single desktop transition, readiness and crash resume" pyunit test_pool
+check "pool (R2-4): a readiness miss is never fatal (first boot retries, a refresh keeps the host); the guard unit restarts a crash, bounded" pyunit test_pool.Readiness
+check "export codec: the host copy is the Worker codec byte for byte; export-capture needs no marker, exit 3 at the limits" pyunit test_codec_parity
+check "export (reverse move): closed body and agent message, digest, idempotent POST, busy, 1 s answer, chunk grammar, from-disk GETs, spec, free space, idle hold" pyunit test_export
 check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection
 check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
 check "hangup: a shell outside the container pid namespace is never signalled; membership read after the pidfd pin" pyunit test_history_stop.HangupScope

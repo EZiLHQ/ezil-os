@@ -2,7 +2,8 @@ export const usage = {
     enabled: true, version: 1, asOf: '2026-10-26T05:00:00Z',
     session: { computerId: 'computer-a', state: 'recording', startedAt: '2026-10-26T03:30:00Z', observedAt: '2026-10-26T05:00:00Z', elapsedSeconds: 5400, endedAt: null },
     period: { unit: 'standard_seconds', startsAt: '2026-10-01T00:00:00Z', resetsAt: '2026-11-01T00:00:00Z', usedStandardSeconds: 86400, allowanceStandardSeconds: 144000, remainingStandardSeconds: 57600 },
-    storage: { state: 'sampled', capBytes: '2000000000', samples: [{ computerId: 'computer-a', bytes: '1200000000', measuredAt: '2026-10-25T00:00:00Z' }] },
+    // Round 5 (D6): storage is measured against the computer's real disk (a 2 GB disk keeps the numbers small).
+    storage: { state: 'sampled', capBytes: '2000000000', disk: { provisionedGiB: 2, usedBytes: null }, samples: [{ computerId: 'computer-a', bytes: '1200000000', measuredAt: '2026-10-25T00:00:00Z' }] },
     egress: { state: 'unavailable', usedBytes: null },
 };
 export const summary = {

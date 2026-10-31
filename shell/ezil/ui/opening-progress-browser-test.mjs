@@ -1,10 +1,12 @@
 // Real Chromium against the SOURCE opening surface (`computer-progress.js` +
-// `app-spinner.js` + `boot-progress.js`, bundled on the fly with Bun; the
-// committed shell bundle is never read or generated) and the real shell CSS in
-// bundle order (`computer-progress.css` before `ezil-shell.css`). No network.
-// Proves what jsdom cannot: the one surface is centred over the older panel
-// rules, the bar is one thin determinate bar, reduced motion drops the
-// transition and the shimmer, and a phone width never scrolls sideways.
+// `app-spinner.js`, bundled on the fly with Bun; the committed shell bundle is
+// never read or generated) and the real shell CSS in bundle order
+// (`computer-progress.css` before `ezil-shell.css`). No network.
+// Proves what jsdom cannot (round 5, D5): the one surface is centred, the bar is
+// one thin token-coloured bar that follows the 250 ms paint with a 600 ms
+// transition, the elapsed line and the bar never reset across a re-open, dev
+// details never paint, actions are 44 px, reduced motion drops the transition,
+// the sheen and the sweep, and a phone width never scrolls sideways.
 //
 // HF3 adds screenshot cases (1200×800 PNG, written to <worktree>/.tmp/hf3/<case>-<tab>.png):
 // the opening surface at reached 1 / 3 / 4, and Settings → Computer and System for an
@@ -41,8 +43,7 @@ let source, settingsSource;
 try {
     const entry = path.join(buildDir, 'entry.js');
     await fs.writeFile(entry, `import { AppSpinner } from ${JSON.stringify(path.join(here, 'app-spinner.js'))};
-import { BootProgress } from ${JSON.stringify(path.join(here, 'boot-progress.js'))};
-window.AppSpinner = AppSpinner; window.BootProgress = BootProgress;`);
+window.AppSpinner = AppSpinner;`);
     source = execFileSync('bun', ['build', entry, '--target=browser', '--format=iife'], { encoding: 'utf8' });
     // Settings → Computer and System from source, every import stubbed (the replacements of computers-test Part A).
     const settings = path.join(here, 'Settings');
@@ -56,7 +57,7 @@ window.AppSpinner = AppSpinner; window.BootProgress = BootProgress;`);
         ["import trpc from '../trpc.js';", 'const trpc = { query: async () => ({ ok: false }), mutate: async () => ({ ok: false }) };'],
         ["import TabBilling from './billing.js';", 'const TabBilling = { available: () => true };'],
         ["import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';", 'const feedback_enabled = () => true, open_feedback_dialog = () => undefined;'],
-        ["import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';"],
+        ["import { TRANSITION_EVENT, MOVE_LIMIT_BYTES } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition', MOVE_LIMIT_BYTES = 536870912;"],
     ]) + '\n// Test only: what the tab records when it renders a transition in flight.\nexport const markSeenInFlight = id => seenInFlight.add(id);\n';
     const system = stub(await fs.readFile(path.join(settings, 'tabs/system.js'), 'utf8'), [
         ["import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../native-runtime.js';", 'const isNative = () => false, NATIVE_CAPABILITIES = {}, selectRuntimeAdapter = () => null;'],
@@ -101,49 +102,160 @@ try {
         await page.addScriptTag({ content: source });
         const tag = `${viewport.width}px/${reducedMotion}`;
 
-        await check(`${tag}: the spinner is one centred surface with a thin indeterminate bar and no ring`, async () => {
+        await check(`${tag}: one centred surface — icon, title, one thin bar, no ring, no app-name line, no sideways scroll`, async () => {
             const box = await page.evaluate(() => {
+                document.documentElement.style.setProperty('--ezil-accent', '#7c3bed');
                 const s = window.AppSpinner({ label: 'Opening Code…' });
-                document.getElementById('host').appendChild(s.el);
-                s.render({ kind: 'progress' }, { elapsedMs: 42_000 });
+                document.getElementById('host').replaceChildren(s.el);
+                s.render({ kind: 'progress' });
                 const panel = s.el.querySelector('.ezil-opening');
                 const bar = s.el.querySelector('.ezil-opening-bar').getBoundingClientRect();
                 const fill = getComputedStyle(s.el.querySelector('.ezil-opening-fill'));
                 return { align: getComputedStyle(panel).textAlign, h: bar.height, w: bar.width,
+                    fillW: s.el.querySelector('.ezil-opening-fill').getBoundingClientRect().width,
                     centre: Math.abs((bar.left + bar.width / 2) - window.innerWidth / 2), ring: !!s.el.querySelector('.ezil-app-spinner-ring'),
-                    animation: fill.animationName, meta: s.el.querySelector('.ezil-opening-meta').textContent,
-                    name: s.el.querySelector('.ezil-opening-name').textContent, overflow: document.documentElement.scrollWidth - window.innerWidth };
+                    animation: fill.animationName, colour: fill.backgroundColor, title: s.el.querySelector('h1').textContent,
+                    name: !!s.el.querySelector('.ezil-opening-name'), bg: getComputedStyle(s.el).backgroundColor,
+                    overflow: document.documentElement.scrollWidth - window.innerWidth };
             });
             assert.equal(box.align, 'center');
             assert.equal(box.h, 4);
-            assert.ok(box.w > 100 && box.w <= 220, String(box.w));
+            assert.ok(box.w > 100 && box.w <= 260, String(box.w));
             assert.ok(box.centre < 2, `centred (${box.centre})`);
             assert.equal(box.ring, false);
-            assert.equal(box.meta, '0:42');
-            assert.equal(box.name, 'Code');
+            assert.equal(box.name, false);
+            assert.equal(box.title, 'Opening Code…');
+            assert.equal(box.colour, 'rgb(124, 59, 237)', 'the fill is the user accent (--ezil-accent)');
+            assert.equal(box.bg, 'rgb(22, 22, 22)', 'dark default background');
             assert.equal(box.overflow, 0, 'no sideways scroll');
-            assert.equal(box.animation, reducedMotion === 'reduce' ? 'none' : 'ezil-opening-shimmer');
+            assert.equal(box.animation, reducedMotion === 'reduce' ? 'none' : 'ezil-open-sweep', 'no basis yet: a sweep, not a position');
+            if ( reducedMotion === 'reduce' ) assert.equal(box.fillW, 0, 'reduced motion with no basis: the bare track, never a static full bar that reads as done');
         });
 
-        await check(`${tag}: BootProgress renders the same surface over the older panel rules; reduced motion drops the transition`, async () => {
-            const out = await page.evaluate(() => {
-                document.getElementById('host').replaceChildren();
-                const b = window.BootProgress({ appName: 'Linux Desktop' });
-                document.getElementById('host').appendChild(b.el);
-                b.render({ kind: 'progress', currentPhase: 'mounting', confirmed: false, isRunningLong: false }, null, { elapsedMs: 9_000 });
-                const panel = b.el.querySelector('.ezil-opening');
-                const bar = b.el.querySelector('.ezil-opening-bar');
-                const fill = getComputedStyle(b.el.querySelector('.ezil-opening-fill'));
-                return { align: getComputedStyle(panel).textAlign, value: Number(bar.getAttribute('aria-valuenow')),
-                    transition: fill.transitionDuration, rows: b.el.querySelectorAll('li').length,
-                    status: b.el.querySelector('.ezil-boot-title').textContent };
+        await check(`${tag}: observed opening — determinate bar on every paint, 600 ms transition, monotonic and no elapsed reset across a re-open, no dev line painted`, async () => {
+            const out = await page.evaluate(async () => {
+                const T = new Date(Date.now()).toISOString();
+                let payload = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true,
+                    path: 'warm', openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }], updatedAt: T,
+                    bytes: { transferred: null, total: null }, percent: null };
+                window.__EZIL_BOOT__ = { features: { devDetails: true } };
+                window.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+                const realNow = Date.now; let skew = 0; Date.now = () => realNow() + skew;
+                const s = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…', className: 'ezil-boot' });
+                document.getElementById('host').replaceChildren(s.el);
+                s.render({ kind: 'progress' });
+                for ( let i = 0; i < 100 && s.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
+                const read = () => ({ pct: Number(s.el.querySelector('.ezil-opening-bar').dataset.percent), meta: s.el.querySelector('.ezil-opening-meta').textContent });
+                skew = 85_000; s.render({ kind: 'progress' });
+                const before = read();
+                skew = 86_000; s.stamp(null); s.render({ kind: 'progress' }, { reopening: true });
+                const after = read();
+                const fill = getComputedStyle(s.el.querySelector('.ezil-opening-fill'));
+                const details = s.el.querySelector('details.ezil-opening-details');
+                const detailsText = details.querySelector('.ezil-opening-details-text');
+                const out = { before, after, transition: fill.transitionDuration, sheen: getComputedStyle(s.el.querySelector('.ezil-opening-fill'), '::after').animationName,
+                    detailsOpen: details.open, detailsHidden: details.hidden, devPainted: detailsText.checkVisibility(), devInText: s.el.innerText.includes('Last recorded update'),
+                    visible: s.el.innerText, width: s.el.querySelector('.ezil-opening-fill').style.width };
+                s.dispose(); Date.now = realNow;
+                return out;
             });
-            assert.equal(out.align, 'center');
-            assert.equal(out.rows, 0);
-            assert.equal(out.status, 'Loading your files');
-            assert.ok(out.value >= 25 && out.value < 90, String(out.value));
-            assert.equal(out.transition, reducedMotion === 'reduce' ? '0s' : '0.9s');
-            if ( reducedMotion === 'reduce' ) assert.equal(out.value % 10, 0, 'whole steps');
+            assert.ok(out.before.pct > 5 && out.before.pct < 100, JSON.stringify(out.before));
+            assert.equal(out.before.meta, '1:25 · usually about 4 min');
+            assert.equal(out.after.meta, '1:26 · usually about 4 min', 'no 1:25 → 0:01 reset');
+            assert.ok(out.after.pct >= out.before.pct, JSON.stringify(out));
+            assert.equal(out.width, `${out.after.pct}%`, 'the fill width follows the paint');
+            assert.equal(out.transition, reducedMotion === 'reduce' ? '0s' : '0.6s, 0.2s');
+            assert.equal(out.sheen, reducedMotion === 'reduce' ? 'none' : 'ezil-open-sheen');
+            assert.equal(out.detailsHidden, true, 'devDetails on: the details block exists for diagnostics but never paints (no "Details" row)');
+            assert.equal(out.detailsOpen, false, 'closed by default');
+            assert.equal(out.devPainted, false, 'the dev line is never painted on the surface');
+            assert.equal(out.devInText, false, 'nor in the rendered text');
+            assert.doesNotMatch(out.visible, /Last recorded update|Next session/);
+        });
+
+        await check(`${tag}: attention — amber frozen fill, one 44 px action, no sheen; manual: two 44 px actions`, async () => {
+            const out = await page.evaluate(async () => {
+                const T = new Date(Date.now()).toISOString();
+                let payload = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true,
+                    path: 'warm', openingStartedAt: T, expectedSeconds: 240, milestones: [{ key: 'requested', at: T }, { key: 'host_claimed', at: T }],
+                    bytes: { transferred: null, total: null }, percent: null };
+                window.__EZIL_BOOT__ = {};
+                window.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+                const wait = async test => { for ( let i = 0; i < 100 && ! test(); i++ ) await new Promise(r => setTimeout(r, 20)); };
+                const repoll = () => document.dispatchEvent(new Event('visibilitychange'));
+                const a = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
+                document.getElementById('host').replaceChildren(a.el);
+                a.render({ kind: 'progress' });
+                await wait(() => a.el.dataset.progress === 'observed');
+                a.render({ kind: 'progress' });
+                const bar = a.el.querySelector('.ezil-opening-bar'), fill = a.el.querySelector('.ezil-opening-fill');
+                const high = Number(bar.dataset.percent);
+                const probe = document.createElement('i'); a.el.appendChild(probe);
+                const token = name => { probe.style.color = `var(${name})`; return getComputedStyle(probe).color; };
+                payload = { ...payload, stage: 'needs_operator', recordedStage: 'unconfirmed', active: false };
+                repoll(); await wait(() => a.el.dataset.state === 'attention');
+                a.render({ kind: 'failed', reason: 'unknown' });
+                await new Promise(r => setTimeout(r, 300)); // past the 200 ms colour transition
+                const retry = a.el.querySelector('.ezil-boot-retry').getBoundingClientRect();
+                const after = getComputedStyle(fill, '::after');
+                const out = { state: a.el.dataset.state, retryH: retry.height, retryW: retry.width, high, pct: Number(bar.dataset.percent),
+                    barShown: bar.checkVisibility(), fillBg: getComputedStyle(fill).backgroundColor, warn: token('--open-warn'), accent: token('--open-accent'),
+                    sheenContent: after.content, sheenAnimation: after.animationName,
+                    actions: [...a.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0).length,
+                    title: a.el.querySelector('h1').textContent, status: a.el.querySelector('.ezil-opening-status').textContent };
+                // Manual attention with feedback on: "View computer status" + "Send feedback", both 44 px.
+                window.__EZIL_BOOT__ = { desktopState: { endpoints: { feedback: '/api/shell/feedback' } } };
+                payload = { ...payload, recordedStage: 'failed_needs_operator' };
+                repoll(); await wait(() => ! a.el.querySelector('.ezil-opening-view-status').hidden);
+                a.render({ kind: 'failed', reason: 'unknown' });
+                out.manual = [...a.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0)
+                    .map(b => ({ text: b.textContent, w: b.getBoundingClientRect().width, h: b.getBoundingClientRect().height }));
+                out.manualStatus = a.el.querySelector('.ezil-opening-status').textContent;
+                a.dispose();
+                return out;
+            });
+            assert.equal(out.state, 'attention');
+            assert.equal(out.title, 'Your computer needs attention');
+            assert.equal(out.status, 'Starting it stopped before it finished.', 'the body matches the one action (Try again)');
+            assert.ok(out.retryH >= 44 && out.retryW >= 44, `${out.retryW}x${out.retryH}`);
+            assert.equal(out.actions, 1, 'exactly one action (feedback is off)');
+            assert.ok(out.barShown && out.high > 0 && out.pct === out.high, `the fill is frozen where it was (${out.pct}/${out.high})`);
+            assert.equal(out.fillBg, out.warn, 'the attention fill is amber (--open-warn)');
+            assert.notEqual(out.fillBg, out.accent);
+            assert.equal(out.sheenContent, 'none', 'no sheen in attention');
+            assert.equal(out.sheenAnimation, 'none');
+            assert.deepEqual(out.manual.map(b => b.text), ['View computer status', 'Send feedback']);
+            assert.ok(out.manual.every(b => b.w >= 44 && b.h >= 44), JSON.stringify(out.manual));
+            assert.equal(out.manualStatus, 'Your computer needs a fix on our side. Your files stay on your own disk.');
+        });
+
+        await check(`${tag}: long — the meta turns warn, no button`, async () => {
+            const out = await page.evaluate(async () => {
+                const T = new Date(Date.now()).toISOString();
+                const payload = { version: 2, computerId: 'qa-computer', operation: 'opening', stage: 'starting', recordedStage: 'starting', active: true,
+                    path: 'warm', openingStartedAt: T, expectedSeconds: 90, milestones: [{ key: 'requested', at: T }], bytes: { transferred: null, total: null }, percent: null };
+                window.__EZIL_BOOT__ = {};
+                window.fetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+                const realNow = Date.now; let skew = 0; Date.now = () => realNow() + skew;
+                const s = window.AppSpinner({ computerId: 'qa-computer', label: 'Opening Browser…' });
+                document.getElementById('host').replaceChildren(s.el);
+                s.render({ kind: 'progress' });
+                for ( let i = 0; i < 100 && s.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
+                const meta = s.el.querySelector('.ezil-opening-meta');
+                const calm = getComputedStyle(meta).color;
+                skew = 91_000; s.render({ kind: 'progress' });
+                await new Promise(r => setTimeout(r, 300));
+                const probe = document.createElement('i'); s.el.appendChild(probe); probe.style.color = 'var(--open-warn)';
+                const out = { state: s.el.dataset.state, text: meta.textContent, colour: getComputedStyle(meta).color, calm,
+                    warn: getComputedStyle(probe).color, actions: [...s.el.querySelectorAll('.ezil-opening-action')].filter(b => b.getClientRects().length > 0).length };
+                s.dispose(); Date.now = realNow;
+                return out;
+            });
+            assert.equal(out.state, 'long');
+            assert.equal(out.text, 'Taking longer than usual · 1:31');
+            assert.equal(out.colour, out.warn, 'the long meta is warn-coloured');
+            assert.notEqual(out.calm, out.warn, 'and was not before');
+            assert.equal(out.actions, 0, 'no button while long');
         });
         assert.deepEqual(errors, []);
         await context.close();
@@ -185,8 +297,8 @@ async function hf3Screens () {
                 for ( let i = 0; i < 100 && s.el.dataset.progress !== 'observed'; i++ ) await new Promise(r => setTimeout(r, 20));
                 s.render({ kind: 'progress' });
                 const out = { observed: s.el.dataset.progress, status: s.el.querySelector('.ezil-opening-status').textContent,
-                    sub: s.el.querySelector('.ezil-opening-sub').textContent, text: s.el.textContent,
-                    bar: Number(s.el.querySelector('.ezil-opening-bar').getAttribute('aria-valuenow')) };
+                    sub: s.el.querySelector('.ezil-opening-status').textContent, text: s.el.innerText,
+                    bar: Number(s.el.querySelector('.ezil-opening-bar').dataset.percent) };
                 s.dispose();
                 return out;
             }, payload);
@@ -197,6 +309,8 @@ async function hf3Screens () {
                 assert.doesNotMatch(out.text, BACK_ON);
                 assert.ok(out.bar > 0 && out.bar < 100, String(out.bar));
             });
+            // The card fades in after 150 ms (a warm open never shows it); shoot it settled.
+            await page.waitForTimeout(400);
             const file = path.join(shotDir, `reached${reached}-opening.png`);
             await page.screenshot({ path: file });
             shots.push(file);

@@ -34,7 +34,20 @@ export interface ComputeBillingState {
     allowanceStdSeconds: number;
     overage: { enabled: boolean; capCents: number } | null;
     summary: BillingSummaryV2 | BillingSummaryV3;
+    /**
+     * Round 6 R1-04 (v3 only): when Free began (a paid period or payment grace that ended); null while paid, or
+     * when no time is recorded (an immediate cancel). A paid-era session still open on Free ends here.
+     */
+    freeSince?: string | null;
+    /**
+     * Round 6 R2-3 (v3 only): an active paid AWS plan whose current period has no compute grant yet, within
+     * GRANT_PENDING_SECONDS of the period start (Stripe reports the period before its invoice receipt is processed).
+     */
+    grantPending?: boolean;
 }
+
+/** Round 6 R2-3: how long after a paid period starts a missing compute grant reads as not landed yet, never as used up. */
+export const GRANT_PENDING_SECONDS = 10 * 60;
 
 export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' | 'enforcementEnabled'>): boolean {
     return config.tabEnabled || config.enforcementEnabled;
@@ -70,6 +83,14 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
             usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: allowance }),
             allowanceStdSeconds: allowance, overage: null, summary,
+            // deriveStanding reports the drop time (heldSince) only with files on AWS; it is the same for any placement.
+            freeSince: paidAccess(standing) ? null
+                : deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: 'aws-ec2', now }).heldSince,
+            // Grace has its own allowance (D17); a refund or revoke row is a real zero, not a grant still to come.
+            grantPending: resolved.sku !== 'free_v3' && resolved.offer.provider === 'aws' && paidAccess(standing) && standing !== 'grace'
+                && !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === resolved.subscriptionId)
+                && now.getTime() >= Date.parse(resolved.window.start)
+                && now.getTime() - Date.parse(resolved.window.start) < GRANT_PENDING_SECONDS * 1000,
         };
         if (resolved.sku !== 'free_v3' && !paidAccess(standing)) {
             // D17/D18: grace over, raw unpaid or never paid (incomplete): Free now, with Free's window and limits
@@ -210,6 +231,12 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
         // Round 4 D16 (C8 hold): a Free user's existing AWS computer opens as std-2 under Free limits, never
         // resized; a larger one stays closed (files_on_aws). With no placement type (a Free canary) it is refused.
         const held = kind === 'aws-ec2' && !!state.v3 && state.provider !== 'aws' && instanceType !== null;
+        // Round 6 R2-3: a new paid period's grant still on its way is no admission decision yet. The AWS open goes to
+        // ensure(), which answers a retryable wait (computer_starting) until the grant lands, then opens on the paid tier.
+        if (kind === 'aws-ec2' && state.grantPending) {
+            console.info('[billing.gate] grant pending', { userId, computerId });
+            return { allowed: true };
+        }
         const decision: AdmitDecision | AdmitDecisionV3 = size === null
             ? { admit: false, reason: 'size_not_allowed' }
             : kind === 'aws-ec2' && state.paymentIssue
@@ -226,6 +253,16 @@ export async function gateComputerStart({ deps, userId, computerId, kind, instan
         console.warn('[billing.gate] read failed', { userId, computerId, error });
         return deps.config.enforcementEnabled ? { allowed: false, reason: 'billing_unavailable' } : { allowed: true };
     }
+}
+
+/**
+ * Round 6 R2-3, for aws-ec2.ts `ensure()` (which sees only the resolved tier): true while the owner's active paid
+ * plan waits for its period's compute grant. Metering off is never pending; a failed read throws to the caller.
+ */
+export async function computeGrantPending(userId: string, getDeps: () => BillingDeps = getBillingDeps): Promise<boolean> {
+    const deps = getDeps();
+    if (!billingMeteringActive(deps.config)) return false;
+    return (await loadComputeBillingState(deps, userId, deps.now())).grantPending === true;
 }
 
 export function billingV2EntitlementReader(getDeps: () => BillingDeps = getBillingDeps): EntitlementReader {

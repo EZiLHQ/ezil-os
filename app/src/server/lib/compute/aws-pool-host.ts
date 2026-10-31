@@ -87,13 +87,16 @@ export async function handlePoolHost(req: Request, deps: PoolHostDeps, action: '
             poolGuard('row_unclaimed', ['booting', 'ready'].includes(row.state) && row.leasedComputerId === null);
             return row;
         });
-        console.info('pool-host-readiness', { event: action === 'enroll' ? 'enrolled' : 'ready', ...context,
+        // D4: heartbeat refreshes are silent. Log each enroll while the row is still booting (normally once) and
+        // the first ready (ready_at is COALESCEd, so it equals this report's clock only the first time).
+        const first = action === 'enroll' ? committed.state === 'booting' : committed.readyAt?.getTime() === now.getTime();
+        if (first) console.info(JSON.stringify({ event: 'pool-host-readiness', result: action === 'enroll' ? 'enrolled' : 'ready', ...context,
             state: committed.state, enrolledAt: committed.enrolledAt?.toISOString() ?? null,
-            readyAt: committed.readyAt?.toISOString() ?? null, observedAt: now.toISOString() });
+            readyAt: committed.readyAt?.toISOString() ?? null, observedAt: now.toISOString() }));
         return Response.json({ ok: true }, { headers: POOL_NO_STORE });
     } catch (error) {
-        if (context) console.warn('pool-host-readiness', { event: `${action}_rejected`, ...context,
-            reason: error instanceof PoolError ? error.message : error instanceof z.ZodError ? 'pool_request_invalid' : 'pool_unavailable' });
+        if (context) console.warn(JSON.stringify({ event: 'pool-host-readiness', result: `${action}_rejected`, ...context,
+            reason: error instanceof PoolError ? error.message : error instanceof z.ZodError ? 'pool_request_invalid' : 'pool_unavailable' }));
         return error instanceof z.ZodError ? Response.json({ error: 'pool_request_invalid' }, { status: 400, headers: POOL_NO_STORE }) : poolErrorResponse(error);
     }
 }

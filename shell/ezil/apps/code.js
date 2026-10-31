@@ -84,6 +84,30 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 // response — code-server WebSocket traffic is not HMR" and
 // `route-auth.test.ts`'s equivalent both pass. See the wave-b-t7 report for
 // the exact commands run.
+//
+// ── Full view, its strip, and the stopped/reconnecting state ────────────────
+// ADDED 2026-10-30 (app-code lane A2). See `docs/APP-CODE-FULL-VIEW.md`.
+//   - Full view is the Browser's full-bleed, shared through
+//     `../ui/full-view.js`: no taskbar, no head, the window at the viewport.
+//     The green button, a title double-click and the head's context menu
+//     toggle it (`_ezil_maximise`); "restore" goes back to the bounds the
+//     window had. A launch with `ctx.view === 'full'` (the `/app/code` route)
+//     opens in it; a launch with no view opens windowed 980x680 unless the
+//     user's last explicit choice in this tab was full (`VIEW_STORAGE_KEY`).
+//     Never the browser Fullscreen API.
+//   - In full view a compact dark strip replaces the head. It holds two
+//     things: the control drawer's grab notch, centred, and the small
+//     Feedback icon in its top-right corner. The title, Show desktop,
+//     Restore window and Close live in the notch's expanded tray (gate G3,
+//     2026-10-31; until then a top bar carried its own title and buttons).
+//   - The shell never calls a history API from here. Each change of view is
+//     announced as `ezil:app-view-changed` for the router to record.
+//   - When the shell sees the computer go away (a restart/switch transition,
+//     or the return-from-away check finding it stopped) the frame is covered
+//     by an OS state — "Reconnecting…" or "Computer stopped" — instead of
+//     leaving code-server's own reconnect dialog, which this cross-origin
+//     shell cannot see, on screen. Coming back re-mints through
+//     `start_boot()`, the same path as every other open.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
@@ -93,9 +117,39 @@ import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
+import attach_app_drawer from '../ui/app-drawer.js';
+import { createFullView } from '../ui/full-view.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
+
+/**
+ * sessionStorage: the user's last EXPLICIT view choice for Code in this tab
+ * (`'full'` | `'window'`) — written only by a gesture (green button, title
+ * double-click, context menu, the drawer's restore, a double-click on the
+ * strip), never by a route-driven launch or relaunch. Read only when a launch
+ * names no view.
+ */
+export const VIEW_STORAGE_KEY = 'ezil-os:view.code';
+/** Window event announcing a change of view; the router records it (contract item 5). */
+export const VIEW_EVENT = 'ezil:app-view-changed';
+/** How often the "Computer stopped" state asks the cheap status probe whether the computer is back. */
+const STOPPED_POLL_MS = 10_000;
+/** How often "Reconnecting…" checks that its transition watch has not given up (the watch polls every 5s). */
+const TRANSITION_GUARD_MS = 5_000;
+
+function remembered_view () {
+    try { return sessionStorage.getItem(VIEW_STORAGE_KEY) === 'full' ? 'full' : 'window'; } catch { return 'window'; }
+}
+function remember_view (view) {
+    try { sessionStorage.setItem(VIEW_STORAGE_KEY, view); } catch { /* the choice still applies to this window */ }
+}
+
+const MINIMISE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
+    + ' stroke-linecap="round" aria-hidden="true"><line x1="6" y1="12" x2="18" y2="12"/></svg>';
+const RESTORE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+    + ' stroke-linejoin="round" aria-hidden="true"><rect x="5" y="8" width="11" height="11" rx="1.5"/>'
+    + '<path d="M9 8V5.5A.5.5 0 0 1 9.5 5H18.5a.5.5 0 0 1 .5.5V14.5a.5.5 0 0 1-.5.5H16"/></svg>';
 
 /** How often the UI re-derives its phase from elapsed time. */
 const TICK_MS = 250;
@@ -113,6 +167,16 @@ const POLL_MS = 2_000;
 const FRAME_CONFIRM_DELAYS_MS = [300, 600, 1_200, 1_900, 1_500, 1_500];
 const FRAME_CONFIRM_ATTEMPTS = FRAME_CONFIRM_DELAYS_MS.length;
 const FRAME_RECOVERY_ATTEMPTS = 12;
+
+/**
+ * Round 6 (R3-1/R3-2, live 10-30 05:42-05:44Z): the mint gave up (its existing wake deadline) while the
+ * computer was observed RUNNING with nothing opening. The generic `timeout` copy ("Starting your computer is
+ * taking longer than it should") is false there: the computer is up and Code did not answer. Same Try again.
+ */
+const CODE_UNREACHABLE_COPY = {
+    title: "Code isn't reachable right now",
+    body: "Your computer is running, but Code didn't answer in time. It may still be starting up — try again.",
+};
 
 /**
  * Mint a fresh code-server window URL. Mirrors `session.js`'s `previewUrl()`
@@ -163,7 +227,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ computerId }),
+            // Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and
+            // only an ask that says so may start moving a held computer's files. An older server ignores the field.
+            body: JSON.stringify({ computerId, intent: 'open' }),
             signal: mintSignal(cancel),
         });
     } catch ( err ) {
@@ -232,6 +298,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
  * @param {string} [ctx.icon]       The launching descriptor's icon.
  * @param {string} [ctx.appName]    The launching descriptor's `name` — this
  *   window's TITLE. See the `title` assignment in the body.
+ * @param {'full'|'window'} [ctx.view] How to open (the `/app/code` route passes
+ *   `'full'`). Absent or anything else: windowed, unless the user's last
+ *   explicit choice in this tab was full (`VIEW_STORAGE_KEY`).
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openCodeWindow (ctx = {}) {
@@ -275,6 +344,9 @@ export async function openCodeWindow (ctx = {}) {
         // An editor wants more room than the app-preview default — this is
         // the one number in this file with no contract behind it, unlike the
         // timeouts/tokens above; resize freely if it reads wrong on screen.
+        // It is also the WINDOWED size: full view (below) is entered after
+        // creation, so leaving it restores this box (or wherever the user
+        // moved it), never a guess.
         width: 980,
         height: 680,
         is_resizable: true,
@@ -312,6 +384,15 @@ export async function openCodeWindow (ctx = {}) {
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
+    /**
+     * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
+     * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
+     */
+    let last_progress = null;
+    /** The mint's timeout give-up while it is on screen with the generic copy (no running answer yet). */
+    let generic_timeout = null;
+    /** A timeout give-up over a computer last seen running with nothing opening is Code's, not the computer's. */
+    const code_timeout = failed => last_progress?.connect === true ? { ...failed, copy: CODE_UNREACHABLE_COPY } : failed;
 
     const stop_timers = () => {
         stop_confirmation(); stop_confirmation = () => {};
@@ -323,7 +404,16 @@ export async function openCodeWindow (ctx = {}) {
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy });
+        // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
+        isPreparing: () => session.isComputePreparing(computer.id),
+        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy,
+        onProgressChange: () => {
+            const seen = progress.computerProgress();
+            if ( ! seen ) return;
+            last_progress = seen;
+            // A give-up painted before any running answer (tab hidden, polls failing) takes Code's words once one arrives.
+            if ( generic_timeout && seen.connect === true ) { progress.render(code_timeout(generic_timeout)); generic_timeout = null; }
+        } });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -374,11 +464,79 @@ export async function openCodeWindow (ctx = {}) {
     el_unavailable.appendChild(el_retry);
     el_body.appendChild(el_unavailable);
 
-    const show_panel = () => { progress.el.hidden = false; el_unavailable.hidden = true; };
-    const show_unavailable = () => { progress.el.hidden = true; el_unavailable.hidden = false; };
+    // ── the "Reconnecting…" / "Computer stopped" state (lane A2) ─────────
+    // An OS-level cover over the frame for the moments the shell KNOWS the
+    // computer is not there: a restart/switch transition in flight, or the
+    // return-from-away check finding it stopped. Without it the frame keeps
+    // code-server's own "Attempting to reconnect" dialog, which lives inside
+    // the cross-origin iframe where this shell can neither see nor replace it.
+    // Retired by `show_panel()`, i.e. by every `start_boot()`. Styled in
+    // `ezil-shell.css` and hidden with `hidden` — no inline `display`, for the
+    // reason documented on `el_unavailable` above.
+    //
+    // "Start computer" is `start_boot()` on an explicit click: the same mint
+    // (`mintCodePreviewUrl` -> `session.cancellableWake`, which the server's
+    // ensure() uses to start a stopped computer, and which Stop can cancel via
+    // `session.cancelComputerOpens`) that "Try again" already runs. Nothing
+    // here starts a computer on its own.
+    const el_state = document.createElement('div');
+    el_state.className = 'ezil-code-state';
+    el_state.hidden = true;
+    el_state.setAttribute('role', 'status');
+    el_state.setAttribute('aria-live', 'polite');
+    const el_state_title = document.createElement('div');
+    el_state_title.className = 'ezil-code-state-title';
+    const el_state_body = document.createElement('div');
+    el_state_body.className = 'ezil-code-state-body';
+    const el_state_start = document.createElement('button');
+    el_state_start.type = 'button';
+    el_state_start.className = 'ezil-code-state-start';
+    el_state_start.textContent = 'Start computer';
+    el_state_start.addEventListener('click', () => { void start_boot(); });
+    el_state.append(el_state_title, el_state_body, el_state_start);
+    el_body.appendChild(el_state);
+
+    const STATE_COPY = {
+        reconnecting: ['Reconnecting…', 'Your computer is restarting or switching configuration. Code reopens here when it is back. Your files are safe.'],
+        stopped: ['Computer stopped', "Your computer isn't running, so Code can't reach it. Your files are safe."],
+    };
+    /** The cheap status probe while "Computer stopped" is up: never wakes anything. */
+    let stopped_timer = null;
+    let stopped_asking = false;
+    const hide_state = () => {
+        clearInterval(stopped_timer); stopped_timer = null;
+        el_state.hidden = true;
+        delete el_state.dataset.state;
+    };
+    const show_state = (kind) => {
+        if ( disposed ) return;
+        hide_state();
+        [el_state_title.textContent, el_state_body.textContent] = STATE_COPY[kind];
+        el_state.dataset.state = kind;
+        el_state_start.hidden = kind !== 'stopped';
+        el_state.hidden = false;
+        if ( kind !== 'stopped' ) return;
+        // Back to running by any other route (the Browser opened it, another
+        // tab started it): re-mint the same Code URL through `start_boot()`.
+        // Only the cheap probe, only while the tab is visible.
+        stopped_timer = setInterval(async () => {
+            if ( disposed || stopped_asking || document.visibilityState !== 'visible' ) return;
+            stopped_asking = true;
+            try {
+                const running = await session.desktopRunning(computer.id);
+                if ( ! disposed && el_state.dataset.state === 'stopped' && running === true ) void start_boot();
+            } finally {
+                stopped_asking = false;
+            }
+        }, STOPPED_POLL_MS);
+    };
+
+    const show_panel = () => { hide_state(); progress.el.hidden = false; el_unavailable.hidden = true; };
+    const show_unavailable = () => { hide_state(); progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
         last_failure = null;
+        last_progress = null; generic_timeout = null;
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
@@ -455,11 +613,16 @@ export async function openCodeWindow (ctx = {}) {
                 // FEEDBACK-DIAG: into the local mirror only (`diagnostics.js`).
                 reason: res.reason, serverCorrelationId: res.correlationId,
             });
-            progress.render(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            // A give-up over a computer last seen running (and opening nothing) is Code's, not the computer's.
+            const timed_out = failed.kind === 'failed' && failed.reason === 'timeout';
+            const shown = timed_out ? code_timeout(failed) : failed;
+            generic_timeout = timed_out && ! shown.copy ? failed : null;
+            progress.render(shown);
             // Terminal: the mint failed for real.
             trace.step('mint_error');
             trace.end('error');
@@ -492,6 +655,9 @@ export async function openCodeWindow (ctx = {}) {
         // the input that means "no observation exists", and the panel shows
         // the `connecting` phase until there is one. The boot still ends on
         // its own: `FRAME_CONFIRM_DEADLINE_MS` is measured from `t_handoff`.
+        // The open answered with a URL: a real signal, so the one bar takes the
+        // opening-app floor (never 100 before the frame is confirmed).
+        progress.stamp('url_received');
         const t_handoff = performance.now();
         const paint_handoff = () => {
             if ( disposed || my_attempt !== attempt ) return;
@@ -538,6 +704,9 @@ export async function openCodeWindow (ctx = {}) {
             stop_timers();
 
             if ( seen === true ) {
+                // The real ready signal concludes this open on the one surface (bar to 100), so a
+                // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
+                progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 stop_monitor = watchNativeSurface(nativeSurface, reason => {
@@ -672,36 +841,205 @@ export async function openCodeWindow (ctx = {}) {
     }
     // Back after an absence long enough for an idle-stop: re-check before the
     // stale frame is used (`../runtime-recheck.js`).
+    //
+    // MODIFIED 2026-10-30 (lane A2): a computer found STOPPED is no longer
+    // started again by THIS window just because the tab regained focus. It
+    // used to `start_boot()` here, and that mint's ensure() starts a stopped
+    // computer — including one its owner stopped from another tab or device.
+    // Now the frame is covered by "Computer stopped" with an explicit Start,
+    // and the state re-mints on its own as soon as the computer is running
+    // again (see `show_state`). This is Code's rule only: the Browser window's
+    // own return check (`desktop-window.js`, unchanged) still `start_boot()`s,
+    // so with the Browser open the computer still starts on return and this
+    // cover then re-mints by itself. Pending owner sign-off
+    // (docs/APP-CODE-FULL-VIEW.md §4); the revert is `void start_boot()` here.
     const stop_runtime_recheck = heartbeat_timer === null ? null : watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
-        reboot: () => { void start_boot(); },
+        reboot: () => { show_state('stopped'); },
         desktopRunning: (id) => session.desktopRunning(id),
     });
 
-    // Restart desktop (Settings → Troubleshoot) restarts code-server too on an AWS host, and the
-    // open frame then shows "Cannot reconnect". Re-mint for the same computer (live 2026-10-22).
+    // A completed desktop restart restarts code-server too on an AWS host, and
+    // the open frame then shows "Cannot reconnect". Re-mint for the same
+    // computer (live 2026-10-22). Its Settings → Troubleshoot sender was
+    // removed on 2026-10-30 (lane A2); the listener stays for any caller of the
+    // kept `session.restartDesktop`.
     const on_restarted = (e) => { if ( ! disposed && e?.detail?.computerId === computer.id ) void start_boot(); };
     // A switch or a computer restart replaces the machine; re-mint once the server settles it (round 3).
+    // While it is in flight the frame is covered by "Reconnecting…" (lane A2).
     let transition_watch = null;
+    /**
+     * 🔴 The watch can also end WITHOUT settling: `watchComputerTransition`
+     * gives up after its poll budget (~16 min) and never calls `onSettled`.
+     * Without this the opaque "Reconnecting…" cover would then stay up for
+     * good with nothing to press. So once the watch is no longer active and
+     * nothing re-minted, the cover becomes "Computer stopped": its Start, and
+     * its own probe that re-mints as soon as the computer is running.
+     */
+    let transition_guard = null;
     const on_transition = (e) => {
         if ( disposed || nativeSurface || e?.detail?.computerId !== computer.id || transition_watch?.active() ) return;
         transition_watch = watchComputerTransition({
             computerId: computer.id, element: el_window,
             transitionId: typeof e.detail.transitionId === 'string' ? e.detail.transitionId : null,
-            onSettled: () => { transition_watch = null; if ( ! disposed ) void start_boot(); },
+            onSettled: () => {
+                transition_watch = null;
+                clearInterval(transition_guard); transition_guard = null;
+                if ( ! disposed ) void start_boot();
+            },
         });
+        show_state('reconnecting');
+        clearInterval(transition_guard);
+        transition_guard = setInterval(() => {
+            if ( disposed || transition_watch?.active() ) return;
+            clearInterval(transition_guard); transition_guard = null;
+            transition_watch = null;
+            if ( el_state.dataset.state === 'reconnecting' ) show_state('stopped');
+        }, TRANSITION_GUARD_MS);
     };
+
+    // ── full view and its strip (lane A2; gate G3) ───────────────────────
+    // The mechanism is `../ui/full-view.js`, shared with the Browser. What is
+    // Code's own: the view is a TOGGLE (the Browser's expand only enters), it
+    // is chosen at launch (`ctx.view`, else the remembered choice), and the
+    // chrome full view hides is replaced by a compact strip whose only
+    // controls are the drawer's centred grab notch and the Feedback icon.
+    // Visual values are provisional — see `docs/APP-CODE-FULL-VIEW.md` §3.
+    const full_view = createFullView(el_window);
+
+    // The control drawer: the Browser's tray, centred in the strip as the
+    // Browser's is. Its expanded tray carries the title and every window
+    // action. "Show desktop" is the one minimise: until G3 the top bar also
+    // had a "Minimise" that called the same `full_view.minimise()`.
+    // Hidden while windowed (`.ezil-full-view-host:not(.ezil-fullbleed)`).
+    const drawer = attach_app_drawer(el_window, {
+        title,
+        icon: ctx.icon,
+        flash_on_attach: false,
+        actions: [
+            { id: 'minimize', label: 'Show desktop', svg: MINIMISE_SVG, onClick: () => { full_view.minimise(); } },
+            { id: 'restore', label: 'Restore window', svg: RESTORE_SVG, onClick: () => { set_view('window', { remember: true }); } },
+        ],
+    });
+
+    // The strip itself: an empty, presentational band (the window's own dark
+    // background shows through it) that keeps the head's two mouse gestures.
+    // Nothing in it is focusable or announced; the notch is the controls.
+    const el_bar = document.createElement('div');
+    el_bar.className = 'ezil-full-view-bar';
+    el_bar.setAttribute('aria-hidden', 'true');
+    // Double-clicking the strip is the head's double-click: back to a window.
+    el_bar.addEventListener('dblclick', () => { set_view('window', { remember: true }); });
+    // Pressing the strip activates the window, as pressing a head would (the
+    // iframe only takes pointer events in an active window). Same latch as the
+    // drawer's: `pointerdown` then its synthesized `mousedown` focus once.
+    let bar_press_pending = false;
+    el_bar.addEventListener('pointerdown', () => { bar_press_pending = true; setTimeout(() => $(el_window).focusWindow(), 0); });
+    el_bar.addEventListener('mousedown', () => {
+        if ( bar_press_pending ) { bar_press_pending = false; return; }
+        setTimeout(() => $(el_window).focusWindow(), 0);
+    });
+    // DOM order is tab order: the drawer (its toggle, then the tray's
+    // buttons), then the editor. The strip has nothing to focus.
+    el_window.insertBefore(el_bar, el_body);
+    if ( drawer ) el_window.insertBefore(drawer, el_bar);
+    if ( ! drawer ) {
+        // 🔴 Full view hides the taskbar and the head: no drawer, no entry.
+        // The window keeps upstream's maximise (no hook is installed below).
+        console.error(`[${PHASE}] control drawer did not attach — Code will stay windowed`);
+        telemetry.capture({ eventClass: 'window_error', site: 'ezil-os:apps/code#drawer', code: 'drawer_attach_failed' });
+        full_view.forbid();
+    }
+
+    /**
+     * The window's title everywhere it is shown — the head and the drawer's
+     * tray — as TEXT (`textContent`), never markup. A later lane names the
+     * project/repo here. Empty input falls back to the app's name.
+     */
+    const set_title = (text) => {
+        const t = String(text ?? '').trim() || title;
+        const el_head_title = el_window.querySelector(':scope > .window-head .window-head-title');
+        if ( el_head_title ) el_head_title.textContent = t;
+        const el_drawer_title = drawer?.querySelector('.dashboard-app-drawer-title');
+        if ( el_drawer_title ) el_drawer_title.textContent = t;
+    };
+    set_title(title);
+    el_window._ezil_set_title = set_title;
+
+    /** The view the router was last told about. The open itself is not announced. */
+    let view_now = 'window';
+    const current_view = () => (full_view.allowed && full_view.wants ? 'full' : 'window');
+    // Read by the router (`../app-history.js`) each time it writes an entry
+    // for this window: the view NOW, from the full-view state, not the last
+    // one announced. 'full' while minimised from full view (it still wants it).
+    el_window._ezil_view = current_view;
+    /**
+     * Apply a view. `remember` only for a user's gesture. Announces
+     * `ezil:app-view-changed` when the view actually changes — never at open:
+     * the router launches, THEN pushes its entry, and an event fired inside
+     * the launch would be recorded on the entry being left.
+     */
+    function set_view (view, { remember = false } = {}) {
+        if ( disposed ) return;
+        if ( view === 'full' ) full_view.enter(); else full_view.exit();
+        if ( remember ) remember_view(view);
+        const next = current_view();
+        if ( next === view_now ) return;
+        view_now = next;
+        window.dispatchEvent(new CustomEvent(VIEW_EVENT, { detail: { appId: 'code', view: next } }));
+    }
+
+    if ( full_view.allowed ) {
+        // The green button, a head double-click and the head's context-menu
+        // Maximize all reach `scale_window`, which hands the whole job to this.
+        el_window._ezil_maximise = () => {
+            set_view(full_view.is_full() ? 'window' : 'full', { remember: true });
+        };
+    }
+    // Deliberately NO `_ezil_minimise` hook (the Browser has one). Its only
+    // callers, the head's minimise button and the head's context menu
+    // (`minimize_window`, UIWindow.js), are hidden whenever this window is in
+    // full view, so they can only ever minimise a WINDOWED Code — which
+    // upstream's `hideWindow()` already does exactly. In full view the
+    // drawer's Show desktop calls `full_view.minimise()` itself.
+    // `seam-minimise-browser-test.mjs` pins one provider of that hook.
+    /**
+     * Single-instance relaunch (contract item 4): the registry calls this on the
+     * existing window, after `showWindow()`, with the launch's ctx. Only
+     * `ctx.view` is read, and only `'full'` / `'window'`; every other key and
+     * value is ignored (a later lane reads `ctx.project`). Not remembered.
+     */
+    el_window._ezil_relaunch = (relaunch_ctx) => {
+        const view = relaunch_ctx?.view;
+        if ( view === 'full' || view === 'window' ) set_view(view);
+    };
+    // Back from the taskbar: full view again if still wanted, else the
+    // windowed bounds a minimise-from-full left stashed. After `showWindow`'s
+    // 0.2s geometry transition, as the Browser does, and re-checked then.
+    const restore_observer = full_view.watch_restore(() => {
+        setTimeout(() => {
+            if ( disposed ) return;
+            if ( full_view.wants ) full_view.enter(); else full_view.settle();
+        }, 220);
+    });
+
+    const launch_view = ctx.view === 'full' || ctx.view === 'window' ? ctx.view : remembered_view();
+    if ( launch_view === 'full' ) full_view.enter();
+    view_now = current_view();
 
     const dispose = () => {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        hide_state();
+        restore_observer.disconnect();
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
         mint_ctl?.abort();
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
         window.removeEventListener(TRANSITION_EVENT, on_transition);
         transition_watch?.stop();
+        clearInterval(transition_guard);
         nativeSurface?.dispose();
         stop_timers();
         stop_runtime_recheck?.();
@@ -722,6 +1060,9 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     el_window.on_before_exit = async () => {
+        // Closing from full view while the Browser is still full-bleed must
+        // not put the taskbar over it (`full-view.js#prepare_close`).
+        full_view.prepare_close();
         dispose();
         return true;
     };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CATALOG_V3, hoursLeftAtWeight, OPENING_MILESTONES_V3, upgradeAiCredits } from './contract';
+import { CATALOG_V3, hoursLeftAtWeight, OPENING_MILESTONES_V3, SWITCH_HEAL_REASONS_V3, upgradeAiCredits } from './contract';
 import { upgradeGrantSeconds } from './catalog';
 
 const period = { periodStart: '2026-10-25T00:00:00Z', periodEnd: '2026-11-24T00:00:00Z' };
@@ -50,5 +50,13 @@ describe('opening milestones', () => {
     it('are ordered and unique', () => {
         expect([...OPENING_MILESTONES_V3]).toEqual(['requested', 'host_claimed', 'files_attached', 'desktop_starting', 'desktop_ready']);
         expect(new Set(OPENING_MILESTONES_V3).size).toBe(OPENING_MILESTONES_V3.length);
+    });
+});
+
+describe('switch heal reasons (round 5 D2)', () => {
+    it('pins the three reason codes; each fits the stored transition reason format', () => {
+        expect([...SWITCH_HEAL_REASONS_V3]).toEqual(['stop_healing', 'release_heal_failed', 'release_heal_timeout']);
+        // Same bound as the stored ComputerTransition.reason schema (progress.ts): no schema change needed.
+        for (const reason of SWITCH_HEAL_REASONS_V3) expect(reason).toMatch(/^[a-z0-9_:]{1,64}$/);
     });
 });

@@ -413,6 +413,71 @@ describe('create (fence-first, once per epoch)', () => {
   });
 });
 
+describe('restartPush (the open path\'s once-per-boot config push to a running desktop)', () => {
+  const BOOT = '11111111-1111-4111-8111-111111111111';
+  it('claims, records and releases on this epoch\'s record only, each only while the record shows what the caller read', async () => {
+    const s = memStorage();
+    let t = 1_000;
+    const svc = createAwsTunnelService({ api: fakeApi().api, storage: s, zone: ZONE, nowMs: () => t });
+    expect((await svc.create(claims(), body())).status).toBe(200);
+    const pushOf = () => {
+      const r = s.map.get('tunnel') as AwsTunnelRecord;
+      return [r.restartPushBootId, r.restartPushAt, r.restartPushExpiresAt];
+    };
+    t = 5_000;
+    // Claim (no expiry yet): exactly one of two asks that read "no push" gets it.
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBe(5_000);
+    expect(pushOf()).toEqual([BOOT, 5_000, undefined]);
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBeNull();
+    // The claimer records the pushed config against its own claim; a stale reader cannot.
+    t = 6_000;
+    expect(await svc.restartPush(1, 2, BOOT, 4_999, { expiresAt: 9_000_000 })).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT, 5_000, { expiresAt: 9_000_000 })).toBe(6_000);
+    expect(pushOf()).toEqual([BOOT, 6_000, 9_000_000]);
+    expect([(s.map.get('tunnel') as AwsTunnelRecord).leaseEpoch, typeof (s.map.get('tunnel') as AwsTunnelRecord).tunnelId]).toEqual([2, 'string']);
+    // Another boot reads "no push" for itself and claims over the old boot's record.
+    const BOOT2 = '22222222-2222-4222-8222-222222222222';
+    t = 7_000;
+    expect(await svc.restartPush(1, 2, BOOT2, 6_000)).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT2, null)).toBe(7_000);
+    expect(pushOf()).toEqual([BOOT2, 7_000, undefined]);
+    // A failed push releases its own claim only.
+    expect(await svc.restartPush(1, 2, BOOT2, 6_999, { release: true })).toBeNull();
+    expect(await svc.restartPush(1, 2, BOOT2, 7_000, { release: true })).toBe(0);
+    expect(pushOf()).toEqual([undefined, undefined, undefined]);
+    expect(s.map.get('tunnel')).toMatchObject({ leaseEpoch: 2, generation: 1 });
+    // Wrong epoch, generation, boot id, expectation or expiry: refused, nothing written.
+    expect(await svc.restartPush(1, 2, BOOT, null)).toBe(7_000);
+    for (const [g, e, b, x, n] of [[1, 3, BOOT, 7_000, {}], [2, 2, BOOT, 7_000, {}], [1, 2, 'not-a-boot', null, {}], [1, 2, BOOT, 7_000, { expiresAt: 0 }],
+      [1, 2, BOOT, 7_000, { expiresAt: 1.5 }], [1, 2, BOOT, -1, {}], [1, 2, BOOT, 1.5, {}]] as const) {
+      expect(await svc.restartPush(g, e, b, x, n)).toBeNull();
+    }
+    expect(pushOf()).toEqual([BOOT, 7_000, undefined]);
+    expect((await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }))).status).toBe(200);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).restartPushBootId).toBeUndefined();
+    expect(await createAwsTunnelService({ api: null, storage: memStorage(), zone: ZONE }).restartPush(1, 2, BOOT, null)).toBeNull();
+  });
+  it('the registry route answers 200 with the time on a write and 409 when refused; lookups return the record with it', async () => {
+    const reg = new AwsTunnelRegistry({ storage: memStorage() }, {
+      AWS_TUNNEL_CF_ACCOUNT_ID: 'a', AWS_TUNNEL_CF_ZONE_ID: 'z', AWS_TUNNEL_CF_API_TOKEN: 't',
+    }, async (url) => new Response(JSON.stringify({ success: true,
+      result: url.endsWith('/token') ? 'tunnel-token-0123456789' : url.endsWith('/connections') ? [{ conns: [{ origin_ip: '13.200.1.2' }] }] : { id: 'tid' } })),
+    () => ZONE);
+    const create = await routeAwsTunnels('POST', claims(), body(), () => reg);
+    expect(create.status).toBe(200);
+    const push = (leaseEpoch: number, b: Record<string, unknown>) => reg.fetch(new Request('https://aws-tunnels/restart-push', {
+      method: 'POST', body: JSON.stringify({ generation: 1, leaseEpoch, bootId: BOOT, ...b }) }));
+    const claim = await push(2, { expectAt: null });
+    const { at } = await claim.json() as { at: number };
+    expect([claim.status, typeof at]).toEqual([200, 'number']);
+    const lost = await push(2, { expectAt: null });
+    expect([lost.status, await lost.json()]).toEqual([409, { at: null }]);
+    expect((await push(9, { expectAt: at, expiresAt: 9_000_000 })).status).toBe(409);
+    expect((await push(2, { expectAt: at, expiresAt: 9_000_000 })).status).toBe(200);
+    expect(await lookupAwsTunnel(() => reg, SID)).toMatchObject({ restartPushBootId: BOOT, restartPushExpiresAt: 9_000_000 });
+  });
+});
+
 describe('remove', () => {
   it('deletes when the stored epoch is at or below the request; otherwise reports deleted:false', async () => {
     const s = memStorage(); const { api, calls } = fakeApi();
@@ -1010,30 +1075,5 @@ describe('AWS AI boot nonce', () => {
     await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
     expect((await svc.get())!.aiProxyNonce).toBeUndefined();
     expect(await svc.aiNonce(1, 3, boot)).not.toBe(one);
-  });
-
-  it('G12: records an accepted AI push only for this epoch and the boot its nonce was minted for', async () => {
-    const storage = memStorage(); const { api } = fakeApi();
-    let t = 1_000;
-    const svc = createAwsTunnelService({ storage, api, zone: ZONE, nowMs: () => t });
-    const boot = '11111111-1111-4111-8111-111111111111';
-    const exp = 1_800_000_600_000;
-    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(false);
-    await svc.create(claims(), body());
-    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(false); // no nonce minted for this boot yet
-    await svc.aiNonce(1, 2, boot);
-    expect(await svc.aiDelivered(2, 2, boot, exp)).toBe(false);
-    expect(await svc.aiDelivered(1, 3, boot, exp)).toBe(false);
-    expect(await svc.aiDelivered(1, 2, 'container-choice', exp)).toBe(false);
-    expect(await svc.aiDelivered(1, 2, '22222222-2222-4222-8222-222222222222', exp)).toBe(false);
-    expect(await svc.aiDelivered(1, 2, boot, 1.5)).toBe(false);
-    expect((await svc.get())!.aiDelivered).toBeUndefined();
-    t = 2_000;
-    expect(await svc.aiDelivered(1, 2, boot, exp)).toBe(true);
-    expect((await svc.get())!.aiDelivered).toEqual({ bootId: boot, expiresAt: exp, at: 2_000 });
-    expect((await svc.get())!.aiBootId).toBe(boot);
-    // A new lease epoch is a new record: nothing delivered to it yet.
-    await svc.create(claims({ leaseEpoch: 3 }), body({ leaseEpoch: 3 }));
-    expect((await svc.get())!.aiDelivered).toBeUndefined();
   });
 });

@@ -1,0 +1,71 @@
+/**
+ * Round 5 D2: a pool release that failed and is being healed (aws-pool-release-recovery.ts).
+ *
+ * A release that fails (aws-receipts.ts:340-345 writes UNCONFIRMED, `failed:*`, job and digest
+ * kept) is reconciled by `reconcilePoolReleaseRecovery` on the next lifecycle-receipt pass: the
+ * driver's own status polls (aws-ec2.ts status → reconcileOwn → applyLifecycleReceipt →
+ * reconcilePoolReleaseRecovery) or the minute cron. It reserves RECOVERING with a replay
+ * intent, replays the release, and settles STOPPED/pool_released. A switch or a Stop waits
+ * through that instead of failing on the first UNCONFIRMED look.
+ *
+ * Pure and dependency-free so progress.ts never pulls in aws-receipts.
+ */
+import type { Placement } from './placement';
+import type { ComputerTransition } from './progress';
+
+/** The lastError prefix of a pool-release recovery context (the replay document and its last error). */
+export const POOL_RELEASE_RECOVERY_PREFIX = 'pool_release_recovery:';
+
+export type ReleaseHeal = 'pending' | 'failed' | null;
+
+/** Recovery errors the next pass retries on an UNCONFIRMED row. */
+const TRANSIENT_RECOVERY_ERRORS: readonly string[] = ['execution_unavailable', 'describe_unavailable'];
+
+type HealFields = Pick<Placement, 'provider' | 'state' | 'lastError' | 'lifecycleJobId' | 'lifecycleDigest' | 'instanceId'>;
+
+function recoveryContext(lastError: string): { intent?: unknown; error?: unknown } | null {
+    try {
+        const parsed: unknown = JSON.parse(lastError.slice(POOL_RELEASE_RECOVERY_PREFIX.length));
+        return parsed && typeof parsed === 'object' ? parsed as { intent?: unknown; error?: unknown } : null;
+    } catch { return null; }
+}
+
+/**
+ * The placement-only half: `pending` while a release heal can still settle STOPPED, `failed`
+ * once the recovery recorded a non-retryable error, null when the row is not a release heal.
+ * - pending: UNCONFIRMED `failed:*` with job, digest and host (what the recovery accepts: any failed lifecycle
+ *   job writes `failed:*`, aws-receipts.ts:340-345, but a cold replace/provision has no host and the recovery
+ *   leaves it to other handlers, aws-pool-release-recovery.ts `!p.instanceId && !saved?.intent`);
+ *   RECOVERING with a replay intent (`isPoolReleaseRecovering`; its kept errors are retryable);
+ *   UNCONFIRMED with the prefix, job and digest, and a transient error;
+ *   UNCONFIRMED with the prefix, job, digest and host and NO saved replay intent: the recovery's first
+ *   evaluation found the resources still moving (e.g. instance_identity while the host is still
+ *   stopping, volume_attachment while the volume detaches). Nothing was replayed, so the next pass
+ *   re-evaluates the original job (aws-pool-release-recovery.ts `fail` keeps job and digest; the
+ *   one-recovery guard needs a saved intent). A deterministic one ends at the caller's 230 s bound.
+ * - failed: UNCONFIRMED with the prefix, a saved replay intent and a non-transient error (the replay
+ *   ran; one recovery per lifecycle version), a malformed context, or no job left to recover.
+ */
+export function releaseHealOf(p: HealFields | null | undefined): ReleaseHeal {
+    if (!p || p.provider !== 'aws-ec2' || (p.state !== 'UNCONFIRMED' && p.state !== 'RECOVERING')) return null;
+    const error = p.lastError ?? '';
+    const job = !!p.lifecycleJobId && !!p.lifecycleDigest;
+    if (p.state === 'UNCONFIRMED' && error.startsWith('failed:')) return job && p.instanceId ? 'pending' : null;
+    if (!error.startsWith(POOL_RELEASE_RECOVERY_PREFIX)) return null;
+    const context = recoveryContext(error);
+    if (p.state === 'RECOVERING') return context?.intent ? 'pending' : null;
+    if (!job || !context) return 'failed';
+    if (!context.intent) return p.instanceId ? 'pending' : 'failed';
+    return typeof context.error === 'string' && TRANSIENT_RECOVERY_ERRORS.includes(context.error) ? 'pending' : 'failed';
+}
+
+/**
+ * The heal of THIS transition's stop: the transition is still requested/stopping and the
+ * placement is on the generation and lease epoch the transition started from (none of the
+ * stop, failed-receipt, recovery or settle writes moves either; placement.ts bump {0,0}).
+ */
+export function releaseHeal(t: Pick<ComputerTransition, 'phase' | 'fromGeneration' | 'fromLeaseEpoch'>, p: Placement | null): ReleaseHeal {
+    if (!p || (t.phase !== 'requested' && t.phase !== 'stopping')) return null;
+    if (p.leaseEpoch !== t.fromLeaseEpoch || p.generation !== t.fromGeneration) return null;
+    return releaseHealOf(p);
+}

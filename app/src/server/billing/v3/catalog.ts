@@ -12,12 +12,16 @@ export function offerByLookupKey(key: string): PlanOfferV3 | undefined {
     return Object.values(CATALOG_V3).find(offer => offer.stripeLookupKey === key);
 }
 
-export function publicOffers(): PublicOfferV3[] {
+/** Round 6 (R1-06): `legacyFree` = the viewer keeps the legacy Free allowance, so the Free offer says those hours. */
+export function publicOffers(viewer: { legacyFree?: boolean } = {}): PublicOfferV3[] {
     return Object.values(CATALOG_V3).map(offer => ({
         sku: offer.sku, name: offer.name, tagline: offer.tagline, priceCents: offer.priceCents,
         vcpu: offer.vcpu, memoryGiB: offer.memoryGiB, sessionMaxSeconds: offer.sessionMaxSeconds,
-        opening: offer.opening, fairUseHours: offer.fairUseSeconds / 3600, highlighted: offer.highlighted,
+        opening: offer.opening,
+        fairUseHours: (viewer.legacyFree && offer.legacyFairUseSeconds !== null ? offer.legacyFairUseSeconds : offer.fairUseSeconds) / 3600,
+        highlighted: offer.highlighted,
         badge: offer.badge, machineChoice: [...offer.machineChoice], aiCredits: { ...offer.aiCredits }, bullets: [...offer.bullets],
+        storageGiB: offer.storageGiB,
     }));
 }
 
@@ -54,6 +58,15 @@ export function planFromSubscriptions(input: {
     const legacyFree = freeSkuFor(input.userCreatedAt, input.freeEffectiveAt) === 'free_v1_legacy';
     if (offer) return { ...selected, sku: offer.sku, offer, legacy: null, legacyFree, sessionMaxSeconds: offer.sessionMaxSeconds };
     return { ...selected, sku: 'legacy', legacy: selected, legacyFree, sessionMaxSeconds: SESSION_MAX_SECONDS };
+}
+
+/**
+ * Promotion review: a subscription row whose id is not a Stripe id (`sub_…`) was granted by an operator
+ * (e.g. `op_canary_…`) and has no Stripe object, so no Stripe action (resume/cancel, portal, upgrade,
+ * downgrade, renewal preview) may run against it. The summary and the router both decide with this.
+ */
+export function operatorGrantedSubscription(subscriptionId: string | null | undefined): boolean {
+    return typeof subscriptionId === 'string' && !subscriptionId.startsWith('sub_');
 }
 
 /** Same integer, period-prorated grant rule used by v2 upgrades. */

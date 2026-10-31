@@ -97,10 +97,11 @@ import telemetry from '../telemetry.js';
 import { FRAME_CONFIRM_DEADLINE_MS, applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import BootProgress, { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/boot-progress.js';
+import { DisplayNotice, awsBootTimeoutVerdict, awsBootWaitVerdict } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
+import { createFullView, is_minimized } from '../ui/full-view.js';
 import {
     computeFitBox,
     createScreenController,
@@ -120,21 +121,11 @@ const TICK_MS = 250;
 const POLL_MS = 2_000;
 
 /**
- * Progressive disclosure (W3). The window opens showing `AppSpinner` — a
- * ring and "Opening Browser…", nothing else — and only reveals the phase
- * panel's checklist once a boot has been genuinely pending this long. A warm
- * open (the common case, thanks to `warm.js`) usually settles well inside
- * this window and never shows a phase list at all; a genuinely long cold
- * boot earns the detail because it is genuinely taking longer than "a
- * circular thing rotates a few seconds" covers.
- *
- * Origin probes overlap the viewer handshake — the
- * phase list must have a chance to appear before the display gate's own
- * "we could not check" strip could ever fire, or a slow-but-honest boot would
- * jump straight from a bare spinner to a failure/unverified surface with no
- * detail in between.
+ * Round 5 (D5): ONE opening surface. The window opens showing `AppSpinner`
+ * and keeps showing it until the desktop is revealed or the open fails: the
+ * round-3 swap to the `BootProgress` phase panel at 4 s is retired, so the
+ * status copy and the bar never change type mid-open.
  */
-const PHASE_LIST_AFTER_MS = 4_000;
 
 /**
  * The post-handoff frame confirmation (`settle_frame`). These three govern
@@ -241,22 +232,15 @@ const FOCUS_APPS = [
     },
 ];
 
-/** `data-is_minimized` is written as 1/0 at creation and true/false later. */
-function is_minimized (el) {
-    const v = $(el).attr('data-is_minimized');
-    return v === '1' || v === 'true';
-}
-
-/**
- * The class that says "this window currently owns the viewport".
- *
- * It is EZiL's own, deliberately NOT `data-is_fullpage`: upstream's
- * `exit_fullpage_mode` REMOVES that attribute, so it cannot answer "is this
- * window full-bleed right now" across a minimise. `ezil-shell.css` keys the
- * control drawer's visibility off this class, and `go_fullbleed` /
- * `minimise_to_taskbar` are the only two places that write it.
- */
-const FULLBLEED_CLASS = 'ezil-fullbleed';
+// The class that says "this window currently owns the viewport" is
+// `ezil-fullbleed` (`FULL_VIEW_CLASS`). It is EZiL's own, deliberately NOT
+// `data-is_fullpage`: upstream's `exit_fullpage_mode` REMOVES that attribute,
+// so it cannot answer "is this window full-bleed right now" across a minimise.
+// `ezil-shell.css` keys the control drawer's visibility off it. MODIFIED
+// 2026-10-30 (app-code lane A2): the mechanism that writes it — and
+// `is_minimized` — moved to `../ui/full-view.js`, shared with the Code window;
+// this window's `go_fullbleed` / `minimise_to_taskbar` are still the only two
+// callers here.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE STREAM'S SHAPE, AND WHAT THIS FILE CAN AND CANNOT DO ABOUT IT
@@ -892,23 +876,31 @@ export async function openDesktopWindow (ctx = {}) {
     /** Whether THIS attempt has watched the AWS computer actively opening. */
     let aws_seen_active = false;
     /**
+     * Phase B (reverse move contract §6.4): this attempt's open handed back a MOVE still in flight (the move's own
+     * watch ran out). The window keeps showing the move, and asks again once a `computer.progress` read says it
+     * committed: the open then opens the Free computer. A failed outcome never asks again (the user chooses).
+     */
+    let move_wait = false;
+    /**
      * Cancels this window's own in-flight `session.openDesktop` (a reopen or a
      * Try again). One controller per request; aborting a finished one is a no-op.
      */
     let own_open = null;
     let disposed = false;
     /**
-     * Set once the desktop has actually been shown. It is the DESIRE, not the
-     * state — a minimise clears the full-bleed geometry but not this, which is
-     * how a restore knows to go back to full-bleed instead of a 560x400 box.
+     * The shared full-view mechanism (`../ui/full-view.js`). Two of its fields
+     * are the two flags this window used to keep itself:
+     *
+     *   `full_view.wants` — set once the desktop has actually been shown. It is
+     *     the DESIRE, not the state — a minimise clears the full-bleed geometry
+     *     but not this, which is how a restore knows to go back to full-bleed
+     *     instead of a 560x400 box.
+     *   `full_view.allowed` — cleared (`forbid()`) if the control drawer fails
+     *     to attach. Full-bleed hides the taskbar and the window head, so
+     *     without the drawer there would be no way out of the window at all —
+     *     better to stay windowed forever.
      */
-    let wants_fullbleed = false;
-    /**
-     * Cleared if the control drawer fails to attach. Full-bleed hides the
-     * taskbar and the window head, so without the drawer there would be no way
-     * out of the window at all — better to stay windowed forever.
-     */
-    let may_fullbleed = true;
+    const full_view = createFullView(el_window);
     /**
      * Repaints the panel from the CURRENT attempt's clock and observations.
      * Assigned by `start_boot`, which owns both; held out here so the display
@@ -1086,8 +1078,15 @@ export async function openDesktopWindow (ctx = {}) {
     // only as focus moving into it (window `blur` with the iframe active), unless
     // the viewer posts `input_accepted`. Times run from this window's open.
     let tti = { url: null, frame: null, input: null };
-    const opening_path = () => aws_observation?.path ?? spinner.computerProgress()?.path
-        ?? (desktop_state.provider === 'cloudflare-guacamole' ? 'cloudflare' : 'unknown');
+    // Round 6 (CR-3, live 10-30 06:37Z: first_frame_cloudflare on an AWS computer). An AWS
+    // observation carries no `path` once the computer is RUNNING (nothing is opening any more),
+    // so the last path this attempt saw is kept; an AWS answer that never saw one opened a
+    // computer that was already running. `desktop_state.provider` is 'cloudflare-guacamole'
+    // for every computer, so it names the path only when the answer was not AWS.
+    let tti_path = null;
+    let tti_aws = false;
+    const opening_path = () => tti_path ?? aws_observation?.path ?? spinner.computerProgress()?.path
+        ?? (tti_aws ? 'running' : desktop_state.provider === 'cloudflare-guacamole' ? 'cloudflare' : 'unknown');
     function stamp_milestone (key) {
         if ( disposed ) return;
         const slot = { url_received: 'url', first_frame: 'frame', first_input: 'input' }[key];
@@ -1134,7 +1133,10 @@ export async function openDesktopWindow (ctx = {}) {
         telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: why });
         void start_boot();
     }
-    // Settings → Troubleshoot → Restart desktop announces a completed restart.
+    // A completed desktop restart is announced with `ezil:desktop-restarted`.
+    // Settings → Troubleshoot → Restart desktop, its only sender, was removed
+    // on 2026-10-30 (app-code lane A2); the listener stays for any caller of
+    // the kept `session.restartDesktop`.
     const on_desktop_restarted = (e) => {
         if ( disposed || e?.detail?.computerId !== computer.id ) return;
         reopen_on_new_runtime('desktop_restarted');
@@ -1174,22 +1176,35 @@ export async function openDesktopWindow (ctx = {}) {
     let last_failure = null;
     /** The user's own "Try again" (never the automatic paths above): see `session.userRetry`. */
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); }; // stable: identifies this window to userRetry
-    const user_retry = () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); };
-    const progress = BootProgress({ onRetry: user_retry, appName: ctx.appName || title, icon: ctx.icon });
-    el_body.appendChild(progress.el);
-
-    // ── W3: opens showing this, not the phase panel ─────────────────────────
-    // See `PHASE_LIST_AFTER_MS`'s doc comment. Same `BootUiState` in, same
-    // failure/not-configured copy out — the two components disagree only on
-    // how much detail a still-`progress` state gets, and `render_both` below
-    // is what keeps them from ever disagreeing about anything else: both are
-    // always fed the identical state, in the same call, so there is no
-    // sequence in which one shows a claim the other has not also made.
+    const user_retry = (action) => {
+        // 🔴 PHASE B (§6.4): [Open my AWS computer] on a move's failed outcome is the user's choice, and it must never
+        // be lost. The surface reads the outcome on its own 5 s poll, up to one 30 s move pause before this window's
+        // open loop does, so the loop may still be waiting on the move: `start_boot` would hand that back and the
+        // click would do nothing. So the click ends the wait (this attempt ends without painting) and asks afresh,
+        // an ordinary open (the D16 hold), once it has stopped.
+        if ( action?.openAws === true && boot_work ) {
+            const settling = boot_work;
+            attempt++;
+            own_open?.abort();
+            void settling.catch(() => {}).then(() => { if ( ! disposed ) void start_boot(); });
+            return;
+        }
+        void session.userRetry(computer.id, last_failure, reopen_after_retry);
+    };
+    // ── the ONE opening surface (round 5, D5) ────────────────────────────────
+    // `AppSpinner` is the only loading/failure surface in this window. It also
+    // carries the legacy `.ezil-boot` hook class, so diagnostics and tests that
+    // read the boot panel read this surface; there is no second panel to swap to.
     const spinner = AppSpinner({
+        className: 'ezil-boot',
         computerId: computer.id,
         onProgressChange: () => {
             const seen = spinner.computerProgress();
             if ( seen ) aws_observation = seen;
+            // Phase B: a read that says the move ended retires the kept moving view, even when it has no view of its
+            // own (a commit's Cloudflare placement): a later timeout of the Free computer's open is that open's.
+            else if ( aws_observation?.moving === true && spinner.computerMove()?.outcome ) aws_observation = null;
+            if ( seen?.path ) tti_path = seen.path;
             if ( seen?.activeAws === true ) aws_seen_active = true;
             // A switch or restart is in flight: re-open again once it settles, and a
             // failure it caused (the old machine stopped under a live desktop) becomes
@@ -1202,6 +1217,12 @@ export async function openDesktopWindow (ctx = {}) {
                 }
             }
             check_aws_wait();
+            // Phase B: a move this window stopped waiting on committed after all: open the Free computer now.
+            if ( move_wait && ! boot_work && ! disposed && spinner.computerMove()?.outcome === 'committed' ) {
+                move_wait = false;
+                console.info(`[${PHASE}] the move committed; opening the Free computer`);
+                void start_boot();
+            }
             if (last_kind === 'progress') show_panel();
         },
         label: `Opening ${ctx.appName || title}…`,
@@ -1209,17 +1230,13 @@ export async function openDesktopWindow (ctx = {}) {
         icon: ctx.icon,
         isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
+        // Phase B: this window's own open only (its signal), never another surface's loop for the same computer.
+        isMoving: () => !! own_open && session.isComputeMoving(computer.id, own_open.signal),
         onRetry: user_retry,
     });
     el_body.appendChild(spinner.el);
 
-    /** Has a boot attempt been pending long enough to earn the phase list? */
-    let show_phase_list = false;
-    /** Cleared on every fresh attempt and on disposal; see `start_boot`. */
-    let phase_list_timer = null;
-    /** The most recent state either surface was given, so the reveal timer
-     *  can tell "still pending" from "already concluded" without a second,
-     *  separately-maintained flag that could drift from what was rendered. */
+    /** The most recent state the surface was given ("still pending" vs "concluded"). */
     let last_kind = null;
 
     /**
@@ -1252,13 +1269,13 @@ export async function openDesktopWindow (ctx = {}) {
         resolve({ ok: false, errorCode: 'timeout', message: `Stopped waiting for the AWS computer (${verdict}).` });
     }
 
-    /** The one place either boot surface is told what to render. */
+    /** The one place the boot surface is told what to render. */
     function render_both (state, elapsedMs) {
         last_kind = state.kind;
-        // This panel is on screen exactly when the spinner has no live observation
-        // (failed poll, hidden tab); during a reopen it says only "still starting".
-        const extra = Number.isFinite(elapsedMs) ? { elapsedMs } : {};
-        progress.render(state, state.kind === 'progress' && aws_stop_wait?.clock ? {} : null, extra);
+        // During a reopen with no live observation the surface keeps the last
+        // observed stage (or says only "still starting"); it never swaps.
+        const extra = { reopening: state.kind === 'progress' && !! aws_stop_wait?.clock };
+        if ( Number.isFinite(elapsedMs) ) extra.elapsedMs = elapsedMs;
         spinner.render(state, extra);
         if (state.kind === 'progress') show_panel();
     }
@@ -1271,19 +1288,9 @@ export async function openDesktopWindow (ctx = {}) {
     const notice = DisplayNotice({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(notice.el);
 
-    /**
-     * Show whichever of the two surfaces is currently earned, and hide the
-     * other. Called on every fresh attempt and every time the phase-list
-     * timer fires on a still-pending boot — never while a terminal state
-     * (failed / not_configured / ready / ready_unverified) is showing,
-     * because at that point which DOM node is visible is no longer this
-     * function's decision (the reveal/failure code paths own it directly).
-     */
+    /** Put the one opening surface on screen (fresh attempts, failures). */
     const show_panel = () => {
-        // Migration and fresh launch copy stay visible on the shared warm path too.
-        const show_phases = show_phase_list && !spinner.hasComputerProgress() && !session.isComputeMigrating(computer.id) && !session.isComputeLaunching(computer.id);
-        progress.el.hidden = ! show_phases;
-        spinner.el.hidden = show_phases;
+        spinner.el.hidden = false;
         // The unverified strip belongs to a revealed desktop; it never sits over the opening surface.
         notice.hide();
     };
@@ -1298,29 +1305,21 @@ export async function openDesktopWindow (ctx = {}) {
      *
      * Deliberately does nothing while the window is minimised: the user went
      * somewhere else and must not have the viewport yanked out from under
-     * them. `wants_fullbleed` remembers, and the restore observer below
+     * them. `full_view.wants` remembers, and the restore observer below
      * finishes the job when they come back.
+     *
+     * The DOM work is `full_view.enter()` (`../ui/full-view.js`): the class,
+     * `enter_fullpage_mode`, `data-is_fullpage="1"` (which `$.fn.close` reads
+     * to decide whether it owes the user a taskbar back), `focusWindow()` (🔴
+     * `style.css` gives `.window-app-iframe` `pointer-events: none` until the
+     * window is active — a user who clicked the wallpaper during the boot would
+     * otherwise get a desktop that renders perfectly and ignores every click),
+     * and the drawer's intro flash, since the drawer is now the only chrome on
+     * screen. Same writes, same order, as when they lived here.
      */
     function go_fullbleed (why) {
         if ( disposed ) return;
-        wants_fullbleed = true;
-        if ( ! may_fullbleed ) return;
-        if ( is_minimized(el_window) ) return;
-        if ( el_window.classList.contains(FULLBLEED_CLASS) ) return;
-
-        el_window.classList.add(FULLBLEED_CLASS);
-        window.enter_fullpage_mode(el_window);
-        // `$.fn.close` reads this to decide whether it owes the user a taskbar
-        // back (UIWindow.js:3641). It is '0' until now, because until now the
-        // taskbar was never hidden.
-        $(el_window).attr('data-is_fullpage', '1');
-        // 🔴 `style.css` gives `.window-app-iframe` `pointer-events: none` and
-        // only `.window-active .window-app-iframe` gets them back. A user who
-        // clicked the wallpaper during the boot would otherwise get a desktop
-        // that renders perfectly and ignores every click.
-        $(el_window).focusWindow();
-        // The drawer is now the only chrome on screen; let it introduce itself.
-        el_window._ezil_drawer_flash?.();
+        if ( ! full_view.enter() ) return;
         console.info(`[${PHASE}] full-bleed (${why})`);
     }
 
@@ -1343,33 +1342,21 @@ export async function openDesktopWindow (ctx = {}) {
         viewer_origin = null;
         viewer_previous = null;
         stop_timers();
-        clearTimeout(phase_list_timer); phase_list_timer = null;
-        // A fresh attempt has earned nothing yet — start back at the spinner,
-        // whatever the previous attempt had revealed.
-        show_phase_list = false;
+        // A fresh attempt starts on the opening surface, whatever the previous
+        // attempt had revealed.
         show_panel();
         // A fresh attempt has established nothing yet, so last attempt's "we
         // could not check" must not linger over it.
         notice.hide();
         running_signal = undefined;
+        move_wait = false;
         aws_observation = spinner.computerProgress();
         aws_seen_active = aws_observation?.activeAws === true;
         spinner.stamp(null);
         tti = { url: null, frame: null, input: null };
+        tti_path = aws_observation?.path ?? null;
+        tti_aws = false;
 
-        // 🔴 PHASE_LIST_AFTER_MS, measured from THIS attempt's own start, not
-        // from anything upstream. Guarded on `last_kind` rather than a second
-        // "are we still booting" flag: if this attempt has already reached a
-        // terminal state (or a later attempt has started) by the time this
-        // fires, there is nothing to reveal and calling `show_panel()` would
-        // only re-toggle visibility on a surface that already retired itself
-        // for a real reason.
-        phase_list_timer = setTimeout(() => {
-            phase_list_timer = null;
-            if ( disposed || my_attempt !== attempt || last_kind !== 'progress' ) return;
-            show_phase_list = true;
-            show_panel();
-        }, PHASE_LIST_AFTER_MS);
 
         if ( desktop_state.configured !== true ) {
             // No provider at all. Do not send a request whose answer is
@@ -1443,14 +1430,20 @@ export async function openDesktopWindow (ctx = {}) {
         // open), the first settle corrects it — which is exactly what the live
         // path is for.
         const boot_screen_ask = measure_screen();
-        const ask_fresh = () => {
+        const ask_fresh = (movingAnswer) => {
             own_open = new AbortController();
-            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal });
+            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal, ...(movingAnswer ? { movingAnswer } : {}) });
         };
         // The first request ends early only on an observed stage change (see
         // `check_aws_wait`); its own wake loop still owns the clock.
         const first_stop = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: false }; });
         let res = await Promise.race([my_attempt === 1 ? claimWarm(computer.id) : ask_fresh(), first_stop]);
+        // 🔴 PHASE B: the warm (`warm.js`; no window can cancel it) never waits on a move: it hands the moving answer
+        // straight back. This window's own open takes the wait over from that answer (a read first, never a second
+        // ask back to back), on its own signal, so closing the window ends it. Still the first request's stop.
+        if ( my_attempt === 1 && res?.ok !== true && res?.computeMoving === true && ! disposed && my_attempt === attempt ) {
+            res = await Promise.race([ask_fresh(res), first_stop]);
+        }
         aws_stop_wait = null;
 
         // 🔴 A TIMEOUT IS NOT A FAILURE WHILE AWS SAYS IT IS STILL OPENING. A cold
@@ -1464,13 +1457,20 @@ export async function openDesktopWindow (ctx = {}) {
         let aws_reopens = 0;
         let reopen_started_at = null;
         let aws_budget_spent = false;
+        // Phase B: 'moving' or 'needs_attention' when this open met a move (read BEFORE `classifyFailure` decides).
+        let move_answer = null;
         while ( ! disposed && my_attempt === attempt && ! res.ok ) {
             const reason = computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }).reason;
             const verdict = awsBootTimeoutVerdict({
                 reason, observation: aws_observation, bootElapsedMs: performance.now() - t0, reopens: aws_reopens,
                 // The wake loop gave up on its own ten-minute launch/migration clock.
                 sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true,
+                moving: res.computeMoving === true || res.computeMoveNeedsAttention === true,
             });
+            if ( verdict === 'move' ) {
+                move_answer = res.computeMoveNeedsAttention === true ? 'needs_attention' : 'moving';
+                break;
+            }
             if ( verdict === 'budget_spent' ) {
                 aws_budget_spent = true;
                 console.info(`[${PHASE}] AWS boot budget spent at +${Math.round(performance.now() - t0)}ms`
@@ -1514,6 +1514,25 @@ export async function openDesktopWindow (ctx = {}) {
             refit();
         }
 
+        if ( ! res.ok && move_answer ) {
+            // 🔴 PHASE B (§6.4): A MOVE IS NOT A FAILED BOOT. The open was answered by the move: its outcome (the
+            // open's loop read it and stopped asking), "still working on it" (its watch ran out), or the open-blocked
+            // card (`computeMoveNeedsAttention`, deterministic). The surface shows which, from the move itself; this
+            // window never re-opens the AWS computer on its own (under the Free hold that boot uses Free hours).
+            last_failure = res;
+            move_wait = move_answer === 'moving';
+            console.info(`[${PHASE}] the open met a move (${move_answer}) after ${Math.round(performance.now() - t0)}ms; showing the move`);
+            telemetry.capture({
+                eventClass: 'boot_phase', site: 'ezil-os:apps/desktop#mint',
+                code: move_answer === 'needs_attention' ? 'computer_move_needs_attention' : 'computer_moving', durationMs: performance.now() - t0,
+            });
+            render_both({ ...computeBootUiState({ requestStatus: 'error', elapsedMs: performance.now() - t0, errorCode: res.errorCode }), move: move_answer });
+            // Terminal for this attempt: the move, not this window, decides what happens next.
+            trace.step('mint_moving');
+            trace.end('skipped');
+            return;
+        }
+
         if ( ! res.ok ) {
             last_failure = res;
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`
@@ -1548,6 +1567,7 @@ export async function openDesktopWindow (ctx = {}) {
             return;
         }
 
+        tti_aws = res.computeProvider === 'aws-ec2';
         stamp_milestone('url_received');
         console.info(`[${PHASE}] desktop URL in ${Math.round(performance.now() - t0)}ms`
             + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`
@@ -1937,7 +1957,6 @@ export async function openDesktopWindow (ctx = {}) {
                 }
                 stop();
                 stop_timers();
-                clearTimeout(phase_list_timer); phase_list_timer = null;
                 render_both(state);
                 // The blank frame is never revealed. The panel stays, over an
                 // ordinary window, on an OS with its taskbar still on it.
@@ -1962,14 +1981,9 @@ export async function openDesktopWindow (ctx = {}) {
             // that is on screen. Caught by boot-test, intermittently, which is
             // the worst way to find out.
             stop_timers();
-            clearTimeout(phase_list_timer); phase_list_timer = null;
             render_both(state);
-            // 🔴 BOTH surfaces, not just whichever one `show_phase_list` had
-            // made visible. Whichever of the two was on screen a moment ago,
-            // the iframe is about to take the viewport — leaving the OTHER
-            // one visible (a warm open that never earned the phase list, e.g.)
-            // would paint the spinner over a desktop that is now live.
-            progress.el.hidden = true;
+            // 🔴 Hidden synchronously: the iframe is about to take the viewport,
+            // and the surface must never paint over a desktop that is now live.
             spinner.el.hidden = true;
             if ( state.kind === 'ready_unverified' ) notice.show();
             else notice.hide();
@@ -2199,19 +2213,15 @@ export async function openDesktopWindow (ctx = {}) {
      * intact (`reset_window_size_and_position` consumes it), so a later close
      * still restores the pre-full-bleed geometry correctly.
      */
-    function minimise_to_taskbar (el) {
-        // Guarded, because this handler is now reachable from a window that
-        // never went full-bleed (the drawer exists from the moment the window
-        // does). The fullpage exit on a windowed window would re-show a head
-        // that was never hidden.
-        if ( el.classList.contains(FULLBLEED_CLASS) ) {
-            // The class comes off so the restore observer's `go_fullbleed` is
-            // not turned away by its own already-full-bleed early return; that
-            // call is what puts the chrome back.
-            el.classList.remove(FULLBLEED_CLASS);
-            window.exit_fullpage_chrome(el);
-        }
-        $(el).hideWindow();
+    function minimise_to_taskbar () {
+        // `full_view.minimise()` (`../ui/full-view.js`) is the body this
+        // function used to have: guarded, because this handler is reachable
+        // from a window that never went full-bleed (the drawer exists from the
+        // moment the window does), so a windowed window only hides; a
+        // full-bleed one drops the class (so the restore observer's
+        // `go_fullbleed` is not turned away by its own already-full-bleed early
+        // return) and calls `exit_fullpage_chrome` before `hideWindow`.
+        full_view.minimise();
     }
 
     // ── the two window-control hooks ───────────────────────────────────────
@@ -2261,13 +2271,11 @@ export async function openDesktopWindow (ctx = {}) {
     // so watch the attribute it writes — which keeps this entirely inside EZiL
     // code and leaves the whole-file UIWindow.js port untouched.
     //
-    // 🔴 Gated on `wants_fullbleed`. A window minimised WHILE IT IS STILL
+    // 🔴 Gated on `full_view.wants`. A window minimised WHILE IT IS STILL
     // BOOTING was never full-bleed, and restoring it must not hide the taskbar
     // to show a progress panel.
-    let was_minimized = is_minimized(el_window);
-    const observer = new MutationObserver(() => {
-        const now_minimized = is_minimized(el_window);
-        if ( was_minimized && ! now_minimized && wants_fullbleed ) {
+    const observer = full_view.watch_restore(() => {
+        if ( full_view.wants ) {
             // After showWindow's 0.2s geometry transition, so the window
             // grows back to full-bleed instead of jumping. `go_fullbleed`
             // re-checks `disposed` and the minimised state itself, and
@@ -2297,9 +2305,7 @@ export async function openDesktopWindow (ctx = {}) {
             // than a guess.
             reconcile_screen('restored from the taskbar');
         }
-        was_minimized = now_minimized;
     });
-    observer.observe(el_window, { attributes: true, attributeFilter: ['data-is_minimized'] });
 
     // ── app switching wiring ─────────────────────────────────────────────────
     // See the constants block above for the feature-detection rule. Only
@@ -2399,7 +2405,7 @@ export async function openDesktopWindow (ctx = {}) {
         telemetry.capture({
             eventClass: 'window_error', site: 'ezil-os:apps/desktop#drawer', code: 'drawer_attach_failed',
         });
-        may_fullbleed = false;
+        full_view.forbid();
     }
 
     /**
@@ -2551,6 +2557,10 @@ export async function openDesktopWindow (ctx = {}) {
     // `$.fn.close` awaits this before it dismantles anything, so it is the one
     // place guaranteed to run exactly once per close.
     el_window.on_before_exit = async () => {
+        // Closing while ANOTHER window (Code, since 2026-10-30) is in full
+        // view must not give the taskbar back over it. A no-op whenever this
+        // is the only full window, i.e. in every state that existed before.
+        full_view.prepare_close();
         // Release BEFORE tearing down, so the request is issued while
         // everything it needs still exists — and NOT awaited, so a slow or
         // dead network cannot delay the close by one frame. See

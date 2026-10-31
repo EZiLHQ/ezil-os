@@ -3,6 +3,7 @@ import { failStalledPoolAdopt, reconcileStalledPoolAdopt, replaceStalledPoolAdop
 import { replacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { failPoolOpenRelease, isPoolOpenRelease, POOL_OPEN_RELEASE_FAILED, recoverRefusedAdopt } from './aws-pool-recovery';
 import { createProviderMigrationStore } from './provider-migrate-store';
+import { createProviderReverseStore, reverseMovesTablePresent } from './provider-reverse-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
  *
@@ -242,6 +243,21 @@ export async function startLifecycleJob(
     }
 }
 
+/** Boot states the export-boot mode changes: LEASED → STARTING → MOUNTING may all apply in one call. */
+const EXPORT_BOOT_STATES: readonly PlacementState[] = ['LEASED', 'STARTING', 'MOUNTING'];
+const RECEIPT_VOLUME = /^vol-[0-9a-f]{8,17}$/;
+/**
+ * Whether `p` is a reverse move's export boot (REVERSE-MOVE-CONTRACT §5.2): an `aws-ec2` boot whose generation, lease epoch
+ * and volume a non-committed reverse row claimed (`readByExportBoot`). A released (failed) row still matches, so its own
+ * boot never reaches RUNNING; the placement's next boot (E+2) and any row after a committed move never do. A database
+ * without 0012 (production) has no reverse move: the probe answers first, so this is one extra read per boot-path receipt.
+ */
+export async function isReverseExportBoot(db: PlacementExecutor, p: Placement): Promise<boolean> {
+    if (p.provider !== 'aws-ec2' || !EXPORT_BOOT_STATES.includes(p.state) || !p.volumeId || !RECEIPT_VOLUME.test(p.volumeId)) return false;
+    if (!(await reverseMovesTablePresent(db))) return false;
+    return (await createProviderReverseStore(db).readByExportBoot(p.computerId, p.generation, p.leaseEpoch, p.volumeId)) !== null;
+}
+
 /**
  * Apply the CURRENT job's outcome (C-3). Only the execution named by the
  * placement's own job id is read, and its receipt must match that job, its
@@ -261,6 +277,10 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (!m || m.state !== 'committed' || m.computerId !== p0.computerId || m.userId !== p0.ownerUserId) return;
         migrationCommitted = true;
     }
+    // 🔴 A reverse move's export boot (REVERSE-MOVE-CONTRACT §5.2) keeps every receipt rule but two: STARTING → MOUNTING
+    // opens no usage row, and MOUNTING → RUNNING is never taken (no epoch, no usage, no session limit). Failures fail
+    // exactly like a Free open's. Keyed on the reverse row's claim, never on `last_error` (enrollment overwrites it).
+    const exportBoot = await isReverseExportBoot(deps.db, p0);
     let claimReadyAt: Date | null = null;
     let startDate: Date | null = null;
     let stopDate: Date | null = null;
@@ -295,7 +315,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const enrolled = (x: Placement) => (x.lastError === ENROLLMENT_SUCCEEDED || (migrationCommitted && x.lastError === p0.lastError)) && x.enrollNonceHash === null && x.instanceId !== null;
     // A receipt already applied (job cleared): bound the wait for the host's enrollment.
     if (p.state === 'MOUNTING' && p.lifecycleJobId === null) {
-        if (enrolled(p)) await step(p, 'RUNNING');
+        if (enrolled(p)) { if (!exportBoot) await step(p, 'RUNNING'); }
         else if (!options.terminalOnly) {
             const observedAt = (deps.now ?? deps.clock ?? (() => new Date()))();
             // No in-transaction `retire`: a Step Functions start issued inside the classifying
@@ -466,8 +486,8 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         return;
     }
     if (p.state === 'LEASED') p = await step(p, 'STARTING');
-    if (p && p.state === 'STARTING') p = await step(p, 'MOUNTING', done, open);
-    if (p && p.state === 'MOUNTING' && enrolled(p)) {
+    if (p && p.state === 'STARTING') p = await step(p, 'MOUNTING', done, exportBoot ? undefined : open);
+    if (p && p.state === 'MOUNTING' && enrolled(p) && !exportBoot) {
         // The job is still recorded only when this call applies the receipt itself.
         await step(p, 'RUNNING', p.lifecycleJobId === null ? {} : done, p.lifecycleJobId === null ? undefined : open);
     }

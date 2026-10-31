@@ -248,7 +248,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  * request cannot fail this way. See `applyDisplayEvidence`.
  *
  * @typedef {'worker_unreachable' | 'sandbox_crashed' | 'desktop_unreachable'
- *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'computer_stopped' | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
+ *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'computer_stopped' | 'desktop_config_unapplied' | 'desktop_failed'
+ *   | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
  *   | 'payment_issue' | 'plan_required' | 'fair_use_paused' | 'files_on_aws' | 'unknown'} BootFailureReason
  */
 
@@ -304,7 +305,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
  *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'capacity_attempt_expired' | 'region_capacity'
- *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'computer_stopped' | BillingBootErrorCode | 'unknown'} BootErrorCode
+ *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'computer_stopped' | 'desktop_config_unapplied' | 'desktop_failed'
+ *   | BillingBootErrorCode | 'unknown'} BootErrorCode
  */
 
 /**
@@ -353,6 +355,9 @@ const AWS_REFUSAL_ERROR_CODES = [
     'global_hours_cap',
     // Hotfix r5 review: the stop hold answers the same until it lapses (60 s); re-asking at once is waste.
     'computer_stopped',
+    // Round 6 (seam A): the Worker answers these the same until the host's record changes.
+    'desktop_config_unapplied',
+    'desktop_failed',
 ];
 
 /**
@@ -419,6 +424,9 @@ function classifyFailure(errorCode) {
             return errorCode;
         case 'computer_stopped':
             return 'computer_stopped';
+        case 'desktop_config_unapplied':
+        case 'desktop_failed':
+            return errorCode;
         case 'connection_refused':
         case 'fetch_failed':
             return 'worker_unreachable';
@@ -665,6 +673,21 @@ export const BOOT_PROGRESS_LONG_SUBTEXT =
 
 /** @type {Record<BootFailureReason, BootFailureCopy>} */
 export const BOOT_FAILURE_COPY = {
+    // Round 6 (seam A): the AWS host's desktop never took its new settings within the Worker's bound (150 s),
+    // or its restarts are exhausted. Both answer the same on a re-ask until the host changes, so each names
+    // the Troubleshoot action that changes it, never "try again" alone. Round 6a: both name Restart computer.
+    // Restart desktop was only ever enabled while a desktop window was open, and it has since been removed from
+    // Settings/tabs/troubleshoot.js (app-code lane A2); Restart computer is enabled with any computer, so a Code or
+    // app preview open is never sent to a missing or disabled button. A restarted computer is a fresh host boot,
+    // which gets its own once-per-boot config push. The title reads the same over the desktop, Code and an app.
+    desktop_config_unapplied: {
+        title: "Your computer's desktop didn't finish setting up",
+        body: "Your computer is running, but its desktop, which also runs Code and your app, didn't pick up its new settings in time. Use Restart computer in Settings → Troubleshoot to start it fresh, then open this again. Your files are kept.",
+    },
+    desktop_failed: {
+        title: "Your computer's desktop couldn't start",
+        body: "Your computer is running, but its desktop, which also runs Code and your app, stopped and couldn't restart. Use Restart computer in Settings → Troubleshoot. Your files are kept.",
+    },
     // Hotfix r5 review: the server's stop hold (`stopCooldownAnswer`) refuses a hosted-app open for 60 s
     // after the computer stopped, so a leftover poll cannot restart it. An explicit desktop open is not held.
     computer_stopped: {

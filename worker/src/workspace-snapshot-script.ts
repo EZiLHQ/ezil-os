@@ -152,8 +152,9 @@ def inventory():
 def stamp(entries):
     return [(n, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_ino, t) for n,s,t in entries]
 
-def capture(path):
-    marker()
+def capture(path, hydrated=True):
+    # export-capture (an AWS volume, never hydrated by this codec) has no marker to check.
+    if hydrated: marker()
     entries, skipped = inventory()
     with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as tar:
         for name, s, target in entries:
@@ -270,9 +271,9 @@ try:
         except FileNotFoundError:
             sys.exit(4)
     elif op == 'check': marker()
-    elif op == 'capture':
+    elif op in ('capture', 'export-capture'):
         os.mkdir(work, 0o700)
-        result = capture(os.path.join(work, 'archive.tar'))
+        result = capture(os.path.join(work, 'archive.tar'), op == 'capture')
         with open(os.path.join(work, 'archive.tar'), 'rb') as f:
             for i in range(len(result['chunks'])):
                 with open(os.path.join(work, str(i)), 'xb') as out: out.write(f.read(CHUNK))
@@ -318,7 +319,7 @@ try:
     else: raise ValueError('unknown operation')
 except AssertionError as e:
     # A size/entry limit is permanent (retrying cannot help): its own exit code.
-    if op == 'capture' and str(e) in ('snapshot byte limit', 'snapshot entry limit', 'Git index byte limit', 'Git paths byte limit'):
+    if op in ('capture', 'export-capture') and str(e) in ('snapshot byte limit', 'snapshot entry limit', 'Git index byte limit', 'Git paths byte limit'):
         print('workspace snapshot too large', file=sys.stderr)
         sys.exit(3)
     # This container does not hold the hydrated workspace: nothing in it may be committed.

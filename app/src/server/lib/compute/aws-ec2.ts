@@ -40,7 +40,7 @@ export { buildEnrollmentUserData as buildAwsProvisionUserData } from './aws-enro
 
 import { runAdmission, type AdmissionRefusal, type AdmissionRequest } from './admission';
 import {
-    AWS_TIER_DATA_GIB,
+    dataGiBForNewVolume,
     instanceTypeForTier,
     isAwsComputersEnabled,
     readAwsAdmissionConfig,
@@ -70,6 +70,7 @@ import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, Comput
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 import { requestAwsRestart } from './aws-restart';
 import { poolPriorityForEntitlement } from './select';
+import { releaseHealOf } from './release-heal';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -144,6 +145,11 @@ export interface AwsProviderDeps {
     entitlement?: EntitlementRecord | null;
     /** Legacy tier source for callers that do not supply a resolved record. */
     tierFor?: (userId: string) => Promise<AwsTier>;
+    /**
+     * Round 6 R2-3: the owner's active paid plan still waits for its new period's compute grant, so the tier reads
+     * Free for a moment (billing compute-access `computeGrantPending`; the default imports it lazily, like progress.ts).
+     */
+    grantPending?: (userId: string) => Promise<boolean>;
     /** Source of the enrollment nonce's 32 bytes (tests make it deterministic). */
     randomBytes?: (n: number) => Buffer;
     /** Reads lifecycle executions so `status` can apply their receipts. Without it nothing is reconciled. */
@@ -209,6 +215,16 @@ function isReplacementLaunching(p: Placement, input?: string): boolean {
 const CAPACITY_REFUSALS: readonly AdmissionRefusal[] = ['max_running', 'region_capacity'];
 
 const notReady = (errorCode: string, retryable = false, error = errorCode): EnsureResult => ({ ok: false, error, errorCode, retryable });
+
+/**
+ * Round 6 R2-2: one line per AWS boot decision, so a cold open beside an idle spare says why. `path` is warm (a pool
+ * adopt), cold (a cold provision/replace), wait (no boot on this ask: capacity demand, a pool release first, a grant
+ * pending) or none (admission refused). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
+ * release_failed, pool_type, volume_check, no_spare, capacity, volume_attached, grant_pending), or the refusal. No id beyond 8 chars.
+ */
+function logAwsOpen(computerId: string, path: 'warm' | 'cold' | 'wait' | 'none', reason: string): void {
+    console.info(JSON.stringify({ event: 'aws-open', computer: computerId.slice(0, 8), path, reason }));
+}
 /** RETRY-118: this open's capacity attempt expired. Not retryable automatically; only an explicit user Retry resets it. */
 const attemptExpired = (capacityAttemptId: string): EnsureResult =>
     ({ ok: false, error: 'capacity_attempt_expired', errorCode: 'capacity_attempt_expired', retryable: false, capacityAttemptId });
@@ -319,6 +335,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
 
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
+
+    const grantPending = deps.grantPending ?? (async (userId: string) =>
+        (await import('@/server/billing/v2/compute-access')).computeGrantPending(userId));
 
     const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId, clock: now, now, sleep: deps.sleep, meter: deps.meter, pool: deps.pool });
 
@@ -465,20 +484,29 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
      * delaying it. Nothing about admission, the durable commit or the job identity changes. */
     const admitBoot = async (request: AdmissionRequest, tier: AwsTier | undefined, e: Env,
         workRef: { get(): LifecycleWork | undefined; set(work: LifecycleWork): void },
-        after: { replenish?: () => Promise<void> } = {}) => {
+        after: { replenish?: () => Promise<void> } = {},
+        /** Round 6 R2-2: why there is no pool tier (the caller knows): not STOPPED, or a failed pool-open release. */
+        untiered: 'not_stopped' | 'release_failed' = 'not_stopped') => {
         let own: CapacityDemand | null | undefined;
+        // Round 6 R2-2: why this boot is not a warm adopt, for its one `aws-open` line (set where the pool path declines).
+        let coldReason = 'unknown';
         const result = await reservePoolHostForBoot(deps.db,
             db => runAdmission(db, request, { env: e, now }),
             async (tx, p) => {
                 const cold = workRef.get()!;
                 const deployment = cold.intent.deployment;
-                if (!isPoolMode(deployment) || !tier || tier === 'free' || !POOL_TYPES.includes(p.instanceType as PoolClass['instanceType'])) return null;
+                coldReason = !isPoolMode(deployment) ? 'not_pool' : !tier ? untiered : tier === 'free' ? 'tier_free'
+                    : !POOL_TYPES.includes(p.instanceType as PoolClass['instanceType']) ? 'pool_type' : 'no_spare';
+                if (coldReason !== 'no_spare' || !tier) return null;
                 if (!deps.pool) throw new LifecycleIntentInvalidError();
                 // Recheck under the admission lock, immediately before reserving a host.
                 // Missing or uncertain attachment evidence uses the existing cold path.
                 if (p.volumeId) {
                     const volume = await deps.describer?.describeVolume?.(p.region!, p.volumeId).catch(() => null);
-                    if (!volume || volume.volumeId !== p.volumeId || volume.state !== 'available' || volume.attachments?.length !== 0) return null;
+                    if (!volume || volume.volumeId !== p.volumeId || volume.state !== 'available' || volume.attachments?.length !== 0) {
+                        coldReason = 'volume_check';
+                        return null;
+                    }
                 }
                 const c: PoolClass = { region: p.region!, zoneId: p.zoneId!, instanceType: p.instanceType as PoolClass['instanceType'], deployment };
                 const host = await deps.pool.leasePoolHost(tx, c, p.computerId, poolPriorityForEntitlement(deps.entitlement), now());
@@ -489,7 +517,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 }
                 const work = deps.pool.buildWork({ ...cold.intent, operation: 'adopt', poolHostId: host.poolHostId,
                     providerInstanceId: host.instanceId, dataVolumeId: p.volumeId,
-                    dataVolumeGiB: p.volumeId === null ? AWS_TIER_DATA_GIB[tier] : null,
+                    dataVolumeGiB: p.volumeId === null ? dataGiBForNewVolume(tier, deps.entitlement?.planId) : null,
                     userData: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
                 });
                 workRef.set(work);
@@ -515,6 +543,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     : { admitted: false as const, reason: 'capacity_waiting' as const };
             });
         const work = workRef.get();
+        const warm = result.admitted && work?.intent.operation === 'adopt';
+        if (result.admitted) logAwsOpen(request.computerId, warm ? 'warm' : 'cold', warm ? 'adopted' : coldReason);
+        else if (result.reason === 'capacity_waiting') logAwsOpen(request.computerId, 'wait', 'capacity');
+        else logAwsOpen(request.computerId, 'none', result.reason);
         if (result.admitted && work?.intent.operation === 'adopt') {
             const leasedClass = { region: result.placement.region!, zoneId: result.placement.zoneId!,
                 instanceType: result.placement.instanceType as PoolClass['instanceType'] };
@@ -591,7 +623,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 work = buildLifecycleWork({
                                     schemaVersion: 1, jobId: newId(), computerId, revision: 1, operation: 'provision', targetGeneration: 1, fenceToken,
                                     providerInstanceId: null, dataVolumeId: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
-                                    deployment, instanceType: instanceTypeForTier(tier), dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: 1, userData,
+                                    deployment, instanceType: instanceTypeForTier(tier), dataVolumeGiB: dataGiBForNewVolume(tier, deps.entitlement?.planId), leaseEpoch: 1, userData,
                                 });
                                 return {
                                     zoneId: deployment.zoneId, fsUuid, fenceToken,
@@ -666,6 +698,13 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
+                    // Round 6 R2-3: a paid plan whose new period's grant has not landed reads as Free for a moment. Never
+                    // boot it as the Free hold (cold, at the hold size): wait, so the next ask opens on the paid tier.
+                    // Unknown is not pending: a failed billing read keeps today's open, never an endless wait.
+                    if (openTier === 'free' && await grantPending(c.userId).catch(() => false)) {
+                        logAwsOpen(c.computerId, 'wait', 'grant_pending');
+                        return notReady('computer_starting', true);
+                    }
                     // A lost instance (INSTANCE_LOST: EC2 terminated it) can only come back as a REPLACE onto its volume.
                     const replace = resizeTo !== undefined || placement.lastError === ENROLLMENT_FAILED || placement.lastError === INSTANCE_LOST || cfg.wakeMode === 'replace' || isPoolMode(deployment) || placement.lastError === POOL_RELEASED;
                     const instanceType = resizeTo ? instanceTypeForTier(resizeTo) : placement.instanceType;
@@ -678,6 +717,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                             const source = await deps.describer?.describeForEnrollment(placement.region, placement.instanceId).catch(() => null);
                             if (source?.instanceId === placement.instanceId && source.state !== 'terminated') {
                                 const work = sessionEndWork(placement, deployment, newId(), deps.pool);
+                                logAwsOpen(c.computerId, 'wait', 'volume_attached');
                                 const reserved = await writePoolOpen(deps.db, placement, 'STOPPING', {
                                     lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: POOL_OPEN_RELEASE,
                                     enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null,
@@ -741,6 +781,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 },
                             },
                             poolTier, cfg.e, { get: () => work, set: value => { work = value; } }, afterLaunch,
+                            placement.state === 'STOPPED' && placement.lastError === POOL_OPEN_RELEASE_FAILED ? 'release_failed' : 'not_stopped',
                         );
                     } catch (error) {
                         if (error instanceof LifecycleIntentInvalidError) return notReady('aws_intent_invalid');
@@ -799,7 +840,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             p = settled.placement;
             const state = isPoolOpenRelease(p) || isPoolReleaseRecovering(p) || await isAdoptRecoveryStarting(p)
                 || await isStalledPoolAdoptPending(deps, p) ? 'starting' : isEnrollmentHostRetire(p) ? 'stopping' : AWS_STATE_FOR[p.state];
-            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}) };
+            // Round 5 D2: a failed pool release being healed (release-heal.ts); present only when there is one. Only a
+            // pool-mode deployment heals one (reconcilePoolReleaseRecovery), so elsewhere the stop fails fast as before.
+            const healer = cfg.deployments[p.region ?? ''];
+            const releaseHeal = healer && isPoolMode(healer) ? releaseHealOf(p) : null;
+            return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region, ...(settled.computeLaunching ? { computeLaunching: true } : {}),
+                ...(releaseHeal ? { releaseHeal } : {}) };
         },
 
         async stop(_ctx, c): Promise<StopResult> {

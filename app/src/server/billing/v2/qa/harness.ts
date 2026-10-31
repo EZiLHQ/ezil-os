@@ -107,6 +107,8 @@ export function fakeStripe() {
         scheduleDowngrade: unused('scheduleDowngrade'), cancelScheduledChange: unused('cancelScheduledChange'),
         setCancelAtPeriodEnd: unused('setCancelAtPeriodEnd'), createCustomer: unused('createCustomer'),
         createCheckoutSession: unused('createCheckoutSession'), createPortalSession: unused('createPortalSession'),
+        listCustomerSubscriptions: unused('listCustomerSubscriptions'), listOpenCheckoutSessions: unused('listOpenCheckoutSessions'),
+        expireCheckoutSession: unused('expireCheckoutSession'),
         listInvoices: async () => [],
         retrieveSubscription: async id => read(subscriptions, id),
         retrieveInvoice: async id => read(invoices, id),

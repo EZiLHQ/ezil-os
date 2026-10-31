@@ -21,26 +21,104 @@ type UnavailableReason = 'config_missing' | 'zone_invalid' | 'endpoint_invalid' 
     | 'placement_integrity' | 'placement_reserved' | 'placement_read_failed' | 'enrollment_failed'
     | 'sign_failed' | 'parse_failed' | `worker_status_${number}`;
 
-/** A refusal value. `reason` is optional on the type: a test double or an older caller may omit it. */
-type AwsPreviewRefusal = { ok: false; error: string; errorCode: string; reason?: string };
+/**
+ * Round 6 (seam B): which window asks (worker/src/aws-origin.ts `awsPreviewSurface`). Code and the hosted
+ * app are answered once the desktop config is applied (Code: once code-server answers too), without
+ * waiting on the desktop's relay. Absent is the desktop, whose signed body stays byte-identical to the
+ * one sent before this field existed. A Worker that predates it parses the body field by field and never
+ * reads an unknown key (74ed2c92 `handlePreview`); the v2 digest covers the bytes either way.
+ */
+export type AwsPreviewSurface = 'code' | 'app';
+/** The preview's options: the provider's ensure options plus the asking surface (never sent to `ensure`). */
+export type AwsPreviewOptions = EnsureOptions & { surface?: AwsPreviewSurface };
 
-const unavailable = (reason: UnavailableReason, workerCode?: string): AwsPreviewRefusal => {
+/**
+ * Round 6 (seam A): the reasons the Worker gives with `503 aws_desktop_starting` (worker/src/aws-ice.ts
+ * `AwsDesktopStarting`, aws-origin.ts `code_starting`), a closed set. Every one is retryable within the
+ * shell's existing wake bound, like any `aws_desktop_starting`; an absent or unknown reason is too, and is
+ * never echoed.
+ */
+export const AWS_DESKTOP_STARTING_REASONS = ['config_pushed', 'restart_scheduled', 'config_pending', 'desktop_starting', 'code_starting'] as const;
+export type AwsDesktopStartingReason = typeof AWS_DESKTOP_STARTING_REASONS[number];
+/**
+ * Round 6 (seam C): the reasons that mean the desktop is taking this host boot's config (one push, then a
+ * container restart; the Worker bounds it at 150 s, aws-ice.ts AWS_DESKTOP_CONFIG_APPLY_MS) or code-server is
+ * starting after it. The answer then carries `computePreparing: true`, so the shell shows that wait's
+ * expectation instead of a connect's. `desktop_starting` (no push, the desktop is booting) is not one.
+ */
+export const AWS_PREPARING_REASONS: readonly AwsDesktopStartingReason[] = ['config_pushed', 'restart_scheduled', 'config_pending', 'code_starting'];
+/**
+ * Round 6 (seam A): the Worker's terminal desktop answers and the shell code each becomes. Classified by code
+ * at 502 or 503 (the Worker sends both at 502 today). Re-asking returns the same answer until the host's
+ * record changes, so neither is retried: `desktop_config_unapplied` (the pushed config was still not applied
+ * after the Worker's 150 s bound) and `desktop_failed` (the host's desktop restarts are exhausted).
+ */
+const WORKER_TERMINAL = {
+    aws_desktop_config_unapplied: 'desktop_config_unapplied',
+    aws_desktop_failed: 'desktop_failed',
+} as const;
+type WorkerTerminalCode = keyof typeof WORKER_TERMINAL;
+
+/** The Worker's explicit transient codes by HTTP status, never an arbitrary 409/5xx (see `workerStarting`). */
+const WORKER_STARTING = {
+    503: ['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'],
+    502: ['aws_origin_unavailable'],
+    409: ['relay_busy', 'relay_runtime_changed', 'relay_negotiation_busy'],
+    504: ['relay_timeout'],
+} as const;
+type WorkerStartingCode = typeof WORKER_STARTING[keyof typeof WORKER_STARTING][number];
+type StartingReason = 'placement_opening' | 'pool_session_pending' | 'enrollment_pending' | 'lifecycle_pending'
+    | 'transport_failed' | 'epoch_moved' | WorkerStartingCode;
+
+/**
+ * Round 6 (R3-2/R3-8): why an answer was not ok — one bounded code (a category below or an allow-listed
+ * Worker code) and the Worker's HTTP status when it answered — for the router's one `aws-preview` log line.
+ * Kept beside the answer object, never on it: the wire answer is unchanged. Nothing logs here (the hold reads
+ * placements up to 33 times per wait, and pool relay preparation has no user surface).
+ */
+export interface AwsPreviewRefusal {
+    reason: string; status: number | null;
+    /** Round 6: the Worker's `aws_desktop_starting` reason, only when it is one of AWS_DESKTOP_STARTING_REASONS. */
+    detail?: AwsDesktopStartingReason;
+}
+const refusals = new WeakMap<object, AwsPreviewRefusal>();
+const tagged = <T extends object>(answer: T, reason: string, status: number | null, detail?: AwsDesktopStartingReason): T => {
+    refusals.set(answer, detail ? { reason, status, detail } : { reason, status }); return answer;
+};
+/** The reason `requestAwsPreview` refused with; undefined for an ok answer or any other object. */
+export const awsPreviewRefusal = (answer: object): AwsPreviewRefusal | undefined => refusals.get(answer);
+
+/** A refusal value (#239). `reason` is optional on the type: a test double or an older caller may omit it. */
+type AwsPreviewRefusalAnswer = { ok: false; error: string; errorCode: string; reason?: string };
+
+const unavailable = (reason: UnavailableReason, status: number | null = null, workerCode?: string) => {
     // One bounded category per refusal. Never log bodies, URLs, tokens, IDs or exceptions.
     // `workerCode` is the Worker's own public error code, and only when it passes the
     // reason allowlist (`hmac_signature_mismatch`), so a 401 can say WHICH 401.
     const worker = isReasonSegment(workerCode) ? workerCode : undefined;
     console.warn(`[aws-preview] unavailable reason=${reason}${worker ? ` worker_error=${worker}` : ''}`);
-    return {
+    return tagged<AwsPreviewRefusalAnswer>({
         ok: false as const,
         error: 'aws_preview_unavailable',
         errorCode: 'aws_preview_unavailable',
         // FEEDBACK-DIAG: the same category, on the answer. The router adds the
         // request's correlation id when it logs the refusal.
         reason: failureReason('aws_preview_unavailable', reason, worker) ?? 'aws_preview_unavailable',
-    };
+    }, reason, status);
 };
 
-const starting = (): AwsPreviewRefusal => ({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', reason: 'sandbox_starting' });
+const starting = (reason: StartingReason, status: number | null = null, detail?: AwsDesktopStartingReason) =>
+    tagged<AwsPreviewRefusalAnswer & { computePreparing?: true }>({
+        ok: false as const, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+        // FEEDBACK-DIAG (#239): the wire answer names its reason; the tag below stays the log's own.
+        reason: 'sandbox_starting',
+        // Seam C: additive, and only for the preparing reasons (absent otherwise), like `computeLaunching`.
+        ...(detail && AWS_PREPARING_REASONS.includes(detail) ? { computePreparing: true as const } : {}),
+    }, reason, status, detail);
+
+/** Seam A: a terminal desktop answer, as its own shell code (never `aws_preview_unavailable`'s one silent re-ask). */
+const desktopRefused = (code: WorkerTerminalCode, status: number) =>
+    tagged({ ok: false as const, error: code, errorCode: WORKER_TERMINAL[code] }, code, status);
 
 function placementRefusal(p: Placement | null, preparePool = false) {
     if (!p) return unavailable('placement_missing');
@@ -48,12 +126,13 @@ function placementRefusal(p: Placement | null, preparePool = false) {
     if (p.generation < 1 || p.leaseEpoch < 1) return unavailable('placement_epoch_invalid');
     if (preparePool) return p.lastError === POOL_SESSION_PENDING && p.enrollNonceHash === null && p.enrollConsumedHash !== null
         && p.instanceId !== null && p.volumeId !== null && p.lifecycleJobId !== null && p.lifecycleDigest !== null
-        && ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state) ? null : starting();
+        && ['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state) ? null : starting('pool_session_pending');
     if (p.lastError === ENROLLMENT_FAILED) return unavailable('enrollment_failed');
-    if (['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state)) return starting();
+    if (['PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING'].includes(p.state)) return starting('placement_opening');
     if (p.state !== 'RUNNING') return unavailable('placement_not_running');
     // Do not sign an epoch whose enrollment or receipt is still being settled.
-    if (p.enrollNonceHash || p.lastError === ENROLLMENT_PENDING || p.lifecycleJobId || p.lifecycleDigest) return starting();
+    if (p.enrollNonceHash || p.lastError === ENROLLMENT_PENDING) return starting('enrollment_pending');
+    if (p.lifecycleJobId || p.lifecycleDigest) return starting('lifecycle_pending');
     return null;
 }
 
@@ -87,17 +166,30 @@ export async function waitForAwsPreviewPlacement(db: PlacementExecutor, computer
     return false;
 }
 
-function workerStarting(status: number, data: unknown): boolean {
+/** The Worker's `aws_desktop_starting` reason when it is in the closed set, else undefined (never echoed). */
+function workerStartingReason(data: unknown): AwsDesktopStartingReason | undefined {
+    const reason = (data as { reason?: unknown } | null)?.reason;
+    return AWS_DESKTOP_STARTING_REASONS.find(r => r === reason);
+}
+
+/** The Worker's terminal desktop code at 502 or 503 (`WORKER_TERMINAL`), or null. */
+function workerTerminal(status: number, data: unknown): WorkerTerminalCode | null {
+    if (status !== 502 && status !== 503) return null;
     const parsed = z.object({ ok: z.literal(false).optional(), error: z.string() }).safeParse(data);
-    if (!parsed.success) return false;
+    if (!parsed.success || !Object.hasOwn(WORKER_TERMINAL, parsed.data.error)) return null;
+    return parsed.data.error as WorkerTerminalCode;
+}
+
+/** The Worker's transient code (from `WORKER_STARTING` only), or null. */
+function workerStarting(status: number, data: unknown): WorkerStartingCode | null {
+    const parsed = z.object({ ok: z.literal(false).optional(), error: z.string() }).safeParse(data);
+    if (!parsed.success) return null;
     const error = parsed.data.error;
     // Pin to the Worker's explicit transient codes, never an arbitrary 409/5xx.
     // aws-origin.ts uses 502 aws_origin_unavailable for an absent or mismatched tunnel.
     // aws-ice.ts uses 503 aws_desktop_unreachable while the host control service boots.
-    return (status === 503 && ['aws_desktop_starting', 'aws_origin_starting', 'aws_desktop_unreachable'].includes(error))
-        || (status === 502 && error === 'aws_origin_unavailable')
-        || (status === 409 && ['relay_busy', 'relay_runtime_changed', 'relay_negotiation_busy'].includes(error))
-        || (status === 504 && error === 'relay_timeout');
+    const codes: readonly WorkerStartingCode[] | undefined = (WORKER_STARTING as Partial<Record<number, readonly WorkerStartingCode[]>>)[status];
+    return codes?.find(code => code === error) ?? null;
 }
 
 /**
@@ -127,7 +219,7 @@ function bootstrapUrl(port: number, sandboxId: string, zone: string) {
 export async function requestAwsPreview(
     db: PlacementExecutor,
     computer: ComputerRef,
-    options: EnsureOptions,
+    options: AwsPreviewOptions,
     config: CloudflareGuacamoleConfig,
     hmacSecret: string,
     correlationId: string,
@@ -161,6 +253,8 @@ export async function requestAwsPreview(
             projectId: placement.computerId,
             desktopMode: options.desktopMode,
             ...(options.screen ? { screen: options.screen } : {}),
+            // Seam B: only when set, last. Pool relay preparation is the desktop's exchange: never a surface.
+            ...(options.surface && !preparePool ? { surface: options.surface } : {}),
         });
         // AWS always requires v2, independently of the Cloudflare opt-in flag.
         // EBS has no v2 object-store claim; '' means no store claim.
@@ -184,12 +278,14 @@ export async function requestAwsPreview(
         }).catch(() => null);
         // A transport loss says nothing about the origin's readiness; let the bounded
         // shell wake loop re-ask. No inline retry with potentially stale signed claims.
-        if (!response) return starting();
+        if (!response) return starting('transport_failed');
         failureReason = 'parse_failed';
         const data: unknown = await response.json();
         const retryable = workerStarting(response.status, data);
-        if (response.status !== 200 && !retryable) {
-            return unavailable(`worker_status_${response.status}`, (data as { error?: unknown } | null)?.error as string | undefined);
+        const terminal = retryable ? null : workerTerminal(response.status, data);
+        if (response.status !== 200 && !retryable && !terminal) {
+            return unavailable(`worker_status_${response.status}`, response.status,
+                (data as { error?: unknown } | null)?.error as string | undefined);
         }
         // Enrollment/receipt, stop or replacement may win while the Worker is answering.
         // Discard the old handoff and let the next request sign the newly confirmed pair.
@@ -198,8 +294,10 @@ export async function requestAwsPreview(
         const currentRefusal = placementRefusal(current);
         if (currentRefusal) return currentRefusal;
         if (!current) return unavailable('placement_missing');
-        if (current.generation !== placement.generation || current.leaseEpoch !== placement.leaseEpoch) return starting();
-        if (retryable) return starting();
+        if (current.generation !== placement.generation || current.leaseEpoch !== placement.leaseEpoch) return starting('epoch_moved', response.status);
+        // A terminal answer about this same epoch (one about a replaced epoch re-asks above).
+        if (terminal) return desktopRefused(terminal, response.status);
+        if (retryable) return starting(retryable, response.status, retryable === 'aws_desktop_starting' ? workerStartingReason(data) : undefined);
         failureReason = 'parse_failed';
         // Allowlist the response, including only public relay metadata.
         const parsed = z.object({

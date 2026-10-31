@@ -122,6 +122,23 @@ describe('P1/P2 pool planning', () => {
         expect(planPool(c, demand({ spares: 5, booting: [9, 10, 10.001, 11, 12].map(n => ({ poolHostId: String(n), createdAt: ago(n) })) }), NOW).fail)
             .toEqual(['10.001', '11', '12']);
     });
+    // Round 6 (R2-4, live 10-30 01:18→01:29Z): an enrolled spare whose first readiness wait died
+    // (pool_desktop_not_ready) is failed at six minutes, not ten, and readPoolDemand no longer counts it
+    // as a spare, so its replacement provisions in the same pass.
+    it('fails an enrolled boot that never became ready: six minutes from creation, its own readiness wait spent', () => {
+        const dead = { poolHostId: 'dead', createdAt: ago(6.5), enrolledAt: ago(5.5) };
+        // readPoolDemand reports the dead host outside `spares`; the one paid user's spare is missing.
+        expect(planPool(c, demand({ spares: 0, vcpuInUse: 2, booting: [dead] }), NOW)).toEqual({ target: 1, provision: 1, retire: [], fail: ['dead'] });
+        // Still inside a bound: younger than six minutes, enrolled under five minutes ago (its readiness wait plus a
+        // retried ready POST), or never enrolled.
+        for (const alive of [{ createdAt: ago(5.9), enrolledAt: ago(5.5) }, { createdAt: ago(9), enrolledAt: ago(4.9) }, { createdAt: ago(9.9) }]) {
+            expect(planPool(c, demand({ spares: 1, vcpuInUse: 2, booting: [{ poolHostId: 'alive', ...alive }] }), NOW)).toEqual({ target: 1, provision: 0, retire: [], fail: [] });
+        }
+        // The provision budget and the region cap are unchanged: a full region launches nothing.
+        expect(planPool(c, demand({ spares: 0, vcpuInUse: 10, regionVcpuCap: 10, booting: [dead] }), NOW)).toEqual({ target: 0, provision: 0, retire: [], fail: ['dead'] });
+        expect(planPool(c, demand({ opens15m: 1000, activeStandard: 30, booting: [dead, { ...dead, poolHostId: 'dead2' }] }), NOW))
+            .toMatchObject({ provision: 2, fail: ['dead', 'dead2'] });
+    });
     it.each(['opens15m', 'activeStandard', 'activePremium', 'spares', 'vcpuInUse', 'regionVcpuCap'] as const)('rejects invalid %s', field => {
         for (const value of [-1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, null, undefined]) {
             expect(() => planPool(c, demand({ [field]: value }), NOW)).toThrow('pool_count_invalid');
@@ -263,6 +280,19 @@ describe('readPoolDemand', () => {
         expect((await readPoolDemand(capture([aggregate]).db, c, NOW)).regionVcpuCap).toBe(0);
     });
     it('refuses missing snapshot', () => expect(readPoolDemand(capture([]).db, c, NOW)).rejects.toThrow('pool_demand_missing'));
+    it('R2-4: a stalled enrolled boot is not a spare, by the same six/five-minute cutoffs planPool fails it with', async () => {
+        const { db, queries } = capture([{ ...aggregate, booting: [{ poolHostId: 'b', createdAt: ago(7).toISOString(), enrolledAt: ago(5.5).toISOString() },
+            { poolHostId: 'n', createdAt: ago(1).toISOString(), enrolledAt: null }] }]);
+        const d = await readPoolDemand(db, c, NOW);
+        expect(d.booting).toEqual([{ poolHostId: 'b', createdAt: ago(7), enrolledAt: ago(5.5) }, { poolHostId: 'n', createdAt: ago(1) }]);
+        expect(planPool(c, d, NOW).fail).toEqual(['b']);
+        const { sql: text, params } = queries[0]!;
+        const spares = text.slice(text.indexOf("(state = 'booting' AND NOT"), text.indexOf(' AS spares'));
+        expect(spares).toMatch(/^\(state = 'booting' AND NOT \(enrolled_at IS NOT NULL AND created_at < \$\d+::timestamptz AND enrolled_at < \$\d+::timestamptz\)\) OR/);
+        const cutoffs = [...spares.matchAll(/\$(\d+)::timestamptz AND enrolled_at < \$(\d+)/g)][0]!.slice(1).map(n => params[Number(n) - 1]);
+        expect(cutoffs).toEqual([ago(6).toISOString(), ago(5).toISOString()]);
+        expect(text).toContain("json_build_object('poolHostId', id, 'createdAt', created_at, 'enrolledAt', enrolled_at)");
+    });
     it('queries authoritative tables and guarded demand windows without counting polls or duplicate joins', async () => {
         const { db, queries } = capture([aggregate]); await readPoolDemand(db, c, NOW);
         expect(queries).toHaveLength(1);
@@ -272,7 +302,7 @@ describe('readPoolDemand', () => {
             'e.size =', 'count(DISTINCT e.id)', 's.user_id = e.user_id', 'p.owner_user_id = e.user_id',
             "s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')", 'e.ready_at >', 'e.ready_at <=', "interval '15 minutes'",
             "s.sku = 'standard_monthly_v3'", "sku = 'premium_monthly_v3'", 'p.owner_user_id = s.user_id',
-            'percentile_cont(0.9)', "interval '24 hours'", 'ready_at <=', 'ready_at > created_at', "state = 'booting' OR",
+            'percentile_cont(0.9)', "interval '24 hours'", 'ready_at <=', 'ready_at > created_at', "(state = 'booting' AND NOT",
             'OR region IS NULL', "h.state <> 'retired'", 'NOT EXISTS (SELECT 1 FROM live_placements', 'p.instance_id = h.instance_id',
             'p.computer_id = h.leased_computer_id AND p.instance_id IS NULL', "state = 'ready' AND leased_at IS NULL AND leased_computer_id IS NULL AND ready_at IS NOT NULL",
             "state = 'booting'", 'ELSE 8 END']) expect(queries[0]!.sql).toContain(fragment);

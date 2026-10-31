@@ -7,7 +7,7 @@ import { createTRPCContext } from '@/server/api/trpc';
 import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { shellFeaturesFor } from '@/server/shell/features';
-import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
+import { Routes, getReturnUrlQueryParam, returnUrlFor, shellAppRoute } from '@/utils/constants';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
@@ -93,15 +93,22 @@ export const metadata = {
 /** Never prerender or cache: the payload is per-user and can create a row. */
 export const dynamic = 'force-dynamic';
 
-export default async function Page({ searchParams }: {
+/**
+ * Also the body of `/app/[appId]` (`../app/[appId]/page.tsx`), which renders
+ * this same document for one app and passes its id as `params.appId`. `/os`
+ * itself has no params. The id only decides where sign-in returns to; which
+ * app opens is the shell's own reading of the URL (`shell/ezil/app-link.js`).
+ */
+export default async function Page({ params: routeParams, searchParams }: {
+    params?: Promise<{ appId?: string }>;
     searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
     const params = await searchParams ?? {};
-    const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-        for (const item of Array.isArray(value) ? value : value === undefined ? [] : [value]) query.append(key, item);
-    }
-    const returnUrl = `${Routes.OS}${query.size ? `?${query}` : ''}`;
+    const appId = (await routeParams)?.appId;
+    // Built from the allowlisted id, never echoed from the request path.
+    // `/app/[appId]` has already answered 404 for any other id;
+    // `shellAppRoute` throws rather than build a return URL from one.
+    const returnUrl = returnUrlFor(appId === undefined ? Routes.OS : shellAppRoute(appId), params);
     // The tRPC context is built here rather than reusing `src/trpc/server.ts`'s
     // `api` for one reason: this page needs the resolved user for the payload
     // AND for the auth gate, and `createTRPCContext` has already resolved it.
@@ -115,8 +122,9 @@ export default async function Page({ searchParams }: {
 
     if (!ctx.user) {
         // Same gate as `src/app/computers/layout.tsx` and
-        // `src/app/computer/layout.tsx`. The pathname is known statically here,
-        // so it is used directly rather than read back from `x-pathname`.
+        // `src/app/computer/layout.tsx`. The pathname is known here (`/os`,
+        // or `/app/<id>` for an allowlisted id), so it is used directly rather
+        // than read back from `x-pathname`.
         redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(returnUrl)}`);
     }
 

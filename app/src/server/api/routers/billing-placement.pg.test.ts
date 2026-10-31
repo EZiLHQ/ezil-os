@@ -11,7 +11,7 @@ vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ scheduleP
 vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => { throw new Error('Tests must inject billing ports'); } }));
 
-import { userPlacementProvider } from './billing';
+import { userPlacement, userPlacementProvider } from './billing';
 
 type Database = typeof import('@/server/db').db;
 
@@ -43,10 +43,22 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('userPlacementProvider w
     afterEach(async () => { await client`rollback`; vi.unstubAllEnvs(); });
     afterAll(async () => { await client?.end(); });
 
-    const createTable = () => client`create table if not exists public.ezil_computer_placements (
-        computer_id uuid primary key, owner_user_id uuid not null, provider text not null)`;
-    const place = (computerId: string, owner: string, provider: string) =>
-        client`insert into public.ezil_computer_placements (computer_id, owner_user_id, provider) values (${computerId}::uuid, ${owner}::uuid, ${provider})`;
+    // Round 5 D3: the columns the placement module's full read selects (aws-ec2 rows only), plus the
+    // image-job tables its reservation check reads; a toy table without them aborts the transaction.
+    const createTable = async () => {
+        await client`create table if not exists public.ezil_computer_placements (
+            computer_id uuid primary key, owner_user_id uuid not null, provider text not null,
+            workspace_store text not null default 'r2', generation bigint not null default 1, lease_epoch bigint not null default 0,
+            state text not null default 'STOPPED', region text, zone_id text, instance_id text, instance_type text, volume_id text,
+            fs_uuid uuid, tunnel_id text, enroll_nonce_hash text, enroll_expires_at timestamptz, enroll_consumed_hash text,
+            lease_until timestamptz, presence_at timestamptz, fence_token uuid, lifecycle_job_id uuid, lifecycle_digest text,
+            last_error text, updated_at timestamptz not null default now(), image_upgrade_job_id uuid)`;
+        await client`create table if not exists public.ezil_computer_image_jobs (job_id uuid primary key, computer_id uuid not null, phase text not null)`;
+    };
+    const place = (computerId: string, owner: string, provider: string, volumeId: string | null = null) => provider === 'aws-ec2'
+        ? client`insert into public.ezil_computer_placements (computer_id, owner_user_id, provider, workspace_store, region, volume_id)
+            values (${computerId}::uuid, ${owner}::uuid, ${provider}, 'ebs', 'ap-south-1', ${volumeId})`
+        : client`insert into public.ezil_computer_placements (computer_id, owner_user_id, provider) values (${computerId}::uuid, ${owner}::uuid, ${provider})`;
 
     it('null without the placement table', async () => {
         await client`drop table if exists public.ezil_computer_placements`;
@@ -64,5 +76,28 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('userPlacementProvider w
         await expect(userPlacementProvider(db, user)).resolves.toBe('aws-ec2');
         await client`update ezil_computers set deleted_at = now() where id = ${ids.b}::uuid`;
         await expect(userPlacementProvider(db, user)).resolves.toBe('cloudflare');
+    });
+
+    it('round 5 D3: the live aws-ec2 placement exposes its region and data volume; foreign, deleted and volume-less ones do not', async () => {
+        await createTable();
+        await place(ids.a, user, 'cloudflare');
+        await place(ids.foreign, other, 'aws-ec2', 'vol-0ffffffffffffffff');
+        // Phase B (§6.1.1): `computers` lists the live computers and the records already read; asserted below.
+        const volumes = async () => { const rest: Partial<Awaited<ReturnType<typeof userPlacement>>> = { ...await userPlacement(db, user) };
+            delete rest.computers; return rest; };
+        await expect(volumes()).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
+        await place(ids.b, user, 'aws-ec2', null);
+        await expect(volumes()).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [] });
+        await client`update public.ezil_computer_placements set volume_id = 'vol-0bbbbbbbbbbbbbbbb' where computer_id = ${ids.b}::uuid`;
+        await expect(volumes()).resolves.toEqual({ provider: 'aws-ec2',
+            awsVolumes: [{ computerId: ids.b, region: 'ap-south-1', volumeId: 'vol-0bbbbbbbbbbbbbbbb' }] });
+        // The move computer's reads: only live, owned computers, each with its provider and (aws-ec2) placement record.
+        const listed = (await userPlacement(db, user)).computers!;
+        expect(listed.map(c => c.computerId).sort()).toEqual([ids.a, ids.b].map(id => id.toLowerCase()).sort());
+        expect(listed.find(c => c.computerId === ids.b.toLowerCase())).toMatchObject({ provider: 'aws-ec2', placement: { provider: 'aws-ec2' } });
+        expect(listed.find(c => c.computerId === ids.a.toLowerCase())).toMatchObject({ provider: 'cloudflare', placement: { provider: 'cloudflare', state: null } });
+        await client`update ezil_computers set deleted_at = now() where id = ${ids.b}::uuid`;
+        await expect(volumes()).resolves.toEqual({ provider: 'cloudflare', awsVolumes: [] });
+        expect((await userPlacement(db, user)).computers!.map(c => c.computerId)).toEqual([ids.a.toLowerCase()]);
     });
 });

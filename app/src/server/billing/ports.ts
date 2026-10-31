@@ -416,6 +416,12 @@ export interface StripeApi extends StripePackApi {
     setCancelAtPeriodEnd(input: { subscriptionId: string; cancel: boolean; idempotencyKey: string }): Promise<{ cancelsAt: Date | null }>;
     createCustomer(input: { userId: string; email: string | null; idempotencyKey: string }): Promise<{ id: string }>;
     createCheckoutSession(input: CheckoutRequest): Promise<CheckoutSessionCreated>;
+    /** Every subscription of one customer, any status (Stripe `status=all`), all pages: the checkout guard filters them. */
+    listCustomerSubscriptions(customerId: string): Promise<{ id: string; status: string }[]>;
+    /** One customer's OPEN Checkout Sessions (`status=open`), all pages, with their mode. */
+    listOpenCheckoutSessions(customerId: string): Promise<{ id: string; mode: string }[]>;
+    /** Expire one open Checkout Session so it can no longer be paid (Stripe refuses a session that is not open). */
+    expireCheckoutSession(id: string): Promise<void>;
     /** Newest first. */
     listInvoices(customerId: string, limit: number): Promise<StripeInvoiceSummary[]>;
     createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;

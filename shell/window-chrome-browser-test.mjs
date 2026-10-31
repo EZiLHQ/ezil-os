@@ -60,7 +60,9 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const OS = path.resolve(here, '../app/public/os');
+// Same override as the sibling suites: point at a build without touching the
+// committed `app/public/os`.
+const OS = process.env.EZIL_SHELL_OUT_DIR || process.env.EZIL_OS_DIR || path.resolve(here, '../app/public/os');
 
 for ( const f of ['icons.js', 'bundle.min.js', 'bundle.min.css'] ) {
     if ( ! fs.existsSync(path.join(OS, f)) ) {
@@ -129,6 +131,12 @@ const PAYLOAD = {
 // head, taskbar present) instead of racing the real go_fullbleed flow this
 // file is not testing.
 function stub (url, method) {
+    // GROUP 6's Code window: a real minted URL and a confirmed frame, so the
+    // window settles quietly (the desktop's own boot still fails, below).
+    if ( url.includes('/api/shell/code-preview-url') ) {
+        return { ok: true, codePreviewUrl: `${HOST}/frame?code=1`, expiresAt: Date.now() + 300_000 };
+    }
+    if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true, status: 200 };
     if ( url.includes('/api/shell/desktop') && method === 'POST' ) {
         return { ok: false, errorCode: 'connection_refused' };
     }
@@ -159,6 +167,10 @@ await page.route('**/*', async (route) => {
     const url = req.url();
     if ( url === `${HOST}/os` ) {
         await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+        return;
+    }
+    if ( url.startsWith(`${HOST}/frame?`) ) {
+        await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><body style="margin:0;background:#1e1e1e"></body>' });
         return;
     }
     if ( url.includes('/api/') ) {
@@ -422,6 +434,200 @@ const afterClose = await page.evaluate(() => ({
 push('GROUP 5: the window is actually gone once the shrink completes', ! afterClose.stillInDom, JSON.stringify(afterClose));
 push('GROUP 5 ACCEPTANCE (d), part 3: taskbar remains visible after the close fully completes',
     afterClose.taskbarDisplay !== 'none', `display=${afterClose.taskbarDisplay}`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP 6 — the Code window's full view (app-code lane A2, 2026-10-30)
+// ═══════════════════════════════════════════════════════════════════════════
+// The same seams GROUP 2 pins for minimise (`_ezil_minimise`) and the expand
+// hook (`_ezil_maximise`, `scale_window`), now driven by REAL clicks on the
+// Code window's own head, its context menu, its full-view strip and the
+// actions in its drawer's tray (`../ezil/ui/full-view.js` +
+// `../ezil/apps/code.js`; the tray since gate G3). Restoring must land on the
+// window's exact previous box, measured by the browser.
+const codeItem = await page.evaluate(() => {
+    const r = document.querySelector('.taskbar-item[data-app="code"]')?.getBoundingClientRect();
+    return r ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2 } : null;
+});
+push('GROUP 6 setup: Code is in the dock', !! codeItem);
+await page.mouse.click(codeItem.cx, codeItem.cy);
+await page.waitForSelector('.window[data-app="code"]', { timeout: 5000 });
+await sleep(400);
+const CODE = '.window[data-app="code"]';
+const codeState = () => page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    const r = el.getBoundingClientRect();
+    const bar = el.querySelector(':scope > .ezil-full-view-bar');
+    return {
+        rect: [r.left, r.top, r.width, r.height].map(Math.round),
+        full: el.classList.contains('ezil-fullbleed'),
+        head: getComputedStyle(el.querySelector(':scope > .window-head')).display,
+        bar: bar ? getComputedStyle(bar).display : 'MISSING',
+        taskbar: getComputedStyle(document.querySelector('.taskbar')).display,
+        minimized: el.getAttribute('data-is_minimized'),
+    };
+}, CODE);
+const centre = async (sel) => {
+    const r = await rectOf(sel);
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+};
+const vp = page.viewportSize();
+// Open the tray by focusing its toggle (a click would toggle it, and could
+// shut a tray its intro flash left open), then wait until it stops moving.
+const openTray = async () => {
+    await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
+    await page.waitForFunction((sel) => {
+        const d = document.querySelector(`${sel} > .ezil-app-drawer`);
+        return !! d && ! d.classList.contains('collapsed') && d.getAnimations({ subtree: true }).length === 0;
+    }, CODE, { timeout: 5000 });
+};
+// An empty point of the strip: a quarter of the way across, half its height.
+const stripPoint = () => page.evaluate((sel) => {
+    const b = document.querySelector(`${sel} > .ezil-full-view-bar`).getBoundingClientRect();
+    return { x: b.left + b.width / 4, y: b.top + b.height / 2 };
+}, CODE);
+const isFullView = (s) => s.full && s.head === 'none' && s.bar === 'flex' && s.taskbar === 'none'
+    && s.rect[0] === 0 && s.rect[1] === 0 && s.rect[2] === vp.width && s.rect[3] === vp.height;
+const windowedBox = await codeState();
+push('GROUP 6 setup: a dock click opens Code WINDOWED (head, taskbar, no top bar)',
+    ! windowedBox.full && windowedBox.head !== 'none' && windowedBox.bar === 'none' && windowedBox.taskbar !== 'none', JSON.stringify(windowedBox));
+
+let at = await centre(`${CODE} > .window-head .window-scale-btn`);
+await page.mouse.click(at.x, at.y);
+await sleep(300);
+push('🔴 GROUP 6: a real click on the green button takes the whole viewport (no head, no taskbar, top bar shown)',
+    isFullView(await codeState()), JSON.stringify(await codeState()));
+await openTray();
+const restoreHit = await page.evaluate((sel) => {
+    const b = document.querySelector(`${sel} > .ezil-app-drawer .dashboard-app-drawer-restore`).getBoundingClientRect();
+    return document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2)?.closest('button')?.getAttribute('aria-label') ?? null;
+}, CODE);
+push('GROUP 6: the tray\'s Restore window button is what a click at its centre hits', restoreHit === 'Restore window', String(restoreHit));
+at = await centre(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-restore`);
+await page.mouse.click(at.x, at.y);
+await sleep(300);
+let now = await codeState();
+push('🔴 GROUP 6: restore lands on the EXACT previous box, with head and taskbar back',
+    ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect) && now.head !== 'none' && now.taskbar !== 'none',
+    JSON.stringify({ now, before: windowedBox }));
+
+at = await centre(`${CODE} > .window-head .window-head-title`);
+await page.mouse.dblclick(at.x, at.y);
+await sleep(300);
+push('GROUP 6: a real double-click on the title enters full view', isFullView(await codeState()), JSON.stringify(await codeState()));
+at = await stripPoint();
+const stripHit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.className ?? null, at);
+await page.mouse.dblclick(at.x, at.y);
+await sleep(300);
+now = await codeState();
+push('GROUP 6: a real double-click on an empty point of the strip returns to the previous box',
+    stripHit === 'ezil-full-view-bar' && ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect),
+    JSON.stringify({ stripHit, now }));
+
+at = await centre(`${CODE} > .window-head .window-head-title`);
+await page.mouse.click(at.x, at.y, { button: 'right' });
+await sleep(250);
+const maximiseItem = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('.context-menu .context-menu-item')]
+        .find((i) => i.querySelector('.contextmenu-label')?.textContent.trim() === 'Maximize');
+    const r = el?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+});
+push('GROUP 6 setup: the head\'s context menu offers Maximize', !! maximiseItem);
+if ( maximiseItem ) await page.mouse.click(maximiseItem.x, maximiseItem.y);
+await sleep(300);
+push('GROUP 6: the context menu\'s Maximize reaches the same hook (full view)', isFullView(await codeState()), JSON.stringify(await codeState()));
+
+await openTray();
+at = await centre(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-minimize`);
+await page.mouse.click(at.x, at.y);
+await sleep(400);
+now = await codeState();
+push('🔴 GROUP 6: the tray\'s Show desktop gives the taskbar back before the window goes',
+    ['true', '1'].includes(now.minimized) && now.taskbar !== 'none' && ! now.full, JSON.stringify(now));
+await page.mouse.click(codeItem.cx, codeItem.cy);
+await sleep(700);
+push('GROUP 6: back from the dock it is in full view again', isFullView(await codeState()), JSON.stringify(await codeState()));
+
+// ── GROUP 6 geometry: full view keeps FILLING the viewport (2026-10-30) ─────
+// No fixed sleeps below: each read waits until nothing is moving the window
+// (no jQuery animation, no CSS transition), then reads twice, two frames apart.
+const settledGeometry = async () => {
+    await page.waitForFunction((s) => {
+        const w = document.querySelector(s);
+        return !! w && ! $(w).is(':animated') && w.getAnimations().length === 0;
+    }, CODE, { timeout: 5000 });
+    const read = () => page.evaluate(async (s) => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const w = document.querySelector(s);
+        const r = w.getBoundingClientRect();
+        const b = w.querySelector(':scope > .window-body').getBoundingClientRect();
+        const hit = (x, y) => document.elementFromPoint(x, y)?.closest('.window') === w;
+        return {
+            rect: [r.x, r.y, r.width, r.height], body: [b.x, b.y, b.width, b.height], vp: [innerWidth, innerHeight],
+            strip: Number.parseFloat(getComputedStyle(w).getPropertyValue('--ezil-control-strip-height')),
+            opacity: getComputedStyle(w).opacity, full: w.classList.contains('ezil-fullbleed'),
+            hits: hit(innerWidth / 2, innerHeight / 2) && hit(1, innerHeight - 1) && hit(innerWidth - 1, innerHeight - 1),
+        };
+    }, CODE);
+    const first = await read();
+    const second = await read();
+    return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
+};
+const fills = (g) => g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
+    && JSON.stringify(g.rect) === JSON.stringify([0, 0, g.vp[0], g.vp[1]])
+    && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+const resizeTo = async (width, height) => {
+    await page.setViewportSize({ width, height });
+    await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [width, height]);
+};
+let g = await settledGeometry();
+push('🔴 GROUP 6 geometry: back from the dock it FILLS the viewport (window = viewport, body below the strip, on top)', fills(g), JSON.stringify(g));
+await resizeTo(1100, 720);
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: a viewport resize while full keeps filling (1100x720)', fills(g) && g.vp[0] === 1100, JSON.stringify(g));
+// A relaunch onto the open window: what a dock click or Back/Forward onto
+// `/app/code` does (registry.js: `showWindow()`, then `_ezil_relaunch` with
+// no view). `showWindow` used to write back the box the last minimise
+// recorded (here the 1280x860 viewport), and the window kept its class.
+const origBeforeRelaunch = await page.evaluate((s) => document.querySelector(s).getAttribute('data-orig-width'), CODE);
+push('GROUP 6 geometry setup: the last minimise left its snapshot (the old viewport width) on the window',
+    Number(origBeforeRelaunch) === vp.width, String(origBeforeRelaunch));
+await page.evaluate(async () => {
+    const p = window.__EZIL_BOOT__;
+    await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState });
+});
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: a relaunch onto the open full Code (dock / Back-Forward) leaves it filling the RESIZED viewport, '
+    + 'not the box its last minimise recorded', fills(g) && g.vp[0] === 1100, JSON.stringify(g));
+// Minimised from full view, the viewport changes, then back from the dock.
+await openTray();
+await page.locator(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-minimize`).click();
+await page.waitForFunction((s) => ['true', '1'].includes(document.querySelector(s).getAttribute('data-is_minimized')), CODE);
+await resizeTo(1180, 780);
+await page.locator('.taskbar-item[data-app="code"]').click();
+await page.waitForSelector(`${CODE}.ezil-fullbleed`, { timeout: 5000 });
+g = await settledGeometry();
+push('🔴 GROUP 6 geometry: restored from minimised-in-full after a resize, it fills the NEW viewport (1180x780)',
+    fills(g) && g.vp[0] === 1180, JSON.stringify(g));
+await resizeTo(vp.width, vp.height);
+g = await settledGeometry();
+push('GROUP 6 geometry: and back at the original viewport it still fills', fills(g) && g.vp[0] === vp.width, JSON.stringify(g));
+
+// Keyboard modality, so `:focus-visible` applies: from the tray's toggle, Tab
+// to Show desktop, Tab to Restore window.
+await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
+await page.keyboard.press('Tab');
+await page.keyboard.press('Tab');
+const ring = await page.evaluate(() => {
+    const el = document.activeElement;
+    return el?.classList.contains('dashboard-app-drawer-restore') ? getComputedStyle(el).outlineStyle : `focus on ${el?.className ?? el?.tagName}`;
+});
+await page.keyboard.press('Enter');
+await sleep(300);
+now = await codeState();
+push('GROUP 6: the restore button works from the keyboard (Enter) and shows a focus ring',
+    ! now.full && JSON.stringify(now.rect) === JSON.stringify(windowedBox.rect) && ring !== 'none', JSON.stringify({ now, ring }));
+push('GROUP 6: no Fullscreen API element at any point', await page.evaluate(() => document.fullscreenElement === null));
 
 push('no uncaught page errors during the whole run', page_errors.length === 0, JSON.stringify(page_errors));
 

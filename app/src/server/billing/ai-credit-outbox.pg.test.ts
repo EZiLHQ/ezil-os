@@ -7,7 +7,8 @@ import * as schema from '@/server/db/schema';
 import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts, hasAiReversals, aiCreditRestoreItem } from './ai-credits';
 import { findPack } from './catalog';
-import { createAiCreditOutboxStore, requeueFailedAiCredits } from './ai-credit-outbox-store';
+import { AI_CREDIT_KICK_SQL, createAiCreditOutboxStore, requeueFailedAiCredits } from './ai-credit-outbox-store';
+import { AI_CREDIT_PROTOCOL } from './ai-credits';
 import { CATALOG_V3 } from './v3/contract';
 import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbox';
 import { enqueueFreeAiCredits } from './ai-balance';
@@ -158,6 +159,15 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
             expiresAt: '2026-11-04T00:00:00.000Z', deliveredAt: new Date(NOW).toISOString() }]);
         expect(await store.receiptsFor!(randomUUID())).toEqual([]);
     });
+    it('round 5 D1 review fix: marks a terminally failed undelivered grant receipt as failed (never waiting)', async () => {
+        await billing.enqueueOutbox(item());
+        const claimed = (await store.claim(NOW))!;
+        await store.finish(claimed, { status: 'failed', reason: 'attempts_exhausted' }, NOW);
+        expect(await store.receiptsFor!(userId)).toEqual([{ entitlementId: item().payload.entitlementId, credits: 200,
+            expiresAt: '2026-11-04T00:00:00.000Z', deliveredAt: null, failed: true }]);
+        await requeueFailedAiCredits(db, { userId, apply: true, now: NOW });
+        expect((await store.receiptsFor!(userId))[0]).not.toHaveProperty('failed');
+    });
     it('claims only whole-credit rows and marks success once', async () => {
         await billing.enqueueOutbox({ eventKey: `legacy:${userId}`, userId, kind: 'ai_grant', payload: { amountUsdMicro: '100000' } });
         await billing.enqueueOutbox(item());
@@ -219,6 +229,94 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         expect((await rows())[0]).toMatchObject({ attempts: 10, lastError: 'attempts_exhausted',
             payload: expect.objectContaining({ delivery: { status: 'failed', nextAttemptAt: null } }) });
         expect(await store.claim(NOW + 86400000)).toBeNull();
+    });
+    describe('round 5 D1: needs_ezil_id park and the sign-in kick', () => {
+        const grantFor = (owner: string, suffix: string) => aiCreditOutboxItem(owner, aiCreditEntitlement({ userId: owner,
+            sku: 'standard_monthly_v3', subscriptionId: `sub_${suffix}_${owner}`, periodStart: start, periodEnd: end, invoiceId: 'in' }), 'grant', 'in');
+        const DAY = 24 * 3_600_000;
+        async function kick(owner: string, at: number) {
+            // The exact statement text the sign-in enrollment sends, bound inside this rollback-only transaction.
+            await db.execute(sql.raw(`prepare r5_kick(uuid, bigint, text) as ${AI_CREDIT_KICK_SQL}`));
+            try { await db.execute(sql.raw(`execute r5_kick('${owner}', ${at}, '${AI_CREDIT_PROTOCOL}')`)); }
+            finally { await db.execute(sql.raw('deallocate r5_kick')); }
+        }
+        const byKey = async () => new Map((await db.select().from(billingOutbox)).map(r => [r.eventKey, r]));
+
+        it('the drain parks a needs_ezil_id grant for 24 h as a dependency wait with blockedBy, never failed', async () => {
+            await billing.enqueueOutbox(item());
+            const parked = { ...store, accountFor: async () => null, enrollFor: vi.fn(async () => 'needs_ezil_id' as const) };
+            const counts = await drainAiCreditOutbox({ config: { fundingUrl: 'https://gateway.test', fundingHmacSecret: 'test-key' },
+                aiCredits: parked, clock: () => NOW, fetch: vi.fn<typeof fetch>() }, { limit: 5, deadlineMs: NOW + 40_000 });
+            expect(counts).toMatchObject({ claimed: 1, retry: 1, failed: 0, skipped: 1 });
+            expect(parked.enrollFor).toHaveBeenCalledExactlyOnceWith(userId);
+            expect((await rows())[0]).toMatchObject({ attempts: 1, lastError: 'no_ai_account', deliveredAt: null,
+                payload: expect.objectContaining({ delivery: { status: 'retry', nextAttemptAt: NOW + DAY, dependencyWaits: 1, blockedBy: 'needs_ezil_id' } }) });
+            expect(await store.claim(NOW + DAY - 1)).toBeNull();
+            await kick(userId, NOW + 60_000);
+            expect(await store.claim(NOW + 60_000)).toMatchObject({ userId, attempts: 2, dependencyWaits: 1 });
+        });
+
+        it('wakes only this user\'s retry rows waiting on the account; processing, other errors, delivered and other users stay', async () => {
+            const other = randomUUID(); await db.insert(authUsers).values({ id: other });
+            const waiting = grantFor(userId, 'a'), notFound = grantFor(userId, 'b'), gateway = grantFor(userId, 'c');
+            const held = grantFor(userId, 'd'), delivered = grantFor(userId, 'e'), foreign = grantFor(other, 'f');
+            for (const [i, row] of [waiting, notFound, gateway, held, delivered, foreign].entries()) {
+                await billing.enqueueOutbox(row);
+                await db.update(billingOutbox).set({ createdAt: new Date(NOW - 10_000 + i) }).where(eq(billingOutbox.eventKey, row.eventKey));
+            }
+            const finishes: [string, Parameters<AiCreditOutboxStore['finish']>[1]][] = [
+                [waiting.eventKey, { status: 'retry', reason: 'no_ai_account', blockedBy: 'needs_ezil_id', nextAttemptAt: NOW + DAY }],
+                [notFound.eventKey, { status: 'retry', reason: 'account_not_found', nextAttemptAt: NOW + 3_600_000 }],
+                [gateway.eventKey, { status: 'retry', reason: 'http_503', nextAttemptAt: NOW + 3_600_000 }],
+                [held.eventKey, { status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 1 }],
+                [delivered.eventKey, { status: 'done', reason: null }],
+                [foreign.eventKey, { status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + DAY }],
+            ];
+            for (const [key, result] of finishes) {
+                const claimed = (await store.claim(NOW))!;
+                expect(claimed.eventKey).toBe(key);
+                await store.finish(claimed, result, NOW);
+            }
+            // `held` is re-claimed by a worker (processing under its lease) before the kick.
+            const leased = (await store.claim(NOW + 1))!;
+            expect(leased.eventKey).toBe(held.eventKey);
+            // Another protocol's row with the same wait reason is never woken by a v1 kick.
+            const v2Key = `ezil-ai-credits-v2:${userId}:grant`;
+            await db.insert(billingOutbox).values({ eventKey: v2Key, userId, kind: 'ai_grant', lastError: 'no_ai_account',
+                payload: { protocol: 'ezil-ai-credits-v2', delivery: { status: 'retry', nextAttemptAt: NOW + DAY } } });
+            const before = await byKey();
+            await kick(userId, NOW + 5_000);
+            const after = await byKey();
+            const delivery = (key: string) => (after.get(key)!.payload as { delivery: Record<string, unknown> }).delivery;
+            expect(delivery(waiting.eventKey)).toEqual({ status: 'retry', nextAttemptAt: NOW + 5_000, dependencyWaits: 1, blockedBy: 'needs_ezil_id' });
+            expect(delivery(notFound.eventKey)).toEqual({ status: 'retry', nextAttemptAt: NOW + 5_000, dependencyWaits: 1 });
+            for (const key of [gateway.eventKey, held.eventKey, delivered.eventKey, foreign.eventKey, v2Key]) {
+                expect(after.get(key)!.payload).toEqual(before.get(key)!.payload);
+            }
+            for (const [key, row] of after) expect(row.attempts).toBe(before.get(key)!.attempts);
+            // The held worker's fence still matches: the kick did not touch its delivery JSON.
+            await store.finish(leased, { status: 'done', reason: null }, NOW + 6_000);
+            expect((await byKey()).get(held.eventKey)!.deliveredAt).not.toBeNull();
+            expect((await store.claim(NOW + 5_000))!.eventKey).toBe(waiting.eventKey);
+            expect((await store.claim(NOW + 5_000))!.eventKey).toBe(notFound.eventKey);
+            expect(await store.claim(NOW + 5_000)).toBeNull();
+        });
+
+        it('review fix (lost wakeup): a kick that lands while the drain holds the row cannot strand it for a day', async () => {
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            await billing.enqueueOutbox(item());
+            let linked = false;
+            // Stale admin read (before the bridge linked the subject); the bridge then enrolls and kicks.
+            const racing = { ...store, accountFor: async () => (linked ? 'works-public-id' : null),
+                enrollFor: vi.fn(async () => { linked = true; await kick(userId, NOW + 1); return 'needs_ezil_id' as const; }) };
+            const counts = await drainAiCreditOutbox({ config: { fundingUrl: 'https://gateway.test', fundingHmacSecret: 'test-key' },
+                aiCredits: racing, clock: () => NOW, fetch: vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 })) },
+            { limit: 1, deadlineMs: NOW + 40_000 });
+            expect(counts).toMatchObject({ claimed: 1, done: 1 });
+            expect((await rows())[0]).toMatchObject({ deliveredAt: new Date(NOW),
+                payload: expect.objectContaining({ accountPublicId: 'works-public-id' }) });
+            info.mockRestore();
+        });
     });
     it('a revoke retains the original grant account without requiring the Works view', async () => {
         await billing.enqueueOutbox(item());

@@ -5,18 +5,21 @@ import { z } from 'zod';
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
 import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
 import { getBillingDeps } from '@/server/billing/deps';
-import type { BillingDeps, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
+import type { SubscriptionRow } from '@/server/billing/meters';
+import type { BillingDeps, PaymentIssueRow, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
-import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3 } from '@/server/billing/v3/summary';
+import { operatorGrantedSubscription, planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
+import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
+import { deriveStanding } from '@/server/billing/v3/standing';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
-import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
+import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
     type SizeCode,
@@ -25,6 +28,7 @@ import {
     type CancelAtPeriodEndOutput, type SetOverageOutput, type SelectSizeOutput,
 } from '@/server/billing/v2/contract';
 import { buildSummaryV2, hasOveragePaymentFailure, summaryMeters } from '@/server/billing/v2/summary';
+import type { ReverseMovePlacementView } from '@/server/lib/compute/provider-reverse';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -69,10 +73,38 @@ function paidSubscription(plan: { subscriptionId: string | null; planActive: boo
 
 async function ownedSubscription(deps: BillingDeps, stripe: StripeApi, userId: string, subscriptionId: string,
     disallowed?: 'upgrade_not_allowed' | 'downgrade_not_allowed') {
+    // Promotion review: an operator-granted plan has no Stripe subscription to read or change (the summary
+    // offers no action for it; this refuses a direct call before any Stripe request or store write).
+    if (operatorGrantedSubscription(subscriptionId)) throw billingError(disallowed ?? 'not_subscribed', 'PRECONDITION_FAILED');
     const subscription = await stripeCall(() => stripe.retrieveSubscription(subscriptionId), disallowed);
     const customer = await deps.store.stripeCustomerFor(userId);
     if (subscription.customer !== customer) throw billingError('customer_conflict', 'CONFLICT');
     return subscription;
+}
+
+/** The only subscription statuses Stripe never bills again; any other (or an unknown) status is a live subscription. */
+const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * Promotion review (double subscription): the local plan lags Stripe until the webhook lands, and every
+ * Checkout Session has its own idempotency key, so two windows (or one slow webhook) could each pay for a
+ * plan. Before a subscription Checkout for an existing customer: expire that customer's other open
+ * subscription-mode sessions (only the new one can then be paid), THEN ask Stripe for a live subscription
+ * (one completed before the expiry is listed; one completing during it makes the expiry fail). Any Stripe
+ * failure refuses (`stripe_unavailable`); a live subscription refuses `already_subscribed`. Fail-closed.
+ */
+async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: string): Promise<void> {
+    const subscriptions = await stripeCall(async () => {
+        const open = await stripe.listOpenCheckoutSessions(customerId);
+        for (const session of open) {
+            if (session.mode === 'subscription') await stripe.expireCheckoutSession(session.id);
+        }
+        return stripe.listCustomerSubscriptions(customerId);
+    });
+    // Decided outside stripeCall, which would turn this refusal into stripe_unavailable.
+    if (subscriptions.some(subscription => !ENDED_SUBSCRIPTION_STATUSES.has(subscription.status))) {
+        throw billingError('already_subscribed', 'CONFLICT');
+    }
 }
 
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
@@ -100,27 +132,259 @@ async function aiReceipts(deps: BillingDeps, userId: string) {
 }
 
 type PlacementProvider = 'aws-ec2' | 'cloudflare' | null;
+type AiMemberLookup = (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<string | null>;
+type AiEnrollmentState = BillingSummaryV3['ai']['enrollment'];
+
+/** EZiL ID sign-in page that returns to the desktop; the `needs_ezil_id` CTA. */
+export const EZIL_ID_SIGN_IN_URL = '/auth/auth0/login?returnUrl=/os';
+
+/**
+ * Round 5 D1: whether this account can receive AI credits, from the Works member row and the stored
+ * EZiL ID subject (never the Gateway): a member is `enrolled`; a linked subject without a member is
+ * `activating` (the outbox drain enrolls it); otherwise `needs_ezil_id`. A database without the Works
+ * member view (enrollment does not apply there) or a lookup failure keeps the `enrolled` default
+ * (no false CTA, top-up unchanged); only the failure logs a fixed warning.
+ */
+async function aiEnrollmentOf(lookup: AiMemberLookup, db: { execute(query: SQL): Promise<unknown> },
+    user: { id: string; app_metadata?: Record<string, unknown> | null }): Promise<AiEnrollmentState> {
+    try {
+        if (await lookup(db, user.id)) return 'enrolled';
+    } catch (error) {
+        if (!missingAiAccountView(error)) console.warn('[billing.ai] enrollment state unavailable');
+        return 'enrolled';
+    }
+    const sub = user.app_metadata?.auth0_sub;
+    return typeof sub === 'string' && sub.length > 0 ? 'activating' : 'needs_ezil_id';
+}
+
+/** The EZiL ID link when EZiL ID sign-in is configured (lazy: auth0.ts is server-only). */
+async function ezilIdSignInUrl(): Promise<string | null> {
+    try {
+        const { auth0Enabled } = await import('@/server/auth/auth0');
+        return auth0Enabled() ? EZIL_ID_SIGN_IN_URL : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Round 5 D3: one aws-ec2 computer's data volume, for its real size. */
+export interface AwsVolumeRef { computerId: string; region: string; volumeId: string }
+/**
+ * Round 4 provider (standing) plus, round 5 D3, the user's aws-ec2 data volumes (real disk size), plus,
+ * round 6 (R4-02), the metered size every aws-ec2 placement is on; omitted when there is none, any type is
+ * unreadable or unlisted, or they differ.
+ */
+export interface UserPlacement {
+    provider: PlacementProvider; awsVolumes: AwsVolumeRef[]; awsSize?: SizeCode;
+    /**
+     * Phase B (REVERSE-MOVE-CONTRACT §6.1.1): the live computers this read already lists, each with its provider and, for an
+     * aws-ec2 one, the placement record it already reads (null when that read threw, as for the volume). Omitted by
+     * injected doubles and with placement reads off: then there is no move computer.
+     */
+    computers?: { computerId: string; provider: string | null; placement: ReverseMovePlacementView | null }[];
+}
+type DbReader = { execute(query: SQL): Promise<unknown> };
 
 /**
  * Round 4: where the user's files are, for the computer's standing. Any aws-ec2 placement among the user's
- * LIVE computers counts (a user may have two). Read-only, through the placement module's own reader (only
- * placement.ts names the placement table); null with placement reads off, without the placement table
- * (billing-only databases) or on any read error: the summary never fails on it.
+ * LIVE computers counts (a user may have two). Read-only, through the placement module's own readers (only
+ * placement.ts names the placement table); provider null with placement reads off, without the placement
+ * table (billing-only databases) or on any read error: the summary never fails on it.
+ * Round 5 D3: each aws-ec2 placement's {region, volumeId}, from the placement module's full read
+ * (owner-checked). That read is separate: when it fails the provider stands and only the volume is missing.
+ * Round 6 (R4-02): the same read gives each placement's instance type, metered as the start gate meters it.
  */
-export async function userPlacementProvider(db: { execute(query: SQL): Promise<unknown> }, userId: string): Promise<PlacementProvider> {
+export async function userPlacement(db: DbReader, userId: string): Promise<UserPlacement> {
     try {
-        const [{ isPlacementReadEnabled }, { readPlacementProvider }, { computers }] = await Promise.all([
-            import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema')]);
-        if (!isPlacementReadEnabled()) return null;
-        const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computers.id}::text AS id FROM ${computers}
-            WHERE ${computers.userId} = ${userId}::uuid AND ${computers.deletedAt} IS NULL`);
+        const [{ isPlacementReadEnabled, meteredSizeForInstanceType }, { readPlacement, readPlacementProvider }, { computers: computersTable },
+            { reversePlacementView }] = await Promise.all([
+            import('@/server/lib/compute/aws-config'), import('@/server/lib/compute/placement'), import('@/server/db/schema'),
+            import('@/server/lib/compute/provider-reverse')]);
+        // Phase B (§6.1.1 rule 4): with placement reads off there are no computer ids, so there is no move computer.
+        if (!isPlacementReadEnabled()) return { provider: null, awsVolumes: [], computers: [] };
+        const result = await db.execute(sql`/* billing:live-computers */ SELECT ${computersTable.id}::text AS id FROM ${computersTable}
+            WHERE ${computersTable.userId} = ${userId}::uuid AND ${computersTable.deletedAt} IS NULL`);
         const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] } | null)?.rows ?? []) as Record<string, unknown>[];
-        const providers = await Promise.all(rows.map(row => typeof row.id === 'string' ? readPlacementProvider(db, row.id) : null));
-        return providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(provider => provider !== null) ? 'cloudflare' : null;
+        const ids = rows.map(row => row.id).filter((id): id is string => typeof id === 'string');
+        const providers = await Promise.all(ids.map(id => readPlacementProvider(db, id)));
+        const provider = providers.includes('aws-ec2') ? 'aws-ec2' : providers.some(p => p !== null) ? 'cloudflare' : null;
+        const awsVolumes: AwsVolumeRef[] = [];
+        const awsSizes: (SizeCode | null)[] = [];
+        // Phase B (§6.1.1): no new placement query; the records read below, for the summary's move computer.
+        const computers: NonNullable<UserPlacement['computers']> = ids.map((computerId, index) => ({ computerId: computerId.toLowerCase(),
+            provider: providers[index] ?? null,
+            placement: providers[index] === 'cloudflare' ? { provider: 'cloudflare' as const, state: null, leaseEpoch: null, lifecycleJobId: null, instanceType: null } : null }));
+        for (const [index, id] of ids.entries()) {
+            if (providers[index] !== 'aws-ec2') continue;
+            try {
+                const { record } = await readPlacement(db, id, userId);
+                if (record?.provider === 'aws-ec2' && record.region && record.volumeId)
+                    awsVolumes.push({ computerId: record.computerId, region: record.region, volumeId: record.volumeId });
+                awsSizes.push(record?.provider === 'aws-ec2' ? meteredSizeForInstanceType(record.instanceType) : null);
+                computers[index]!.placement = record?.provider === 'aws-ec2' ? reversePlacementView(record) : null;
+            } catch {
+                console.warn('[billing.summary] volume placement unavailable');
+                awsSizes.push(null);
+            }
+        }
+        const awsSize = awsSizes[0] ?? null;
+        return { provider, awsVolumes, ...(awsSize !== null && awsSizes.every(size => size === awsSize) ? { awsSize } : {}), computers };
     } catch {
         console.warn('[billing.summary] placement unavailable');
-        return null;
+        return { provider: null, awsVolumes: [] };
     }
+}
+
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1.1): the summary's move computer and its newest reverse row, from the
+ * live computers `userPlacement` already read (no new placement query, no new store method). First match wins:
+ * 1. the computer whose newest row HOLDS (in flight or `failed_needs_operator`; a holding row is always the newest);
+ * 2. else the user's aws-ec2 computer (a Free user holds at most one; with several, the lowest id);
+ * 3. else the computer whose newest row is terminal and visible (24 h, DB clock), the most recent: after a commit;
+ * 4. else none (no keys' worth of move: `reverseMove` null, `moveOnOpen` and `moveAvailable` false).
+ * 🔴 Probes 0012 first: a database without it (production today) gives `undefined`, today's summary exactly. Any read that
+ * fails gives `undefined` too: no move action is ever shown from a read that did not complete.
+ */
+export async function reverseMoveSummaryInput(db: DbReader, placement: UserPlacement, user: { id: string; email?: unknown },
+    isOperator: (email: string) => boolean | Promise<boolean>, env: Record<string, string | undefined> = process.env)
+    : Promise<ReverseMoveSummaryInput | undefined> {
+    const computers = placement.computers;
+    if (!computers) return undefined;
+    try {
+        const [{ createProviderReverseStore, REVERSE_MOVE_HOLDING, reverseMovesTablePresent }, { reverseFounderOwned, reverseMoveVisible },
+            { readAwsAdmissionConfig }] = await Promise.all([
+            import('@/server/lib/compute/provider-reverse-store'), import('@/server/lib/compute/provider-reverse'), import('@/server/lib/compute/aws-config')]);
+        const executor = db as unknown as Parameters<typeof reverseMovesTablePresent>[0];
+        if (!(await reverseMovesTablePresent(executor))) return undefined;
+        const store = createProviderReverseStore(executor);
+        const userId = user.id.toLowerCase();
+        const newest = await Promise.all(computers.map(c => store.readByComputer(c.computerId)));
+        // Another owner's row (a re-keyed computer) is never this user's move.
+        const entries = computers.map((c, i) => ({ ...c, row: newest[i]?.userId === userId ? newest[i]! : null }));
+        const holding = entries.find(e => e.row && REVERSE_MOVE_HOLDING.includes(e.row.state));
+        const aws = entries.filter(e => e.provider === 'aws-ec2').sort((a, b) => a.computerId < b.computerId ? -1 : a.computerId > b.computerId ? 1 : 0)[0];
+        const ended = entries.filter(e => e.row && !REVERSE_MOVE_HOLDING.includes(e.row.state) && reverseMoveVisible(e.row))
+            .sort((a, b) => a.row!.ages.stateEntered - b.row!.ages.stateEntered)[0];
+        const pick = holding ?? aws ?? ended ?? null;
+        const config = readAwsAdmissionConfig(env);
+        return {
+            tablePresent: true, row: pick?.row ?? null, placement: pick?.placement ?? null,
+            awsEnabled: config.enabled, killSwitchOn: config.enabled && config.killSwitch,
+            founderOwned: await reverseFounderOwned(user.email, isOperator),
+        };
+    } catch {
+        console.warn('[billing.summary] reverse move unavailable');
+        return undefined;
+    }
+}
+
+/** Round 4 reader kept for its callers: the provider only. */
+export async function userPlacementProvider(db: DbReader, userId: string): Promise<PlacementProvider> {
+    return (await userPlacement(db, userId)).provider;
+}
+
+/** Round 5 D3: a cached volume size lasts at most 5 minutes (a volume only changes size through a grow, Phase B). */
+const VOLUME_SIZE_TTL_MS = 5 * 60_000;
+/** Bounded: one entry per AWS computer read recently on this instance; the oldest goes first. */
+const VOLUME_SIZE_MAX_ENTRIES = 512;
+/** The summary never waits on EC2 for longer than this; slower reads fall back to the 50 GiB figure. */
+const VOLUME_SIZE_TIMEOUT_MS = 2_000;
+/**
+ * An unreadable volume (error, throttle, unknown, timeout) is held as unreadable this long, so a throttled
+ * EC2 is not re-asked on every summary: DescribeVolumes shares its rate limit with the admission-lock
+ * attachment check (aws-ec2.ts), whose failure sends a warm pool adopt down the cold path.
+ */
+const VOLUME_SIZE_NEGATIVE_TTL_MS = 30_000;
+
+type VolumeDescribe = (region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>;
+
+/**
+ * Round 5 D3: the data volume's real size in GiB (EC2 DescribeVolumes), cached per volume in a bounded map:
+ * a size for at most 5 minutes, an unreadable answer (error, missing size, unknown volume, timeout) as null
+ * for 30 s. Concurrent reads of one volume share one call, and a call that outlives the timeout still fills
+ * the cache when it lands. The caller shows the fallback for null, never a guess.
+ */
+export function createVolumeSizeReader(describe: VolumeDescribe, options: { now?: () => number; ttlMs?: number;
+    negativeTtlMs?: number; maxEntries?: number; timeoutMs?: number } = {}): (volume: AwsVolumeRef) => Promise<number | null> {
+    const now = options.now ?? Date.now, ttlMs = Math.min(options.ttlMs ?? VOLUME_SIZE_TTL_MS, VOLUME_SIZE_TTL_MS);
+    const negativeTtlMs = Math.min(options.negativeTtlMs ?? VOLUME_SIZE_NEGATIVE_TTL_MS, ttlMs);
+    const maxEntries = options.maxEntries ?? VOLUME_SIZE_MAX_ENTRIES, timeoutMs = options.timeoutMs ?? VOLUME_SIZE_TIMEOUT_MS;
+    const cache = new Map<string, { sizeGiB: number | null; at: number }>();
+    /** One in-flight call per volume; a call stuck past the negative TTL is replaced (bounded with the cache). */
+    const pending = new Map<string, { promise: Promise<number | null>; at: number }>();
+    const store = (key: string, sizeGiB: number | null) => {
+        cache.delete(key);
+        while (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
+        cache.set(key, { sizeGiB, at: now() });
+    };
+    return async ({ region, volumeId }) => {
+        const key = `${region}:${volumeId}`;
+        const hit = cache.get(key);
+        if (hit && now() - hit.at <= (hit.sizeGiB === null ? negativeTtlMs : ttlMs)) return hit.sizeGiB;
+        let inflight = pending.get(key);
+        if (!inflight || now() - inflight.at > negativeTtlMs) {
+            const call = { at: now() } as { promise: Promise<number | null>; at: number };
+            call.promise = (async () => {
+                try {
+                    const sizeGiB = (await describe(region, volumeId))?.sizeGiB;
+                    return typeof sizeGiB === 'number' && Number.isInteger(sizeGiB) && sizeGiB >= 1 ? sizeGiB : null;
+                } catch {
+                    return null;
+                }
+            })().then(sizeGiB => {
+                if (pending.get(key) === call) pending.delete(key);
+                store(key, sizeGiB);
+                return sizeGiB;
+            });
+            while (!pending.has(key) && pending.size >= maxEntries) pending.delete(pending.keys().next().value!);
+            pending.set(key, call);
+            inflight = call;
+        }
+        const call = inflight;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([call.promise, new Promise<null>(resolve => {
+                timer = setTimeout(() => {
+                    // Still in flight: unreadable for now; the late answer overwrites this when it lands.
+                    if (pending.get(key) === call) store(key, null);
+                    resolve(null);
+                }, timeoutMs);
+            })]);
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+}
+
+/** The app's own EC2 reader (the same collaborators the compute provider uses); nothing with AWS off. */
+const defaultVolumeSize = createVolumeSizeReader(async (region, volumeId) => {
+    const { sharedAwsSdkCollaborators } = await import('@/server/lib/compute/aws-clients');
+    return await sharedAwsSdkCollaborators(process.env).describer?.describeVolume(region, volumeId) ?? null;
+});
+
+/**
+ * Round 5 D3: the smallest size among `volumes` (never overclaim). An unreadable volume beside a readable one
+ * counts as the fallback (it may be a 50 GiB volume); null when none is readable (the summary's fallback).
+ */
+async function readVolumeGiB(volumes: readonly AwsVolumeRef[], read: (volume: AwsVolumeRef) => Promise<number | null>): Promise<number | null> {
+    const sizes = await Promise.all(volumes.map(volume => read(volume).catch(() => null)));
+    if (!sizes.some(size => typeof size === 'number')) return null;
+    return Math.min(...sizes.map(size => typeof size === 'number' ? size : DISK_FALLBACK_GIB));
+}
+
+type StoredEpochs = Awaited<ReturnType<BillingDeps['store']['epochsFor']>>;
+
+/**
+ * Round 6 review (dunning into the hold): a paid subscription without paid access rates the computer on Free's
+ * calendar month (summary.ts `computePlanV3`), which can start before the unpaid period; the epochs are then
+ * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState).
+ */
+async function computeWindowEpochs(deps: BillingDeps, userId: string, epochs: StoredEpochs, input: {
+    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null }): Promise<StoredEpochs> {
+    const plan = planFromSubscriptions(input);
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
+    const rated = computePlanV3(plan, standing, input);
+    return Date.parse(rated.window.start) < Date.parse(plan.window.start) ? deps.store.epochsFor(userId, new Date(rated.window.start)) : epochs;
 }
 
 /** Injecting the ports keeps session authorization real while tests replace billing effects. */
@@ -132,9 +396,35 @@ async function telemetryOperator(email: string | null | undefined): Promise<bool
 
 export function createBillingRouter(getDeps: () => BillingDeps,
     options: { isOperator?: (email: string | null | undefined) => boolean | Promise<boolean>;
-        placementProvider?: (db: { execute(query: SQL): Promise<unknown> }, userId: string) => Promise<PlacementProvider> } = {}) {
+        /** Round 4 (provider only); superseded by `placement`, kept for callers that inject it. */
+        placementProvider?: (db: DbReader, userId: string) => Promise<PlacementProvider>;
+        /** Round 5 D3: provider plus the user's aws-ec2 volumes. */
+        placement?: (db: DbReader, userId: string) => Promise<UserPlacement>;
+        /** Round 5 D3: a volume's real size in GiB, null when unreadable. */
+        volumeGiB?: (volume: AwsVolumeRef) => Promise<number | null>;
+        /** Round 5 D1: the AI member public id (default: `lookupAiAccount` on ctx.db, on the funding URL's member contract). */
+        aiMember?: AiMemberLookup } = {}) {
     const isOperator = options.isOperator ?? telemetryOperator;
-    const placementOf = options.placementProvider ?? userPlacementProvider;
+    const aiMember: AiMemberLookup = options.aiMember
+        ?? ((db, userId) => lookupAiAccount(db as Parameters<typeof lookupAiAccount>[0], userId, getDeps().config.fundingUrl,
+            { strict: true }));
+    const legacyPlacement = options.placementProvider;
+    const placementOf = options.placement ?? (legacyPlacement
+        ? async (db: DbReader, userId: string): Promise<UserPlacement> => ({ provider: await legacyPlacement(db, userId), awsVolumes: [] })
+        : userPlacement);
+    const volumeSize = options.volumeGiB ?? defaultVolumeSize;
+    /** Never throws: an unreadable placement is no provider and no volume (fallback disk). */
+    const placementAndVolume = async (db: DbReader, userId: string, computerId?: string) => {
+        let placement: UserPlacement;
+        try {
+            placement = await placementOf(db, userId);
+        } catch {
+            console.warn('[billing.summary] placement unavailable');
+            placement = { provider: null, awsVolumes: [] };
+        }
+        const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement };
+    };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
             const deps = getDeps();
@@ -147,17 +437,22 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, userCreatedAt, now });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, storage, consent, overageInvoices, sizePreference] = await Promise.all([
+            // Round 6 (R1-07/R1-09): the placement provider and open payment issues give usage the summary's
+            // standing, so under the D16 hold both show the held AWS computer and its disk.
+            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
                 deps.store.overageInvoicesFor(ctx.user.id),
                 deps.store.sizePreference(ctx.user.id),
+                placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
+                deps.store.openPaymentIssues(ctx.user.id),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
-                consent, overageInvoices, planChanges: [], paymentIssues: [], sizePreference,
-                hasCustomer: false, computerId: input?.computerId });
+                consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
+                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -171,7 +466,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             ]);
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
-            const [epochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placementProvider] = await Promise.all([
+            const [periodEpochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
+                enrollmentState, ezilIdUrl] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -181,10 +477,16 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.stripeCustomerFor(ctx.user.id),
                 deps.store.overageInvoicesFor(ctx.user.id),
                 readStripePacks(deps.stripe),
-                placementOf(ctx.db, ctx.user.id),
+                placementAndVolume(ctx.db, ctx.user.id),
+                aiEnrollmentOf(aiMember, ctx.db, ctx.user),
+                ezilIdSignInUrl(),
             ]);
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
+            const reverseMove = await reverseMoveSummaryInput(ctx.db, placement.placement, ctx.user,
+                email => isOperator(email));
             let renewal = null;
-            if (plan.renewsAt && plan.subscriptionId && customer && deps.stripe?.previewRenewal) {
+            if (plan.renewsAt && plan.subscriptionId && !operatorGrantedSubscription(plan.subscriptionId) && customer && deps.stripe?.previewRenewal) {
                 try {
                     await ownedSubscription(deps, deps.stripe, ctx.user.id, plan.subscriptionId);
                     const next = await deps.stripe.previewRenewal(plan.subscriptionId);
@@ -199,7 +501,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
-                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider,
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
+                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
+                ...(reverseMove ? { reverseMove } : {}),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -230,7 +534,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
-            if (!customerId) {
+            if (customerId) {
+                await refuseLiveStripeSubscription(stripe, customerId);
+            } else {
+                // A customer created here has no subscription and no earlier Checkout Session to expire.
                 const customer = await stripeCall(() => stripe.createCustomer({
                     userId: ctx.user.id,
                     email: ctx.user.email ?? null,
@@ -272,6 +579,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const stripe = configuredStripe(deps);
             const publishableKey = deps.config.stripePublishableKey;
             if (!publishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            // Round 5 D1: credits bought before enrollment would only wait; same rule as summary actions.topup.
+            if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+            }
             const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
             if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
 

@@ -92,7 +92,7 @@ function isStripeModalFrame (iframe) {
     } catch { return false; }
 }
 
-export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -163,7 +163,11 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     if ( pack ) lines = [allowance];
     else if ( v3 ) {
         // Round 3 (plan §6.4, M8): the bullets in plan order, then "What happens next" beside the payment form.
-        lines = planBullets(offer).bullets;
+        // Promotion review: a Free user whose files are still on an AWS computer (the hold) gets that same
+        // computer and its disk back, never a new plan-sized one; the disk bullet names that disk, as the
+        // upgrade and downgrade sheets do (billing-sheets.js offerDetails).
+        const keepsComputer = summary?.computer?.filesOn === 'aws';
+        lines = planBullets(offer, { existingDisk: keepsComputer ? summary.computer.disk ?? {} : null }).bullets;
         const next = doc.createElement('section');
         next.className = 'ezil-billing-next';
         next.setAttribute('aria-label', 'What happens next');
@@ -171,9 +175,11 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         heading.textContent = 'What happens next';
         const list = doc.createElement('dl');
         const credits = Number.isSafeInteger(offer.aiCredits?.amount) && offer.aiCredits.amount > 0 ? offer.aiCredits.amount.toLocaleString('en-US') : null;
+        const choice = (offer.machineChoice ?? []).length > 1;
         for ( const [term, detail] of [
             ['Today', credits ? `${offer.name} starts after payment and ${credits} AI credits are added.` : `${offer.name} starts after payment.`],
-            ['Your computer', (offer.machineChoice ?? []).length > 1 ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.'],
+            ['Your computer', keepsComputer ? `Your existing AWS computer and its disk are kept.${choice ? ' Choose 2, 4 or 8 vCPU in Settings → Computer.' : ''}`
+                : choice ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.'],
             ['Renews', 'Every month until you cancel in Settings → Billing.'],
         ] ) {
             const row = doc.createElement('div');

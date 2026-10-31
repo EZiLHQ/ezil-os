@@ -116,6 +116,10 @@ let codePreviewUrlMode = 'ok';
 const confirmScript = [];
 
 const mintedUrls = [];
+/** What the cheap status probe (`GET /api/shell/desktop?computerId=`) answers. Section 7k flips it. */
+let guacRunning = true;
+/** `computer.progress` (tRPC) for the transition watch, only while section 7j sets it; otherwise unstubbed (500), as before. */
+let progressAnswer = null;
 
 window.fetch = async (url, opts = {}) => {
     const u = String(url);
@@ -157,8 +161,12 @@ window.fetch = async (url, opts = {}) => {
             if ( confirmAnswer === undefined ) return json({ ok: false });
             return json({ ok: true, confirmed: confirmAnswer, status: confirmAnswer ? 200 : 500 });
         }
-        if ( (opts.method ?? 'GET') === 'GET' ) return json({ ok: true, guacamoleRunning: true });
+        if ( (opts.method ?? 'GET') === 'GET' ) return json({ ok: true, guacamoleRunning: guacRunning });
         return json({ ok: true, guacamoleUrl: 'https://8181-guac-u1-c1-nekodesktop.ezil.org/', frame: { confirmed: true } });
+    }
+
+    if ( progressAnswer && u.startsWith('/api/trpc/computer.progress') ) {
+        return json({ result: { data: { json: progressAnswer } } });
     }
 
     return json({ error: { code: 'STUB', message: 'not stubbed' } }, 500);
@@ -253,6 +261,11 @@ push('🔴 opening the window REQUESTS a URL (it did not have one already)',
     mintCalls.length === 1, `${mintCalls.length} mint call(s) after the click`);
 push('the mint is a POST carrying the computer id',
     mintCalls[0]?.method === 'POST' && mintCalls[0]?.body?.computerId === COMPUTER.id);
+// Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and only an ask
+// that says so may start moving a held computer's files. The body is exactly this; nothing else rides on the mint.
+push('🔴 r9: the mint body is exactly { computerId, intent: \'open\' }',
+    JSON.stringify(mintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+    JSON.stringify(mintCalls[0]?.body));
 push('🔴 it minted from `/api/shell/code-preview-url`, NOT `/api/shell/preview-url`',
     ! calls.slice(callsBeforeOpen).some(c => c.url.startsWith(ENDPOINTS.previewUrl)));
 
@@ -288,6 +301,9 @@ push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     `${remintCalls.length} mint(s); src changed: ${iframe2?.getAttribute('src') !== firstUrl}`);
 push('and the fresh URL is the one the SECOND call returned',
     iframe2?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]);
+push('r9: the re-open\'s mint says intent \'open\' too',
+    JSON.stringify(remintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+    JSON.stringify(remintCalls[0]?.body));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. FRAME HONESTY, BOTH DIRECTIONS, inside the shell.
@@ -608,56 +624,573 @@ await settle(4);
     push('a CLOSED Code window no longer listens for restarts', mintedUrls.length === closedMints, `${mintedUrls.length - closedMints}`);
 }
 
-// The real Settings -> session -> Code path with a deferred restart response.
-// The app tests supply the runtime transition; here the built shell must wait for
-// that HTTP completion before minting, and must ignore it if Code closed meanwhile.
+// App-code lane A2 (2026-10-30): Settings → Troubleshoot no longer offers
+// "Restart desktop", so the Settings -> session -> Code restart path this block
+// used to drive no longer exists. What stays is the Code window's
+// `ezil:desktop-restarted` listener (5b above proves it still re-mints on a
+// direct dispatch). Here: with Code open, Troubleshoot renders no Restart
+// desktop control (negative), still renders Restart computer (positive), and
+// merely opening the pane re-mints nothing.
 {
     ENDPOINTS.restart = '/api/shell/restart';
-    const originalFetch = window.fetch;
-    let finishRestart;
-    let restartRequests = 0;
-    window.fetch = async (url, opts) => {
-        if (String(url) !== ENDPOINTS.restart) return originalFetch(url, opts);
-        restartRequests++;
-        return new Promise(resolve => { finishRestart = resolve; });
-    };
-    await ezil.registry.launch('desktop', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
-    await settle(6);
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(20);
     await ezil.registry.launch('settings');
     await settle(6);
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="troubleshoot"]'));
     await settle(4);
-    const startRestart = async () => {
-        click(q('.window[data-app="settings"] [data-action="restart"]'));
-        await settle(2);
-        click(qa('button').find(b => b.textContent.trim() === 'Restart'));
-        await settle(4);
-    };
-    const completeRestart = () => finishRestart?.({ ok: true, status: 200, json: async () => ({ ok: true }) });
-    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
-    await settle(20);
-    let before = mintedUrls.length;
-    const oldSrc = q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src');
-    await startRestart();
-    push('Settings dispatched one restart while Code is open', restartRequests === 1);
-    push('Code does not re-mint while the AWS restart response is pending', mintedUrls.length === before);
-    push('the pending restart has not assigned another Code frame URL',
-        q('.window[data-app="code"] .window-app-iframe')?.getAttribute('src') === oldSrc);
-    completeRestart();
-    await settle(20);
-    push('HTTP restart completion re-mints Code exactly once through the real Settings handler', mintedUrls.length === before + 1);
-
-    await startRestart();
-    push('a second restart is pending before Code closes', restartRequests === 2);
-    await window.$(q('.window[data-app="code"]')).close();
-    await settle(4);
-    before = mintedUrls.length;
-    completeRestart();
-    await settle(10);
-    push('closing Code during the restart prevents any late re-mint', mintedUrls.length === before && !q('.window[data-app="code"]'));
+    const pane = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+    const before = mintedUrls.length;
+    push('🔴 with Code open, Troubleshoot offers no Restart desktop control',
+        !! pane && ! pane.querySelector('[data-action="restart"]') && ! /Restart desktop/i.test(pane.textContent ?? ''));
+    push('…positive control: the same pane offers Restart computer',
+        !! pane?.querySelector('[data-action="restart-computer"]') && /Restart computer/.test(pane?.textContent ?? ''));
+    await settle(6);
+    push('opening Troubleshoot re-mints nothing in the open Code window', mintedUrls.length === before, `${mintedUrls.length - before}`);
     await window.$(q('.window[data-app="settings"]')).close();
-    window.fetch = originalFetch;
+    await window.$(q('.window[data-app="code"]')).close();
+    await settle(6);
     delete ENDPOINTS.restart;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5c. 🔴 ROUND 6 (R3-1/R3-2/R3-4, live 10-30 05:42-05:44Z). Code opened on a
+//     RUNNING AWS computer read "Almost there — waiting for Code to connect ·
+//     usually about 4 min" with the bar parked at 85 %, its mint was answered
+//     "starting" for two minutes, and the wake deadline would have ended it in
+//     "This is taking too long — Starting your computer…" over a running computer.
+//     Now it is a connect, and the same give-up (the existing bound) says Code
+//     is not reachable, with Try again. The clock is skewed, not waited.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const originalFetch = window.fetch, realNow = window.Date.now;
+    let skew = 0, progressAnswer = null, mintAsks = 0, progressFail = false, progressAsks = 0;
+    window.Date.now = () => realNow.call(window.Date) + skew;
+    window.fetch = async (url, opts) => {
+        const u = String(url);
+        if ( u.includes('/api/trpc/computer.progress') ) progressAsks++;
+        if ( u.includes('/api/trpc/computer.progress') && progressFail ) throw new Error('network');
+        if ( u.includes('/api/trpc/computer.progress') && progressAnswer ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: progressAnswer } } }) };
+        }
+        if ( u.startsWith(ENDPOINTS.codePreviewUrl) ) {
+            mintAsks++;
+            return { ok: true, status: 200, json: async () => ({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+                provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' }) };
+        }
+        return originalFetch(url, opts);
+    };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    /** The tab hidden or shown: the progress observer drops its answer on hide and asks at once on show. */
+    const setHidden = hidden => {
+        Object.defineProperty(doc, 'hidden', { configurable: true, get: () => hidden });
+        doc.dispatchEvent(new window.Event('visibilitychange'));
+    };
+    const RUNNING = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        durable: false, openingStartedAt: null, path: null, milestones: [], expectedSeconds: 30 };
+    const open = async (progress) => {
+        progressAnswer = progress; skew = 0; mintAsks = 0;
+        await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+        const w = q('.window[data-app="code"]');
+        const spinner = w?.querySelector('.ezil-app-spinner');
+        const text = sel => spinner?.querySelector(sel)?.textContent ?? '';
+        return { w, spinner, status: () => text('.ezil-opening-status'), meta: () => text('.ezil-opening-meta'),
+            title: () => text('.ezil-opening-title'), kind: () => spinner?.getAttribute('data-kind'),
+            percent: () => Number(spinner?.querySelector('.ezil-opening-bar')?.dataset.percent) };
+    };
+
+    const r = await open(RUNNING);
+    await waitFor(() => r.status() === 'Connecting to Code…', 3000);
+    push('🔴 R3-1: Code on a running computer says "Connecting to Code…", never "Almost there"',
+        r.status() === 'Connecting to Code…' && ! /Almost there/.test(r.spinner?.textContent ?? ''), r.status());
+    skew = 5_000;
+    await waitFor(() => r.meta().startsWith('0:05'), 2000);
+    push('🔴 R3-4: "0:05 · usually under a minute", never "usually about 4 min"',
+        r.meta() === '0:05 · usually under a minute' && ! /about 4 min/.test(r.spinner?.textContent ?? ''), r.meta());
+    push('🔴 R3-4: the bar is not parked at the 85% open floor', r.percent() > 85 && r.percent() < 100, String(r.percent()));
+    push('the mint is still asking (sandbox_starting is a wait, not a failure)', mintAsks >= 1 && r.kind() === 'progress', `${mintAsks} ${r.kind()}`);
+    // The wake loop's existing deadline (WAKE_DEADLINE_MS) passes on its next ask.
+    skew = 216_000;
+    await waitFor(() => r.kind() === 'failed', 6000);
+    const retry = r.spinner?.querySelector('.ezil-boot-retry');
+    push('🔴 R3-2: the give-up on a running computer reads "Code isn\'t reachable right now", with Try again',
+        r.kind() === 'failed' && r.title() === "Code isn't reachable right now" && !! retry && retry.hidden === false,
+        `${r.kind()} "${r.title()}" retry=${retry && ! retry.hidden}`);
+    push('🔴 ...and never the "Starting your computer" timeout copy over a running computer',
+        ! /This is taking too long|Starting your computer/.test(r.spinner?.textContent ?? ''), r.status());
+    push('...its body names Code and the running computer', /Code/.test(r.status()) && /running/.test(r.status()), r.status());
+    await window.$(r.w).close();
+    await settle(4);
+
+    // Not observed running (no AWS observation): the existing timeout copy is unchanged.
+    const n = await open(null);
+    await waitFor(() => mintAsks >= 1, 3000);
+    skew = 216_000;
+    await waitFor(() => n.kind() === 'failed', 6000);
+    push('without a running observation the give-up keeps the existing timeout copy',
+        n.kind() === 'failed' && n.title() === 'This is taking too long', `${n.kind()} "${n.title()}"`);
+    // A running answer that arrives only after that give-up (the tab was hidden, the polls failed) corrects it:
+    // the computer is running now, so the failure is Code's. Showing the tab again asks at once.
+    progressAnswer = RUNNING;
+    const asked = progressAsks;
+    setHidden(true); setHidden(false);
+    await waitFor(() => progressAsks > asked && n.title() === "Code isn't reachable right now", 2000);
+    push('🔴 R3-2: a running answer after a generic give-up turns it into "Code isn\'t reachable right now", with Try again',
+        n.kind() === 'failed' && n.title() === "Code isn't reachable right now"
+        && n.spinner?.querySelector('.ezil-boot-retry')?.hidden === false, `${n.kind()} "${n.title()}" asks=${progressAsks - asked}`);
+    await window.$(n.w).close();
+    await settle(4);
+
+    // 🔴 The give-up decides from this attempt's last answer, not the live one. A hidden tab (and a failed or
+    // slow poll) clears the live answer; the tab shown again repaints the state that was decided then.
+    // (Round 6 review probe: hidden across the give-up read "This is taking too long", and kept it.)
+    const h = await open(RUNNING);
+    await waitFor(() => h.status() === 'Connecting to Code…', 3000);
+    setHidden(true);
+    await waitFor(() => h.spinner?.dataset.progress === 'unavailable', 1000);
+    skew = 216_000;
+    await waitFor(() => h.kind() === 'failed', 6000);
+    push('🔴 R3-2: hidden across the give-up (no live answer) still reads "Code isn\'t reachable right now"',
+        h.kind() === 'failed' && h.title() === "Code isn't reachable right now" && h.spinner?.dataset.progress === 'unavailable',
+        `${h.kind()} "${h.title()}" progress=${h.spinner?.dataset.progress}`);
+    setHidden(false);
+    await waitFor(() => h.spinner?.dataset.progress === 'observed', 2000);
+    await settle(4);
+    push('🔴 ...and the tab shown again keeps it',
+        h.spinner?.dataset.progress === 'observed' && h.title() === "Code isn't reachable right now"
+        && ! /This is taking too long|Starting your computer/.test(h.spinner?.textContent ?? ''), `"${h.title()}" ${h.status()}`);
+    await window.$(h.w).close();
+    await settle(4);
+
+    // A progress poll that fails just before the give-up (network, its 15 s timeout): the same decision.
+    const f = await open(RUNNING);
+    await waitFor(() => f.status() === 'Connecting to Code…', 3000);
+    progressFail = true;
+    const before = progressAsks;
+    setHidden(true); setHidden(false);
+    await waitFor(() => progressAsks > before && f.spinner?.dataset.progress === 'unavailable', 2000);
+    await settle(2);
+    skew = 216_000;
+    await waitFor(() => f.kind() === 'failed', 6000);
+    push('🔴 R3-2: a failed progress poll before the give-up still reads "Code isn\'t reachable right now"',
+        f.kind() === 'failed' && f.title() === "Code isn't reachable right now" && f.spinner?.dataset.progress === 'unavailable',
+        `${f.kind()} "${f.title()}" progress=${f.spinner?.dataset.progress} asks=${progressAsks - before}`);
+    progressFail = false;
+    await window.$(f.w).close();
+    await settle(4);
+    delete doc.hidden;
+    window.fetch = originalFetch;
+    window.Date.now = realNow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5d. 🔴 ROUND 6a (seam C wiring + C2), through the BUILT bundle. The Code
+//     window hands its spinner `isPreparing: () => session.isComputePreparing(
+//     computer.id)` (code.js). Without that one line the spinner never learns
+//     the computer is taking its config and reads "Connecting to Code…" over
+//     the whole bounded wait. And the wait itself: preparing first seen at
+//     ~70 s, the container restarting, then the Worker's answer at ~222 s,
+//     past the old 215 s give-up (session.js PREPARE_DEADLINE_MS). The clock
+//     is skewed, not waited.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const originalFetch = window.fetch, realNow = window.Date.now;
+    let skew = 0, mintAsks = 0, mintAnswer = null;
+    window.Date.now = () => realNow.call(window.Date) + skew;
+    const RUNNING = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        durable: false, openingStartedAt: null, path: null, milestones: [], expectedSeconds: 30 };
+    const starting = { ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' };
+    const preparing = { ...starting, computePreparing: true };
+    window.fetch = async (url, opts) => {
+        const u = String(url);
+        if ( u.includes('/api/trpc/computer.progress') ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: RUNNING } } }) };
+        }
+        if ( u.startsWith(ENDPOINTS.codePreviewUrl) && mintAnswer ) {
+            mintAsks++;
+            const answer = mintAnswer;
+            return { ok: true, status: 200, json: async () => answer };
+        }
+        return originalFetch(url, opts);
+    };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    const PREPARING = 'Preparing Code — the first open after your computer starts takes a minute or two.';
+
+    // (a) The wiring: a preparing answer for THIS computer shows the preparing wait, not a connect.
+    mintAnswer = preparing; mintAsks = 0;
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    let w = q('.window[data-app="code"]');
+    let spinner = w?.querySelector('.ezil-app-spinner');
+    const status = () => spinner?.querySelector('.ezil-opening-status')?.textContent ?? '';
+    await waitFor(() => mintAsks >= 1 && status() === PREPARING, 8000);
+    push('🔴 seam C wiring: Code opened while its computer prepares shows the preparing wait, never "Connecting to Code…"',
+        mintAsks >= 1 && status() === PREPARING && ! /Connecting to Code|under a minute/.test(spinner?.textContent ?? ''),
+        `${mintAsks} ask(s): "${status()}"`);
+    await window.$(w).close();
+    await settle(4);
+
+    // (b) C2: plain starting answers until ~70 s, preparing, the container restarting (unflagged starting
+    //     answers), then the Worker's answer at ~222 s. The loop is still asking there, and Code opens.
+    mintAnswer = starting; mintAsks = 0; skew = 0;
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    w = q('.window[data-app="code"]');
+    spinner = w?.querySelector('.ezil-app-spinner');
+    const kind = () => spinner?.getAttribute('data-kind');
+    await waitFor(() => mintAsks >= 1, 8000);
+    skew = 70_000;
+    mintAnswer = preparing;
+    let asked = mintAsks;
+    await waitFor(() => mintAsks > asked && status() === PREPARING, 8000);
+    const preparingSeen = status() === PREPARING;
+    mintAnswer = starting;
+    skew = 222_000;
+    asked = mintAsks;
+    // Two asks past 215 s: the old deadline would have ended the loop at the first of them.
+    await waitFor(() => mintAsks >= asked + 2, 10_000);
+    push('🔴 C2: preparing first seen at ~70 s keeps Code waiting past 215 s (the Worker answers at ~222 s)',
+        preparingSeen && mintAsks >= asked + 2 && kind() === 'progress' && status() === PREPARING
+        && ! /isn't reachable|taking too long/.test(spinner?.textContent ?? ''),
+        `seen=${preparingSeen} asks=${mintAsks - asked} kind=${kind()} "${status()}"`);
+    const mintsBefore = mintedUrls.length;
+    mintAnswer = null; // the stub's own ok mint
+    await waitFor(() => mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1], 8000);
+    push('🔴 C2: the answer at ~222 s opens Code (its frame gets that URL), never "Code isn\'t reachable right now"',
+        mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]
+        && ! /isn't reachable/.test(spinner?.textContent ?? ''),
+        `${mintedUrls.length - mintsBefore} mint(s) kind=${kind()}`);
+    await window.$(w).close();
+    await settle(4);
+    window.fetch = originalFetch;
+    window.Date.now = realNow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. FULL VIEW, ITS STRIP AND TRAY, RELAUNCH, AND "RECONNECTING…" /
+//    "COMPUTER STOPPED" (app-code lane A2, 2026-10-30; the strip reshaped by
+//    gate G3, 2026-10-31; docs/APP-CODE-FULL-VIEW.md).
+//    jsdom: classes, attributes, inline geometry (what "restore the previous
+//    bounds" restores), computed `display` from the built CSS, events and
+//    storage. Pixels and hit-testing are os-chrome / feedback-browser's job.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const VIEW_KEY = 'ezil-os:view.code';
+    const store = window.sessionStorage;
+    const views = [];
+    const on_view = (e) => views.push(e.detail);
+    window.addEventListener('ezil:app-view-changed', on_view);
+    let fullscreen_calls = 0;
+    window.Element.prototype.requestFullscreen = function () { fullscreen_calls++; return Promise.resolve(); };
+    const codeWin = () => q('.window[data-app="code"]');
+    const shown = (el) => !! el && window.getComputedStyle(el).display !== 'none';
+    const taskbarShown = () => shown(q('.taskbar'));
+    const geom = (el) => JSON.stringify({ width: el?.style.width, height: el?.style.height, top: el?.style.top, left: el?.style.left });
+    const isFull = (el) => !! el?.classList.contains('ezil-fullbleed') && el.getAttribute('data-is_fullpage') === '1'
+        && ! taskbarShown() && ! shown(el.querySelector(':scope > .window-head')) && shown(el.querySelector(':scope > .ezil-full-view-bar'));
+    const isWindowed = (el) => !! el && ! el.classList.contains('ezil-fullbleed') && el.getAttribute('data-is_fullpage') !== '1'
+        && taskbarShown() && shown(el.querySelector(':scope > .window-head')) && ! shown(el.querySelector(':scope > .ezil-full-view-bar'));
+    const dblclick = (el) => el?.dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    // Gate G3: every window action is in the drawer's tray (Show desktop is
+    // `minimize`); the strip (`.ezil-full-view-bar`) is empty.
+    const trayBtn = (el, action) => el?.querySelector(`:scope > .ezil-app-drawer .dashboard-app-drawer-${action}`);
+    const bar = (el) => el?.querySelector(':scope > .ezil-full-view-bar');
+    const closeCode = async () => { if ( codeWin() ) { await window.$(codeWin()).close(); await settle(8); } };
+    const launchCode = async (extra = {}) => {
+        await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState, ...extra });
+        await settle(20);
+        return codeWin();
+    };
+
+    await closeCode();
+    // The Browser opened by an earlier section is set aside, so the taskbar
+    // checks below are about Code alone (two-window full view: full-view-test).
+    for ( const el of qa('.window[data-app="desktop"]') ) { await window.$(el).close(); }
+    await settle(8);
+    store.removeItem(VIEW_KEY);
+
+    // 7a. A launch with no view and nothing remembered (the dock) -> windowed.
+    const w = await launchCode();
+    push('7a 🔴 a launch with no view and nothing remembered opens WINDOWED (taskbar, head, no top bar)', isWindowed(w),
+        JSON.stringify({ cls: w?.className, fp: w?.getAttribute('data-is_fullpage'), taskbar: taskbarShown() }));
+    push('7a …at the windowed size, 980x680', w?.style.width === '980px' && w?.style.height === '680px', geom(w));
+    push('7a the window is a full-view host; its top bar and drawer exist and are hidden while windowed',
+        w?.classList.contains('ezil-full-view-host') && !! w.querySelector(':scope > .ezil-full-view-bar')
+        && !! w.querySelector(':scope > .ezil-app-drawer') && ! shown(w.querySelector(':scope > .ezil-app-drawer')));
+    push('7a nothing is announced or remembered by an open', views.length === 0 && store.getItem(VIEW_KEY) === null, JSON.stringify(views));
+    // `_ezil_view()`: the view the router records for this window's entry
+    // (docs/APP-ROUTES.md §5 "State"), read from the full-view state.
+    push('7a _ezil_view() reports the open, unannounced: "window"', w?._ezil_view?.() === 'window', String(w?._ezil_view?.()));
+    const windowed = geom(w);
+
+    // 7b. The green button -> full view.
+    click(w.querySelector(':scope > .window-head .window-scale-btn'));
+    await settle(4);
+    push('7b 🔴 the green button enters full view (class, data-is_fullpage, no taskbar, no head, top bar shown)', isFull(w),
+        JSON.stringify({ cls: w.className, taskbar: taskbarShown() }));
+    push('7b the window takes the viewport', w.style.width === '100%' && w.style.height === '100%', geom(w));
+    // Gate G3: the strip holds nothing of its own (the notch is the drawer, the
+    // Feedback icon is the body's); the tray carries the title and the actions.
+    push('7b 🔴 the strip is empty and presentational: no element, no text, aria-hidden, no role',
+        bar(w)?.children.length === 0 && bar(w).textContent === '' && bar(w).getAttribute('aria-hidden') === 'true'
+        && ! bar(w).hasAttribute('role') && ! w.querySelector('.ezil-full-view-title, .ezil-full-view-btn'),
+        bar(w)?.outerHTML);
+    push('7b 🔴 the tray carries the title and Show desktop / Restore window / Close, in that order, as labelled buttons',
+        w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-title')?.textContent === 'Code'
+        && [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].map(b => b.getAttribute('aria-label')).join()
+            === 'Show desktop,Restore window,Close'
+        && [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].every(b => b.type === 'button'),
+        [...w.querySelectorAll(':scope > .ezil-app-drawer .dashboard-app-drawer-btn')].map(b => b.getAttribute('aria-label')).join());
+    push('7b the tray toggle is a real, named button that reports its state',
+        w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-toggle')?.type === 'button'
+        && w.querySelector('.dashboard-app-drawer-toggle').getAttribute('aria-label') === 'Window controls'
+        && ['true', 'false'].includes(w.querySelector('.dashboard-app-drawer-toggle').getAttribute('aria-expanded')));
+    push('7b the drawer is shown in full view and sits before the bar in tab order',
+        shown(w.querySelector(':scope > .ezil-app-drawer'))
+        && w.querySelector(':scope > .ezil-app-drawer').nextElementSibling === w.querySelector(':scope > .ezil-full-view-bar')
+        && w.querySelector(':scope > .ezil-full-view-bar').nextElementSibling === w.querySelector(':scope > .window-body'));
+    push('7b …announced once as {appId:"code", view:"full"} and remembered as the user\'s choice',
+        views.length === 1 && views[0].appId === 'code' && views[0].view === 'full' && store.getItem(VIEW_KEY) === 'full', JSON.stringify(views));
+    push('7b 🔴 never the browser Fullscreen API (and full view DID engage)', fullscreen_calls === 0 && isFull(w));
+    push('7b _ezil_view() reports "full"', w._ezil_view() === 'full');
+    push('7b upstream maximise did not also run', w.getAttribute('data-is_maximized') !== '1');
+
+    // 7c. The same control again -> the window, at its previous bounds.
+    window.scale_window(w);
+    await settle(4);
+    push('7c 🔴 the green button toggles back to the window at the EXACT previous bounds', isWindowed(w) && geom(w) === windowed, `${geom(w)} vs ${windowed}`);
+    push('7c …announced {view:"window"} and remembered', views.length === 2 && views[1].view === 'window' && store.getItem(VIEW_KEY) === 'window');
+
+    // 7d. Title double-click -> full; a double-click on the strip -> window.
+    dblclick(w.querySelector(':scope > .window-head'));
+    await settle(4);
+    push('7d a title double-click enters full view', isFull(w));
+    dblclick(w.querySelector(':scope > .ezil-app-drawer .dashboard-app-drawer-toggle'));
+    await settle(4);
+    push('7d a double-click on the notch is not a strip double-click (still full)', isFull(w));
+    dblclick(bar(w));
+    await settle(4);
+    push('7d positive control: a double-click on the strip returns to the window, previous bounds', isWindowed(w) && geom(w) === windowed);
+    dblclick(w.querySelector(':scope > .window-head'));
+    await settle(4);
+
+    // 7e. The tray's Restore window and Show desktop; back from the taskbar.
+    click(trayBtn(w, 'restore'));
+    await settle(4);
+    push('7e the tray\'s "Restore window" returns to the window at the previous bounds', isWindowed(w) && geom(w) === windowed);
+    window.scale_window(w);
+    await settle(4);
+    click(trayBtn(w, 'minimize'));
+    await settle(8);
+    push('7e the tray\'s "Show desktop" hides the window and gives the taskbar back',
+        ['true', '1'].includes(w.getAttribute('data-is_minimized')) && taskbarShown() && ! w.classList.contains('ezil-fullbleed'));
+    push('7e 🔴 _ezil_view() still reports "full" while minimised from full view (no full-view class: the desire, not the class)',
+        w._ezil_view() === 'full' && ! w.classList.contains('ezil-fullbleed'));
+    window.$(w).showWindow();
+    await settle(24);
+    push('7e 🔴 back from the taskbar it is in full view again (the desire outlived the minimise)', isFull(w));
+    click(trayBtn(w, 'restore'));
+    await settle(4);
+    push('7e …and the tray\'s "Restore window" then returns to the window, previous bounds', isWindowed(w) && geom(w) === windowed);
+    push('7e positive control: _ezil_view() reports "window" once restored to the window', w._ezil_view() === 'window');
+    push('setup: windowed again before the relaunch checks', isWindowed(w) && geom(w) === windowed);
+
+    // 7f. The single-instance relaunch hook (contract item 4).
+    views.length = 0;
+    // A value no relaunch could write, so "nothing remembered" holds whichever
+    // view a relaunch applies (7b/7c are the positive control: gestures write it).
+    const remembered = 'sentinel';
+    store.setItem(VIEW_KEY, remembered);
+    push('7f the window exposes _ezil_relaunch', typeof w._ezil_relaunch === 'function');
+    w._ezil_relaunch({ view: 'full', project: '00000000-0000-4000-8000-000000000000', repo: 'r', anything: 1 });
+    await settle(2);
+    push('7f 🔴 relaunch with view "full" enters full view; the other keys are ignored', isFull(w) && views.map(v => v.view).join() === 'full');
+    push('7f 🔴 …and a relaunch to "full" is not remembered', store.getItem(VIEW_KEY) === remembered, String(store.getItem(VIEW_KEY)));
+    let threw = null;
+    try {
+        w._ezil_relaunch({ view: 'bogus' }); w._ezil_relaunch({}); w._ezil_relaunch(undefined);
+        w._ezil_relaunch({ project: 'p' }); w._ezil_relaunch({ view: 'FULL' });
+    } catch ( e ) { threw = e; }
+    await settle(2);
+    push('7f relaunch with no view or an unknown one changes nothing and never throws', ! threw && isFull(w) && views.length === 1, String(threw));
+    w._ezil_relaunch({ view: 'window' });
+    await settle(2);
+    push('7f relaunch with view "window" restores the window at its previous bounds',
+        isWindowed(w) && geom(w) === windowed && views.map(v => v.view).join() === 'full,window');
+    w._ezil_relaunch({ view: 'window' });
+    push('7f a relaunch to the view it already has announces nothing', views.length === 2);
+    // The same unknown values again, now WINDOWED: none of them may read as "full".
+    threw = null;
+    try {
+        for ( const c of [{ view: 'bogus' }, { view: 'FULL' }, { view: 'Full' }, { view: true }, { view: 1 }, {}, undefined, { project: 'p' }] ) {
+            w._ezil_relaunch(c);
+        }
+    } catch ( e ) { threw = e; }
+    await settle(2);
+    push('7f 🔴 while windowed, no view or an unknown one changes nothing and never throws',
+        ! threw && isWindowed(w) && geom(w) === windowed && views.length === 2, `${String(threw)} ${geom(w)} ${JSON.stringify(views)}`);
+    push('7f a relaunch is not the user\'s explicit choice: nothing remembered', store.getItem(VIEW_KEY) === remembered);
+    w._ezil_relaunch({ view: 'full' });
+    await settle(2);
+    push('7f positive control: the same windowed state still enters full view on view "full"',
+        isFull(w) && views.map(v => v.view).join() === 'full,window,full');
+    w._ezil_relaunch({ view: 'window' });
+    await settle(2);
+    push('setup: windowed again after the relaunch checks', isWindowed(w) && geom(w) === windowed);
+
+    // 7g. The title setter writes TEXT.
+    const evil = '<img src=x onerror="window.__ezilTitleInjected=1">';
+    w._ezil_set_title(evil);
+    await settle(2);
+    push('7g 🔴 _ezil_set_title writes text: head and tray show the string verbatim and contain no element',
+        w.querySelector(':scope > .window-head .window-head-title').textContent === evil
+        && w.querySelector('.dashboard-app-drawer-title').textContent === evil
+        && ! w.querySelector('.window-head-title *, .dashboard-app-drawer-title *')
+        && ! window.__ezilTitleInjected);
+    push('7g …and the strip still carries no title (gate G3: the title is the tray\'s)', bar(w)?.textContent === '' && bar(w).children.length === 0);
+    w._ezil_set_title('  ');
+    push('7g an empty title falls back to the app\'s name', w.querySelector('.dashboard-app-drawer-title').textContent === 'Code'
+        && w.querySelector(':scope > .window-head .window-head-title').textContent === 'Code');
+
+    // 7h. A launch with view "full" (the /app/code route).
+    await closeCode();
+    store.removeItem(VIEW_KEY);
+    views.length = 0;
+    const r = await launchCode({ view: 'full' });
+    push('7h 🔴 a launch with view "full" opens IN full view', isFull(r));
+    push('7h …without announcing it (the router pushes its entry after the launch) or remembering it',
+        views.length === 0 && store.getItem(VIEW_KEY) === null, JSON.stringify(views));
+    window.scale_window(r);
+    await settle(4);
+    push('7h leaving it lands on the 980x680 window the Code window was created as',
+        isWindowed(r) && r.style.width === '980px' && r.style.height === '680px', geom(r));
+    window.scale_window(r);
+    await settle(4);
+    await closeCode();
+    push('7h closing a Code window in full view gives the taskbar back', ! codeWin() && taskbarShown());
+
+    // 7i. The dock, after an explicit choice.
+    push('setup: the user\'s last explicit choice was full', store.getItem(VIEW_KEY) === 'full');
+    const d = await launchCode();
+    push('7i 🔴 a launch with no view opens in full view when the user\'s last explicit choice in this tab was full', isFull(d));
+    window.scale_window(d);
+    await settle(4);
+    await closeCode();
+    const d2 = await launchCode();
+    push('7i …and windowed once their last explicit choice was the window', isWindowed(d2) && store.getItem(VIEW_KEY) === 'window');
+    const d3 = await launchCode({ view: 'window' });
+    push('7i a relaunch through the registry keeps the single window', d3 === d2 && qa('.window[data-app="code"]').length === 1);
+    await closeCode();
+    store.setItem(VIEW_KEY, 'full');
+    const d4 = await launchCode({ view: 'window' });
+    push('7i an explicit view "window" wins over a remembered "full"', isWindowed(d4));
+
+    // 7j. "Reconnecting…" while a restart/switch transition is in flight.
+    {
+        const realTimeout = window.setTimeout;
+        // `observeComputerProgress` polls every 5s; the watch is the real one, only faster.
+        window.setTimeout = (fn, ms, ...a) => realTimeout.call(window, fn, ms === 5000 ? 20 : ms, ...a);
+        const state = () => d4.querySelector('.ezil-code-state');
+        push('7j the state cover exists and is hidden while the editor is up', !! state() && ! shown(state()) && state().hidden);
+        const before = mintedUrls.length;
+        window.dispatchEvent(new window.CustomEvent('ezil:computer-transition', { detail: { computerId: 'some-other-computer', transitionId: 't-x' } }));
+        await settle(4);
+        push('7j a transition of ANOTHER computer shows nothing', ! shown(state()));
+        progressAnswer = { version: 2, computerId: COMPUTER.id, operation: 'opening', stage: 'switching', active: true,
+            transition: { transitionId: 't-1', kind: 'switch', phase: 'stopping', current: 'std-2', target: 'cmp-4' } };
+        window.dispatchEvent(new window.CustomEvent('ezil:computer-transition', { detail: { computerId: COMPUTER.id, transitionId: 't-1' } }));
+        await settle(6);
+        push('7j 🔴 a transition of THIS computer covers the editor with "Reconnecting…"',
+            shown(state()) && state().dataset.state === 'reconnecting' && /Reconnecting…/.test(state().textContent)
+            && state().getAttribute('role') === 'status', state()?.textContent);
+        push('7j …with no Start button (nothing to start: the server is doing it)', ! shown(state().querySelector('.ezil-code-state-start')));
+        push('7j nothing is re-minted while the transition is in flight', mintedUrls.length === before, `${mintedUrls.length - before}`);
+        progressAnswer = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', active: false,
+            transition: { transitionId: 't-1', kind: 'switch', phase: 'done', current: 'std-2', target: 'cmp-4' } };
+        for ( let i = 0; i < 40 && mintedUrls.length === before; i++ ) await tick(25);
+        await settle(10);
+        push('7j 🔴 when the server settles it, the same Code window re-mints exactly once and the cover goes',
+            mintedUrls.length === before + 1 && ! shown(state())
+            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+        // A watch that never settles (the server keeps reporting the transition
+        // in flight) gives up after its poll budget without calling back. The
+        // cover must not then stay up forever with nothing to press.
+        const realInterval = window.setInterval;
+        window.setInterval = (fn, ms, ...a) => realInterval.call(window, fn, ms === 5000 ? 20 : ms, ...a);
+        progressAnswer = { version: 2, computerId: COMPUTER.id, operation: 'opening', stage: 'switching', active: true,
+            transition: { transitionId: 't-2', kind: 'restart', phase: 'stopping', current: 'std-2', target: 'std-2' } };
+        const before2 = mintedUrls.length;
+        window.dispatchEvent(new window.CustomEvent('ezil:computer-transition', { detail: { computerId: COMPUTER.id, transitionId: 't-2' } }));
+        await settle(4);
+        push('setup: a second transition shows "Reconnecting…"', shown(state()) && state().dataset.state === 'reconnecting');
+        for ( let i = 0; i < 600 && state().dataset.state === 'reconnecting'; i++ ) await tick(25);
+        push('7j 🔴 a transition watch that gives up without settling turns the cover into "Computer stopped" with Start (never a dead end)',
+            shown(state()) && state().dataset.state === 'stopped' && shown(state().querySelector('.ezil-code-state-start')),
+            state()?.dataset.state);
+        push('7j …and nothing was started or re-minted on its own', mintedUrls.length === before2, `${mintedUrls.length - before2}`);
+        window.setInterval = realInterval;
+        click(state().querySelector('.ezil-code-state-start'));
+        for ( let i = 0; i < 40 && mintedUrls.length === before2; i++ ) await tick(25);
+        await settle(10);
+        push('setup: Start re-minted and the cover is gone before 7k', mintedUrls.length === before2 + 1 && ! shown(state()));
+        progressAnswer = null;
+        window.setTimeout = realTimeout;
+    }
+
+    // 7k. "Computer stopped" when the return-from-away check finds it stopped.
+    {
+        const state = () => d4.querySelector('.ezil-code-state');
+        const realNow = window.Date.now;
+        let skew = 0;
+        window.Date.now = () => realNow.call(window.Date) + skew;
+        const realInterval = window.setInterval;
+        // The stopped state's own probe runs every 10s; faster here, same code.
+        window.setInterval = (fn, ms, ...a) => realInterval.call(window, fn, ms === 10_000 ? 30 : ms, ...a);
+        const away = async (minutes) => {
+            Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+            window.document.dispatchEvent(new window.Event('visibilitychange'));
+            skew += minutes * 60_000;
+            Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+            window.document.dispatchEvent(new window.Event('visibilitychange'));
+            await settle(8);
+        };
+        guacRunning = true;
+        const before = mintedUrls.length;
+        await away(6);
+        push('7k positive control: back after 6 min to a RUNNING computer shows no cover and re-mints nothing',
+            ! shown(state()) && mintedUrls.length === before);
+        guacRunning = false;
+        await away(6);
+        push('7k 🔴 back after 6 min to a STOPPED computer: "Computer stopped" covers the editor',
+            shown(state()) && state().dataset.state === 'stopped' && /Computer stopped/.test(state().textContent), state()?.textContent);
+        push('7k …with a Start button, and nothing started on its own (no mint, no wake)',
+            shown(state().querySelector('.ezil-code-state-start')) && state().querySelector('.ezil-code-state-start').textContent === 'Start computer'
+            && mintedUrls.length === before, `${mintedUrls.length - before}`);
+        const probes = () => calls.filter(c => c.method === 'GET' && c.url.startsWith(`${ENDPOINTS.desktop}?computerId=`)).length;
+        const probed = probes();
+        await settle(6);
+        push('7k while it stays stopped the cheap probe keeps asking and still starts nothing',
+            shown(state()) && probes() > probed && mintedUrls.length === before, `${probes() - probed} probe(s)`);
+        click(state().querySelector('.ezil-code-state-start'));
+        for ( let i = 0; i < 40 && mintedUrls.length === before; i++ ) await tick(25);
+        await settle(10);
+        push('7k 🔴 Start re-mints the same Code window once (the existing mint path) and the cover goes',
+            mintedUrls.length === before + 1 && ! shown(state())
+            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+        const before2 = mintedUrls.length;
+        await away(6);
+        push('setup: stopped again', shown(state()) && state().dataset.state === 'stopped' && mintedUrls.length === before2);
+        guacRunning = true;
+        for ( let i = 0; i < 40 && mintedUrls.length === before2; i++ ) await tick(25);
+        await settle(10);
+        push('7k 🔴 when the computer is running again (started elsewhere), it re-mints by itself, once',
+            mintedUrls.length === before2 + 1 && ! shown(state()), `${mintedUrls.length - before2}`);
+        push('7k no request in this section ever asked to stop, restart or start a computer by any other route',
+            ! calls.some(c => /\/api\/shell\/(stop|restart|start)/.test(c.url)));
+        window.Date.now = realNow;
+        window.setInterval = realInterval;
+    }
+
+    window.removeEventListener('ezil:app-view-changed', on_view);
+    await closeCode();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

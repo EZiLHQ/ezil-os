@@ -28,11 +28,14 @@ export interface PoolPassRecord {
     retirements: { poolHostId: string; jobId: string; outcome: 'pending' | 'started' | 'refused' | 'unknown' }[];
     slowHosts: PoolReadinessDiagnostic[];
 }
+/** One class's record in a pass, paired at push time (the planner reorders classes by floor priority). */
+export interface PoolPassEntry { c: PoolClass; record: PoolPassRecord }
 export interface PoolReplenishDeps {
     db: PlacementDb; data: PoolData; store: PoolDispatchStore; starter: LifecycleStarter;
     classes: PoolClass[]; deployments: Record<string, LifecycleDeployment>; now(): Date;
     withLock<T>(run: (tx?: PlacementExecutor, lock?: AdmissionLock) => Promise<T>): Promise<T | null>;
-    log(record: PoolPassRecord): void;
+    /** Called exactly once per pass that took the lock; `failed` when the pass threw (the error is rethrown). */
+    log(entries: PoolPassEntry[], failed: boolean): void;
     sleep?: (ms: number) => Promise<void>;
 }
 /** Transaction lock works through transaction poolers; the transaction stays open
@@ -61,6 +64,7 @@ export function poolWork(c: PoolClass, d: LifecycleDeployment, operation: 'pool-
 export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPassRecord[] | null> {
     await deps.store.reconcile?.();
     const records: PoolPassRecord[] = [];
+    const entries: PoolPassEntry[] = [];
     let prepared;
     try { prepared = await deps.withLock(async (locked, lock) => {
         let provisionBudget = 2, retireBudget = 2;
@@ -111,7 +115,7 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             const record: PoolPassRecord = { target: plan.target, recent: Math.ceil(demand.opens15m * (demand.bootMinutes ?? 4) / 15),
                 base: Math.ceil(.04 * demand.activeStandard + .10 * demand.activePremium), spares: demand.spares, provisioned: 0, retired: 0,
                 retirements: [], slowHosts: await deps.data.readPoolReadinessDiagnostics(db, c, now) };
-            records.push(record);
+            records.push(record); entries.push({ c, record });
             const reserve = async (operation: 'pool-provision' | 'pool-retire', id?: string,
                 from: import('./ready-pool').PoolHostState[] = ['ready', 'failed', 'retiring']) => {
                 if (id && reservedRetirements.has(id)) return false;
@@ -148,9 +152,13 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
                 }
                 if (changed) poolGuard('replenish_demand_cleanup', await updateDemandCleanup(locked, lock, d, cleanup), 503);
             }
-            for (const id of plan.fail) await deps.data.markPoolHost(db, id, ['booting'], 'failed', now);
+            // Round 6 (codeopen review): only a stalled boot this pass actually marked failed is retired as one. A spare
+            // that committed ready between readPoolDemand and this mark keeps its ready state (the mark updates nothing)
+            // and is left to the aged/obsolete rules, never terminated as a stalled boot.
+            const failedNow: string[] = [];
+            for (const id of plan.fail) if (await deps.data.markPoolHost(db, id, ['booting'], 'failed', now)) failedNow.push(id);
             const failed = await deps.store.retirementCandidates?.(db, c, 'failed') ?? [];
-            for (const id of new Set([...failed, ...plan.fail, ...plan.retire])) {
+            for (const id of new Set([...failed, ...failedNow, ...plan.retire])) {
                 if (retireBudget === 0) break;
                 if (await reserve('pool-retire', id)) retireBudget--;
             }
@@ -159,11 +167,12 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             provisionBudget -= provisions;
             snapshot.demand={...demand,spares:demand.spares+provisions};
         }
-        return { records, jobs };
+        return { records, entries, jobs };
     });
-    } catch (error) { for (const record of records) deps.log(record); throw error; }
+    } catch (error) { if (entries.length) deps.log(entries, true); throw error; }
     if (!prepared) return null;
     // The advisory transaction, including all demand reads and boot reservations, has committed.
+    let failed = true;
     try {
         for (const { work, record } of prepared.jobs) {
             const outcome = await startLifecycleJob(deps.starter, work.intent.deployment.region, work, deps.sleep);
@@ -172,6 +181,33 @@ export async function runPoolReplenish(deps: PoolReplenishDeps): Promise<PoolPas
             await deps.store.outcome(work, outcome);
             if (outcome === 'started') record[work.intent.operation === 'pool-provision' ? 'provisioned' : 'retired']++;
         }
-    } finally { for (const record of prepared.records) deps.log(record); }
+        failed = false;
+    } finally { deps.log(prepared.entries, failed); }
     return prepared.records;
+}
+
+/**
+ * D4 (round 5) log memo: the last emitted per-class target/spares signature, when any line was emitted,
+ * and whether that line was a failed pass (so the first good pass after it is logged as the recovery).
+ */
+export interface PoolPassLogMemo { signature: string | null; emittedAt: number | null; failed: boolean }
+export const POOL_LOG_HEARTBEAT_MS = 15 * 60_000;
+export function newPoolPassLogMemo(): PoolPassLogMemo { return { signature: null, emittedAt: null, failed: false }; }
+/**
+ * The ONE compact pool-replenish line for a pass, or null when nothing changed. A pass is a change when it
+ * dispatched (provisioned+retired>0), reserved retirements, saw slow hosts, failed, is the first good pass
+ * after a failed one, or its per-class target/spares signature differs from the last emitted line. An
+ * unchanged pass emits at most one `heartbeat` line per 15 minutes. Updates `memo` only when it returns a line.
+ */
+export function poolPassLine(entries: PoolPassEntry[], memo: PoolPassLogMemo, now: Date, opts: { failed?: boolean } = {}): string | null {
+    const failed = !!opts.failed;
+    const classes = entries.map(({ c, record: r }) => ({ region: c.region, type: c.instanceType, target: r.target, spares: r.spares,
+        provisioned: r.provisioned, retired: r.retired, retirements: r.retirements, slowHosts: r.slowHosts }));
+    const signature = classes.map(k => `${k.region}:${k.type}:${k.target}:${k.spares}`).sort().join(',');
+    const changed = failed || memo.failed || signature !== memo.signature
+        || classes.some(k => k.provisioned + k.retired > 0 || k.retirements.length > 0 || k.slowHosts.length > 0);
+    const heartbeatDue = memo.emittedAt === null || now.getTime() - memo.emittedAt >= POOL_LOG_HEARTBEAT_MS;
+    if (!changed && !heartbeatDue) return null;
+    memo.signature = signature; memo.emittedAt = now.getTime(); memo.failed = failed;
+    return JSON.stringify({ event: 'pool-replenish', ...(failed ? { failed: true } : {}), ...(changed ? {} : { heartbeat: true }), classes });
 }

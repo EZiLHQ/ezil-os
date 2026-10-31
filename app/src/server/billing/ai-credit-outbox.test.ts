@@ -412,3 +412,107 @@ describe('restore receipt conflicts after enqueue', () => {
             : { status: 'failed', reason: disposition === 'review' ? 'restore_review_required' : 'restore_mismatch', reviewRequired: true });
     });
 });
+
+describe('round 5 D1: drain-side enrollment for rows waiting on the AI account', () => {
+    const userRow = (userId: string, overrides: Partial<AiCreditOutboxRow> = {}) => {
+        const r = row(overrides); return { ...r, userId, id: `${userId}-${r.id}` };
+    };
+    function enrolling(rows: AiCreditOutboxRow[], results: Record<string, Awaited<ReturnType<NonNullable<AiCreditOutboxStore['enrollFor']>>>>) {
+        const f = fixture(rows);
+        const enrolled = new Set<string>();
+        f.store.accountFor.mockImplementation(async r => enrolled.has(r.userId) ? 'works-public-id' : null);
+        const enrollFor = vi.fn<NonNullable<AiCreditOutboxStore['enrollFor']>>(async userId => {
+            const result = results[userId] ?? 'needs_ezil_id';
+            if (result === 'enrolled') enrolled.add(userId);
+            return result;
+        });
+        Object.assign(f.store, { enrollFor });
+        return { ...f, enrollFor };
+    }
+    const lines = (info: ReturnType<typeof vi.spyOn>) => info.mock.calls.map(call => JSON.parse(String(call[0])));
+
+    it('enrolls, re-resolves the account and delivers in the same pass', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const f = enrolling([userRow('u1')], { u1: 'enrolled' });
+        expect(await f.run()).toMatchObject({ claimed: 1, done: 1, retry: 0, skipped: 0 });
+        expect(f.enrollFor).toHaveBeenCalledExactlyOnceWith('u1');
+        expect(f.store.accountFor).toHaveBeenCalledTimes(2);
+        expect(f.store.pinAccount).toHaveBeenCalledWith(expect.anything(), 'works-public-id');
+        expect(f.fetcher).toHaveBeenCalledOnce();
+        expect(lines(info)).toEqual([{ event: 'ai-outbox', eventKey: row().eventKey, status: 'done', attempts: 1, reason: null, enroll: 'enrolled' }]);
+        info.mockRestore();
+    });
+    it('parks needs_ezil_id rows for 24 h as a dependency wait (never failed), enrolling each user once per pass', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const f = enrolling([userRow('u1', { attempts: 71, dependencyWaits: 70 }), userRow('u1', { attempts: 71, dependencyWaits: 70 })], {});
+        expect(await f.run()).toMatchObject({ claimed: 2, retry: 2, failed: 0, skipped: 2 });
+        expect(f.enrollFor).toHaveBeenCalledOnce();
+        for (const [, result] of f.store.finish.mock.calls) {
+            expect(result).toEqual({ status: 'retry', reason: 'no_ai_account', blockedBy: 'needs_ezil_id', nextAttemptAt: NOW + 24 * 3_600_000 });
+        }
+        expect(lines(info).map(line => line.enroll)).toEqual(['needs_ezil_id', 'needs_ezil_id']);
+        expect(f.fetcher).not.toHaveBeenCalled();
+        info.mockRestore();
+    });
+    it.each(['refused:email_unconfirmed', 'refused:subject_mismatch', 'unavailable:timeout', 'unavailable:disabled'] as const)
+    ('keeps %s as an hourly-capped no_ai_account wait with the code recorded', async code => {
+        const f = enrolling([userRow('u1', { attempts: 3 })], { u1: code });
+        expect(await f.run()).toMatchObject({ retry: 1, failed: 0 });
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', blockedBy: code, nextAttemptAt: NOW + 240_000 });
+    });
+    it('calls enrollFor for at most three users per pass; the rest wait without a call', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const f = enrolling(['u1', 'u2', 'u3', 'u4'].map(id => userRow(id)), {});
+        await f.run();
+        expect(f.enrollFor.mock.calls.map(([id]) => id)).toEqual(['u1', 'u2', 'u3']);
+        expect(f.store.finish.mock.calls[3]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 60_000 });
+        expect(lines(info)[3].enroll).toBe('deferred');
+        info.mockRestore();
+    });
+    it('does not enroll with less than the enrollment budget left before the deadline', async () => {
+        const f = enrolling([userRow('u1')], { u1: 'enrolled' });
+        await f.run(20, NOW + 19_999);
+        expect(f.enrollFor).not.toHaveBeenCalled();
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 60_000 });
+        const enough = enrolling([userRow('u1')], { u1: 'enrolled' });
+        await enough.run(20, NOW + 20_000);
+        expect(enough.enrollFor).toHaveBeenCalledOnce();
+    });
+    it('a throwing enrollFor stays an account wait, never delivery_unavailable', async () => {
+        const f = enrolling([userRow('u1')], {});
+        f.enrollFor.mockRejectedValue(new Error('postgres://private:secret@host'));
+        await f.run();
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account',
+            blockedBy: 'unavailable:connect_failed', nextAttemptAt: NOW + 60_000 });
+    });
+    it('only grants trigger enrollment; an unenrolled revoke waits as before', async () => {
+        const revoke = aiCreditOutboxItem('u1', aiCreditEntitlement({ userId: 'u1', sku: 'standard_monthly_v3',
+            subscriptionId: 'sub', periodStart: new Date('2026-10-01Z'), periodEnd: new Date('2026-11-01Z'), invoiceId: 'in' }), 'revoke', 'in');
+        const f = enrolling([{ ...revoke, id: 'rv', attempts: 1 }], { u1: 'enrolled' });
+        await f.run();
+        expect(f.enrollFor).not.toHaveBeenCalled();
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', nextAttemptAt: NOW + 60_000 });
+    });
+    // Review fix (r5 L1, lost wakeup): a sign-in can link, enroll and kick while this row is processing
+    // (the kick skips processing rows), so the drain re-reads the account before parking it for a day.
+    it('re-resolves the account before a needs_ezil_id park and delivers when a concurrent sign-in enrolled the user', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const f = enrolling([userRow('u1', { attempts: 71, dependencyWaits: 70 })], {});
+        let enrolledConcurrently = false;
+        f.store.accountFor.mockImplementation(async () => enrolledConcurrently ? 'works-public-id' : null);
+        f.enrollFor.mockImplementation(async () => { enrolledConcurrently = true; return 'needs_ezil_id'; });
+        expect(await f.run()).toMatchObject({ claimed: 1, done: 1, retry: 0, skipped: 0 });
+        expect(f.store.accountFor).toHaveBeenCalledTimes(2);
+        expect(f.store.pinAccount).toHaveBeenCalledWith(expect.anything(), 'works-public-id');
+        expect(f.fetcher).toHaveBeenCalledOnce();
+        expect(lines(info)[0]).toMatchObject({ status: 'done', enroll: 'needs_ezil_id' });
+        info.mockRestore();
+    });
+    it('a re-resolve miss after enrolled stays an hourly-capped wait', async () => {
+        const f = enrolling([userRow('u1')], {});
+        f.enrollFor.mockResolvedValue('enrolled');
+        await f.run();
+        expect(f.store.accountFor).toHaveBeenCalledTimes(2);
+        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'retry', reason: 'no_ai_account', blockedBy: 'enrolled', nextAttemptAt: NOW + 60_000 });
+    });
+});

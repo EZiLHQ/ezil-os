@@ -1202,6 +1202,36 @@ for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout requires
     await h.tick(1500); assert.match(h.text(), new RegExp(`You're on ${offer.name}`));
     h.click('[data-action="done"]'); assert.equal(h.done, 1); assert.equal(h.destroyed, 1);
 });
+// Promotion review: a Free user whose files are still on an AWS computer (the hold) gets that computer and its
+// volume back (ensure() reuses it), so checkout must not promise the plan's new-computer disk.
+for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout for a held AWS computer keeps its disk, never a new one`, async h => {
+    h.v3 = true;
+    const free = summaryV3('free'), offer = free.catalog.offers.find(offer => offer.sku === `${tier}_monthly_v3`);
+    const newDisk = `${offer.storageGiB} GB disk for your projects`;
+    const held = { ...free, computer: { ...free.computer, filesOn: 'aws', standing: 'files_on_aws',
+        disk: { provisionedGiB: 50, usedBytes: '1073741824', growsOnSwitch: false } } };
+    const bullets = () => [...h.document.querySelectorAll('.ezil-upgrade-allowances li')].map(li => li.textContent);
+    const computerLine = () => [...h.document.querySelectorAll('.ezil-billing-next dd')][1]?.textContent;
+    h.open({ sku: offer.sku, offer, sizes: undefined, summary: held }); await settle();
+    assert.equal(bullets().length, 4);
+    assert.ok(bullets().includes('Your computer keeps its 50 GB disk'), bullets().join(' | '));
+    assert.ok(! bullets().includes(newDisk));
+    assert.equal(computerLine(), tier === 'premium'
+        ? 'Your existing AWS computer and its disk are kept. Choose 2, 4 or 8 vCPU in Settings → Computer.'
+        : 'Your existing AWS computer and its disk are kept.');
+    h.handle.close(); await settle();
+    // An unreadable disk size still never promises the plan's figure.
+    h.open({ sku: offer.sku, offer, sizes: undefined, summary: { ...held, computer: { ...held.computer, disk: undefined } } }); await settle();
+    assert.ok(bullets().includes('Your computer keeps its disk'), bullets().join(' | '));
+    h.handle.close(); await settle();
+    // Positive control: files on Cloudflare (or no summary) → a new AWS computer with the plan's disk.
+    for ( const summary of [{ ...free, computer: { ...free.computer, filesOn: 'cloudflare', disk: { provisionedGiB: null, usedBytes: null, growsOnSwitch: false } } }, undefined] ) {
+        h.open({ sku: offer.sku, offer, sizes: undefined, summary }); await settle();
+        assert.ok(bullets().includes(newDisk), bullets().join(' | '));
+        assert.doesNotMatch(computerLine(), /existing|kept/);
+        h.handle.close(); await settle();
+    }
+});
 test('v3 failed checkout creation retries the chosen SKU and unpaid timeout never grants a plan', async h => {
     h.v3 = true;
     const offer = summaryV3().catalog.offers[1];

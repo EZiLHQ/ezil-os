@@ -21,6 +21,7 @@ TimeoutStopSec=90
 KillMode=mixed
 Restart=always
 RestartSec=5
-# Exit 2 = a refusal (guard stamp gone, or runDir/stopping: the agent is stopping this host):
-# never loop on it, so a stop's flush is never undone by a restart.
+# Exit 2 = a refusal (guard stamp gone, or runDir/stopping: the agent is stopping this host, or
+# runDir/export-quiesce: a reverse-move export holds the desktop down): never loop on it, so a
+# stop's flush or an export's capture is never undone by a restart.
 RestartPreventExitStatus=2

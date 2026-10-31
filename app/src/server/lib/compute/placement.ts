@@ -847,6 +847,53 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
     });
 }
 
+/**
+ * The reverse move's flip (REVERSE-MOVE-CONTRACT §5.6 transaction 2), the mirror of `flipPlacementToAws`: under the
+ * admission then computer lock, the move's `aws-ec2` row (this owner's, STOPPED at the export boot's N+1/E+1, no job, on
+ * the move's volume: the export host is already retired) walks STOPPED → RETIRING → RETIRED with no job and no usage
+ * (none is open: the export boot never ran), is deleted, and a Cloudflare row is inserted with every new Cloudflare
+ * row's counters (generation 1, lease epoch 0, store `r2`), exactly what `pinCloudflarePlacement` creates.
+ *
+ * 🔴 `finishInTx` (the reverse row's `finish`) runs in the SAME transaction: there is never a moment where the placement
+ * is Cloudflare while the move is not committed. Anything unexpected throws and rolls back; the move stays `flipping`.
+ * There is no AWS call here: the host was retired in `checking`, before the point of no return.
+ */
+export function flipPlacementToCloudflare(db: PlacementDb, input: {
+    computerId: string;
+    ownerUserId: string;
+    /** The move's export-boot claim: the row is STOPPED exactly here after the host retire. */
+    expected: { placementGeneration: number; leaseEpoch: number; volumeId: string };
+    /** The Worker commit's store; v1 is R2-only. */
+    store: string;
+    finishInTx: (tx: PlacementExecutor) => Promise<void>;
+}): Promise<Placement> {
+    const computerId = canonicalId(input.computerId), ownerUserId = canonicalId(input.ownerUserId);
+    if (input.store !== 'r2') return Promise.reject(new Error('reverse_flip_store_unsupported'));
+    return withAdmission(db, async (tx) => {
+        await lockComputer(tx, computerId);
+        const current = (await readPlacement(tx, computerId)).record;
+        const { placementGeneration, leaseEpoch, volumeId } = input.expected;
+        if (!current || current.provider !== 'aws-ec2' || current.ownerUserId !== ownerUserId || current.state !== 'STOPPED'
+            || current.generation !== placementGeneration || current.leaseEpoch !== leaseEpoch || current.lifecycleJobId !== null
+            || current.volumeId !== volumeId) throw new Error('reverse_flip_source_mismatch');
+        let retired = current;
+        for (const to of ['RETIRING', 'RETIRED'] as const) {
+            const result = await casInTx(tx, computerId, retired, to, { generation: 0, leaseEpoch: 0 }, {}, { ownerUserId, provider: 'aws-ec2' });
+            if (!result.ok) throw new Error('reverse_flip_placement_conflict');
+            retired = result.placement;
+        }
+        const deleted = rowsOf(await tx.execute(sql`/* placement:reverse-flip-remove */ DELETE FROM public.ezil_computer_placements
+            WHERE computer_id = ${computerId}::uuid AND owner_user_id = ${ownerUserId}::uuid
+                AND provider = 'aws-ec2' AND state = 'RETIRED' AND generation = ${placementGeneration} AND lease_epoch = ${leaseEpoch}
+            RETURNING computer_id`));
+        if (deleted.length !== 1) throw new Error('reverse_flip_placement_conflict');
+        const created = await createInTx(tx, { computerId, ownerUserId, provider: 'cloudflare', state: 'STOPPED' }, true);
+        if (!created.ok) throw new Error('reverse_flip_placement_conflict');
+        await input.finishInTx(tx);
+        return created.placement;
+    });
+}
+
 /** A concurrent first open cannot re-pin CF after empty-workspace cutover. */
 export async function pinCloudflarePlacement(db: PlacementDb, computer: { computerId: string; userId: string },
     options: { honorDemand?: boolean } = {}): Promise<ResolvedPlacement> {
@@ -1502,6 +1549,35 @@ export async function failUnenrolledPlacement(db: PlacementDb, p: Placement, now
                 lastError: p.lastError, updatedAt: p.updatedAt });
         if (result.ok && retire) await retire(tx);
         return result;
+    });
+}
+
+/**
+ * The reverse move hands its export boot back (REVERSE-MOVE-CONTRACT §5.2): the boot's MOUNTING row at the move's
+ * N+1/E+1, with NO lifecycle job and the same instance, goes UNCONFIRMED with `ENROLLMENT_FAILED` and its enrollment
+ * proofs cleared: the exact write `failUnenrolledPlacement` makes (an existing edge), so the existing
+ * `retireUnenrolledHost` chain ends the host and lands STOPPED/`INSTANCE_LOST` at N+1/E+1 with the volume kept.
+ *
+ * Under the admission then computer lock, like the claim and the flip. 🔴 Never with a job pending (LEASED, STARTING or
+ * MOUNTING with a job): the ordinary receipt path settles those. The re-read under the lock checks the job is null, and
+ * the CAS is guarded on the re-read's `updated_at`, so any write since (a job recorded included) loses it. The retire is
+ * started by the caller AFTER this commits: a Step Functions start inside it would be authorized against an uncommitted row.
+ */
+export async function releaseExportBoot(db: PlacementDb, p: Placement,
+    expected: { placementGeneration: number; leaseEpoch: number }): Promise<TransitionResult> {
+    const releasable = (x: Placement) => x.provider === 'aws-ec2' && x.state === 'MOUNTING' && x.lifecycleJobId === null
+        && x.generation === expected.placementGeneration && x.leaseEpoch === expected.leaseEpoch && x.instanceId !== null;
+    if (!releasable(p)) return { ok: false, reason: 'cas_conflict' };
+    return withAdmission(db, async tx => {
+        await lockComputer(tx, p.computerId);
+        const current = (await readPlacement(tx, p.computerId)).record;
+        if (!current || !releasable(current) || current.ownerUserId !== p.ownerUserId || current.instanceId !== p.instanceId
+            || current.volumeId !== p.volumeId || current.updatedAt.getTime() !== p.updatedAt.getTime()) return { ok: false, reason: 'cas_conflict' };
+        return casInTx(tx, p.computerId, current, 'UNCONFIRMED', { generation: 0, leaseEpoch: 0 },
+            { lastError: ENROLLMENT_FAILED, enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null },
+            { provider: 'aws-ec2', ownerUserId: current.ownerUserId, instanceId: current.instanceId,
+                volumeId: current.volumeId ?? undefined, fenceToken: current.fenceToken ?? undefined,
+                lastError: current.lastError, updatedAt: current.updatedAt });
     });
 }
 

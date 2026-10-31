@@ -334,6 +334,41 @@ describe('createStripeClient requests', () => {
         expect(fetcher).not.toHaveBeenCalled();
     });
 
+    it('lists every subscription of one encoded customer across pages, any status', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'sub_live', status: 'active', customer: 'cus_fixture' }], has_more: true }))
+            .mockResolvedValueOnce(Response.json({ data: [{ id: 'sub_old', status: 'canceled' }], has_more: false }));
+        expect(await client.listCustomerSubscriptions('cus_fixture&status=active')).toEqual([
+            { id: 'sub_live', status: 'active' }, { id: 'sub_old', status: 'canceled' },
+        ]);
+        const first = inspect(fetcher), second = inspect(fetcher, 1);
+        expect(first.url).toBe('https://api.stripe.com/v1/subscriptions?customer=cus_fixture%26status%3Dactive&status=all&limit=100');
+        expect(first.init?.method).toBe('GET');
+        expect(first.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
+        expect(second.url).toBe('https://api.stripe.com/v1/subscriptions?customer=cus_fixture%26status%3Dactive&status=all&limit=100&starting_after=sub_live');
+        fetcher.mockResolvedValueOnce(Response.json({ error: { type: 'api_error' } }, { status: 500 }));
+        await expect(client.listCustomerSubscriptions('cus_fixture')).rejects.toMatchObject({ name: 'StripeRequestError', status: 500 });
+    });
+
+    it('lists one customer\'s open Checkout Sessions with their mode and expires one by POST', async () => {
+        const { client, fetcher } = fixture(null);
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'cs_sub', mode: 'subscription', status: 'open' }, { id: 'cs_pack', mode: 'payment', status: 'open' }], has_more: false }))
+            .mockResolvedValueOnce(Response.json({ id: 'cs_sub', status: 'expired' }));
+        expect(await client.listOpenCheckoutSessions('cus_fixture')).toEqual([{ id: 'cs_sub', mode: 'subscription' }, { id: 'cs_pack', mode: 'payment' }]);
+        const listed = inspect(fetcher);
+        expect(listed.url).toBe('https://api.stripe.com/v1/checkout/sessions?customer=cus_fixture&status=open&limit=100');
+        expect(listed.init?.method).toBe('GET');
+        await expect(client.expireCheckoutSession('cs_sub/../x')).resolves.toBeUndefined();
+        const expired = inspect(fetcher, 1);
+        expect(expired.url).toBe('https://api.stripe.com/v1/checkout/sessions/cs_sub%2F..%2Fx/expire');
+        expect(expired.init?.method).toBe('POST');
+        expect(expired.size).toBe(0);
+        expect(expired.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
+        // Stripe refuses to expire a session that is no longer open; the caller must see that failure.
+        fetcher.mockResolvedValueOnce(Response.json({ error: { type: 'invalid_request_error' } }, { status: 400 }));
+        await expect(client.expireCheckoutSession('cs_done')).rejects.toMatchObject({ name: 'StripeRequestError', status: 400 });
+    });
+
     it('creates a portal session with its return URL and the pinned version', async () => {
         const { client, fetcher } = fixture({ id: 'bps_fixture', url: 'https://billing.stripe.com/fixture' });
         fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'bpc_v2', metadata: { ezil_portal: 'v2' }, features: { subscription_update: { enabled: false } } }] }));
@@ -363,6 +398,26 @@ describe('Stripe response mapping', () => {
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
         expect(sent.headers.get('Stripe-Version')).toBe('2026-09-30.endive');
         expect(sent.init?.body).toBeUndefined();
+    });
+
+    // Round 6 (R4-04): a cancel scheduled as a DATE (Dashboard "cancel on a custom date", portal or API cancel_at)
+    // arrives with cancel_at_period_end false. At or before the period end it ends the plan, so it reads as a
+    // cancel at period end (plan_ending), never "Active / renews" followed by a silent drop to Free.
+    it.each([
+        { name: 'cancel_at at the period end', shape: { cancel_at: end }, expected: true },
+        { name: 'cancel_at before the period end', shape: { cancel_at: end - 86_400 }, expected: true },
+        { name: 'cancel_at on the item period end (modern shape)', shape: { cancel_at: end, current_period_end: null,
+            items: { data: [{ current_period_start: start, current_period_end: end }] } }, expected: true },
+        { name: 'cancel_at after the period end (a later renewal still bills)', shape: { cancel_at: end + 86_400 }, expected: false },
+        { name: 'no cancel_at', shape: { cancel_at: null }, expected: false },
+        { name: 'cancel_at with no known period end', shape: { cancel_at: end, current_period_end: null }, expected: false },
+    ])('maps $name to cancelAtPeriodEnd=$expected', async ({ shape, expected }) => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: false, current_period_start: start, current_period_end: end, ...shape });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(expected);
+    });
+    it('keeps cancel_at_period_end true whatever cancel_at says', async () => {
+        const { client } = fixture({ ...subscription, cancel_at_period_end: true, cancel_at: null, current_period_start: start, current_period_end: end });
+        expect((await client.retrieveSubscription('sub_fixture')).cancelAtPeriodEnd).toBe(true);
     });
 
     it('preserves epoch dates and leaves absent subscription periods and SKU null', async () => {
@@ -1088,12 +1143,32 @@ describe('endive plan changes', () => {
     it.each([
         { cancel: true, cancelAt: end + 10, expected: end + 10 },
         { cancel: true, cancelAt: null, expected: end },
-        { cancel: false, cancelAt: end + 10, expected: null },
+        { cancel: false, cancelAt: null, expected: null },
     ])('sets cancellation=$cancel with cancel_at=$cancelAt', async ({ cancel, cancelAt, expected }) => {
         const { client, fetcher } = sequence({ ...planSubscription, cancel_at: cancelAt });
         expect(await client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel, idempotencyKey: 'cancel_fixture' }))
             .toEqual({ cancelsAt: expected === null ? null : new Date(expected * 1000) });
         expectRequest(fetcher, 0, '/subscriptions/sub_fixture', { cancel_at_period_end: String(cancel) }, 'cancel_fixture');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    // Round 6 review (R4-04): a dated cancel (Dashboard custom date) reads as plan_ending, so Billing offers Resume.
+    it('resume unsets a dated cancel_at the flag alone leaves, under its own idempotency key', async () => {
+        const dated = { ...planSubscription, cancel_at_period_end: false, cancel_at: end - 86_400 * 10 };
+        const { client, fetcher } = sequence(dated, { ...dated, cancel_at: null });
+        expect(await client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel: false, idempotencyKey: 'resume_fixture' }))
+            .toEqual({ cancelsAt: null });
+        // The first request is the in-app resume, byte for byte; the second only unsets cancel_at (Stripe's empty-string unset).
+        expectRequest(fetcher, 0, '/subscriptions/sub_fixture', { cancel_at_period_end: 'false' }, 'resume_fixture');
+        expectRequest(fetcher, 1, '/subscriptions/sub_fixture', { cancel_at: '' }, 'resume_fixture:cancel_at');
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('a resume that leaves a cancel_at is refused, never reported as resumed', async () => {
+        const dated = { ...planSubscription, cancel_at_period_end: false, cancel_at: end - 86_400 * 10 };
+        const { client } = sequence(dated, dated);
+        await expect(client.setCancelAtPeriodEnd({ subscriptionId: subscription.id, cancel: false, idempotencyKey: 'resume_fixture' }))
+            .rejects.toMatchObject({ name: 'BillingProviderError' });
     });
 });
 

@@ -1,8 +1,9 @@
 """Offline traces of deploy.sh and install-host.sh per OS_ENV (no AWS, Docker or systemd).
 
 aws, docker, curl and systemctl are PATH shims that log their arguments. The
-host script runs with /opt, /etc and /var/lib rewritten under a temporary root
-and its root/arch check replaced, so it never touches this machine.
+host script runs with /opt, /etc, /var/lib and /var/log (the D4 web-log
+snapshot) rewritten under a temporary root and its root/arch check replaced,
+so it never touches this machine.
 """
 import gzip
 import hashlib
@@ -153,13 +154,13 @@ class Sandbox:
 
     def host_script(self, set_args, script=None):
         host = self.root / "host"
-        for directory in ("opt", "etc/systemd/system", "var/lib"):
+        for directory in ("opt", "etc/systemd/system", "var/lib", "var/log"):
             (host / directory).mkdir(parents=True, exist_ok=True)
         text = (script or self.deploy / "install-host.sh").read_text()
         guard = "[[ $EUID == 0 && $(uname -m) == x86_64 ]]"
         assert text.count(guard) == 1
         text = text.replace(guard, "true")
-        for prefix in ("/opt/", "/etc/", "/var/lib/"):
+        for prefix in ("/opt/", "/etc/", "/var/lib/", "/var/log/"):
             count = text.count(prefix)
             text = text.replace(prefix, f"{host}{prefix}")
             assert text.count(f"{host}{prefix}") == count and str(host).count(prefix) == 0
