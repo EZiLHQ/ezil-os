@@ -151,8 +151,8 @@ describe('the export-boot mode of applyLifecycleReceipt (§5.2)', () => {
  * - internal lifecycle-authority: authorizes only the boot's own recorded job and writes nothing (its route.test.ts);
  * - internal image-rebase: a reservation is refused while a reverse row holds the computer (rebase.pg.test.ts), so it never
  *   acts on an export boot;
- * - pool-replenish, by construction: it works on pool hosts and demands only, and a Free export boot is never a pool adopt
- *   (aws-ec2.ts `tier_free`).
+ * - pool-replenish: it works on pool hosts and demands only, and a Free export boot is never a pool adopt (aws-ec2.ts
+ *   `tier_free`). Driven here too: a real `runPoolReplenish` pass over the database that holds the export boot.
  */
 describe('§5.2 actors: an enrolled export boot stays below RUNNING with no usage', () => {
     const ENV = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '10', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
@@ -179,5 +179,30 @@ describe('§5.2 actors: an enrolled export boot stays below RUNNING with no usag
         expect(await runAwsStopSettlement(ENV, s.deps)).toMatchObject({ ok: true, checked: 0, settled: 0 });
         expect(s.placements[0]).toMatchObject({ state: 'MOUNTING' });
         expect(s.usage).toEqual([]);
+    });
+    it('pool-replenish (runPoolReplenish) provisions pool hosts and never touches an export boot in LEASED, STARTING or MOUNTING', async () => {
+        // The pool's own demand reads and planner are faked (lane H's ready-pool.ts SQL only counts placements); the pass is real.
+        const { runPoolReplenish } = await import('./aws-pool-replenish');
+        const { poolFixture, demandFixture } = await import('./aws-pool-test-support');
+        for (const row of [bootRow({ state: 'LEASED' }), bootRow(), bootRow({ state: 'MOUNTING', instance_id: INSTANCE }), enrolled()]) {
+            const s = setup([row], ok);
+            const before = { ...s.placements[0] };
+            const f = poolFixture();
+            f.deps.data.readPoolDemand = vi.fn(async () => demandFixture());
+            f.deps.data.planPool = vi.fn(() => ({ target: 4, provision: 2, retire: [] as string[], fail: [] as string[] }));
+            const start = vi.fn(async () => {});
+            for (let i = 0; i < 3; i++) {
+                const records = await runPoolReplenish({ db: s.db, data: f.deps.data, deployments: { 'ap-south-1': f.deployment },
+                    classes: [{ region: f.row.region, zoneId: f.row.zoneId, instanceType: 'm6i.large' }], now: () => NOW,
+                    withLock: async run => run(), log: () => {}, sleep: async () => {}, starter: { start },
+                    store: { prepare: vi.fn(async (_tx, c, _op, build, host) => build(host ?? { ...f.row, ...c, instanceId: null })), outcome: vi.fn(async () => {}) } });
+                expect(records, String(row.state)).not.toBeNull();
+            }
+            expect(start, String(row.state)).toHaveBeenCalled();
+            expect(s.placements[0], String(row.state)).toEqual(before);
+            expect(s.usage, String(row.state)).toEqual([]);
+            expect(s.meter.ready, String(row.state)).not.toHaveBeenCalled();
+            expect(s.starts, String(row.state)).toEqual([]);
+        }
     });
 });
