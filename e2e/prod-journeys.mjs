@@ -1011,10 +1011,14 @@ export async function revealDock(page, app, { timeoutMs = 12_000, nap = ms => sl
 
 // ── The live run ────────────────────────────────────────────────────────────
 
+/** EZIL_E2E_SIGNIN=ezilid drives the real login UI; the default is the UI-less password grant. Both export `signIn`. */
+export function signInModule(mode) {
+  return mode === 'ezilid' ? './sign-in-ezilid.mjs' : './sign-in.mjs';
+}
+
 async function loadLiveDependencies(env, config) {
   const deployment = await import('./deployed-target.mjs');
-  // EZIL_E2E_SIGNIN=ezilid drives the real login UI; the default is the UI-less password grant.
-  const { signIn } = config?.signInMode === 'ezilid' ? await import('./sign-in-ezilid.mjs') : await import('./sign-in.mjs');
+  const { signIn } = await import(signInModule(config?.signInMode));
   const { stopIsolatedComputer } = await import('./isolated-computer.mjs');
   const require = createRequire(join(resolve(env.PLAYWRIGHT_REQUIRE_DIR), 'prod-journeys.cjs'));
   const { chromium } = require('playwright');
