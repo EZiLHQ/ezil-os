@@ -8,7 +8,9 @@ finding to its section). **r5 dispositions every one of that review's 28 finding
 r4 verifier gap (§12.1).** **r6 rebases onto round 6a (`7a1f2ed1`), applies the lead's §7.2 decision (DECISION_72: no
 deployment field, lane O held, DLM covers D21 in v1), reconciles 6a's changes and closes the r5 verifier's gaps (§12.2),
 and lists lane A's required mutants (§12.3).** Sections r3 changed carry the gap id in brackets, e.g. **[G1]**; sections
-r4 changed carry **[r4]**; sections r5 changed carry **[r5]**; sections r6 changed carry **[r6]**.
+r4 changed carry **[r4]**; sections r5 changed carry **[r5]**; sections r6 changed carry **[r6]**. **r7 (2026-10-31) is the
+integration of Phase B: it ratifies what the five lanes shipped and the lead's integration decisions, H-1 among them
+(§2.5 step 3); sections it changed carry **[r7]**, and §12.4 maps each item.**
 
 **Base [r6]:** citations are `path:line` at `7a1f2ed1` (`r6/integ-20261030`, round 6a, LIVE on os-staging). r6 rebased
 this branch onto it (no conflicts) and re-pinned every citation into a file 6a changed; a file 6a did not change is
@@ -88,9 +90,9 @@ file asks that lane (or the lead) and changes this table first. Files not listed
 
 | Lane | Files (new files marked *new*) |
 |---|---|
-| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`** (**[r6]** v1 adds no deployment field, §7.2)), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
-| **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test). |
-| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r5 on, **[r6]** as the header and §3.4 say)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). |
+| **H** | `infra/host-agent/lib/ezil_host/{edge,agent,desktop}.py`, **[r7] `infra/host-agent/lib/ezil_host/cli.py` (the export's quiesce marker, §2.5 step 3) and `infra/host-agent/systemd/ezil-desktop.service` (its refusal comment)**, `infra/host-agent/lib/ezil_host/export.py` *new*, their tests under `infra/host-agent/test/` (incl. `test_export.py` *new* and the codec parity test *new*), the bake inputs that copy the codec into `infra/host-agent` (`infra/host-agent/ami/`, `deploy/aws/mum/` maintenance-agent bake, **including `deploy/aws/mum/json-tool.py`** (**[r6]** v1 adds no deployment field, §7.2)), and `worker/src/workspace-snapshot-script.ts` (additive op only, §2.6). **[r7]** `infra/host-agent/lib/ezil_host/workspace-snapshot-script.py` *new* (the committed generated codec copy, §2.6), `infra/host-agent/ami/sync-codec.py` *new* (its generator, `--check`), `infra/host-agent/test/test_unit_restart_policy.py`, and `infra/host-agent/test/export_edge_seam_server.py` *new* (the W ↔ H seam server). **[r5] The AMI train (§2.8):** `infra/host-agent/lib/ezil_host/{pool,lease,guard}.py`, `infra/host-agent/systemd/ezil-guard.service`, their tests; and the app side of those items, which no other lane owns: `app/src/server/lib/compute/{ready-pool,aws-pool-replenish,aws-pool-adopt,aws-pool-claim,aws-ec2,provider-migrate-runtime,provider-migrate-provision}.ts`, `app/src/server/lib/compute/provider-migrate-store.ts` (only the `_awsProvision` shape, C3), `app/src/app/api/compute/aws/pool/claim/route.ts`, and the tests next to each. The seams with lane A are in §2.8. |
+| **W** | `worker/src/index.ts`, `worker/src/workspace-migration-import.ts` *new* (+ test *new*), `worker/src/aws-origin.ts` (export GETs over the existing signer), the prefix helper (*new*, `worker/src/workspace-prefix.ts`, + test), **[r7] `worker/src/export-edge-seam.test.ts` *new* (the W ↔ H seam harness)**. |
+| **A** | `app/src/server/lib/compute/`: `provider-reverse.ts` *new*, `provider-reverse-runtime.ts` *new*, `provider-reverse-placement.ts` *new* (reverse waiting provider + routing read), **`provider-reverse-store.ts` and its `.test.ts`/`.pg.test.ts` (sole writer from r5 on, **[r6]** as the header and §3.4 say)**, `admission.ts` (`admitExportBoot`, §5.1), `placement.ts` (`releaseExportBoot`, `flipPlacementToCloudflare`), `aws-receipts.ts` (export-boot mode), `select.ts`, **`progress.ts` (the `moving` description, §5.10)**; `app/src/server/api/routers/compute-dispatch.ts` (`computeMoving`, §5.3), `app/src/server/api/routers/computer.ts` (`computer.move.start`/`retry`, §5.9), `app/src/server/api/routers/cloudflare-guacamole.ts` (the open trigger in `previewUrl`, §5.9), `app/src/server/lib/cloudflare-guacamole-provider.ts` (`MIGRATE_CONFLICT_REASONS`, per-action timeouts, §4.1, §4.6), `app/src/server/billing/v3/{summary,contract}.ts` (§6.1), **[r4] `app/src/server/api/routers/billing.ts` (the `summary` procedure's reads and `userPlacement`, §6.1)**, **[r4] `app/src/server/lib/compute/aws-rebase-store.ts` (the reverse-row exclusion in `reserve`, §5.2.1)**, `app/src/app/api/cron/billing-session-sweep/handler.ts` (§5.4), **[r5] the actor routes of §5.2: `app/src/app/api/cron/{aws-reconcile,aws-stop-settle,sandbox-reap,billing-session-sweep,pool-replenish}/` and `app/src/app/api/internal/computers/{lifecycle-authority,image-rebase}/` (route and handler files). Any change to them, and to their tests, is lane A's** (the `pool-replenish` route is A's; the library it calls is H's, §2.8). Tests next to each (for `aws-rebase-store.ts`: `aws-rebase-store.test.ts` and `rebase.pg.test.ts`). **[r7]** `app/src/server/lib/compute/fake-placement-db.test-support.ts` (shared test support: its 0012 probe answers "absent"), and the integration's seam harnesses `app/src/server/lib/compute/reverse-import-worker-seam.test.ts` *new* (A ↔ W) and `app/src/server/billing/v3/summary-shell-seam.test.ts` *new* (A → U); the U → A harness lives in `compute-dispatch-reverse.test.ts`. |
 | **U** | `shell/ezil/ui/computer-progress.js`, `shell/ezil/ui/app-spinner.js`, `shell/ezil/ui/boot-progress.js`, `shell/ezil/session.js`, `shell/ezil/apps/desktop-window.js`, `shell/ezil/ui/Settings/tabs/computers.js`, **[r4] `shell/ezil/ui/Settings/tabs/billing.js` and `shell/ezil/ui/Settings/billing-test.mjs` (the Billing tab during a move, §6.2; [r6] its banner copy is 6a's and is not edited)**, their shell tests, and the rebuilt committed shell bundle (`shell/build-shell.sh` output). |
 | **O** | **[r6] Held for v1 (DECISION_72, §7).** v1: `app/src/server/lib/compute/reverse-snapshot.ts` *new* (the no-op seam, §7.2) and its unit test, nothing else. Post-v1 (each needs its own contract revision first, §7.3): the executor of the chosen §7.2 candidate, `app/src/server/lib/compute/retention.ts` (the listing's caller) and the purge runbook (`docs/compute/REVERSE-MOVE-RETENTION.md` *new*). **[r6] Withdrawn:** r5's `provider-reverse-snapshot.ts`, `infra/app-computers/lib/lifecycle/reverse-snapshot-{contract,definition,helper}.ts`, `infra/app-computers/lib/reverse-snapshot.ts`, the deployment field in `aws-intent.ts` (and its fixtures and tests) and `infra/app-computers/lib/lifecycle/deployment.ts`, and the edits to `app-caller.ts` (and its tests and snapshots), `bin/lifecycle.ts`, `computer-lifecycle.ts` and `ops.ts`. v1 needs none of them, and those files are read-only for every lane. |
 
@@ -131,7 +133,7 @@ The signature is unchanged: `x-ezil-gw: gw1.<ts>.<hex>` = HMAC-SHA256(controlKey
 
 | Method + path | Body | Served by | Success | Errors (JSON `{ok:false,error}`) |
 |---|---|---|---|---|
-| `POST /__ezil/control/export/<sha256hex(body)>` | Required. `Content-Length` 1..1024, no `Transfer-Encoding`, no query. A JSON object with exactly the keys `v`, `moveId`, `generation`, lowercase UUIDs (byte rules below). | edge → agent op `export` (§2.5), then the edge reads `state.json` | `202` with the §2.4 status. Idempotent for the same `{moveId, generation}`. | `400 export_body_invalid`, `400 export_digest_mismatch`, `409 export_busy` (another `{moveId, generation}` holds the host), `409 export_invalid` (the agent refused the message), `503 agent_unavailable` (the agent socket failed or timed out, as `edge.py:393,401`) |
+| `POST /__ezil/control/export/<sha256hex(body)>` | Required. `Content-Length` 1..1024, no `Transfer-Encoding`, no query. A JSON object with exactly the keys `v`, `moveId`, `generation`, lowercase UUIDs (byte rules below). | edge → agent op `export` (§2.5), then the edge reads `state.json` | `202` with the §2.4 status. Idempotent for the same `{moveId, generation}`. | `400 export_body_invalid`, `400 export_digest_mismatch`, `409 export_busy` (another `{moveId, generation}` holds the host), `409 export_invalid` (the agent refused the message; **[r7]** only for a refusal the agent itself sent: `export_invalid`, `bad_json`, `bad_mac`, `wrong_epoch`, `bad_ts`, `stale_request`, `bad_seq`, `replayed`), `503 agent_unavailable` (the agent socket failed or timed out, as `edge.py:393,401`; **[r7]** also an empty or non-object reply, `internal`, the agent's `stopping` (§2.5) and any other error), **[r7]** `503 export_state_unreadable` (the export was accepted but `state.json` cannot be read; the Worker maps any host 503 to `export_unreachable`) |
 
 **Body bytes and the path digest [minor: digest].** There is no canonical-JSON rule to agree on; the digest binds the bytes.
 - The Worker builds the body once, `JSON.stringify({v: 1, moveId, generation})` (this key order, no whitespace), and sends
@@ -195,12 +197,15 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 - Any other key, or a `moveId`/`importGeneration` that is not a lowercase UUID, returns `{ok:false, error:"export_invalid"}`.
 - The edge maps the HTTP body's `generation` to `importGeneration`.
 
-**The agent answers within 1 s and runs the job asynchronously.** The socket is served by one thread with a 5 s client timeout (`agent.py:372-393,593-605`). So `handle()` only validates, persists the job and returns `{ok:true}` (or `export_busy`). Stopping the desktop and the capture run in a separate worker thread (one job per host). The edge then answers the POST with the §2.4 status read from `state.json`.
+**The agent answers within 1 s and runs the job asynchronously.** The socket is served by one thread with a 5 s client timeout (`agent.py:372-393,593-605`). So `handle()` only validates, persists the job and returns `{ok:true}` (or `export_busy`). **[r7]** It answers the additive `{ok:false, error:"stopping"}` once the host committed to stopping (a control-plane `stop` or `fence` was accepted, or `runDir/shutdown-pending` exists); the edge answers that `503 agent_unavailable`. The job checks the same condition at its start and again right before its container binds `/workspace`, and fails `capture_failed` if it holds: no capture holds the volume while the quiesce unmounts it. Stopping the desktop and the capture run in a separate worker thread (one job per host). The edge then answers the POST with the §2.4 status read from `state.json`.
 
 **Behaviour:**
 1. **One job per host.** A durable state file `/var/lib/ezil-host/export/state.json` (0600, root, **root volume**, written atomically: temp file, fsync, rename) holds `{moveId, importGeneration, state, startedAt, finishedAt, lastServedAt, error, head}`. The same `{moveId, importGeneration}` resumes or reports; anything else gets `export_busy`.
 2. **Free space.** Before capturing, `statvfs('/var/lib/ezil-host/export')` must show at least **1.75 GiB** free: the archive (≤ 512 MiB) plus its chunk copies (≤ 512 MiB) plus the codec's Git index copy (≤ 512 MiB, `workspace-snapshot-script.ts:96-98`) plus the Git paths file (≤ 16 MiB) plus slack. Otherwise `failed`/`staging_space_low`.
-3. **Stop the desktop unit**, under the same runDir/stopping guard as `stop`. Failure → `failed`/`desktop_stop_failed`.
+3. **Stop the desktop unit** under the export's own quiesce marker, **[r7] `runDir/export-quiesce`** (lead decision H-1; r6 said "under the same runDir/stopping guard as `stop`", which held `runDir/stopping` for the export's whole life, up to 185 min, and so refused a restarted `ezil-edge` or `ezil-cloudflared`, exit 2, never restarted). Failure → `failed`/`desktop_stop_failed`.
+   - **[r7]** The desktop step refuses on `runDir/export-quiesce` (`desktop_export_quiesced`, exit 2, never restarted), and the agent's own desktop restarts refuse on it too (a signed `restart-desktop`, an `ice` push that finds the unit stopped). The desktop stays down for the host's life.
+   - **[r7]** The edge and cloudflared steps never read it: they refuse only on `runDir/stopping` (a committed stop or shutdown). A crashed edge or tunnel comes back mid-export, and the Worker's GETs reach the host again.
+   - **[r7]** The idle tick's blocked-flush path clears only `runDir/stopping`, never this marker. `runDir` is tmpfs: the retired host takes the marker with it.
 4. **Capture in a throwaway runc container** built by a new `desktop.build_export_spec(cfg, lease, export_dir)`. It does **not** use `build_spec` (`desktop.py:526-616`), whose `/tmp` is a 1 GiB RAM tmpfs (`:575`), whose `/workspace` and profiles binds are read-write (`:577-578`), whose root is the merged overlay (`:594`) and whose network is the host-wide netns (`:599`). The export spec pins:
    - **root:** the promoted lower `cfgmod.lower_dir(cfg, cfgmod.host_digest(cfg))` (`desktop.py:309`), `readonly: true`. The user's AWS upper layer is never executed.
    - **`/tmp`:** a bind of `<export_dir>/tmp` (a fresh, empty 0700 root-owned directory on the root volume), read-write. The codec's own `os.mkdir('/tmp/ezil-snapshot-<importGeneration>', 0o700)` (`workspace-snapshot-script.ts:274`) then succeeds, and its path assertion (`:18`) holds. Nothing else is mounted at `/tmp`.
@@ -210,6 +215,7 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
    - **container id:** `ezil-export`, distinct from `cfg.containerId`; deleted after exit.
    - Never run the codec as host root on guest bytes. It runs `git ls-files` on the guest's index (`workspace-snapshot-script.ts:103`), and the host has no git (`build-host-ami.sh:33-43`). Doing so breaks safety rule 3a.
 5. **Exit codes → status:** 0 → continue; **3 → `failed`/`workspace_too_large`**; anything else → `failed`/`capture_failed`. `/workspace` absent on the volume → `failed`/`workspace_missing` before the container starts.
+   - **[r7] Job budget:** `JOB_BUDGET_SECONDS` = **15 min from the record's `startedAt`** bounds the desktop stop plus the capture (the container's timeout is what is left). A capture past it, or a resumed job already past it, is `failed`/`capture_failed`, which the app records as `export_failed` (a reopen) before its own 20 min `exporting` deadline. T0 (e) must show a 512 MiB / 100k-entry capture fits after a worst-case stop (about 10.5 min left).
 6. **Staging.** The agent moves the chunk files out of `<export_dir>/tmp/ezil-snapshot-<g>/` into `<export_dir>/chunks/`, deletes `archive.tar`, re-hashes every chunk on the host and compares with the codec's JSON, then writes `head.json` (§2.3) and sets `state: ready`. Any mismatch → `capture_failed`. `export_dir` = `/var/lib/ezil-host/export/<importGeneration>/`, on the root volume, never the data volume. It dies with the instance at retire.
 7. **Idle hold.** The idle stop (`agent.py:544-549`; window 600 s, `config.py:34`) is held:
    - always while `capturing`;
@@ -222,7 +228,7 @@ Limits. These are the Worker codec's own limits, so the result is a valid Cloudf
 - New op **`export-capture`**: exactly `capture` without `marker()` (AWS volumes carry no `.ezil-hydrated.json`, `workspace-snapshot-script.ts:66-74,156`), writing `archive.tar` and the chunk files the same way (`:273-279`).
 - The exit-3 branch (`:321`) applies to `op in ('capture', 'export-capture')`. The exit-4 `hydration incomplete` branch never applies to `export-capture`.
 - The Worker's existing ops stay byte-for-byte unchanged in behaviour (the Worker codec tests prove it). The Worker never calls `export-capture`.
-- The bake copies the script into `infra/host-agent`. A parity test generated from `worker/src/workspace-snapshot-script.ts` keeps the copy from drifting.
+- **[r7]** The copy is committed, generated: `infra/host-agent/lib/ezil_host/workspace-snapshot-script.py`, written by `infra/host-agent/ami/sync-codec.py` (`--check` in CI) from `worker/src/workspace-snapshot-script.ts`, because `rebuild-ami.sh` archives only `infra/host-agent`. `test_codec_parity` (in `test-units.sh`) keeps it from drifting. (r6: "the bake copies the script".)
 
 ### 2.7 Lane H acceptance (unit, then live)
 
@@ -248,6 +254,11 @@ one owner (§1.1). Sources: the round 6 understand phase (R2-1, R2-4) and the ro
 | **`pool_desktop_not_ready`** (R2-4) | First boot: the pool agent waits 180 s for neko (:8181) and code-server healthz (:8443), else raises `pool_desktop_not_ready` (`pool.py:282-293,355-363`). Each 300 s refresh waits 20 s and tolerates only `pool_retry_exhausted`/`pool_unavailable` (`pool.py:296-316`). `ezil-guard.service` is a oneshot with no `Restart=`, so one miss ends the host's pool agent for good. **[r6] The app side shipped in round 6a** (`07e3173a`, `0d49c24c`, `3403c33e`): a `booting` spare with `enrolled_at` set, created more than 6 min ago (`POOL_BOOT_STALLED_MS`) and enrolled more than 5 min ago (`POOL_ENROLLED_READY_WAIT_MS`), is failed by `planPool` and no longer counts as a spare (`ready-pool.ts:45-57,224,228,337`), and replenish retires only a boot its own fail mark took (`aws-pool-replenish.ts:158-161`). | A readiness miss is never fatal. First boot retries `wait_ready` within a bound H pins in the test. A refresh keeps the host on `pool_desktop_not_ready` and tries again next refresh. The unit restarts a failed agent, with a bounded restart rate. **[r6]** App: done in 6a, with 6a's predicate (created + 6 min **and** enrolled + 5 min), which supersedes r5's "6 min after `enrolled_at`". The provision budget (2 per pass) and the region cap are unchanged. | `pool.py`, `ezil-guard.service`, the pool tests under `infra/host-agent/test/`. **[r6]** No app file: `ready-pool.ts` and its tests need no change for this item (they stay H's for F11 and C3). **A file outside this set changes this table first (lead), before any edit.** | Unit: a first-boot miss followed by success ends `ready`; a refresh miss keeps the host; the unit file restarts on failure, rate-bounded. (The planner tests shipped in 6a, `ready-pool.test.ts` and `ready-pool.pg.test.ts`.) Live: no host's `ezil-guard` journal ends on `pool_desktop_not_ready`, and no spare is retired about 11 min after launch for that cause. |
 | **F11** | After every pool adopt, the **first** refill the planner launches enrolls but never posts ready, and is retired about 10 min later (2/2 at 10-30 01:18Z, 2/2 at 07:14/07:18Z). The second refill is ready in 51–84 s. The pool is one spare short for about 10 min after each adopt. The cause is not known. | **Diagnosis first**, read-only on staging: the refill host's `ezil-guard` journal and its `ezil_compute_pool_hosts` timestamps (`enrolled_at`, `ready_at`, `editor_ready_at`), next to the adopt's own timeline. Then fix the cause in the file the diagnosis names. | Provisional: `pool.py`, `guard.py`, `ezil-guard.service` (host); `ready-pool.ts`, `aws-pool-replenish.ts`, `aws-pool-adopt.ts`, and the replenish-after-adopt call sites in `aws-ec2.ts` (`:550-556,658-660,816-819`) (app). **A cause outside this set changes this table first (lead), before any edit.** | Live: two consecutive adopts on staging, and each one's first refill posts ready. |
 | **C3** (R2-1) | The first Cloudflare → AWS move with a non-empty R2 workspace is always a cold `provision` (`provider-migrate-runtime.ts:66-110`), never the warm spare. The pool agent cannot take a restore: pool user data rejects `restore`, `parse_claim` whitelists the claim keys and `computer_lease` builds a lease without one (`lease.py:153-162`, `pool.py:60-61,221-239`). | A pool-restore adopt. Host: `parse_claim` accepts an optional restore lease (the existing `RestoreLease` shape) and `computer_lease` copies it into the lease, so the guard restores before the marker (`guard.py:347-358`, unchanged unless the restore path needs it). App: `provision` leases a pool host (`leasePoolHost`) in the same `withAdmission` transaction and runs `validateCapacity`. It records an `adopt` intent with `createVolume` and `dataVolumeGiB` in `_awsProvision`, and the pool claim carries the migration's restore lease. **Order:** the app half ships only after the AMI that accepts a restore claim is promoted. Until then `provision` stays cold, which is today's behaviour. | Host: `pool.py`, `lease.py`, `guard.py` (only if the restore path changes), tests. App: `provider-migrate-runtime.ts`, `provider-migrate-provision.ts`, `provider-migrate-store.ts` (only the `_awsProvision` shape), `aws-pool-claim.ts`, `app/src/app/api/compute/aws/pool/claim/route.ts`, `ready-pool.ts`, tests. **A file outside this set (for example a pool-runtime or enroll helper) changes this table first (lead), before any edit.** | Unit: a claim carrying a restore lease; `provision` leases a pool host under admission; enrollment accepts the adopt path. Live: a Free → Standard upgrade with a non-empty workspace adopts a spare (an `ezil_compute_pool_hosts` row for the instance, EC2 tag `ezil:pool=1`) and the restored workspace opens. |
+
+**[r7] Status at integration (lead):**
+- **`pool_desktop_not_ready` (R2-4): the host half shipped.** First boot retries `wait_ready` (a re-enroll between two waits); a refresh miss keeps the host; an app outage on a claim poll keeps a waiting spare; `ezil-guard.service` has `Restart=on-failure`, **`RestartMode=direct`** (so a restart never fails its `Requires=` dependents), `RestartSec=30`, `StartLimitBurst=3`/900 s and `RestartPreventExitStatus=2`. Live, before promote: make the guard fail once on a systemd 255 host and see every dependent start.
+- **C3: the host half shipped** (a pool claim may carry the migration's restore lease; the guard restores into its own deep copy, so saved leases stay claim-shaped). **The app half is DEFERRED** for H's cited design gaps: who publishes a migration-bound pool claim off the unpublished `_awsProvision` placement, and how the plaintext restore token reaches a replayable claim. H's `readMigrationReadyReceipt` adopt sub-row is a proposal, not pinned. **Residual:** the first Cloudflare → AWS move with a non-empty workspace stays a cold `provision` (today's behaviour); the host half is inert until the app half ships.
+- **F11 is a lead live diagnosis** (read-only, staging: the refill host's `ezil-guard` journal and its pool-host timestamps next to the adopt's timeline). No lane changed code for it in Phase B.
 
 **Seams (one owner each):**
 - **`aws-receipts.ts` stays lane A's.** C3 needs `readMigrationReadyReceipt` (`aws-receipts.ts:1116-1130`) to accept the
@@ -402,7 +413,8 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
 - To write inside a placement transaction, build the store over that `tx`.
 - **Owner from r5 on: lane A** (§1.1; r5 was the last S0 edit). Lane O consumes (**[r6]** post-v1, §7.3) the four snapshot/retention calls (`listUnsnapshotted`,
   `listRetentionExpired`, `recordSnapshot`, `markSnapshotSpent`) and adds nothing here. **[r5]** Lane A's one pinned change
-  to the store is `claimStale`'s order (§5.4).
+  to the store is `claimStale`'s order (§5.4). **[r7]** Ratified additions by lane A: `countHostBound()` (§5.1.1 step 5b) and
+  `recordCompensation(m, marker)`, the compensation's durable marker in `last_error` across passes (§5.5, §5.7).
 
 ---
 
@@ -426,20 +438,32 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
     - `config.prefix` is `env.SANDBOX_WORKSPACE_S3_PREFIX` (`index.ts:1411`), read in both store branches (`index.ts:1513,1525`). It is a **deployment-wide** value (the same for every computer) and is unset in the deployed Worker; T0 (g) confirms that on canary2's DO.
     - `realR2KeyPrefix` strips the leading slash (`workspace-seed.ts:94-95`); the stored flush context holds that real prefix (`index.ts:1660,3062`).
   - **Env-prefix rule:** if `SANDBOX_WORKSPACE_S3_PREFIX` is set, v1 never imports: every `import/*` answers `409 prefix_mismatch` before any write. Importing into a deployment-wide prefix would overwrite every computer's head.
-  - Lane W extracts that derivation into one helper used by both hydrate and import, and a unit test proves the import's P equals what the open route hydrates.
+    **[r7] (W-2)** One exception, and §4.5 wins: an `abort` with no DO key answers `200` with no I/O behind a refusing gate (this
+    prefix rule, or a store that is not R2), so a refused begin's compensation never ends `abort_unconfirmed`. An `abort` that holds
+    this move's key keeps the gate's `409 prefix_mismatch`/`store_unsupported` (§5.5's abort row).
+  - **[r7] (W-1)** The import derives P with the helper `worker/src/workspace-prefix.ts`. The open route keeps its inline
+    expressions (`index.ts`: `config.prefix ?? …` and `body.branch?.trim() || 'main'`), because `worker/src/index.test.ts` pins
+    their source text. `workspace-prefix.test.ts` drives the real `/sandbox/preview` route and proves the import's P equals what
+    the open route hydrates; a drift in either inline expression fails it. (r6: "one helper used by both hydrate and import".)
   - If the DO has a `WORKSPACE_FLUSH_CONTEXT_KEY` (`index.ts:1872`) **without** `freshProvision`, its `prefix` must equal P, else `409 prefix_mismatch`.
-  - A `freshProvision` context with prefix `${name}/branches/main` (`index.ts:3470-3472`) is a fence placeholder for a never-used workspace. It is not compared; commit replaces it (§4.4).
+  - A `freshProvision` context with prefix `${name}/branches/main` (`index.ts:3470-3472`) is a fence placeholder for a never-used workspace. It is not compared; commit replaces it (§4.4). **[r7]** A `freshProvision` context with any other prefix is compared with P
+    like any other context (`409 prefix_mismatch` when it differs).
   - System prefix `S = systemPrefixOf(P)` (`system-persist.ts:32-35`). Chunks go to `chunkKey(P, generation, i)` = `P/.ezil-snapshots/<generation>/<i>` (`workspace-persist.ts:304-305`).
 - **Host binding:** the Sandbox DO for `<name>` reaches the host through the AWS tunnel record for the same `<name>`. It uses `lookupAwsTunnel` (`aws-tunnels.ts:600`) and signs every request with `signGatewayHeader` (`aws-origin.ts:174-182`), as `sendAwsControl` does (`aws-origin.ts:487-510`).
   - Every request carries `placementGeneration` and `leaseEpoch`. The tunnel record must match both, or the response is `409 export_host_mismatch`. The Worker only ever pulls from the export boot's host.
   - A tunnel or host transport failure is `503 export_unreachable`.
+  - **[r7]** `begin`'s idempotent path and `pull` also compare the request's `placementGeneration`/`leaseEpoch` with the binding
+    `begin` recorded in the DO key: a different binding is `409 export_host_mismatch` before any write or host call, even when
+    the tunnel record carries it.
   - The bytes never pass through the app.
   - **[r6]** The import routes use only `lookupAwsTunnel` and `signGatewayHeader`. They never call round 6a's
     `ensureAwsDesktop` or `ensureAwsDesktopConfig` (`aws-ice.ts:513,453`) and never claim the tunnel record's
     `restartPush*` (`aws-tunnels.ts:351`): the export boot's desktop is the agent's to stop (§2.5 step 3), and no preview
     ever reaches it (§5.3).
 - **DO storage** (values stay under the 128 KiB DO value limit):
-  - `ezil:reverseImport` = `{moveId, generation, computerId, placementGeneration, leaseEpoch, store:'r2', prefix:P, headKind:'none'|'migrated', migratedEtag, systemMigratedEtag, startedAt, verified?:{sha256, chunkCount}, committing?:true}`. At most one exists. A different `{moveId, generation}` gets `409 import_busy`.
+  - `ezil:reverseImport` = `{moveId, generation, computerId, placementGeneration, leaseEpoch, store:'r2', prefix:P, headKind:'none'|'migrated', migratedEtag, systemMigratedEtag, startedAt, verified?:{sha256, chunkCount}, committing?:true,
+    systemRevertGeneration?}` (**[r7]** `systemRevertGeneration`: the `generation` of the v1 system head `commit` puts back, recorded
+    before that put, §4.4 step 3). At most one exists. A different `{moveId, generation}` gets `409 import_busy`.
   - `ezil:reverseImport:head` = the validated export head (≤ 128 KiB, §2.3).
   - `ezil:reverseImport:put:<i>` = `{etag, size, sha256}` per stored chunk, recorded from the bytes the Worker itself hashed.
   - Commit and abort delete every `ezil:reverseImport*` key.
@@ -451,6 +475,8 @@ A lost CAS throws `ReverseMoveConflictError('lost_race')`. An illegal edge throw
   - It goes stale 40 min after `startedAt` (`workspace-persist.ts:201`), so **every `begin`, `pull` and `commit` (both kinds, before any other write) rewrites `startedAt`** (at most once per request). Between requests, `checking` (≤ 20 min) plus `flipping` (≤ 30 min) can outlast 40 min; the `ezil:reverseImport` start fence covers any such gap.
   - Garbage collection is already safe: it is suspended under a migrated head and does nothing with no head (`workspace-persist.ts:594-597`).
 - **Errors.** A transient store read or write failure is `503`, never a 409. 409 is only for the closed codes below.
+  **[r7]** One carve-out, `pull`: after at least one chunk landed in this pull, a transient failure answers `200` with partial
+  progress (§4.3 step 4).
 
 ### 4.2 `begin`
 
@@ -470,8 +496,12 @@ Request: `{moveId, generation, computerId, placementGeneration, leaseEpoch}`.
 | present but unparseable or invalid | `409 head_unreadable` |
 
 5. Read `S`. It must be absent (record `systemMigratedEtag: null`) or migrated v2 (record its etag). A v1 system head → `409 system_head_moved`.
+   **[r7]** An unreadable or invalid S → `409 head_unreadable`. A migrated S is accepted whatever its `targetProvider`.
 6. Write the flag, then the DO key.
-7. Send `POST /__ezil/control/export/<sha>` with `{v:1, moveId, generation}` to the host. Host `202` → continue. Host `409 export_busy` or any host `400` → `409 export_refused`. Host `503`/transport failure → `503 export_unreachable`.
+7. Send `POST /__ezil/control/export/<sha>` with `{v:1, moveId, generation}` to the host. Host `202` → continue. **[r7] (lead decision)**
+   Host `409 export_busy`, host `409 export_invalid` (a refusal the agent itself sent, §2.2: a retry on the same host cannot clear
+   it) or any host `400` → `409 export_refused`. **Everything else** → `503 export_unreachable` (retry): a host `503`, a transport
+   failure, `401`, `404`, other `5xx`, any other `409` (a raw agent error the edge relays) and an unparseable `202`.
 8. Return `200 {ok:true, headKind, export:<host status §2.4>}`.
 
 ### 4.3 `pull`
@@ -480,13 +510,19 @@ Request: `{moveId, generation, computerId, placementGeneration, leaseEpoch, from
 
 1. The DO key must match. Otherwise `409 import_not_started`, or `409 import_mismatch` for other ids. Store and prefix unchanged, else `409 store_unsupported`/`prefix_mismatch`.
 2. `GET …/export/status`:
-   - `none` → the host lost or never got the POST: re-send it (idempotent) and answer as not ready.
+   - `none` → the host lost or never got the POST: re-send it (idempotent) and answer as not ready. **[r7]** The re-POST maps the
+     host's answer as §4.2 step 7, so a pull can answer `409 export_refused` (§5.5's pull row).
    - `failed` → `409` with a **top-level** `error` (no sub-field): `workspace_too_large` → `workspace_too_large`; `workspace_missing` → `export_workspace_missing`; `capture_failed` → `export_capture_failed`; `desktop_stop_failed` → `export_desktop_stop_failed`; `staging_space_low` → `export_staging_space`.
    - `capturing` → `200 {ok:true, export, head:null, stored:[], next:from}`. This is how the app polls.
 3. On the first `ready`, `GET …/export/head`. Validate it exactly as §2.3 and check `moveId` and `generation`, else `409 export_head_invalid`. Store it in `ezil:reverseImport:head`.
 4. For `i` in `[from, min(from+count, n))`, with up to **4 chunk transfers in flight**, and starting no new transfer after **20 s** of wall time:
    - `put:<i>` exists → count it as stored.
    - Otherwise GET the chunk. Check `Content-Length`, `size` and sha256 against `head.chunks[i]`, else `409 chunk_mismatch`. Put it to `chunkKey(P, generation, i)` and record `put:<i>` from the put result's etag.
+   - **[r7] Partial progress.** After the first transient failure (a host non-200, a tunnel or transport throw, an R2 or DO put
+     error) no new transfer starts and the ones in flight finish. If at least one chunk landed in this pull, the answer is step 5's
+     `200` with `next` the first missing index; if none landed, the first failure's `503` (`export_unreachable` or
+     `store_unavailable`). A `chunk_mismatch` always answers `409`, even when other chunks landed. Each chunk GET's timeout is
+     `max(12 s, arrival + 32 s − now)`, so none runs past 32 s after the request's arrival.
 5. Response: `200 {ok:true, export, head, stored:[i…], next: <first index at or after from not stored> | null}`. `stored` lists every stored index in the window (previously or now), so the app records progress idempotently.
 
 ### 4.4 `commit`
@@ -512,6 +548,8 @@ Request: `{moveId, generation, computerId, sha256, chunkCount, verifyOnly: boole
      - A migrated v2 head **without `previous`** (legacy marker): delete the head.
      - Absent: no-op.
      - The etag moved → `409 system_head_moved`, after the workspace head is already committed. This is retryable and idempotent; `committing` stays set.
+     - **[r7]** Before the put, `commit` records `systemRevertGeneration` (the reverted head's `generation`) in `ezil:reverseImport`.
+       On a retry, a v1 S whose `generation` equals it counts as done; any other v1 S is `409 system_head_moved`.
      - Why revert: a migrated system head blocks system saves forever (`system-persist.ts:172-174`). `previous` brings back the user's pre-move Cloudflare settings. Changes made on AWS outside `/workspace` are the "not moved" part of D-4.
   4. **DO keys:**
      - `WORKSPACE_FLUSH_CONTEXT_KEY = {prefix: P, mountPath: '/workspace'}` with no `freshProvision`. If the old context was a `freshProvision` placeholder, also delete its fence object `${name}/branches/main/.ezil-snapshots/migrating.json`.
@@ -528,7 +566,9 @@ Request: `{moveId, generation, computerId}`.
 - `ezil:reverseImport.committing` is set → `409 commit_in_progress`.
 - `P`'s head is this move's committed v1 → `409 already_imported`.
 - Otherwise list and delete `P/.ezil-snapshots/<generation>/*`, then delete the flag **only if** its `reverse` is this move's, then the DO keys **only if** they are this move's. Return `200 {ok:true}`.
-- With no DO key it still returns `200 {ok:true}` (idempotent).
+- With no DO key it still returns `200 {ok:true}` (idempotent), **[r7]** also behind a refusing store or prefix gate (no I/O, §4.1).
+  An abort that holds this move's key behind such a gate answers `409 prefix_mismatch`/`store_unsupported`. `commit_in_progress`
+  is checked first.
 - Abort sends nothing to the host. The app retires it.
 
 ### 4.6 Reason codes the app must add
@@ -985,6 +1025,7 @@ The classes are:
 | `requested` | kill switch on | `reopen` → `kill_switch` |
 | `requested` (claim, §5.1.1) **[G2]** | admission `aws_disabled`, `aws_config_invalid`, `kill_switch` | `reopen` → `kill_switch` (try later) |
 | `requested` (claim) **[G2] [r4]** | admission `max_running`, `region_capacity`, `global_hours_cap`, `global_egress_cap`, `duplicate_placement`, `region_not_configured` (the last two also log `[reverse-move] anomaly`), **[r5]** `move_capacity` (§5.1.1 step 5b), or `cas_conflict` (including a caught `ImageJobConflictError`) | wait (no `recordRetry`); at the deadline pass → `reopen` → `boot_unavailable` (try later) |
+| `requested` (claim) **[r7]** | the runtime's own waits: `intent_invalid` (the deployment refuses this placement's lifecycle intent; nothing leased, nothing started), `placement_incomplete` (a legacy row without `volumeId`, `fsUuid`, `fenceToken`, `instanceType` or `instanceId`; logged `[reverse-move] anomaly`), `claim_failed` (the claim threw: attempted and not admitted) | wait (no `recordRetry`); at the deadline pass → `reopen` → `boot_unavailable` (try later) |
 | `requested` (read) **[r4]** | the pass's placement read is not claimable (not `aws-ec2` STOPPED, a job, `ImageJobConflictError`, or **[r5]** an open billing epoch, §5.1.1) | wait (no `recordRetry`); at the deadline pass → `reopen` → `computer_busy` |
 | `requested` (claim) **[G2] [r4]** | admission `user_has_aws_computer`, `computer_not_owned`, `computer_deleted` | `reopen_final` → `boot_refused`, logged `[reverse-move] anomaly` |
 | `requested` (read or claim) **[r6]** | the placement's `region` is null or not `AWS_REGION_PATTERN` (§5.1.1 step 4) | `reopen_final` → `region_missing`, logged `[reverse-move] anomaly` |
@@ -998,6 +1039,7 @@ The classes are:
 | `pull` | `export_workspace_missing` | `reopen_final` → `workspace_missing` |
 | `pull` | `chunk_mismatch` | `reopen` → `import_corrupt` |
 | `pull` | `import_mismatch`, `store_unsupported`, `prefix_mismatch`, `other` | `reopen_final` → the code (`other` → `worker_conflict`) |
+| `pull` **[r7]** | `export_refused` (the host refused the re-POST, §4.3 step 2; rare: each export boot is bound to one move) | `reopen_final` → `worker_conflict` (not in pull's own list, like `other`) |
 | `commit{verifyOnly}` (`checking`) | `unavailable`, `not_found` | `retry` |
 | `commit{verifyOnly}` | `not_verified` | `reopen` → `import_corrupt` |
 | `commit{verifyOnly}` | `import_not_started` | `reopen` → `import_lost` |
@@ -1009,6 +1051,7 @@ The classes are:
 | `abort` (compensation) | `200` | continue §5.7 |
 | `abort` | `unavailable`, `not_found` | retried inside compensation; still failing after 5 → `operator` → `abort_unconfirmed` |
 | `abort` | `already_imported`, `commit_in_progress` | `operator` → that code (impossible before `flipping`) |
+| `abort` **[r7]** | `prefix_mismatch`, `store_unsupported` (an abort holding this move's key behind a refusing gate, §4.1, §4.5) | retried inside compensation as `unavailable`; still failing after 5 → `compensate:<code>:unconfirmed`, then `operator` → `abort_unconfirmed` once the placement settled (§5.7) |
 | boot (`booting`) | the boot settles failed / 15 min | `reopen` → `boot_failed` / `boot_timeout` |
 | compensation | the placement does not settle (§5.7 step 2: **[r5]** `STOPPED`, no job, lease epoch ≥ E+1, generation N or N+1) by the state's deadline + 30 min (`ages.stateEntered`, §5.4) | `operator` → `boot_unsettled` (**[r5]** open blocked, §5.3) |
 
@@ -1023,6 +1066,13 @@ The classes are:
   - **Open blocked** (`openBlocked`): `flip_stuck`, `import_head_moved`, `import_not_verified` (all with `commit_sent_at`), `already_imported`, `commit_in_progress`, and **[r5]** `boot_unsettled` (no `commit_sent_at`: the export boot's placement never settled, so an open would meet a LEASED/STARTING/MOUNTING boot held in export-boot mode, or an UNCONFIRMED one that answers `computer_recovering`, `aws-ec2.ts:691`).
 - **[r4]** `committed` (lane O's `markSnapshotSpent` only; never shown to the user, §3.4): `snapshot_failed`, `snapshot_receipt_invalid`. **[r6]** No v1 writer (§7.3).
 - In-flight retry codes (`recordRetry`): `unavailable`, `not_found`, `lost_race`, `container_running`, `export_host_mismatch`, `import_not_started`, `system_head_moved`, `commit_unavailable`.
+- **[r7] In-flight compensation markers** (lane A's `recordCompensation`, §3.4, §5.7): `compensate:<code>`, `compensate:<code>:host`
+  and `compensate:<code>:unconfirmed`, where `<code>` is the failure the compensation will write once the placement settled
+  (`compensate:<code>`: the Worker abort is pending, for a row that reached `exporting`; `:host`: the abort answered 200, or none
+  was needed, and only the host's settle is left; `:unconfirmed`: the abort never answered, so the outcome is `abort_unconfirmed`).
+  Abort tries count through `recordRetry` with the marker as the reason. Never shown: `reason` is null in flight (§5.10, §6.1).
+- **[r7] Claim wait reasons** (decide only the deadline pass's outcome; never written to `last_error`): the admission waits above,
+  plus `intent_invalid`, `placement_incomplete` and `claim_failed`.
 
 #### 5.5.1 Operator runbook SQL (pinned; the only operator writes) **[minor: operator_cleared]**
 
@@ -1111,6 +1161,12 @@ Finishing a `flip_stuck` row (`failed_needs_operator → committed`) is **not** 
 4. **After commit**, outside any lock: re-read the entitlement. If it is `paidAccess`, call `startPaidMigration(userId, sku)` (`provider-migrate-runtime.ts:173`). That runs a forward move onto a fresh volume; the retained volume is rollback-only. **[r6]** In v1 the D21 snapshot is the DLM policy's (§7.1); nothing more runs here.
 
 There is no AWS call after the point of no return: the export host is retired in `checking`, before `commit_sent_at`.
+
+**[r7] Fail-safe residual (checking without MOUNTING).** `checking` sends `commit{verifyOnly}` only while the export boot's placement
+is `MOUNTING` with no job, and nothing on the row records that the verify passed. A row whose placement is already `STOPPED` at
+N+1/E+1 when it enters `checking` (only an out-of-band retire can do that: no in-app actor moves an enrolled `MOUNTING` boot
+with no job) goes to transaction 1 unverified. The Worker then refuses the unverified commit (`not_verified`), and the row ends
+`failed_needs_operator('import_not_verified')` with `commit_sent_at` set: open blocked, the files intact on AWS. Accepted for v1.
 
 ### 5.7 Compensation (pre-flip only; before any `failed_*` write)
 
@@ -1515,7 +1571,7 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | State | Copy |
 |---|---|
 | files held, `moveOnOpen` true | **Your files are on your AWS computer.** The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files now] |
-| files held, `moveAvailable` false (r3) | **Your files are on your AWS computer.** Opening it uses your Free limits. (no move sentence, no button) |
+| files held, `moveAvailable` false (r3) | **[r7]** 6a's files-held banner only, unchanged (§6.2 r6, `standingCopy('files_on_aws')`): no move sentence, no button. (r3's "Your files are on your AWS computer. Opening it uses your Free limits." is superseded.) |
 | files held, `moveOnOpen` false | **Your files are on your AWS computer.** Opening it uses your Free limits. You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer] |
 | **[r6]** files held, `holdOpenable` false (6a's held-closed card, `computers.js:613-616`) | 6a's card stays as its first line: `heldClosedText` (§6.2) and its [Upgrade]. With `moveAvailable` true it continues: You can move the files in your Workspace folder to your Free computer. Not moved: {NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move. [Move my files to my Free computer]. The `moveOnOpen` variant is never used for it: 6a shows no Open desktop for a held-closed computer (`computers.js:791`). With `moveAvailable` false, 6a's card is unchanged. "Opening it uses your Free limits" is never said for it. |
 | `saving` | Moving your files to your Free computer. Step 1 of 4: Saving your files. |
@@ -1533,6 +1589,9 @@ The "not moved" list, used verbatim wherever it says {NOT_MOVED}: **settings and
 | `failed_needs_operator`, `openBlocked` false (**[r5]** `abort_unconfirmed`) | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted, and you can keep using it. We're looking into it. (no Try again; Send feedback when enabled) **[r5]** With `holdOpenable` false, without ", and you can keep using it". |
 | `failed_needs_operator`, `openBlocked` true, **[r5]** `reason` `boot_unsettled` | We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it. (no Try again; Send feedback when enabled) |
 | `failed_needs_operator`, `openBlocked` true, any other reason (the commit may have been sent) | We're finishing moving your files to your Free computer. Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it. (no Try again; Send feedback when enabled) |
+
+**[r7]** In every files-held row the banner above the card is 6a's (§6.2 r6). The pre-move card's copy (the `moveOnOpen` rows)
+follows it as shipped, so its first sentence restates the banner's (a known copy residual, not a lane defect).
 
 **Start/retry refusals (§5.9) [G3]:**
 
@@ -1702,11 +1761,12 @@ row is the only DB record of the AWS volume.** It holds `aws_volume_id`, `aws_fs
 ### 7.2 The seam: `advanceReverseSnapshots` (lane O's file, lane A's call) **[r6]**
 
 - **File:** `app/src/server/lib/compute/reverse-snapshot.ts` *new*, owned by **lane O** (§1.1). In v1 it is exactly this,
-  plus its unit test:
+  plus its unit test (**[r7]** with the `eslint-disable-next-line` line, so the unused `_input` lints with zero warnings):
 
 ```ts
 /** DECISION_72 (REVERSE-MOVE-CONTRACT §7.2): lane O is held for v1; the D21 snapshot is the existing DLM policy (§7.1). */
 export type ReverseSnapshotPass = { status: 'held'; reason: 'v1_dlm' };
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- the pinned v1 signature (§7.2); lane O's executor reads it
 export async function advanceReverseSnapshots(_input: { deadlineMs: number }): Promise<ReverseSnapshotPass> {
     return { status: 'held', reason: 'v1_dlm' };
 }
@@ -2002,3 +2062,29 @@ means the r5 pattern (Date set to 2001, and once to 2100) around the **read or w
   because no writer on a committed row compares and swaps on `updated_at`.
 - **Any further mutant a verifier invents is reported, not blocking.** Only the rows above, and the tests other sections
   pin for lane A, gate lane A's acceptance.
+
+### 12.4 r7: integration **[r7]**
+
+r7 integrates Phase B on `r6/integb-20261031`, from `edd72496` (r6.1). The five lane branches merged with `--no-ff`, in order,
+with **no conflicts** (they touch disjoint files): O `7f7c31bf`, A `59707797`, W `7b4088f6`, H `3f4e3515`, U `8199e010`. This
+revision ratifies what they shipped where the contract was silent or in conflict, and records the lead's integration decisions.
+
+| Item | Section(s) | Resolution |
+|---|---|---|
+| **H-1** (lead decision; both lane H reviewers): the export's desktop stop held `runDir/stopping` for up to 185 min, so a restarted edge or tunnel refused (exit 2, never restarted) | §2.5 step 3, §1.1 | The export sets its own `runDir/export-quiesce`. Only the desktop step (and the agent's own desktop restarts) refuse on it; the edge and cloudflared read `runDir/stopping` only; the blocked idle flush never clears it. `cli.py` and `ezil-desktop.service` join lane H. Host tests prove the edge and cloudflared restart during an export while the desktop stays down. |
+| **W-1**: the open route keeps its inline P derivation | §4.1 | Ratified: `index.test.ts` pins the inline expressions; `workspace-prefix.test.ts` drives the real `/sandbox/preview` route against the import's helper. |
+| **W-2**: a keyless abort behind a refusing gate | §4.1, §4.5, §5.5 | §4.5 wins: `200`, no I/O. An abort holding the key keeps the gate's 409; §5.5 gains its abort row. |
+| §4.2 step 7, unlisted host answers (lead decision) | §4.2, §4.3, §2.2 | Host `409 export_invalid` → `export_refused` (with `export_busy` and any 400); every other unlisted answer → `503 export_unreachable`. The Worker code changed with it (its test flipped; another 409 stays a retry). |
+| The DO key's `systemRevertGeneration` | §4.1, §4.4 step 3 | Added to the key shape; how a commit retry recognises its own reverted system head. |
+| Partial pulls | §4.1, §4.3 | A transient failure after ≥ 1 chunk landed answers `200` with partial progress; `503` only when nothing landed; `chunk_mismatch` is always 409. The chunk GET timeout is `max(12 s, arrival + 32 s − now)`. |
+| W's stricter checks | §4.1, §4.2 | The recorded binding is checked on begin's idempotent path and on pull (`export_host_mismatch`); a `freshProvision` context with another prefix is compared; an unreadable S is `head_unreadable`. |
+| §5.5 gaps | §5.5 | New rows: pull `export_refused` → `reopen_final` → `worker_conflict`; abort `prefix_mismatch`/`store_unsupported` → retried, then `abort_unconfirmed`; the runtime's claim waits `intent_invalid`, `placement_incomplete`, `claim_failed` → `boot_unavailable` at the deadline pass. |
+| Lane A's compensation markers | §3.4, §5.5, §5.7 | `recordCompensation` and `countHostBound` are ratified store additions; `compensate:<code>[:host\|:unconfirmed]` joins the closed vocabulary as in-flight markers (never shown). |
+| §6.3's held-banner row vs §6.2 r6 | §6.3 | §6.2 r6 wins: 6a's banner, unchanged; the `moveAvailable` false row is that banner only. The pre-move card's repeated first sentence is a recorded residual. |
+| Lane O's `_input` lint warning | §7.2 | The pinned block and the file gain one `eslint-disable-next-line` line; the file still ends with the block, byte for byte. |
+| `fake-placement-db.test-support.ts` | §1.1 | Joins lane A (its 0012 probe answers "absent" for every suite that uses it). |
+| Lane H's additive behaviour | §2.2, §2.5, §2.6 | The agent's `stopping` answer (edge `503 agent_unavailable`); `JOB_BUDGET_SECONDS` = 15 min from `startedAt`; `503 export_state_unreadable` on a POST; the committed generated codec copy and its generator. |
+| §2.8 | §2.8 | `pool_desktop_not_ready`: host half shipped (`RestartMode=direct`; live proof before promote). C3: host half shipped, **app half DEFERRED** (residual: the first Cloudflare → AWS move stays cold). F11: a lead live diagnosis. |
+| Checking without MOUNTING | §5.6 | A fail-safe residual: `import_not_verified`, open blocked, files intact. |
+| Verifier test gaps (A E8, E18; H E3, J5; W W20, W21, W22, W24; U C2, C3, D1) | §12.3 (reported, not blocking) | Each now has a test that fails on the mutant with an assertion; the integration handoff lists each proof. |
+| Seams | §1.1 | One harness per seam drives the real code on both sides: U → A (`compute-dispatch-reverse.test.ts`: the shell's tRPC client and readMoveAsk's GET over HTTP into the real router), A → U (`summary-shell-seam.test.ts`: absent keys read as null/false), A ↔ W (`reverse-import-worker-seam.test.ts`), W ↔ H (`export-edge-seam.test.ts` + `export_edge_seam_server.py`: the real edge and agent on loopback). §6.2's `MOVE_LIMIT_BYTES === EXPORT_MAX_BYTES` assertion lands with lane U's constant. |
