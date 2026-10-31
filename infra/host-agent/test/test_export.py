@@ -24,7 +24,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
-from ezil_host import agent as agentmod, config, desktop, edge, export  # noqa: E402
+from ezil_host import agent as agentmod, cli, config, desktop, edge, export, guard, tunnel  # noqa: E402
 from ezil_host.fsops import Refused  # noqa: E402
 
 REAL_START_EXPORT = agentmod.Agent._start_export
@@ -784,7 +784,7 @@ class AgentJob(unittest.TestCase):
         start.assert_not_called()
 
 class StopDesktop(unittest.TestCase):
-    def test_stop_desktop_sets_the_stopping_guard_and_requires_the_unit_down(self):
+    def test_stop_desktop_sets_the_export_quiesce_marker_and_requires_the_unit_down(self):
         d, cfg, _ = scratch(self)
         agent = agentmod.Agent(cfg, LEASE, log=lambda m: None)
         ran = []
@@ -796,7 +796,9 @@ class StopDesktop(unittest.TestCase):
                                ("activating", False), ("unknown", False)):
                 with self.subTest(unit=unit), mock.patch.object(agentmod.Agent, "_desktop_unit", return_value=unit):
                     self.assertEqual(agentmod.Agent._export_stop_desktop(agent), want)
-                    self.assertTrue(os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)))
+                    self.assertTrue(os.path.exists(os.path.join(cfg.runDir, desktop.EXPORT_QUIESCE)))
+                    self.assertFalse(os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)),
+                                     "r7: never runDir/stopping, which also refuses the edge and the tunnel")
         self.assertIn(["/bin/true"], ran)
         stop.assert_called()
         with mock.patch.object(agentmod.subprocess, "run"), mock.patch.object(desktop, "stop", return_value="clean"), \
@@ -913,6 +915,94 @@ class Bake(unittest.TestCase):
     def test_the_cli_runs_the_export_check(self):
         with open(os.path.join(HERE, "..", "ami", "validate-lowers.py")) as f:
             self.assertIn("    validate_export(args.lowers_dir, args.current)", f.read())
+
+
+class ExportQuiesce(unittest.TestCase):
+    """r7 (lead decision H-1, §2.5 step 3): the export's desktop stop sets runDir/export-quiesce, which
+    keeps the desktop down for the host's life but never gates the edge or cloudflared: a crashed edge
+    or tunnel restarts mid-export and the Worker's chunk GETs still reach the host."""
+
+    def setUp(self):
+        self.d, self.cfg, _ = scratch(self)
+        self.t0 = 1_800_000_000.0
+        self.clock = [self.t0]
+        self.agent = agentmod.Agent(self.cfg, LEASE, log=lambda m: None, clock=lambda: self.clock[0])
+        for p in (mock.patch.object(cli, "_lease", return_value=dict(LEASE)), mock.patch.object(guard, "require_stamp")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def marker(self, name):
+        return os.path.exists(os.path.join(self.cfg.runDir, name))
+
+    def quiesce(self):
+        """The REAL export desktop stop, with the unit and the container reported down."""
+        with mock.patch.object(agentmod.subprocess, "run"), mock.patch.object(desktop, "stop", return_value="clean"), \
+                mock.patch.object(desktop, "state", return_value="absent"), \
+                mock.patch.object(agentmod.Agent, "_desktop_unit", return_value="inactive"):
+            self.assertTrue(self.agent._export_stop_desktop())
+        self.assertTrue(self.marker(desktop.EXPORT_QUIESCE))
+        self.assertFalse(self.marker(desktop.STOPPING))
+
+    def test_the_edge_and_cloudflared_restart_during_an_export(self):
+        self.quiesce()
+        with mock.patch.object(edge, "Edge") as e, mock.patch.object(edge, "load_key", return_value=KEY), \
+                mock.patch.object(cli.signal, "signal"):
+            self.assertEqual(cli.step(self.cfg, "edge"), "edge stopped")
+        e.return_value.serve.assert_called_once()
+        with mock.patch.object(tunnel, "supervise", return_value=("exit", 1)) as sup:
+            self.assertIn("cloudflared supervisor exit", cli.step(self.cfg, "cloudflared"))
+        sup.assert_called_once()
+        with mock.patch.object(config, "load", return_value=self.cfg), \
+                mock.patch.object(tunnel, "supervise", return_value=("exit", 1)):
+            self.assertEqual(cli.main(["cloudflared"]), 0, "a restarted tunnel is never a refusal (exit 2) mid-export")
+
+    def test_the_desktop_stays_down_during_an_export(self):
+        self.quiesce()
+        with mock.patch.object(desktop, "run") as run, mock.patch.object(cli, "desktop_relay") as relay:
+            with self.assertRaises(Refused) as r:
+                cli.step(self.cfg, "desktop", detach=True)
+            self.assertEqual(r.exception.code, "desktop_export_quiesced")
+            with mock.patch.object(config, "load", return_value=self.cfg):
+                self.assertEqual(cli.main(["desktop"]), 2, "exit 2: RestartPreventExitStatus, never restarted")
+        run.assert_not_called()
+        relay.assert_not_called()
+
+    def test_no_agent_restart_brings_the_desktop_back_during_an_export(self):
+        self.quiesce()
+        msg = {"op": "restart-desktop", "seq": 1, "ts": self.t0, "leaseEpoch": LEASE["leaseEpoch"], "requestId": "a" * 64}
+        msg["mac"] = agentmod.sign(KEY, msg)
+        self.assertEqual(self.agent.handle(json.dumps(msg)), {"ok": False, "error": "restart_unavailable"})
+        self.agent.restart_request = True         # e.g. an `ice` push that found the unit inactive
+        with mock.patch.object(agentmod.Agent, "restart_desktop") as restart:
+            self.agent.tick()
+        restart.assert_not_called()
+
+    def test_a_blocked_idle_flush_after_the_hold_never_clears_the_export_marker(self):
+        write_record(self.cfg, startedAt=export.iso(self.t0))
+        self.quiesce()
+        self.clock[0] = self.t0 + 185 * 60          # the export's hold has ended; the normal predicate applies
+        self.agent.last_presence = self.t0
+        with mock.patch.object(agentmod.Agent, "_terminal_hold", return_value=False), \
+                mock.patch.object(agentmod, "parse_load1", return_value=0.0), \
+                mock.patch.object(agentmod.Agent, "flush", return_value="busy"):
+            self.assertEqual(self.agent.tick(), "flush_busy")
+        self.assertFalse(self.marker(desktop.STOPPING), "the blocked flush clears its own marker")
+        self.assertTrue(self.marker(desktop.EXPORT_QUIESCE), "and never the export's")
+        with mock.patch.object(desktop, "run") as run:
+            with self.assertRaises(Refused):
+                cli.step(self.cfg, "desktop", detach=True)
+        run.assert_not_called()
+
+    def test_a_committed_stop_still_refuses_the_edge_and_cloudflared(self):
+        self.quiesce()
+        open(os.path.join(self.cfg.runDir, desktop.STOPPING), "w").close()
+        for step in ("edge", "cloudflared"):
+            with self.subTest(step=step), mock.patch.object(edge, "Edge") as e, mock.patch.object(tunnel, "supervise") as sup:
+                with self.assertRaises(Refused) as r:
+                    cli.step(self.cfg, step)
+                self.assertEqual(r.exception.code, f"{step}_stopping")
+                e.assert_not_called()
+                sup.assert_not_called()
 
 
 class Quiesce(unittest.TestCase):

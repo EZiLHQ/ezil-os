@@ -72,6 +72,10 @@ DESKTOP_CONFIG = "desktop-config.json"     # runDir: the pushed relay config
 ICE_STATE = "desktop-ice.json"             # runDir: how the running desktop was started
 AI_STATE = "desktop-ai.json"               # runDir: boolean only, no token
 STOPPING = "stopping"                      # runDir: the agent committed to stopping; no desktop may start
+# runDir: a reverse-move export holds the desktop down for the host's life (REVERSE-MOVE-CONTRACT
+# §2.5 step 3). Only the desktop step honours it: the edge and the tunnel serve the export's chunks
+# for up to 185 min, so their (re)starts must never read it. runDir is tmpfs; a retired host takes it.
+EXPORT_QUIESCE = "export-quiesce"
 RELAY_MIN_AHEAD_MS, RELAY_MAX_AHEAD_MS, CLOCK_SKEW_MS = 60_000, 1_800_000, 5_000
 MAX_ICE_SERVERS = MAX_ICE_URLS = 8
 NEKO_VALUE_RE = re.compile(r"^[0-9a-f]{32}$")

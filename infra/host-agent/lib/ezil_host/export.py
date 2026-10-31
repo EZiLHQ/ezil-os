@@ -4,7 +4,8 @@
 The agent's signed `export` op validates, persists the job and answers within 1 s; one worker
 thread per host then runs it (the socket is served by one thread with a 5 s client timeout):
   1. free space on the export dir (root volume) >= 1.75 GiB, else staging_space_low;
-  2. the desktop stops under the runDir/stopping guard, as for `stop`, else desktop_stop_failed;
+  2. the desktop stops under the export's own runDir/export-quiesce marker (r7: never
+     runDir/stopping, which would also refuse a restarted edge or tunnel), else desktop_stop_failed;
   3. /workspace missing (or not a real directory) on the volume -> workspace_missing;
   4. the Worker's own codec (`export-capture`) runs in a throwaway runc container
      (desktop.build_export_spec): exit 3 -> workspace_too_large (permanent), other -> capture_failed;
@@ -426,7 +427,7 @@ def stage(cfg, export_dir, move_id, generation, raw_result):
 
 class Job:
     """One export, run in the agent's worker thread. `stop_desktop()` is the agent's: it stops
-    the desktop under the runDir/stopping guard and says whether it is down. `stopping()` is the
+    the desktop under runDir/export-quiesce (§2.5 step 3) and says whether it is down. `stopping()` is the
     agent's too: True once it committed to stopping the host (a control-plane stop or fence, a
     shutdown begun), when no container may start: the quiesce is about to unmount /workspace."""
 

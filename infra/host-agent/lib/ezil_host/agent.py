@@ -33,10 +33,13 @@ finds it exited or failed makes the agent reset and restart it, at most desktopR
 times per desktopRestartWindowSeconds, after which `desktop_status` says restartsExhausted.
 
 A signed `export` (REVERSE-MOVE-CONTRACT §2.5) persists one reverse-move export job per host and
-answers at once; a worker thread stops the desktop (runDir/stopping, and its unit) and captures
+answers at once; a worker thread stops the desktop (runDir/export-quiesce, and its unit) and captures
 /workspace with the Worker's codec in a throwaway container (export.py). The edge serves the
 result from disk. While the job captures, and for 15 min after the Worker's last GET once it is
 ready, it holds an otherwise-due idle stop (never past 185 min after the job started).
+runDir/export-quiesce refuses only the desktop step (and this agent's own desktop restarts): it is
+never runDir/stopping, which would also refuse a restarted edge or cloudflared mid-export, and the
+idle tick's blocked-flush path, which clears runDir/stopping, never clears it.
 
 A desktop that needed KILL is never reported as a clean stop: the flush says `unclean`
 (the idle stop still proceeds — the desktop is already gone, staying up only bills), and
@@ -71,6 +74,9 @@ STALLED_UNIT_STATES = ("inactive", "failed")   # exited after running, or failed
 # runDir/stopping check interrupts, and would start runc mid-capture. Bounded by TimeoutStopSec.
 DESKTOP_STOP_CMD = ("/usr/bin/systemctl", "stop", "ezil-desktop.service")
 DESKTOP_STOP_TIMEOUT = 150
+# runDir markers under which this agent never restarts the desktop: a committed stop, a shutdown
+# begun, and a reverse-move export's quiesce (§2.5 step 3).
+DESKTOP_DOWN_MARKERS = (desktop.STOPPING, SHUTDOWN_PENDING, desktop.EXPORT_QUIESCE)
 
 
 def _is_number(v):
@@ -242,7 +248,7 @@ class Agent:
         Only the desktop unit is queued; never stop the host, unmount data or kill host tmux.
         The bounded journal refuses new IDs when full, retaining all acknowledged IDs."""
         unavailable = {"ok": False, "error": "restart_unavailable"}
-        if self.stop_request or any(os.path.exists(self._marker(m)) for m in (desktop.STOPPING, SHUTDOWN_PENDING)):
+        if self.stop_request or any(os.path.exists(self._marker(m)) for m in DESKTOP_DOWN_MARKERS):
             return unavailable
         if request_id in self.restart_ids:
             return {"ok": True, "state": "restart_requested"}
@@ -265,8 +271,8 @@ class Agent:
         """Lock held. Validate, persist, answer: never wait for the stop or the capture (the
         socket has one thread and a 5 s client timeout). The same ids resume or report. A host
         that committed to stopping answers `stopping` (the edge's retryable 503): no job may
-        start a container that binds /workspace while the quiesce unmounts it. runDir/stopping
-        alone is not that: the export's own desktop stop sets it, and its re-POSTs must report."""
+        start a container that binds /workspace while the quiesce unmounts it. runDir/export-quiesce
+        is not that: the export's own desktop stop sets it, and its re-POSTs must report."""
         if self._host_stopping():
             return {"ok": False, "error": "stopping"}
         if export.accept(self.cfg, move_id, import_generation, now) == "busy":
@@ -290,9 +296,11 @@ class Agent:
         self.export_thread.start()
 
     def _export_stop_desktop(self):
-        """§2.5 step 3: stop the desktop under the same runDir/stopping guard as `stop` (its unit's
-        Restart= then refuses), stop the unit itself (bounded), and confirm both are down."""
-        self._set_marker(desktop.STOPPING)
+        """§2.5 step 3 (r7): stop the desktop under the export's own quiesce marker,
+        runDir/export-quiesce (the desktop unit's Restart= then refuses, exit 2), stop the unit
+        itself (bounded), and confirm both are down. Never runDir/stopping: that marker also
+        refuses a restarted edge or cloudflared, which serve this export's chunks."""
+        self._set_marker(desktop.EXPORT_QUIESCE)
         try:
             subprocess.run(list(DESKTOP_STOP_CMD), timeout=DESKTOP_STOP_TIMEOUT, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -303,7 +311,7 @@ class Agent:
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             self.log(f"export: desktop stop failed: {type(e).__name__}")
             return False
-        # pending (its start job still queued) is down too: the step refuses on runDir/stopping.
+        # pending (its start job still queued) is down too: the step refuses on runDir/export-quiesce.
         return self._desktop_state() == "absent" and self._desktop_unit() in ("inactive", "failed", "pending")
 
     def _desktop_state(self):
@@ -584,8 +592,9 @@ class Agent:
         with self.lock:
             req = self.stop_request
             restart, self.restart_request = self.restart_request and not req, False
-            # A persisted pending request cannot undo a committed shutdown after a crash.
-            if any(os.path.exists(self._marker(m)) for m in (desktop.STOPPING, SHUTDOWN_PENDING)):
+            # A persisted pending request cannot undo a committed shutdown after a crash, and no
+            # restart (an `ice` push included) brings the desktop back during an export.
+            if any(os.path.exists(self._marker(m)) for m in DESKTOP_DOWN_MARKERS):
                 restart = False
             self.restart_in_progress = bool(restart)
         if restart:
