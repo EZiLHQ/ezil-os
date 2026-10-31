@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { auth0Enabled, logoutUrl } from '@/server/auth/auth0';
+import { clearProjectIdentity } from '@/server/auth/retained-identity';
 import { computers } from '@/server/db/schema';
 import { revokeAiCredentialsOnSignout } from '@/server/lib/ai-credential';
 import { resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
@@ -38,6 +39,8 @@ const isAuthCookie = (name: string) => name.startsWith(SECURE_AUTH_COOKIE_NAME) 
  * by hand on that path.
  */
 export async function POST(request: NextRequest) {
+    // The retained EZiL ID token goes first and unconditionally: nothing below may leave it usable.
+    try { await clearProjectIdentity(); } catch { /* a cookie-less request has nothing retained */ }
     const supabase = await createClient();
     // Revoke before signOut removes the identity. The total budget is three seconds,
     // independent of whether Supabase subsequently succeeds or throws.

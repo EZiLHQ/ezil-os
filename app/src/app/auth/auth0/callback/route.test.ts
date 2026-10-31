@@ -3,10 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn() }));
+const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), retain: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => ({ set: stub.set }) }));
 vi.mock('@/server/auth/auth0', async importOriginal => ({ ...await importOriginal<typeof import('@/server/auth/auth0')>(), exchangeCode: stub.exchangeCode, verifyIdToken: stub.verifyIdToken }));
 vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge }));
+vi.mock('@/server/auth/retained-identity', () => ({ retainProjectIdentity: stub.retain }));
 
 import { AUTH0_COOKIE, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
 import { GET } from './route';
@@ -97,5 +98,65 @@ describe('Auth0 callback', () => {
         state = url.searchParams.get('state')!; cookie = stub.set.mock.calls[0][1];
         const response = await GET(request({ returnUrl: '//also-evil.example' }));
         expect(response.headers.get('location')).toBe(`${origin}/computers`);
+    });
+});
+
+describe('Auth0 callback retains the verified ID token for EZiL Works', () => {
+    it('retains the exact token only after the bridge minted the session it is bound to', async () => {
+        const response = await GET(request());
+        expect(stub.retain).toHaveBeenCalledWith('private-id-token');
+        expect(stub.bridge.mock.invocationCallOrder[0]).toBeLessThan(stub.retain.mock.invocationCallOrder[0]);
+        expect(response.headers.get('location')).toBe(`${origin}/os?computer=one`);
+        expectCleared(response);
+    });
+    it('a retention failure never fails the sign-in and logs only a fixed line', async () => {
+        const logs = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+        stub.retain.mockRejectedValue(new Error('private-id-token vault full'));
+        const response = await GET(request());
+        expect(response.headers.get('location')).toBe(`${origin}/os?computer=one`);
+        expect(logs[1].mock.calls).toEqual([['[auth0] identity not retained']]);
+        expect(logs[0]).not.toHaveBeenCalled(); expect(logs[2]).not.toHaveBeenCalled();
+    });
+    it.each(['exchangeCode', 'verifyIdToken', 'bridge'] as const)('retains nothing when %s fails', async method => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub[method].mockRejectedValue(new Error('refused'));
+        await GET(request());
+        expect(stub.retain).not.toHaveBeenCalled();
+    });
+});
+
+describe('Auth0 callback after a silent (prompt=none) attempt', () => {
+    async function silentRequest(query: Record<string, string>) {
+        stub.set.mockClear();
+        const url = await buildAuthorizeUrl({ origin, returnUrl: '/app/code?project=p&repo=r', prompt: 'none' });
+        expect(url.searchParams.get('prompt')).toBe('none');
+        const silentState = url.searchParams.get('state')!;
+        const silentCookie = stub.set.mock.calls[0][1];
+        return new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state: silentState, ...query })}`, { headers: { cookie: `${AUTH0_COOKIE}=${silentCookie}` } });
+    }
+    it.each(['login_required', 'interaction_required', 'consent_required'])('%s falls back to ONE interactive sign-in for the same page', async error => {
+        const response = await GET(await silentRequest({ error }));
+        const location = new URL(response.headers.get('location')!);
+        expect(location.origin + location.pathname).toBe(`${origin}/auth/auth0/login`);
+        expect([...location.searchParams.keys()]).toEqual(['returnUrl']);
+        expect(location.searchParams.get('returnUrl')).toBe('/app/code?project=p&repo=r');
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expectCleared(response);
+    });
+    it('any other provider error after a silent attempt is still the plain refusal', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const response = await GET(await silentRequest({ error: 'access_denied' }));
+        expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
+    });
+    it('a silent success retains the token like an interactive one', async () => {
+        const response = await GET(await silentRequest({ code: 'private-code' }));
+        expect(response.headers.get('location')).toBe(`${origin}/app/code?project=p&repo=r`);
+        expect(stub.retain).toHaveBeenCalledWith('private-id-token');
+    });
+    it('an interactive transaction never takes the silent fallback', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const response = await GET(request({ error: 'login_required', code: '' }));
+        expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
     });
 });

@@ -44,9 +44,18 @@ interface Transaction {
     codeVerifier: string;
     returnUrl: string;
     expiresAt: number;
+    /** `prompt=none`: a failed silent attempt falls back to one interactive sign-in. */
+    silent?: true;
 }
 
-export async function buildAuthorizeUrl({ origin, returnUrl }: { origin: string; returnUrl?: string | null }) {
+/** Auth0's answers to `prompt=none` that mean "ask the person", not "refuse the person". */
+export const SILENT_LOGIN_FALLBACK_ERRORS: ReadonlySet<string> = new Set(['login_required', 'interaction_required', 'consent_required']);
+
+/**
+ * `prompt: 'none'` is the silent re-auth that refreshes the retained ID token (`./retained-identity.ts`) after it
+ * expired or a restart emptied the vault. It rides on the id.ezil.work single sign-on session and shows no UI.
+ */
+export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' }) {
     const { clientId } = config();
     const transaction: Transaction = {
         state: randomBytes(32).toString('base64url'),
@@ -54,6 +63,7 @@ export async function buildAuthorizeUrl({ origin, returnUrl }: { origin: string;
         codeVerifier: randomBytes(32).toString('base64url'),
         returnUrl: safeReturnUrl(returnUrl),
         expiresAt: Date.now() + TEN_MINUTES,
+        ...(prompt === 'none' ? { silent: true as const } : {}),
     };
     const payload = Buffer.from(JSON.stringify(transaction)).toString('base64url');
     (await cookies()).set(AUTH0_COOKIE, `${payload}.${signature(payload)}`, {
@@ -66,6 +76,7 @@ export async function buildAuthorizeUrl({ origin, returnUrl }: { origin: string;
         redirect_uri: `${new URL(origin).origin}/auth/auth0/callback`,
         state: transaction.state, nonce: transaction.nonce,
         code_challenge: Buffer.from(challenge).toString('base64url'), code_challenge_method: 'S256',
+        ...(transaction.silent ? { prompt: 'none' } : {}),
     }).toString();
     return url;
 }
@@ -82,7 +93,8 @@ export function readTransaction(cookie: string | undefined, state: string | null
     if (!value || !Number.isFinite(value.expiresAt) || value.expiresAt <= Date.now()
         || value.expiresAt > Date.now() + TEN_MINUTES
         || ![value.state, value.nonce, value.codeVerifier].every(v => typeof v === 'string' && /^[\w-]{43}$/.test(v))
-        || typeof value.returnUrl !== 'string') throw new Auth0Error('invalid_transaction');
+        || typeof value.returnUrl !== 'string'
+        || (value.silent !== undefined && value.silent !== true)) throw new Auth0Error('invalid_transaction');
     if (!state || !constantTimeEqual(value.state, state)) throw new Auth0Error('state_mismatch');
     return value;
 }
@@ -167,4 +179,37 @@ export function logoutUrl(origin: string): URL {
     const url = new URL('oidc/logout', AUTH0_ISSUER);
     url.search = new URLSearchParams({ client_id: config().clientId, post_logout_redirect_uri: `${new URL(origin).origin}/login` }).toString();
     return url;
+}
+
+/**
+ * Re-verify a retained ID token before it is handed to EZiL Works (ported from 1ac89c72). Independent of
+ * `verifyIdToken`: no nonce (the login transaction is gone), no expiry leeway, an exact audience, and only the
+ * issuer and subject come back, never the email.
+ */
+export async function verifyProjectIdToken(token: string): Promise<{ issuer: string; subject: string; expiresAt: number }> {
+    const { clientId } = config();
+    try {
+        if (token.length > 16384) throw new Error();
+        const parts = token.split('.');
+        if (parts.length !== 3 || !parts.every(p => /^[\w-]+$/.test(p))) throw new Error();
+        const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+        if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid || header.crit) throw new Error();
+        let key = (await signingKeys()).find(k => k.kid === header.kid);
+        if (!key) key = (await signingKeys(true)).find(k => k.kid === header.kid);
+        if (!key || key.kty !== 'RSA' || (key.alg && key.alg !== 'RS256') || (key.use && key.use !== 'sig')) throw new Error();
+        const publicKey = await crypto.subtle.importKey('jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey,
+            new Uint8Array(Buffer.from(parts[2], 'base64url')), new TextEncoder().encode(`${parts[0]}.${parts[1]}`))) throw new Error();
+        const c = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const audiences = typeof c.aud === 'string' ? [c.aud] : c.aud;
+        const now = Date.now() / 1000;
+        if (c.iss !== AUTH0_ISSUER || !Array.isArray(audiences) || !audiences.length
+            || !audiences.every((a: unknown) => typeof a === 'string' && a && !a.includes('*'))
+            || !audiences.includes(clientId) || (audiences.length > 1 && c.azp !== clientId) || (c.azp !== undefined && c.azp !== clientId)
+            || c.gty === 'client-credentials' || typeof c.sub !== 'string' || !c.sub || c.sub.length > 255
+            // No leeway on expiry. `iat` keeps the login verifier's 60 s, so a clock behind Auth0 cannot refuse a token
+            // minted a moment ago and send the person round the silent re-auth for nothing.
+            || !Number.isFinite(c.exp) || c.exp <= now || !Number.isFinite(c.iat) || c.iat > now + 60 || c.iat >= c.exp) throw new Error();
+        return { issuer: AUTH0_ISSUER, subject: c.sub as string, expiresAt: c.exp * 1000 };
+    } catch { throw new Auth0Error('invalid_id_token'); }
 }

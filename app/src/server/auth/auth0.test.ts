@@ -5,7 +5,7 @@ vi.mock('server-only', () => ({}));
 const jar = vi.hoisted(() => ({ set: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => jar }));
 
-import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken } from './auth0';
+import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken, verifyProjectIdToken } from './auth0';
 
 const secret = 'test-client-secret-do-not-log';
 const clientId = 'test-client';
@@ -204,5 +204,43 @@ describe('code exchange', () => {
         if (failure === 'network') fetchMock.mockRejectedValue(new Error(secret));
         else fetchMock.mockResolvedValue(Response.json({ error_description: secret }, { status: failure === 'http' ? 400 : 200 }));
         await expect(exchangeCode('code', { origin: 'https://os-staging.ezil.work', codeVerifier: 'verifier' })).rejects.toThrow(/^token_exchange_failed$/);
+    });
+});
+
+describe('silent (prompt=none) transaction', () => {
+    it('asks Auth0 for prompt=none and records it in the signed transaction only when asked', async () => {
+        const url = await buildAuthorizeUrl({ origin: 'https://os-staging.ezil.work', returnUrl: '/app/code', prompt: 'none' });
+        expect(url.searchParams.get('prompt')).toBe('none');
+        expect(readTransaction(jar.set.mock.calls[0][1], url.searchParams.get('state'))).toMatchObject({ silent: true, returnUrl: '/app/code' });
+        jar.set.mockClear();
+        const { url: plain, cookie, state } = await start();
+        expect(plain.searchParams.has('prompt')).toBe(false);
+        expect(readTransaction(cookie, state).silent).toBeUndefined();
+    });
+    it('refuses a signed transaction whose silent flag is anything but true', async () => {
+        const { cookie, state } = await start();
+        const value = JSON.parse(Buffer.from(cookie.split('.')[0], 'base64url').toString());
+        for (const silent of [false, 'true', 1]) expect(() => readTransaction(signed({ ...value, silent }), state)).toThrow('invalid_transaction');
+    });
+});
+
+describe('retained ID-token verification (ported from 1ac89c72)', () => {
+    it('accepts a single exact audience and returns issuer, subject and expiry, never the email', async () => {
+        expect(await verifyProjectIdToken(await token())).toEqual({ issuer: AUTH0_ISSUER, subject: 'auth0|one', expiresAt: (now + 300) * 1000 });
+    });
+    it.each([{ aud: 'foreign' }, { iss: 'https://other.invalid/' }, { azp: 'foreign' }, { aud: [clientId, 'another'] }, { aud: [clientId, '*'], azp: clientId },
+        { exp: now - 1 }, { iat: now + 100 }, { gty: 'client-credentials' }, { sub: '' }, { sub: 'x'.repeat(256) }])('rejects %j', async claims => {
+        await expect(verifyProjectIdToken(await token(claims))).rejects.toMatchObject({ code: 'invalid_id_token' });
+    });
+    it('has no expiry leeway, unlike the login verifier', async () => {
+        const expired = await token({ iat: now - 100, exp: now - 30 });
+        await expect(verifyIdToken(expired, { nonce: 'nonce' })).resolves.toMatchObject({ sub: 'auth0|one' });
+        await expect(verifyProjectIdToken(expired)).rejects.toMatchObject({ code: 'invalid_id_token' });
+    });
+    it('accepts a proper multi-audience azp and refuses a tampered signature', async () => {
+        await expect(verifyProjectIdToken(await token({ aud: [clientId, 'another'], azp: clientId }))).resolves.toMatchObject({ subject: 'auth0|one' });
+        const t = await token();
+        await expect(verifyProjectIdToken(t.slice(0, -10) + 'AAAAAAAAAA')).rejects.toMatchObject({ code: 'invalid_id_token' });
+        await expect(verifyProjectIdToken('x'.repeat(16385))).rejects.toMatchObject({ code: 'invalid_id_token' });
     });
 });
