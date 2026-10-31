@@ -250,3 +250,7 @@ These files are not this lane's to edit.
   - `shell/ezil/apps/relay-renewal.js:4` names "Restart desktop" as a cause. Only Restart computer and a switch remain.
   - The header of `app/src/app/api/shell/restart/route.ts:12` names troubleshoot.js plus `session.restartDesktop()` as the caller. Troubleshoot now posts only `scope: 'computer'`.
 - **`shell/ezil/runtime-recheck.js:21-22`**: see §4, "Behaviour change".
+- **Round 6 release 129 merge (2026-10-31, `feat/os-app-code-129-20261031`).** Round 6's r7 fixer (`5a2c8f6a`) made Troubleshoot's Restart desktop say the move during a reverse move, with no `api_failure` row. Restart desktop is gone, so:
+  - `restartMoveReason` and its `MOVE_COPY` import are kept in `tabs/troubleshoot.js`. The function is exported, has no caller in the tab, and is pinned by `troubleshoot-test.mjs` check 6.
+  - Restart computer is unchanged. During a move, `restartWholeComputer` reads the placement and answers `busy` or `not_running` (REVERSE-MOVE-CONTRACT §6.4). The route forwards that as `restart_<reason>` with no move flags, so the tab shows that reason's own sentence. It still records an `api_failure` row, as it does for any busy computer.
+  - Stale in Round 6's document, which is not this lane's: `docs/compute/REVERSE-MOVE-CONTRACT.md:103` (lane U's "Restart desktop during a move"), `:1817` and `:2263`.
