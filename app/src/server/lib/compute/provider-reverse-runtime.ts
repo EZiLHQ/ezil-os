@@ -272,20 +272,27 @@ async function productionRuntime(db: PlacementDb): Promise<ReversePorts> {
     return createReverseRuntime(db, { aws: defaultAwsCollaborators(process.env), pool: createPoolDeps(db, process.env) });
 }
 
+/** Lane O's seam module (§7.2): `reverse-snapshot.ts` is lane O's file, loaded only by the snapshot step. */
+type ReverseSnapshotSeam = { advanceReverseSnapshots(input: { deadlineMs: number }): Promise<{ status: string }> };
+
 /**
  * billing-session-sweep's last step (§5.4): after `drain()` on both of its paths. Returns at once without 0012 (production)
  * and does nothing later than the handler's start + 150 s. Lane O's `advanceReverseSnapshots` (§7.2, `reverse-snapshot.ts`)
  * runs first in the pass, awaited. 🔴 Never throws out of the billing handler.
+ * 🔴 The seam is loaded INSIDE the snapshot step, whose own guard turns any fault (a load failure included) into
+ * `snapshot: 'error'`: the pass still claims and drives its rows, because only it enforces their deadlines.
  */
 export async function advanceReverseMoves(handlerStartedAt = Date.now(), context: {
     db?: PlacementDb;
     ports?: ReversePorts;
     snapshots?: (input: { deadlineMs: number }) => Promise<{ status: string }>;
+    loadSnapshots?: () => Promise<ReverseSnapshotSeam>;
     clock?: () => number;
 } = {}): Promise<void> {
     try {
         const db = context.db ?? (await import('@/server/db')).db as unknown as PlacementDb;
-        const snapshots = context.snapshots ?? (await import('./reverse-snapshot')).advanceReverseSnapshots;
+        const load = context.loadSnapshots ?? (() => import('./reverse-snapshot'));
+        const snapshots = context.snapshots ?? (async (input: { deadlineMs: number }) => (await load()).advanceReverseSnapshots(input));
         let ports: ReversePorts | undefined = context.ports;
         await sweepReverseMoves({
             handlerStartedAt, ...(context.clock ? { clock: context.clock } : {}),

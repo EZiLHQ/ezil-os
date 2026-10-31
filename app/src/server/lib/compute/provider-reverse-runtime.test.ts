@@ -17,6 +17,7 @@ import { fixtureDeployment } from './aws-intent.test-support';
 import { isPoolMode } from './aws-receipts';
 import { createFakePlacementDb, placementRow, type Row } from './fake-placement-db.test-support';
 import { INSTANCE_LOST, readPlacement, type PlacementDb, type PlacementExecutor } from './placement';
+import type { ReversePorts } from './provider-reverse';
 import { advanceReverseMoves, createReverseRuntime, EXPORT_BOOT_LEASE_MS } from './provider-reverse-runtime';
 import type { ComputeReverseMove } from './provider-reverse-store';
 
@@ -201,5 +202,25 @@ describe('advanceReverseMoves: the sweep\'s last step (§5.4, §7.2)', () => {
         const broken: PlacementDb = { execute: async () => { throw new Error('db down'); }, transaction: async () => { throw new Error('db down'); } };
         await expect(advanceReverseMoves(1_000, { db: broken, snapshots, clock: () => 2_000 })).resolves.toBeUndefined();
         warn.mockRestore();
+    });
+    it('a seam that fails to load (or throws) is snapshot: error, and the pass still claims and drives its rows', async () => {
+        const claimed = { id: MOVE, user_id: U1, computer_id: C1, started_by: 'open', state: 'requested', generation: GEN, attempts: 0,
+            state_entered_at: 't', created_at: 't', updated_at: 'u0', age_created: 5, age_state_entered: 5 };
+        for (const loadSnapshots of [
+            async () => { throw new Error('Cannot find module ./reverse-snapshot'); },
+            async () => ({ advanceReverseSnapshots: async () => { throw new Error('seam failed'); } }),
+        ]) {
+            const { db, sqls } = probeDb(true, [claimed]);
+            const fail = vi.fn(async (m: ComputeReverseMove, to: string, reason: string) => ({ ...m, state: to, lastError: reason }));
+            // The driven row meets the kill switch: the cheapest real step (one write, no claim).
+            const ports = { clock: () => 5_000, paid: async () => false, killSwitchOn: () => true, store: { fail }, log: () => {} } as unknown as ReversePorts;
+            const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+            await advanceReverseMoves(1_000, { db, ports, loadSnapshots: loadSnapshots as never, clock: () => 5_000 });
+            expect(sqls.map(s => s.slice(0, 13))).toEqual(['SELECT to_reg', 'WITH stale AS']);
+            expect(fail).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: MOVE }), 'failed_reopened', 'kill_switch');
+            expect(info).toHaveBeenCalledWith('[reverse-move] pass',
+                { startOffsetMs: 4_000, snapshot: 'error', claimed: 1, states: { failed_reopened: 1 }, errors: 0 });
+            info.mockRestore();
+        }
     });
 });
