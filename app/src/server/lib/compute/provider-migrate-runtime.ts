@@ -15,12 +15,13 @@ import { cloudflareComputeProvider } from './cloudflare';
 import { finishFreshProvision, flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
 import { advanceMigration, MigrationStepError, type MigrationDeps } from './provider-migrate-orchestrator';
 import { createProviderMigrationStore, type ComputeMigration } from './provider-migrate-store';
-import { provisionFor, type MigrationProvision } from './provider-migrate-provision';
+import { provisionFor, type MigrationProvision, type MigrationProvisionHoldReason } from './provider-migrate-provision';
 import { restoreFetchBase, restoreLeaseFor } from './provider-migrate';
 import { utcMonthStart } from './usage';
 
 const rows = (r: unknown) => (Array.isArray(r) ? r : (r as { rows?: Record<string, unknown>[] })?.rows) as Record<string, unknown>[] ?? [];
 const TERMINAL_EXECUTION: readonly string[] = ['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'ABORTED'];
+const HOLD_SIGNAL_INTERVAL_MS = 10 * 60_000;
 
 /** The launch's own receipt, only when it is bound to this exact intent. */
 function launchReceipt(p: Placement, output: string | null | undefined) {
@@ -55,37 +56,51 @@ export function createMigrationRuntime(db: PlacementDb, options: {
     const sandbox = (m: ComputeMigration) => deriveGuacamoleSandboxId(m.userId, m.computerId);
     const sdk = () => options.collaborators ?? sharedAwsSdkCollaborators(options.env ?? process.env);
     /**
+     * Keep a failed boot reserved for an operator. The CAS-written marker bounds the
+     * `migration-boot-held` warning to one per row per `HOLD_SIGNAL_INTERVAL_MS`; a lost CAS emits nothing.
+     */
+    async function hold(m: ComputeMigration, intent: MigrationProvision, reason: MigrationProvisionHoldReason, instanceId: string | null): Promise<void> {
+        const held = intent.held, now = new Date();
+        const due = !held || !(now.getTime() - Date.parse(held.signalledAt) < HOLD_SIGNAL_INTERVAL_MS);
+        if (held && !due && held.reason === reason) return;
+        const since = held?.reason === reason ? held.since : now.toISOString();
+        await store.saveProvision(m, { ...intent, held: { reason, since, signalledAt: held && !due ? held.signalledAt : now.toISOString() } });
+        if (due) console.warn(JSON.stringify({ event: 'migration-boot-held', reason, migrationId: m.id,
+            computer: m.computerId.slice(0, 8), instanceId, since }));
+    }
+    /**
      * End a failed migration's still-live boot through the lifecycle `retire` job, as
      * `retireUnenrolledHost` does for a cold boot: the job is recorded by CAS first, so the
      * authority finds it, then started. The helper stops and terminates the instance and keeps
      * the data volume (R11); after reopen the Cloudflare copy is authoritative. A refused or
      * failed retire is re-issued no sooner than `ENROLL_HOST_RETIRE_RETRY_MS` after the last.
+     * Every boot left live here is held and signalled.
      */
     async function retireFailedBoot(m: ComputeMigration, intent: MigrationProvision, p: Placement,
         instance: Ec2EnrollmentView, deployment: LifecycleDeployment | undefined, starter: LifecycleStarter | undefined): Promise<void> {
-        const log = { migrationId: m.id, computerId: m.computerId, instanceId: p.instanceId };
-        if (!starter || !deployment || !p.region || !p.volumeId || !p.fenceToken || !p.instanceType) return;
+        if (!starter) return hold(m, intent, 'no_starter', p.instanceId);
+        if (!deployment) return hold(m, intent, 'no_deployment', p.instanceId);
+        // Without its identity no retire can be built, as with an invalid intent below.
+        if (!p.region || !p.volumeId || !p.fenceToken || !p.instanceType) return hold(m, intent, 'retire_failed', p.instanceId);
         // Never act on an instance this boot did not launch: its tags carry this intent's fence.
-        if (deployment.namespace !== intent.deployment.namespace || !bootTagsMatch(instance.tags, p, intent.deployment.namespace)) {
-            console.warn('[compute.migration.retire]', { ...log, outcome: 'foreign_instance' });
-            return;
-        }
-        if (intent.retire && Date.now() - Date.parse(intent.retire.requestedAt) < ENROLL_HOST_RETIRE_RETRY_MS) return;
+        if (deployment.namespace !== intent.deployment.namespace || !bootTagsMatch(instance.tags, p, intent.deployment.namespace))
+            return hold(m, intent, 'foreign_instance', p.instanceId);
+        // The recorded retire ended (or never started) with the boot still live.
+        if (intent.retire && Date.now() - Date.parse(intent.retire.requestedAt) < ENROLL_HOST_RETIRE_RETRY_MS)
+            return hold(m, intent, 'retire_failed', p.instanceId);
         // The authority reads a published AWS placement first and would refuse this retire.
-        if ((await readPlacement(db, m.computerId)).provider === 'aws-ec2') {
-            console.warn('[compute.migration.retire]', { ...log, outcome: 'aws_placement_published' });
-            return;
-        }
+        if ((await readPlacement(db, m.computerId)).provider === 'aws-ec2') return hold(m, intent, 'aws_placement_published', p.instanceId);
         let work: LifecycleWork;
         try {
             work = buildLifecycleWork(currentGenerationIntent(p, 'retire', deployment, { jobId: randomUUID(), userData: null, leaseEpoch: p.leaseEpoch }));
         } catch (error) {
-            if (error instanceof LifecycleIntentInvalidError) return;
+            if (error instanceof LifecycleIntentInvalidError) return hold(m, intent, 'retire_failed', p.instanceId);
             throw error;
         }
-        await store.saveProvision(m, { ...intent, retire: { jobId: work.intent.jobId, digest: work.digest, requestedAt: new Date().toISOString() } });
+        await store.saveProvision(m, { ...intent, retire: { jobId: work.intent.jobId, digest: work.digest, requestedAt: new Date().toISOString(),
+            executionArn: lifecycleExecutionArn(deployment, work.intent.jobId) } });
         const outcome = await startLifecycleJob(starter, p.region, work);
-        console.info('[compute.migration.retire]', { ...log, jobId: work.intent.jobId, outcome });
+        console.info('[compute.migration.retire]', { migrationId: m.id, computerId: m.computerId, instanceId: p.instanceId, jobId: work.intent.jobId, outcome });
     }
     const deps: MigrationDeps & { store: typeof store } = {
         store,
@@ -178,7 +193,7 @@ export function createMigrationRuntime(db: PlacementDb, options: {
             // A recorded retire settles before anything else: never release under a running retire.
             if (intent.retire) {
                 try {
-                    const retire = await executions.describe(p.region, lifecycleExecutionArn(deployment ?? intent.deployment, intent.retire.jobId));
+                    const retire = await executions.describe(p.region, intent.retire.executionArn);
                     if (!TERMINAL_EXECUTION.includes(retire.status)) return;
                 } catch (error) {
                     if (!isExecutionAbsent(error) || Date.now() - Date.parse(intent.retire.requestedAt) < START_SETTLE_MS) return;
@@ -186,10 +201,12 @@ export function createMigrationRuntime(db: PlacementDb, options: {
             }
             // Enrollment records the boot's identity; a host that never enrolled is named by the launch receipt.
             let instanceId = p.instanceId, volumeId = p.volumeId;
+            // An unidentified boot stays held after Step Functions expires its launch (~90 days).
+            if (intent.held?.reason === 'receipt_invalid') return hold(m, intent, 'receipt_invalid', instanceId);
             if (launch?.status === 'SUCCEEDED' && (instanceId === null || volumeId === null)) {
                 const receipt = launchReceipt(p, launch.output);
                 // A succeeded launch whose instance cannot be identified stays reserved for an operator.
-                if (!receipt || (instanceId !== null && receipt.instanceId !== instanceId)) return;
+                if (!receipt || (instanceId !== null && receipt.instanceId !== instanceId)) return hold(m, intent, 'receipt_invalid', instanceId);
                 instanceId = receipt.instanceId; volumeId = receipt.volumeId;
             }
             if (instanceId !== null) {

@@ -15,11 +15,23 @@ export interface MigrationProvision {
     released?: boolean;
     /** The stale sweep's lifecycle `retire` of a failed boot still running, recorded before its start. */
     retire?: MigrationProvisionRetire;
+    /** The last operator hold signalled for this boot; `receipt_invalid` is never released automatically. */
+    held?: MigrationProvisionHold;
 }
 export interface MigrationProvisionRetire {
     jobId: string;
     digest: string;
     requestedAt: string;
+    /** The execution as started, so a later deployment change cannot hide a running retire. */
+    executionArn: string;
+}
+/** Why a failed boot stays reserved: `retire_failed` also covers a retire that cannot be built. */
+export type MigrationProvisionHoldReason = 'foreign_instance' | 'aws_placement_published' | 'receipt_invalid'
+    | 'no_starter' | 'no_deployment' | 'retire_failed';
+export interface MigrationProvisionHold {
+    reason: MigrationProvisionHoldReason;
+    since: string;
+    signalledAt: string;
 }
 const FAILED_MIGRATION_STATES: readonly string[] = ['failed_reopened', 'failed_needs_operator'];
 function hydrate(p: Placement): Placement {
