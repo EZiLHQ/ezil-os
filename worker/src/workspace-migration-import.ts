@@ -56,7 +56,21 @@ export const PULL_MAX_COUNT = 64;
  */
 export const EXPORT_POST_TIMEOUT_MS = 10_000;
 export const EXPORT_READ_TIMEOUT_MS = 6_000;
+/** A chunk GET's floor: one started at the 20 s mark ends by 32 s, as `PULL_CHUNK_DEADLINE_MS`. */
 export const EXPORT_CHUNK_TIMEOUT_MS = 12_000;
+/** No chunk GET runs past this much wall time from the pull's arrival (`chunkTimeoutMs`). */
+export const PULL_CHUNK_DEADLINE_MS = PULL_TRANSFER_WINDOW_MS + EXPORT_CHUNK_TIMEOUT_MS;
+
+/**
+ * One chunk GET's timeout: the time left to `PULL_CHUNK_DEADLINE_MS`, and never less than
+ * `EXPORT_CHUNK_TIMEOUT_MS`. A transfer starts by the 20 s mark, so none runs past 32 s, the
+ * same bound a flat 12 s gives. But an early transfer on a slow host gets the whole span:
+ * with 4 in flight, a flat 12 s stores nothing below about 0.33 MiB/s (4 MiB per 12 s), and a
+ * slow copy would stall instead of running slower (§5.4's floor is 0.5 MiB/s, T0 (e2)).
+ */
+export function chunkTimeoutMs(startedAt: number, now: number): number {
+  return Math.max(EXPORT_CHUNK_TIMEOUT_MS, startedAt + PULL_CHUNK_DEADLINE_MS - now);
+}
 /** The commit's chunk listing never needs more than the 512 chunk keys of one generation. */
 const LIST_MAX_OBJECTS = 4 * MAX_CHUNKS;
 
@@ -361,6 +375,16 @@ async function listAll(bucket: ImportBucket, prefix: string): Promise<Array<{ ke
 const sameIds = (state: ImportIds, ids: ImportIds) => state.moveId === ids.moveId && state.generation === ids.generation
   && state.computerId === ids.computerId;
 
+/**
+ * 🔴 The export boot's binding, recorded at begin, is the only host this import ever asks
+ * (§4.1 "Host binding"). A request at another binding is refused before any write or host
+ * call, also when the tunnel record carries it: after an abort that never landed, the
+ * computer's next hold open is a live desktop at N+2/E+2, and an export POST would stop it
+ * (§2.5 step 3). The app's export boot is immutable per move, so its own requests always match.
+ */
+const sameBinding = (state: ExportBinding, binding: ExportBinding) => state.placementGeneration === binding.placementGeneration
+  && state.leaseEpoch === binding.leaseEpoch;
+
 /** Every `ezil:reverseImport*` key, the main key LAST: a crash in between leaves no chunk record without its owner. */
 async function clearImportKeys(storage: ImportStorage): Promise<void> {
   const keys = [...(await storage.list<unknown>({ prefix: REVERSE_IMPORT_KEY })).keys()].filter(key => key !== REVERSE_IMPORT_KEY);
@@ -480,11 +504,11 @@ async function requestExport(deps: ReverseImportDeps, to: ExportTarget, ids: Imp
     if (!status) throw unreachable();
     return status;
   }
-  // The host refused the message (its closed body, or another move holds the host): retrying cannot help.
+  // §4.2 step 7's list, and only it: another move holds the host, or the host refused the body.
+  // Retrying cannot help. Anything else is retried, including a 409 the agent answers for the
+  // message (`export_invalid`; at base the edge relays a replayed or stale message as a 409 too).
   const error = (answer as { error?: unknown } | undefined)?.error;
-  if (response.status === 400 || (response.status === 409 && (error === 'export_busy' || error === 'export_invalid'))) {
-    throw refuse('export_refused');
-  }
+  if (response.status === 400 || (response.status === 409 && error === 'export_busy')) throw refuse('export_refused');
   throw unreachable();
 }
 
@@ -515,10 +539,10 @@ async function readExportHead(deps: ReverseImportDeps, to: ExportTarget, ids: Im
 
 /** One chunk, hash-checked against the export head before it is stored; its record comes from this Worker's own put. */
 async function transferChunk(deps: ReverseImportDeps, to: ExportTarget, store: { bucket: ImportBucket; prefix: string },
-  head: ExportHead, index: number): Promise<void> {
+  head: ExportHead, index: number, timeoutMs: number): Promise<void> {
   const expected = head.chunks[index]!;
   let response: Response;
-  try { response = await readAwsExport(to.record, to.host.zone, { chunk: index }, to.host.fetch, nowSeconds(deps), EXPORT_CHUNK_TIMEOUT_MS); }
+  try { response = await readAwsExport(to.record, to.host.zone, { chunk: index }, to.host.fetch, nowSeconds(deps), timeoutMs); }
   catch { throw unreachable(); }
   if (response.status !== 200) { await discard(response); throw unreachable(); }
   const declared = response.headers.get('content-length');
@@ -541,10 +565,11 @@ async function begin(request: Extract<ImportRequest, { op: 'begin' }>, deps: Rev
   const target = await importTarget(request, deps);
   const existing = await deps.storage.get<ReverseImportState>(REVERSE_IMPORT_KEY);
   if (existing) {
-    // Another move holds this computer. The same move goes to step 7 (§4.2 step 3), at the
-    // request's own binding: `exportHost` asks only a tunnel record that carries it.
+    // Another move holds this computer. The same move goes to step 7 (§4.2 step 3), and only
+    // at its export boot's binding.
     if (!sameIds(existing, request)) throw refuse('import_busy');
     checkStateTarget(existing, target.prefix);
+    if (!sameBinding(existing, request)) throw refuse('export_host_mismatch');
     await raiseFlag(target.bucket, target.prefix, request, deps);
     const status = await requestExport(deps, await exportHost(deps, request, request), request);
     return { status: 200, body: { ok: true, headKind: existing.headKind, export: status } };
@@ -590,10 +615,11 @@ async function begin(request: Extract<ImportRequest, { op: 'begin' }>, deps: Rev
 // ── §4.3 pull ──
 
 async function pull(request: Extract<ImportRequest, { op: 'pull' }>, deps: ReverseImportDeps, startedAt: number): Promise<ImportAnswer> {
-  // The ids pick the import (§4.3 step 1); the request's binding picks the host (`exportHost`).
+  // The ids pick the import (§4.3 step 1); the binding begin recorded is the only host.
   const state = await requireState(deps.storage, request);
   const target = await importTarget(request, deps);
   checkStateTarget(state, target.prefix);
+  if (!sameBinding(state, request)) throw refuse('export_host_mismatch');
   await raiseFlag(target.bucket, target.prefix, request, deps);
   const to = await exportHost(deps, request, request);
   const status = await readExportStatus(deps, to);
@@ -618,22 +644,37 @@ async function pull(request: Extract<ImportRequest, { op: 'pull' }>, deps: Rever
     if (recorded.has(i)) stored.add(i);
     else pending.push(i);
   }
-  let failure: unknown;
+  let mismatch: ImportRefusal | undefined;
+  let transient: unknown;
+  let landed = 0;
   let nextPending = 0;
   const worker = async () => {
-    while (failure === undefined && nextPending < pending.length) {
-      // No new transfer after the window; the ones in flight finish.
+    // No new transfer after a failure or after the window; the ones in flight finish.
+    while (mismatch === undefined && transient === undefined && nextPending < pending.length) {
       if (deps.now() - startedAt >= PULL_TRANSFER_WINDOW_MS) return;
       const index = pending[nextPending++]!;
       try {
-        await transferChunk(deps, to, target, head!, index);
+        await transferChunk(deps, to, target, head!, index, chunkTimeoutMs(startedAt, deps.now()));
         stored.add(index);
-      } catch (err) { failure ??= err; }
+        landed++;
+      } catch (err) {
+        if (err instanceof ImportRefusal && err.status === 409) mismatch ??= err;
+        else transient ??= err;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(PULL_CONCURRENCY, pending.length) }, worker));
-  // Chunks stored before a failure stay recorded; the next pull lists them as stored.
-  if (failure !== undefined) throw failure;
+  // 🔴 A chunk that is not the export head's is never stored, and the app reopens (§4.3 step 4,
+  // §5.5 `import_corrupt`): that answer wins over any progress.
+  if (mismatch) throw mismatch;
+  if (transient !== undefined) {
+    // A host, tunnel or store failure. With nothing new landed it is this pull's 503 (§4.1).
+    // Otherwise the pull answers what landed, as when the 20 s window ends: the app records it
+    // as progress, and the next pull starts at `next`, the first chunk still missing. A 503 here
+    // would drop that progress and count a copy that is advancing as a retry (§5.4, §5.5).
+    if (landed === 0) throw transient;
+    console.warn(`[reverse-import] pull stopped early: ${transient instanceof ImportRefusal ? transient.code : 'store_unavailable'}`);
+  }
   let next: number | null = null;
   for (let i = request.from; i < head.chunks.length; i++) {
     if (!recorded.has(i) && !stored.has(i)) { next = i; break; }

@@ -8,8 +8,9 @@ import { EXPORT_CONTROL_PATH, verifyGatewayHeader, type AwsTunnelRecord } from '
 import { REGISTRY_PATHS } from './aws-tunnels';
 import { MIGRATING_FLAG, SNAPSHOT_HEAD, chunkKey } from './workspace-persist';
 import {
-  IMPORT_CONFLICT_CODES, PULL_CONCURRENCY, PULL_TRANSFER_WINDOW_MS, REVERSE_IMPORT_HEAD_KEY, REVERSE_IMPORT_KEY,
-  REVERSE_IMPORT_PUT_PREFIX, parseImportRequest, runReverseImport, type ExportHostAccess, type ReverseImportDeps,
+  EXPORT_CHUNK_TIMEOUT_MS, EXPORT_READ_TIMEOUT_MS, IMPORT_CONFLICT_CODES, PULL_CHUNK_DEADLINE_MS, PULL_CONCURRENCY,
+  PULL_TRANSFER_WINDOW_MS, REVERSE_IMPORT_HEAD_KEY, REVERSE_IMPORT_KEY, REVERSE_IMPORT_PUT_PREFIX, chunkTimeoutMs,
+  parseImportRequest, runReverseImport, type ExportHostAccess, type ReverseImportDeps,
 } from './workspace-migration-import';
 
 const SECRET = 'reverse-import-tests-only';
@@ -365,15 +366,51 @@ describe('reverse import: begin (§4.2)', () => {
     expect(f.host.posts).toHaveLength(2);
   });
 
-  it('another move is import_busy; the same move at another binding goes to step 7, where only a matching host is asked', async () => {
+  it('another move is import_busy; the same move at another binding is export_host_mismatch', async () => {
     const f = await fixture();
     await f.begin();
     const state = f.store.map.get(REVERSE_IMPORT_KEY);
     expect(await f.call('begin', { ...beginBody, moveId: uuid() })).toEqual({ status: 409, body: { ok: false, error: 'import_busy' } });
-    // §4.2 step 3 keys on {moveId, generation}; the tunnel record (7/3) does not carry epoch 4.
+    // §4.2 step 3 keys on {moveId, generation}; the host is only ever the export boot's (§4.1).
     expect(await f.call('begin', { ...beginBody, leaseEpoch: 4 })).toEqual({ status: 409, body: { ok: false, error: 'export_host_mismatch' } });
     expect(f.host.posts).toHaveLength(1);
     expect(f.store.map.get(REVERSE_IMPORT_KEY)).toEqual(state);
+  });
+
+  it('🔴 a begin or pull at another binding never reaches a host, even one whose tunnel record carries that binding', async () => {
+    // The export boot was 7/3 and its abort never landed. The hold's next open replaced the host
+    // at 9/5 with the user's desktop running: an export POST there would stop it (§2.5 step 3).
+    const state = ownState();
+    const f = await fixture({ shape: 'none', record: { generation: 9, leaseEpoch: 5 }, storage: { [REVERSE_IMPORT_KEY]: state } });
+    const late = { ...beginBody, placementGeneration: 9, leaseEpoch: 5 };
+    for (const [op, body] of [['begin', late], ['pull', { ...late, from: 0, count: 64 }], ['pull', { ...late, from: 0, count: 0 }]] as const) {
+      expect(await f.call(op, body)).toEqual({ status: 409, body: { ok: false, error: 'export_host_mismatch' } });
+    }
+    expect(f.fetches).toEqual([]);
+    expect(f.host.requests).toEqual([]);
+    expect(f.r2.writes).toEqual([]);
+    expect(f.store.map.get(REVERSE_IMPORT_KEY)).toEqual(state);
+    // Positive control: the export boot's own binding reaches the export boot's host.
+    const own = await fixture({ shape: 'none', storage: { [REVERSE_IMPORT_KEY]: ownState() } });
+    expect((await own.begin()).status).toBe(200);
+    expect(own.host.posts).toHaveLength(1);
+  });
+
+  it('begin\'s check and fence run in the start queue: a container start in flight lands first, then container_running', async () => {
+    const f = await fixture({ shape: 'none' });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    // A Cloudflare start already queued in the DO: its container is up once it is released.
+    const starting = f.fake.withMigrationStart(async () => { await gate; f.fake.ctx.container.running = true; });
+    const begun = f.begin();
+    // Long enough for a begin that skipped the queue to publish its fence and ask the host.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    release();
+    await starting;
+    expect(await begun).toEqual({ status: 409, body: { ok: false, error: 'container_running' } });
+    expect(f.r2.writes).toEqual([]);
+    expect(importKeys(f.store.map)).toEqual([]);
+    expect(f.host.posts).toEqual([]);
   });
 
   it('a running Cloudflare container is container_running, before anything is written', async () => {
@@ -392,6 +429,8 @@ describe('reverse import: begin (§4.2)', () => {
     ['an unparseable head', f => f.r2.bucket.put(HEAD, new TextEncoder().encode('{not json')), 'head_unreadable'],
     ['an invalid v2 marker', async f => { const m = f.r2.json(HEAD); await f.r2.put(HEAD, { ...m, exported: { ...m.exported, sha256: 'x' } }); }, 'head_unreadable'],
     ['a v1 system head', f => f.r2.put(SYS, { version: 1, generation: uuid(), sha256: 'a'.repeat(64), entries: 1, chunks: [{ size: 1, sha256: 'b'.repeat(64) }] }), 'system_head_moved'],
+    // Refused before any write: accepted, the commit would meet it after the head CAS (`flip_stuck`).
+    ['an unparseable system head', f => f.r2.bucket.put(SYS, new TextEncoder().encode('{not json')), 'head_unreadable'],
   ];
   for (const [name, arrange, code] of headCases) {
     it(`refuses ${name}: ${code}, with no flag and no key`, async () => {
@@ -464,11 +503,14 @@ describe('reverse import: begin (§4.2)', () => {
     expect((await placeholder.begin()).status).toBe(200);
   });
 
-  it('the host: export_busy or a 400 is export_refused; a 503 or no answer is export_unreachable', async () => {
+  it('the host: export_busy or a 400 is export_refused; any other answer (an agent refusal, a 503, none) is export_unreachable', async () => {
     const cases: Array<[(f: Awaited<ReturnType<typeof fixture>>) => void, number, string]> = [
       [f => { f.host.job = { moveId: uuid(), generation: uuid() }; }, 409, 'export_refused'],
       [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_body_invalid' }, { status: 400 }); }, 409, 'export_refused'],
-      [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_invalid' }, { status: 409 }); }, 409, 'export_refused'],
+      // §4.2 step 7 names only export_busy and a 400. The agent's refusal of the message may be a
+      // replayed or stale sequence after a restart: retried (§5.5 `unavailable`), never final.
+      [f => { f.host.answer = () => Response.json({ ok: false, error: 'export_invalid' }, { status: 409 }); }, 503, 'export_unreachable'],
+      [f => { f.host.answer = () => Response.json({ ok: false, error: 'replayed' }, { status: 409 }); }, 503, 'export_unreachable'],
       [f => { f.host.answer = () => Response.json({ ok: false, error: 'agent_unavailable' }, { status: 503 }); }, 503, 'export_unreachable'],
       [f => { f.host.answer = () => { throw new Error('tunnel down'); }; }, 503, 'export_unreachable'],
       [f => { f.host.answer = () => Response.json({ ok: true, state: 'bogus' }, { status: 202 }); }, 503, 'export_unreachable'],
@@ -593,15 +635,96 @@ describe('reverse import: pull (§4.3)', () => {
     }
   });
 
-  it('a chunk the host cannot serve is export_unreachable; an R2 put failure is a 503', async () => {
+  it('right bytes under a missing or wrong Content-Length are chunk_mismatch (§4.3 step 4 checks the header itself)', async () => {
+    const cases: Array<[string, (bytes: Uint8Array) => Response, string | null]> = [
+      ['no Content-Length', bytes => new Response(new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } })), null],
+      ['a short Content-Length', bytes => new Response(bytes, { headers: { 'content-length': String(bytes.length - 1) } }), String(MIB - 1)],
+    ];
+    for (const [, respond, header] of cases) {
+      const f = await fixture();
+      await f.begin();
+      f.host.state = 'ready';
+      const seen: Array<string | null> = [];
+      f.host.chunkOverride = index => {
+        const response = respond(f.host.export.chunks[index]!);
+        seen.push(response.headers.get('content-length'));
+        return response;
+      };
+      expect(await f.pull(0, 1)).toEqual({ status: 409, body: { ok: false, error: 'chunk_mismatch' } });
+      // Not vacuous: the runtime sent the header this case means to send.
+      expect(seen).toEqual([header]);
+      expect(f.store.map.has(`${REVERSE_IMPORT_PUT_PREFIX}0`)).toBe(false);
+      expect(f.r2.objects.has(chunkKey(P, GEN, 0))).toBe(false);
+    }
+  });
+
+  it('a chunk the host cannot serve is export_unreachable; an R2 put failure is a 503: nothing landed', async () => {
     const f = await fixture();
     await f.begin();
     f.host.state = 'ready';
     f.host.chunkOverride = () => Response.json({ ok: false, error: 'export_chunk_missing' }, { status: 404 });
     expect(await f.pull(0, 1)).toEqual({ status: 503, body: { ok: false, error: 'export_unreachable' } });
+    expect(await f.pull(0, 64)).toEqual({ status: 503, body: { ok: false, error: 'export_unreachable' } });
     f.host.chunkOverride = null;
     f.r2.faults.put = key => key.startsWith(`${P}/.ezil-snapshots/${GEN}/`);
     expect(await f.pull(0, 1)).toEqual({ status: 503, body: { ok: false, error: 'store_unavailable' } });
+    expect(await f.pull(0, 64)).toEqual({ status: 503, body: { ok: false, error: 'store_unavailable' } });
+    expect(importKeys(f.store.map).filter(key => key.startsWith(REVERSE_IMPORT_PUT_PREFIX))).toEqual([]);
+  });
+
+  it('one transient chunk failure keeps the pull\'s progress: 200 with what landed, next at the missing chunk', async () => {
+    const faults: Array<[string, (f: Fixture) => void]> = [
+      ['the host', f => { f.host.chunkOverride = index => index === 1 ? Response.json({ ok: false, error: 'agent_unavailable' }, { status: 503 }) : null; }],
+      ['the tunnel', f => { f.host.chunkOverride = index => { if (index === 1) throw new Error('tunnel reset'); return null; }; }],
+      ['an R2 put', f => { f.r2.faults.put = key => key === chunkKey(P, GEN, 1); }],
+      ['a DO put', f => {
+        const put = f.store.api.put;
+        f.store.api.put = async (key: string, value: unknown) => {
+          if (key === `${REVERSE_IMPORT_PUT_PREFIX}1`) throw new Error('storage blip');
+          return put(key, value);
+        };
+      }],
+    ];
+    for (const [, arrange] of faults) {
+      const f = await fixture();
+      await f.begin();
+      f.host.state = 'ready';
+      const put = f.store.api.put;
+      arrange(f);
+      expect(await f.pull(0, 64)).toEqual({ status: 200, body: { ok: true, export: expect.objectContaining({ state: 'ready' }),
+        head: f.host.export.head, stored: [0, 2], next: 1 } });
+      expect(f.store.map.has(`${REVERSE_IMPORT_PUT_PREFIX}1`)).toBe(false);
+      // The fault clears: the next pull starts at `next` and the copy completes.
+      f.host.chunkOverride = null;
+      f.r2.faults.put = () => false;
+      f.store.api.put = put;
+      expect((await f.pull(1, 64)).body).toMatchObject({ ok: true, stored: [1, 2], next: null });
+      expect((await f.verify()).status).toBe(200);
+    }
+  });
+
+  it('a failure starts no new transfer: the ones in flight finish and are reported', async () => {
+    const f = await fixture();
+    await f.begin();
+    f.host.export = exportOf([...Array.from({ length: 9 }, () => MIB), 5]);
+    f.host.state = 'ready';
+    f.host.chunkDelay = 5;
+    f.host.chunkOverride = index => index === 0 ? Response.json({ ok: false, error: 'agent_unavailable' }, { status: 503 }) : null;
+    const r = await f.pull(0, 64);
+    expect(r.body).toMatchObject({ ok: true, stored: [1, 2, 3], next: 0 });
+    // The four that were in flight together, in whatever order they reached the host; none after.
+    expect(f.host.requests.filter(req => req.path.includes('/chunk/')).map(req => Number(req.path.split('/').at(-1))).sort()).toEqual([0, 1, 2, 3]);
+  });
+
+  it('a mismatched chunk wins over a transient failure and over the chunks that landed', async () => {
+    const f = await fixture();
+    await f.begin();
+    f.host.state = 'ready';
+    f.host.chunkOverride = index => index === 0 ? Response.json({ ok: false, error: 'agent_unavailable' }, { status: 503 })
+      : index === 1 ? new Response(new Uint8Array(MIB).fill(9), { headers: { 'content-length': String(MIB) } }) : null;
+    expect(await f.pull(0, 64)).toEqual({ status: 409, body: { ok: false, error: 'chunk_mismatch' } });
+    expect(f.store.map.has(`${REVERSE_IMPORT_PUT_PREFIX}1`)).toBe(false);
+    expect(f.r2.objects.has(chunkKey(P, GEN, 1))).toBe(false);
   });
 
   for (const [name, mutate] of [
@@ -729,6 +852,55 @@ describe('reverse import: commit (§4.4)', () => {
     expect(importKeys(f.store.map)).toEqual([]);
   });
 
+  it('a computer created on AWS: a head that appeared at P since begin loses the create-only CAS (head_moved)', async () => {
+    const f = await fixture({ shape: 'none' });
+    await f.copied();
+    await f.verify();
+    // 🔴 §4.2: a Cloudflare head is never overwritten, also where begin saw none.
+    const cloudflare = { version: 1, generation: uuid(), sha256: 'a'.repeat(64), entries: 1, chunks: [{ size: 1, sha256: 'b'.repeat(64) }] };
+    await f.r2.put(HEAD, cloudflare);
+    const etag = f.r2.objects.get(HEAD)!.etag;
+    expect(await f.commit()).toEqual({ status: 409, body: { ok: false, error: 'head_moved' } });
+    expect(f.r2.objects.get(HEAD)!.etag).toBe(etag);
+    expect(f.r2.json(HEAD)).toEqual(cloudflare);
+    expect((f.store.map.get(REVERSE_IMPORT_KEY) as any).committing).toBeUndefined();
+  });
+
+  it('a v1 system head where begin saw none is system_head_moved after the workspace head committed', async () => {
+    const f = await fixture({ shape: 'none' });
+    await f.copied();
+    await f.verify();
+    expect((f.store.map.get(REVERSE_IMPORT_KEY) as any).systemMigratedEtag).toBeNull();
+    await f.r2.put(SYS, { version: 1, generation: uuid(), sha256: 'a'.repeat(64), entries: 1, chunks: [{ size: 1, sha256: 'b'.repeat(64) }] });
+    expect(await f.commit()).toEqual({ status: 409, body: { ok: false, error: 'system_head_moved' } });
+    expect(f.r2.json(HEAD).generation).toBe(GEN);
+    expect((f.store.map.get(REVERSE_IMPORT_KEY) as any).committing).toBe(true);
+    expect((await f.commit()).body.error).toBe('system_head_moved');
+  });
+
+  it('step 3 records the generation it puts back BEFORE the put: a crash between the two completes on retry', async () => {
+    const f = await fixture();
+    await f.copied();
+    await f.verify();
+    const put = f.store.api.put;
+    let failed = false;
+    // Die on the record: with the record after the put, the put would have landed by now and
+    // every retry would read a v1 system head it cannot recognise (`system_head_moved`).
+    f.store.api.put = async (key: string, value: unknown) => {
+      if (key === REVERSE_IMPORT_KEY && (value as { systemRevertGeneration?: string }).systemRevertGeneration && !failed) {
+        failed = true;
+        throw new Error('storage blip');
+      }
+      return put(key, value);
+    };
+    expect(await f.commit()).toEqual({ status: 503, body: { ok: false, error: 'store_unavailable' } });
+    expect(failed).toBe(true);
+    expect(f.r2.json(HEAD).generation).toBe(GEN);
+    expect(await f.commit()).toEqual({ status: 200, body: { ok: true, committed: true, store: 'r2' } });
+    expect(f.r2.json(SYS)).toEqual(f.previousSystem());
+    expect(importKeys(f.store.map)).toEqual([]);
+  });
+
   it('a moved system head is system_head_moved after the workspace head committed; committing holds abort off', async () => {
     const f = await fixture();
     await f.copied();
@@ -757,7 +929,19 @@ describe('reverse import: commit (§4.4)', () => {
     expect(f.r2.json(SYS)).toEqual(f.previousSystem());
     expect(f.r2.objects.has(FLAG)).toBe(true);
     f.store.api.put = put;
+    // The retry is a commit too: it rewrites the flag's startedAt first (§4.1), then lowers it.
+    await f.r2.put(FLAG, { startedAt: '2001-01-01T00:00:00.000Z', reverse: { moveId: MOVE, generation: GEN } });
+    const log = writeLog(f);
+    const flagPut = f.r2.bucket.put;
+    let rewritten: string | undefined;
+    f.r2.bucket.put = async (key: string, value: Uint8Array | string, opts?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
+      if (key === FLAG) rewritten = JSON.parse(typeof value === 'string' ? value : new TextDecoder().decode(value)).startedAt;
+      return flagPut(key, value, opts);
+    };
     expect(await f.commit()).toEqual({ status: 200, body: { ok: true, committed: true, store: 'r2' } });
+    expect(log[0]).toBe(`r2 ${FLAG}`);
+    expect(log).toContain(`r2-delete ${FLAG}`);
+    expect(Date.parse(rewritten!)).toBeGreaterThan(Date.parse('2026-01-01'));
     expect(f.r2.json(SYS)).toEqual(f.previousSystem());
     expect(f.r2.objects.has(FLAG)).toBe(false);
     expect(importKeys(f.store.map)).toEqual([]);
@@ -974,6 +1158,34 @@ describe('reverse import: pull throughput bounds (unit, fake clock)', () => {
     expect(stored.length).toBeLessThanOrEqual(9);
     expect(r.body.next).toBe(stored.length);
     expect(PULL_TRANSFER_WINDOW_MS).toBe(20_000);
+  });
+
+  it('a chunk GET gets the time left to 32 s after arrival, never less than 12 s: none runs past 32 s', () => {
+    expect(EXPORT_CHUNK_TIMEOUT_MS).toBe(12_000);
+    expect(PULL_CHUNK_DEADLINE_MS).toBe(32_000);
+    const arrival = 1_000_000;
+    for (const offset of [0, 4_000, 9_000, 19_999, PULL_TRANSFER_WINDOW_MS]) {
+      const timeout = chunkTimeoutMs(arrival, arrival + offset);
+      expect(timeout).toBeGreaterThanOrEqual(12_000);
+      expect(offset + timeout).toBeLessThanOrEqual(32_000);
+    }
+    // An early transfer on a slow host is not cut at 12 s with its three siblings.
+    expect(chunkTimeoutMs(arrival, arrival + 9_000)).toBe(23_000);
+  });
+
+  it('the pull hands each chunk GET that timeout', async () => {
+    // Each host request moves the clock 2 s: the chunks start 4 s after arrival (status, head).
+    const { run, now } = await unit(4, { tick: 2_000 });
+    const timeout = spyOn(AbortSignal, 'timeout');
+    try {
+      const r = await run({ op: 'pull', ...beginBody, from: 0, count: 4 }, now());
+      expect(r.body.stored).toEqual([0, 1, 2, 3]);
+      const ms = timeout.mock.calls.map(([value]) => value as number);
+      expect(ms.filter(value => value === EXPORT_READ_TIMEOUT_MS)).toHaveLength(2);
+      expect(ms.filter(value => value !== EXPORT_READ_TIMEOUT_MS)).toEqual(Array(4).fill(PULL_CHUNK_DEADLINE_MS - 4_000));
+    } finally {
+      timeout.mockRestore();
+    }
   });
 });
 
