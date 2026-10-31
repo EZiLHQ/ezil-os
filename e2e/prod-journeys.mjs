@@ -11,16 +11,20 @@
  * it records the status and body error CODE of every failing `/api/*` response,
  * the console errors, the visible error text and a screenshot.
  *
- * Journeys (select with EZIL_E2E_JOURNEYS, comma list; default: all but paid):
+ * Journeys (select with EZIL_E2E_JOURNEYS, comma list; default: all but paid and ezil-ai):
  *   free-open-apps        sign in, Code ready, terminal echo, Browser pixels
+ *   ezil-ai               Code's EZiL AI status shows credits, one tiny chat reply (spends credits)
  *   paid-aws-computer     NEW computer on AWS: boot, stop, wake, stop (costs money)
  *   feedback-diagnostics  Settings → Feedback with diagnostics, what the report carries
  *   billing-view          Settings → Billing, read-only: plan, AI credits, compute
  *
  * Inputs come only from the environment (see e2e/README.md): EZIL_E2E_APP,
- * EZIL_E2E_EMAIL, EZIL_E2E_PASSWORD, NEXT_PUBLIC_SUPABASE_URL,
- * NEXT_PUBLIC_SUPABASE_ANON_KEY, PLAYWRIGHT_REQUIRE_DIR. Use a DEDICATED QA
- * account. Evidence goes to EZIL_E2E_OUT (default: <tmpdir>/ezil-prod-journeys).
+ * EZIL_E2E_EMAIL, EZIL_E2E_PASSWORD, PLAYWRIGHT_REQUIRE_DIR, and the sign-in:
+ * EZIL_E2E_SIGNIN=supabase (default; e2e/sign-in.mjs, needs
+ * NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY) or
+ * EZIL_E2E_SIGNIN=ezilid (e2e/sign-in-ezilid.mjs: the real /login → EZiL ID UI).
+ * Use a DEDICATED QA account. Evidence goes to EZIL_E2E_OUT (default:
+ * <tmpdir>/ezil-prod-journeys).
  *
  * Exit 0 = every selected journey passed. 1 = a journey failed. 2 = could not
  * run (bad or missing inputs; never a pass).
@@ -38,9 +42,13 @@ import { FINAL_STOP_TIMEOUT_MS, isMeaningfulFrame, parseTerminalMarker } from '.
 // ── Journeys, budgets, deadlines ────────────────────────────────────────────
 
 export const SUITE_VERSION = 1;
-export const JOURNEYS = Object.freeze(['free-open-apps', 'paid-aws-computer', 'feedback-diagnostics', 'billing-view']);
-/** The paid journey creates an AWS computer that bills while it runs: it is never implicit. */
-export const DEFAULT_JOURNEYS = Object.freeze(JOURNEYS.filter(name => name !== 'paid-aws-computer'));
+export const JOURNEYS = Object.freeze(['free-open-apps', 'ezil-ai', 'paid-aws-computer', 'feedback-diagnostics', 'billing-view']);
+/**
+ * Never implicit: the paid journey creates an AWS computer that bills while it
+ * runs, and `ezil-ai` spends AI credits and needs an account enrolled in EZiL
+ * AI (one that signed in through EZiL ID, `EZIL_E2E_SIGNIN=ezilid`).
+ */
+export const DEFAULT_JOURNEYS = Object.freeze(JOURNEYS.filter(name => !['paid-aws-computer', 'ezil-ai'].includes(name)));
 /** Every computer this suite creates carries this name prefix; it is how a re-run recognises its own. */
 export const COMPUTER_NAME_PREFIX = '[QA automated] aws-journey';
 export const FEEDBACK_PREFIX = '[QA automated]';
@@ -56,12 +64,18 @@ const CLOSE_MS = 30 * SECOND;
 const PRECHECK_MS = 2 * MINUTE;
 const CREATE_MS = MINUTE;
 const OS_READY_MS = MINUTE;
+const SIGN_IN_MS = 90 * SECOND;
+const AI_STATUS_MS = 2 * MINUTE;
+/** How long the status item may stay on "Loading…" (or absent while the extension activates). */
+const AI_STATUS_WAIT_MS = 90 * SECOND;
+const CHAT_OPEN_MS = MINUTE;
 
 export const DEFAULT_TIMEOUTS = Object.freeze({
   appTimeoutMs: 4 * MINUTE,
   awsTimeoutMs: 15 * MINUTE,
   awsWakeTimeoutMs: 10 * MINUTE,
   stoppedTimeoutMs: 5 * MINUTE,
+  aiReplyTimeoutMs: 2 * MINUTE,
 });
 
 /** Which journeys run, in canonical order, deduplicated. Unknown names are an error, never ignored. */
@@ -97,28 +111,49 @@ function parseDurationEnv(env, name, fallback, { min = SECOND, max = 60 * MINUTE
   return value;
 }
 
+/** Required with the default sign-in (`EZIL_E2E_SIGNIN=supabase`, e2e/sign-in.mjs). */
 export const REQUIRED_ENV = Object.freeze([
   'EZIL_E2E_APP', 'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD',
   'NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY', 'PLAYWRIGHT_REQUIRE_DIR',
 ]);
+/** `supabase`: password grant, no UI (sign-in.mjs). `ezilid`: the real /login → EZiL ID UI (sign-in-ezilid.mjs). */
+export const SIGN_IN_MODES = Object.freeze(['supabase', 'ezilid']);
+const SUPABASE_ENV = Object.freeze(['NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']);
+
+/** The variables a sign-in mode needs. EZiL ID signs in through the app's own UI: no Supabase inputs. */
+export function requiredEnv(mode = 'supabase') {
+  return mode === 'ezilid' ? REQUIRED_ENV.filter(name => !SUPABASE_ENV.includes(name)) : [...REQUIRED_ENV];
+}
+
+export function parseSignInMode(raw) {
+  const mode = String(raw ?? '').trim().toLowerCase() || 'supabase';
+  if (!SIGN_IN_MODES.includes(mode)) throw new Error(`EZIL_E2E_SIGNIN must be one of ${SIGN_IN_MODES.join(', ')}`);
+  return mode;
+}
 
 /** Validate the environment. Errors name variables, never their values. */
 export function parseEnv(env = process.env) {
-  const missing = REQUIRED_ENV.filter(name => String(env[name] ?? '').trim() === '');
+  const signInMode = parseSignInMode(env.EZIL_E2E_SIGNIN);
+  const missing = requiredEnv(signInMode).filter(name => String(env[name] ?? '').trim() === '');
   if (missing.length) throw new Error(`Missing prod-journeys inputs: ${missing.join(', ')}`);
-  const supabase = String(env.NEXT_PUBLIC_SUPABASE_URL);
-  try {
-    const url = new URL(supabase);
-    if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('scheme');
-  } catch { throw new Error('NEXT_PUBLIC_SUPABASE_URL must be an HTTPS URL'); }
+  let supabaseUrl = null, anonKey = null;
+  if (signInMode === 'supabase') {
+    supabaseUrl = String(env.NEXT_PUBLIC_SUPABASE_URL);
+    try {
+      const url = new URL(supabaseUrl);
+      if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('scheme');
+    } catch { throw new Error('NEXT_PUBLIC_SUPABASE_URL must be an HTTPS URL'); }
+    anonKey = String(env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+  }
   const awsComputer = String(env.EZIL_E2E_AWS_COMPUTER ?? 'new').trim() || 'new';
   if (!['new', 'reuse'].includes(awsComputer)) throw new Error('EZIL_E2E_AWS_COMPUTER must be "new" or "reuse"');
   return {
     app: parseAppOrigin(env.EZIL_E2E_APP),
     email: String(env.EZIL_E2E_EMAIL).trim(),
     password: String(env.EZIL_E2E_PASSWORD),
-    supabaseUrl: supabase,
-    anonKey: String(env.NEXT_PUBLIC_SUPABASE_ANON_KEY),
+    signInMode,
+    supabaseUrl,
+    anonKey,
     requireDir: resolve(String(env.PLAYWRIGHT_REQUIRE_DIR)),
     journeys: selectJourneys(env.EZIL_E2E_JOURNEYS),
     out: resolve(env.EZIL_E2E_OUT || join(tmpdir(), 'ezil-prod-journeys')),
@@ -127,6 +162,7 @@ export function parseEnv(env = process.env) {
     awsTimeoutMs: parseDurationEnv(env, 'EZIL_E2E_AWS_TIMEOUT_MS', DEFAULT_TIMEOUTS.awsTimeoutMs),
     awsWakeTimeoutMs: parseDurationEnv(env, 'EZIL_E2E_AWS_WAKE_TIMEOUT_MS', DEFAULT_TIMEOUTS.awsWakeTimeoutMs),
     stoppedTimeoutMs: parseDurationEnv(env, 'EZIL_E2E_AWS_STOPPED_TIMEOUT_MS', DEFAULT_TIMEOUTS.stoppedTimeoutMs),
+    aiReplyTimeoutMs: parseDurationEnv(env, 'EZIL_E2E_AI_REPLY_TIMEOUT_MS', DEFAULT_TIMEOUTS.aiReplyTimeoutMs, { min: 10 * SECOND, max: 10 * MINUTE }),
   };
 }
 
@@ -135,6 +171,8 @@ export function journeyBudgetMs(name, config) {
   const t = { ...DEFAULT_TIMEOUTS, ...config };
   switch (name) {
     case 'free-open-apps': return OS_READY_MS + 2 * (t.appTimeoutMs + 15 * SECOND) + TERMINAL_MS + CLOSE_MS;
+    case 'ezil-ai': return SIGN_IN_MS + OS_READY_MS + (t.appTimeoutMs + 15 * SECOND) + AI_STATUS_MS
+      + CHAT_OPEN_MS + t.aiReplyTimeoutMs + 30 * SECOND + CLOSE_MS;
     case 'paid-aws-computer': return OS_READY_MS + PRECHECK_MS + CREATE_MS + t.awsTimeoutMs + t.appTimeoutMs
       + FINAL_STOP_TIMEOUT_MS + t.stoppedTimeoutMs + t.awsWakeTimeoutMs + 3 * CLOSE_MS + 2 * MINUTE;
     case 'feedback-diagnostics': return OS_READY_MS + 2 * MINUTE;
@@ -547,6 +585,157 @@ export function normalizeVisibleText(text, { max = 400, secrets = [] } = {}) {
   return capText(redactText(String(text ?? '').replace(/\s+/g, ' ').trim(), { secrets }), max);
 }
 
+// ── EZiL AI in Code (the `ezil-ai` journey) ────────────────────────────────
+//
+// The ezil-models extension runs in Code's extension host ON THE COMPUTER, so
+// its Gateway requests never pass through this browser: the only evidence is
+// the copy Code renders. These helpers map that copy back to the codes behind
+// it (extensions/ezil-models/src/status-data.ts `statusView`/`statusProblem`,
+// gateway.ts `describeGatewayError`). In particular `os_ai_unavailable` (the
+// OS proxy could not reach EZiL AI) has no status label of its own: the item
+// reads "Credits unavailable", and a chat reply reads "EZiL OS could not reach
+// EZiL AI". An "is the code absent" check would pass while AI is down; the
+// journey instead requires a credit balance and a real reply.
+
+/** The default chat model's display name: `"default": true` in worker/ezil-models/models.json. */
+export const DEFAULT_AI_MODEL_NAME = 'Qwen3 Coder Next';
+/** One tiny prompt. The reply is recorded by length and its first 40 characters only. */
+export const AI_PROMPT = 'Reply with the single word: pong';
+export const AI_REPLY_PREVIEW_CHARS = 40;
+/** The status item: `createStatusBarItem('ezil-models.aiStatus', …)`, prefixed with the extension id by the workbench. */
+export const AI_STATUS_ITEM = '.statusbar-item[id$="ezil-models.aiStatus" i]';
+
+/** Status-bar attention labels (status-data.ts `statusProblem` and `statusView`) → the codes behind them. */
+const AI_STATUS_LABELS = Object.freeze([
+  [/^Session expired$/, 'session_expired'],
+  [/^Not configured$/, 'not_configured'],
+  [/^Sign-in needed$/, 'sign_in_needed'],          // os_session_missing, unauthorized, http_401
+  [/^AI access needed$/, 'no_ai_access'],          // no_ezil_role, not_a_member, no_entitlement, http_403
+  [/^Reconnect needed$/, 'os_proxy_unauthorized'],
+  [/^AI access suspended$/, 'suspended'],
+  [/^No credits available$/, 'insufficient_credits'],
+  [/^Window credits used$/, 'window_budget_reached'],
+  [/^Paused\b/, 'paused'],
+  [/^Daily credit budget used$/, 'daily_budget_reached'],
+  [/^Monthly credit budget used$/, 'monthly_budget_reached'],
+  [/^Credits held$/, 'credits_held'],
+]);
+
+/**
+ * The status item's text (`EZiL AI · 12.5 credits`, `EZiL AI · 3 credits left · resets 14:00`,
+ * `EZiL AI · Loading…`, `EZiL AI · Credits unavailable · …`, `EZiL AI · Sign-in needed`) as
+ * `{ state: 'credits' | 'loading' | 'unavailable' | 'attention' | 'missing' | 'unknown', … }`.
+ */
+export function classifyAIStatus(text) {
+  const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!value) return { state: 'missing' };
+  const match = /^EZiL AI\s*·\s*(.+)$/.exec(value);
+  if (!match) return { state: 'unknown' };
+  const rest = match[1];
+  if (/^Loading\b/.test(rest)) return { state: 'loading' };
+  // Every status read failed without an attention code: os_ai_unavailable, a timeout or a network error.
+  if (/^Credits unavailable\b/.test(rest)) return { state: 'unavailable', code: 'credits_unavailable' };
+  const credits = /^([\d,]+(?:\.\d+)?) credits( left)?(?= ·|$)/.exec(rest);
+  if (credits) {
+    const partial = ['limits unavailable', 'availability unknown', 'usage unavailable'].filter(part => rest.includes(part));
+    return { state: 'credits', credits: credits[1], window: Boolean(credits[2]),
+      zero: Number(credits[1].replace(/,/g, '')) === 0 || /· window used\b/.test(rest), ...(partial.length ? { partial } : {}) };
+  }
+  const label = rest.split(' · ')[0];
+  const known = AI_STATUS_LABELS.find(([pattern]) => pattern.test(label));
+  return { state: 'attention', label: capText(label, 60), code: known ? known[1] : 'unknown' };
+}
+
+/**
+ * What the status quick pick (or, when it cannot be read, the item's aria-label, which joins
+ * the same lines with ". ") says, by fact: the available balance, whether the credit read
+ * failed, the entitlement and pause lines, and the recent-usage COUNT (never the rows).
+ */
+export function summarizeAIQuickPick(rows) {
+  const lines = (Array.isArray(rows) ? rows : []).map(row => String(row ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const find = pattern => lines.find(line => pattern.test(line)) ?? null;
+  const available = /^Available credits: ([\d,]+(?:\.\d+)?)/.exec(find(/^Available credits:/) ?? '');
+  const header = lines.findIndex(line => /^Recent usage\b/.test(line));
+  const usage = find(/^Usage unavailable\b/) ? 'unavailable' : find(/^No recent usage\b/) ? 'none'
+    : header >= 0 ? `rows:${lines.slice(header + 1).filter(line => / · /.test(line)).length}` : null;
+  return {
+    rows: lines.length,
+    availableCredits: available ? available[1] : null,
+    creditsUnavailable: Boolean(find(/^Credits unavailable\b/)),
+    entitlement: capText(find(/^Entitlement:/) ?? '', 80) || null,
+    globalPause: capText(find(/^Global AI (?:pause|availability)\b/) ?? '', 80) || null,
+    usage,
+  };
+}
+
+/** Pass only with a non-zero balance on the item and, when the lines were read, an "Available credits" line. */
+export function aiStatusVerdict(status, summary = null) {
+  switch (status?.state) {
+    case 'credits':
+      if (status.zero) return { ok: false, reason: `EZiL AI shows ${status.credits} credits${status.window ? ' left in this window' : ''}: the free AI grant has not landed, or it is used up` };
+      if (summary?.rows > 0 && summary.availableCredits === null) {
+        return { ok: false, reason: `EZiL AI status lists no "Available credits" line${summary.creditsUnavailable ? ' ("Credits unavailable")' : ''}` };
+      }
+      return { ok: true };
+    case 'loading': return { ok: false, reason: 'EZiL AI status never left "Loading…"' };
+    case 'missing': return { ok: false, reason: 'Code shows no "EZiL AI" status-bar item (the ezil-models extension is not active)' };
+    case 'unavailable': return { ok: false, reason: 'EZiL AI shows no credit balance ("Credits unavailable"): its Gateway reads failed (os_ai_unavailable, a timeout or a network error; the item does not say which)' };
+    case 'attention': return { ok: false, reason: `EZiL AI needs attention: "${status.label}" (${status.code})` };
+    default: return { ok: false, reason: 'EZiL AI status-bar text is not recognised' };
+  }
+}
+
+/** Chat error copy (`EZiL AI: …`, gateway.ts `describeGatewayError`) → the code behind it. First match wins. */
+const CHAT_ERRORS = Object.freeze([
+  [/could not reach EZiL AI/i, 'os_ai_unavailable'],
+  [/not available here yet/i, 'os_session_missing'],
+  [/sign-in has expired/i, 'session_expired'],
+  [/refused this computer.s AI connection/i, 'os_proxy_unauthorized'],
+  [/no AI access|does not have AI (?:access|membership)/i, 'no_ai_access'],
+  [/AI access is suspended/i, 'suspended'],
+  [/Not enough AI credits|No AI credits|needs up to [\d.,]+ credits/i, 'insufficient_credits'],
+  [/credits are used up/i, 'window_budget_reached'],
+  [/\bAI is (?:temporarily )?paused\b/i, 'paused'],
+  [/model is temporarily unavailable/i, 'model_unavailable'],
+  [/did not answer in time/i, 'upstream_timeout'],
+  [/Too many requests/i, 'rate_limited'],
+  [/Wait for the current response/i, 'concurrency_limit'],
+  [/Conversation too large/i, 'input_too_large'],
+  [/refused (?:this account.s sign-in|authentication)|could not verify this account|does not accept this account/i, 'unauthorized'],
+]);
+
+/** A chat response's text as `{ state: 'reply' | 'error' | 'empty', code? }`. */
+export function classifyChatReply(text) {
+  const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!value) return { state: 'empty' };
+  const gateway = /\bEZiL AI:/.test(value);
+  if (!gateway && !/Sorry, (?:your request failed|no response was returned)|\brequest failed\b|an error occurred/i.test(value)) {
+    return { state: 'reply' };
+  }
+  const known = CHAT_ERRORS.find(([pattern]) => pattern.test(value));
+  const coded = /AI request failed \(([a-z0-9_]{1,64})\)/.exec(value)?.[1] ?? /\(([a-z0-9_]{1,64})\); please report/.exec(value)?.[1];
+  return { state: 'error', code: known ? known[1] : coded ?? (gateway ? 'gateway_error' : 'chat_failed') };
+}
+
+/** A response that is still a placeholder ("Working…", "Thinking"), not a reply. */
+export function isPlaceholderReply(text) {
+  return /^(?:thinking|working|loading|getting ready|preparing)[.…\s]*$/i.test(String(text ?? '').trim());
+}
+
+/** The model the chat input shows: the default by name, else anything that reads like a model. */
+export function pickModelLabel(labels, expected = DEFAULT_AI_MODEL_NAME) {
+  const list = (Array.isArray(labels) ? labels : []).map(label => String(label ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  return list.find(label => label.includes(expected))
+    ?? list.find(label => /qwen|kimi|coder|gpt|claude|gemini|llama|mistral|deepseek|nova|^auto$/i.test(label)) ?? null;
+}
+
+/** What the report keeps of a reply: its length and its first 40 characters, redacted. */
+export function replyEvidence(text, { secrets = [] } = {}) {
+  const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return { replyLength: value.length, replyPreview: capText(redactText(value.slice(0, AI_REPLY_PREVIEW_CHARS), { secrets }), AI_REPLY_PREVIEW_CHARS),
+    saysPong: /\bpong\b/i.test(value) };
+}
+
 // ── Report ──────────────────────────────────────────────────────────────────
 
 export function stepRecord(name, ok, ms, { error, evidence, note } = {}) {
@@ -690,6 +879,69 @@ export function readDockProbe(app) {
     fullbleed, apps: items.map(el => el.dataset.app ?? '') };
 }
 
+/**
+ * In Code's frame: the EZiL AI status item (`AI_STATUS_ITEM`). `text` is what the status bar
+ * shows; `aria` is its accessibility label, the full status lines joined with ". ".
+ */
+export function readAIStatusItem() {
+  const item = document.querySelector('.statusbar-item[id$="ezil-models.aiStatus" i]');
+  if (!item) return { present: false, text: '', aria: '' };
+  const label = item.querySelector('a, [role="button"]') ?? item;
+  return { present: true, text: (label.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 200),
+    aria: String(label.getAttribute('aria-label') ?? item.getAttribute('aria-label') ?? '').slice(0, 4000) };
+}
+
+/** In Code's frame: the visible quick pick, its title and its rows in list order. */
+export function readQuickPick() {
+  const shown = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden';
+  const widget = [...document.querySelectorAll('.quick-input-widget')].find(shown);
+  if (!widget) return { open: false, title: '', rows: [] };
+  const rows = [...widget.querySelectorAll('.quick-input-list .monaco-list-row')]
+    .sort((a, b) => Number(a.getAttribute('data-index') ?? 0) - Number(b.getAttribute('data-index') ?? 0))
+    .map(row => String(row.getAttribute('aria-label') || row.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200))
+    .filter(Boolean);
+  return { open: true, title: (widget.querySelector('.quick-input-title')?.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    rows: rows.slice(0, 60) };
+}
+
+/**
+ * In Code's frame: the Chat view as the user sees it. The input (`.chat-input-container`
+ * with its Monaco editor), whether a request is in flight (a Stop/Cancel control in the
+ * input), every response (`.interactive-item-container.interactive-response`: its `.value`
+ * text, error widgets, and whether it is still loading), the input toolbar's labels (the
+ * model picker is one of them) and any notification toasts.
+ */
+export function readChatState() {
+  const shown = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+  const clean = el => String(el?.textContent ?? '').replace(/\s+/g, ' ').trim();
+  const input = [...document.querySelectorAll('.chat-input-container')].find(shown) ?? null;
+  const session = input?.closest('.interactive-session') ?? document.querySelector('.interactive-session');
+  // Error widgets: `.chat-notification-widget` holding a `.chat-error-codicon` (ChatErrorWidget), or
+  // older `.chat-error` markup. Warnings and info notices are kept apart: they do not fail a reply.
+  const isError = el => el.matches('.chat-error, [class*="chat-error-content"]') || !!el.querySelector('.chat-error-codicon');
+  const responses = session ? [...session.querySelectorAll('.interactive-item-container.interactive-response')].map(item => {
+    const widgets = [...item.querySelectorAll('.chat-notification-widget, .chat-error, .chat-warning, [class*="chat-error-content"]')].filter(shown);
+    const texts = list => [...new Set(list.map(clean).filter(Boolean))].join(' ').slice(0, 400);
+    const row = item.closest('.monaco-list-row') ?? item;
+    return {
+      text: clean(item.querySelector('.value') ?? item).slice(0, 2000),
+      error: texts(widgets.filter(isError)),
+      warning: texts(widgets.filter(el => !isError(el))),
+      loading: item.classList.contains('chat-response-loading') || row.classList.contains('chat-response-loading')
+        || [...item.querySelectorAll('.codicon-loading')].some(shown),
+    };
+  }) : [];
+  const busy = !!input && [...input.querySelectorAll('[aria-label*="Cancel" i], [aria-label*="Stop" i], .codicon-stop-circle, .codicon-debug-stop')].some(shown);
+  return {
+    inputVisible: !!input,
+    inputText: clean(input?.querySelector('.monaco-editor .view-lines')).slice(0, 200),
+    busy,
+    responses,
+    labels: input ? [...input.querySelectorAll('.action-label')].filter(shown).map(clean).filter(Boolean).slice(0, 20) : [],
+    toasts: [...document.querySelectorAll('.notifications-toasts .notification-list-item')].filter(shown).map(clean).filter(Boolean).slice(0, 3),
+  };
+}
+
 /** The app's own non-batched tRPC wire format (shell/ezil/ui/Settings/trpc.js), same-origin with the session cookie. */
 export async function trpcInPage({ method, path, input }) {
   let url = `/api/trpc/${path}`;
@@ -759,9 +1011,10 @@ export async function revealDock(page, app, { timeoutMs = 12_000, nap = ms => sl
 
 // ── The live run ────────────────────────────────────────────────────────────
 
-async function loadLiveDependencies(env) {
+async function loadLiveDependencies(env, config) {
   const deployment = await import('./deployed-target.mjs');
-  const { signIn } = await import('./sign-in.mjs');
+  // EZIL_E2E_SIGNIN=ezilid drives the real login UI; the default is the UI-less password grant.
+  const { signIn } = config?.signInMode === 'ezilid' ? await import('./sign-in-ezilid.mjs') : await import('./sign-in.mjs');
   const { stopIsolatedComputer } = await import('./isolated-computer.mjs');
   const require = createRequire(join(resolve(env.PLAYWRIGHT_REQUIRE_DIR), 'prod-journeys.cjs'));
   const { chromium } = require('playwright');
@@ -806,6 +1059,7 @@ export async function runProdJourneys({
   // The final stop may outlive `deadline`: it runs on its own reserve.
   const finalDeadline = deadline + deadlines.finalStopMs;
   const report = makeReport({ startedAt, app: config.app, account: redactEmail(config.email), selected: names });
+  report.signIn = config.signInMode;
   const nonce = randomBytes(10).toString('hex');
   const owned = new Set();           // computers this run created (or recognised as its own)
   let browser, context, page, target, deployment, signIn, stopIsolatedComputer;
@@ -859,7 +1113,11 @@ export async function runProdJourneys({
     if (!page || page.isClosed()) return null;
     const file = `${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.png`;
     try {
+      // Off the app (an EZiL ID screen shows the address being signed in): mask the address.
+      let foreign = true;
+      try { foreign = new URL(page.url()).origin !== config.app; } catch { foreign = true; }
       await page.screenshot({ path: join(config.out, file), timeout: 5000,
+        ...(foreign && config.email ? { mask: [page.locator(`text=${config.email}`)] } : {}),
         style: `${showFrames ? '' : 'iframe, video, canvas, object, embed, '}[data-pane="account"] { visibility: hidden !important; }
           input, textarea { color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: transparent !important; }` });
       return file;
@@ -937,8 +1195,9 @@ export async function runProdJourneys({
       }
     }
   }
+  // Same call for both sign-ins: sign-in-ezilid.mjs ignores `env` and drives /login → EZiL ID instead.
   const ensureSignedIn = () => signedIn ??= signIn(page, { email: config.email, password: config.password,
-    destination: '/os', app: target.app,
+    destination: '/os', app: target.app, ...(config.signInMode === 'ezilid' ? { timeoutMs: SIGN_IN_MS - 10 * SECOND } : {}),
     env: { NEXT_PUBLIC_SUPABASE_URL: config.supabaseUrl, NEXT_PUBLIC_SUPABASE_ANON_KEY: config.anonKey } });
   /** `/os` with a booted session; an already-booted page is kept (a reload forgets the chosen computer). */
   async function openOs() {
@@ -1342,8 +1601,124 @@ export async function runProdJourneys({
     });
   }
 
+  /** Type into the chat input the way a user does, and send only what landed there. */
+  async function sendChatPrompt(frame, prompt) {
+    const lines = frame.locator('.chat-input-container .monaco-editor:visible .view-lines').first();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await lines.click({ timeout: remaining(5000) });
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Delete');
+        await page.keyboard.type(prompt, { delay: 5 });
+        await sleep(remaining(300));
+        // Monaco renders spaces as U+00A0, which \s covers.
+        const typed = (await lines.innerText({ timeout: remaining(2000) })).replace(/\s+/g, ' ');
+        if (typed.includes(prompt.slice(0, 20))) { await page.keyboard.press('Enter'); return; }
+      } catch { /* retried below */ }
+      await page.keyboard.press('Escape').catch(() => {});
+      await sleep(remaining(500));
+    }
+    throw new Error('The prompt never reached the chat input');
+  }
+
+  async function ezilAi(journey) {
+    await step(journey, 'sign-in', SIGN_IN_MS, async () => { await ensureSignedIn(); });
+    await step(journey, 'os-session-ready', OS_READY_MS, openOs);
+    const code = await step(journey, 'open-code', config.appTimeoutMs + 15 * SECOND, async () => {
+      await clickDock('code');
+      const ready = await waitForApp('code', codeReady, config.appTimeoutMs);
+      journey.evidence.code = readinessEvidence(ready, 'firstEditorMs');
+      await readyShot(journey, 'code', 'code');
+      return ready;
+    });
+    const frame = code.frame;
+    // Soft: when the status is wrong the chat reply still runs, and its error copy names the code.
+    await step(journey, 'ai-status', AI_STATUS_MS, async () => {
+      // "EZiL AI · Loading…" until the extension's first Gateway reads answer; absent until it activates.
+      const empty = { present: false, text: '', aria: '' };
+      const waitUntil = performance.now() + AI_STATUS_WAIT_MS;
+      let item, status;
+      for (;;) {
+        item = await frame.evaluate(readAIStatusItem).catch(() => empty);
+        status = classifyAIStatus(item.text);
+        if (!['missing', 'loading'].includes(status.state) || performance.now() > waitUntil) break;
+        await sleep(remaining(2000));
+      }
+      // Its click target is a quick pick titled "EZiL AI": "Available credits: …", limits, "Recent usage …".
+      let quick = null;
+      if (item.present) {
+        try {
+          await frame.locator(AI_STATUS_ITEM).first().click({ timeout: remaining(5000) });
+          const quickUntil = performance.now() + 20 * SECOND;
+          for (;;) {
+            quick = await frame.evaluate(readQuickPick).catch(() => null);
+            if (quick?.open && quick.rows.some(row => /^(?:Available credits|Credits unavailable)\b/.test(row))) break;
+            if (performance.now() > quickUntil) break;
+            await sleep(remaining(500));
+          }
+        } catch { /* recorded as quickPick: null; the item's aria-label carries the same lines */ }
+        // To the focused quick input (focusing another element first would only blur it shut).
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+      const fromQuick = quick?.open && quick.rows.length > 0;
+      const summary = fromQuick ? { source: 'quick-pick', ...summarizeAIQuickPick(quick.rows) }
+        : item.aria ? { source: 'aria-label', ...summarizeAIQuickPick(item.aria.split(/\.\s+(?=[A-Z])/)) } : null;
+      journey.evidence.ai = {
+        statusText: normalizeVisibleText(item.text, { secrets, max: 160 }), status,
+        quickPickTitle: fromQuick ? normalizeVisibleText(quick.title, { secrets, max: 60 }) : null, quickPick: summary,
+      };
+      const verdict = aiStatusVerdict(status, summary);
+      if (!verdict.ok) throw new Error(verdict.reason);
+    }, { soft: true });
+    await step(journey, 'chat-reply', CHAT_OPEN_MS + config.aiReplyTimeoutMs + 30 * SECOND, async () => {
+      const input = frame.locator('.chat-input-container .monaco-editor:visible').first();
+      if (!await input.isVisible().catch(() => false)) {
+        await codeCommand(frame, 'Chat: Open Chat', 'workbench.action.chat.open');
+        try { await input.waitFor({ state: 'visible', timeout: remaining(20_000) }); } catch {
+          throw new Error('The Chat view did not open (no chat input)');
+        }
+      }
+      const before = await frame.evaluate(readChatState);
+      const model = pickModelLabel(before.labels);
+      const chat = journey.evidence.chat = { model: model ? normalizeVisibleText(model, { secrets, max: 60 }) : null,
+        defaultModel: DEFAULT_AI_MODEL_NAME, modelIsDefault: Boolean(model?.includes(DEFAULT_AI_MODEL_NAME)),
+        prompt: AI_PROMPT, earlierResponses: before.responses.length };
+      await sendChatPrompt(frame, AI_PROMPT);
+      const sent = performance.now();
+      const replyUntil = sent + config.aiReplyTimeoutMs;
+      let state = before, reply = null, last = null, stableSince = 0;
+      for (;;) {
+        state = await frame.evaluate(readChatState).catch(() => state);
+        reply = state.responses.slice(before.responses.length).at(-1) ?? null;
+        if (reply) {
+          const verdict = classifyChatReply(reply.error || reply.text);
+          if (reply.error || verdict.state === 'error') {
+            const code = verdict.state === 'error' ? verdict.code : 'chat_error';
+            Object.assign(chat, { replyMs: Math.round(performance.now() - sent), errorCode: code });
+            throw new Error(`Chat answered with an error (${code}): "${normalizeVisibleText(reply.error || reply.text, { secrets, max: 160 })}"`);
+          }
+          const settled = !state.busy && !reply.loading && verdict.state === 'reply' && !isPlaceholderReply(reply.text);
+          if (settled && reply.text === last) {
+            if (performance.now() - stableSince >= 1500) break;
+          } else { last = settled ? reply.text : null; stableSince = performance.now(); }
+        }
+        if (performance.now() > replyUntil) {
+          const toast = state.toasts.find(text => classifyChatReply(text).state === 'error');
+          const why = toast ? `a notification says: "${normalizeVisibleText(toast, { secrets, max: 160 })}" (${classifyChatReply(toast).code})`
+            : !reply ? 'no response appeared' : state.busy || reply.loading ? 'still generating' : 'the response stayed empty';
+          chat.toasts = state.toasts.map(text => normalizeVisibleText(text, { secrets, max: 120 }));
+          throw new Error(`No chat reply within ${Math.round(config.aiReplyTimeoutMs / 1000)}s: ${why}`);
+        }
+        await sleep(remaining(1000));
+      }
+      Object.assign(chat, { replyMs: Math.round(stableSince - sent), ...replyEvidence(reply.text, { secrets }),
+        ...(reply.warning ? { warning: normalizeVisibleText(reply.warning, { secrets, max: 160 }) } : {}) });
+      await screenshot(`${journey.name}-chat-reply`, { showFrames: true });
+    });
+  }
+
   const runners = {
-    'free-open-apps': freeOpenApps, 'paid-aws-computer': paidAwsComputer,
+    'free-open-apps': freeOpenApps, 'ezil-ai': ezilAi, 'paid-aws-computer': paidAwsComputer,
     'feedback-diagnostics': feedbackDiagnostics, 'billing-view': billingView,
   };
 
@@ -1367,12 +1742,12 @@ export async function runProdJourneys({
 
   // ── run ──
   try {
-    say({ suite: 'prod-journeys', app: config.app, account: redactEmail(config.email), journeys: names, out: config.out });
+    say({ suite: 'prod-journeys', app: config.app, account: redactEmail(config.email), signIn: config.signInMode, journeys: names, out: config.out });
     mkdirSync(config.out, { recursive: true, mode: 0o700 });
     const setupBegan = performance.now();
     try {
       ({ deployment, signIn, stopIsolatedComputer } = await bounded(async () => {
-        const loaded = await loadDependencies(env);
+        const loaded = await loadDependencies(env, config);
         const { chromium } = loaded;
         target = loaded.deployment.deployedTarget({ EZIL_E2E_APP: config.app,
           ...(env.VERCEL_AUTOMATION_BYPASS_SECRET ? { VERCEL_AUTOMATION_BYPASS_SECRET: env.VERCEL_AUTOMATION_BYPASS_SECRET } : {}) });
