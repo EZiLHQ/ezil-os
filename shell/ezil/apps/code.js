@@ -213,10 +213,16 @@ function repositoryNameOf (data) {
     return m ? `${m[1]}/${m[2]}` : null;
 }
 
-/** Whether a minted Code URL opens THIS repository's folder (`folder=…/projects/<repoId>`). */
+/**
+ * Whether a minted Code URL opens THIS repository's folder: exactly one
+ * `folder=`, ending `/projects/<repoId>`. One, because the bridge forwards only
+ * the first (`worker/src/preview-bridge.ts`), so a second could not be the one
+ * code-server opens.
+ */
 function opensRepository (url, project) {
     try {
-        return (new URL(url).searchParams.get('folder') ?? '').endsWith(`/projects/${project.repoId}`);
+        const folders = new URL(url).searchParams.getAll('folder');
+        return folders.length === 1 && folders[0].endsWith(`/projects/${project.repoId}`);
     } catch {
         return false;
     }

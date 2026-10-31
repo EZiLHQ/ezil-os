@@ -1283,16 +1283,25 @@ await settle(4);
         && headTitle(codeWin()) === 'Code', JSON.stringify(mints(from)[0]?.body));
     await closeCode();
 
-    // 8e. A server that ignored the project (no folder for this repository) is refused, never shown.
-    codeMintAnswer = opened('site', () => 'someone-else');
-    from = calls.length;
-    await launch({ project: P1 });
-    await waitFor(() => spinnerKind(codeWin()) === 'failed', 3000);
-    w = codeWin();
-    push('8e 🔴 a URL that does not open the repository\'s folder is refused: "Couldn\'t open this project\'s repository", frame untouched',
-        spinnerKind(w) === 'failed' && spinnerTitle(w) === "Couldn't open this project's repository" && frameSrc(w) === 'about:blank',
-        `${spinnerKind(w)} "${spinnerTitle(w)}" ${frameSrc(w)}`);
-    await closeCode();
+    // 8e. A server that ignored the project (no folder for this repository, or a second `folder=` the bridge would
+    //     never forward) is refused, never shown.
+    for ( const [name, answer] of [
+        ['another folder', opened('site', () => 'someone-else')],
+        ['the workspace root first, the repository second', (b) => {
+            const r = opened('site')(b);
+            r.payload.codePreviewUrl = r.payload.codePreviewUrl.replace('&folder=', '&folder=/workspace&folder=');
+            return r;
+        }],
+    ] ) {
+        codeMintAnswer = answer;
+        await launch({ project: P1 });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 3000);
+        w = codeWin();
+        push(`8e 🔴 ${name}: refused as "Couldn't open this project's repository", frame untouched`,
+            spinnerKind(w) === 'failed' && spinnerTitle(w) === "Couldn't open this project's repository" && frameSrc(w) === 'about:blank',
+            `${spinnerKind(w)} "${spinnerTitle(w)}" ${frameSrc(w)}`);
+        await closeCode();
+    }
 
     // 8f. Refusals: their own copy, asked exactly once (never silently retried), the frame never navigated.
     const refusals = [
