@@ -11,7 +11,9 @@
  * during outbound fetches to the Cloudflare API.
  *
  * Nothing here logs or returns the control key or the API token; the tunnel token is
- * returned exactly once, to the create call.
+ * returned exactly once, to the create call. A failed create, fence or removal logs one
+ * bounded `[aws-tunnels] <event>` line (the failing leg and the client's `cf_api_*` code)
+ * and returns that code as `detail`, so a refused Cloudflare token is visible in the logs.
  */
 import {
   AWS_EDGE_PORT_DEFAULT,
@@ -47,11 +49,16 @@ export interface CloudflareTunnelApi {
 export function createCloudflareTunnelApi(cfg: { accountId: string; zoneId: string; apiToken: string; fetch: FetchLike }): CloudflareTunnelApi {
   const base = 'https://api.cloudflare.com/client/v4';
   const call = async (method: string, path: string, body?: unknown, okStatuses: number[] = []): Promise<unknown> => {
-    const res = await cfg.fetch(`${base}${path}`, {
-      method,
-      headers: { authorization: `Bearer ${cfg.apiToken}`, 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await cfg.fetch(`${base}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${cfg.apiToken}`, 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch {
+      throw new TunnelApiError('cf_api_transport');
+    }
     if (okStatuses.includes(res.status)) return null;
     let parsed: { success?: boolean; result?: unknown } | null = null;
     try {
@@ -169,6 +176,34 @@ export type TunnelResult = { status: number; body: Record<string, unknown> };
 
 const fail = (status: number, error: string): TunnelResult => ({ status, body: { ok: false, error } });
 
+/** Which step of a create, fence or removal failed (logged with the failure's code). */
+export type TunnelLeg = 'fence' | 'cleanup' | 'find' | 'create' | 'ingress' | 'dns' | 'token' | 'store';
+
+/**
+ * A failure's bounded code: the Cloudflare client's own (`cf_api_<status>`, `cf_api_bad_result`,
+ * `cf_api_duplicate_*`, `cf_api_transport`), which never carries a body or token, else `unexpected`.
+ */
+export function tunnelErrorCode(err: unknown): string {
+  return err instanceof TunnelApiError && /^cf_api_[a-z0-9_]{1,32}$/.test(err.message) ? err.message : 'unexpected';
+}
+
+type LogSubject = { computerId: string; generation: number; leaseEpoch: number };
+
+/**
+ * One bounded line, e.g. `[aws-tunnels] create_failed { leg: 'create', code: 'cf_api_403', computerId, generation, leaseEpoch }`.
+ * Only claims-verified ids and the code: never the control key, a token, a hostname, an address or a body.
+ */
+function logTunnelFailure(event: 'create_failed' | 'fence_failed' | 'remove_failed' | 'origin_fence_failed', leg: TunnelLeg, code: string, s: LogSubject): void {
+  console.warn(`[aws-tunnels] ${event}`, { leg, code, computerId: s.computerId, generation: s.generation, leaseEpoch: s.leaseEpoch });
+}
+
+/** Log the failure, and answer `error` with the same bounded code as `detail` (the app logs it too). */
+function failLogged(status: number, error: string, event: 'create_failed' | 'fence_failed' | 'remove_failed', leg: TunnelLeg, err: unknown, s: LogSubject): TunnelResult {
+  const code = tunnelErrorCode(err);
+  logTunnelFailure(event, leg, code, s);
+  return { status, body: { ok: false, error, detail: code } };
+}
+
 function isEpoch(v: unknown): v is number {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1;
 }
@@ -285,9 +320,11 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
   }
 
   /** This epoch's tunnel: adopt the one a lost create response left (same deterministic name), else create. */
-  async function ensureTunnel(api: CloudflareTunnelApi, name: string): Promise<string> {
+  async function ensureTunnel(api: CloudflareTunnelApi, name: string, at: { leg: TunnelLeg }): Promise<string> {
+    at.leg = 'find';
     const found = await api.findTunnelByName(name);
     if (found) return found.id;
+    at.leg = 'create';
     try {
       return (await api.createTunnel(name)).id;
     } catch (err) {
@@ -324,7 +361,9 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       await deps.storage.put(RECORD_KEY, { ...rec, originVerified: true, originVerifiedAt: checkedAt });
       return 'verified';
     }
-    await destroy(deps.api, rec).catch(() => undefined);
+    // The record holds the control key, AI nonce, address and hostname: only its ids reach the log.
+    const subject = { computerId: rec.computerId, generation: rec.generation, leaseEpoch: rec.leaseEpoch };
+    await destroy(deps.api, rec).catch((err: unknown) => logTunnelFailure('origin_fence_failed', 'fence', tunnelErrorCode(err), subject));
     return 'mismatch';
   }
 
@@ -393,8 +432,8 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         }
         try {
           return { status: 200, body: { tunnelToken: await api.getTunnelToken(existing.tunnelId) } };
-        } catch {
-          return fail(502, 'tunnel_create_failed');
+        } catch (err) {
+          return failLogged(502, 'tunnel_create_failed', 'create_failed', 'token', err, body);
         }
       }
       if (existing) {
@@ -404,8 +443,8 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         if (existing.leaseEpoch === body.leaseEpoch) return fail(409, 'tunnel_exists');
         try {
           await destroy(api, existing); // fence-first: the older epoch is gone before the next exists
-        } catch {
-          return fail(502, 'tunnel_fence_failed');
+        } catch (err) {
+          return failLogged(502, 'tunnel_fence_failed', 'fence_failed', 'fence', err, body);
         }
       }
       const hostname = awsOriginHostname(body.sandboxId, body.generation, body.leaseEpoch, deps.zone);
@@ -413,16 +452,20 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         computerId: body.computerId, sandboxId: body.sandboxId, generation: body.generation, leaseEpoch: body.leaseEpoch,
         tunnelName: tunnelNameFor(body.sandboxId, body.generation, body.leaseEpoch), hostname,
       };
+      // The step in flight, for the failure log only.
+      const at: { leg: TunnelLeg } = { leg: 'store' };
       try {
         // An older epoch's unfinished create: fence-first, delete its leftovers before this one exists.
         const prior = (await deps.storage.get<PendingCreate>(PENDING_KEY)) ?? null;
         if (prior && (prior.leaseEpoch !== pending.leaseEpoch || prior.generation !== pending.generation || prior.computerId !== pending.computerId)) {
           if (prior.leaseEpoch > pending.leaseEpoch) return fail(409, 'stale_epoch');
+          at.leg = 'cleanup';
           await cleanupPending(api, prior);
         }
         // Before the first Cloudflare call, so a lost response is always recoverable by name.
+        at.leg = 'store';
         await deps.storage.put(PENDING_KEY, pending);
-        const tunnelId = await ensureTunnel(api, pending.tunnelName);
+        const tunnelId = await ensureTunnel(api, pending.tunnelName, at);
         // Drain every leg before returning or releasing the serial queue: a failed
         // sibling must not let removal/new-epoch cleanup overtake an outstanding write.
         // Defer invocation too, so a synchronous throw cannot bypass the barrier.
@@ -431,9 +474,9 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
           Promise.resolve().then(() => ensureDns(api, hostname, `${tunnelId}.cfargotunnel.com`)),
           Promise.resolve().then(() => api.getTunnelToken(tunnelId)),
         ]);
-        if (ingress.status === 'rejected') throw ingress.reason;
-        if (dns.status === 'rejected') throw dns.reason;
-        if (token.status === 'rejected') throw token.reason;
+        if (ingress.status === 'rejected') { at.leg = 'ingress'; throw ingress.reason; }
+        if (dns.status === 'rejected') { at.leg = 'dns'; throw dns.reason; }
+        if (token.status === 'rejected') { at.leg = 'token'; throw token.reason; }
         const dnsRecordId = dns.value;
         const tunnelToken = token.value;
         const record: AwsTunnelRecord = {
@@ -441,13 +484,14 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
           instanceId: body.instanceId, region: body.region, publicIp: body.publicIp, tunnelId, dnsRecordId, hostname,
           controlKey: body.controlKey, createdAt: now(), originVerified: false,
         };
+        at.leg = 'store';
         await deps.storage.put(RECORD_KEY, record);
         await deps.storage.delete(PENDING_KEY);
         return { status: 200, body: { tunnelToken } };
-      } catch {
+      } catch (err) {
         // No blind rollback: an id whose response was lost cannot be deleted by id anyway. The pending
         // marker stays, so a retry ADOPTS by name, and a removal or the next epoch deletes by name.
-        return fail(502, 'tunnel_create_failed');
+        return failLogged(502, 'tunnel_create_failed', 'create_failed', at.leg, err, body);
       }
     }),
 
@@ -459,6 +503,7 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       if (existing && (existing.computerId !== body.computerId || existing.leaseEpoch > body.leaseEpoch)) {
         return { status: 200, body: { deleted: false } };
       }
+      let leg: TunnelLeg = 'fence';
       try {
         await fenceThrough(body.leaseEpoch);
         const pending = (await deps.storage.get<PendingCreate>(PENDING_KEY)) ?? null;
@@ -466,9 +511,10 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
         if (!existing && !cleanable) return { status: 200, body: { deleted: false } };
         if (!deps.api) return fail(503, 'tunnel_api_not_configured');
         if (existing) await destroy(deps.api, existing);
+        leg = 'cleanup';
         if (cleanable) await cleanupPending(deps.api, pending);
-      } catch {
-        return fail(502, 'tunnel_fence_failed');
+      } catch (err) {
+        return failLogged(502, 'tunnel_fence_failed', 'remove_failed', leg, err, body);
       }
       return { status: 200, body: { deleted: true } };
     }),
