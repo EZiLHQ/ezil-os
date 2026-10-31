@@ -1,6 +1,7 @@
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
 import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { reverseMove } from '../reverse-move-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -1084,6 +1085,34 @@ try {
             assert.doesNotMatch(copy, banned); assert.doesNotMatch(copy, honestyBans); assert.doesNotMatch(copy, /ap-south-1|mumbai/i);
         }
         pass('Round 4 standing banners: grace, plan ending, files held on AWS; unknown standing unchanged; copy pinned across tabs');
+    }
+    {
+        // Phase B (reverse move contract §6.2): during a move the standing stays files_on_aws and the Billing tab shows
+        // 6a's files-held banner ONLY: no move card, no move action, no move sentence (the move lives on the Computer
+        // tab). After the commit the standing is free and the banner goes. The banner's words are 6a's, unchanged.
+        const held = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+        const moveWords = /Moving your files|Move my files|move your files|Workspace folder|Step \d of 4|finishing moving|kept for 14 days|kept until|Switching to your Free computer|Stop and move/i;
+        for ( const [label, standing, row] of [
+            ['before a move', 'files_on_aws', null], ['saving', 'files_on_aws', reverseMove({ stage: 'saving' })],
+            ['copying', 'files_on_aws', reverseMove({ stage: 'copying', bytesDone: '120000000', bytesTotal: '400000000' })],
+            ['checking', 'files_on_aws', reverseMove({ stage: 'checking' })], ['flipping', 'files_on_aws', reverseMove({ stage: 'flipping' })],
+            ['failed_reopened', 'files_on_aws', reverseMove({ stage: 'failed_reopened', reason: 'workspace_too_large', retry: 'now' })],
+            ['open blocked', 'files_on_aws', reverseMove({ stage: 'failed_needs_operator', reason: 'flip_stuck', retry: 'no', openBlocked: true })],
+            ['committed', 'free', reverseMove({ stage: 'committed', retainUntil: '2026-11-13T10:00:00Z' })],
+        ] ) {
+            summary = summaryV3('free');
+            Object.assign(summary.computer, { standing, filesOn: standing === 'free' ? 'cloudflare' : 'aws', heldSince: null, move: null,
+                reverseMove: row, moveAvailable: standing === 'files_on_aws', moveOnOpen: true });
+            await refresh(); audit();
+            if ( standing === 'files_on_aws' ) {
+                assert.equal(q('[data-role="files-held"]')?.textContent, held, `${label}: 6a's banner, exactly`);
+                assert.equal(qa('[data-role="files-held"]').length, 1, `${label}: said once`);
+            } else has('[data-role="files-held"]', false);
+            assert.doesNotMatch(text(), moveWords, `${label}: no move sentence on Billing`);
+            assert.equal(qa('[data-pane="billing"] [data-action^="move-"], [data-pane="billing"] [data-role^="move-"]').length, 0, `${label}: no move card or action`);
+            assert.doesNotMatch(text(), /mumbai|ap-south-1/i);
+        }
+        pass('Phase B: the Billing tab during and after a move shows only 6a\'s files-held banner, never the move');
     }
     summary = summaryV3(); history = [invoice()]; getHistory = () => failure('private invoice failure'); await refresh();
     contains('[data-role="invoice-rows"]', "Couldn't load invoices.");

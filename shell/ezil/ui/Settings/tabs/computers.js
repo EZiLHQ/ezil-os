@@ -20,7 +20,7 @@ import session from '../../../session.js';
 import trpc from '../trpc.js';
 import TabBilling from './billing.js';
 import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';
-import { TRANSITION_EVENT } from '../../computer-progress.js';
+import { TRANSITION_EVENT, MOVE_LIMIT_BYTES } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/computers';
 
@@ -347,6 +347,13 @@ let generation = 0;
 let stopBusy = false;
 let paneCtx = null;
 let queuedSwitch = null; // a configuration Billing handed over after an upgrade
+// Phase B (reverse move contract §6.2): the last `computer.move.start`/`retry` refusal shown as its card
+// (`{reason, kind}`), a move action in flight, and the summary re-reads while `computer.progress` and the
+// summary's `reverseMove` disagree (a move started from an open in another window; at most MOVE_SUMMARY_READS).
+let moveNotice = null;
+let moveBusy = false;
+let moveSummaryReads = 0;
+const MOVE_SUMMARY_READS = 6;
 const seenInFlight = new Set(); // transition ids this page saw in flight, so "Done" is never a stale record
 const dismissed = new Set();
 const barFloor = new Map();     // transition id → the highest ratio shown, so the bar never moves back
@@ -470,8 +477,20 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const switching = pending ? { current: pending.current, target: pending.target, phase: 'requested', acknowledged: false }
         : flying && flying.kind !== 'restart' ? { current: flying.current, target: flying.target, phase: flying.phase, acknowledged: true } : null;
     const nextStart = ! switching && ! free && preference && current && preference !== current && (stopped || ! lifecycle) ? preference : null;
+    // Phase B (contract §6.1, §6.4): the reverse move. The summary's own key (never the dormant `computer.move`), and
+    // computer.progress's moving view, which is polled live; an outcome the progress read already has wins.
+    const reverse = reverseMoveOf(data);
+    const progMove = prog?.move && typeof prog.move === 'object' && prog.move.direction === 'to_cloudflare' ? prog.move : null;
+    const progOutcome = MOVE_OUTCOMES.has(progMove?.outcome) ? progMove.outcome : null;
+    const blocked = progOutcome ? (progOutcome === 'failed_needs_operator' && progMove.openBlocked === true)
+        : (reverse?.stage === 'failed_needs_operator' && reverse.openBlocked === true);
+    const moving = ! blocked && ! progOutcome && (prog?.operation === 'moving' || (reverse !== null && MOVE_IN_FLIGHT.has(reverse.stage)));
     let chip = null;
-    if ( switching ) chip = { state: 'switching', text: `Switching to ${sizeInfo(switching.target, data)?.vcpu ?? ''} vCPU` };
+    // §6.4: the move's chip wins over every chip but the user's own Stop in progress.
+    if ( (moving || blocked) && stopping ) chip = { state: 'stopping', text: 'Stopping…' };
+    else if ( blocked ) chip = { state: 'attention', text: 'Needs attention' };
+    else if ( moving ) chip = { state: 'moving', text: 'Moving files…' };
+    else if ( switching ) chip = { state: 'switching', text: `Switching to ${sizeInfo(switching.target, data)?.vcpu ?? ''} vCPU` };
     else if ( flying ) chip = { state: 'switching', text: 'Restarting…' };
     // D6: the chip says Stopping… the moment the user confirms, not when the server first reports it.
     else if ( stopping ) chip = { state: 'stopping', text: 'Stopping…' };
@@ -499,7 +518,9 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const done = ! switching && running && ! stopping && prog?.operation !== 'stopping'
         && t?.phase === 'done' && t.kind !== 'restart' && seenInFlight.has(t.transitionId) && ! dismissed.has(t.transitionId) ? t : null;
     const failed = ! switching && t?.phase === 'failed' && t.kind !== 'restart' && ! dismissed.has(t.transitionId) ? t : null;
-    const move = data?.computer?.move?.direction === 'to_cloudflare' ? data.computer.move : null; // Phase B; dormant while null
+    const move = cardMove(reverse, progMove, { moving, outcome: progOutcome });
+    // The pre-move card: files held, no move row, and the server says a move can start (`moveAvailable`).
+    const offer = held && ! move && data?.computer?.moveAvailable === true;
     // Round 6 (CR-2): a capped session (Free, and the hold's 1 hour) says when it ends, from the summary's
     // deadline, only while it runs and only while that time is still ahead. Review: never a deadline read for an
     // earlier session (`deadlineStale`: the computer was seen not running since that read).
@@ -510,11 +531,49 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     // Round 6 (R1-08): the hold's limits in numbers ("Free sessions last 1 hour · About 5 of 8 hours left this month").
     const capHours = Number.isFinite(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
     const holdLine = held && ! heldClosed && capHours ? [`Free sessions last ${capHours} hour${capHours === 1 ? '' : 's'}`, monthLeft(usage?.period)].filter(Boolean).join(' · ') : null;
-    return { computer, data, free, standing, held, heldClosed, move,
+    return { computer, data, free, standing, held, heldClosed, move, moving, blocked, offer,
+        // §6.3: the pre-move copy's variant; a held-closed computer never gets the "next open" one (it has no Open).
+        moveOnOpen: data?.computer?.moveOnOpen === true && ! heldClosed,
         // Round 6 (R1-11): one provider string everywhere, "AWS (India)" (never a city or a region code).
         provider: data ? free && ! held ? 'Cloudflare' : 'AWS (India)' : null, chip, current, nextStart, switching,
         running, stopped, cards, done, failed, disk, sessionEnds, holdLine,
-        busy: !! (switching || flying || stopping || prog?.operation === 'opening' || prog?.operation === 'stopping') };
+        busy: !! (switching || flying || stopping || prog?.operation === 'opening' || prog?.operation === 'stopping' || moving || blocked) };
+}
+
+// ── Phase B: the reverse move (AWS → Cloudflare), contract §6.1-§6.4 ─────────
+const MOVE_IN_FLIGHT = new Set(['saving', 'copying', 'checking', 'flipping']);
+const MOVE_OUTCOMES = new Set(['committed', 'failed_reopened', 'failed_needs_operator']);
+/** computer.progress `move.phase` → the summary's stage (the same §6.1 step map). */
+const MOVE_PHASE_STAGE = { export_boot: 'saving', exporting: 'saving', importing: 'copying', checking: 'checking', committing: 'flipping' };
+
+/** `summary.computer.reverseMove` (ComputerReverseMoveV3), or null. Only the shell that ships with lane A reads it. */
+export function reverseMoveOf (data) {
+    const move = data?.computer?.reverseMove;
+    return move && typeof move === 'object' && move.direction === 'to_cloudflare' ? move : null;
+}
+
+/**
+ * The move the card shows. In flight, computer.progress's live step and bytes (numbers there, decimal strings in
+ * the summary; one step map, so they agree). An outcome the progress read has and the summary does not yet (it is
+ * re-read): the progress row's own outcome. Else the summary's row.
+ */
+function cardMove (reverse, progMove, { moving, outcome }) {
+    if ( moving && progMove && Object.hasOwn(MOVE_PHASE_STAGE, progMove.phase) ) {
+        return { direction: 'to_cloudflare', stage: MOVE_PHASE_STAGE[progMove.phase], bytesDone: progMove.bytesDone, bytesTotal: progMove.bytesTotal };
+    }
+    if ( outcome && (! reverse || MOVE_IN_FLIGHT.has(reverse.stage)) ) {
+        return { direction: 'to_cloudflare', stage: outcome, reason: outcome === 'committed' ? null : progMove.reason ?? null, retry: progMove.retry ?? null,
+            openBlocked: progMove.openBlocked === true, holdOpenable: progMove.holdOpenable ?? null, bytesDone: '0', bytesTotal: null };
+    }
+    if ( moving && ! reverse ) return { direction: 'to_cloudflare', stage: 'saving', bytesDone: '0', bytesTotal: null };
+    return reverse;
+}
+
+/** True while computer.progress says something about the move the summary does not yet carry. */
+export function moveSummaryLags (prog, data) {
+    const reverse = reverseMoveOf(data);
+    if ( prog?.operation === 'moving' ) return ! reverse || ! (MOVE_IN_FLIGHT.has(reverse.stage) || reverse.stage === 'failed_needs_operator');
+    return MOVE_OUTCOMES.has(prog?.move?.outcome) && reverse !== null && MOVE_IN_FLIGHT.has(reverse.stage);
 }
 
 const STANDINGS = new Set(['paid', 'grace', 'plan_ending', 'files_on_aws', 'free']);
@@ -564,15 +623,31 @@ export function heldClosedCopy (size, data) {
     return heldClosedText(sizeInfo(size, data)?.vcpu);
 }
 
-const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Starting your desktop'];
+const MOVE_STEPS = ['Saving your files', 'Copying your files to your Free computer', 'Checking your files', 'Switching to your Free computer'];
 const MOVE_STEP_OF = { requested: 0, fenced: 0, saving: 0, exporting: 1, copying: 1, exported: 2, restoring: 2, restored: 2, checking: 2, flipping: 3, starting: 3 };
+/** §6.3 {NOT_MOVED}, verbatim wherever the copy says what a move leaves behind. */
+export const MOVE_NOT_MOVED = 'settings and programs you added on your AWS computer, saved browser sign-ins, installed packages, and build folders you can recreate (node_modules, .next, .turbo and dist, unless Git tracks them)';
+const MOVE_RETRY = new Set(['now', 'after_aws_session', 'no']);
+/** §5.9 refusals with no card of their own: the summary, re-read, shows what is true. */
+const MOVE_RE_READ = new Set(['move_in_progress', 'move_unavailable', 'move_not_held', 'move_unsupported']);
 
-/** A reverse move (AWS → Cloudflare, Phase B) from server fields only: done, failed or a step index. */
+/**
+ * A reverse move (AWS → Cloudflare, Phase B) from server fields only (`summary.computer.reverseMove`, §6.1): done,
+ * failed or a step index. The reason passes only the dormant view's own rule (§6.1); the decimal byte strings are
+ * the summary's, the numbers computer.progress's.
+ */
 export function moveView (move) {
     if ( ! move || move.direction !== 'to_cloudflare' ) return null;
     const stage = String(move.stage ?? '');
-    if ( stage === 'committed' || stage === 'done' ) return { kind: 'done' };
-    if ( stage.startsWith('failed') ) return { kind: 'failed', code: /^[a-z0-9_:-]{1,64}$/i.test(String(move.reason ?? '')) ? move.reason : `move_${stage}` };
+    const reason = /^[a-z0-9_:-]{1,64}$/i.test(String(move.reason ?? '')) ? move.reason : null;
+    const holdOpenable = typeof move.holdOpenable === 'boolean' ? move.holdOpenable : null;
+    if ( stage === 'committed' || stage === 'done' ) {
+        return { kind: 'done', skipped: Number.isSafeInteger(move.skipped) && move.skipped > 0 ? move.skipped : 0, retainUntil: dayLabel(move.retainUntil) };
+    }
+    if ( stage.startsWith('failed') ) {
+        return { kind: 'failed', stage, reason, code: reason ?? `move_${stage}`, retry: MOVE_RETRY.has(move.retry) ? move.retry : null,
+            openBlocked: stage === 'failed_needs_operator' && move.openBlocked === true, holdOpenable };
+    }
     const index = MOVE_STEP_OF[stage] ?? 0;
     const done = /^\d+$/.test(String(move.bytesDone ?? '')) ? Number(move.bytesDone) : null;
     const total = /^\d+$/.test(String(move.bytesTotal ?? '')) ? Number(move.bytesTotal) : null;
@@ -581,24 +656,110 @@ export function moveView (move) {
     return { kind: 'progress', index, steps: MOVE_STEPS, bytes, percent: Math.round(Math.min(0.95, (index + fraction) / MOVE_STEPS.length) * 100) };
 }
 
+/** §6.3 `workspace_too_large`. The cap is `MOVE_LIMIT_BYTES` in the shell's MB unit, never a literal (the overlay says the same). */
+export function moveTooLargeCopy (holdOpenable) {
+    const cap = `${(MOVE_LIMIT_BYTES / 1e6).toLocaleString('en-US', { maximumFractionDigits: 0 })} MB`;
+    return `Your Workspace folder is larger than a Free computer can hold (${cap}), so your files stay on your AWS computer. Nothing was deleted. ${
+        holdOpenable === false ? 'Upgrade to use them again.' : 'Remove some files on your AWS computer and try again, or upgrade to keep using them.'}`;
+}
+
+/**
+ * §6.3 the card for a done, failed or needs-attention move: its words and its actions. Pure, so every row is
+ * unit-tested. Copy precedence (§6.1.1): a reason's own row wins over the `retry`-keyed rows; within a row,
+ * `holdOpenable: false` drops "keep using it", "remove some files" and Try again. Try again only when `retry` is
+ * 'now' (it calls `computer.move.retry`).
+ */
+export function moveCardCopy (view) {
+    if ( view?.kind === 'done' ) {
+        const n = view.skipped;
+        const skipped = n > 0 ? `, and ${n} item${n === 1 ? '' : 's'} that can't be copied, like links that point outside your Workspace folder` : '';
+        return { role: 'move-done', text: `Your files are on your Free computer. Not moved: ${MOVE_NOT_MOVED}${skipped}.${view.retainUntil ? ` Your AWS disk is kept until ${view.retainUntil}.` : ''}` };
+    }
+    if ( view?.kind !== 'failed' ) return null;
+    const keep = view.holdOpenable === false ? '' : ', and you can keep using it';
+    if ( view.stage === 'failed_needs_operator' ) {
+        const text = ! view.openBlocked ? `We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted${keep}. We're looking into it.`
+            : view.reason === 'boot_unsettled' ? "We couldn't finish moving your files. They're safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it."
+                : "We're finishing moving your files to your Free computer. Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.";
+        return { role: view.openBlocked ? 'move-attention' : 'move-failed', text, feedback: true };
+    }
+    const now = view.retry === 'now';
+    switch ( view.reason ) {
+    case 'workspace_too_large': return { role: 'move-failed', text: moveTooLargeCopy(view.holdOpenable), upgrade: true, retry: now && view.holdOpenable !== false };
+    case 'kill_switch': case 'boot_unavailable':
+        return { role: 'move-failed', text: "We couldn't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again later.", retry: now };
+    case 'entitlement_paid': return { role: 'move-failed', text: 'Your plan is active again, so your files stay on your AWS computer.' };
+    case 'region_missing':
+        return { role: 'move-failed', text: "We couldn't move your files. They're still on your AWS computer and nothing was deleted. This computer needs a fix on our side before it can open or move; we're looking into it." };
+    default:
+        if ( view.retry === 'no' ) return { role: 'move-failed', text: `We couldn't move your files. They're still on your AWS computer and nothing was deleted${keep}. We're looking into it.` };
+        return { role: 'move-failed', text: "We couldn't move your files. They're still on your AWS computer and nothing was deleted.", retry: now };
+    }
+}
+
+/**
+ * §6.3 the pre-move sentences (after the files-held words): `onOpen` is the `moveOnOpen` variant ("the next time
+ * you open your computer"). `lead`: the card's own first sentence; a held-closed card continues 6a's instead.
+ */
+export function moveOfferCopy ({ onOpen = false, lead = true } = {}) {
+    const kept = `Not moved: ${MOVE_NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
+    if ( onOpen ) return { lead: 'Your files are on your AWS computer.', text: `The next time you open your computer, we'll first move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files now' };
+    return { lead: lead ? 'Your files are on your AWS computer.' : '', text: `${lead ? 'Opening it uses your Free limits. ' : ''}You can move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files to my Free computer' };
+}
+
+/** §6.3 a start/retry refusal's card, or null when it has none (the summary, re-read, shows the truth). */
+export function moveRefusalCopy (reason) {
+    if ( reason === 'move_computer_running' ) {
+        return { lead: 'Your AWS computer is open.', text: 'Stop it first, and your files start moving to your Free computer as soon as it has stopped.', action: 'stop-and-move' };
+    }
+    if ( MOVE_RE_READ.has(reason) ) return null;
+    // `move_paused`, `move_busy`, `move_computer_unsettled`, and an answer that never came: try later.
+    return { lead: '', text: "We can't start moving your files right now. They're still on your AWS computer and nothing was deleted. Try again later.", action: 'try-again' };
+}
+
+const offerButton = copy => `<button type="button" class="ezil-settings-btn" data-action="move-start"${moveBusy ? ' disabled' : ''}>${html_encode(copy.action)}</button>`;
+
 function moveHtml (model) {
+    // A refusal answers the click that asked (§6.2); a move that exists since then shows instead.
+    if ( moveNotice && ! model.moving && ! model.blocked ) {
+        const copy = moveRefusalCopy(moveNotice.reason);
+        if ( copy ) {
+            const action = copy.action === 'stop-and-move'
+                ? `<button type="button" class="ezil-settings-btn" data-action="move-stop-start"${moveBusy || stopBusy ? ' disabled' : ''}>Stop and move my files</button>`
+                : `<button type="button" class="ezil-settings-btn" data-action="${moveNotice.kind === 'retry' ? 'move-retry' : 'move-start'}"${moveBusy ? ' disabled' : ''}>Try again</button>`;
+            return `<div class="ezil-computer-switch" data-role="move-refused" role="status"><p>${copy.lead ? `<strong>${html_encode(copy.lead)}</strong> ` : ''}${html_encode(copy.text)}</p>
+                <div class="ezil-settings-row-actions">${action}</div></div>`;
+        }
+    }
     const view = moveView(model.move);
     if ( ! view ) return '';
-    if ( view.kind === 'done' ) {
-        // One primary per state (D6): Open desktop lives in the header.
-        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>Your files are on your Free computer. Open your desktop to continue.</p></div>`;
-    }
-    if ( view.kind === 'failed' ) {
-        return `<div class="ezil-computer-switch is-failed" data-role="move-failed" role="alert">
-            <p>We couldn't move your files. They're still on your AWS computer and nothing was deleted.</p><div class="ezil-settings-row-actions">
-            <button type="button" class="ezil-settings-btn" data-action="move-retry">Try again</button>
-            ${feedback_enabled() ? `<button type="button" class="ezil-settings-btn" data-action="move-feedback" data-code="${html_encode(view.code)}">Send feedback</button>` : ''}</div></div>`;
-    }
-    return `<div class="ezil-computer-switch" data-role="move-progress" role="status" aria-live="polite">
+    if ( view.kind === 'progress' ) {
+        return `<div class="ezil-computer-switch" data-role="move-progress" role="status" aria-live="polite">
         <p><strong>Moving your files to your Free computer</strong></p>
+        <p data-role="move-step">${html_encode(`Step ${view.index + 1} of ${view.steps.length}: ${view.steps[view.index]}.`)}</p>
         ${view.bytes ? `<p data-role="move-bytes">${html_encode(view.bytes)}</p>` : ''}
         <div class="ezil-computer-bar" role="progressbar" aria-label="Move progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.percent}"><span style="width:${view.percent}%"></span></div>
         <ol class="ezil-computer-steps">${view.steps.map((step, i) => `<li data-step="${i + 1}" data-state="${i < view.index ? 'done' : i === view.index ? 'active' : 'todo'}">${html_encode(step)}</li>`).join('')}</ol></div>`;
+    }
+    const copy = moveCardCopy(view);
+    if ( view.kind === 'done' ) {
+        // One primary per state (D6): Open desktop lives in the header.
+        return `<div class="ezil-computer-switch is-done" data-role="move-done" role="status"><p>${html_encode(copy.text)}</p></div>`;
+    }
+    const actions = [
+        copy.retry ? `<button type="button" class="ezil-settings-btn" data-action="move-retry"${moveBusy ? ' disabled' : ''}>Try again</button>` : '',
+        copy.upgrade ? '<a class="ezil-settings-btn" data-action="move-upgrade" href="/os?settings=billing&amp;upgrade=pro">Upgrade</a>' : '',
+        copy.feedback && feedback_enabled() ? `<button type="button" class="ezil-settings-btn" data-action="move-feedback" data-code="${html_encode(view.code)}">Send feedback</button>` : '',
+    ].filter(Boolean).join('');
+    return `<div class="ezil-computer-switch is-failed" data-role="${copy.role}" role="alert"><p>${html_encode(copy.text)}</p>${actions ? `<div class="ezil-settings-row-actions">${actions}</div>` : ''}</div>`;
+}
+
+/** §6.3 the pre-move card on the files-held state (shown only when `moveAvailable`); a held-closed computer's is in its own card. */
+function offerHtml (model) {
+    if ( ! model.offer || model.heldClosed || (moveNotice && moveRefusalCopy(moveNotice.reason)) ) return '';
+    const copy = moveOfferCopy({ onOpen: model.moveOnOpen });
+    return `<div class="ezil-computer-switch" data-role="move-offer" role="status"><p><strong>${html_encode(copy.lead)}</strong> ${html_encode(copy.text)}</p>
+        <div class="ezil-settings-row-actions">${offerButton(copy)}</div></div>`;
 }
 
 /** Round 4 standing banners (D16-D18): grace, plan ending, files held on AWS. */
@@ -611,8 +772,11 @@ function standingHtml (model) {
     if ( model.standing === 'plan_ending' ) return `<div class="ezil-computer-switch" data-role="plan-ending" role="status"><p>${html_encode(copy)}</p></div>`;
     // R4-02: no Open desktop for a held computer the hold cannot open; Upgrade is the way back (secondary: D6 keeps one primary).
     if ( model.heldClosed ) {
+        // Phase B (§6.3): with a move available, 6a's card continues with the move (never the "next open" variant).
+        const offer = model.offer && ! (moveNotice && moveRefusalCopy(moveNotice.reason)) ? moveOfferCopy({ lead: false }) : null;
         return `<div class="ezil-computer-switch" data-role="files-held" role="status"><p>${html_encode(heldClosedCopy(model.current, model.data))}</p>
-            <a class="ezil-settings-btn" data-action="held-upgrade" href="/os?settings=billing&amp;upgrade=pro">Upgrade</a></div>`;
+            <a class="ezil-settings-btn" data-action="held-upgrade" href="/os?settings=billing&amp;upgrade=pro">Upgrade</a>${offer
+        ? `<p data-role="move-offer">${html_encode(offer.text)}</p><div class="ezil-settings-row-actions">${offerButton(offer)}</div>` : ''}</div>`;
     }
     if ( model.held ) {
         // The model decided it opens (the live hardware wins over the summary's placed size): the open copy.
@@ -733,7 +897,7 @@ function statusHtml (model, prog) {
     return '';
 }
 
-function manageHtml (computer) {
+function manageHtml (computer, locked = false) {
     if ( editingId === computer.id ) {
         return `<div class="ezil-settings-row" data-id="${html_encode(computer.id)}" data-role="computer-manage">
             <form class="ezil-settings-rename-form" data-role="rename-form">
@@ -746,7 +910,7 @@ function manageHtml (computer) {
         <div class="ezil-settings-row-meta"><div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
             <div class="ezil-settings-row-sub">Name shown in your browser tab and window titles</div></div>
         <div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn" data-action="rename"${isBusy ? ' disabled' : ''}>Rename</button>
-            <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete" hidden${isBusy ? ' disabled' : ''}>${isBusy ? 'Removing…' : 'Delete'}</button></div></div>`;
+            <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete" hidden${isBusy || locked ? ' disabled' : ''}>${isBusy ? 'Removing…' : 'Delete'}</button></div></div>`;
 }
 
 function olderHtml (rows) {
@@ -780,6 +944,9 @@ export function computerHtml (model, prog = progress, older = []) {
     const configHelp = model.heldClosed ? `On the Free plan a ${size?.vcpu ?? ''} vCPU computer can't open. Upgrade to choose a size.`
         : model.held ? `On the Free plan your AWS computer opens at ${sizeLabel(HOLD_SIZE, data)}. Upgrade to choose a size.`
         : model.free ? 'Pick a size for your computer. More sizes come with Standard and Premium.' : 'Pick a size for your computer. Your files stay on your disk when you switch.';
+    // Phase B (§6.4): while a move is in flight, or its row blocks opens, the move card is the body: no Open desktop,
+    // Stop or Start now, no transition, files-held, hold or session line; Delete is refused, so it is disabled.
+    const moveOnly = model.moving || model.blocked;
     return `<section class="ezil-computer" data-role="your-computer" data-id="${html_encode(computer.id)}">
         <header class="ezil-computer-header" data-role="computer-header">
             <div class="ezil-computer-identity"><h3>Your computer</h3>
@@ -788,14 +955,15 @@ export function computerHtml (model, prog = progress, older = []) {
                 ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}</p>
                 ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}</div>
             <div class="ezil-settings-row-actions" data-role="computer-actions">
-                ${model.heldClosed ? '' : `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>`}
+                ${model.heldClosed || moveOnly ? '' : `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>`}
                 ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
         </header>
-        ${statusHtml(model, prog)}
-        ${model.switching ? '' : moveHtml(model)}
-        ${standingHtml(model)}
-        ${sessionEndsHtml(model)}
-        ${notice ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
+        ${moveOnly ? '' : statusHtml(model, prog)}
+        ${model.switching && ! moveOnly ? '' : moveHtml(model)}
+        ${moveOnly ? '' : standingHtml(model)}
+        ${moveOnly ? '' : offerHtml(model)}
+        ${moveOnly ? '' : sessionEndsHtml(model)}
+        ${notice && ! moveOnly ? `<p class="${notice.tone === 'error' ? 'ezil-settings-error' : 'ezil-settings-muted'}" data-role="computer-notice" role="status">${html_encode(notice.text)}</p>` : ''}
         ${model.cards.length ? `<section class="ezil-computer-section" aria-labelledby="ezil-config-heading"><h4 id="ezil-config-heading">Configuration</h4>
             <p class="ezil-settings-muted" data-role="config-help">${html_encode(configHelp)}</p>
             <ul class="ezil-computer-configs" data-role="config-grid">${model.cards.map(card => cardHtml(card, model)).join('')}</ul>
@@ -804,7 +972,7 @@ export function computerHtml (model, prog = progress, older = []) {
             <p>${html_encode(Number.isFinite(disk) ? `${disk} GB disk for your projects` : 'Your files are saved with your computer.')}</p>
             ${used !== null && Number.isFinite(disk) ? `<p data-role="storage-used">${html_encode(`${used.toLocaleString(undefined, { maximumFractionDigits: 1 })} of ${disk} GB used`)}</p>` : ''}
             ${Number.isFinite(disk) ? `<p class="ezil-settings-muted">${model.disk?.growsOnSwitch === true ? 'It grows when you switch to a larger size and never shrinks.' : 'It keeps its size when you switch configuration.'}</p>` : ''}</section>` : ''}
-        ${manageHtml(computer)}
+        ${manageHtml(computer, moveOnly)}
     </section>${olderHtml(older)}`;
 }
 
@@ -850,7 +1018,9 @@ function schedulePoll ($win) {
     if ( ! paneActive || isNative() ) return;
     const fast = pendingSwitch || inFlight(progress) || progress?.operation === 'opening' || progress?.operation === 'stopping' || stopBusy
         || awaitingDeadline(); // round 6 review: a just-started capped session's deadline is asked again soon
-    pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : 20000);
+    // Phase B (§6.4): a move in flight is watched at the overlay's own 5 s cadence, for its live step and bytes.
+    const moving = progress?.operation === 'moving' || MOVE_IN_FLIGHT.has(reverseMoveOf(summary)?.stage);
+    pollTimer = setTimeout(() => { void refreshProgress($win); }, fast ? 3000 : moving ? 5000 : 20000);
 }
 
 /** Billing's own gate (`tabs/billing.js` `available`): where Billing is off, no summary is requested. */
@@ -936,6 +1106,15 @@ async function refreshProgress ($win) {
         if ( step.usage ) await readUsage();
         if ( mine !== generation ) return;
         sawRunning = runningNow;
+        // Phase B (§6.4): a move started from an open in another window (or one that just ended) is in
+        // computer.progress before the summary carries it: re-read the summary, once per poll, at most 6 times.
+        if ( ! moveSummaryLags(progress, summary) ) moveSummaryReads = 0;
+        else if ( ! step.summary && moveSummaryReads < MOVE_SUMMARY_READS ) {
+            moveSummaryReads++;
+            await readSummary();
+            if ( mine !== generation ) return;
+        }
+        if ( progress.operation === 'moving' ) { moveNotice = null; notice = null; }
     }
     if ( mine !== generation ) return;
     if ( ! editingId ) render($win); // never repaint over a rename in progress
@@ -1059,9 +1238,13 @@ export async function requestSwitch ($win, target, { confirm = true } = {}) {
     else await run();
 }
 
+/**
+ * Stop, after the confirmation. Resolves 'declined' (no stop was asked), 'moving' (Phase B: the stop met a move: the
+ * machine owns the export boot, and the tab now shows the move), or 'asked'.
+ */
 async function handleStop ($win) {
     const computer = mainComputer();
-    if ( ! computer || stopBusy || pendingSwitch || inFlight(progress) ) return;
+    if ( ! computer || stopBusy || pendingSwitch || inFlight(progress) ) return 'declined';
     // The chip flips to Stopping… as the user confirms; the stop itself (≈ 40 s) runs after the sheet closes.
     let confirmed = false;
     await confirmAction($win, 'stop', { data: summary }, () => {
@@ -1071,7 +1254,8 @@ async function handleStop ($win) {
         notice = null;
         render($win);
     });
-    if ( ! confirmed ) return;
+    if ( ! confirmed ) return 'declined';
+    let met = 'asked';
     // Hotfix r5 review: from the confirm on, no hover over the Browser dock icon may warm (= start)
     // it again — set BEFORE the windows close, so a warm begun meanwhile cannot slip past the cancel.
     session.holdAfterStop?.(computer.id);
@@ -1084,11 +1268,74 @@ async function handleStop ($win) {
         const res = await fetch('/api/shell/stop', { method: 'POST', credentials: 'same-origin',
             headers: { 'content-type': 'application/json' }, body: JSON.stringify({ computerId: computer.id }) }).catch(() => null);
         const data = res ? await res.json().catch(() => null) : null;
-        if ( ! res?.ok || data?.ok === false ) notice = { text: "We couldn't confirm the stop. Try again in a moment.", tone: 'error' };
+        // Phase B (§6.2): the waiting or blocked provider's stop answer is the move (the user cannot stop the export
+        // boot), not "couldn't confirm the stop": re-read the summary and show the move's card instead.
+        if ( data?.outcome === 'computer_moving' || data?.outcome === 'computer_move_needs_attention' ) {
+            met = 'moving';
+            await readSummary();
+        } else if ( ! res?.ok || data?.ok === false ) notice = { text: "We couldn't confirm the stop. Try again in a moment.", tone: 'error' };
     } finally {
         stopBusy = false;
     }
     await refreshProgress($win);
+    return met;
+}
+
+/** `computer.move.start` / `computer.move.retry` (§5.9): `{ok: true, move}` or a refusal value; never throws. */
+async function postMove (computerId, kind) {
+    const res = await trpc.mutate(`computer.move.${kind}`, { computerId });
+    if ( res?.ok && res.data && typeof res.data.ok === 'boolean' ) return res.data;
+    return { ok: false, reason: 'error' };
+}
+
+/**
+ * Phase B (§6.2): [Move my files…] (`start`) and the failed card's Try again (`retry`). `{ok: true, move}` shows that
+ * move's card in any state (a stale card's click mid-move shows the move); a refusal shows its §6.3 card, or, when it
+ * has none, the re-read summary. Resolves the answer (null when nothing was asked).
+ */
+export async function requestMove ($win, kind = 'start') {
+    const computer = mainComputer();
+    if ( ! computer || moveBusy ) return null;
+    moveBusy = true;
+    moveNotice = null;
+    render($win);
+    let answer;
+    try {
+        answer = await postMove(computer.id, kind);
+        if ( answer.ok && answer.move?.direction === 'to_cloudflare' ) {
+            if ( summary?.computer ) summary = { ...summary, computer: { ...summary.computer, reverseMove: answer.move } };
+        } else if ( MOVE_RE_READ.has(answer.reason) ) await readSummary();
+        else moveNotice = { reason: answer.reason, kind };
+    } finally {
+        moveBusy = false;
+    }
+    if ( $win.get(0)?.isConnected ) { render($win); void refreshProgress($win); }
+    return answer;
+}
+
+/** §6.2 the stop watch: computer.progress until `stage` is `stopped`, at most the stop budget (200 polls, 5 s apart). */
+const STOP_WATCH_POLLS = 200;
+
+/**
+ * Phase B (§6.2): [Stop and move my files], after a `move_computer_running` refusal.
+ *   1. start again first: a move started meanwhile (another window) shows, and nothing is stopped;
+ *   2. still running: the tab's own Stop (the same confirmation), then watch until it is `stopped`, then start once;
+ *   3. a closed tab (or a declined stop) starts nothing.
+ */
+async function stopAndMove ($win) {
+    const first = await requestMove($win, 'start');
+    if ( ! first || first.ok || first.reason !== 'move_computer_running' ) return;
+    const mine = generation;
+    if ( await handleStop($win) !== 'asked' ) return;
+    for ( let polls = 0; polls < STOP_WATCH_POLLS; polls++ ) {
+        if ( ! $win.get(0)?.isConnected || mine !== generation ) return;
+        if ( progress?.stage === 'stopped' ) break;
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        if ( ! $win.get(0)?.isConnected || mine !== generation ) return;
+        await refreshProgress($win);
+    }
+    if ( ! $win.get(0)?.isConnected || mine !== generation ) return;
+    await requestMove($win, 'start');
 }
 
 function nativeRowHtml (slot, computer) {
@@ -1220,7 +1467,8 @@ async function load ($win) {
     // unknown for one progress request, not for list + the slow summary + progress.
     const mine = ++generation;
     // Round 6 review: this activation's own view of the session (the deadline re-reads start afresh).
-    sawRunning = null; deadlineRetries = DEADLINE_RETRIES;
+    // Phase B: a refusal card answers one click; a fresh activation shows the move's state from the server again.
+    sawRunning = null; deadlineRetries = DEADLINE_RETRIES; moveSummaryReads = 0; moveNotice = null;
     // Round 6: the hold's hours left (billing.usage) once the summary says the files are held.
     await Promise.all([readSummary().then(readUsage), refreshProgress($win)]);
     if ( mine !== generation ) return;
@@ -1399,11 +1647,11 @@ function bind ($win, ctx) {
     $list.on('click', '[data-action="switch-feedback"]', function () {
         if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer' });
     });
-    // Phase B (dormant while computer.move is null): the move restarts on the next open (D20).
-    $list.on('click', '[data-action="move-retry"]', () => {
-        const computer = mainComputer();
-        if ( computer ) void switchTo(computer, ctx, $win);
-    });
+    // Phase B (§6.2): the move's own actions. Try again is `computer.move.retry`, never an open: after a failed move
+    // an open is the D16 hold boot of the AWS computer (Free hours), not a move.
+    $list.on('click', '[data-action="move-start"]', function () { if ( ! this.disabled ) void requestMove($win, 'start'); });
+    $list.on('click', '[data-action="move-retry"]', function () { if ( ! this.disabled ) void requestMove($win, 'retry'); });
+    $list.on('click', '[data-action="move-stop-start"]', function () { if ( ! this.disabled ) void stopAndMove($win); });
     $list.on('click', '[data-action="move-feedback"]', function () {
         if ( feedback_enabled() ) open_feedback_dialog({ source: 'settings-computer', errorCode: this.dataset.code });
     });
@@ -1479,6 +1727,9 @@ export default {
         pendingSwitch = null;
         notice = null;
         stopBusy = false;
+        moveNotice = null;
+        moveBusy = false;
+        moveSummaryReads = 0;
         progress = null; // never paint lifecycle from a previous window's life
         unavailable = new Set();
         // The fallback hint only — `openDesktopComputerId()` prefers the
