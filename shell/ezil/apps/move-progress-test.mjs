@@ -179,6 +179,28 @@ test('desktop: a move handed back after its watch, then committed, opens the Fre
     assert.ok(h.asks > asks);
 });
 
+// r7 integration (verifier mutant D1): the desktop window hands awsBootTimeoutVerdict the answer's move flags. With every
+// progress read failing, the window has no moving view of its own: only the flags make the handed-back answer a move
+// (never "This is taking too long" with Try again), and its move wait still opens the Free computer at the commit.
+test('desktop: a moving answer handed back while every progress read fails is still the move; the commit then opens', async t => {
+    let readsFail = true, committed = false;
+    const h = await open(t, 'desktop', {
+        progress: () => readsFail ? new Error('network') : committed ? terminalProgress({ outcome: 'committed' }) : movingProgress({ phase: 'committing' }),
+        answer: () => committed ? ready : waitingAnswer(),
+    });
+    await until(() => h.asks >= 1, 'the open');
+    h.now = (13_200 + 300) * 1000 + 60_000; // past the move's watch: the loop hands the moving answer back
+    await until(() => line(h.spinner).startsWith('This is taking longer than usual.') || label(h.spinner) === 'This is taking too long',
+        'the handed-back answer');
+    await wait(60);
+    assert.notEqual(label(h.spinner), 'This is taking too long', 'a move, never a failed boot');
+    assert.equal(h.spinner.querySelector('.ezil-boot-retry').hidden, true, 'no Try again for a move');
+    const asks = h.asks;
+    readsFail = false; committed = true;
+    await until(() => frame(h), 'the Free computer\'s frame, through the window\'s move wait');
+    assert.ok(h.asks > asks);
+});
+
 // ── Review fixes (lane U r6b) ──────────────────────────────────────────────────────────────────────────────────
 
 // R2-M1: the surface polls every 5 s, the open's loop reads every 30 s. Here the 30 s pause outlasts the test, so the

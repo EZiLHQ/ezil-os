@@ -600,6 +600,9 @@ check('Phase B open blocked: chip "Needs attention", no Open, the needs-attentio
 const failedRow = (reason, retry, holdOpenable = true, stage = 'failed_reopened') => reverseMove({ stage, reason, retry, holdOpenable });
 const ROWS = [
     ['default reopen, Try again', failedRow('copy_stalled', 'now'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted.", { retry: true }],
+    // r7 integration (verifier mutant C2): §6.2 "move-retry is shown only when retry === 'now'", pinned on the default
+    // row with a retry the server never sends there ('after_aws_session' comes only with workspace_too_large).
+    ['default reopen, retry not now', failedRow('copy_stalled', 'after_aws_session'), "We couldn't move your files. They're still on your AWS computer and nothing was deleted.", {}],
     ['workspace_too_large, after an AWS session', failedRow('workspace_too_large', 'after_aws_session'),
         'Your Workspace folder is larger than a Free computer can hold (537 MB), so your files stay on your AWS computer. Nothing was deleted. Remove some files on your AWS computer and try again, or upgrade to keep using them.', { upgrade: true }],
     ['workspace_too_large, Try again now', failedRow('workspace_too_large', 'now'), null, { upgrade: true, retry: true }],
@@ -729,7 +732,7 @@ if ( haveBundle ) {
     let data = premium(), progress = running(), switchReply = null, held = null, usageData = null;
     // Phase B: `computer.move.start`/`retry` answers (in order) and the stop route's answer; the move section turns on
     // fast 5 s timers (the move's poll and the stop watch).
-    let moveReplies = [], stopReply = { ok: true, terminated: true }, fastFive = false;
+    let moveReplies = [], stopReply = { ok: true, terminated: true }, fastFive = false, summaryFails = false;
     const realSetTimeout = window.setTimeout.bind(window);
     window.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, fastFive && ms === 5000 ? 30 : ms, ...args);
     window.fetch = async (url, opts = {}) => {
@@ -738,7 +741,10 @@ if ( haveBundle ) {
         calls.push(call);
         const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) });
         if ( u.includes('/api/trpc/computer.list') ) return json({ result: { data: { json: [me] } } });
-        if ( u.includes('/api/trpc/billing.summary') ) return json({ result: { data: { json: data } } });
+        if ( u.includes('/api/trpc/billing.summary') ) {
+            if ( summaryFails ) return json({ error: { json: { message: 'stub', data: { code: 'INTERNAL_SERVER_ERROR' } } } }, 500);
+            return json({ result: { data: { json: data } } });
+        }
         if ( u.includes('/api/trpc/billing.history') ) return json({ result: { data: { json: [] } } });
         if ( u.includes('/api/trpc/computer.progress') ) return json({ result: { data: { json: progress } } });
         if ( u.includes('/api/trpc/billing.usage') && usageData ) return json({ result: { data: { json: usageData } } });
@@ -1129,6 +1135,20 @@ if ( haveBundle ) {
         assert.doesNotMatch(pane().textContent, /couldn't confirm the stop/);
         assert.match(role('move-progress')?.textContent ?? '', /Step 1 of 4: Saving your files\./);
     });
+    // r7 integration (verifier mutant C3): the same stop answer, but the summary re-read fails, so no move card can hide a
+    // notice: handleStop's computer_moving branch alone keeps "We couldn't confirm the stop" off the tab.
+    data = heldMove(); progress = running();
+    await reopen();
+    stopReply = () => { summaryFails = true; return { ok: false, terminated: false, outcome: 'computer_moving' }; };
+    click(pane().querySelector('[data-action="stop"]'));
+    await settle(6);
+    click(q('[role="dialog"][data-sheet="confirm-stop"] [data-action="confirm"]'));
+    await settle(10);
+    check('bundle: Phase B a stop answered computer_moving with a failed summary re-read is still never "We couldn\'t confirm the stop"', () => {
+        assert.equal(role('computer-notice'), null);
+        assert.doesNotMatch(pane().textContent, /couldn't confirm the stop/);
+    });
+    summaryFails = false;
     fastFive = false; stopReply = { ok: true, terminated: true };
     check('bundle: Phase B every move state names no city and passes the copy guards', () => {
         assert.doesNotMatch(pane().textContent, /mumbai|ap-south-1/i);
