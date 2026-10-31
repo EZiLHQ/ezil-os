@@ -338,9 +338,20 @@ async function scenarioCodeFullView () {
         await page.click(`${CODE} > .ezil-full-view-bar [data-action="restore"]`);
         await page.waitForSelector(`${CODE}:not(.ezil-fullbleed)`);
         const g9 = await settledGeometry(page, CODE);
-        push(`${L} positive control: Restore window leaves it at the EXACT box it had before full view (980x680, not the viewport)`,
-            JSON.stringify(g9.rect) === JSON.stringify(stash) && stash[2] === 980 && stash[3] === 680 && ! fillsViewport(g9),
+        push(`${L} positive control: Restore window leaves it at the box it had before full view, to the pixel (980x680, not the viewport)`,
+            near(g9.rect, stash) && near(stash.slice(2), [980, 680]) && ! fillsViewport(g9),
             JSON.stringify({ rect: g9.rect, stash }));
+        // ── the Browser, relaunched while full-bleed (a dock click, Back/Forward) ──
+        // It was minimised and restored above, so `data-orig-*` holds the old
+        // viewport's size, which `showWindow` used to write back over it.
+        await page.evaluate(async () => {
+            const p = window.__EZIL_BOOT__;
+            await window.ezil.registry.launch('desktop', { payload: p, computer: p.computer, desktopState: p.desktopState });
+        });
+        await page.waitForSelector('.window[data-app="desktop"].window-active.ezil-fullbleed');
+        const bg10 = await settledGeometry(page, '.window[data-app="desktop"]');
+        push(`${L} 🔴 the Browser relaunched while full-bleed, after the resize, fills the NEW viewport (not the box its minimise recorded)`,
+            fillsViewport(bg10) && bg10.vp[0] === vw - 140, JSON.stringify(bg10));
         push(`${L} never the Fullscreen API`, await page.evaluate(() => document.fullscreenElement === null));
 
         push(`${L} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
@@ -494,11 +505,21 @@ async function settledGeometry (page, sel) {
     return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
 }
 
+/**
+ * Equal to within a pixel, value by value. This suite runs on every OS
+ * (ci.yml's portable family), and macOS Chromium can settle a box a pixel off
+ * Linux's (run-tests.sh, "CI FAMILY SPLIT"). The defects these checks catch
+ * miss by hundreds of pixels.
+ */
+function near (a, b) {
+    return a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= 1);
+}
+
 /** Window rect = viewport rect, the body directly below the strip to the bottom edge, opaque, on top. */
 function fillsViewport (g) {
     return g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
-        && JSON.stringify(g.rect) === JSON.stringify([0, 0, g.vp[0], g.vp[1]])
-        && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+        && near(g.rect, [0, 0, g.vp[0], g.vp[1]])
+        && near(g.body, [0, g.strip, g.vp[0], g.vp[1] - g.strip]);
 }
 
 /** Open an app through the registry, the same call a dock click makes. */

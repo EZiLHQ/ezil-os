@@ -89,9 +89,14 @@ const geometry = async page => {
     const first = await read(), second = await read();
     return { ...second, stable: JSON.stringify(first) === JSON.stringify(second) };
 };
+// Within a pixel, value by value, rounded: this suite runs on every OS (ci.yml's
+// portable family), and macOS Chromium can settle a box a pixel off Linux's
+// (run-tests.sh, "CI FAMILY SPLIT"). The defects below miss by hundreds.
+const near = (a, b) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= 1);
+const px = a => a.map(Math.round);
 // Full view: the window IS the viewport, the body runs from the strip to the bottom edge, opaque, on top.
 const fills = g => g.stable && g.full && g.strip > 0 && g.opacity === '1' && g.hits
-    && JSON.stringify(g.rect) === JSON.stringify([0, 0, ...g.vp]) && JSON.stringify(g.body) === JSON.stringify([0, g.strip, g.vp[0], g.vp[1] - g.strip]);
+    && near(g.rect, [0, 0, ...g.vp]) && near(g.body, [0, g.strip, g.vp[0], g.vp[1] - g.strip]);
 const resize = async (page, width, height) => {
     await page.setViewportSize({ width, height });
     await page.waitForFunction(([w, h]) => innerWidth === w && innerHeight === h, [width, height]);
@@ -240,8 +245,8 @@ try {
             await bar('restore'); await fullCode.waitFor({ state: 'detached' });
             assert.deepEqual(await now(), ['/app/code', base + 2, 'window', false, 0], 'Restore window, recorded on E3');
             g = await geometry(tab); windowed = g.rect;
-            assert.deepEqual([windowed, windowed.slice(2), g.stable], [stash, [980, 680], true],
-                'positive control: Restore window lands on the EXACT 980x680 box Code had before full view, not the viewport');
+            assert.deepEqual([near(windowed, stash), px(windowed.slice(2)), g.stable], [true, [980, 680], true],
+                'positive control: Restore window lands on the 980x680 box Code had before full view (to the pixel), not the viewport');
         }
         await tab.goBack(); await at('/app/settings');
         await tab.goBack(); await at('/app/code');
@@ -257,7 +262,7 @@ try {
         assert.deepEqual(await now(), ['/app/code', base + 2, restore ? 'window' : 'full', ! restore, 0],
             restore ? '🔴 a reload of E1 opens Code WINDOWED, as it was on screen' : `${label}: a reload of E1 opens Code full`);
         g = await geometry(tab);
-        if ( restore ) assert.deepEqual([g.rect.slice(2), g.full], [[980, 680], false], 'positive control: the windowed reload opens at 980x680');
+        if ( restore ) assert.deepEqual([px(g.rect.slice(2)), g.full], [[980, 680], false], 'positive control: the windowed reload opens at 980x680');
         else assert.ok(fills(g) && g.vp[0] === 1100, `🔴 ${label}: the reload FILLS the viewport: ${JSON.stringify(g)}`);
         await tab.close();
     }
@@ -286,7 +291,7 @@ try {
         await tab.locator('.taskbar-item[data-app="code"]').click();
         await code.waitFor();
         g = await geometry(tab);
-        assert.deepEqual([g.rect.slice(2), g.full], [[980, 680], false], 'positive control: a dock launch with no remembered choice opens windowed, 980x680');
+        assert.deepEqual([px(g.rect.slice(2)), g.full], [[980, 680], false], 'positive control: a dock launch with no remembered choice opens windowed, 980x680');
         await tab.locator('.window[data-app="code"] > .window-head .window-scale-btn').click();
         await tab.locator('.window[data-app="code"].ezil-fullbleed').waitFor();
         g = await geometry(tab);
