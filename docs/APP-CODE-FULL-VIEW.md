@@ -1,12 +1,16 @@
-# Code full view, its top bar, and the stopped/reconnecting state
+# Code full view, its strip, and the stopped/reconnecting state
 
-App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
-`shell/ezil/ui/full-view.js`, `shell/ezil/ui/ezil-shell.css`.
+App-code lane A2, 2026-10-30; the strip reshaped by gate G3, 2026-10-31.
+Source: `shell/ezil/apps/code.js`, `shell/ezil/ui/full-view.js`,
+`shell/ezil/ui/ezil-shell.css`, `shell/ezil/ui/feedback/feedback.{js,css}`.
 
-> **Every visual value in this document is PROVISIONAL.** No reference
-> screenshots were available when it was written. The numbers below are the
-> ones the code uses today, chosen to fit the existing Browser control strip and
-> the existing Feedback icon. They are to be refined after a pixel review.
+> **Every visual value in this document is PROVISIONAL.** G3 worked from the
+> coordinator's description of the founder's reference screenshots ("a centred
+> compact pill/grab notch in a dark full-view strip; a tiny circular outlined
+> speech-bubble Feedback icon flush top-right; no oversized pill overlapping
+> the editor"). The reference pixels themselves were not readable, so every
+> dimension below is a choice, judged only from rendered screenshots, and is to
+> be refined after a pixel review against the references.
 
 ## 1. Behaviour
 
@@ -16,11 +20,11 @@ App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
 | Launch with `ctx.view === 'window'` | Opens windowed at 980×680. |
 | Launch with no view (dock, Start menu, launcher) | Windowed at 980×680, unless the user's last explicit choice in this tab was full (`sessionStorage['ezil-os:view.code'] === 'full'`). |
 | Green button, head double-click, head context menu "Maximize" (all reach `scale_window` → `el._ezil_maximise`) | Toggles full view ↔ window. Remembered. Announced. |
-| Top bar **Restore window**, drawer **Restore window**, double-click on the top bar | Back to the window at the bounds it had before full view. Remembered. Announced. |
-| Top bar **Minimise**, drawer **Show desktop** | Minimises. The taskbar comes back first. Coming back from the taskbar re-enters full view if the window still wants it; otherwise it restores the windowed bounds. The head's minimise button and context menu are reachable only while windowed and keep upstream's `hideWindow()`. Code installs no `_ezil_minimise` hook (`seam-minimise-browser-test` pins a single provider). |
-| Top bar **Close**, drawer **Close** | Closes the window (the taskbar comes back). |
+| Tray **Restore window**, double-click on the strip | Back to the window at the bounds it had before full view. Remembered. Announced. |
+| Tray **Show desktop** | Minimises. The taskbar comes back first. Coming back from the taskbar re-enters full view if the window still wants it; otherwise it restores the windowed bounds. The head's minimise button and context menu are reachable only while windowed and keep upstream's `hideWindow()`. Code installs no `_ezil_minimise` hook (`seam-minimise-browser-test` pins a single provider). |
+| Tray **Close** | Closes the window (the taskbar comes back). |
 | `el._ezil_relaunch(ctx)` (the registry calls it on an existing single-instance window after `showWindow()`, contract item 4) | Reads only `ctx.view`, and only `'full'` / `'window'`; every other key and value is ignored. Not remembered. Announced when the view changes. |
-| `el._ezil_set_title(text)` | Sets the title in the head, the top bar and the drawer as text (`textContent`). An empty value falls back to the app name. A later lane passes the project/repo name. |
+| `el._ezil_set_title(text)` | Sets the title in the head and the tray as text (`textContent`). An empty value falls back to the app name. A later lane passes the project/repo name. |
 | `el._ezil_view()` (read only; the router, `app-history.js`, calls it whenever it writes this window's history entry, docs/APP-ROUTES.md §5 "State") | Returns the view now: `'full'` while the window wants full view, minimised from it included (it re-enters full view when shown, though the `ezil-fullbleed` class is off while hidden); otherwise `'window'`, always `'window'` when full view is forbidden. Read from the full-view state, not from the last announced value. Changes nothing. |
 
 - **Remembered** means that `sessionStorage['ezil-os:view.code']` is set to `'full'` or `'window'`. Only gestures write it. Route launches and relaunches never write it. Storage failures are ignored, and the choice still applies to the open window.
@@ -43,8 +47,9 @@ App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
 - **`prepare_close()`** is called from both windows' `on_before_exit`, which `$.fn.close` awaits before its own full-page exit. It applies the same rule to closing. When another window is still in full view, it drops this window's `data-is_fullpage`, so `$.fn.close` does not put the taskbar over that window. When there is no other full window it does nothing.
 
 **Full view fills the viewport, on every entry path (2026-10-30).** Until
-this date, Code opened from `/app/code` got the class and the top bar but kept
-its windowed size: `left: 0px; top: 0px; width: 980px; height: 680px`. This
+this date, Code opened from `/app/code` got the class and the top bar (since
+G3, the strip) but kept its windowed size:
+`left: 0px; top: 0px; width: 980px; height: 680px`. This
 was measured on real Next and in Chromium. Two writes put the windowed box
 back:
 
@@ -94,20 +99,82 @@ were previously keyed on `.ezil-desktop-window`. Specificity and source
 position are the same, and the Browser's computed full-bleed geometry was diffed
 identical at 1440×900 and 390×844.
 
-## 3. The top bar (PROVISIONAL visuals)
+## 3. The strip (PROVISIONAL visuals, gate G3)
 
-| Element | Value | Notes |
+Until 2026-10-31 a 43px top bar carried the drawer's tongue at the left, a
+centred title and its own Minimise / Restore window / Close buttons. Gate G3
+replaced it with the Browser's pattern: one centred notch in a lower strip,
+everything else in the notch's tray.
+
+**What is on screen.** While the drawer is shut, the strip holds exactly two
+things: the drawer's grab notch, centred, and the Feedback icon, flush right.
+The title and the window actions live in the notch's expanded tray, which is a
+transient menu and may cover the editor's top rows while it is open.
+
+| Element | Value (PROVISIONAL) | Notes |
 |---|---|---|
-| Bar height | `--ezil-control-strip-height`: 43px fine, 59px `pointer: coarse` | Same strip as the Browser, so the Feedback icon's fixed full-bleed position (feedback.css `top: 9.5px` / `7.5px`) is centred in it with no Code-specific rule. |
-| Bar background | Window background `#11151f` (shared full-view rule); bottom hairline `1px rgba(255,255,255,0.08)` | |
-| Text colour | `var(--color-offwhite, #f5f5f4)` | |
-| Left | Control drawer at `left: 8px` (collapsed tongue 56×16 + 1px border, vertically centred as in the Browser) | The Browser's drawer is centred. Expanded, it shows icon, title, **Show desktop**, **Restore window** and **Close**, and covers the title (drawer z 600 > bar z 550). |
-| Left padding | 78px | Clears the collapsed drawer. |
-| Title | Centred, 13px / 600, opacity 0.86, one line with an ellipsis; `max-width: calc(100% - 2 × --ezil-fv-side)`, where `--ezil-fv-side` is 150px fine and 200px coarse | At 390px coarse the title has no room and ellipsises to nothing. |
-| Controls (right) | Minimise, Restore window, Close: `--ezil-fv-btn` 28px fine / 44px coarse square, 4px gap, radius 6px, 16px glyph, opacity 0.8 (1 on hover/focus), hover `rgba(255,255,255,0.12)` | Real `<button>`s with `aria-label` and `title`. |
-| Right padding (Feedback reserve) | `--ezil-fv-chip-reserve` 40px fine / 50px coarse | The icon is 24px at `right: 6px` (fine) or 44px at `right: 0` (coarse). |
-| Focus | `:focus-visible` outline `2px solid var(--ezil-accent, #00adb5)`, offset 2px | |
-| Tab order | Drawer toggle → bar buttons → editor | DOM order: drawer, bar, body. |
+| Strip height | `--ezil-control-strip-height` on `.ezil-code-window.ezil-fullbleed`: **28px** fine, **44px** `pointer: coarse` | Lower than the Browser's 43px / 59px, which is unchanged. 28px is the lowest height that fits the 18px notch and the icon's 20px disc with 4px to spare; 44px keeps 44px targets. The shared body offset reads the same property, so the editor starts at the strip's bottom. |
+| Strip background | The window's own `#11151f` (shared full-view rule), bottom hairline `1px rgba(255,255,255,0.08)` | The same dark strip in both themes, matching the dark editor. |
+| `.ezil-full-view-bar` | Empty, `aria-hidden="true"`, no role | The strip itself. It keeps the head's double-click (back to a window) and press-to-activate. Nothing in it is focusable. |
+| Notch (shut) | dashboard.css's tongue: 56×16 fine, 68×20 coarse, plus a 1px border (58×18, 70×22). Centred horizontally (`left: 50%`, `translateX(-50%)`, as the Browser's) and vertically including its border | Code's `top` subtracts the border's 1px. The shared rule centres the content box and leaves the Browser's notch 1px low; that rule is left alone so the Browser does not move. |
+| Notch hit area | The toggle's `::after` runs from the strip's top edge to its bottom edge (28px fine, 44px coarse), 14px / 16px wider than the notch on each side | It never extends below the strip, so it never takes a click meant for the editor. |
+| Tray (open) | dashboard.css's tray: icon, title (12px / 500), **Show desktop**, **Restore window**, **Close**; 290×43 at 1440 | Opens on hover (mouse), tap, or keyboard focus; covers the editor's top ~15px while open. At ≤500px wide dashboard.css hides the title, as in the Browser. |
+| Feedback icon | `feedback.css`: a 24px button (44px coarse), `right: 6px` (0 coarse), its `top` derived from the strip: `calc((strip − 24px) / 2)`, `calc((strip − 44px) / 2)` coarse | 2px / 0px in Code's strip; 9.5px / 7.5px in the Browser's, as before. |
+| Feedback look in Code's strip | Outlined: the 20px disc becomes a 1px `currentColor` ring with no glass and no shadow; the same stroked speech-bubble glyph at 12px (4px padding); opacity 0.62 (1 on hover/focus); focus ring 2px, 1px out (inside the 28px strip) | Code's strip declares `--ezil-feedback-look: outline`. Everywhere else (a windowed app, the Browser's full-bleed) the icon keeps its glass disc. |
+| Focus | Tray toggle and actions: dashboard.css's `2px solid rgba(255,255,255,0.9)` ring, 1px out. Feedback: the accent ring | Keyboard focus on the toggle opens the tray; its ring is drawn around the tray's dismiss strip. |
+| Tab order | Tray toggle → Show desktop → Restore window → Close → editor; the Feedback icon is the body's last button | DOM order. |
+
+**Show desktop is the one minimise.** The old bar's "Minimise" and the tray's
+"Show desktop" both called `full_view.minimise()`. The tray keeps one button,
+labelled "Show desktop" as it was. If the founder wants the label the Browser
+uses ("Minimise"), that is a one-word change in `code.js`.
+
+**How the icon follows the strip.** The icon is one fixed, body-level button
+shared by every window. On every window mutation (and when the
+`pointer: coarse` query changes) `mount_feedback_chip`'s sync takes the front
+full view (the rendered `.ezil-fullbleed` window with the highest z-index, the
+later one on a tie) and copies its computed `--ezil-control-strip-height` onto
+the icon as `--ezil-feedback-strip-h`, and its `--ezil-feedback-look` onto
+`data-look`. It writes only when a value changes, since `style` is one of the
+attributes it observes. With no full view, or nothing declared, the CSS
+fallbacks are the Browser's strip and the glass disc. So Code full over a
+full-bleed Browser puts the icon in Code's strip, and minimising Code puts it
+back at the Browser's 9.5px, glass.
+
+**Measured** (Chromium, the built bundle, a fake editor whose first row sits at
+the frame's top-left; `x, y, width × height`):
+
+| View | Strip | Notch (shut) | Feedback button / disc | Editor frame |
+|---|---|---|---|---|
+| 1440×900 fine | 0,0 1440×28 | 691,5 58×18 | 1410,2 24×24 / 1412,4 20×20 | 0,28 1440×872 |
+| 900×700 fine | 0,0 900×28 | 421,5 58×18 | 870,2 24×24 / 872,4 20×20 | 0,28 900×672 |
+| 390×844 coarse | 0,0 390×44 | 160,11 70×22 | 346,0 44×44 / 358,12 20×20 | 0,44 390×800 |
+| 1024×768 coarse | 0,0 1024×44 | 477,11 70×22 | 980,0 44×44 / 992,12 20×20 | 0,44 1024×724 |
+| Browser full-bleed, 1440×900 (unchanged) | 0,0 1440×43 | 691,13.5 58×18 | 1410,9.5 24×24 / 1412,11.5 20×20 | body 0,43 |
+
+The Browser's full-bleed screenshot at 1440×900 is pixel-identical to 83078df5
+(0 differing pixels), and so is a windowed Code.
+
+**Tests.** `shell/ezil/apps/code-full-view-browser-test.mjs` (ci.yml's geometry
+family, Linux only, because it measures pixels) checks the relationships at
+1440×900 and 900×700 fine and 390×844 and 1024×768 coarse:
+
+- the strip is empty;
+- the notch is inside it, centred both ways, at most 72px wide;
+- the notch's hit area spans the strip, and 1px below it the editor takes the click;
+- exactly two buttons answer along the strip;
+- the Feedback icon's right edge is within 8px, it is vertically centred, outlined, and clear of the notch and the open tray;
+- the editor and its first row start at or below the strip;
+- "Reconnecting…" stays below the strip;
+- the keyboard path works (Tab to the toggle, Show desktop, Restore window, then Enter);
+- the focused green button enters full view again;
+- the icon follows the front full view.
+
+It pins the two strip heights only as ranges: fine between 26px and 32px, coarse
+at least 44px. `feedback-test` (jsdom) pins the mirroring rules. `os-chrome`
+scenario 5, `window-chrome` GROUP 6, `code-test` §7, `app-link-test`,
+`app-link-browser-test` and `feedback-browser-test` drive the tray where they
+drove the bar.
 
 ## 4. "Reconnecting…" / "Computer stopped" (PROVISIONAL visuals and copy)
 
@@ -136,9 +203,19 @@ uses the accent style of the existing "Try again" button.
 
 ## 5. Not done here (deferred)
 
-- Pixel review of every value above.
+- Pixel review of every value above against the founder's reference
+  screenshots, which G3 could not read (§3).
+- The outlined Feedback look applies only in Code's strip. The Browser's
+  full-bleed and windowed apps keep the glass disc, because the brief said to
+  leave the Browser's look unchanged. To make the outline universal, declare
+  `--ezil-feedback-look: outline` in the shared full-view rule, or drop the
+  `[data-look]` gate in feedback.css.
+- On the keyboard, Enter or Space on the tray toggle toggles the tray. Focus
+  has already opened it, so the first Enter shuts it, and while the tray is
+  shut its actions are hidden and Tab skips them. Tab straight past the toggle
+  works. This is the Browser's behaviour as well.
 - With `desktopState.ui.floatingControls === true`, the fenced Feedback sync hides the icon in every full-bleed window, so Code's full view would have no Feedback icon. Today that flag is always false.
-- A Settings button in Code's drawer (Browser "Guarantee #1") needs `wants_settings_in_drawer: true` on the `code` registry entry (registry.js, not this lane's). Today the top bar's Restore and Minimise bring the taskbar, and its Settings icon, back in one click.
+- A Settings button in Code's drawer (Browser "Guarantee #1") needs `wants_settings_in_drawer: true` on the `code` registry entry (registry.js, not this lane's). Today the tray's Restore window and Show desktop bring the taskbar, and its Settings icon, back in one click.
 
 ## 6. Hand-offs outside this lane (from the removal of "Restart desktop")
 
