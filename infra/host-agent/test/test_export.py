@@ -235,13 +235,52 @@ class AgentOp(unittest.TestCase):
         open(os.path.join(self.cfg.runDir, agentmod.SHUTDOWN_PENDING), "w").close()
         self.assertTrue(stopping())
 
-    def test_unreadable_record_is_busy_never_overwritten(self):
+    def test_unreadable_record_is_unreadable_never_busy_never_overwritten(self):
+        # r7 fixer: an unreadable record (invalid, or an I/O error) cannot be matched, but it is not another move's job:
+        # `export_state_unreadable` (the edge's retryable 503), never `export_busy` (the Worker's final export_refused).
         export.ensure_root(self.cfg)
         with open(os.path.join(self.cfg.stateDir, "export", "state.json"), "w") as f:
             f.write("{not json")
-        self.assertEqual(self.send(moveId=MOVE, importGeneration=str(uuid.uuid4())), {"ok": False, "error": "export_busy"})
+        self.assertEqual(self.send(moveId=MOVE, importGeneration=str(uuid.uuid4())), {"ok": False, "error": "export_state_unreadable"})
         with self.assertRaises(Refused):
             export.read_state(self.cfg)
+        with mock.patch.object(export, "read_state", side_effect=Refused("export_state_unreadable")):
+            self.assertEqual(export.accept(self.cfg, MOVE, str(uuid.uuid4()), time.time()), "unreadable")
+        self.start.assert_not_called()
+
+    def test_read_state_survives_a_writer_rename_between_its_stat_and_open(self):
+        # r7 fixer: read_state is lock-free. A writer's atomic rename (note_served from another edge thread, the job's
+        # finish) between its stat and its open swaps the inode; the read is retried, never refused for a valid record.
+        g = str(uuid.uuid4())
+        self.assertEqual(self.send(moveId=MOVE, importGeneration=g), {"ok": True})
+        real, calls, racing_now = export.read_regular_at, [], []
+
+        def racing(dfd, name, st=None, limit=None):
+            if not racing_now:                                # note_served's own read (inside the race) is not counted
+                calls.append(name)
+                if len(calls) == 1:
+                    racing_now.append(True)
+                    export.note_served(self.cfg, time.time())  # temp -> rename over state.json, under the flock
+                    racing_now.clear()
+            return real(dfd, name, st, limit=limit)
+        with mock.patch.object(export, "read_regular_at", side_effect=racing):
+            try:
+                record = export.read_state(self.cfg)
+            except Refused:
+                self.fail("a valid record was refused because a writer renamed it mid-read")
+        self.assertEqual((record["moveId"], record["importGeneration"]), (MOVE, g))
+        self.assertIsNotNone(record["lastServedAt"], "the second read saw the writer's record")
+        self.assertEqual(len(calls), 2, "one stale read, then one retry")
+        # A writer that keeps renaming is bounded: READ_TRIES reads, then the honest refusal.
+        calls.clear()
+
+        def always(dfd, name, st=None, limit=None):
+            calls.append(name)
+            export._write_state(self.cfg, record)             # every write is a new inode (temp -> rename)
+            return real(dfd, name, st, limit=limit)
+        with mock.patch.object(export, "read_regular_at", side_effect=always), self.assertRaises(Refused):
+            export.read_state(self.cfg)
+        self.assertEqual(len(calls), export.READ_TRIES)
 
 
 class EdgeRig(unittest.TestCase):
@@ -447,6 +486,17 @@ class EdgeGet(EdgeRig):
         for client in (self.get("/__ezil/control/export/status?x=1"), self.request("POST", "/__ezil/control/export/head"),
                        self.get("/__ezil/control/export/chunk/0", headers=["Content-Length: 0"])):
             self.assertEqual(client.json(), (404, {"ok": False, "error": "not_found"}))
+
+    def test_unreadable_record_on_post_is_503_never_409(self):
+        # r7 fixer: the POST's view of an unreadable record matches the GETs' (503, retried by the Worker as
+        # export_unreachable and by the app as a retry), never 409 export_busy (final: export_refused, reopen_final).
+        export.ensure_root(self.cfg)
+        with open(os.path.join(self.cfg.stateDir, "export", "state.json"), "w") as f:
+            f.write('{"state":"ready"}')
+        self.assertEqual(self.post(body_for(MOVE, str(uuid.uuid4()))).json(), (503, {"ok": False, "error": "export_state_unreadable"}))
+        self.assertEqual(self.get("/__ezil/control/export/status").json(), (503, {"ok": False, "error": "export_state_unreadable"}))
+        with open(os.path.join(self.cfg.stateDir, "export", "state.json")) as f:
+            self.assertEqual(f.read(), '{"state":"ready"}', "never overwritten")
 
     def test_unreadable_state(self):
         export.ensure_root(self.cfg)

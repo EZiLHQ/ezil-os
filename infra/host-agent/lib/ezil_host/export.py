@@ -174,8 +174,14 @@ def _valid_record(r):
     return r["head"] is None
 
 
+READ_TRIES = 3
+
+
 def read_state(cfg):
-    """The job record, None when this host has none, or Refused('export_state_unreadable')."""
+    """The job record, None when this host has none, or Refused('export_state_unreadable').
+    Lock-free (callers may hold the flock): a writer's atomic rename between the stat and the
+    open swaps the inode, so the read is retried (READ_TRIES) while the name moved under it;
+    a record that is unreadable on its own inode is refused at once (r7 fixer)."""
     try:
         fd = os.open(root(cfg), DIR_FLAGS)
     except FileNotFoundError:
@@ -183,13 +189,16 @@ def read_state(cfg):
     except OSError as e:
         raise Refused("export_state_unreadable") from e
     try:
-        try:
-            st = os.stat(STATE_FILE, dir_fd=fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            raise Refused("export_state_unreadable") from e
-        raw = read_regular_at(fd, STATE_FILE, st, limit=MAX_STATE_BYTES)
+        for _ in range(READ_TRIES):
+            try:
+                st = os.stat(STATE_FILE, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                raise Refused("export_state_unreadable") from e
+            raw = read_regular_at(fd, STATE_FILE, st, limit=MAX_STATE_BYTES)
+            if raw is not None or not _renamed_since(fd, st):
+                break
     finally:
         os.close(fd)
     try:
@@ -199,6 +208,15 @@ def read_state(cfg):
     if not _valid_record(record):
         raise Refused("export_state_unreadable")
     return record
+
+
+def _renamed_since(fd, st):
+    """Whether state.json is now another inode than `st` (a writer's rename landed in between)."""
+    try:
+        now = os.stat(STATE_FILE, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (now.st_ino, now.st_dev) != (st.st_ino, st.st_dev)
 
 
 def _write_state(cfg, record):
@@ -225,13 +243,15 @@ def status(record):
 
 def accept(cfg, move_id, import_generation, now):
     """The agent's half of the POST (lock held by the agent): 'new' (persisted as capturing),
-    'same' (this host's job: resume or report) or 'busy' (another job holds the host, or its
-    record is unreadable and cannot be matched)."""
+    'same' (this host's job: resume or report), 'busy' (a readable record of another
+    {moveId, importGeneration} holds the host) or 'unreadable' (the record cannot be read, so it
+    cannot be matched; never overwritten). r7 fixer: 'unreadable' is not 'busy': the edge's own
+    reads of the same record answer a retryable 503, and so does this POST (never a final 409)."""
     with _locked(cfg):
         try:
             record = read_state(cfg)
         except Refused:
-            return "busy"
+            return "unreadable"
         if record is not None:
             return "same" if (record["moveId"], record["importGeneration"]) == (move_id, import_generation) else "busy"
         _write_state(cfg, {"moveId": move_id, "importGeneration": import_generation, "state": "capturing",

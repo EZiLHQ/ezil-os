@@ -498,6 +498,10 @@ class Edge:
             error = resp.get("error") if isinstance(resp, dict) else None
             if error == "export_busy":
                 _reply(client, 409, {"ok": False, "error": "export_busy"})
+            elif error == "export_state_unreadable":
+                # r7 fixer: the record could not be read (I/O error, invalid record): as the edge's own
+                # read below and its GETs answer it, retryable, never the final 409 export_busy.
+                _reply(client, 503, {"ok": False, "error": "export_state_unreadable"})
             elif error in AGENT_REFUSALS:
                 _reply(client, 409, {"ok": False, "error": "export_invalid"})
             else:

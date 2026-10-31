@@ -275,8 +275,12 @@ class Agent:
         is not that: the export's own desktop stop sets it, and its re-POSTs must report."""
         if self._host_stopping():
             return {"ok": False, "error": "stopping"}
-        if export.accept(self.cfg, move_id, import_generation, now) == "busy":
+        accepted = export.accept(self.cfg, move_id, import_generation, now)
+        if accepted == "busy":
             return {"ok": False, "error": "export_busy"}
+        if accepted == "unreadable":
+            # Not the message's fault and not another move's: the edge answers a retryable 503.
+            return {"ok": False, "error": "export_state_unreadable"}
         self._start_export()
         return {"ok": True}
 
