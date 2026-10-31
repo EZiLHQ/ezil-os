@@ -1,9 +1,8 @@
 import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../native-runtime.js';
 // tabs/troubleshoot.js — EZiL-authored. Not Puter code.
 //
-// A way out when the desktop is stuck: restart the desktop stack inside the
-// container without losing the computer, the container, or its workspace. Per
-// the owner's brief:
+// A way out when the computer is stuck: restart it without losing the
+// computer or its workspace. Per the owner's brief:
 //
 //   - Reachable while the desktop is full-bleed. That is exactly the moment a
 //     user is stuck — `enter_fullpage_mode` hides the taskbar, and Settings'
@@ -17,29 +16,37 @@ import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../n
 //   - Confirm before acting, and say what it does and does not destroy.
 //   - Feature-detect the restart route and degrade honestly if it is absent.
 //
+// ── "Restart desktop" is gone (2026-10-30, app-code lane A2) ────────────────
+// This tab used to offer TWO restarts. "Restart desktop" posted
+// `scope: 'desktop'` (`session.restartDesktop`), which runs
+// `systemctl restart ezil-desktop.service` on the computer: Neko and
+// code-server restart, files stay, terminals and runtime state are lost. Users
+// read it as "refresh the page", which it never was, and it sat next to the
+// real recovery action with a near-identical name. Only "Restart computer" is
+// offered now. Deliberately KEPT, because other code still relies on them:
+// `/api/shell/restart` (Restart computer posts `scope: 'computer'` to it),
+// `session.restartDesktop` (unused here; `session.js` is not this lane's), and
+// the `ezil:desktop-restarted` listeners in the Code and Browser windows.
+// Merged with Round 6 Phase B (2026-10-31): `restartMoveReason` and its
+// `MOVE_COPY` import are kept too, exported with no caller in this tab: they
+// word the move flags `session.restartDesktop` passes through (see the
+// function's own comment for why Restart computer never meets them).
+//
 // 🔴 FEATURE-DETECTED, not assumed. The chain behind this button is three
 // independently-deployed pieces: `SHELL_API_ROUTES.restart` ->
-// `app/src/app/api/shell/restart/route.ts` -> the Worker's
-// `POST /sandbox/:name/restart`. This tab checks only the FIRST link, because
-// that is the only one it can see, and `render()`'s `! supported` branch draws
-// a disabled button with the honest reason INSTEAD OF throwing or guessing a
-// URL. The check reads the live boot payload every render, not a value cached
-// at import time, so a deployment that has the key picks the control up with
-// no code change here and one that does not degrades quietly.
+// `app/src/app/api/shell/restart/route.ts` -> the Worker. This tab checks only
+// the FIRST link, because that is the only one it can see, and `render()`'s
+// `! supported` branch draws a disabled button with the honest reason INSTEAD
+// OF throwing or guessing a URL. The check reads the live boot payload every
+// render, not a value cached at import time, so a deployment that has the key
+// picks the control up with no code change here and one that does not
+// degrades quietly.
 //
-// 🔴 WHAT IT ACTUALLY DOES, stated where the copy is written. The Worker
-// SIGTERMs the desktop launcher inside the ALREADY-RUNNING container (reusing
-// `start-neko.sh`'s own `terminate_stack` trap) and boots the stack again in
-// place. The container is not recreated, so files written to the container's
-// own disk survive too — but nothing in this shell can verify that, so the
-// copy below promises only what the design guarantees: the workspace in
-// storage and the computer row.
-//
-// 🔴 HONESTY CONTRACT. A restart is reported "restarted" ONLY on a 2xx with
-// `data.ok === true` (`session.restartDesktop`'s own contract). Everything
-// else — including "the request never landed" — renders as `failed`, with
-// the real reason, mirroring the rule `session.openDesktop`/`boot-phases.js`
-// already hold the rest of this shell to.
+// 🔴 HONESTY CONTRACT. A restart is reported "restarted" ONLY when the
+// server's own transition (`computer.progress`) says `done`. Everything else —
+// including "the request never landed" — renders as `failed`, with the real
+// reason, mirroring the rule `session.openDesktop`/`boot-phases.js` already
+// hold the rest of this shell to.
 //
 // ── SECOND CONTROL: the diagnostic log ──────────────────────────────────────
 // `shell/ezil/log.js` has kept a 200-entry ring of every `debug`/`info`/
@@ -68,14 +75,14 @@ import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../n
 // It is included because the console ring alone would tell half the story:
 // exactly one module writes to `log.js` today, while ~30 call sites across
 // this shell report through `telemetry.capture()`.
-import UIAlert from '../../../../src/UI/UIAlert.js';
+import { openConfirmSheet } from '../sheet-frame.js';
 import log from '../../../log.js';
 import session from '../../../session.js';
 import trpc from '../trpc.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
 import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
-import { TRANSITION_EVENT } from '../../computer-progress.js';
+import { MOVE_COPY, TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -83,13 +90,6 @@ const TROUBLESHOOT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentC
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
     + '<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>'
     + '<circle cx="12" cy="12" r="4"/></svg>';
-
-/** Same construction/reasoning as `tabs/computers.js`'s `ALERT_WARNING_ICON`
- * — neither `UIAlert` icon key this fork kept resolves without one. */
-const ALERT_WARNING_ICON = 'data:image/svg+xml,' + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e0a030" stroke-width="2">'
-    + '<path d="M12 3 2 20h20L12 3Z" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke-linecap="round"/></svg>',
-);
 
 const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
 
@@ -110,8 +110,6 @@ function openDesktopComputerId () {
 // A fresh Settings window re-runs `init` from scratch (single_instance means
 // there is only ever one) — see `tabs/computers.js`'s header for why module
 // state is safe under that lifetime.
-let status = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
-let failReason = '';
 // Round 3 (plan §6.6): "Restart computer" — a confirmed stop, then a start on the
 // same configuration, tracked as a server transition (`computer.progress`).
 let computerStatus = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
@@ -213,9 +211,11 @@ async function copyToClipboard (text) {
 /**
  * Two families of code arrive here and both must read as an honest sentence.
  *
- *   - Transport verdicts `session.restartDesktop()` produces itself:
- *     `unsupported` / `timeout` / `fetch_failed` / `unauthorized` /
- *     `bad_request` / `unknown`.
+ *   - Transport verdicts: `fetch_failed` / `unauthorized` / `unknown` from
+ *     Restart computer's own request below, and `unsupported` / `timeout` /
+ *     `bad_request`, which `session.restartDesktop()` (no caller left in this
+ *     tab — see the header) still produces and are kept so the copy stays
+ *     honest for any future caller.
  *   - The Worker's own `RestartReport.outcome`, passed through verbatim by
  *     `app/src/server/api/routers/cloudflare-guacamole.ts`'s `restartDesktop`
  *     as `errorCode` (see `worker/src/sandbox-control.ts`'s
@@ -257,35 +257,33 @@ export function reasonCopy (errorCode) {
     }
 }
 
+/**
+ * Phase B (§5.3, §6.4; r7 fixer): the restart route's `scope: 'desktop'` answer during a move comes from the reverse
+ * provider, which restarts nothing and answers the move itself (`computeMoving`, or the open-blocked
+ * `computeMoveNeedsAttention`), and `session.restartDesktop` passes both flags through. That is no failure of the
+ * restart: these are the move's own words (§6.4's status line, or the open-blocked sentence), and such an answer is no
+ * `api_failure`. Null otherwise.
+ *
+ * Merged with app-code lane A2 (2026-10-31): its caller in this tab, Restart desktop's handler, is gone (see the
+ * header), so nothing here calls it. Restart computer never meets these flags: `computer.restartComputer` ->
+ * `restartWholeComputer` reads the placement directly and, during a move, answers `busy` or `not_running` (an export
+ * boot never reaches RUNNING; contract §6.4), and the route forwards only `restart_<reason>`
+ * (`app/src/app/api/shell/restart/route.ts`), which `reasonCopy` already words. Kept, exported and pinned
+ * (`troubleshoot-test.mjs`) for the kept `session.restartDesktop` answer shape.
+ */
+export function restartMoveReason (res) {
+    if ( res?.computeMoveNeedsAttention === true ) return MOVE_COPY.blockedBody;
+    if ( res?.computeMoving === true ) return `${MOVE_COPY.moving}.`;
+    return null;
+}
+
 function render ($win) {
     const $body = $win.find('[data-role="troubleshoot-body"]');
     if ( $body.length === 0 ) return; // pane not mounted (wrong tab active) — nothing to draw yet
 
-    const computerId = openDesktopComputerId();
     const supported = session.restartEndpoint() !== null;
-
-    let statusHtml = '';
-    if ( status === 'restarting' ) {
-        // ~45s, not ~22s: the Worker waits up to 20s for the old stack to
-        // confirm it is gone (`RESTART_STOP_DEADLINE_MS`) BEFORE it starts the
-        // ~22s boot. Quoting only the boot half would make a normal restart
-        // look overdue while it is still going fine.
-        statusHtml = '<p class="ezil-settings-muted">Restarting… this usually takes about 45 seconds and can take up to 3 minutes.</p>';
-    } else if ( status === 'restarted' ) {
-        statusHtml = '<p class="ezil-settings-muted">Restart requested. Give it a few seconds, then reopen the '
-            + 'desktop from the taskbar or Start menu if it does not reconnect on its own.</p>';
-    } else if ( status === 'failed' ) {
-        statusHtml = `<p class="ezil-settings-error">${html_encode(failReason)}</p>`;
-    } else if ( ! supported ) {
-        statusHtml = '<p class="ezil-settings-muted">Not available in this deployment yet.</p>';
-    } else if ( ! computerId ) {
-        statusHtml = '<p class="ezil-settings-muted">Open a desktop first, then come back here.</p>';
-    }
-
-    const disabled = status === 'restarting' || computerStatus === 'restarting' || ! supported || ! computerId;
-    const label = status === 'restarting' ? 'Restarting…' : 'Restart desktop';
-    const machineId = session.currentComputer()?.id ?? computerId;
-    const computerDisabled = computerStatus === 'restarting' || status === 'restarting' || ! supported || ! machineId;
+    const machineId = session.currentComputer()?.id ?? openDesktopComputerId();
+    const computerDisabled = computerStatus === 'restarting' || ! supported || ! machineId;
     let computerHtml = '';
     if ( computerStatus === 'restarting' ) {
         computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Restarting your computer… this usually takes 1–4 minutes. Your files stay.</p>';
@@ -293,6 +291,12 @@ function render ($win) {
         computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Your computer restarted. Open the desktop to continue.</p>';
     } else if ( computerStatus === 'failed' ) {
         computerHtml = `<p class="ezil-settings-error" data-role="restart-computer-status">${html_encode(computerReason)}</p>`;
+    } else if ( ! supported ) {
+        // The honest "route not shipped" state the removed Restart desktop
+        // control used to carry for both restarts; it now belongs here.
+        computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Not available in this deployment yet.</p>';
+    } else if ( ! machineId ) {
+        computerHtml = '<p class="ezil-settings-muted" data-role="restart-computer-status">Open a desktop first, then come back here.</p>';
     }
 
     // ── the diagnostic-log section ───────────────────────────────────────
@@ -317,13 +321,9 @@ function render ($win) {
 
     $body.html(`
         <p class="ezil-settings-lead">
-            ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If the desktop is frozen or not responding, restart it. Your files are not touched
-            by either restart, and the computer itself is not deleted.`}
+            ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If your computer is frozen or not responding, restart it. Your files are not touched
+            by a restart, and the computer itself is not deleted.`}
         </p>
-        ${isNative() ? '' : '<h3>Restart desktop</h3><p class="ezil-settings-muted">Restarts the desktop and its apps on this machine. Files stay. About 20 seconds.</p>'}
-        <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
-            ${isNative() ? 'hidden' : ''} ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
-        ${statusHtml}
         ${isNative() ? '' : `<h3>Restart computer</h3><p class="ezil-settings-muted">Stops your computer and starts it again. Files stay. 1–4 minutes.</p>
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart-computer" ${computerDisabled ? 'disabled' : ''}>${computerStatus === 'restarting' ? 'Restarting…' : 'Restart computer'}</button>
         ${computerHtml}`}
@@ -350,71 +350,26 @@ function render ($win) {
     `);
 }
 
-async function confirmRestart () {
-    const value = await UIAlert({
-        message: '<strong>Restart this desktop?</strong>'
-            + '<p>The desktop will shut down and start again inside the same container. Anything '
-            + 'unsaved in an open application inside it will be lost. Your workspace in storage, and the '
-            + 'computer itself, are not touched.</p>',
-        type: 'warning',
-        body_icon: ALERT_WARNING_ICON,
-        buttons: [
-            { label: 'Restart', value: 'confirm', type: 'danger' },
-            { label: 'Cancel', value: 'cancel', type: 'secondary' },
+/** The window body the confirm sheet belongs to (it closes with the window). */
+const sheetContainer = $win => $win?.find?.('.window-body')?.get?.(0) ?? $win?.get?.(0) ?? document.body;
+
+/**
+ * Round 5 (D6): Restart computer confirms through the same dark sheet frame as
+ * Switch and Stop (`openConfirmSheet`), never the legacy alert dialog. `begin`
+ * runs from the sheet's primary, so the pane shows Restarting… the moment the
+ * user confirms; the restart itself runs after the sheet closes. Resolves true
+ * only when `begin` took the restart.
+ */
+async function confirmRestartComputer ($win, begin) {
+    let took = false;
+    await openConfirmSheet({ container: sheetContainer($win), sheet: 'confirm-restart-computer', title: 'Restart your computer?',
+        lines: [
+            'Your computer stops and starts again on the same configuration. Open apps close; save your work first.',
+            'Your files stay.',
+            'This usually takes 1-4 minutes.',
         ],
-    });
-    return value === 'confirm';
-}
-
-async function handleRestart ($win) {
-    if ( status === 'restarting' || computerStatus === 'restarting' ) return;
-    const computerId = openDesktopComputerId();
-    if ( ! computerId ) return;
-
-    const confirmed = await confirmRestart();
-    if ( ! confirmed || status === 'restarting' ) return;
-
-    status = 'restarting';
-    render($win);
-
-    const res = await session.restartDesktop(computerId);
-
-    if ( res.ok ) {
-        status = 'restarted';
-        // The AWS route now waits for the new runtime (including code-server's startup gate).
-        // Notify once, only after completion; a queue acknowledgment alone is not readiness.
-        window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } }));
-    } else {
-        status = 'failed';
-        failReason = reasonCopy(res.errorCode);
-        console.error(`[${PHASE}] restart failed: ${res.errorCode}`);
-        // `unsupported` is a feature-detection result, not an operational
-        // failure — nothing went wrong, the route just is not there yet, so
-        // it is not worth a telemetry row (see `session.restartEndpoint()`'s
-        // header). Everything else is a real `api_failure`, same convention
-        // `code.js`/`preview.js`/`desktop-window.js` use for their own mints.
-        if ( res.errorCode !== 'unsupported' ) {
-            telemetry.capture({
-                eventClass: 'api_failure', site: 'ezil-os:settings/troubleshoot#restart', code: res.errorCode,
-            });
-        }
-    }
-    render($win);
-}
-
-async function confirmRestartComputer () {
-    const value = await UIAlert({
-        message: '<strong>Restart your computer?</strong>'
-            + '<p>Your computer stops and starts again on the same configuration. Open apps close and '
-            + 'anything unsaved in them is lost. Your files stay. This takes 1–4 minutes.</p>',
-        type: 'warning',
-        body_icon: ALERT_WARNING_ICON,
-        buttons: [
-            { label: 'Restart computer', value: 'confirm', type: 'danger' },
-            { label: 'Cancel', value: 'cancel', type: 'secondary' },
-        ],
-    });
-    return value === 'confirm';
+        confirmLabel: 'Restart computer', busyLabel: 'Restarting…', onConfirm: () => { took = begin(); } });
+    return took;
 }
 
 function restartRequestId (computerId) {
@@ -454,15 +409,19 @@ function watchComputerRestart ($win, computerId) {
 }
 
 async function handleRestartComputer ($win) {
-    if ( computerStatus === 'restarting' || status === 'restarting' ) return;
+    if ( computerStatus === 'restarting' ) return;
     const computerId = session.currentComputer()?.id ?? openDesktopComputerId();
     const url = session.restartEndpoint();
     if ( ! computerId || ! url ) return;
-    if ( ! await confirmRestartComputer() || computerStatus === 'restarting' ) return;
-    computerStatus = 'restarting';
-    computerReason = '';
-    computerTransition = null;
-    render($win);
+    const confirmed = await confirmRestartComputer($win, () => {
+        if ( computerStatus === 'restarting' ) return false;
+        computerStatus = 'restarting';
+        computerReason = '';
+        computerTransition = null;
+        render($win);
+        return true;
+    });
+    if ( ! confirmed ) return;
     let answer = null;
     try {
         const res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
@@ -553,7 +512,6 @@ async function loadReports ($win) {
 
 function bind ($win) {
     $win.find('[data-role="troubleshoot-body"]')
-        .on('click', '[data-action="restart"]', () => { void handleRestart($win); })
         .on('click', '[data-action="restart-computer"]', () => { void handleRestartComputer($win); })
         .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); })
         .on('click', '[data-action="report-problem"]', function () {
@@ -582,8 +540,6 @@ export default {
     },
 
     init ($win) {
-        status = 'idle';
-        failReason = '';
         computerStatus = 'idle';
         computerReason = '';
         computerTransition = null;

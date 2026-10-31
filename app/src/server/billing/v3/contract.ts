@@ -16,6 +16,12 @@
  * - D5 one computer, selectable configuration: `SwitchConfiguration*` below.
  * - Opening progress: `OpeningProgressV3` (server start time, path, milestones).
  *
+ * Round 5 pins (W0, 2026-10-29; additive, defaults change no behaviour):
+ * - D1 AI enrollment: `ai.enrollment`, `ai.waiting`, `actions.ezilId`.
+ * - D3 storage: `PlanOfferV3.storageGiB` / `PublicOfferV3.storageGiB` (plan storage),
+ *   `MachineOptionV3.diskGiB` (null until a grow path exists), `computer.disk.growsOnSwitch`.
+ * - D2 switch heal: reason codes `SWITCH_HEAL_REASONS_V3` (reasons only; `SwitchPhaseV3` unchanged).
+ *
  * v2 (Standard/Compute, overage, std-hour meters) stays in the codebase,
  * dormant: already-sold v2 subscriptions keep their v2 terms, new checkouts
  * sell v3 only. See docs/billing/CONTRACT-v3.md.
@@ -97,6 +103,11 @@ export interface PlanOfferV3 {
     aiCredits: AiCreditGrantV3;
     /** "Everything in X, plus:" bullets, plain language, 3–4 max. */
     bullets: readonly string[];
+    /**
+     * Round 5 D3 (additive): the plan's disk for a new computer in GiB (Standard 50, Premium 100);
+     * null = no GB figure is shown (Free).
+     */
+    storageGiB: number | null;
 }
 
 const H = 3600;
@@ -110,6 +121,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
         highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
         bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
+        storageGiB: null,
     },
     standard_monthly_v3: {
         sku: 'standard_monthly_v3', tier: 'standard', name: 'Standard', tagline: 'For regular work, every day.',
@@ -118,16 +130,18 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
-        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', 'No session time limit'],
+        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'No session time limit'],
+        storageGiB: 50,
     },
     premium_monthly_v3: {
-        sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For heavy builds and long sessions.',
+        sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For bigger projects and long sessions.',
         priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', 'No session time limit', 'Bigger computers use your monthly time faster'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'No session time limit', 'Bigger sizes count more of your monthly time'],
+        storageGiB: 100,
     },
 });
 
@@ -232,6 +246,38 @@ export interface ComputerMoveV3 {
     bytesTotal: string | null;
 }
 
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1): the AWS → Cloudflare move of a held Free user's files, on the
+ * additive key `summary.computer.reverseMove` (never `computer.move`, which an old cached shell renders with a
+ * [Try again] that opens the computer). Also `computer.move.start`'s answer (§5.9), from the same pure builder.
+ */
+export interface ComputerReverseMoveV3 {
+    direction: 'to_cloudflare';
+    /** `REVERSE_MOVE_DTO_STAGE[state]`: saving, copying, checking, flipping, or the terminal state itself. */
+    stage: 'saving' | 'copying' | 'checking' | 'flipping' | 'committed' | 'failed_reopened' | 'failed_needs_operator' | string;
+    /** Decimal: the import's bytes, '0' before copying. */
+    bytesDone: string;
+    /** Decimal: the export head's bytes once known. */
+    bytesTotal: string | null;
+    /** `failed_*` only: the row's code from the closed list (§5.5); null in flight and once committed. */
+    reason: string | null;
+    /** The export head's skipped count; null before the head. */
+    skipped: number | null;
+    /** ISO; committed only (the AWS disk is kept until then). */
+    retainUntil: string | null;
+    /** `failed_*` only, from the §5.5 class: Try again now, only after an AWS session, or never (null otherwise). */
+    retry: 'now' | 'after_aws_session' | 'no' | null;
+    /** `failed_needs_operator` whose commit may have been sent, or whose code blocks Open (§5.3). */
+    openBlocked: boolean;
+    /** The D16 hold can open this AWS computer (its size meters as the hold size); null once it is not an AWS computer. */
+    holdOpenable: boolean | null;
+}
+
+/** `computer.move.start` / `computer.move.retry` refusals (§5.9), in check order. Values, never thrown. */
+export type ComputerMoveRefusalV3 = 'move_unsupported' | 'move_in_progress' | 'move_not_held' | 'move_paused' | 'move_busy'
+    | 'move_unavailable' | 'move_computer_running' | 'move_computer_unsettled';
+export type ComputerMoveStartOutputV3 = { ok: true; move: ComputerReverseMoveV3 } | { ok: false; reason: ComputerMoveRefusalV3 };
+
 export interface BillingSummaryV3 {
     enabled: true;
     version: 3;
@@ -266,7 +312,11 @@ export interface BillingSummaryV3 {
          * Round 3 (L1, additive): the computer's data disk. `provisionedGiB` is the AWS data volume
          * (same on every configuration; null on Free/Cloudflare); `usedBytes` only when measured.
          */
-        disk?: { provisionedGiB: number | null; usedBytes: string | null };
+        disk?: {
+            provisionedGiB: number | null; usedBytes: string | null;
+            /** Round 5 D3 (additive): true once a configuration switch can grow the disk (Phase B infra); false until then. */
+            growsOnSwitch: boolean;
+        };
         /** Round 4 (additive): what the computer can do under the plan now (see `ComputeStandingV3`). */
         standing?: ComputeStandingV3;
         /** Round 4 (additive): where the files are, from the user's placement (any live aws-ec2 row → 'aws'). */
@@ -275,6 +325,22 @@ export interface BillingSummaryV3 {
         heldSince?: string | null;
         /** Round 4 (additive): always null until Phase B moves files (D20/D21). */
         move?: ComputerMoveV3 | null;
+        /**
+         * Round 6 (additive; R4-02): the user's AWS computer as placed now (its instance type), whatever `size`
+         * says: under the D16 hold only a 2 vCPU one opens (it is never resized), so a 4 or 8 vCPU one stays
+         * closed. null when there is no AWS computer, its type is unreadable or unlisted, or the user's AWS
+         * computers differ.
+         */
+        awsSize?: { size: SizeCode; vcpu: number; memoryGiB: number } | null;
+        /**
+         * Phase B (additive, §6.1): the move computer's newest reverse row, while it holds or for 24 h (DB clock) after it
+         * ended; a `failed_needs_operator` row always. Absent or null: none, or this database has no reverse moves.
+         */
+        reverseMove?: ComputerReverseMoveV3 | null;
+        /** Phase B (§6.1): the next open of this held computer starts the move (the pre-move card's copy). */
+        moveOnOpen?: boolean;
+        /** Phase B (§6.1): a Move action can work here; without it no move action is shown. */
+        moveAvailable?: boolean;
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {
@@ -297,12 +363,31 @@ export interface BillingSummaryV3 {
         purchased?: { remaining: number; expiresAt: string } | null;
         /** The Free starter grant still live; null when none or unknown. */
         starter?: { remaining: number } | null;
+        /**
+         * Round 6 (additive; R1-10/R4-05): credits still live from an EARLIER paid period or plan (on Free after
+         * a cancel, or a paid period's 3-day tail); they are kept until they expire. `expiresAt` = the earliest
+         * expiry. null when none or unknown.
+         */
+        previous?: { remaining: number; expiresAt: string } | null;
         /** The plan's period amount the next renewal adds when this period has no grant of it yet (e.g. right after an upgrade). */
         pendingFromRenewal?: { credits: number; at: string } | null;
+        /**
+         * Round 5 D1 (additive). Whether this account can receive AI credits on the Gateway:
+         * `enrolled` = it has a Gateway member; `activating` = an EZiL ID is linked and enrollment is
+         * pending; `needs_ezil_id` = no EZiL ID on this account (sign in with EZiL ID, same email).
+         * Computed by the server, never from the Gateway status. Default `enrolled`.
+         */
+        enrollment: 'enrolled' | 'activating' | 'needs_ezil_id';
+        /** Round 5 D1 (additive): whole credits granted but parked until enrollment; null when none. */
+        waiting: { credits: number } | null;
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
-    actions: { checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean };
+    actions: {
+        checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean;
+        /** Round 5 D1 (additive): the EZiL ID sign-in link for the `needs_ezil_id` CTA; null otherwise. */
+        ezilId: string | null;
+    };
     catalog: {
         version: typeof CATALOG_V3_VERSION;
         offers: PublicOfferV3[];
@@ -323,7 +408,11 @@ export interface PublicOfferV3 {
     /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
     sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
-    /** Shown in the FAQ only: "Fair use: about N hours a month". */
+    /**
+     * Shown in the FAQ only: "Fair use: about N hours a month". Round 6 (R1-06): in billing.summary the Free
+     * offer carries the hours the viewer's account gets on Free (8 for accounts created before
+     * FREE_V2_EFFECTIVE_AT); `publicOffers()` without a viewer keeps the catalog's figure.
+     */
     fairUseHours: number;
     highlighted: boolean;
     badge: 'Most popular' | null;
@@ -331,6 +420,8 @@ export interface PublicOfferV3 {
     machineChoice: readonly SizeCode[];
     aiCredits: AiCreditGrantV3;
     bullets: readonly string[];
+    /** Round 5 D3 (additive): the plan's disk in GiB (Free null, Standard 50, Premium 100). */
+    storageGiB: number | null;
 }
 
 /** Router (v3): summary, createCheckout({sku: SellableSkuV3}), previewUpgrade/confirmUpgrade({toSku:'premium_monthly_v3'}),
@@ -350,6 +441,11 @@ export interface MachineOptionV3 {
     /** Standard-seconds used per running second (1, 2 or 4). */
     weight: number;
     arch: 'x86_64';
+    /**
+     * Round 5 D3 (additive): the disk this configuration gets, in GiB. null = no per-configuration
+     * figure (every configuration keeps the computer's disk until a grow path exists, Phase B).
+     */
+    diskGiB: number | null;
 }
 
 /** `billing.selectMachine` input. Refused unless `size` is in the plan's `machineChoice`. */
@@ -392,6 +488,16 @@ export type SwitchConfigurationOutputV3 =
     | { ok: false; reason: SwitchRefusalV3 };
 
 export type SwitchPhaseV3 = 'requested' | 'stopping' | 'waking' | 'done' | 'failed';
+
+/**
+ * Round 5 D2 (additive): transition REASON codes for the pool-release heal; no new phase.
+ * - `stop_healing`: in flight, phase stays `stopping` while the release heal is pending.
+ * - `release_heal_failed` / `release_heal_timeout` (the existing stop bound): phase `failed`,
+ *   non-retryable, needs attention. The preference is never reverted during a heal.
+ * Other reasons stay free-form codes (`/^[a-z0-9_:]{1,64}$/`, stored transition schema).
+ */
+export const SWITCH_HEAL_REASONS_V3 = ['stop_healing', 'release_heal_failed', 'release_heal_timeout'] as const;
+export type SwitchHealReasonV3 = typeof SWITCH_HEAL_REASONS_V3[number];
 
 // ── Opening progress (round 3, plan §8 W0.2(e)) ──────────────────────────────
 

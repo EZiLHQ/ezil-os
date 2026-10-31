@@ -228,6 +228,13 @@ for ( const app of APPS ) {
     }
 }
 
+try {
+    await testDesktopOneSurface();
+} catch ( err ) {
+    anyHardFailure = true;
+    push('[desktop] one-surface harness threw without completing', false, String(err?.stack ?? err));
+}
+
 await browser.close();
 
 const failed = checks.filter((c) => ! c.pass);
@@ -508,5 +515,78 @@ async function testApp (app) {
 
     push(`${L} no uncaught page errors during this app's run`, page_errors.length === 0, JSON.stringify(page_errors));
 
+    await page.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Round 5 (D5): the Desktop window paints ONE opening surface for the whole
+// open. Round 3 swapped `AppSpinner` for the `BootProgress` phase panel at 4 s;
+// that swap is retired. The desktop request is held open so the open is
+// GENUINELY still pending at 0.5 s, 3 s and 5.5 s, and at each sample the real
+// paint engine must report the same single surface on top (hit-test), with the
+// same title and no timer-estimated phase label.
+// ═══════════════════════════════════════════════════════════════════════════
+async function testDesktopOneSurface () {
+    const L = '[desktop]';
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const page_errors = [];
+    page.on('pageerror', (e) => page_errors.push(String(e)));
+    let release;
+    const held = new Promise((r) => { release = r; });
+    await page.route('**/*', async (route) => {
+        const req = route.request();
+        const url = req.url();
+        try {
+            if ( url === `${HOST}/os` ) return await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+            if ( url.includes(ENDPOINTS.desktop) && req.method() === 'POST' ) {
+                await held; // the open stays pending for the whole scenario
+                return await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, errorCode: 'timeout' }) });
+            }
+            if ( url.includes(ENDPOINTS.desktop) ) return await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, guacamoleRunning: false }) });
+            if ( url.includes('/api/') ) return await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+            if ( new URL(url).hostname === HOST_HOSTNAME ) return await route.fulfill({ status: 404, body: '' });
+            return await route.continue();
+        } catch { /* the page closed with the request still held */ }
+    });
+    await page.goto(`${HOST}/os`, { waitUntil: 'load' });
+    await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
+    await page.addScriptTag({ content: icons });
+    await page.addScriptTag({ content: bundle });
+    await page.evaluate(() => { window.ezil.boot(); });
+    for ( let i = 0; i < 150 && ! (await page.evaluate(() => !! document.querySelector('.desktop'))); i++ ) await sleep(40);
+    const t0 = Date.now();
+    await page.evaluate(({ payload, computer, desktopState }) => {
+        window.ezil.registry.launch('desktop', { payload, computer, desktopState });
+    }, { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+
+    const sample = () => page.evaluate(() => {
+        const win = document.querySelector('.window[data-app="desktop"]');
+        if ( ! win ) return null;
+        const shown = (el) => ! el.hidden && getComputedStyle(el).display !== 'none' && el.getBoundingClientRect().width > 0;
+        const loaders = [...new Set(win.querySelectorAll('.ezil-app-spinner, .ezil-boot'))];
+        const visible = loaders.filter(shown);
+        const first = visible[0];
+        if ( first && ! win.querySelector('[data-overlay-probe]') ) first.dataset.overlayProbe = 'first';
+        const r = win.querySelector('.window-body').getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return { loaders: loaders.length, visible: visible.length, probe: first?.dataset.overlayProbe ?? null,
+            hitInSurface: !! (first && hit && first.contains(hit)), kind: first?.dataset.kind ?? null,
+            title: first?.querySelector('h1')?.textContent ?? '', text: first?.innerText ?? '' };
+    });
+    const results = [];
+    for ( const at of [500, 3_000, 5_500] ) {
+        const wait = at - (Date.now() - t0);
+        if ( wait > 0 ) await sleep(wait);
+        results.push([at, await sample()]);
+    }
+    for ( const [at, s] of results ) {
+        push(`🔴 ${L} at ${at} ms: exactly ONE loading surface exists and is painted`, s && s.loaders === 1 && s.visible === 1, JSON.stringify(s));
+        push(`🔴 ${L} at ${at} ms: it is the SAME surface as at first paint (no swap)`, s?.probe === 'first', String(s?.probe));
+        push(`${L} at ${at} ms: it is on top at the window centre and still opening`, s?.hitInSurface === true && s?.kind === 'progress', JSON.stringify({ hit: s?.hitInSurface, kind: s?.kind }));
+        push(`${L} at ${at} ms: the title names the app; no timer-estimated phase label`, /^Opening /.test(s?.title ?? '')
+            && ! /Getting your workspace|Loading your files|Starting your apps|Opening the window/.test(s?.text ?? ''), `${s?.title} | ${s?.text}`);
+    }
+    release();
+    push(`${L} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
     await page.close();
 }

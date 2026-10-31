@@ -225,6 +225,7 @@ jobs:
                    shell/ezil/native-test.mjs \
                    shell/ezil/native-persistence-test.mjs \
                    shell/ezil/app-link-test.mjs \
+                   shell/ezil/app-history-test.mjs \
                    shell/ezil/ui/Settings/usage-test.mjs \
                    shell/ezil/ui/Settings/billing-sheets-test.mjs \
                    shell/ezil/ui/Settings/billing-test.mjs \
@@ -240,6 +241,7 @@ jobs:
                    shell/ezil/runtime-recheck-test.mjs \
                    shell/ezil/session-failure-diagnostics-test.mjs \
                    shell/ezil/ui/frame-controls-bridge-test.mjs \
+                   shell/ezil/ui/full-view-test.mjs \
                    shell/ezil/ui/feedback/capture-test.mjs \
                    shell/ezil/ui/feedback/feedback-test.mjs; do
             echo "── $t"
@@ -267,6 +269,7 @@ jobs:
                    shell/ezil/ui/Settings/late-focus-browser-test.mjs \
                    shell/ezil/ui/opening-progress-browser-test.mjs \
                    shell/ezil/ui/Settings/appearance-browser-test.mjs \
+                   shell/ezil/ui/Settings/billing-layout-browser-test.mjs \
                    shell/ezil/ui/feedback-browser-test.mjs; do
             echo "── $t"
             node "$t"
@@ -282,7 +285,8 @@ jobs:
                    shell/phone-stacking-browser-test.mjs \
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
                    shell/ezil/display-notice-browser-test.mjs \
-                   shell/ezil/apps/resize-test.mjs; do
+                   shell/ezil/apps/resize-test.mjs \
+                   shell/ezil/apps/code-full-view-browser-test.mjs; do
             echo "── $t"
             node "$t"
           done
@@ -651,7 +655,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs e2e/billing-staging-journey.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate

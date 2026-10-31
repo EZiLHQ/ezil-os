@@ -364,6 +364,44 @@ await window.$(win4).close();
 await settle(4);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5b. 🔴 ROUND 6a (seam C wiring), through the BUILT bundle. The Preview
+//     window hands its spinner `isPreparing: () => session.isComputePreparing(
+//     computer.id)` (preview.js). Without that one line a Preview opened while
+//     the computer's desktop takes its config reads "Connecting to Preview…"
+//     over the whole bounded wait instead of saying what it is waiting for.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const originalFetch = window.fetch;
+    let mintAsks = 0;
+    const RUNNING = { version: 2, computerId: COMPUTER.id, operation: 'none', stage: 'running', recordedStage: 'running', active: false,
+        durable: false, openingStartedAt: null, path: null, milestones: [], expectedSeconds: 30 };
+    window.fetch = async (url, opts) => {
+        const u = String(url);
+        if ( u.includes('/api/trpc/computer.progress') ) {
+            return { ok: true, status: 200, json: async () => ({ result: { data: { json: RUNNING } } }) };
+        }
+        if ( u.startsWith(ENDPOINTS.previewUrl) ) {
+            mintAsks++;
+            return { ok: true, status: 200, json: async () => ({ ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
+                provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computePreparing: true }) };
+        }
+        return originalFetch(url, opts);
+    };
+    const PREPARING = 'Preparing Preview — the first open after your computer starts takes a minute or two.';
+    await ezil.registry.launch('preview', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    const w = q('.window[data-app="preview"]');
+    const spinner = w?.querySelector('.ezil-app-spinner');
+    const status = () => spinner?.querySelector('.ezil-opening-status')?.textContent ?? '';
+    for ( let t = 0; t < 8000 && ! (mintAsks >= 1 && status() === PREPARING); t += 50 ) await waitMs(50);
+    push('🔴 seam C wiring: Preview opened while its computer prepares shows the preparing wait, never "Connecting to Preview…"',
+        mintAsks >= 1 && status() === PREPARING && ! /Connecting to Preview|under a minute/.test(spinner?.textContent ?? ''),
+        `${mintAsks} ask(s): "${status()}"`);
+    await window.$(w).close();
+    await settle(4);
+    window.fetch = originalFetch;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. THE FOCUS CONTROL — transport, enum, and the tray geometry.
 // ═══════════════════════════════════════════════════════════════════════════
 const dctx = { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState };

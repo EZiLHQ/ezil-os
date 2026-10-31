@@ -1,12 +1,44 @@
 /* feedback.css — EZiL-authored. The in-app icon is above every app window
  * (phone/tablet windows are `9999999 !important`, style.css) and below context
- * menus, the upgrade sheet and the dialog's top layer. */
+ * menus, the upgrade sheet and the dialog's top layer.
+ * Round 5 (D6): dark by default like the rest of the shell, the user's accent on
+ * the primary, colours only through tokens (ezil-tokens.css). The light values
+ * apply only where a page opts in with data-theme="light". */
 /* Founder, 2026-10-29: no Feedback on the home screen (`mount_feedback_chip`
  * hides this while no app window is open). In an app it is a very small,
  * low-emphasis icon: a 16px glyph on a 20px disc, top right, level with the
  * 30px window head (whose controls sit on the left). The button is the hit
  * target: 24px on a fine pointer, 44px under `pointer: coarse` (the same query
  * the drawer and the control strip use). */
+.ezil-feedback-chip,
+.ezil-feedback-dialog {
+    --fb-bg: var(--color-charcoal, #161616);
+    --fb-surface: var(--color-charcoal-light, #1f1f1f);
+    --fb-text: var(--color-offwhite, #f5f5f4);
+    --fb-muted: #a7aeb6;
+    --fb-border: rgb(255 255 255 / 0.14);
+    --fb-field: rgb(255 255 255 / 0.04);
+    --fb-accent: var(--ezil-accent, #00adb5);
+    --fb-accent-ink: var(--ezil-accent-contrast, #04060c);
+    --fb-warn: #f5c46b;
+    --fb-warn-bg: rgb(245 165 36 / 0.14);
+    /* The icon sits over arbitrary app content in either theme: a white glyph on
+     * dark glass with a white hairline, like the drawer, so it is not themed. */
+    --fb-icon-ink: #fff;
+    --fb-icon-glass: rgb(24 24 28 / 0.62);
+    --fb-icon-hairline: rgb(255 255 255 / 0.22);
+}
+:root[data-theme="light"] .ezil-feedback-chip,
+:root[data-theme="light"] .ezil-feedback-dialog {
+    --fb-bg: #ffffff;
+    --fb-surface: #f2f4f8;
+    --fb-text: #1d2733;
+    --fb-muted: #5c687b;
+    --fb-border: #d7dbe4;
+    --fb-field: #ffffff;
+    --fb-warn: #654600;
+    --fb-warn-bg: #fff2d4;
+}
 .ezil-feedback-chip {
     position: fixed;
     top: calc(3px + env(safe-area-inset-top, 0px));
@@ -21,12 +53,11 @@
     padding: 0;
     border: 0;
     background: transparent;
-    color: #fff;
+    color: var(--fb-icon-ink);
     opacity: .7;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
 }
-/* Dark glass with a white hairline, like the drawer: findable on light and dark. */
 .ezil-feedback-chip svg {
     box-sizing: border-box;
     flex: 0 0 auto;
@@ -34,13 +65,13 @@
     height: 20px;
     padding: 2px;
     border-radius: 50%;
-    background: rgba(24, 24, 28, 0.62);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22), 0 1px 3px rgba(0, 0, 0, 0.2);
+    background: var(--fb-icon-glass);
+    box-shadow: inset 0 0 0 1px var(--fb-icon-hairline), 0 1px 3px rgb(0 0 0 / 0.2);
 }
 .ezil-feedback-chip:hover, .ezil-feedback-chip:focus-visible { opacity: 1; }
 .ezil-feedback-chip:focus-visible { outline: none; }
-.ezil-feedback-chip:focus-visible svg { outline: 3px solid #3479d5; outline-offset: 2px; }
-.ezil-feedback-dialog :focus-visible { outline: 3px solid #3479d5; outline-offset: 3px; }
+.ezil-feedback-chip:focus-visible svg { outline: 3px solid var(--fb-accent); outline-offset: 2px; }
+.ezil-feedback-dialog :focus-visible { outline: 3px solid var(--fb-accent); outline-offset: 3px; }
 .ezil-feedback-dialog {
     box-sizing: border-box;
     width: min(560px, calc(100vw - 24px));
@@ -48,14 +79,14 @@
     margin: auto;
     padding: 24px;
     overflow: auto;
-    border: 1px solid #d7dbe4;
+    border: 1px solid var(--fb-border);
     border-radius: 16px;
-    background: #fff;
-    color: #24334c;
-    box-shadow: 0 16px 60px #0004;
+    background: var(--fb-bg);
+    color: var(--fb-text);
+    box-shadow: 0 16px 60px rgb(0 0 0 / 0.5);
     font: 14px/1.5 system-ui, sans-serif;
 }
-.ezil-feedback-dialog::backdrop { background: #11182780; }
+.ezil-feedback-dialog::backdrop { background: rgb(4 6 12 / 0.7); }
 .ezil-feedback-dialog.ezil-feedback-capturing { visibility: hidden; }
 .ezil-feedback-dialog.ezil-feedback-capturing::backdrop { background: transparent; }
 .ezil-feedback-dialog [hidden] { display: none !important; }
@@ -71,27 +102,32 @@
     margin-top: 6px;
     padding: 10px;
     resize: vertical;
-    border: 1px solid #aab3c2;
+    border: 1px solid var(--fb-border);
     border-radius: 6px;
     font: inherit;
     color: inherit;
-    background: #fff;
+    background: var(--fb-field);
 }
-.ezil-feedback-dialog input { accent-color: #245fae; }
-.ezil-feedback-muted { color: #5c687b; margin: 4px 0 12px; }
-.ezil-feedback-warning { padding: 10px; background: #fff2d4; color: #654600; border-radius: 6px; }
+.ezil-feedback-dialog input { accent-color: var(--fb-accent); }
+.ezil-feedback-muted { color: var(--fb-muted); margin: 4px 0 12px; }
+.ezil-feedback-warning { padding: 10px; background: var(--fb-warn-bg); color: var(--fb-warn); border-radius: 6px; }
 .ezil-feedback-consent { display: flex; align-items: center; gap: 6px; margin: 12px 0; }
 .ezil-feedback-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .ezil-feedback-dialog button {
-    border: 1px solid #aab3c2;
+    border: 1px solid var(--fb-border);
     border-radius: 7px;
-    background: #f7f8fb;
+    background: var(--fb-field);
     color: inherit;
     padding: 8px 12px;
     font: inherit;
     cursor: pointer;
 }
-.ezil-feedback-dialog button[type="submit"] { background: #245fae; border-color: #245fae; color: #fff; }
+.ezil-feedback-dialog button[type="submit"] {
+    background: var(--ezil-accent, #00adb5);
+    border-color: var(--ezil-accent, #00adb5);
+    color: var(--ezil-accent-contrast, #04060c);
+    font-weight: 600;
+}
 .ezil-feedback-dialog button:disabled { opacity: .55; cursor: default; }
 .ezil-feedback-preview { margin-top: 16px; }
 .ezil-feedback-preview summary { cursor: pointer; }
@@ -101,7 +137,7 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     padding: 10px;
-    background: #f2f4f8;
+    background: var(--fb-surface);
     font-size: 12px;
     user-select: text;
 }
@@ -112,6 +148,9 @@
 .ezil-feedback-reports p { margin: 4px 0; white-space: pre-wrap; }
 @media (max-width: 499px) {
     .ezil-feedback-dialog { padding: 18px; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .ezil-feedback-chip, .ezil-feedback-dialog, .ezil-feedback-dialog * { transition: none !important; animation: none !important; }
 }
 @media (any-pointer: coarse) {
     .ezil-feedback-dialog button, .ezil-feedback-dialog summary,
@@ -128,10 +167,33 @@
         padding-top: 5px;
     }
 }
-/* Full-bleed desktop (plan §6.8): centred in the top control strip
- * (`--ezil-control-strip-height` in ezil-shell.css: 43px, 59px under
- * `pointer: coarse`), right of the centred drawer, never over the stream. */
-.ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 9.5px; }
+/* Full-bleed desktop (plan §6.8): centred in the top control strip, right of
+ * the centred drawer, never over the stream. Gate G3, 2026-10-31: the strip
+ * height is the FRONT full view's `--ezil-control-strip-height`, which
+ * feedback.js mirrors onto the icon as `--ezil-feedback-strip-h` (the Browser's
+ * 43px / 59px coarse, Code's 28px / 44px; ezil-shell.css). The fallbacks are
+ * the Browser's strip, so its icon stays where it was (9.5px / 7.5px). */
+.ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: calc((var(--ezil-feedback-strip-h, 43px) - 24px) / 2); }
 @media (pointer: coarse) {
-    .ezil-feedback-chip.ezil-feedback-chip-fullbleed { top: 7.5px; align-items: center; padding-top: 0; }
+    .ezil-feedback-chip.ezil-feedback-chip-fullbleed {
+        top: calc((var(--ezil-feedback-strip-h, 59px) - 44px) / 2);
+        align-items: center;
+        padding-top: 0;
+    }
 }
+/* Gate G3, 2026-10-31 (PROVISIONAL, docs/APP-CODE-FULL-VIEW.md §3): in a strip
+ * that declares `--ezil-feedback-look: outline` (Code's full view), the icon is
+ * a low-emphasis OUTLINED speech bubble in a thin ring: no glass, no shadow,
+ * the same stroked glyph drawn smaller inside the same 20px disc. The strip is
+ * always dark, so the ink stays white in either theme. The focus ring is drawn
+ * tighter (2px, 1px out) so it stays inside a 28px strip. Every other place
+ * keeps the glass disc above. */
+.ezil-feedback-chip[data-look="outline"] { opacity: .62; }
+.ezil-feedback-chip[data-look="outline"]:hover,
+.ezil-feedback-chip[data-look="outline"]:focus-visible { opacity: 1; }
+.ezil-feedback-chip[data-look="outline"] svg {
+    padding: 4px;
+    background: transparent;
+    box-shadow: inset 0 0 0 1px currentColor;
+}
+.ezil-feedback-chip[data-look="outline"]:focus-visible svg { outline-width: 2px; outline-offset: 1px; }

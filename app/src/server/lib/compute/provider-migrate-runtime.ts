@@ -4,7 +4,7 @@ import { billingV2EntitlementReader } from '@/server/billing/v2/compute-access';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { deriveGuacamoleSandboxId, migrateBegin, migrateAbort, migrateCommit, migrateReopen, migrateExport, migrateExportHead } from '../cloudflare-guacamole-provider';
 import { decideAdmission } from './admission';
-import { AWS_TIER_DATA_GIB, awsTierForSize, instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
+import { awsTierForSize, dataGiBForNewVolume, instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
 import { sharedAwsSdkCollaborators } from './aws-clients';
 import { buildAwsProvisionUserData } from './aws-ec2';
 import { issueEnrollmentNonce } from './aws-enroll';
@@ -97,7 +97,7 @@ export function createMigrationRuntime(db: PlacementDb, options: {
                 work = buildLifecycleWork({ schemaVersion: 1, jobId: randomUUID(), computerId: m.computerId, revision: 1,
                     operation: 'provision', targetGeneration: 1, fenceToken, providerInstanceId: null, dataVolumeId: null,
                     previousGeneration: null, previousInstanceId: null, previousFenceToken: null, deployment,
-                    instanceType: instanceTypeForTier(tier), dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: 1, userData });
+                    instanceType: instanceTypeForTier(tier), dataVolumeGiB: dataGiBForNewVolume(tier, entitlement.planId), leaseEpoch: 1, userData });
                 const placement: Placement = { computerId: m.computerId, ownerUserId: m.userId, provider: 'aws-ec2', store: 'ebs',
                     state: 'PROVISIONING', generation: 1, leaseEpoch: 1, region: 'ap-south-1', zoneId: deployment.zoneId,
                     instanceId: null, volumeId: null, instanceType: instanceTypeForTier(tier), fsUuid, fenceToken,

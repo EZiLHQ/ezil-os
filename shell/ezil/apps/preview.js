@@ -207,8 +207,8 @@ export async function openPreviewWindow (ctx = {}) {
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Preview…', isMigrating: () => session.isComputeMigrating(computer.id),
-        isLaunching: () => session.isComputeLaunching(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
+    const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Preview…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
+        isLaunching: () => session.isComputeLaunching(computer.id), isPreparing: () => session.isComputePreparing(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
         failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
 
@@ -376,6 +376,9 @@ export async function openPreviewWindow (ctx = {}) {
         // exists", and the panel shows `connecting` until `settle_frame` below
         // produces one. Still bounded: `FRAME_CONFIRM_DEADLINE_MS` runs from
         // `t_handoff`.
+        // The open answered with a URL: a real signal, so the one bar takes the
+        // opening-app floor (never 100 before the frame is confirmed).
+        progress.stamp('url_received');
         const t_handoff = performance.now();
         const paint_handoff = () => {
             if ( disposed || my_attempt !== attempt ) return;
@@ -422,6 +425,9 @@ export async function openPreviewWindow (ctx = {}) {
             stop_timers();
 
             if ( seen === true ) {
+                // The real ready signal concludes this open on the one surface (bar to 100), so a
+                // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
+                progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 stop_monitor = watchNativeSurface(nativeSurface, () => {

@@ -17,7 +17,7 @@
  * settings: shell/ezil/ui/Settings/index.js:107,120
  * billing: ui/Settings/tabs/billing.js:205,209; billing-sheets.js:250
  * Stripe: ui/Settings/upgrade-sheet.js:149 (secure child DOM is external)
- * restart: ui/Settings/tabs/troubleshoot.js:291,310,337
+ * restart: ui/Settings/tabs/troubleshoot.js:288-300,328,365-371; ui/Settings/sheet-frame.js:12-20,261-265
  * chat: worker/copilot-chat/PATCHES.md:95 preserves workbench.action.chat.*;
  *       e2e/copilot-ezil.mjs:145,216 uses the interactive chat/Monaco input.
  * terminal: e2e/live-check.mjs:262 (accessibility mode and xterm tree).
@@ -211,8 +211,8 @@ export async function closeApp(page, id) {
   // hides the dock and intercepts clicks on Code's otherwise-visible titlebar.
   if (id === 'code') await clickDock(page, id);
   else if (await dock(page, id).isVisible()) await dock(page, id).click();
-  // Settings may sit above the full-bleed Browser; closing it must preserve
-  // that Browser and its computer identity until the restart is acknowledged.
+  // Settings may sit above the full-bleed Browser; closing it must leave that
+  // Browser open (the persistence step closes Settings on both sides of a restart).
   if (await win.getAttribute('data-is_fullpage') === '1') {
     await drawerAction(win, '.dashboard-app-drawer-close');
   } else {
@@ -520,6 +520,24 @@ async function chat(page, evidence, redact) {
   }, 'EZiL Chat reply or error', 150_000);
 }
 
+/** The line terminalRun types: the script's output and exit code between two
+ * whole-line markers, written to a file. The terminal renders on a canvas (no
+ * DOM text), so the output goes to an absolute /tmp file that Quick Open opens;
+ * Monaco renders file lines as DOM text.
+ */
+export function terminalCommand(script, runId, phase) {
+  const begin = `E2E_BEGIN_${phase}_${runId}`, end = `E2E_END_${phase}_${runId}`;
+  const out = `/tmp/e2e-out-${phase}-${runId}.txt`;
+  return { begin, end, out,
+    line: `{ printf '\\n${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ${out} 2>&1` };
+}
+
+/** That file's text as { text, exitCode }, or null until both markers are there. */
+export function terminalResult(text, begin, end) {
+  const block = terminalBlock(text, begin, end);
+  return block === null ? null : { text: block, exitCode: Number(block.match(/^E2E_RC=(\d+)$/m)?.[1] ?? -1) };
+}
+
 async function terminalRun(page, frame, script, runId, phase) {
   await clickDock(page, 'code');
   await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
@@ -529,11 +547,8 @@ async function terminalRun(page, frame, script, runId, phase) {
   // Shell-integration command decorations overlay the screen; a user click still focuses it.
   await terminal.locator('.xterm-screen').last().click({ force: true });
   const input = { pressSequentially: (text, opts) => page.keyboard.type(text, opts), press: key => page.keyboard.press(key) };
-  const begin = `E2E_BEGIN_${phase}_${runId}`, end = `E2E_END_${phase}_${runId}`;
-  // The terminal renders on a canvas (no DOM text), so the output goes to an absolute
-  // /tmp file that Quick Open opens; Monaco renders file lines as DOM text.
-  const out = `/tmp/e2e-out-${phase}-${runId}.txt`, name = out.split('/').pop();
-  await input.pressSequentially(`{ printf '\\n${begin}\\n'; ${script}; printf '\\nE2E_RC=%s\\n${end}\\n' "$?"; } > ${out} 2>&1`, { delay: 1 });
+  const { begin, end, out, line } = terminalCommand(script, runId, phase), name = out.split('/').pop();
+  await input.pressSequentially(line, { delay: 1 });
   await input.press('Enter');
   return until(async () => {
     await frame.locator('.monaco-workbench').click({ position: { x: 8, y: 8 } });
@@ -549,103 +564,157 @@ async function terminalRun(page, frame, script, runId, phase) {
     if (!await tab.waitFor({ state: 'visible', timeout: 5000 }).then(() => true, () => false)) return false;
     const lines = frame.locator('.editor-group-container.active .monaco-editor .view-lines').first();
     const text = (await lines.innerText({ timeout: 3000 })).replace(/\u00a0/g, ' ');
-    const block = terminalBlock(text, begin, end);
-    return block === null ? false : { text: block, exitCode: Number(block.match(/^E2E_RC=(\d+)$/m)?.[1] ?? -1) };
+    return terminalResult(text, begin, end) ?? false;
   }, 'terminal output file', 60_000);
 }
 
+/** What the persistence step relies on in Settings → Troubleshoot: render() and
+ * confirmRestartComputer() in ui/Settings/tabs/troubleshoot.js, and the sheet
+ * that ui/Settings/sheet-frame.js draws. The synthetic suite pins every value
+ * here against those two sources, so UI drift fails CI before a live run.
+ */
+export const RESTART_COMPUTER_UI = Object.freeze({
+  path: 'Settings → Troubleshoot → Restart computer',
+  control: '[data-action="restart-computer"]',
+  // Restart computer's own status line. Diagnostic logs elsewhere in the pane
+  // can contain user data, and feedback errors share the error class.
+  status: '[data-role="restart-computer-status"]',
+  failed: '.ezil-settings-error[data-role="restart-computer-status"]',
+  sheet: '[role="dialog"][data-sheet="confirm-restart-computer"]',
+  // The pane's own button has the same name; only the sheet's one confirms.
+  confirm: 'Restart computer',
+  restarting: 'Restarting your computer…',
+  restarted: 'Your computer restarted.',
+  unavailable: 'Not available in this deployment yet.',
+});
+// The UI promises 1–4 minutes; two more cover its 3 s progress poll and a slow stop.
+export const RESTART_COMPUTER_WAIT_MS = 360_000;
+
+/** Only Restart computer's explicit "not in this deployment" line is a SKIP. A
+ * missing prerequisite ("Open a desktop first, then come back here.") and every
+ * failure copy stay failures.
+ */
 export function restartUnavailableReason(text) {
-  if (/Not available in this deployment yet\.|This deployment hasn't turned on desktop restarts yet\./i.test(text)) {
-    return 'restart_not_supported_by_deployment';
-  }
-  if (/This desktop runs on an older stack that cannot be restarted in place\./i.test(text)) {
-    return 'restart_not_supported_by_desktop_stack';
-  }
-  return null;
+  return compact(text) === RESTART_COMPUTER_UI.unavailable ? 'restart_not_supported_by_deployment' : null;
 }
 
+async function restartStatus(pane) {
+  const line = pane.locator(RESTART_COMPUTER_UI.status);
+  if (!await line.count()) return { text: '', failed: false };
+  return { text: compact(await line.first().innerText()),
+    failed: await pane.locator(RESTART_COMPUTER_UI.failed).count() > 0 };
+}
+
+/** Settings → Troubleshoot. Restart computer takes the page's current computer
+ * (troubleshoot.js render()), so no open Browser is needed first.
+ */
 export async function restartPane(page, evidence) {
-  const desktop = appWindow(page, 'desktop');
-  await until(async () => {
-    evidence.desktopOpen = await desktop.count() > 0;
-    evidence.desktopHasComputerId = evidence.desktopOpen && !!await desktop.getAttribute('data-ezil-computer-id');
-    return evidence.desktopHasComputerId;
-  }, 'open Browser computer identity', 15_000);
-  await drawerAction(desktop, '.dashboard-app-drawer-settings');
-  const win = appWindow(page, 'settings');
-  await win.locator('[data-tab="troubleshoot"]').click();
-  const pane = win.locator('[data-pane="troubleshoot"]');
-  await pane.waitFor({ state: 'visible' });
-  const restart = pane.locator('[data-action="restart"]');
-  await until(async () => {
-    evidence.visible = await restart.isVisible();
-    evidence.enabled = evidence.visible && await restart.isEnabled();
-    // Only the restart section; diagnostic logs below it can contain user data.
-    evidence.explanation = evidence.visible ? compact(await restart.evaluate(button => {
-      const lines = [];
-      for (let node = button.nextElementSibling; node && node.tagName !== 'HR'; node = node.nextElementSibling) {
-        if (node.matches('.ezil-settings-muted, .ezil-settings-error')) lines.push(node.textContent);
-      }
-      return lines.join(' ');
-    })) : '';
-    evidence.unavailableReason = !evidence.enabled ? restartUnavailableReason(evidence.explanation) : null;
-    return evidence.enabled || evidence.unavailableReason;
-  }, 'restart control enabled or explicitly unsupported', 15_000);
+  const pane = await settingsTab(page, 'troubleshoot');
+  const restart = pane.locator(RESTART_COMPUTER_UI.control);
+  try {
+    await until(async () => {
+      evidence.visible = await restart.isVisible();
+      evidence.enabled = evidence.visible && await restart.isEnabled();
+      evidence.explanation = (await restartStatus(pane)).text;
+      evidence.unavailableReason = evidence.enabled ? null : restartUnavailableReason(evidence.explanation);
+      return evidence.enabled || evidence.unavailableReason;
+    }, 'Restart computer enabled or explicitly unsupported', 15_000);
+  } catch (error) {
+    if (!/^Timed out: /.test(error.message)) throw error;
+    throw new Error(`Restart computer did not enable: ${evidence.explanation || 'no reason shown'}`);
+  }
   return { pane, restart, reason: evidence.unavailableReason };
 }
 
-async function persistence(page, runId, evidence) {
-  const frame = await codeFrame(page);
-  const initial = await terminalRun(page, frame,
+async function restartComputer(page, { pane, restart }, evidence) {
+  await restart.click();
+  const sheet = page.locator(RESTART_COMPUTER_UI.sheet);
+  await sheet.waitFor({ state: 'visible' });
+  await sheet.getByRole('button', { name: RESTART_COMPUTER_UI.confirm, exact: true }).click();
+  const started = performance.now();
+  try {
+    // Only the server's own `done` draws the restarted line (troubleshoot.js's
+    // honesty contract); its failure copy is a failure, never a skip.
+    await until(async () => {
+      const { text, failed } = await restartStatus(pane);
+      evidence.restartControl.status = text;
+      if (failed) throw new Error(`Restart computer failed: ${text}`);
+      if (text.startsWith(RESTART_COMPUTER_UI.restarting)) evidence.restartControl.restartingSeen = true;
+      return text.startsWith(RESTART_COMPUTER_UI.restarted);
+    }, 'Restart computer outcome', RESTART_COMPUTER_WAIT_MS);
+  } finally { evidence.restartComputerMs = elapsed(started); }
+}
+
+const field = (text, name) => text.match(new RegExp(`^${name}=(.*)$`, 'm'))?.[1]?.trim() || null;
+const MARKERS = [['HOME_MARKER', '~/e2e-persist.txt'], ['WS_MARKER', '/workspace/.e2e-persist.txt']];
+const READ_MARKERS = MARKERS.map(([name, path]) => `printf '${name}=%s\\n' "$(cat ${path} 2>/dev/null)"`).join('; ');
+const missingMarkers = (text, marker) => MARKERS.filter(([name]) => field(text, name) !== marker).map(([, path]) => path);
+
+// The live journey's app and terminal moves; the synthetic suite passes its own.
+const journeySteps = page => ({
+  terminal: async (script, runId, phase) => terminalRun(page, await codeFrame(page), script, runId, phase),
+  openApp: (id, evidence) => openApp(page, id, evidence),
+  closeApp: id => closeApp(page, id),
+});
+
+/** Restart computer stops the machine and starts it again. Files under
+ * /workspace and ~ must survive it: /workspace is the data disk's workspace
+ * bind, and ~ (/root) is in the root overlay's upper layer on the same disk,
+ * which boot does not clear (infra/host-agent/lib/ezil_host/desktop.py). No
+ * process survives it, so the tmux session is recorded, never asserted.
+ *
+ * Evidence since Restart desktop was removed (2026-10-31): `restartMs`, the
+ * old acknowledgement time, is now `restartComputerMs` (confirm to the
+ * restarted line, a whole stop and start). New: `workspaceFilePersisted`,
+ * `hostAfter`, `bootIdChanged`, `restartControl.status`/`restartingSeen`.
+ * Gone with the Browser prerequisite: `desktopBeforeRestart` and
+ * `restartControl.desktopOpen`/`desktopHasComputerId`. `filePersisted` (~),
+ * `tmuxSessionPresent` and `tmuxExitCode` keep their meaning.
+ */
+export async function persistence(page, runId, evidence, { steps = journeySteps(page) } = {}) {
+  const marker = `e2e-${runId}`;
+  const initial = await steps.terminal(
     // PRIOR_MARKER: a marker an earlier run (e.g. on Cloudflare, before migration) left behind.
-    `printf 'PRIOR_MARKER=%s\\n' "$(cat ~/e2e-persist.txt 2>/dev/null)"; printf 'PRIOR_TMUX=%s\\n' "$(tmux ls 2>/dev/null | tr '\\n' ' ')"; printf 'HOST=%s\\n' "$(hostname)"; printf 'PRIOR_WS_MARKER=%s\\n' "$(cat /workspace/.e2e-persist.txt 2>/dev/null)"; echo e2e-${runId} > /workspace/.e2e-persist.txt; `
-    + `tmux kill-session -t e2e 2>/dev/null; echo e2e-${runId} > ~/e2e-persist.txt && tmux new -d -s e2e 'sleep 3600' && free -m | head -2 && nproc`, runId, 'before');
+    `printf 'PRIOR_MARKER=%s\\n' "$(cat ~/e2e-persist.txt 2>/dev/null)"; printf 'PRIOR_TMUX=%s\\n' "$(tmux ls 2>/dev/null | tr '\\n' ' ')"; printf 'HOST=%s\\n' "$(hostname)"; printf 'BOOT_ID=%s\\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; printf 'PRIOR_WS_MARKER=%s\\n' "$(cat /workspace/.e2e-persist.txt 2>/dev/null)"; `
+    + `echo ${marker} > /workspace/.e2e-persist.txt; echo ${marker} > ~/e2e-persist.txt; ${READ_MARKERS}; `
+    + `tmux kill-session -t e2e 2>/dev/null; tmux new -d -s e2e 'sleep 3600' && free -m | head -2 && nproc`, runId, 'before');
   evidence.beforeTerminal = initial.text;
-  evidence.priorMarker = initial.text.match(/^PRIOR_MARKER=(.*)$/m)?.[1]?.trim() || null;
-  evidence.priorTmux = initial.text.match(/^PRIOR_TMUX=(.*)$/m)?.[1]?.trim() || null;
-  evidence.host = initial.text.match(/^HOST=(.*)$/m)?.[1]?.trim() || null;
-  // /workspace is the exported workspace layer; ~ (/root) may not be in any layer.
-  evidence.priorWorkspaceMarker = initial.text.match(/^PRIOR_WS_MARKER=(.*)$/m)?.[1]?.trim() || null;
+  evidence.priorMarker = field(initial.text, 'PRIOR_MARKER');
+  evidence.priorTmux = field(initial.text, 'PRIOR_TMUX');
+  evidence.host = field(initial.text, 'HOST');
+  evidence.priorWorkspaceMarker = field(initial.text, 'PRIOR_WS_MARKER');
   evidence.resources = parseResources(initial.text);
   if (initial.exitCode !== 0) throw new Error('Persistence setup command failed (an existing tmux session named e2e also causes this)');
   if (!evidence.resources.ramMiB || !evidence.resources.vcpus) throw new Error('RAM/vCPU output was not readable');
-  // Troubleshoot requires an open Browser with a computer id. Its drawer opens
-  // Settings without clickDock's full-bleed cleanup closing that prerequisite.
-  await closeApp(page, 'settings');
-  evidence.desktopBeforeRestart = {};
-  await openApp(page, 'desktop', evidence.desktopBeforeRestart);
-  evidence.restartControl = { path: 'Browser drawer → Settings → Troubleshoot → Restart desktop' };
-  const { pane: win, restart, reason } = await restartPane(page, evidence.restartControl);
-  if (reason) return reason;
-  await restart.click();
-  await page.getByRole('button', { name: 'Restart', exact: true }).click();
-  const started = performance.now();
-  const restartOutcome = await until(async () => {
-    const error = win.locator('.ezil-settings-error');
-    if (await error.count()) {
-      evidence.restartControl.explanation = compact(await error.innerText());
-      const reason = restartUnavailableReason(evidence.restartControl.explanation);
-      if (reason) return reason;
-      throw new Error(`Restart failed: ${evidence.restartControl.explanation}`);
-    }
-    return (await win.innerText()).includes('Restart requested.') ? 'restarted' : false;
-  }, 'restart acknowledgement', 120_000);
-  evidence.restartMs = elapsed(started);
-  if (restartOutcome !== 'restarted') return restartOutcome;
-  await closeApp(page, 'settings');
+  // A later FAIL must mean a marker was lost across the restart, not never written.
+  const unwritten = missingMarkers(initial.text, marker);
+  if (unwritten.length) throw new Error(`Persistence marker was not written: ${unwritten.join(', ')}`);
+  await steps.closeApp('settings');
+  evidence.restartControl = { path: RESTART_COMPUTER_UI.path };
+  const control = await restartPane(page, evidence.restartControl);
+  if (control.reason) return control.reason;
+  await restartComputer(page, control, evidence);
+  await steps.closeApp('settings');
+  // Recovery: the Browser and Code both come back on the restarted computer.
   evidence.desktopAfterRestart = {};
-  await openApp(page, 'desktop', evidence.desktopAfterRestart);
+  await steps.openApp('desktop', evidence.desktopAfterRestart);
   evidence.codeAfterRestart = {};
-  await openApp(page, 'code', evidence.codeAfterRestart);
-  const after = await terminalRun(page, await codeFrame(page),
-    'cat ~/e2e-persist.txt; file_rc=$?; tmux ls; tmux_rc=$?; printf "\\nFILE_RC=%s TMUX_RC=%s\\n" "$file_rc" "$tmux_rc"; test "$file_rc" -eq 0', runId, 'after');
+  await steps.openApp('code', evidence.codeAfterRestart);
+  const after = await steps.terminal(
+    `${READ_MARKERS}; printf 'HOST=%s\\n' "$(hostname)"; printf 'BOOT_ID=%s\\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; tmux ls 2>&1; printf 'TMUX_RC=%s\\n' "$?"`,
+    runId, 'after');
   evidence.afterTerminal = after.text;
-  evidence.filePersisted = after.text.split('\n').includes(`e2e-${runId}`);
+  evidence.hostAfter = field(after.text, 'HOST');
+  // A new kernel boot id says the machine itself restarted. Recorded, not asserted.
+  const bootBefore = field(initial.text, 'BOOT_ID'), bootAfter = field(after.text, 'BOOT_ID');
+  evidence.bootIdChanged = bootBefore && bootAfter ? bootBefore !== bootAfter : null;
+  evidence.filePersisted = field(after.text, 'HOME_MARKER') === marker;
+  evidence.workspaceFilePersisted = field(after.text, 'WS_MARKER') === marker;
   evidence.tmuxSessionPresent = /^e2e:\s/m.test(after.text);
-  evidence.tmuxExitCode = Number(after.text.match(/TMUX_RC=(\d+)/)?.[1] ?? -1);
-  if (after.exitCode !== 0 || !evidence.filePersisted) throw new Error('Persistence marker was not restored after restart');
-  // This restart restarts the desktop stack, not necessarily the tmux server.
-  // Record process survival separately; file persistence is the assertion.
+  evidence.tmuxExitCode = Number(field(after.text, 'TMUX_RC') ?? -1);
+  if (after.exitCode !== 0) throw new Error('Persistence read-back command failed');
+  const lost = missingMarkers(after.text, marker);
+  if (lost.length) throw new Error(`Persistence marker was not restored after restart: ${lost.join(', ')}`);
   return null;
 }
 

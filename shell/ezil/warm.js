@@ -67,6 +67,22 @@
 // calls `session.openDesktop()` directly instead — "try again" has to mean
 // the network is actually asked again, not that a possibly-stale warm result
 // is silently replayed. See that file's own comment at the call site.
+//
+// ── Phase B r8: a warm is not an open (REVERSE-MOVE-CONTRACT §5.9, Option C) ──
+// The next open of a held Free computer starts moving its files to the Free
+// computer, which cannot be undone. A hover is not that open. So every ask
+// `warm()` sends carries `intent: 'warm'`, and on a computer whose open would
+// start the move the server creates nothing, boots nothing, and answers the
+// stop hold's `computer_stopped` (`isWarmHeld`). Like any failure the warm
+// drops it. A window must never be handed it: `claim()` of a warm stops the
+// marker on the warm's later asks (they are the click's now), and if the
+// warm's answer was that one, it asks a real open, which starts the move.
+//
+// ── Phase B r9: the move starts only on an explicit open (opt-in) ──────────
+// A real open says so: `session.openDesktop` sends `intent: 'open'` on every
+// ask that is not the warm's (`claim()`'s own mint, and a claimed warm's later
+// asks). The server starts the move only for that intent, so a tab still
+// running a pre-r9 bundle (whose warm sends no intent) gets the D16 hold.
 
 import session from './session.js';
 import { measureDesktopBox } from './apps/desktop-screen.js';
@@ -78,10 +94,20 @@ import { measureDesktopBox } from './apps/desktop-screen.js';
 export const WARM_MAX_AGE_MS = 60_000;
 
 /**
- * The one warm this module is holding, if any.
- * @type {{computerId: string, promise: Promise<unknown>, resolvedAt: number|null} | null}
+ * The one warm this module is holding, if any. `warm`: minted by `warm()` (its asks carry the marker until
+ * `claimed`, then `intent: 'open'`); `claim()`'s own mint is a real open (`intent: 'open'`) and never is.
+ * @type {{computerId: string, promise: Promise<unknown>, resolvedAt: number|null, warm: boolean, claimed: boolean} | null}
  */
 let current = null;
+
+/**
+ * Phase B r8 (§5.9, Option C): the server's answer to a warm on a computer whose next open would start the move:
+ * the stop hold's `computer_stopped`, which `POST /api/shell/desktop` answers for nothing else (the desktop open is
+ * never held). Deterministic, so the warm's loop returns it at once, with no telemetry.
+ */
+export function isWarmHeld (res) {
+    return !! res && res.ok !== true && res.errorCode === 'computer_stopped';
+}
 
 function isFresh (entry) {
     return !!entry
@@ -119,10 +145,17 @@ function bootScreen () {
     }
 }
 
-/** Mint a fresh single-flight entry for `computerId` and make it the current one. */
-function mint (computerId) {
-    const entry = { computerId, promise: null, resolvedAt: null };
-    entry.promise = session.openDesktop(computerId, bootScreen()).then((res) => {
+/**
+ * Mint a fresh single-flight entry for `computerId` and make it the current one. `warm`: this is `warm()`'s (a hover
+ * or press), so each ask carries `intent: 'warm'` until a window claims it (then `'open'`); otherwise it is a real open,
+ * whose every ask carries `intent: 'open'` (r9).
+ */
+function mint (computerId, { warm = false } = {}) {
+    const entry = { computerId, promise: null, resolvedAt: null, warm, claimed: false };
+    const open = warm
+        ? session.openDesktop(computerId, bootScreen(), { warm: () => ! entry.claimed })
+        : session.openDesktop(computerId, bootScreen());
+    entry.promise = open.then((res) => {
         // `session.openDesktop` is failure-first and never throws (see that
         // file's own header), so this is the only branch that needs
         // handling. Only a genuine success counts as "warm" — a failure must
@@ -149,7 +182,7 @@ export function warm (computerId) {
     if ( ! computerId ) return;
     if ( session.stoppedByUser?.(computerId) ) return; // the owner stopped it: only an explicit open starts it
     if ( current?.computerId === computerId ) return; // in flight, or claim() will judge freshness
-    mint(computerId);
+    mint(computerId, { warm: true });
 }
 
 /**
@@ -173,7 +206,13 @@ export function claim (computerId) {
     }
     if ( current?.computerId === computerId
         && (current.resolvedAt === null || isFresh(current)) ) {
-        return current.promise;
+        const entry = current;
+        if ( ! entry.warm ) return entry.promise;
+        // 🔴 Phase B r8: the click now owns the warm's loop, so its later asks carry no warm marker (r9: they say
+        // `intent: 'open'`, so a held computer's next ask starts the move). An answer the warm
+        // already got for its marker (`isWarmHeld`) is never handed to the window: the click asks a real open.
+        entry.claimed = true;
+        return entry.promise.then(res => (isWarmHeld(res) ? mint(computerId).promise : res));
     }
     return mint(computerId).promise;
 }
@@ -183,4 +222,4 @@ export function _resetForTests () {
     current = null;
 }
 
-export default { warm, claim, WARM_MAX_AGE_MS, _resetForTests };
+export default { warm, claim, isWarmHeld, WARM_MAX_AGE_MS, _resetForTests };

@@ -5,6 +5,7 @@ disk guard and enrollment; the rest of the boot chain opens the user's overlay/h
 The authenticated claim is authority; durable state permits only exact-instance resume.
 """
 import base64
+import copy
 import fcntl
 from http.client import HTTPException
 import json
@@ -21,15 +22,49 @@ from .fsops import DIR_FLAGS, Refused, read_regular_at
 EPOCH_FILE = "pool-epoch.json"       # host root disk; survives reboots, never guest-visible
 POLL_SECONDS = 1.0
 READY_POLL_SECONDS = 0.25
+REFRESH_SECONDS = 300
 REFRESH_RETRY_SECONDS = 20
+# R2-4: a readiness miss is never fatal. A cold first boot (lazily loaded root volume) can need
+# more than one 180 s wait; each retry re-enrolls first, which is this host's liveness for the
+# planner's stall rule (ready-pool.ts bootStalled: not ready 5 min after enrolling = dead).
+# Bounded: after FIRST_BOOT_READY_ATTEMPTS misses the host waits for a claim unready, its
+# refreshes try again, and a host that never gets ready ages past that rule and is retired.
+FIRST_BOOT_READY_ATTEMPTS = 2
 TIMING_FILE = "pool-session-timing.json"
 TIMING_PHASES = ("claimObservedMs", "guardDoneMs", "enrollDoneMs", "warmStoppedMs",
                  "relayAvailableMs", "desktopStartedMs", "desktopHealthyMs")
 FENCE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 SERIAL_RE = re.compile(r"vol-?([0-9a-f]{8,17})")
+# C3 (REVERSE-MOVE-CONTRACT §2.8): a claim may carry the migration's restore lease, the same
+# RestoreLease the cold provision puts in user data (app provider-migrate.ts restoreLeaseFor), so
+# an adopted spare restores the Cloudflare workspace before the marker, exactly as a cold boot.
+RESTORE_KEYS = {"kind", "migrationId", "generation", "system", "fetchBase", "identityToken"}
+RESTORE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
-def parse_claim(raw, *, require_nonce=True):
+def parse_restore(r, computer_id, origin=None):
+    """The claim's restore lease, closed; the token is never echoed. fetchBase is the app's
+    restore route for THIS computer, over https (restore.http_fetch requires it), and on the
+    pool's own app origin when that is known."""
+    if (not isinstance(r, dict) or set(r) != RESTORE_KEYS or r["kind"] != "cf-snapshot" or type(r["system"]) is not bool
+            or not all(isinstance(r[k], str) and leasemod.POOL_UUID_RE.fullmatch(r[k]) for k in ("migrationId", "generation"))
+            or not isinstance(r["identityToken"], str) or not RESTORE_TOKEN_RE.fullmatch(r["identityToken"])
+            or not isinstance(r["fetchBase"], str) or len(r["fetchBase"]) > 512):
+        raise Refused("pool_claim_invalid", "restore")
+    try:
+        url = urlsplit(r["fetchBase"])
+        ok = (url.scheme == "https" and url.hostname and not url.username and not url.password and not url.query
+              and not url.fragment and url.path == "/api/compute/restore/" + computer_id
+              and not any(ord(c) <= 32 for c in r["fetchBase"]))
+        url.port
+    except ValueError:
+        ok = False
+    if not ok or (origin is not None and urlunsplit((url.scheme, url.netloc, "", "", "")) != origin):
+        raise Refused("pool_claim_invalid", "restore fetchBase")
+    return dict(r)
+
+
+def parse_claim(raw, *, require_nonce=True, origin=None):
     try:
         claim = leasemod.strict_json(raw)
     except (ValueError, UnicodeDecodeError, TypeError, RecursionError) as e:
@@ -52,13 +87,18 @@ def parse_claim(raw, *, require_nonce=True):
         raise Refused("pool_claim_invalid", "createVolume")
     if claim.get("createVolume") and "fsUuid" not in claim:
         raise Refused("pool_claim_invalid", "createVolume requires fsUuid")
+    if "restore" in claim:
+        # The guard restores only into a fresh volume (its marker-less init path).
+        if claim.get("createVolume") is not True:
+            raise Refused("pool_claim_invalid", "restore requires createVolume")
+        claim["restore"] = parse_restore(claim["restore"], claim["computerId"], origin)
     if "claimPublishedAtMs" in claim:
         published = claim["claimPublishedAtMs"]
         if type(published) not in (int, float) or not 0 <= published <= 4102444800000:
             raise Refused("pool_claim_invalid", "claimPublishedAtMs")
     # Unknown response fields cannot override local paths, authority or device identity.
-    return {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence",
-                                  "volumeSerial", "enrollNonce", "fsUuid", "createVolume", "claimPublishedAtMs") if k in claim}
+    return {k: claim[k] for k in ("computerId", "generation", "leaseEpoch", "fence", "volumeSerial", "enrollNonce",
+                                  "fsUuid", "createVolume", "claimPublishedAtMs", "restore") if k in claim}
 
 
 def timing(cfg, phase=None, claim=None):
@@ -159,7 +199,7 @@ class Client:
 
     def claim(self):
         status, body = self.request("GET", "claim")
-        return None if status == 204 else parse_claim(body)
+        return None if status == 204 else parse_claim(body, origin=self.origin)
 
 
 def read_record(cfg):
@@ -177,7 +217,8 @@ def read_record(cfg):
             if record["phase"] not in ("reserved", "guarding", "enrolled", "switched", "failed"):
                 raise ValueError
             record["claim"] = parse_claim(json.dumps(record["claim"]),
-                                         require_nonce=record["phase"] in ("reserved", "guarding"))
+                                         require_nonce=record["phase"] in ("reserved", "guarding"),
+                                         origin=record.get("appOrigin"))
             leasemod.parse(json.dumps({"kind": "pool", "poolHostId": record["poolHostId"],
                                       "poolGeneration": record["poolGeneration"]}))
             if not isinstance(record["instanceId"], str) or not record["instanceId"]:
@@ -236,6 +277,8 @@ def computer_lease(cfg, claim):
              "provision": claim.get("createVolume", False)}
     if "enrollNonce" in claim:
         lease["nonce"] = claim["enrollNonce"]
+    if "restore" in claim:
+        lease["restore"] = dict(claim["restore"])   # guard.run_guard restores before the marker
     return leasemod.parse(json.dumps(lease))
 
 
@@ -293,26 +336,71 @@ def wait_ready(cfg, timeout=180):
         time.sleep(min(READY_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
+def first_ready(client, warm):
+    """The first boot's readiness: post ready once the warm desktop answers. True once posted;
+    False after FIRST_BOOT_READY_ATTEMPTS misses (never pool_desktop_not_ready: the caller keeps
+    the host and waits for a claim, and the next refresh tries again)."""
+    for attempt in range(FIRST_BOOT_READY_ATTEMPTS):
+        if attempt:
+            try:
+                client.enroll(retry_seconds=REFRESH_RETRY_SECONDS)
+            except Refused as e:
+                if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+                    raise                          # e.g. the planner already failed this host
+        try:
+            health = wait_ready(warm)
+        except Refused as e:
+            if e.code != "pool_desktop_not_ready":
+                raise
+            print(f"[pool] warm desktop not ready (attempt {attempt + 1}/{FIRST_BOOT_READY_ATTEMPTS})", flush=True)
+            continue
+        client.ready(health)
+        return True
+    return False
+
+
+def poll_claim(client):
+    """One claim poll while the warm host waits. An app outage (the request's own retry budget
+    spent) is not fatal: the guard would exit 2, which its unit never restarts, and the spare's
+    pool agent would end for good (R2-4). The host keeps waiting instead; while the app stays
+    unreachable no refresh succeeds, so the host ages out of the claimable set and the planner
+    retires it. A refusal still raises."""
+    try:
+        return client.claim()
+    except Refused as e:
+        if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+            raise
+        print("[pool] claim poll: app unreachable; still waiting", flush=True)
+        return None
+
+
 def wait_claim(client, warm):
-    refresh_at = time.monotonic() + 300
+    refresh_at = time.monotonic() + REFRESH_SECONDS
     while True:
-        claim = client.claim()
+        claim = poll_claim(client)
         if claim is not None:
             return claim
         if time.monotonic() >= refresh_at:
-            # Ready hosts require enrollment age < 10 min even when idle for hours.
+            # Ready hosts require enrollment age < 10 min even when idle for hours. Health first:
+            # an unready warm desktop never refreshes the enrollment, so a host that stays unready
+            # ages out of the claimable set instead of being handed to a user.
             try:
+                health = wait_ready(warm, timeout=REFRESH_RETRY_SECONDS)
                 client.enroll(retry_seconds=REFRESH_RETRY_SECONDS)
-                client.ready(wait_ready(warm, timeout=REFRESH_RETRY_SECONDS), retry_seconds=REFRESH_RETRY_SECONDS)
+                client.ready(health, retry_seconds=REFRESH_RETRY_SECONDS)
             except Refused as e:
                 # Leasing can refuse a refresh before the claim response is published.
-                claim = client.claim()
+                claim = poll_claim(client)
                 if claim is not None:
                     return claim
-                if e.code not in ("pool_retry_exhausted", "pool_unavailable"):
+                if e.code == "pool_desktop_not_ready":
+                    # R2-4: never fatal. The host stays; the next refresh tries again.
+                    print("[pool] warm desktop not ready at refresh; keeping the host", flush=True)
+                    refresh_at = time.monotonic() + REFRESH_SECONDS
+                elif e.code not in ("pool_retry_exhausted", "pool_unavailable"):
                     raise
             else:
-                refresh_at = time.monotonic() + 300
+                refresh_at = time.monotonic() + REFRESH_SECONDS
         time.sleep(POLL_SECONDS)
 
 
@@ -359,7 +447,8 @@ def _adopt(cfg, pool_lease):
                 # A guard process may have died while waiting for a claim.
                 if desktop.state(warm) != "running":
                     start_warm(warm, pool_lease)
-                client.ready(wait_ready(warm))
+                if not first_ready(client, warm):
+                    print("[pool] warm desktop not ready after the first boot's waits; refreshes retry", flush=True)
                 claim = wait_claim(client, warm)
             timing(cfg, "claimObservedMs", claim)
             record = reserve_claim(cfg, pool_lease, claim)
@@ -378,7 +467,11 @@ def _adopt(cfg, pool_lease):
         if not resumed_guard:
             record["phase"] = "guarding"
             save_record(cfg, record)
-        guard.run_guard(cfg, lease, rebase_runner=rebase.run_job, allow_reboot=resumed_guard)
+        # The guard gets its OWN copy: a restore publishes the fetched heads into the lease it is
+        # given (restore.http_fetch), up to 512 chunks each, past lease.parse's user-data bound.
+        # Every saved copy (pool-epoch.json, runDir/lease.json) stays claim-shaped, exactly what
+        # a cold boot's user data holds, so read_record and the later steps still parse it.
+        guard.run_guard(cfg, copy.deepcopy(lease), rebase_runner=rebase.run_job, allow_reboot=resumed_guard)
         mounted = True
         timing(cfg, "guardDoneMs")
         enroll._write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())

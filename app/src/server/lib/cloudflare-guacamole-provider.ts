@@ -3335,8 +3335,18 @@ const MIGRATE_CONFLICT_REASONS = [
     'generation_mismatch', 'chunk_unavailable', 'already_migrated', 'workspace_too_large',
     'workspace_size_unknown', 'system_too_large', 'system_size_unknown', 'final_checkpoint_failed',
     'flag_write_failed', 'stop_failed', 'migrating', 'not_migrated',
+    // The reverse move's import routes (REVERSE-MOVE-CONTRACT §4.6); `head_moved` and `workspace_too_large` are above.
+    'container_running', 'head_invalid', 'head_unreadable', 'system_head_moved', 'import_busy', 'import_not_started',
+    'import_mismatch', 'store_unsupported', 'prefix_mismatch', 'export_host_mismatch', 'export_refused', 'export_head_invalid',
+    'export_workspace_missing', 'export_capture_failed', 'export_desktop_stop_failed', 'export_staging_space', 'chunk_mismatch',
+    'already_imported', 'not_verified', 'commit_in_progress',
 ] as const;
 export type MigrateConflictReason = typeof MIGRATE_CONFLICT_REASONS[number] | 'other';
+/** Per-action Worker timeouts (REVERSE-MOVE-CONTRACT §4.1): the reverse move's driver starts a call only if it fits its budget. */
+export const MIGRATE_ACTION_TIMEOUT_MS: Readonly<Record<string, number>> = {
+    begin: 120_000, 'import/begin': 60_000, 'import/pull': 40_000, 'import/commit': 30_000, 'import/abort': 60_000,
+};
+const migrateTimeoutMs = (action: string) => MIGRATE_ACTION_TIMEOUT_MS[action] ?? 30_000;
 export type MigrateResult<T> = { ok: true; data: T }
     | { ok: false; error: 'not_found' | 'unavailable' }
     | { ok: false; error: 'conflict'; reason?: MigrateConflictReason };
@@ -3403,7 +3413,7 @@ async function migrateRequest(name: string, action: string, body?: object, gener
                 [CORRELATION_HEADER]: newCorrelationId(),
             },
             ...(body === undefined ? {} : { body: payload }),
-            signal: AbortSignal.timeout(action === 'begin' ? 120_000 : 30_000),
+            signal: AbortSignal.timeout(migrateTimeoutMs(action)),
             cache: 'no-store', redirect: 'error',
         });
         if (!response.ok) {
@@ -3457,6 +3467,50 @@ export function migrateReopen(name: string, input: { expectedMigratedEtag: strin
 export function migrateExportHead(name: string, kind: MigrateKind): Promise<MigrateResult<import('./compute/provider-migrate').SnapshotHead>> {
     return migrateJson(migrateExport(name, kind), d => typeof d.generation === 'string');
 }
+// ── AWS → Cloudflare import (REVERSE-MOVE-CONTRACT §4): the Worker pulls the export host's chunks into R2 ──
+
+/** The export host's status (§2.4), as the Worker forwards it. */
+export interface ReverseExportStatus {
+    state: 'none' | 'capturing' | 'ready' | 'failed';
+    error?: string | null;
+    entries?: number;
+    bytes?: number;
+    skipped?: number;
+}
+/** Every import body binds the move, its import generation, the computer and the export boot's placement counters. */
+export interface ReverseImportBinding {
+    moveId: string;
+    generation: string;
+    computerId: string;
+    placementGeneration: number;
+    leaseEpoch: number;
+}
+const exportStatus = (value: unknown) => !!value && typeof value === 'object' && !Array.isArray(value)
+    && ['none', 'capturing', 'ready', 'failed'].includes((value as { state?: unknown }).state as string);
+const indexList = (value: unknown) => Array.isArray(value) && value.every(i => Number.isInteger(i) && i >= 0 && i < 512);
+/** `import/begin` (§4.2): idempotent for the same move and generation; sends the host its export POST. */
+export function migrateImportBegin(name: string, body: ReverseImportBinding): Promise<MigrateResult<{ ok: true; headKind: 'none' | 'migrated'; export: ReverseExportStatus }>> {
+    return migrateJson(migrateRequest(name, 'import/begin', body), d => d.ok === true && (d.headKind === 'none' || d.headKind === 'migrated')
+        && exportStatus(d.export));
+}
+/** `import/pull` (§4.3): `count: 0` polls; `stored` lists every stored index of the window; `head` once the export is ready. */
+export function migrateImportPull(name: string, body: ReverseImportBinding & { from: number; count: number }): Promise<MigrateResult<{
+    ok: true; export: ReverseExportStatus; head: Record<string, unknown> | null; stored: number[]; next: number | null }>> {
+    return migrateJson(migrateRequest(name, 'import/pull', body), d => d.ok === true && exportStatus(d.export)
+        && (d.head === null || (!!d.head && typeof d.head === 'object' && !Array.isArray(d.head))) && indexList(d.stored)
+        && (d.next === null || (Number.isInteger(d.next) && (d.next as number) >= 0)));
+}
+/** `import/commit` (§4.4): `verifyOnly` in `checking`; the real commit only in `flipping` (the point of no return). */
+export function migrateImportCommit(name: string, body: { moveId: string; generation: string; computerId: string; sha256: string;
+    chunkCount: number; verifyOnly: boolean }): Promise<MigrateResult<{ ok: true; verified?: true; committed?: true; store?: string }>> {
+    return migrateJson(migrateRequest(name, 'import/commit', body), d => d.ok === true
+        && (body.verifyOnly ? d.verified === true : d.committed === true && typeof d.store === 'string'));
+}
+/** `import/abort` (§4.5): idempotent; never touches the host. */
+export function migrateImportAbort(name: string, body: { moveId: string; generation: string; computerId: string }): Promise<MigrateResult<{ ok: true }>> {
+    return migrateJson(migrateRequest(name, 'import/abort', body), d => d.ok === true);
+}
+
 /** Streaming export for the host proxy; generation fences both head and chunk reads. */
 export function migrateExport(name: string, kind: MigrateKind, generation?: string, index?: number): Promise<MigrateResult<Response>> {
     if (!['workspace', 'system'].includes(kind) || (index !== undefined && (!Number.isInteger(index) || index < 0 || index > 511)))

@@ -94,6 +94,21 @@ if [[ $environment == production ]] && ! grep -qx EZIL_AWS_COMPUTERS_ENABLED <<<
     echo 'AWS computer timers stay disabled: EZIL_AWS_COMPUTERS_ENABLED is not set.'
 fi
 printf 'OS_%s_TAG=%s\n' "${environment^^}" "$tag" >compose.env
+# D4: --force-recreate deletes the outgoing web container's json-file log. Keep a gzip copy first
+# (root-only, 7-day retention). Best effort: a snapshot problem never blocks the install.
+snapshot_web_log() {
+    local dir=/var/log/$slug container=$slug-web-1 file
+    file="$dir/web-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+    {
+        install -d -m 0700 "$dir" &&
+            if docker container inspect "$container" >/dev/null 2>&1; then
+                timeout 180 docker logs --timestamps "$container" 2>&1 | gzip >"$file.partial" &&
+                    mv "$file.partial" "$file" && printf 'Web log snapshot: %s\n' "$file"
+            fi
+    } || { rm -f "$file.partial"; printf 'Web log snapshot skipped; install continues\n' >&2; }
+    find "$dir" -maxdepth 1 -type f -name 'web-*.log.gz*' -mmin +10080 -delete 2>/dev/null || true
+}
+snapshot_web_log
 docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120
 for job in "${jobs[@]}"; do
     install -m 0644 "cron/$slug-$job.service" "cron/$slug-$job.timer" /etc/systemd/system/

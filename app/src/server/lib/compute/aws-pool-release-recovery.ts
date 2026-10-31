@@ -9,8 +9,8 @@ import { buildLifecycleWork, currentGenerationIntent, type LifecycleDeployment, 
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, POOL_RELEASED, startLifecycleJob,
     USAGE_OBSERVER, type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
 import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLivePoolRecovery, type Placement } from './placement';
+import { POOL_RELEASE_RECOVERY_PREFIX as PREFIX } from './release-heal';
 
-const PREFIX = 'pool_release_recovery:';
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 type Replay = { intent: LifecycleWork['intent']; stoppedAt: string | null; sourceJobId: string; error: string | null;
     basis?: 'ec2_state_transition' | 'recovery_success' | 'failed_release_termination'; sourceStartedAt?: string; sourceStoppedAt?: string;

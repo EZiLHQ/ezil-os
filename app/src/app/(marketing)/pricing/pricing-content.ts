@@ -5,6 +5,14 @@ export const pricingMetadata = {
     description: 'Start free. Choose longer sessions and a bigger computer when you need them.',
 } as const;
 
+/** A home-page feature tile: a description, or a short badge (none ships today). */
+type MarketingFeature = { readonly title: string; readonly description?: string; readonly badge?: string };
+const features: readonly MarketingFeature[] = [
+    { title: 'A real desktop', description: 'Your files and installed tools stay with your computer between sessions.' },
+    { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
+    { title: 'EZiL AI in Code and Chat', description: 'Every plan comes with AI credits to use in Code and Chat.' },
+];
+
 export const marketingContent = {
     skipLink: 'Skip to content',
     brand: 'EZiL OS',
@@ -14,11 +22,7 @@ export const marketingContent = {
     signInLink: { label: 'Sign in', href: '/login' },
     desktop: { browser: 'Browser', editor: 'VS Code' },
     featuresLabel: 'Your workspace',
-    features: [
-        { title: 'A real desktop', description: 'Your files and installed tools stay with your computer between sessions.' },
-        { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
-        { title: 'AI assistant', badge: 'coming soon' },
-    ],
+    features,
     closing: 'Start building for free',
     seller: 'Sold by EZiL LLC',
     footerLabel: 'Legal and support',
@@ -85,6 +89,10 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
                 {
                     question: 'Why do bigger computers use time faster?',
                     answer: 'Bigger computers use more resources: 4 vCPU counts double and 8 vCPU counts four times toward your monthly time. One hour on 2 vCPU uses one hour of that time; on 4 vCPU it uses two, and on 8 vCPU it uses four. Your choice applies to your next session.',
+                },
+                {
+                    question: 'How much storage do I get?',
+                    answer: `Storage is the disk on your computer. Standard comes with a ${CATALOG_V3.standard_monthly_v3.storageGiB} GB disk and Premium with a ${CATALOG_V3.premium_monthly_v3.storageGiB} GB disk when your computer is first set up. Some space is used by the system. On Free, your files are saved between sessions. Your computer keeps its disk and your files when you change plan or configuration.`,
                 },
             ],
         },

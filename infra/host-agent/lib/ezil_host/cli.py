@@ -79,9 +79,14 @@ RESTARTED_STEPS = ("desktop", "edge", "cloudflared")
 
 
 def refuse_while_stopping(cfg, name):
-    """runDir/stopping: the agent committed to stopping (exit 2 = RestartPreventExitStatus)."""
+    """runDir/stopping: the agent committed to stopping (exit 2 = RestartPreventExitStatus).
+    runDir/export-quiesce (REVERSE-MOVE-CONTRACT §2.5 step 3) refuses the desktop step ONLY: a
+    reverse-move export keeps the desktop down while the edge and cloudflared, which serve its
+    chunks, must still come back after a crash."""
     if os.path.exists(os.path.join(cfg.runDir, desktop.STOPPING)):
         raise Refused(f"{name}_stopping", "the agent is stopping this host")
+    if name == "desktop" and os.path.exists(os.path.join(cfg.runDir, desktop.EXPORT_QUIESCE)):
+        raise Refused("desktop_export_quiesced", "a reverse-move export holds the desktop down")
 
 
 def step(cfg, name, detach=False):

@@ -25,8 +25,10 @@
 //   - Settings accepts `ctx.initialTab` for return links; unavailable tabs
 //     fall back to Account (Computers in local/native mode).
 //   - hash-based routing (`dashboard_initial_route`, `parseDashboardRoute`,
-//     `hashchange`/`popstate` handlers) — this fork does not own the `/os`
-//     address bar, and a Settings window is not a page of its own.
+//     `hashchange`/`popstate` handlers) — a Settings window is not a page of
+//     its own. Its URL, `/app/settings?tab=<tab>`, is written by
+//     `../../app-history.js` (docs/APP-ROUTES.md); this window only reads
+//     `ctx.initialTab` and never touches history.
 //   - the entire socket.io block (upload/download progress, `item.moved`,
 //     `trash.is_empty`, reconnect handling) — no realtime backend; see the
 //     LOCAL CODE ONLY rule this whole shell follows.

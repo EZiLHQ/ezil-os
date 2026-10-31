@@ -1,7 +1,7 @@
 // Shared, document-owned modal lifetime for checkout and billing changes.
 const sheets = new WeakMap();
 
-export function openSheetFrame ({ container, title, role = 'billing-sheet', sheet, onClose, dispose, canDismissBackdrop = () => true, onCompact }) {
+export function openSheetFrame ({ container, title, role = 'billing-sheet', sheet, onClose, dispose, canDismissBackdrop = () => true, canDismiss = () => true, onCompact, closeLabel = 'Close billing sheet' }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -11,7 +11,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     backdrop.className = 'ezil-upgrade-backdrop';
     backdrop.innerHTML = `<div class="ezil-upgrade-sheet" role="dialog" aria-modal="true" tabindex="-1">
         <span data-focus-edge="start" tabindex="0"></span>
-        <button type="button" class="ezil-upgrade-close" data-action="close-sheet" aria-label="Close billing sheet">×</button>
+        <button type="button" class="ezil-upgrade-close" data-action="close-sheet">×</button>
         <div data-role="sheet-content"></div>
         <span data-focus-edge="end" tabindex="0"></span>
     </div>`;
@@ -19,6 +19,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     dialog.dataset.role = role;
     if ( sheet ) dialog.dataset.sheet = sheet;
     dialog.setAttribute('aria-label', title);
+    dialog.querySelector('[data-action="close-sheet"]').setAttribute('aria-label', closeLabel);
     const content = dialog.querySelector('[data-role="sheet-content"]');
     const oldOverflow = doc.body.style.overflow;
     doc.body.style.overflow = 'hidden';
@@ -148,7 +149,8 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         if ( event.key === 'Escape' ) {
             event.preventDefault();
             event.stopImmediatePropagation();
-            close();
+            // A user dismissal (Esc, ×) is refused while the owner says so (a request in flight).
+            if ( canDismiss() ) close();
         } else if ( event.key === 'Tab' ) {
             const elements = focusable();
             if ( event.shiftKey && doc.activeElement === elements[0] ) { event.preventDefault(); focusLast(); }
@@ -213,10 +215,70 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     });
     dialog.querySelector('[data-action="close-sheet"]').addEventListener('click', () => {
         sync();
-        if ( ! portals.length ) close();
+        if ( ! portals.length && canDismiss() ) close();
     });
     refreshCompact();
     sync();
     focusFirst();
     return { handle, close, dialog, content, doc, win, focusFirst, refreshCompact, registerProviderPortals, get closed () { return closed; } };
+}
+
+/**
+ * Round 5 (D6): the confirmation for Switch and Stop, replacing the legacy
+ * UIAlert. The same dark, document-owned frame as the billing sheets: a title,
+ * a short "what happens" list, Cancel and ONE accent primary. Esc, Cancel, ×
+ * and the backdrop decline; none of them dismisses while `onConfirm` runs. The
+ * primary runs `onConfirm` with itself disabled (and `busyLabel` shown) until
+ * it settles, then the sheet closes. Used for Switch, Stop and both Restarts.
+ *
+ * @returns {Promise<boolean>} true once confirmed (after `onConfirm`), false when declined.
+ */
+export function openConfirmSheet ({ container, sheet = 'confirm', title, lines = [], confirmLabel, busyLabel, cancelLabel = 'Cancel', onConfirm }) {
+    return new Promise(resolve => {
+        let confirmed = false;
+        let busy = false;
+        const frame = openSheetFrame({ container, title, role: 'confirm-sheet', sheet, closeLabel: 'Close',
+            canDismissBackdrop: () => ! busy, canDismiss: () => ! busy, onClose: () => { if ( ! confirmed ) resolve(false); } });
+        if ( frame.existing ) { resolve(false); return; }
+        const { doc, content, dialog } = frame;
+        dialog.classList.add('ezil-confirm-sheet');
+        const heading = doc.createElement('h2');
+        heading.textContent = title;
+        const list = doc.createElement('ul');
+        list.className = 'ezil-confirm-lines';
+        for ( const line of lines ) {
+            const item = doc.createElement('li');
+            item.textContent = line;
+            list.append(item);
+        }
+        const actions = doc.createElement('div');
+        actions.className = 'ezil-confirm-actions';
+        const cancel = doc.createElement('button');
+        cancel.type = 'button';
+        cancel.className = 'ezil-settings-btn';
+        cancel.dataset.action = 'cancel';
+        cancel.textContent = cancelLabel;
+        const primary = doc.createElement('button');
+        primary.type = 'button';
+        primary.className = 'ezil-settings-btn ezil-settings-btn-primary';
+        primary.dataset.action = 'confirm';
+        primary.textContent = confirmLabel;
+        actions.append(cancel, primary);
+        content.append(heading, list, actions);
+        cancel.addEventListener('click', () => { if ( ! busy ) frame.close(); });
+        primary.addEventListener('click', async () => {
+            if ( busy || frame.closed ) return;
+            busy = true;
+            confirmed = true;
+            primary.disabled = true;
+            cancel.disabled = true;
+            if ( busyLabel ) primary.textContent = busyLabel;
+            try { await onConfirm?.(); } finally {
+                frame.close();
+                resolve(true);
+            }
+        });
+        // The safe choice takes focus: Enter right after opening never restarts or stops anything.
+        cancel.focus();
+    });
 }

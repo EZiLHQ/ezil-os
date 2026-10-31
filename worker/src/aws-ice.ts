@@ -26,7 +26,7 @@
  * browser-safe set, like Cloudflare. Credentials are never logged, never put in an error,
  * and never returned to a caller of this module except inside the pushed body.
  */
-import { filterBrowserSafeIceServers, type IceServerEntry } from './desktop-mode';
+import { CODE_PREVIEW_PORT, filterBrowserSafeIceServers, type IceServerEntry } from './desktop-mode';
 import { relayOperation, RelayFailure, type RelayState } from './relay-refresh';
 import {
   AWS_DESKTOP_PORT,
@@ -48,6 +48,27 @@ export const ICE_CONTROL_PREFIX = '/__ezil/control/ice/';
 export const DESKTOP_STATUS_PATH = '/__ezil/control/desktop';
 /** The host refuses a bigger body; a Cloudflare TURN answer is ~1 KiB. */
 export const MAX_DESKTOP_CONFIG_BYTES = 16_384;
+/** The host answers its status from the agent within seconds; a hung edge or tunnel must not hold the open. */
+export const AWS_DESKTOP_STATUS_TIMEOUT_MS = 8_000;
+/** code-server's own liveness route (it runs with `--auth none` behind the gateway). */
+export const CODE_HEALTH_PATH = '/healthz';
+/** A Code open asks again within seconds; one probe must not hold it. */
+export const AWS_SURFACE_PROBE_TIMEOUT_MS = 5_000;
+/**
+ * How long a config pushed to a RUNNING desktop may stay unapplied. The host applies it only by
+ * restarting the desktop (agent.py `_accept_relay`), on its next tick (30 s, config.py `idle`),
+ * through the unit's stop (TimeoutStopSec=90) and the desktop step that rebuilds the spec.
+ * Inside the shell's 215 s wake deadline, so the open that waited receives the coded failure.
+ */
+export const AWS_DESKTOP_CONFIG_APPLY_MS = 150_000;
+/** The config push answers within this, or it failed (the host stores it under its lock). */
+export const AWS_DESKTOP_PUSH_TIMEOUT_MS = 8_000;
+/**
+ * How long one ask's claim on that push (`restartPush` with no expiry yet) holds the others
+ * back: its mint (20 s) and push (AWS_DESKTOP_PUSH_TIMEOUT_MS) end well within it. A claim
+ * older than this lost its asker; the next ask claims the push anew.
+ */
+export const AWS_DESKTOP_CONFIG_CLAIM_MS = 40_000;
 const MAX_SERVERS = 8;
 const MAX_URLS = 8;
 const NEKO_VALUE = /^[0-9a-f]{32}$/;
@@ -204,18 +225,20 @@ export interface AwsDesktopStatus {
 export const STALLED_DESKTOP_UNITS: readonly string[] = ['inactive', 'failed'];
 const UNIT_STATE = /^[a-z]{1,16}$/;
 
-/** GW-5 `desktop`: the host's config and desktop state for this epoch. */
+/** GW-5 `desktop`: the host's config and desktop state for this epoch. A read that outlives `timeoutMs` is unreachable. */
 export async function readAwsDesktopStatus(
   record: AwsTunnelRecord,
   zone: string,
   fetchFn: FetchLike,
   nowSeconds: number,
+  timeoutMs = AWS_DESKTOP_STATUS_TIMEOUT_MS,
 ): Promise<AwsDesktopStatus> {
   const { host, key } = originFor(record, zone);
   const header = await signGatewayHeader(key, record, 'GET', DESKTOP_STATUS_PATH, nowSeconds);
   let res: Response;
   try {
-    res = await fetchFn(`https://${host}${DESKTOP_STATUS_PATH}`, { method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header }, redirect: 'manual' });
+    res = await fetchFn(`https://${host}${DESKTOP_STATUS_PATH}`, { method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header },
+      redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
   } catch {
     throw new RelayFailure('aws_desktop_unreachable', 503);
   }
@@ -239,6 +262,31 @@ export async function readAwsDesktopStatus(
     restartsExhausted: d.restartsExhausted === true,
     ...(typeof d.bootId === 'string' && /^[0-9a-f-]{36}$/.test(d.bootId) ? { bootId: d.bootId, aiConfigured: d.aiConfigured === true } : {}),
   };
+}
+
+/**
+ * Whether code-server answers on this computer's origin, whatever neko and its relay are doing:
+ * its own `/healthz` answers a gw1-signed GET on `/__p/8443/healthz` (the host edge answers 502
+ * `desktop_unreachable` while nothing listens). Any failure is "not yet".
+ */
+export async function awsCodeServerAnswers(
+  record: AwsTunnelRecord,
+  zone: string,
+  fetchFn: FetchLike,
+  nowMs: () => number,
+  timeoutMs = AWS_SURFACE_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
+  try {
+    const { host, key } = originFor(record, zone);
+    const path = `/__p/${CODE_PREVIEW_PORT}${CODE_HEALTH_PATH}`;
+    const header = await signGatewayHeader(key, record, 'GET', path, Math.floor(nowMs() / 1000));
+    const res = await fetchFn(`https://${host}${path}`, { method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header },
+      redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    await res.body?.cancel().catch(() => undefined);
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -324,48 +372,15 @@ export async function awsRelayRefresh(p: {
   });
 }
 
-export type AwsDesktopReadiness =
-  | { state: 'starting'; reason: 'config_pushed' | 'restart_scheduled' | 'desktop_starting' }
-  | { state: 'ready'; relay: RelayState };
+export type AwsDesktopStarting = {
+  state: 'starting';
+  reason: 'config_pushed' | 'restart_scheduled' | 'desktop_starting' | 'config_pending';
+};
+/** The config half alone: `applied` = the desktop runs with this epoch's config. */
+export type AwsDesktopConfigReadiness = AwsDesktopStarting | { state: 'applied' };
+export type AwsDesktopReadiness = AwsDesktopStarting | { state: 'ready'; relay: RelayState };
 
-/**
- * How long an accepted AI config push is left to take effect before the open path pushes it
- * again: the host agent restarts its desktop onto a pushed config at its next tick (30 s) and a
- * restart takes up to about a minute. Re-pushing sooner is what G12 measured: every request
- * (one every ~2 s) minted TURN credentials and re-scheduled the restart, and a push landing
- * while the agent was mid-restart scheduled a SECOND restart of a desktop that already had it.
- * Past this, a push is sent again (bounded by the host's own restart limit), so a restart the
- * host never ran (its agent restarted in between) still heals.
- */
-export const AI_PUSH_SETTLE_MS = 90_000;
-
-/**
- * G12: the host still holds exactly the AI config this Worker pushed for its current boot (the
- * same relay expiry, unexpired), pushed less than `AI_PUSH_SETTLE_MS` ago: the desktop restart
- * onto it is the host's to do, and a new push would only schedule another one.
- */
-export function aiPushPending(record: AwsTunnelRecord, status: AwsDesktopStatus, nowMs: number): boolean {
-  const d = record.aiDelivered;
-  return !!d && status.bootId !== undefined && d.bootId === status.bootId && record.aiBootId === status.bootId
-    && status.configured && status.expiresAt !== null && status.expiresAt === d.expiresAt
-    && nowMs >= d.at && nowMs - d.at < AI_PUSH_SETTLE_MS;
-}
-
-/**
- * What an open does for an AWS computer's desktop (mirrors Cloudflare's preview path):
- *   - the host has no usable config for this epoch, or its desktop runs WITHOUT a relay
- *     (it timed out waiting), or it is not running and its unit exited or failed (a crash:
- *     nothing would start it) -> mint once, push, report `starting` (the host restarts it);
- *   - the host's desktop restarts are exhausted -> `aws_desktop_failed` (a clear failure,
- *     never an endless `starting`); a push the host refuses for that reason fails the same way;
- *   - the desktop runs without this boot's AI config -> push it ONCE (per boot and lease epoch,
- *     `aiPushPending`), then `starting` while the host restarts onto it (no mint, no push);
- *   - the desktop is not running yet and its unit is starting -> `starting` (no mint);
- *   - it runs with a relay -> read neko's relay state; renew in place when it expires within
- *     60 s (warm open); report `ready` with the relay state the client renews from.
- * neko still booting (its admin API not answering yet) is `starting`, never an error.
- */
-export async function ensureAwsDesktop(p: {
+export interface AwsDesktopParams {
   record: AwsTunnelRecord;
   zone: string;
   fetch: FetchLike;
@@ -373,45 +388,131 @@ export async function ensureAwsDesktop(p: {
   neko: { user: string; admin: string };
   mint: RelayMint;
   aiConfig?: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
-  /** Records that the host accepted a config carrying `bootId`'s AI token (`aiPushPending`). Best effort. */
-  aiDelivered?: (bootId: string, expiresAt: number) => Promise<void>;
+  /**
+   * The tunnel registry's compare-and-set on this host boot's push to its RUNNING desktop
+   * (aws-tunnels.ts `restartPush`): applies only while the record still shows `expectAt` (the
+   * push this ask read, null for none). No `expiresAt` claims the push; an `expiresAt` records
+   * the config the host holds; `release` drops a failed claim. The record's new time, or null
+   * when another ask got there first. The next asks read it back (`record.restartPush*`).
+   */
+  restartPush?: (bootId: string, expectAt: number | null, next?: { expiresAt?: number; release?: boolean }) => Promise<number | null>;
   budgetMs?: number;
-}): Promise<AwsDesktopReadiness> {
-  const nowS = () => Math.floor(p.nowMs() / 1000);
-  const status = await readAwsDesktopStatus(p.record, p.zone, p.fetch, nowS());
+}
+
+/** Mint once and push this epoch's config (with Chat's AI config when the host reports its boot). */
+async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus): Promise<{ answer: AwsDesktopStarting; expiresAt: number }> {
+  const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
+  if (!minted) throw new RelayFailure('turn_unavailable');
+  const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
+  if (p.aiConfig && status.bootId) config.ai = await p.aiConfig(status.bootId);
+  const bounded: FetchLike = (url, init) => p.fetch(url, { ...init, signal: AbortSignal.timeout(AWS_DESKTOP_PUSH_TIMEOUT_MS) });
+  let res: Response;
+  try {
+    res = await pushAwsDesktopConfig(p.record, p.zone, config, bounded, Math.floor(p.nowMs() / 1000));
+  } catch (error) {
+    if (error instanceof RelayFailure) throw error;
+    throw new RelayFailure('aws_desktop_unreachable', 503);
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch {
+    /* an unreadable answer is a failed push */
+  }
+  if (!res.ok || body.ok !== true) {
+    if (body.error === 'desktop_restart_exhausted') throw new RelayFailure('aws_desktop_failed', 502);
+    throw new RelayFailure(typeof body.error === 'string' && /^[a-z_]{1,64}$/.test(body.error) ? body.error : 'aws_desktop_config_refused', 502);
+  }
+  return { answer: { state: 'starting', reason: body.state === 'restart_scheduled' ? 'restart_scheduled' : 'config_pushed' }, expiresAt: config.expiresAt };
+}
+
+/**
+ * The config half of an open (no relay; the Code and app surfaces answer on `applied`):
+ *   - the host has no usable config for this epoch while its desktop is down, or the desktop is
+ *     not running and its unit exited or failed (a crash: nothing would start it) -> mint once,
+ *     push, report `starting` (the host restarts it);
+ *   - the RUNNING desktop lacks the pushed config (it started without a relay, or without Chat's
+ *     AI env) -> the host can apply a config only by restarting the desktop, and every push
+ *     re-arms that restart (agent.py `_accept_relay`): on 10-30 a push on every ~2 s ask kept a
+ *     computer's desktop restarting and its Code waiting ~2 min. So push ONCE per host boot:
+ *     claim it on the tunnel record first (`restartPush`, compare-and-set, so overlapping asks
+ *     push once between them; a failed push releases the claim), then record the pushed
+ *     config. While a claim is in flight or the host holds exactly that config, later asks answer
+ *     `config_pending` with no mint and no push, and one still unapplied after
+ *     AWS_DESKTOP_CONFIG_APPLY_MS fails with `aws_desktop_config_unapplied`, never an endless
+ *     `starting`. Another fresh config held instead (the Restart route stages its own, with its
+ *     own restart) is recorded in its place and gets its own bound, again without a push. A
+ *     record whose config expired is an earlier episode: push anew. A host that reports no boot
+ *     id (an older AMI) keeps the push on every ask;
+ *   - the desktop is not running yet and holds a fresh config: `starting` (no mint).
+ *     `config_pending` when the AI config still waits for it (this boot's Chat nonce is minted,
+ *     so the held config carries it and the desktop step applies it on start);
+ *   - the host's desktop restarts are exhausted -> `aws_desktop_failed` (a clear failure,
+ *     never an endless `starting`); a push the host refuses for that reason fails the same way.
+ */
+export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDesktopConfigReadiness> {
+  const status = await readAwsDesktopStatus(p.record, p.zone, p.fetch, Math.floor(p.nowMs() / 1000));
   const running = status.desktop === 'running';
   if (!running && status.restartsExhausted) throw new RelayFailure('aws_desktop_failed', 502);
-  const fresh = status.configured && status.expiresAt !== null && status.expiresAt > p.nowMs() + RELAY_MIN_AHEAD_MS;
+  const now = p.nowMs();
+  const fresh = status.configured && status.expiresAt !== null && status.expiresAt > now + RELAY_MIN_AHEAD_MS;
   const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
-  // G12: the AI config alone triggers a push once per boot and lease epoch (the record is this
-  // epoch's), not on every request while the host has not restarted onto it yet.
-  const aiMissing = Boolean(p.aiConfig && status.bootId && !status.aiConfigured);
-  const aiPending = aiMissing && aiPushPending(p.record, status, p.nowMs());
-  const needsAi = aiMissing && !aiPending;
-  if ((!running && (!fresh || stalled)) || (running && status.ice !== 'applied') || needsAi) {
-    const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
-    if (!minted) throw new RelayFailure('turn_unavailable');
-    const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
-    if (p.aiConfig && status.bootId) config.ai = await p.aiConfig(status.bootId);
-    const res = await pushAwsDesktopConfig(p.record, p.zone, config, p.fetch, nowS());
-    let body: Record<string, unknown> = {};
+  const needsAi = !!(p.aiConfig && status.bootId && !status.aiConfigured);
+  if (!running && (!fresh || stalled)) return (await pushDesktopConfig(p, status)).answer;
+  if (running && (status.ice !== 'applied' || needsAi)) {
+    const boot = status.bootId;
+    if (!boot || !p.restartPush) return (await pushDesktopConfig(p, status)).answer;
+    const pending: AwsDesktopStarting = { state: 'starting', reason: 'config_pending' };
+    const { restartPushBootId, restartPushAt, restartPushExpiresAt } = p.record;
+    const seen = restartPushBootId === boot && typeof restartPushAt === 'number' ? restartPushAt : null;
+    // Another ask claimed this boot's push and is pushing it (checked before the held config:
+    // the host still holds the previous one until that push lands).
+    if (seen !== null && restartPushExpiresAt === undefined && now - seen < AWS_DESKTOP_CONFIG_CLAIM_MS) return pending;
+    if (seen !== null && restartPushExpiresAt !== undefined && fresh) {
+      if (status.expiresAt !== restartPushExpiresAt) {
+        // The record's push is not the held one (the Restart route staged its own): adopt that.
+        await p.restartPush(boot, seen, { expiresAt: status.expiresAt! }).catch(() => null);
+        return pending;
+      }
+      if (now - seen >= AWS_DESKTOP_CONFIG_APPLY_MS) throw new RelayFailure('aws_desktop_config_unapplied', 502);
+      return pending;
+    }
+    // Claim the push before pushing, so overlapping asks (Code, the desktop window, retries)
+    // push once between them. A registry that does not answer leaves today's behaviour: push.
+    const claim = await p.restartPush(boot, seen).catch(() => undefined);
+    if (claim === null) return pending;
+    let pushed: Awaited<ReturnType<typeof pushDesktopConfig>>;
     try {
-      body = (await res.json()) as Record<string, unknown>;
-    } catch {
-      /* an unreadable answer is a failed push */
+      pushed = await pushDesktopConfig(p, status);
+    } catch (error) {
+      // A failed mint or a refused push leaves nothing to wait for: the next ask tries again. A
+      // push whose answer never came may have landed (and armed the restart): keep its claim,
+      // which lapses after AWS_DESKTOP_CONFIG_CLAIM_MS, so a slow host is pushed once per window.
+      const landed = error instanceof RelayFailure && error.code === 'aws_desktop_unreachable';
+      if (claim !== undefined && !landed) await p.restartPush(boot, claim, { release: true }).catch(() => null);
+      throw error;
     }
-    if (!res.ok || body.ok !== true) {
-      if (body.error === 'desktop_restart_exhausted') throw new RelayFailure('aws_desktop_failed', 502);
-      throw new RelayFailure(typeof body.error === 'string' && /^[a-z_]{1,64}$/.test(body.error) ? body.error : 'aws_desktop_config_refused', 502);
-    }
-    // Only an ACCEPTED push counts as delivered; failing to record it costs one more push, never the open.
-    if (config.ai && status.bootId) await p.aiDelivered?.(status.bootId, config.expiresAt).catch(() => undefined);
-    return { state: 'starting', reason: body.state === 'restart_scheduled' ? 'restart_scheduled' : 'config_pushed' };
+    // A lost record costs at most another push on a later ask (today's behaviour), never this open.
+    await p.restartPush(boot, claim ?? seen, { expiresAt: pushed.expiresAt }).catch(() => null);
+    return pushed.answer;
   }
-  if (!running) return { state: 'starting', reason: 'desktop_starting' };
-  // The running desktop predates the AI config we delivered and the host restarts it onto that
-  // config: still starting (as every re-push used to answer), never `ready` on a desktop about to restart.
-  if (aiPending) return { state: 'starting', reason: 'restart_scheduled' };
+  if (!running) {
+    if (!needsAi) return { state: 'starting', reason: 'desktop_starting' };
+    return p.record.aiBootId === status.bootId ? { state: 'starting', reason: 'config_pending' } : (await pushDesktopConfig(p, status)).answer;
+  }
+  return { state: 'applied' };
+}
+
+/**
+ * What an open does for an AWS computer's desktop (mirrors Cloudflare's preview path): the
+ * config half (`ensureAwsDesktopConfig`), then, once the desktop runs with it, read neko's relay
+ * state; renew in place when it expires within 60 s (warm open); report `ready` with the relay
+ * state the client renews from. neko still booting (its admin API not answering yet) is
+ * `starting`, never an error.
+ */
+export async function ensureAwsDesktop(p: AwsDesktopParams): Promise<AwsDesktopReadiness> {
+  const config = await ensureAwsDesktopConfig(p);
+  if (config.state !== 'applied') return config;
   try {
     let relay = await awsRelayRefresh({ record: p.record, zone: p.zone, fetch: p.fetch, nowMs: p.nowMs, admin: p.neko.admin, budgetMs: p.budgetMs });
     if (relay.expiresAt <= p.nowMs() + RELAY_RENEW_WITHIN_MS) {

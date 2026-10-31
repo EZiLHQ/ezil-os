@@ -532,7 +532,9 @@ describe('routers: AWS previews use their own Worker route', () => {
         expect(fake.statements.every((s) => s.sql.includes('placement:read') || s.sql.includes('placement:usage-month')
             // The image-job reservation check (rebase contract §8) is a read too.
             || s.sql.includes('placement:image-reservation')
-            || (s.sql.startsWith('SELECT') && s.sql.includes('FROM public.ezil_compute_migrations')))).toBe(true);
+            || (s.sql.startsWith('SELECT') && s.sql.includes('FROM public.ezil_compute_migrations'))
+            // Phase B (REVERSE-MOVE-CONTRACT §5.3): routing's 0012 probe for an aws-ec2 placement, a read.
+            || s.sql.startsWith("SELECT to_regclass('public.ezil_compute_reverse_moves')"))).toBe(true);
     });
 
     it('status reports the AWS lifecycle state, no Worker call', async () => {
@@ -711,6 +713,67 @@ describe('Codex 4277613545: the shell stop of an AWS computer answers only a CON
         const moved = scripted({ ok: false, terminated: false, outcome: 'stopping' }, ['UNCONFIRMED']);
         expect(await confirmAwsStop(moved.provider, { correlationId: 'c' }, computer, moved.clock))
             .toEqual({ ok: false, terminated: false, outcome: 'placement_unconfirmed', error: 'placement_unconfirmed' });
+    });
+
+    describe('round 5 D2: a failed pool release being healed is still this stop', () => {
+        /** Status looks that carry the placement-only heal state, as aws-ec2 `status` reports it. */
+        function healing(states: [string, ('pending' | 'failed')?][], first = { ok: false, terminated: false, outcome: 'stopping' }) {
+            const looks: string[] = [];
+            const provider = {
+                kind: 'aws-ec2',
+                stop: vi.fn(async () => first),
+                status: vi.fn(async () => {
+                    const [s, heal] = states.shift() ?? ['UNCONFIRMED', 'pending'];
+                    looks.push(heal ? `${s}:${heal}` : s);
+                    return { ok: s === 'STOPPED' || s === 'STOPPING' || s === 'DRAINING', placementState: s, ...(heal ? { releaseHeal: heal } : {}) };
+                }),
+            } as never;
+            let t = 0;
+            return { provider, looks, clock: { now: () => t, sleep: async (ms: number) => { t += ms; } } };
+        }
+        it('keeps polling through UNCONFIRMED/RECOVERING while the heal is pending, then answers destroyed', async () => {
+            const { provider, looks, clock } = healing([['DRAINING'], ['UNCONFIRMED', 'pending'], ['RECOVERING', 'pending'], ['STOPPED']]);
+            expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 200_000, pollMs: 5_000 }))
+                .toEqual({ ok: true, terminated: true, outcome: 'destroyed' });
+            expect(looks).toEqual(['DRAINING', 'UNCONFIRMED:pending', 'RECOVERING:pending', 'STOPPED']);
+        });
+        it('a heal that fails answers release_heal_failed (never placement_unconfirmed)', async () => {
+            const { provider, clock } = healing([['UNCONFIRMED', 'pending'], ['UNCONFIRMED', 'failed']]);
+            expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, clock))
+                .toEqual({ ok: false, terminated: false, outcome: 'release_heal_failed', error: 'release_heal_failed' });
+        });
+        it('the budget runs out while healing: a stopping outcome (stop_healing), never a false success', async () => {
+            const { provider, looks, clock } = healing([]);
+            expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 20_000, pollMs: 5_000 }))
+                .toEqual({ ok: false, terminated: false, outcome: 'stop_healing' });
+            expect(looks).toHaveLength(4);
+        });
+        it.each([['placement_unconfirmed', 'UNCONFIRMED'], ['placement_recovering', 'RECOVERING']])(
+            'a Stop pressed while the heal is already under way (%s) waits through it too', async (outcome, state) => {
+                const { provider, looks, clock } = healing([[state, 'pending'], [state, 'pending'], ['STOPPED']], { ok: false, terminated: false, outcome });
+                expect(await confirmAwsStop(provider, { correlationId: 'c' }, computer, { ...clock, budgetMs: 200_000, pollMs: 5_000 }))
+                    .toEqual({ ok: true, terminated: true, outcome: 'destroyed' });
+                expect(looks).toEqual([`${state}:pending`, `${state}:pending`, 'STOPPED']);
+            });
+        it('a Stop pressed mid-heal whose budget runs out answers stop_healing; a row with no heal (or a failed one) keeps the refusal, one look', async () => {
+            const stuck = healing([], { ok: false, terminated: false, outcome: 'placement_unconfirmed' });
+            expect(await confirmAwsStop(stuck.provider, { correlationId: 'c' }, computer, { ...stuck.clock, budgetMs: 20_000, pollMs: 5_000 }))
+                .toEqual({ ok: false, terminated: false, outcome: 'stop_healing' });
+            for (const look of [['UNCONFIRMED'], ['UNCONFIRMED', 'failed'], ['RECOVERING']] as [string, ('pending' | 'failed')?][]) {
+                const first = { ok: false, terminated: false, outcome: `placement_${look[0].toLowerCase()}` };
+                const h = healing([look], first);
+                expect(await confirmAwsStop(h.provider, { correlationId: 'c' }, computer, h.clock)).toEqual(first);
+                expect(h.looks).toHaveLength(1);
+            }
+        });
+        it('UNCONFIRMED or RECOVERING with no heal is the unchanged failure', async () => {
+            const a = healing([['UNCONFIRMED']]);
+            expect(await confirmAwsStop(a.provider, { correlationId: 'c' }, computer, a.clock))
+                .toEqual({ ok: false, terminated: false, outcome: 'placement_unconfirmed', error: 'placement_unconfirmed' });
+            const b = healing([['UNCONFIRMED', 'pending'], ['RECOVERING']]);
+            expect(await confirmAwsStop(b.provider, { correlationId: 'c' }, computer, b.clock))
+                .toEqual({ ok: false, terminated: false, outcome: 'placement_recovering', error: 'placement_recovering' });
+        });
     });
 
     it('the shell route asks for the confirmed stop', () => {

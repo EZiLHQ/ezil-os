@@ -471,10 +471,19 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         },
 
         async setCancelAtPeriodEnd(input) {
-            const subscription = await request<SubscriptionResponse>(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, {
+            const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
+            const subscription = await request<SubscriptionResponse>(path, {
                 cancel_at_period_end: input.cancel,
             }, input.idempotencyKey);
-            return { cancelsAt: input.cancel ? date(subscription.cancel_at) ?? date(subscription.items?.data[0]?.current_period_end) : null };
+            if (input.cancel) return { cancelsAt: date(subscription.cancel_at) ?? date(subscription.items?.data[0]?.current_period_end) };
+            // Round 6 review (R4-04): retrieveSubscription reads a dated cancel (`cancel_at`, e.g. the Dashboard's
+            // custom date) as a cancel at period end, so Billing offers Resume. Its flag is already false, so when
+            // the answer still carries a cancel_at it is unset explicitly (Stripe's empty-string unset); a resume
+            // that leaves one is refused, never reported as resumed.
+            if (typeof subscription.cancel_at !== 'number') return { cancelsAt: null };
+            const cleared = await request<SubscriptionResponse>(path, { cancel_at: '' }, `${input.idempotencyKey}:cancel_at`);
+            if (typeof cleared.cancel_at === 'number') throw new BillingProviderError('invalid_subscription_state');
+            return { cancelsAt: null };
         },
 
         async createCustomer(input) {
@@ -582,6 +591,22 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             return { id: session.id, url: session.url ?? null, clientSecret: session.client_secret ?? null };
         },
 
+        async listCustomerSubscriptions(customerId) {
+            // `status=all`: the default list omits canceled ones only; the caller decides which statuses block.
+            return (await listAll<{ id: string; status: string }>('/subscriptions', { customer: customerId, status: 'all' }))
+                .map(subscription => ({ id: subscription.id, status: subscription.status }));
+        },
+
+        async listOpenCheckoutSessions(customerId) {
+            return (await listAll<{ id: string; mode: string }>('/checkout/sessions', { customer: customerId, status: 'open' }))
+                .map(session => ({ id: session.id, mode: session.mode }));
+        },
+
+        async expireCheckoutSession(id) {
+            // An empty form makes this a POST (undefined fields mean GET).
+            await request(`/checkout/sessions/${encodeURIComponent(id)}/expire`, {});
+        },
+
         async listInvoices(customerId, limit) {
             const query = new URLSearchParams({ customer: customerId, limit: String(limit) });
             const invoices = await request<{ data: InvoiceSummaryResponse[] }>(`/invoices?${query}`);
@@ -621,13 +646,19 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const sku = itemOffer?.sku ?? (metadataSku && !metadataSku.endsWith('_v3') && offerBySku(metadataSku) ? metadataSku : null);
             const offer = sku ? offerBySku(sku) : undefined;
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
+            const periodEnd = item?.current_period_end ?? subscription.current_period_end;
+            // Round 6 (R4-04): a cancel scheduled as a date (`cancel_at`, e.g. the Dashboard's custom date) at or
+            // before the period end ends the plan, so it is a cancel at period end (plan_ending), not a renewal.
+            // A cancel_at earlier than the period end still shows the period end as the end date (no stored column;
+            // a known gap until a later migration stores the dated cancel). Resume unsets it (setCancelAtPeriodEnd).
+            const datedCancel = typeof subscription.cancel_at === 'number' && typeof periodEnd === 'number' && subscription.cancel_at <= periodEnd;
             return {
                 id: subscription.id,
                 customer: requiredCustomer(subscription.customer),
                 status: subscription.status,
-                cancelAtPeriodEnd: subscription.cancel_at_period_end,
+                cancelAtPeriodEnd: subscription.cancel_at_period_end || datedCancel,
                 currentPeriodStart: date(item?.current_period_start ?? subscription.current_period_start),
-                currentPeriodEnd: date(item?.current_period_end ?? subscription.current_period_end),
+                currentPeriodEnd: date(periodEnd),
                 sku,
                 items,
                 pendingUpdateExpiresAt: date(subscription.pending_update?.expires_at),

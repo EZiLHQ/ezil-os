@@ -95,6 +95,19 @@ describe('Auth0 bridge AI enrollment boundary', () => {
         }
     });
 
+    // Review fix (r5 L1): the email confirm must never run for an account whose stored subject belongs
+    // to another EZiL ID identity, so the conflict fixture here is unconfirmed (the confirm branch is live).
+    it.each([['null', null], ['missing', undefined]] as const)
+    ('never confirms the email of a conflicting account (email_confirmed_at %s)', async (_name, confirmedAt) => {
+        stub.listUsers.mockResolvedValue({ data: { users: [{
+            ...user, email_confirmed_at: confirmedAt, app_metadata: { auth0_sub: 'auth0|another' },
+        }] }, error: null });
+        await expect(bridgeAuth0Identity(identity)).rejects.toMatchObject({ code: 'account_conflict' });
+        for (const fn of [stub.createUser, stub.updateUserById, stub.enroll, stub.generateLink, stub.verifyOtp]) {
+            expect(fn).not.toHaveBeenCalled();
+        }
+    });
+
     it.each(['listUsers', 'createUser', 'updateUserById'] as const)('does not enroll after %s fails', async method => {
         if (method === 'updateUserById') stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, app_metadata: {} }] }, error: null });
         stub[method].mockResolvedValue({ data: null, error: { message: 'provider fixture failure' } });
@@ -122,5 +135,41 @@ describe('Auth0 bridge AI enrollment boundary', () => {
         await expect(bridgeAuth0Identity(identity)).rejects.toThrow(/^session_failed$/);
         expect(stub.enroll).toHaveBeenCalledOnce();
         expect(stub.signOut).toHaveBeenCalledExactlyOnceWith({ scope: 'local' });
+    });
+});
+
+describe('round 5 D1: the bridge confirms an unconfirmed Supabase email that Auth0 verified', () => {
+    it.each([['missing', undefined], ['null', null]] as const)('confirms before enrolling when email_confirmed_at is %s', async (_name, confirmedAt) => {
+        const unconfirmed = { ...user, email_confirmed_at: confirmedAt };
+        stub.listUsers.mockResolvedValue({ data: { users: [unconfirmed] }, error: null });
+        await bridgeAuth0Identity(identity);
+        expect(stub.updateUserById).toHaveBeenCalledExactlyOnceWith(user.id, { email_confirm: true });
+        expect(stub.updateUserById.mock.invocationCallOrder[0]).toBeLessThan(stub.enroll.mock.invocationCallOrder[0]);
+        expect(stub.verifyOtp).toHaveBeenCalledOnce();
+    });
+    it('links the subject and then confirms the email for an unlinked unconfirmed account', async () => {
+        stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, email_confirmed_at: null, app_metadata: {} }] }, error: null });
+        await bridgeAuth0Identity(identity);
+        expect(stub.updateUserById.mock.calls).toEqual([
+            [user.id, { app_metadata: { auth0_sub: identity.sub } }], [user.id, { email_confirm: true }]]);
+        expect(stub.updateUserById.mock.invocationCallOrder[1]).toBeLessThan(stub.enroll.mock.invocationCallOrder[0]);
+    });
+    it('never confirms an already confirmed or newly created account', async () => {
+        stub.listUsers.mockResolvedValue({ data: { users: [user] }, error: null });
+        await bridgeAuth0Identity(identity);
+        stub.listUsers.mockResolvedValue({ data: { users: [] }, error: null });
+        await bridgeAuth0Identity(identity);
+        expect(stub.updateUserById).not.toHaveBeenCalled();
+    });
+    it.each(['error', 'throw'] as const)('a confirmation %s is best effort: fixed warning, enrollment and session still run', async failure => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, email_confirmed_at: null }] }, error: null });
+        if (failure === 'error') stub.updateUserById.mockResolvedValue({ data: { user: null }, error: { message: 'private provider detail' } });
+        else stub.updateUserById.mockRejectedValue(new Error('private provider detail'));
+        await expect(bridgeAuth0Identity(identity)).resolves.toBeUndefined();
+        expect(stub.enroll).toHaveBeenCalledOnce();
+        expect(stub.verifyOtp).toHaveBeenCalledOnce();
+        expect(warn.mock.calls).toEqual([['[auth0] email confirmation unavailable']]);
+        warn.mockRestore();
     });
 });

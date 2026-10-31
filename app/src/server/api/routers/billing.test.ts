@@ -15,13 +15,24 @@ import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
+const auth0 = vi.hoisted(() => ({ enabled: vi.fn(() => true) }));
+vi.mock('@/server/auth/auth0', () => ({ auth0Enabled: auth0.enabled }));
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
 vi.mock('@/server/billing/deps', () => ({
     getBillingDeps: () => { throw new Error('Tests must inject billing ports'); },
 }));
+// Round 5 D3: the router's DEFAULT volume reader goes through the app's EC2 collaborators. The describer is a
+// fake; by default it knows no volume (null), which is the AWS-off answer, so every other case keeps the fallback.
+const awsDescribeVolume = vi.hoisted(() => vi.fn<(region: string, volumeId: string) => Promise<{ sizeGiB?: number } | null>>(async () => null));
+vi.mock('@/server/lib/compute/aws-clients', async importOriginal => ({
+    ...await importOriginal<typeof import('@/server/lib/compute/aws-clients')>(),
+    sharedAwsSdkCollaborators: () => ({ describer: { describeVolume: awsDescribeVolume } }),
+}));
 
-import { createBillingRouter, userPlacementProvider } from './billing';
+import { createBillingRouter, createVolumeSizeReader, userPlacement, userPlacementProvider, type UserPlacement } from './billing';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 
 const now = new Date('2026-10-11T12:00:00Z');
 const sku = 'standard_monthly_v3';
@@ -148,6 +159,9 @@ function fixture() {
             id: session.id, url: input.uiMode === 'hosted' ? 'https://checkout.example/session' : null,
             clientSecret: input.uiMode === 'embedded' ? 'cs_fixture_secret_fixture' : null,
         })),
+        listCustomerSubscriptions: vi.fn<StripeApi['listCustomerSubscriptions']>().mockResolvedValue([]),
+        listOpenCheckoutSessions: vi.fn<StripeApi['listOpenCheckoutSessions']>().mockResolvedValue([]),
+        expireCheckoutSession: vi.fn<StripeApi['expireCheckoutSession']>().mockResolvedValue(undefined),
         listInvoices: vi.fn<StripeApi['listInvoices']>(async () => [{ ...invoice }]),
         createPortalSession: vi.fn(async () => ({ url: 'https://billing.example/portal' })),
         retrieveCheckoutSession: vi.fn(async () => ({ ...session })),
@@ -169,7 +183,8 @@ function fixture() {
         headers: new Headers({ origin: 'https://os.ezil.work' }),
         user: { id: userId, email: 'fixture@example.org', aud: 'authenticated', app_metadata: {}, user_metadata: {}, created_at: now.toISOString() },
     };
-    const router = createBillingRouter(() => deps);
+    // Round 5 D1: the fixture user is a Gateway member unless a test says otherwise.
+    const router = createBillingRouter(() => deps, { aiMember: async () => 'works-member-fixture' });
     return { deps, store, stripe, ctx, router, changes, caller: router.createCaller(ctx) };
 }
 
@@ -312,6 +327,70 @@ describe('billing router', () => {
         await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
         expect(f.stripe.createCustomer).not.toHaveBeenCalled();
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    // Promotion review (double subscription): the local plan lags Stripe until the webhook lands.
+    it.each(['active', 'trialing', 'past_due', 'incomplete', 'unpaid', 'paused', 'unrecognized'])(
+        'refuses checkout when Stripe lists a %s subscription the local plan does not show yet', async status => {
+            const f = fixture();
+            await f.store.linkCustomer(userId, 'cus_fixture');
+            const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+            f.stripe.listCustomerSubscriptions.mockResolvedValueOnce([{ id: 'sub_canceled', status: 'canceled' }, { id: 'sub_live', status }]);
+            await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+            expect(f.stripe.listCustomerSubscriptions).toHaveBeenCalledExactlyOnceWith('cus_fixture');
+            expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(log).not.toHaveBeenCalled();
+            // Positive control: only ended subscriptions → checkout proceeds for the same customer.
+            f.stripe.listCustomerSubscriptions.mockResolvedValueOnce([{ id: 'sub_canceled', status: 'canceled' }, { id: 'sub_expired', status: 'incomplete_expired' }]);
+            await checkoutControl(f);
+            expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ customerId: 'cus_fixture' }));
+        });
+
+    it('expires the customer\'s other open subscription Checkout Sessions before the subscription check and the new session', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.stripe.listOpenCheckoutSessions.mockResolvedValueOnce([
+            { id: 'cs_old_window', mode: 'subscription' }, { id: 'cs_topup', mode: 'payment' }, { id: 'cs_older_window', mode: 'subscription' },
+        ]);
+        await checkoutControl(f);
+        expect(f.stripe.listOpenCheckoutSessions).toHaveBeenCalledExactlyOnceWith('cus_fixture');
+        // A top-up (payment mode) session is not a subscription and stays payable.
+        expect(f.stripe.expireCheckoutSession.mock.calls).toEqual([['cs_old_window'], ['cs_older_window']]);
+        const order = (mock: { mock: { invocationCallOrder: number[] } }) => mock.mock.invocationCallOrder;
+        expect(Math.max(...order(f.stripe.expireCheckoutSession))).toBeLessThan(order(f.stripe.listCustomerSubscriptions)[0]!);
+        expect(order(f.stripe.listCustomerSubscriptions)[0]).toBeLessThan(order(f.stripe.createCheckoutSession)[0]!);
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+    });
+
+    it.each(['list sessions', 'expire', 'list subscriptions'] as const)('refuses checkout (stripe_unavailable) when the %s guard call fails', async step => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const error = new StripeRequestError(step === 'expire' ? 400 : 503, null, 'invalid_request_error', null, 'private detail');
+        if (step === 'list sessions') f.stripe.listOpenCheckoutSessions.mockRejectedValueOnce(error);
+        else f.stripe.listOpenCheckoutSessions.mockResolvedValueOnce([{ id: 'cs_old_window', mode: 'subscription' }]);
+        if (step === 'expire') f.stripe.expireCheckoutSession.mockRejectedValueOnce(error);
+        if (step === 'list subscriptions') f.stripe.listCustomerSubscriptions.mockRejectedValueOnce(error);
+        await domainFailure(() => f.caller.createCheckout({ sku }), 'stripe_unavailable');
+        expect(log).toHaveBeenCalledExactlyOnceWith('Billing Stripe unavailable');
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        if (step !== 'list subscriptions') expect(f.stripe.listCustomerSubscriptions).not.toHaveBeenCalled();
+        // Positive control: the next attempt, with Stripe answering, proceeds.
+        await checkoutControl(f);
+    });
+
+    it('creates a first customer\'s checkout without the Stripe subscription guard, then guards that customer', async () => {
+        const f = await checkoutControl();
+        expect(f.stripe.createCustomer).toHaveBeenCalledTimes(1);
+        expect(f.stripe.listOpenCheckoutSessions).not.toHaveBeenCalled();
+        expect(f.stripe.listCustomerSubscriptions).not.toHaveBeenCalled();
+        expect(f.stripe.expireCheckoutSession).not.toHaveBeenCalled();
+        await expect(f.caller.createCheckout({ sku })).resolves.toMatchObject({ mode: 'redirect', sessionId: session.id });
+        expect(f.stripe.createCustomer).toHaveBeenCalledTimes(1);
+        expect(f.stripe.listOpenCheckoutSessions).toHaveBeenCalledExactlyOnceWith('cus_fixture');
+        expect(f.stripe.listCustomerSubscriptions).toHaveBeenCalledExactlyOnceWith('cus_fixture');
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(2);
     });
 
     it('creates and links the customer once, using session identity and distinct checkout keys', async () => {
@@ -1093,6 +1172,55 @@ describe('v3-only sales and renewal', () => {
         expect(preview).not.toHaveBeenCalled();
         expect(log).toHaveBeenCalledWith('Billing renewal preview unavailable');
     });
+
+    // Promotion review: operator-granted rows (op_…, no Stripe subscription) are standard_monthly_v3, active, and
+    // may cancel at period end. Each Stripe-backed handler used to read Stripe for 'op_…' and fail stripe_unavailable.
+    const operatorId = 'op_canary_b91f424a_20261031';
+    const operatorCalls = {
+        preview: (f: Fixture) => f.caller.previewUpgrade(toCompute),
+        confirm: (f: Fixture) => f.caller.confirmUpgrade(confirmInput),
+        downgrade: (f: Fixture) => f.caller.scheduleDowngrade(toStandard),
+        cancel: (f: Fixture) => f.caller.cancelAtPeriodEnd({ cancel: true }),
+        resume: (f: Fixture) => f.caller.cancelAtPeriodEnd({ cancel: false }),
+        portal: (f: Fixture) => f.caller.portal(),
+    };
+    it.each([
+        ['preview', sku, false, 'upgrade_not_allowed'], ['confirm', sku, false, 'upgrade_not_allowed'],
+        ['downgrade', 'premium_monthly_v3', false, 'downgrade_not_allowed'], ['cancel', sku, false, 'not_subscribed'],
+        ['resume', sku, true, 'not_subscribed'], ['portal', sku, true, 'not_subscribed'],
+    ] as const)('%s on an operator-granted %s row refuses before any Stripe call or store write (cancel at period end: %s)', async (name, planSku, cancelAtPeriodEnd, code) => {
+        const f = await paidFixture(planSku);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: planSku, stripeSubscriptionId: operatorId, cancelAtPeriodEnd })]);
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        await domainFailure(() => operatorCalls[name](f), code);
+        for (const [method, mock] of Object.entries(f.stripe)) expect(mock, method).not.toHaveBeenCalled();
+        expect(f.store.recordPlanChange).not.toHaveBeenCalled();
+        expect(f.store.setPlanChangeState).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        // Positive control: the same row with a Stripe id reaches Stripe.
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: planSku, cancelAtPeriodEnd })]);
+        await operatorCalls[name](f);
+        expect(f.stripe.retrieveSubscription).toHaveBeenCalledWith('sub_fixture');
+    });
+
+    it('summarises an operator-granted row with every Stripe-backed action off and no Stripe read', async () => {
+        const f = await paidFixture();
+        const preview = vi.fn<NonNullable<StripeApi['previewRenewal']>>().mockResolvedValue({ at: new Date('2026-10-20T00:00:00Z'), amountCents: 1734 });
+        f.deps.stripe = { ...f.stripe, previewRenewal: preview };
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        for (const cancelAtPeriodEnd of [false, true]) {
+            f.store.subscriptionsFor.mockResolvedValue([subscription({ stripeSubscriptionId: operatorId, cancelAtPeriodEnd })]);
+            expect(await f.caller.summary()).toMatchObject({ plan: { sku, status: cancelAtPeriodEnd ? 'cancels' : 'active', renewal: null },
+                actions: { checkout: false, upgrade: false, downgrade: false, cancel: false, portal: false } });
+        }
+        expect(preview).not.toHaveBeenCalled();
+        expect(f.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        // Positive control: a Stripe subscription row offers them and previews its renewal.
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        expect(await f.caller.summary()).toMatchObject({ actions: { upgrade: true, cancel: true, portal: true } });
+        expect(preview).toHaveBeenCalledExactlyOnceWith('sub_fixture');
+    });
 });
 
 
@@ -1145,9 +1273,10 @@ describe('billing.usage read-only boundary', () => {
         const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('No external calls allowed'));
         const result = await f.caller.usage();
         expect(result).toMatchObject({ enabled: true, version: 1, egress: { state: 'unavailable', usedBytes: null } });
-        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference'] as const)
+        // Round 6: open payment issues too, so usage derives the same standing as the summary (the D16 hold).
+        for (const name of ['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference', 'openPaymentIssues'] as const)
             expect(f.store[name].mock.calls[0][0]).toBe(userId);
-        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference']);
+        const reads = new Set(['subscriptionsFor', 'userCreatedAt', 'epochsFor', 'grantsForPeriod', 'latestStorageFor', 'overageInvoicesFor', 'sizePreference', 'openPaymentIssues']);
         for (const [name, method] of Object.entries(f.store)) if (!reads.has(name)) expect(method).not.toHaveBeenCalled();
         for (const method of Object.values(f.stripe)) expect(method).not.toHaveBeenCalled();
         expect(fetch).not.toHaveBeenCalled();
@@ -1262,5 +1391,425 @@ describe('round 4: the computer standing in the summary', () => {
         execute.mockRejectedValueOnce(new Error('relation missing'));
         await expect(userPlacementProvider({ execute }, userId)).resolves.toBeNull();
         expect(warn).toHaveBeenCalledWith('[billing.summary] placement unavailable');
+    });
+});
+
+describe('round 5 D1: summary enrollment state and top-up gating', () => {
+    const link = '/auth/auth0/login?returnUrl=/os';
+    function enrolling(member: string | null | Error, sub?: unknown) {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        const aiMember = vi.fn(async () => { if (member instanceof Error) throw member; return member; });
+        const ctx = { ...f.ctx, user: { ...f.ctx.user!, app_metadata: sub === undefined ? {} : { auth0_sub: sub } } };
+        const caller = createBillingRouter(() => f.deps, { aiMember }).createCaller(ctx);
+        return { ...f, ctx, aiMember, caller };
+    }
+    afterEach(() => { auth0.enabled.mockReset(); auth0.enabled.mockReturnValue(true); });
+
+    it('needs_ezil_id: no Gateway member and no stored EZiL ID; CTA link, no top-up', async () => {
+        const f = enrolling(null);
+        const summary = await f.caller.summary();
+        expect(f.aiMember).toHaveBeenCalledWith(f.ctx.db, userId);
+        expect(summary).toMatchObject({ ai: { enrollment: 'needs_ezil_id' }, actions: { topup: false, ezilId: link } });
+    });
+    it('needs_ezil_id with EZiL ID sign-in off has no link', async () => {
+        auth0.enabled.mockReturnValue(false);
+        expect(await enrolling(null, '').caller.summary()).toMatchObject({ ai: { enrollment: 'needs_ezil_id' }, actions: { topup: false, ezilId: null } });
+    });
+    it('activating: a stored EZiL ID subject without a member yet', async () => {
+        expect(await enrolling(null, 'auth0|stored').caller.summary()).toMatchObject({
+            ai: { enrollment: 'activating' }, actions: { topup: false, ezilId: null } });
+    });
+    it('enrolled: a Works member (even without a stored subject, e.g. operator-seeded)', async () => {
+        expect(await enrolling('works-member').caller.summary()).toMatchObject({
+            ai: { enrollment: 'enrolled', waiting: null }, actions: { topup: true, ezilId: null } });
+    });
+    it('sums waiting credits from undelivered, unexpired stored receipts', async () => {
+        const f = enrolling(null);
+        const receiptsFor = vi.fn(async () => [
+            { entitlementId: `ezil-os:v1:free-once:${userId}`, credits: 100, expiresAt: '2027-10-01T00:00:00.000Z', deliveredAt: null },
+            { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-10-01T00:00:00.000Z', credits: 200, expiresAt: '2027-10-01T00:00:00.000Z', deliveredAt: '2026-10-02T00:00:00.000Z' },
+        ]);
+        f.deps.aiCredits = { claim: vi.fn(), accountFor: vi.fn(), pinAccount: vi.fn(), finish: vi.fn(), receiptsFor };
+        expect((await f.caller.summary() as { ai: { waiting: unknown } }).ai.waiting).toEqual({ credits: 100 });
+    });
+    it('a member lookup failure keeps the enrolled default with a fixed warning (no false CTA, top-up unchanged)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const f = enrolling(new Error('postgres://private:secret@host'));
+        expect(await f.caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true, ezilId: null } });
+        expect(warn).toHaveBeenCalledWith('[billing.ai] enrollment state unavailable');
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('secret');
+        warn.mockRestore();
+    });
+    it('a database without the Works member view keeps the enrolled default silently (enrollment does not apply there)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const f = enrolling(Object.assign(new Error('relation "ezil_works.ai_members" does not exist'), { code: '42P01' }));
+        expect(await f.caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true, ezilId: null } });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 })).resolves.toMatchObject({ sessionId: session.id });
+        expect(warn).not.toHaveBeenCalledWith('[billing.ai] enrollment state unavailable');
+        warn.mockRestore();
+    });
+    it('the default member lookup is strict: a missing view is not read as "no member"', async () => {
+        const f = fixture();
+        const execute = vi.fn(async () => { throw Object.assign(new Error('missing'), { code: '42P01' }); });
+        const caller = createBillingRouter(() => f.deps).createCaller({ ...f.ctx, db: { execute } as unknown as typeof f.ctx.db });
+        expect(await caller.summary()).toMatchObject({ ai: { enrollment: 'enrolled' }, actions: { topup: true } });
+        expect(execute).toHaveBeenCalled();
+    });
+    it.each([['needs_ezil_id', undefined], ['activating', 'auth0|stored']] as const)
+    ('createTopupCheckout refuses %s before any Stripe call', async (_state, sub) => {
+        const f = enrolling(null, sub);
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 }))
+            .rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture' }))
+            .rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        expect(f.stripe.listProducts).not.toHaveBeenCalled();
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+    it('createTopupCheckout proceeds for an enrolled member', async () => {
+        const f = enrolling('works-member');
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000 })).resolves.toMatchObject({ sessionId: session.id });
+    });
+});
+
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1.1): the `summary` procedure wires the move computer's reads into the
+ * builder. With 0012 the three keys come from the newest row; without it (production today) none of them appears.
+ */
+describe('Phase B: billing.summary carries the reverse move from the router\'s reads', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const C1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const view = { provider: 'aws-ec2' as const, state: 'STOPPED' as const, leaseEpoch: 12, lifecycleJobId: null, instanceType: 'm6i.large' };
+    const row = { id: '33333333-3333-4333-8333-333333333333', user_id: userId, computer_id: C1, started_by: 'open', state: 'copying', generation: 'g',
+        export_boot: { placementGeneration: 8, leaseEpoch: 12, region: 'ap-south-1', volumeId: 'vol-0aaaaaaaaaaaaaaaa', jobId: null, instanceId: null,
+            fsUuid: null, claimedAt: '2026-10-11T11:00:00.000Z' },
+        bytes_total: 2_000_000, attempts: 0, last_error: null, state_entered_at: '2026-10-11 11:00:00+00', commit_sent_at: null,
+        created_at: '2026-10-11 10:59:00+00', updated_at: '2026-10-11 11:00:01+00', age_created: 120, age_state_entered: 60 };
+    const held = (present: boolean) => {
+        for (const [k, v] of Object.entries({ EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_AWS_KILL_SWITCH: '0', AWS_REGIONS: 'ap-south-1', AWS_MAX_RUNNING: '10',
+            EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '10', EZIL_AWS_USER_MONTHLY_HOURS: '100', EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+            EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200' })) vi.stubEnv(k, v);
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: 'aws-ec2', awsVolumes: [],
+            computers: [{ computerId: C1, provider: 'aws-ec2', placement: view }] }));
+        const dialect = new PgDialect();
+        const execute = vi.fn(async (q: Parameters<typeof dialect.sqlToQuery>[0]) => {
+            const text = dialect.sqlToQuery(q).sql;
+            if (text.includes("to_regclass('public.ezil_compute_reverse_moves')")) return [{ present }];
+            if (text.includes('FROM public.ezil_compute_reverse_moves')) return [row];
+            throw new Error(`unexpected query ${text}`);
+        });
+        const caller = createBillingRouter(() => f.deps, { placement, isOperator: () => false })
+            .createCaller({ ...f.ctx, db: { execute } as unknown as typeof f.ctx.db });
+        return { caller, execute };
+    };
+    it('with 0012: reverseMove from the newest row, moveOnOpen false while it holds, moveAvailable true; computer.move stays null', async () => {
+        const summary = await held(true).caller.summary();
+        expect(summary).toMatchObject({ computer: { standing: 'files_on_aws', move: null, moveOnOpen: false, moveAvailable: true,
+            reverseMove: { direction: 'to_cloudflare', stage: 'copying', bytesDone: '0', bytesTotal: '2000000', reason: null, retry: null,
+                openBlocked: false, holdOpenable: true } } });
+    });
+    it('without 0012 (production today): none of the three keys, and no reverse read', async () => {
+        const { caller, execute } = held(false);
+        const summary = await caller.summary();
+        if (!summary.enabled) throw new Error('summary disabled');
+        for (const key of ['reverseMove', 'moveOnOpen', 'moveAvailable']) expect(summary.computer).not.toHaveProperty(key);
+        expect(summary.computer.move).toBeNull();
+        // Only the probe touched the reverse table (the AI member lookup shares this executor).
+        const reverse = execute.mock.calls.map(([q]) => new PgDialect().sqlToQuery(q).sql).filter(text => text.includes('ezil_compute_reverse_moves'));
+        expect(reverse).toEqual([expect.stringContaining('to_regclass')]);
+    });
+});
+
+describe('round 5 D3: the summary and usage show the computer\'s REAL volume', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const [C1, C2] = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+    const VOL_TODAY = 'vol-0aaaaaaaaaaaaaaaa', VOL_OLD = 'vol-0bbbbbbbbbbbbbbbb';
+    const GiB = 1024 ** 3;
+    const withVolumes = (awsVolumes: UserPlacement['awsVolumes'], sizes: Record<string, number | null | Error>) => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3' })]);
+        const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: awsVolumes.length ? 'aws-ec2' : null, awsVolumes }));
+        const volumeGiB = vi.fn(async ({ volumeId }: { region: string; volumeId: string }) => {
+            const size = sizes[volumeId];
+            if (size instanceof Error) throw size;
+            return size ?? null;
+        });
+        return { ...f, placement, volumeGiB, caller: createBillingRouter(() => f.deps, { placement, volumeGiB }).createCaller(f.ctx) };
+    };
+
+    it('a Premium computer created today (100 GiB volume) shows 100; an older one (50 GiB) shows 50; summary and usage agree', async () => {
+        for (const [volumeId, gib] of [[VOL_TODAY, 100], [VOL_OLD, 50]] as const) {
+            const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId }], { [VOL_TODAY]: 100, [VOL_OLD]: 50 });
+            const summary = await f.caller.summary();
+            expect(summary).toMatchObject({ computer: { disk: { provisionedGiB: gib, growsOnSwitch: false }, standing: 'paid', filesOn: 'aws' },
+                storage: { capBytes: String(gib * GiB) } });
+            if (!summary.enabled) throw new Error('summary disabled');
+            // D3 + W0 pin: the tiles carry no disk figure; the real volume is the computer's disk.
+            expect(summary.computer.machineChoice.map(option => option.diskGiB)).toEqual([null, null, null]);
+            await expect(f.caller.usage()).resolves.toMatchObject({ storage: { capBytes: String(gib * GiB), disk: { provisionedGiB: gib } } });
+            expect(f.volumeGiB).toHaveBeenCalledWith({ computerId: C1, region: 'ap-south-1', volumeId });
+            expect(f.placement).toHaveBeenCalledWith(f.ctx.db, userId);
+        }
+    });
+
+    it('round 6: Free held on AWS (D16): usage shows the held 2 vCPU computer and its real disk, as the summary does', async () => {
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        f.store.epochsFor.mockResolvedValue([{ id: 'hold', userId, computerId: C1, size: 'std-2', weight: 1, readyAt: '2026-10-11T11:30:00Z',
+            endedAt: null, endReason: null, overheadSeconds: 0, deadlineAt: '2026-10-11T12:29:59Z', lastHeartbeatAt: null }]);
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', size: 'std-2', disk: { provisionedGiB: 50 } } });
+        const usage = await f.caller.usage({ computerId: C1 });
+        expect(usage).toMatchObject({ period: { currentSize: 'std-2', allowanceStandardSeconds: 8 * 3600, equivalents: [{ size: 'std-2', weight: 1 }] },
+            storage: { disk: { provisionedGiB: 50 } } });
+        if (!usage.enabled) throw new Error('usage disabled');
+        expect(usage.period.equivalents).toHaveLength(1);
+        // The same standing as the summary: the open payment issues are read for usage too.
+        expect(f.store.openPaymentIssues).toHaveBeenLastCalledWith(userId);
+    });
+
+    it('round 6 review (R4-02): the summary carries the PLACED AWS size from the placement read (a held 8 vCPU stays 8)', async () => {
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'canceled' })]);
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], awsSize: 'cmp-8' });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', size: 'std-2',
+            awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } } });
+        // No size from the placement read (unknown or mixed): null.
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: [] });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { standing: 'files_on_aws', awsSize: null } });
+    });
+
+    it('round 6 review (dunning into the hold): after grace both read epochs from Free\'s month and rate the computer as Free', async () => {
+        // A Premium renewal on 10-03 failed at once; grace ended 10-10; on 10-11 the computer runs as Free (Oct 1 - Nov 1).
+        const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }], { [VOL_OLD]: 50 });
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3', status: 'past_due',
+            currentPeriodStart: new Date('2026-10-03T00:00:00Z'), currentPeriodEnd: new Date('2026-11-03T00:00:00Z') })]);
+        f.store.openPaymentIssues.mockResolvedValue([{ stripeInvoiceId: 'in_fail', userId, subscriptionId: 'sub_fixture', invoiceKind: 'subscription',
+            issue: 'payment_failed', hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-10-03T00:00:00Z'), resolvedAt: null, updatedAt: now }]);
+        f.store.grantsForPeriod.mockResolvedValue([]);
+        f.store.epochsFor.mockResolvedValue([{ id: 'hold', userId, computerId: C1, size: 'std-2', weight: 1, readyAt: '2026-10-11T11:30:00Z',
+            endedAt: null, endReason: null, overheadSeconds: 0, deadlineAt: '2026-10-11T12:29:59Z', lastHeartbeatAt: null }]);
+        const free = { start: new Date('2026-10-01T00:00:00Z'), periodStart: new Date('2026-10-03T00:00:00Z') };
+        await expect(f.caller.summary()).resolves.toMatchObject({ plan: { sku: 'premium_monthly_v3', status: 'past_due' },
+            computer: { standing: 'files_on_aws', sessionMaxSeconds: 3600, activeDeadline: '2026-10-11T12:29:59Z' }, fairUse: { status: 'ok' } });
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString(), free.start.toISOString()]);
+        f.store.epochsFor.mockClear();
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ period: { startsAt: '2026-10-01T00:00:00Z',
+            allowanceStandardSeconds: 8 * 3600, usedStandardSeconds: 1800, currentSize: 'std-2' } });
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString(), free.start.toISOString()]);
+        // Paid access (no issue): one read from the paid period's start, as before.
+        f.store.openPaymentIssues.mockResolvedValue([]);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3',
+            currentPeriodStart: new Date('2026-10-03T00:00:00Z'), currentPeriodEnd: new Date('2026-11-03T00:00:00Z') })]);
+        f.store.epochsFor.mockClear();
+        await f.caller.summary();
+        expect(f.store.epochsFor.mock.calls.map(([, since]) => since.toISOString())).toEqual([free.periodStart.toISOString()]);
+    });
+
+    it('an unreadable volume (error, missing, no AWS placement) shows 50 and never fails the summary or usage', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        for (const f of [withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: new Error('AccessDenied') }),
+            withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }], { [VOL_TODAY]: null }),
+            withVolumes([], {})]) {
+            await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } }, storage: { capBytes: String(50 * GiB) } });
+            await expect(f.caller.usage()).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        }
+        const failing = withVolumes([], {});
+        failing.placement.mockRejectedValue(new Error('db down'));
+        await expect(failing.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 }, filesOn: 'cloudflare' } });
+        expect(warn).toHaveBeenCalled();
+    });
+
+    it('two AWS volumes: the smallest readable size (never overclaim); usage for one computer reads that computer\'s volume', async () => {
+        const volumes = [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }, { computerId: C2, region: 'ap-south-1', volumeId: VOL_OLD }];
+        const f = withVolumes(volumes, { [VOL_TODAY]: 100, [VOL_OLD]: 50 });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } } });
+        f.store.computerOwner = vi.fn(async () => userId) as never;
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
+        await expect(f.caller.usage({ computerId: C2 })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 50 } } });
+        // One volume unreadable (error/timeout) beside a readable 100: that computer may be 50, so the summary shows 50.
+        const partly = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }, { computerId: C2, region: 'ap-south-1', volumeId: VOL_OLD }],
+            { [VOL_TODAY]: 100, [VOL_OLD]: new Error('Throttling') });
+        await expect(partly.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50 } } });
+        // z.string().uuid() accepts upper case; the placement ids are lower case.
+        await expect(f.caller.usage({ computerId: C1.toUpperCase() })).resolves.toMatchObject({ storage: { disk: { provisionedGiB: 100 } } });
+    });
+
+    it('without an injected reader, the router reads the volume through the app\'s EC2 describer (region, volumeId)', async () => {
+        const f = fixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'premium_monthly_v3' })]);
+        // Unique ids: the default reader's cache is module-wide.
+        const VOL_DEFAULT = 'vol-0dddddddddddddddd', VOL_DEFAULT_OLD = 'vol-0eeeeeeeeeeeeeeee';
+        const sizes: Record<string, number> = { [VOL_DEFAULT]: 100, [VOL_DEFAULT_OLD]: 50 };
+        awsDescribeVolume.mockImplementation(async (region, volumeId) => region === 'ap-south-1' && sizes[volumeId] ? { sizeGiB: sizes[volumeId] } : null);
+        try {
+            for (const [volumeId, gib] of [[VOL_DEFAULT, 100], [VOL_DEFAULT_OLD, 50]] as const) {
+                const placement = vi.fn(async (): Promise<UserPlacement> => ({ provider: 'aws-ec2',
+                    awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId }] }));
+                const caller = createBillingRouter(() => f.deps, { placement }).createCaller(f.ctx);
+                await expect(caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: gib } }, storage: { capBytes: String(gib * GiB) } });
+                await expect(caller.usage()).resolves.toMatchObject({ storage: { disk: { provisionedGiB: gib } } });
+                expect(awsDescribeVolume).toHaveBeenCalledWith('ap-south-1', volumeId);
+            }
+        } finally {
+            awsDescribeVolume.mockReset();
+            awsDescribeVolume.mockResolvedValue(null);
+        }
+    });
+
+    it('the legacy placementProvider option still works (provider only, fallback disk)', async () => {
+        const f = fixture();
+        const placementProvider = vi.fn(async () => 'aws-ec2' as const);
+        const caller = createBillingRouter(() => f.deps, { placementProvider }).createCaller(f.ctx);
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v3' })]);
+        await expect(caller.summary()).resolves.toMatchObject({ computer: { filesOn: 'aws', disk: { provisionedGiB: 50 } } });
+    });
+
+    it('userPlacement: aws-ec2 placements expose {computerId, region, volumeId}; a failed rich read keeps the provider', async () => {
+        vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
+        const dialect = new PgDialect();
+        const rows: Record<string, Record<string, unknown>> = {
+            [C1]: placementRow({ computer_id: C1, owner_user_id: userId, provider: 'aws-ec2', region: 'ap-south-1', volume_id: VOL_TODAY }),
+            [C2]: placementRow({ computer_id: C2, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' }),
+        };
+        let richFails = false;
+        const execute = vi.fn(async (query: Parameters<typeof dialect.sqlToQuery>[0]) => {
+            const { sql: text, params } = dialect.sqlToQuery(query);
+            if (text.includes('billing:live-computers')) return [{ id: C1 }, { id: C2 }];
+            if (text.includes('placement:provider-table')) return [{ present: true }];
+            if (text.includes('placement:provider */')) return [{ provider: rows[String(params[0])]!.provider }];
+            if (text.includes('placement:read')) { if (richFails) throw new Error('column missing'); return [rows[String(params[0])]!]; }
+            if (text.includes('placement:image-reservation')) return [];
+            throw new Error(`unexpected query ${text}`);
+        });
+        const cloudflareView = { provider: 'cloudflare', state: null, leaseEpoch: null, lifecycleJobId: null, instanceType: null };
+        const first = await userPlacement({ execute: execute as never }, userId);
+        expect(first).toEqual({ provider: 'aws-ec2', awsVolumes: [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_TODAY }],
+            ...(first.awsSize ? { awsSize: first.awsSize } : {}),
+            // Phase B (REVERSE-MOVE-CONTRACT §6.1.1): the live computers and the records already read, for the move computer.
+            computers: [
+                { computerId: C1.toLowerCase(), provider: 'aws-ec2', placement: expect.objectContaining({ provider: 'aws-ec2', state: rows[C1]!.state }) },
+                { computerId: C2.toLowerCase(), provider: 'cloudflare', placement: cloudflareView },
+            ] });
+        await expect(userPlacementProvider({ execute: execute as never }, userId)).resolves.toBe('aws-ec2');
+        // Only the aws-ec2 computer gets the rich read.
+        expect(execute.mock.calls.filter(([q]) => dialect.sqlToQuery(q).sql.includes('placement:read')).map(([q]) => dialect.sqlToQuery(q).params[0])).toEqual([C1, C1]);
+        // Round 6 (R4-02): the instance type, metered as the start gate meters it; an unlisted type is no size.
+        for (const [type, size] of [['m6i.2xlarge', 'cmp-8'], ['m6i.xlarge', 'cmp-4'], ['m6i.large', 'std-2']] as const) {
+            rows[C1] = { ...rows[C1], instance_type: type };
+            await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ provider: 'aws-ec2', awsSize: size });
+        }
+        rows[C1] = { ...rows[C1], instance_type: 'p5.48xlarge' };
+        expect(await userPlacement({ execute: execute as never }, userId)).not.toHaveProperty('awsSize');
+        // Two aws-ec2 computers on different sizes: no single placed size.
+        rows[C1] = { ...rows[C1], instance_type: 'm6i.2xlarge' };
+        rows[C2] = placementRow({ computer_id: C2, owner_user_id: userId, provider: 'aws-ec2', region: 'ap-south-1', instance_type: 'm6i.large' });
+        expect(await userPlacement({ execute: execute as never }, userId)).not.toHaveProperty('awsSize');
+        rows[C2] = { ...rows[C2], instance_type: 'm6i.2xlarge' };
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ awsSize: 'cmp-8' });
+        rows[C1] = { ...rows[C1], instance_type: null };
+        rows[C2] = placementRow({ computer_id: C2, owner_user_id: userId, provider: 'cloudflare', workspace_store: 'r2' });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        richFails = true;
+        // A failed rich read is no record: no volume, and no placement for the move computer (its fields fail closed).
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: 'aws-ec2', awsVolumes: [],
+            computers: [{ computerId: C1.toLowerCase(), provider: 'aws-ec2', placement: null },
+                { computerId: C2.toLowerCase(), provider: 'cloudflare', placement: cloudflareView }] });
+        expect(warn).toHaveBeenCalledWith('[billing.summary] volume placement unavailable');
+        // A placement without a volume yet (provisioning) has nothing to read.
+        richFails = false; rows[C1] = { ...rows[C1], volume_id: null };
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toMatchObject({ provider: 'aws-ec2', awsVolumes: [] });
+        // Placement reads off: nothing is read at all, and there is no computer (Phase B §6.1.1 rule 4: no move computer).
+        vi.unstubAllEnvs(); execute.mockClear();
+        await expect(userPlacement({ execute: execute as never }, userId)).resolves.toEqual({ provider: null, awsVolumes: [], computers: [] });
+        expect(execute).not.toHaveBeenCalled();
+    });
+});
+
+describe('round 5 D3: the volume size reader (describeVolume, cached)', () => {
+    const volume = { computerId: 'c', region: 'ap-south-1', volumeId: 'vol-0aaaaaaaaaaaaaaaa' };
+    const setup = (sizeGiB: number | 'missing' | Error | 'hang' = 100) => {
+        let clock = 0;
+        const describe = vi.fn(async () => {
+            if (sizeGiB === 'hang') return new Promise<never>(() => {});
+            if (sizeGiB instanceof Error) throw sizeGiB;
+            return sizeGiB === 'missing' ? {} : { sizeGiB };
+        });
+        const read = createVolumeSizeReader(describe, { now: () => clock, timeoutMs: 20, maxEntries: 3 });
+        return { describe, read, at: (ms: number) => { clock = ms; } };
+    };
+    it('reads sizeGiB once per volume within 5 minutes, then again after', async () => {
+        const r = setup();
+        await expect(r.read(volume)).resolves.toBe(100);
+        r.at(299_000);
+        await expect(r.read(volume)).resolves.toBe(100);
+        expect(r.describe).toHaveBeenCalledTimes(1);
+        expect(r.describe).toHaveBeenCalledWith('ap-south-1', volume.volumeId);
+        r.at(300_001);
+        await expect(r.read(volume)).resolves.toBe(100);
+        expect(r.describe).toHaveBeenCalledTimes(2);
+    });
+    it('is bounded: the oldest entry is evicted past maxEntries', async () => {
+        const r = setup();
+        for (const id of ['1', '2', '3', '4']) await r.read({ ...volume, volumeId: `vol-0${id.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(4);
+        await r.read({ ...volume, volumeId: `vol-0${'4'.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(4);
+        await r.read({ ...volume, volumeId: `vol-0${'1'.repeat(16)}` });
+        expect(r.describe).toHaveBeenCalledTimes(5);
+    });
+    it('a caller ttlMs above 5 minutes is clamped to 5 minutes', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => ({ sizeGiB: 100 }));
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 60 * 60_000 });
+        await read(volume);
+        clock = 300_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it.each([['an AWS error', new Error('Throttling')], ['a missing size', 'missing' as const], ['a hung call (timeout)', 'hang' as const]])(
+        '%s is null, held for 30 s (a throttled EC2 is not re-hit on every call), then read again', async (_name, size) => {
+            const r = setup(size);
+            await expect(r.read(volume)).resolves.toBeNull();
+            r.at(30_000);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(1);
+            r.at(30_001);
+            await expect(r.read(volume)).resolves.toBeNull();
+            expect(r.describe).toHaveBeenCalledTimes(2);
+        });
+    it('a caller negativeTtlMs is clamped to the positive TTL', async () => {
+        let clock = 0;
+        const describe = vi.fn(async () => { throw new Error('Throttling'); });
+        const read = createVolumeSizeReader(describe, { now: () => clock, ttlMs: 1_000, negativeTtlMs: 60_000 });
+        await read(volume);
+        clock = 1_001;
+        await read(volume);
+        expect(describe).toHaveBeenCalledTimes(2);
+    });
+    it('concurrent reads of one volume share one DescribeVolumes call', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 1_000 });
+        const reads = Array.from({ length: 5 }, () => read(volume));
+        release({ sizeGiB: 100 });
+        await expect(Promise.all(reads)).resolves.toEqual([100, 100, 100, 100, 100]);
+        expect(describe).toHaveBeenCalledTimes(1);
+    });
+    it('a read that finishes after the timeout still fills the cache (the next summary shows the real size)', async () => {
+        let release!: (view: { sizeGiB: number }) => void;
+        const describe = vi.fn(() => new Promise<{ sizeGiB: number }>(resolve => { release = resolve; }));
+        const read = createVolumeSizeReader(describe, { timeoutMs: 10 });
+        await expect(read(volume)).resolves.toBeNull();
+        release({ sizeGiB: 100 });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await expect(read(volume)).resolves.toBe(100);
+        expect(describe).toHaveBeenCalledTimes(1);
+    });
+    it('a volume EC2 does not know (null) or AWS off is null', async () => {
+        const read = createVolumeSizeReader(async () => null, { timeoutMs: 20 });
+        await expect(read(volume)).resolves.toBeNull();
     });
 });

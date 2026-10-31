@@ -61,6 +61,16 @@ class UnitPolicy(unittest.TestCase):
                 self.assertGreater(int(one(u, "Unit", "StartLimitIntervalSec") or 0), 0, "restarts are bounded (interval)")
                 self.assertGreater(int(one(u, "Unit", "StartLimitBurst") or 0), 0, "restarts are bounded (burst)")
 
+    def test_a_restarted_oneshot_never_fails_its_dependents(self):
+        # A oneshot boot step's restart in the default (normal) mode passes through failed, which
+        # fails the start job of every unit that Requires= it, for good (ezil-enroll.service).
+        restarted = sorted(n for n, u in UNITS.items() if u["Service"].get("Type", ["simple"])[-1] == "oneshot"
+                           and one(u, "Service", "Restart") not in (None, "no"))
+        self.assertEqual(restarted, ["ezil-guard"], "a new restarted oneshot gets this policy on purpose")
+        for name in restarted:
+            with self.subTest(unit=name):
+                self.assertEqual(one(UNITS[name], "Service", "RestartMode"), "direct")
+
     def test_units_whose_step_refuses_while_stopping_never_restart_that_refusal(self):
         for step in cli.RESTARTED_STEPS:
             u = UNITS[f"ezil-{step}"]

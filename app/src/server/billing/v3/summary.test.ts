@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
-import { buildSummaryV3, usedSecondsInWindow } from './summary';
+import { operatorGrantedSubscription, planFromSubscriptions } from './catalog';
+import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
@@ -16,7 +17,12 @@ function input(sku?: SellableSkuV3): Input {
         packs: [offeredPack],
         renewal: sku ? { at: '2026-11-10T00:00:00Z', amountCents: 1700 } : null };
 }
-const epoch = (overrides: Partial<Input['epochs'][number]> = {}): Input['epochs'][number] => ({ id: 'e', userId: 'u', computerId: 'c',
+/** The fixture's bare 'sub' id is not a Stripe id; Stripe-backed actions need one (`sub_…`). */
+function withSubscriptionId(args: Input, id: string, overrides: { cancelAtPeriodEnd?: boolean } = {}): Input {
+    return { ...args, subs: args.subs.map(sub => ({ ...sub, stripeSubscriptionId: id, ...overrides })),
+        grants: args.grants.map(grant => ({ ...grant, subscriptionId: id })) };
+}
+const epoch =(overrides: Partial<Input['epochs'][number]> = {}): Input['epochs'][number] => ({ id: 'e', userId: 'u', computerId: 'c',
     size: 'cmp-4', weight: 2, readyAt: '2026-10-19T11:00:00Z', endedAt: null, endReason: null, overheadSeconds: 100, ...overrides });
 
 function sessions(hours: number, size: 'std-2' | 'cmp-8'): Input['epochs'] {
@@ -99,12 +105,29 @@ describe('v3 summary', () => {
         expect(Object.keys(summary.fairUse)).toEqual(['status', 'resetsAt']);
     });
     it('uses the next invoice amount and date, not catalog price or past charges', () => {
-        const summary = buildSummaryV3(input('standard_monthly_v3'));
+        const summary = buildSummaryV3(withSubscriptionId(input('standard_monthly_v3'), 'sub_fixture'));
         expect(summary.plan.renewal).toEqual({ at: '2026-11-10T00:00:00Z', amountCents: 1700 });
         expect(summary.fairUse.resetsAt).toBe('2026-11-10T00:00:00Z');
         expect(summary.actions).toMatchObject({ checkout: false, upgrade: true });
         const args = input('standard_monthly_v3'); args.subs[0]!.cancelAtPeriodEnd = true;
         expect(buildSummaryV3(args).plan).toMatchObject({ status: 'cancels', renewal: null, cancelsAt: '2026-11-10T00:00:00Z' });
+    });
+    // Promotion review: operator-granted rows (e.g. op_canary_…_20261031) have no Stripe subscription behind them.
+    it('decides operator-granted subscriptions by the Stripe id prefix alone', () => {
+        for (const id of ['op_canary_b91f424a_20261031', 'op_qa002_db0c45cd_20261031', 'sub', 'SUB_upper', '']) expect(operatorGrantedSubscription(id), id).toBe(true);
+        for (const id of ['sub_fixture', 'sub_1QxYz', null, undefined]) expect(operatorGrantedSubscription(id), String(id)).toBe(false);
+    });
+    it.each([
+        ['standard_monthly_v3', false], ['standard_monthly_v3', true], ['premium_monthly_v3', false], ['premium_monthly_v3', true],
+    ] as const)('offers no Stripe-backed action for an operator-granted %s row (cancel at period end: %s)', (sku, cancelAtPeriodEnd) => {
+        // Positive control: the same row with a Stripe id offers its actions.
+        expect(buildSummaryV3(withSubscriptionId(input(sku), 'sub_fixture', { cancelAtPeriodEnd })).actions).toMatchObject({
+            checkout: false, topup: true, cancel: true, portal: true,
+            upgrade: sku === 'standard_monthly_v3' && !cancelAtPeriodEnd, downgrade: sku === 'premium_monthly_v3' && !cancelAtPeriodEnd });
+        const summary = buildSummaryV3(withSubscriptionId(input(sku), 'op_canary_b91f424a_20261031', { cancelAtPeriodEnd }));
+        expect(summary.plan).toMatchObject({ sku, status: cancelAtPeriodEnd ? 'cancels' : 'active' });
+        // The plan itself is unchanged; only the Stripe-backed actions are off (top-up never touches the subscription).
+        expect(summary.actions).toMatchObject({ checkout: false, topup: true, cancel: false, portal: false, upgrade: false, downgrade: false });
     });
     it('counts weighted running time across sizes, clips the window, and excludes overhead', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
@@ -220,6 +243,27 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         expect(summary('premium_monthly_v3', [standard, topup], [grant(500, 400, topup.expiresAt)], M(400)))
             .toMatchObject({ included: { granted: 200, remaining: null }, purchased: null });
     });
+    it('round 6 (R1-10/R4-05): on Free after an immediate cancel, the paid period\'s remainder is its own bucket with its expiry', () => {
+        // contact@ on 10-30: 100 starter credits plus 663 left of a cancelled Premium period (kept to periodEnd + 3 days).
+        const cancelled = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-27T12:00:00.000Z', 1000, '2026-11-30T12:00:00.000Z');
+        const starter = receipt('ezil-os:v1:free-once:u', 100, '2027-10-27T00:00:00.000Z');
+        const ai = summary(undefined, [cancelled, starter], [grant(1000, 663, cancelled.expiresAt), grant(100, 100, starter.expiresAt)]);
+        expect(ai).toMatchObject({ balance: 763, state: 'ok', included: null, purchased: null, starter: { remaining: 100 },
+            previous: { remaining: 663, expiresAt: '2026-11-30T12:00:00.000Z' } });
+        // Two earlier grants (a period and an upgrade): one total, the EARLIEST expiry.
+        const upgradeEarlier = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-28T00:00:00.000Z:upgrade', 300, '2026-11-29T00:00:00.000Z');
+        expect(summary(undefined, [cancelled, upgradeEarlier], [grant(1000, 663, cancelled.expiresAt), grant(300, 37, upgradeEarlier.expiresAt)]).previous)
+            .toEqual({ remaining: 700, expiresAt: '2026-11-29T00:00:00.000Z' });
+    });
+    it('round 6: previous is the paid plan\'s 3-day tail of the last period; null when spent, none, or unknown', () => {
+        const last = receipt(`ezil-os:v1:premium_monthly_v3:sub:${prev.toISOString()}`, 1000, expiry(start));
+        const renewal = receipt(`ezil-os:v1:premium_monthly_v3:sub:${start.toISOString()}`, 1000, expiry(end));
+        expect(summary('premium_monthly_v3', [renewal, last], [grant(1000, 200, last.expiresAt), grant(1000, 1000, renewal.expiresAt)]).previous)
+            .toEqual({ remaining: 200, expiresAt: last.expiresAt });
+        expect(summary('premium_monthly_v3', [renewal, last], [grant(1000, 0, last.expiresAt), grant(1000, 1000, renewal.expiresAt)]).previous).toBeNull();
+        expect(summary('premium_monthly_v3', [renewal], [grant(1000, 1000, renewal.expiresAt)]).previous).toBeNull();
+        expect(summary('premium_monthly_v3', [renewal, last], null, M(1200)).previous).toBeNull();
+    });
     it('ignores revoked or foreign-subscription grants and announces no renewal for a canceling plan', () => {
         const foreign = receipt(`ezil-os:v1:premium_monthly_v3:sub_other:${start.toISOString()}`, 1000, expiry(end));
         const ai = summary('premium_monthly_v3', [{ ...standard, deliveredAt: null }, foreign],
@@ -237,10 +281,10 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
         const args = input(sku); args.sizePreference = preference;
         const summary = buildSummaryV3(args);
         expect(summary.storage).toEqual({ usedBytes: '0', capBytes: GiB50, state: 'unavailable' });
-        expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null });
+        expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null, growsOnSwitch: false });
         args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(1024) ** BigInt(3), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: String(43 * 1024 ** 3), capBytes: GiB50, state: 'low' });
-        expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3) });
+        expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3), growsOnSwitch: false });
     });
     it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
         const args = input(); args.config.largeStorageEnabled = true;
@@ -275,10 +319,184 @@ describe('round 4: standing fields (additive)', () => {
         expect(buildSummaryV3({ ...args, grants: [{ ...input('premium_monthly_v3').grants[0]!, amount: BigInt(0) }] }).fairUse.status).toBe('paused');
         expect(buildSummaryV3({ ...args, now: new Date('2026-10-22T00:00:00Z') }).computer).toMatchObject({ standing: 'files_on_aws', heldSince: '2026-10-22T00:00:00Z' });
     });
+    it('round 6 review (dunning into the hold): after grace the computer is rated as Free, as the start gate rates it', () => {
+        // A Premium renewal failed on 11-01, grace ended 11-08, the files are on AWS; a std-2 hold session runs at 11-12 12:00.
+        const at = new Date('2026-11-12T12:00:00Z');
+        const lapsed: Input = { ...input('premium_monthly_v3'), now: at, userCreatedAt: new Date('2026-09-01T00:00:00Z'), grants: [],
+            placementProvider: 'aws-ec2', volumeGiB: 50,
+            subs: [{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'past_due', currentPeriodStart: new Date('2026-11-01T00:00:00Z'),
+                currentPeriodEnd: new Date('2026-12-01T00:00:00Z'), cancelAtPeriodEnd: false }],
+            paymentIssues: [{ stripeInvoiceId: 'in', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed',
+                hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-11-01T01:00:00Z'), resolvedAt: null, updatedAt: at }],
+            epochs: [epoch({ size: 'std-2', weight: 1, readyAt: '2026-11-12T11:30:00Z', deadlineAt: '2026-11-12T12:29:59Z' })] };
+        const free = planFromSubscriptions({ subs: [], now: at, userCreatedAt: lapsed.userCreatedAt });
+        const summary = buildSummaryV3(lapsed);
+        // The plan block still names the unpaid subscription; the computer runs under Free's limits and month.
+        expect(summary.plan).toMatchObject({ sku: 'premium_monthly_v3', status: 'past_due', paymentIssue: 'payment_failed' });
+        expect(summary.computer).toMatchObject({ standing: 'files_on_aws', size: 'std-2', sessionMaxSeconds: 3600,
+            activeDeadline: '2026-11-12T12:29:59Z', machineChoice: [{ size: 'free-cf' }] });
+        expect(summary.fairUse).toEqual({ status: 'ok', resetsAt: free.window.end });
+        // Without an AWS placement (standing free) it is still Free's limits, at Free's size.
+        expect(buildSummaryV3({ ...lapsed, placementProvider: null, epochs: [] }).computer).toMatchObject({ standing: 'free', size: 'free-cf', sessionMaxSeconds: 3600 });
+        // Still in grace (11-05): the paid plan's limits stand (no session cap, the paid period).
+        const grace = buildSummaryV3({ ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] });
+        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: null });
+        expect(grace.fairUse).toMatchObject({ status: 'ok', resetsAt: '2026-12-01T00:00:00Z' });
+        // A never-paid (incomplete) subscription is Free too.
+        expect(buildSummaryV3({ ...lapsed, subs: [{ ...lapsed.subs[0]!, status: 'incomplete' }], paymentIssues: [] }).computer)
+            .toMatchObject({ sessionMaxSeconds: 3600 });
+    });
+    it('round 6 (R1-06): the Free offer in the summary says the hours THIS account gets on Free; paid offers and publicOffers() are unchanged', () => {
+        // FREE_V2_EFFECTIVE_AT is null: every account keeps the legacy 8 hours.
+        const legacy = buildSummaryV3({ ...input(), placementProvider: 'aws-ec2' });
+        expect(legacy.catalog.offers.map(offer => [offer.sku, offer.fairUseHours])).toEqual([['free_v3', 8], ['standard_monthly_v3', 40], ['premium_monthly_v3', 500]]);
+        expect(buildSummaryV3(input('premium_monthly_v3')).catalog.offers[0]!.fairUseHours).toBe(8);
+        const newer = { ...input(), userCreatedAt: now, freeEffectiveAt: '2026-10-01T00:00:00Z' };
+        expect(buildSummaryV3(newer).catalog.offers[0]!.fairUseHours).toBe(5);
+    });
+    it('round 6 review (R4-02): awsSize is the PLACED AWS size (any standing), apart from the hold size and the preference', () => {
+        // A Premium cmp-8 computer cancelled at once: held, the size that would open is std-2, the placement is cmp-8.
+        const held = buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize: 'cmp-8' }).computer;
+        expect(held).toMatchObject({ standing: 'files_on_aws', size: 'std-2', vcpu: 2, awsSize: { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } });
+        expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize: 'cmp-4' }).computer.awsSize).toEqual({ size: 'cmp-4', vcpu: 4, memoryGiB: 16 });
+        // Paid: the preference (next start) and the placement are separate facts.
+        const paid = buildSummaryV3({ ...input('premium_monthly_v3'), placementProvider: 'aws-ec2', sizePreference: 'std-2', awsSize: 'cmp-8' }).computer;
+        expect(paid).toMatchObject({ standing: 'paid', size: 'std-2', awsSize: { size: 'cmp-8' } });
+        // Unknown, mixed or a non-AWS size: null, never a guess.
+        for (const awsSize of [undefined, null, 'free-cf'] as const)
+            expect(buildSummaryV3({ ...input(), placementProvider: 'aws-ec2', awsSize }).computer.awsSize).toBeNull();
+    });
+    it('round 6 (CR-2): a running hold session carries its stored deadline (ready + 1 h) for "This session ends at HH:MM"', () => {
+        const held = { ...input(), placementProvider: 'aws-ec2' as const, epochs: [epoch({ size: 'std-2', weight: 1, readyAt: '2026-10-19T11:30:00Z',
+            deadlineAt: '2026-10-19T12:29:59Z' })] };
+        expect(buildSummaryV3(held).computer).toMatchObject({ standing: 'files_on_aws', sessionMaxSeconds: 3600, activeDeadline: '2026-10-19T12:29:59Z' });
+    });
     it('cancel at period end reads plan_ending with planEndsAt', () => {
         const args = input('premium_monthly_v3');
         args.subs = [{ ...args.subs[0]!, cancelAtPeriodEnd: true }];
         expect(buildSummaryV3(args)).toMatchObject({ plan: { status: 'cancels', planEndsAt: '2026-11-10T00:00:00Z', cancelsAt: '2026-11-10T00:00:00Z' },
             computer: { standing: 'plan_ending' } });
+    });
+});
+
+describe('round 5 contract pin (W0): enrollment, storage and heal fields default with no behaviour change', () => {
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('%s: enrolled, nothing waiting, no EZiL ID link, no per-configuration disk', sku => {
+        for (const ai of [undefined, { receipts: [], gatewayGrants: [], balanceMicro: '0' }]) {
+            const summary = buildSummaryV3({ ...input(sku), ai });
+            expect(summary.ai.enrollment).toBe('enrolled');
+            expect(summary.ai.waiting).toBeNull();
+            expect(summary.actions.ezilId).toBeNull();
+            expect(summary.computer.machineChoice.length).toBeGreaterThan(0);
+            for (const option of summary.computer.machineChoice) expect(option.diskGiB).toBeNull();
+            expect(summary.computer.disk?.growsOnSwitch).toBe(false);
+            expect(summary.catalog.offers.map(offer => offer.storageGiB)).toEqual([null, 50, 100]);
+        }
+    });
+});
+
+describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', () => {
+    const link = '/auth/auth0/login?returnUrl=/os';
+    const future = '2027-10-19T12:00:00.000Z', past = '2026-10-19T11:59:59.000Z';
+    const receipts = [
+        { entitlementId: 'ezil-os:v1:free-once:u', credits: 100, expiresAt: future, deliveredAt: null },
+        { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-10-10T00:00:00.000Z', credits: 200, expiresAt: future, deliveredAt: null },
+        { entitlementId: 'ezil-os:v1:topup:p:pi:grant', credits: 1000, expiresAt: future, deliveredAt: '2026-10-11T00:00:00.000Z' },
+        { entitlementId: 'ezil-os:v1:standard_monthly_v3:sub:2026-09-10T00:00:00.000Z', credits: 200, expiresAt: past, deliveredAt: null },
+    ];
+    const ai = { receipts, gatewayGrants: null, balanceMicro: null };
+    it.each([undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const)('%s needs_ezil_id: CTA link, waiting credits, no top-up', sku => {
+        const summary = buildSummaryV3({ ...input(sku), ai, enrollment: { state: 'needs_ezil_id', ezilIdUrl: link } });
+        expect(summary.ai.enrollment).toBe('needs_ezil_id');
+        expect(summary.ai.waiting).toEqual({ credits: 300 });
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: link });
+    });
+    it('activating: waiting credits, no top-up, no CTA', () => {
+        const summary = buildSummaryV3({ ...input('standard_monthly_v3'), ai, enrollment: { state: 'activating', ezilIdUrl: link } });
+        expect(summary.ai).toMatchObject({ enrollment: 'activating', waiting: { credits: 300 } });
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: null });
+    });
+    it('enrolled: top-up stays, no CTA, nothing parked', () => {
+        const summary = buildSummaryV3({ ...input('standard_monthly_v3'), ai, enrollment: { state: 'enrolled', ezilIdUrl: link } });
+        expect(summary.ai).toMatchObject({ enrollment: 'enrolled', waiting: null });
+        expect(summary.actions).toMatchObject({ topup: true, ezilId: null });
+    });
+    it('needs_ezil_id without EZiL ID sign-in configured has no link; nothing undelivered means waiting null', () => {
+        const summary = buildSummaryV3({ ...input(), ai: { ...ai, receipts: receipts.slice(2) }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: null } });
+        expect(summary.ai.waiting).toBeNull();
+        expect(summary.actions).toMatchObject({ topup: false, ezilId: null });
+        expect(buildSummaryV3({ ...input(), ai: { ...ai, receipts: null }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: null } }).ai.waiting).toBeNull();
+    });
+    // Review fix (r5 L1): a terminally failed grant (invalid_payload, attempts_exhausted, review) will not
+    // arrive on sign-in, so it is not "waiting".
+    it('does not count terminally failed undelivered grants as waiting', () => {
+        const failed = { entitlementId: 'ezil-os:v1:premium_monthly_v3:sub:2026-10-12T00:00:00.000Z', credits: 1000,
+            expiresAt: future, deliveredAt: null, failed: true };
+        const summary = buildSummaryV3({ ...input(), ai: { ...ai, receipts: [...receipts, failed] }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: link } });
+        expect(summary.ai.waiting).toEqual({ credits: 300 });
+    });
+    it('checkout off keeps top-up off in every state', () => {
+        const args = input(); args.config.checkoutEnabled = false;
+        expect(buildSummaryV3({ ...args, enrollment: { state: 'enrolled', ezilIdUrl: null } }).actions.topup).toBe(false);
+    });
+});
+
+describe('round 5 D3: the shown disk is the computer\'s REAL volume; machine options carry no disk figure', () => {
+    const GiB = 1024 ** 3;
+    it.each([null, 'cmp-4', 'cmp-8'] as const)('Premium at %s: a computer created today shows its 100 GiB volume, an older one its 50 GiB volume', preference => {
+        const today = { ...input('premium_monthly_v3'), sizePreference: preference, volumeGiB: 100 };
+        expect(buildSummaryV3(today).computer.disk).toEqual({ provisionedGiB: 100, usedBytes: null, growsOnSwitch: false });
+        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: '0', capBytes: String(100 * GiB), state: 'unavailable' });
+        const older = { ...today, volumeGiB: 50, storage: [{ computerId: 'c', bytes: BigInt(43) * BigInt(GiB), measuredAt: now }] };
+        expect(buildSummaryV3(older).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * GiB), growsOnSwitch: false });
+        expect(buildSummaryV3(older).storage).toEqual({ usedBytes: String(43 * GiB), capBytes: String(50 * GiB), state: 'low' });
+    });
+    it.each([undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 16385])('an unreadable or implausible volume (%s) falls back to 50, never the plan figure', volumeGiB => {
+        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
+            expect(buildSummaryV3({ ...input(sku), volumeGiB }).computer.disk?.provisionedGiB).toBe(50);
+        }
+    });
+    it('Free keeps no GB figure even when a volume size is passed', () => {
+        expect(buildSummaryV3({ ...input(), volumeGiB: 100 }).computer.disk).toEqual({ provisionedGiB: null, usedBytes: null, growsOnSwitch: false });
+    });
+    // D3 + the W0 pin (contract.ts MachineOptionV3.diskGiB): tiles carry NO disk figure until a grow path exists
+    // (a switch keeps the computer's volume); plan storage is on the plan cards (offer storageGiB) only.
+    it('machineChoice diskGiB is null on every tile, past-due Premium included; offers carry storageGiB (Free null, Standard 50, Premium 100)', () => {
+        const disks = (sku?: SellableSkuV3) => buildSummaryV3(input(sku)).computer.machineChoice.map(option => [option.size, option.diskGiB]);
+        expect(disks()).toEqual([['free-cf', null]]);
+        expect(disks('standard_monthly_v3')).toEqual([['std-2', null]]);
+        expect(disks('premium_monthly_v3')).toEqual([['std-2', null], ['cmp-4', null], ['cmp-8', null]]);
+        const pastDue = input('premium_monthly_v3');
+        pastDue.subs = [{ ...pastDue.subs[0]!, status: 'past_due' }];
+        for (const option of buildSummaryV3(pastDue).computer.machineChoice) expect(option.diskGiB).toBeNull();
+        expect(buildSummaryV3(input('premium_monthly_v3')).catalog.offers.map(offer => [offer.sku, offer.storageGiB]))
+            .toEqual([['free_v3', null], ['standard_monthly_v3', 50], ['premium_monthly_v3', 100]]);
+    });
+    it('copy guard: no "unlimited" anywhere; configuration tiles carry no per-configuration disk claim', () => {
+        for (const sku of [undefined, 'standard_monthly_v3', 'premium_monthly_v3'] as const) {
+            const summary = buildSummaryV3({ ...input(sku), volumeGiB: 100 });
+            expect(JSON.stringify(summary)).not.toMatch(/unlimited/i);
+            // No tile carries a disk figure at all (none claims a disk a switch would not deliver).
+            for (const option of summary.computer.machineChoice) expect(option.diskGiB).toBeNull();
+            for (const option of summary.computer.machineChoice) {
+                expect(Object.values(option).every(value => typeof value !== 'string' || /^(free-cf|std-2|cmp-4|cmp-8|x86_64)$/.test(value))).toBe(true);
+            }
+        }
+    });
+});
+
+describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
+    const GiB = BigInt(1024) ** BigInt(3);
+    it('divides by 1024^3 (a full 50 GiB disk reads 50, not 53.7), one decimal', () => {
+        expect(usedGiBOf(BigInt(50) * GiB)).toBe(50);
+        expect(usedGiBOf(String(BigInt(50) * GiB))).toBe(50);
+        expect(usedGiBOf(BigInt(43) * GiB + GiB / BigInt(2))).toBe(43.5);
+        expect(usedGiBOf(BigInt(1_000_000_000))).toBe(0.9);
+        expect(usedGiBOf(BigInt(0))).toBe(0);
+        // Rounded to the nearest tenth, not floored: 0.96 GiB reads 1, 0.94 GiB reads 0.9.
+        expect(usedGiBOf(BigInt(Math.round(0.96 * 1024 ** 3)))).toBe(1);
+        expect(usedGiBOf(BigInt(Math.round(0.94 * 1024 ** 3)))).toBe(0.9);
+    });
+    it('null, negative or malformed input is null (no invented figure)', () => {
+        for (const value of [null, undefined, '', 'abc', '-5', BigInt(-1)]) expect(usedGiBOf(value as never)).toBeNull();
     });
 });

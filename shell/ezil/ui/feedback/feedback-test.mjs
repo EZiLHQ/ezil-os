@@ -304,6 +304,86 @@ try {
         await tick();
         assert.equal(shown(), false, 'every window closed: hidden again');
     });
+    // Gate G3, 2026-10-31: the Browser's strip is 43px and Code's 28px
+    // (ezil-shell.css), so the icon mirrors the FRONT full view's
+    // `--ezil-control-strip-height` and its declared `--ezil-feedback-look`.
+    // jsdom resolves custom properties; the windows here declare them inline
+    // as ezil-shell.css does for the real ones. Pixels: code-full-view-browser-test.
+    await check('in-app icon: in a full view it takes the FRONT full view\'s strip height and look, and writes only on a change', async () => {
+        feedback.mount_feedback_chip();
+        const chip = document.querySelector('.ezil-feedback-chip');
+        const strip = () => chip.style.getPropertyValue('--ezil-feedback-strip-h');
+        const look = () => chip.dataset.look ?? null;
+        const parent = document.createElement('div');
+        parent.innerHTML = '<div class="window ezil-fullbleed" data-app="desktop" style="z-index: 5; --ezil-control-strip-height: 43px"></div>'
+            + '<div class="window" data-app="code" style="z-index: 9; --ezil-control-strip-height: 28px; --ezil-feedback-look: outline"></div>';
+        document.body.append(parent);
+        const [browserWin, codeWin] = parent.children;
+        await tick();
+        assert.equal(chip.classList.contains('ezil-feedback-chip-fullbleed'), true);
+        assert.deepEqual([strip(), look()], ['43px', null], 'only the Browser is full: its strip, the default look');
+        codeWin.classList.add('ezil-fullbleed');
+        await tick();
+        assert.deepEqual([strip(), look()], ['28px', 'outline'], '🔴 Code full in front: Code\'s strip and its outlined look');
+        browserWin.style.zIndex = '12';
+        await tick();
+        assert.deepEqual([strip(), look()], ['43px', null], 'positive control: the Browser back in front takes its strip back');
+        browserWin.style.zIndex = '9';
+        await tick();
+        assert.deepEqual([strip(), look()], ['28px', 'outline'], 'a tie goes to the later window in the document');
+        codeWin.style.display = 'none';
+        await tick();
+        assert.deepEqual([strip(), look()], ['43px', null], 'a full view that is not rendered is not in front');
+        codeWin.style.display = '';
+        codeWin.style.setProperty('--ezil-control-strip-height', '2em');
+        codeWin.style.setProperty('--ezil-feedback-look', 'Outline!');
+        await tick();
+        assert.deepEqual([strip(), look()], ['', null], 'a value that is not a plain px length or look word is not copied (the CSS fallbacks apply)');
+        codeWin.style.setProperty('--ezil-control-strip-height', '28px');
+        codeWin.style.setProperty('--ezil-feedback-look', 'outline');
+        await tick();
+        assert.deepEqual([strip(), look()], ['28px', 'outline']);
+        // Writes only on a change: a window mutation that changes nothing sets
+        // no style property and no attribute on the icon. (A same-value CSSOM
+        // write queues no mutation record, so the style writes are counted at
+        // the call; an attribute set queues one even when the value is equal.)
+        const writes = [];
+        const watch = new MutationObserver(records => writes.push(...records.map(r => `attribute ${r.attributeName}`)));
+        watch.observe(chip, { attributes: true });
+        for ( const method of ['setProperty', 'removeProperty'] ) {
+            const real = chip.style[method].bind(chip.style);
+            chip.style[method] = (...args) => { writes.push(`${method} ${args[0]}`); return real(...args); };
+        }
+        parent.setAttribute('class', 'unrelated');
+        await tick(); await tick();
+        watch.disconnect();
+        delete chip.style.setProperty;
+        delete chip.style.removeProperty;
+        assert.deepEqual(writes, [], 'nothing changed, nothing written to the icon');
+        // The strip height is a `pointer: coarse` media query; flipping one
+        // mutates nothing, so the icon also re-reads it on the query's change.
+        const query = new window.EventTarget();
+        query.matches = false;
+        const realMatchMedia = window.matchMedia;
+        window.matchMedia = () => query;
+        feedback.mount_feedback_chip();
+        const coarse = document.createElement('style');
+        coarse.textContent = '.window[data-app="code"].ezil-fullbleed { --ezil-control-strip-height: 44px !important; }';
+        document.head.append(coarse);
+        await tick();
+        assert.equal(strip(), '28px', 'setup: a stylesheet change alone is not observed');
+        query.dispatchEvent(new window.Event('change'));
+        assert.equal(strip(), '44px', '🔴 the pointer query\'s change re-reads the strip');
+        coarse.remove();
+        codeWin.classList.remove('ezil-fullbleed');
+        browserWin.classList.remove('ezil-fullbleed');
+        await tick();
+        assert.deepEqual([strip(), look(), chip.classList.contains('ezil-feedback-chip-fullbleed')], ['', null, false], 'no full view: neither is set');
+        parent.remove();
+        window.matchMedia = realMatchMedia;
+        feedback.mount_feedback_chip();
+        await tick();
+    });
     await check('native dialog semantics, default-off consent, live preview, no pre-submit request', () => {
         open();
         assert.equal(modalCalls, 1);

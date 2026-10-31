@@ -22,7 +22,7 @@
  * forwards only to a port the Worker chose from `AWS_EDGE_PORTS`, and the contract's
  * path-only signature still covers it.
  */
-import type { AwsDesktopReadiness } from './aws-ice';
+import type { AwsDesktopConfigReadiness, AwsDesktopReadiness } from './aws-ice';
 import { APP_PREVIEW_PORT, CODE_PREVIEW_PORT, portFor } from './desktop-mode';
 import { relayFailureResult, type RelayState } from './relay-refresh';
 import {
@@ -80,11 +80,14 @@ export interface AwsTunnelRecord {
   aiProxyNonce?: string;
   aiBootId?: string;
   /**
-   * The last desktop config carrying this boot's AI token that the host ACCEPTED: its host boot,
-   * the config's relay expiry (its identity on the host's status) and when (Unix ms). G12: the
-   * open path does not push the AI config again while the host still holds exactly this one.
+   * The host boot whose RUNNING desktop was last pushed a config, that config's expiry (which
+   * identifies it in the host's status; absent while the claiming ask still pushes it) and when
+   * (ms). The host applies it only by restarting the desktop, so later asks wait for that
+   * instead of pushing again (aws-ice.ts `ensureAwsDesktopConfig`, aws-tunnels.ts `restartPush`).
    */
-  aiDelivered?: { bootId: string; expiresAt: number; at: number };
+  restartPushBootId?: string;
+  restartPushExpiresAt?: number;
+  restartPushAt?: number;
 }
 
 export function isAwsOriginFresh(record: AwsTunnelRecord, nowMs: number): boolean {
@@ -369,6 +372,14 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   return proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
 }
 
+/** Which window asks for the preview: the streamed desktop, Code (code-server) or the hosted app. */
+export type AwsPreviewSurface = 'desktop' | 'code' | 'app';
+
+/** The `/sandbox/preview` body's `surface` (covered by the v2 body digest); anything but `code`/`app` is the desktop. */
+export function awsPreviewSurface(value: unknown): AwsPreviewSurface {
+  return value === 'code' || value === 'app' ? value : 'desktop';
+}
+
 export interface AwsPreviewDeps {
   zone: string | null;
   secrets: string[];
@@ -382,6 +393,12 @@ export interface AwsPreviewDeps {
    * open. `starting` answers 503 `aws_desktop_starting` (the client's wake loop retries).
    */
   ensureDesktop?: (record: AwsTunnelRecord) => Promise<AwsDesktopReadiness>;
+  /** The asking surface; absent is the desktop (today's app sends none). */
+  surface?: AwsPreviewSurface;
+  /** Code/app: the desktop config alone, no relay (`./aws-ice` `ensureAwsDesktopConfig`). */
+  ensureConfig?: (record: AwsTunnelRecord) => Promise<AwsDesktopConfigReadiness>;
+  /** Code: whether code-server answers on the origin (`./aws-ice` `awsCodeServerAnswers`). */
+  codeAnswers?: (record: AwsTunnelRecord) => Promise<boolean>;
   nowMs: () => number;
 }
 
@@ -410,7 +427,28 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     if (verdict !== 'verified') return json({ ok: false, error: 'aws_origin_starting' }, 503);
   }
   let relay: RelayState | undefined;
-  if (deps.ensureDesktop) {
+  const surface = deps.surface ?? 'desktop';
+  if (surface !== 'desktop' && deps.ensureConfig && (surface === 'app' || deps.codeAnswers)) {
+    // Code and the hosted app run in the desktop's container but never use neko or its relay,
+    // so they never wait on those. They do wait for the desktop config to be applied: the host
+    // applies a config to a RUNNING desktop only by restarting that container (agent.py
+    // `_accept_relay`), code-server and the user's dev server with it, and Chat's AI env reaches
+    // code-server's ezil-models extension only that way (desktop.py `build_spec`). An answer
+    // before then would hand out a window that the host's next tick tears down.
+    let readiness: AwsDesktopConfigReadiness;
+    try {
+      readiness = await deps.ensureConfig(record);
+    } catch (error) {
+      const failure = relayFailureResult(error);
+      return json({ ok: false, error: failure.error }, failure.status);
+    }
+    if (readiness.state === 'starting') return json({ ok: false, error: 'aws_desktop_starting', reason: readiness.reason }, 503);
+    // Applied: the container runs. The hosted app's dev server is the user's (one that is absent
+    // is normal, and the app's own page says so); Code waits for code-server itself.
+    if (surface === 'code' && (await deps.codeAnswers?.(record)) !== true) {
+      return json({ ok: false, error: 'aws_desktop_starting', reason: 'code_starting' }, 503);
+    }
+  } else if (deps.ensureDesktop) {
     let readiness: AwsDesktopReadiness;
     try {
       readiness = await deps.ensureDesktop(record);
@@ -438,6 +476,83 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     expiresAt: now + AWS_PREVIEW_TTL_MS,
     // Like Cloudflare: the relay state the client renews from, and only WHETHER a relay is wired.
     ...(relay ? { relay, turnRelay: true } : {}),
+  });
+}
+
+/**
+ * GW-5 `export` (docs/compute/REVERSE-MOVE-CONTRACT.md §2.2): the export boot's host stages
+ * `/workspace` as a v1 snapshot; the reverse import (./workspace-migration-import) starts the job
+ * and pulls its status, head and chunks. Same gw1 signer as every other host call, bound to the
+ * tunnel record's placement generation and lease epoch.
+ */
+export const EXPORT_CONTROL_PATH = '/__ezil/control/export';
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The host's chunk-index grammar: decimal, no leading zeros, below the 512-chunk cap. */
+const MAX_EXPORT_CHUNKS = 512;
+
+/**
+ * The export POST's exact bytes, built ONCE (this key order, no whitespace). The signature covers
+ * the path only, so the body's sha256 travels in the signed path and the host compares it with
+ * the bytes it read before parsing (§2.2 "Body bytes"): never re-serialize between hash and send.
+ */
+export function awsExportBody(moveId: string, generation: string): string {
+  if (!LOWER_UUID.test(moveId) || !LOWER_UUID.test(generation)) throw new Error('gw_invalid_control_op');
+  return JSON.stringify({ v: 1, moveId, generation });
+}
+
+async function sha256HexOf(text: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+  return [...digest].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function exportOrigin(record: AwsTunnelRecord, zone: string): { host: string; key: Uint8Array } {
+  const key = decodeControlKey(record.controlKey);
+  if (!key) throw new Error('gw_invalid_binding');
+  return { host: awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone), key };
+}
+
+/** `POST /__ezil/control/export/<sha256hex(body)>`: start (or resume, idempotently) this move's export. */
+export async function startAwsExport(
+  record: AwsTunnelRecord,
+  zone: string,
+  moveId: string,
+  generation: string,
+  fetchFn: FetchLike,
+  nowSeconds: number,
+  timeoutMs: number,
+): Promise<Response> {
+  const body = awsExportBody(moveId, generation);
+  const { host, key } = exportOrigin(record, zone);
+  const path = `${EXPORT_CONTROL_PATH}/${await sha256HexOf(body)}`;
+  const header = await signGatewayHeader(key, record, 'POST', path, nowSeconds);
+  return fetchFn(`https://${host}${path}`, {
+    method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header, 'content-type': 'application/json' }, body,
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** What the import reads from the host edge: served from disk, never through the agent socket. */
+export type AwsExportRead = 'status' | 'head' | { chunk: number };
+
+/** `GET /__ezil/control/export/{status,head,chunk/<i>}`: no body, no query, so the signed path is the whole request. */
+export async function readAwsExport(
+  record: AwsTunnelRecord,
+  zone: string,
+  read: AwsExportRead,
+  fetchFn: FetchLike,
+  nowSeconds: number,
+  timeoutMs: number,
+): Promise<Response> {
+  if (typeof read === 'object' && (!Number.isSafeInteger(read.chunk) || read.chunk < 0 || read.chunk >= MAX_EXPORT_CHUNKS)) {
+    throw new Error('gw_invalid_control_op');
+  }
+  const { host, key } = exportOrigin(record, zone);
+  const path = `${EXPORT_CONTROL_PATH}/${typeof read === 'object' ? `chunk/${read.chunk}` : read}`;
+  const header = await signGatewayHeader(key, record, 'GET', path, nowSeconds);
+  // Identity: the chunk's Content-Length is checked against the export head.
+  return fetchFn(`https://${host}${path}`, {
+    method: 'GET', headers: { [AWS_GATEWAY_HEADER]: header, 'accept-encoding': 'identity' },
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
   });
 }
 

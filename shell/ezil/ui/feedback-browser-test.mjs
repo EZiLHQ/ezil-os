@@ -14,6 +14,10 @@
 //     inside the full-bleed control strip, clear of the drawer and of every
 //     window's traffic lights;
 //   - minimising or closing the last app window hides it again;
+//   - Code in full view (app-code lane A2, 2026-10-30; gate G3, 2026-10-31):
+//     the icon sits in Code's own, lower strip, vertically centred, outlined,
+//     clear of the notch and of the open tray's Show desktop / Restore window /
+//     Close (the geometry at four sizes: code-full-view-browser-test.mjs);
 //   - clicking it opens the real dialog: native <dialog> focus, the exact
 //     request bytes and header, refusals, the draft, and Chromium's own offline
 //     emulation followed by its `online` event.
@@ -118,6 +122,8 @@ try {
                 if ( url.searchParams.get('confirm') === 'display' ) return json({ ok: true, display: 'live' });
                 if ( url.pathname === ENDPOINTS.desktop ) return json(request.method() === 'POST'
                     ? { ok: true, guacamoleUrl: `${origin}/frame?desktop=1`, frame: { confirmed: true } } : { ok: true, guacamoleRunning: true });
+                // The Code window's mint (its default route; not in ENDPOINTS).
+                if ( url.pathname === '/api/shell/code-preview-url' ) return json({ ok: true, codePreviewUrl: `${origin}/frame?code=1` });
                 return json({ ok: true });
             }
             return route.fulfill({ status: 404, body: '' });
@@ -152,6 +158,10 @@ try {
                 ...[...w.querySelectorAll(':scope > .window-head > .window-action-btn')].map(rect)
                     .map(r => ({ x: r.x - 6, y: r.y - 6, width: r.width + 12, height: r.height + 12 })),
                 ...[...w.querySelectorAll('.ezil-app-drawer, .ezil-app-drawer button')].map(rect),
+                // Code's full-view strip (lane A2): no buttons since gate G3
+                // moved them into the drawer's tray (counted above). Still
+                // collected, so a control added to the strip is checked too.
+                ...[...w.querySelectorAll(':scope > .ezil-full-view-bar button')].map(rect),
             ]).filter(r => r.width > 0 && r.height > 0);
             const strip = document.querySelector('.window.ezil-fullbleed');
             return { box, disc: rect(icon.querySelector('svg')), hitIsIcon: hit?.closest('button') === icon, controls,
@@ -290,6 +300,37 @@ try {
             }
             await page.locator('.window[data-app="settings"] > .window-head > .window-close-btn').click();
             await page.waitForSelector('.window[data-app="settings"]', { state: 'detached' });
+            await chip.waitFor({ state: 'hidden' });
+        });
+
+        await check(`${tag}: Code in full view (the /app/code route) shows one tiny outlined icon centred in its strip, clear of the notch and the open tray; closing Code hides it`, async () => {
+            await page.evaluate(async () => {
+                const p = window.__EZIL_BOOT__;
+                await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
+            });
+            await page.waitForSelector('.window[data-app="code"].ezil-fullbleed > .ezil-app-drawer', { state: 'visible' });
+            const m = await assertTiny('Code full view');
+            assert.ok(m.strip > 0 && m.box.y >= 0 && m.box.y + m.box.height <= m.strip, `inside the ${m.strip}px strip (${JSON.stringify(m.box)})`);
+            assert.ok(Math.abs(m.disc.y + m.disc.height / 2 - m.strip / 2) <= 1, `vertically centred in the strip (${JSON.stringify({ disc: m.disc, strip: m.strip })})`);
+            const look = await page.evaluate(() => {
+                const icon = document.querySelector('button.ezil-feedback-chip');
+                return { look: icon.dataset.look ?? null, bg: getComputedStyle(icon.querySelector('svg')).backgroundColor };
+            });
+            assert.deepEqual(look, { look: 'outline', bg: 'rgba(0, 0, 0, 0)' }, 'the outlined look Code\'s strip declares: a ring, no glass');
+            // The tray open: its title and actions are on screen, and none is under the icon.
+            await page.locator('.window[data-app="code"] .dashboard-app-drawer-toggle').focus();
+            await page.waitForFunction(() => {
+                const d = document.querySelector('.window[data-app="code"] > .ezil-app-drawer');
+                return ! d.classList.contains('collapsed') && d.getAnimations({ subtree: true }).length === 0;
+            });
+            const open = await assertTiny('Code full view, tray open');
+            const tray = await page.evaluate(() => [...document.querySelectorAll('.window[data-app="code"] > .ezil-app-drawer .dashboard-app-drawer-btn')]
+                .map(b => { const r = b.getBoundingClientRect(); return { label: b.getAttribute('aria-label'), x: r.x, w: r.width }; }));
+            assert.deepEqual(tray.map(b => b.label), ['Show desktop', 'Restore window', 'Close'], 'the tray\'s three actions are on screen');
+            assert.ok(tray.every(b => b.w > 0 && b.x + b.w <= open.box.x), `every action ends left of the icon (${JSON.stringify({ tray, icon: open.box })})`);
+            assert.ok(open.controls.length >= 4, 'the tray and its actions were part of the overlap check');
+            await page.locator('.window[data-app="code"] > .ezil-app-drawer .dashboard-app-drawer-close').click();
+            await page.waitForSelector('.window[data-app="code"]', { state: 'detached' });
             await chip.waitFor({ state: 'hidden' });
         });
 

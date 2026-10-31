@@ -597,6 +597,8 @@
 /* Size to the resizable window and content column, not the desktop viewport. */
 .ezil-settings-billing {
     min-width: 0;
+    /* Round 5 (D6): one column, never wider than 760 px. */
+    max-width: 760px;
     overflow-wrap: anywhere;
     container-type: inline-size;
 }
@@ -865,6 +867,8 @@
 .ezil-computer-config > div:first-child { display: flex; flex-direction: column; gap: 2px; }
 .ezil-computer-config[data-state="current"],
 .ezil-computer-config[data-state="switching"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+/* During a switch only the target is highlighted; the size it leaves is plain. */
+.ezil-computer-config[data-state="from"] { border-color: var(--border); box-shadow: none; }
 .ezil-computer-config[data-state="locked"],
 .ezil-computer-config[data-state="unavailable"] { opacity: 0.85; }
 .ezil-computer-config-action { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -878,7 +882,192 @@
 .ezil-computer-steps { margin: 0; padding-left: 20px; color: var(--muted); }
 .ezil-computer-steps li[data-state="active"] { color: var(--text); font-weight: 600; }
 .ezil-computer-steps li[data-state="done"] { color: var(--muted); }
+/* D6: a finished step (from a server milestone, never a timer) carries a marker. */
+.ezil-computer-steps { list-style: none; padding-left: 0; display: grid; gap: 6px; }
+.ezil-computer-steps li { position: relative; padding-left: 22px; }
+.ezil-computer-steps li::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 4px;
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--border);
+    border-radius: 50%;
+}
+.ezil-computer-steps li[data-state="active"]::before { border-color: var(--accent); }
+.ezil-computer-steps li[data-state="done"]::before {
+    background: var(--accent);
+    border-color: var(--accent);
+}
 
 /* Billing round 3 (§6.3): three meter rows, each its own card. */
 .ezil-billing-v3-meters { display: grid; gap: 12px; }
 .ezil-billing-credit-line { margin: 4px 0 0; color: var(--text); }
+
+/* ── Round 5 (D6): Settings design — Billing, Computer, shared ───────────── */
+/* Hidden means hidden here, even on elements whose class sets a display. */
+.ezil-settings-window [hidden] { display: none !important; }
+
+/* A tertiary action that reads as a link (Manage payment, Change configuration, Cancel plan). */
+.ezil-billing-link {
+    min-height: 32px;
+    padding: 6px 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    text-align: left;
+}
+.ezil-billing-link:hover:not(:disabled) { text-decoration: underline; }
+.ezil-billing-header .ezil-billing-actions { margin-top: 0; }
+
+.ezil-billing-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px 16px;
+    margin-bottom: 24px;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    border-radius: 10px;
+    background: var(--surface-2);
+}
+.ezil-billing-banner.is-danger { border-left-color: var(--danger); }
+.ezil-billing-banner > div { flex: 1 1 260px; min-width: 0; }
+.ezil-billing-banner p { margin: 0; }
+.ezil-billing-banner p + p { margin-top: 4px; color: var(--muted); }
+.ezil-billing-banner-title { font-weight: 600; }
+
+.ezil-billing-plan-grid { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 16px; }
+.ezil-billing-plan-grid > div:first-child { flex: 1 1 260px; min-width: 0; }
+.ezil-billing-plan-grid .ezil-billing-actions { margin-top: 0; }
+.ezil-billing-plan-price { font-size: 20px; line-height: 28px; font-weight: 600; }
+.ezil-billing-computer { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+.ezil-billing-computer p { margin: 0 0 2px; }
+.ezil-billing-computer strong { font-weight: 600; }
+
+.ezil-billing-section { margin-top: 24px; }
+.ezil-billing-section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 8px; }
+.ezil-settings-content .ezil-billing-section-head h3 {
+    margin: 0;
+    font-size: 13px;
+    line-height: 20px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.ezil-billing-usage-card { display: grid; gap: 0; padding: 0 16px; }
+.ezil-billing-meter-row { padding: 14px 0; min-width: 0; }
+.ezil-billing-meter-row + .ezil-billing-meter-row { border-top: 1px solid var(--border); }
+.ezil-billing-meter-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 12px; }
+.ezil-billing-meter-head h4 { font-size: 14px; line-height: 20px; }
+.ezil-billing-meter-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ezil-billing-meter-row p { margin: 6px 0 0; }
+.ezil-billing-gauge { height: 6px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: var(--surface-2); }
+.ezil-billing-gauge span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.ezil-billing-meter-row.is-warn .ezil-billing-gauge span { background: var(--warn); }
+.ezil-billing-meter-row.is-danger .ezil-billing-gauge span { background: var(--danger); }
+.ezil-billing-meter-row.is-warn .ezil-billing-meter-value { color: var(--warn); }
+.ezil-billing-meter-row.is-danger .ezil-billing-meter-value { color: var(--danger); }
+.ezil-settings-billing .ezil-billing-fair-use { padding: 0; }
+.ezil-billing-meter-row .ezil-billing-actions { margin-top: 10px; }
+.ezil-billing-meter-row h4:focus { outline: 2px solid var(--accent); outline-offset: 4px; }
+
+.ezil-billing-offer { display: flex; flex-direction: column; gap: 8px; }
+.ezil-billing-offer.is-current { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.ezil-billing-offer .ezil-billing-offer-price { margin: 0; align-items: baseline; gap: 4px; }
+.ezil-billing-offer .ezil-billing-offer-price strong { font-size: 28px; line-height: 34px; font-weight: 600; }
+.ezil-billing-offer-configs,
+.ezil-billing-offer-facts { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; font-size: 13px; }
+.ezil-billing-offer-configs span { color: var(--muted); }
+.ezil-billing-offer-configs li > span:not(.ezil-billing-now) { display: block; }
+.ezil-billing-offer-facts { padding-top: 8px; border-top: 1px solid var(--border); }
+.ezil-billing-offer-cta { margin-top: auto; padding-top: 8px; }
+.ezil-billing-current { display: inline-block; padding: 6px 0; color: var(--accent); font-weight: 600; }
+.ezil-billing-now { margin-left: 4px; padding: 0 6px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 18%, var(--surface)); color: var(--text); font-size: 11px; }
+
+.ezil-billing-topup { margin-top: 16px; }
+.ezil-billing-topup summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: var(--text); }
+.ezil-billing-topup .ezil-billing-actions { margin-top: 12px; }
+.ezil-billing-v3-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-top: 24px; }
+.ezil-billing-v3-footer p { margin: 0; }
+
+/* L5b review: the fixed 760x560 Settings window gives Billing ~512 px, so the
+ * comparison goes three-up from 460 px with compact cards (it stacks below). */
+@container (min-width: 460px) {
+    .ezil-settings-billing .ezil-billing-offers { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .ezil-settings-billing .ezil-billing-offers .ezil-billing-offer { padding: 12px; gap: 6px; }
+    .ezil-settings-billing .ezil-billing-offer .ezil-billing-offer-price strong { font-size: 22px; line-height: 28px; }
+    .ezil-settings-billing .ezil-billing-offer .ezil-billing-offer-price span,
+    .ezil-settings-billing .ezil-billing-offer > .ezil-billing-note,
+    .ezil-settings-billing .ezil-billing-offer-configs,
+    .ezil-settings-billing .ezil-billing-offer-facts { font-size: 12px; line-height: 16px; }
+    .ezil-settings-billing .ezil-billing-offer-cta .ezil-settings-btn { padding: 6px 10px; font-size: 13px; }
+}
+
+/* Computer: one card with the header, then the configuration tiles. */
+.ezil-computer-header { justify-content: space-between; align-items: flex-start; }
+.ezil-computer-identity { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 240px; }
+.ezil-computer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0; }
+.ezil-computer-meta [data-role="computer-name"] { font-weight: 600; }
+.ezil-computer-config-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ezil-computer-config-body strong { font-size: 15px; }
+.ezil-computer-config-benefit { color: var(--text); font-size: 13px; }
+.ezil-computer-config [data-role="config-weight"] { font-size: 12px; }
+.ezil-computer-upgrade {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    border-color: var(--accent);
+    color: var(--accent);
+    background: transparent;
+    font-weight: 600;
+    text-decoration: none;
+}
+.ezil-computer-upgrade:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ezil-computer-config[data-state="locked"] [data-role="config-title"],
+.ezil-computer-config[data-state="locked"] [data-role="config-weight"] { opacity: 0.75; }
+
+/* 44 px targets wherever the pointer is coarse. */
+@media (any-pointer: coarse) {
+    .ezil-settings-window :is(.ezil-settings-btn, .ezil-billing-link, .ezil-billing-topup summary, .ezil-sys-details summary) { min-height: 44px; }
+}
+
+.ezil-sys-details { margin-top: 16px; }
+.ezil-sys-details summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: var(--text); }
+/* A flex <summary> loses its disclosure marker; draw a chevron that turns when open. */
+:is(.ezil-billing-topup, .ezil-sys-details) > summary { list-style: none; gap: 8px; }
+:is(.ezil-billing-topup, .ezil-sys-details) > summary::-webkit-details-marker { display: none; }
+:is(.ezil-billing-topup, .ezil-sys-details) > summary::after {
+    content: '';
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted);
+    transform: translateY(-2px) rotate(45deg);
+    transition: transform 0.15s ease;
+}
+:is(.ezil-billing-topup, .ezil-sys-details)[open] > summary::after { transform: translateY(2px) rotate(-135deg); }
+
+/* Light values apply only where a page opts in (data-theme="light"); dark stays the default. */
+:root[data-theme="light"] .ezil-settings-window {
+    --bg: #f6f7f7;
+    --surface: #ffffff;
+    --surface-2: #f2f4f6;
+    --border: rgba(0, 0, 0, 0.1);
+    --text: #161616;
+    --muted: #5f6666;
+    --warn: #a86a00;
+    --danger: #b42318;
+}
+/* A link styled as a button (Sign in with EZiL ID, Upgrade) reads as a button, not underlined text. */
+.ezil-settings-window a.ezil-settings-btn { display: inline-flex; align-items: center; text-decoration: none; }

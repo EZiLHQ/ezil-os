@@ -21,7 +21,7 @@ import { decodeControlKey, verifyGatewayHeader, type FetchLike } from './aws-ori
 import { AwsTunnelRegistry, verifyAwsTunnelOrigin, type TunnelStorage } from './aws-tunnels';
 import { deriveNekoCredentials, hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, mintPreviewCookie, mintPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 import { deriveAiProxyToken } from './ai-proxy';
-import { sha256Hex } from './aws-ice';
+import { AWS_DESKTOP_CONFIG_APPLY_MS, sha256Hex } from './aws-ice';
 import { relayExpiryFor } from './relay-refresh';
 
 const worker = (await import('./index')).default;
@@ -92,9 +92,11 @@ afterEach(() => { globalThis.fetch = realFetch; });
  */
 interface FakeHost {
   bootId?: string; aiConfigured?: boolean;
-  /** Hold a pushed config like the real host: `configured` and its `expiresAt` in the status read. */
-  echo?: boolean; heldExpiresAt?: number;
   configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
+  /** code-server answers its /healthz on 8443; otherwise the edge's 502. */
+  codeUp?: boolean;
+  /** neko's admin API (8181) not up yet: the edge's 502. */
+  nekoDown?: boolean;
   pushed?: { ai?: { baseUrl: string; proxyToken: string }; expiresAt: number; neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; turnStatus?: number; bad: string[]; paths: string[];
 }
@@ -120,13 +122,15 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     const v = await verifyGatewayHeader(headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, method, url.pathname, Math.floor(Date.now() / 1000));
     if (!v.ok) { h.bad.push(`gw ${url.pathname} ${v.error}`); return j({ ok: false }, 401); }
     if (url.pathname.startsWith('/__ezil/control/restart-desktop/')) return j({ ok: true, state: 'restart_requested' });
-    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: h.heldExpiresAt ?? null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
+    if (url.pathname === '/__p/8443/healthz') return h.codeUp ? j({ status: 'alive' }) : j({ ok: false, error: 'desktop_unreachable' }, 502);
+    // Like the host: the held config's expiry once one was pushed (agent.py _desktop_status).
+    if (url.pathname === '/__ezil/control/desktop') return j({ ok: true, configured: h.configured, expiresAt: h.pushed?.expiresAt ?? null, desktop: h.desktop, ice: h.ice, bootId: h.bootId, aiConfigured: h.aiConfigured });
     if (url.pathname.startsWith('/__ezil/control/ice/')) {
       if (url.pathname.slice(20) !== (await sha256Hex(body))) h.bad.push('digest');
       h.pushed = JSON.parse(body);
-      if (h.echo) { h.configured = true; h.heldExpiresAt = h.pushed!.expiresAt; }
       return j({ ok: true, state: 'accepted' });
     }
+    if (h.nekoDown && url.pathname.startsWith('/__p/8181/')) return j({ ok: false, error: 'desktop_unreachable' }, 502);
     const neko = await deriveNekoCredentials({ SANDBOX_HMAC_SECRET: SECRET }, SID);
     if (url.pathname === '/__p/8181/api/login') return (JSON.parse(body) as { password: string }).password === neko.admin ? j({ token: 't' }) : j({}, 401);
     if (url.pathname === '/__p/8181/api/relay' && method === 'GET') return j({ runtimeId, expiresAt: h.relayExpiresAt });
@@ -644,8 +648,19 @@ describe('AWS AI signed boot delivery', () => {
     const ns = (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS;
     const rec = await (await ns.get(SID).fetch(new Request('https://aws-tunnels/get'))).json() as { record: { aiProxyNonce: string } };
     expect(first.proxyToken).toBe(await deriveAiProxyToken(SECRET, SID, rec.record.aiProxyNonce));
+    const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+    // The running desktop applies it only through a restart: later asks wait for it, never push again.
+    for (let i = 0; i < 3; i++) {
+      const again = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+      expect([again.status, await again.json()]).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }]);
+    }
+    expect(pushes()).toBe(1);
+    // A retry that does push again for the same boot (its config gone while the desktop is down) keeps the token.
+    host.desktop = 'absent'; host.configured = false;
     await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+    expect(pushes()).toBe(2);
     expect(host.pushed!.ai).toEqual(first);
+    host.desktop = 'running'; host.configured = true;
     host.bootId = '22222222-2222-4222-8222-222222222222';
     await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
     expect(host.pushed!.ai!.proxyToken).not.toBe(first.proxyToken);
@@ -655,31 +670,97 @@ describe('AWS AI signed boot delivery', () => {
     expect(host.turnCalls).toBe(count);
     expect(host.bad).toEqual([]);
   });
+});
 
-  it('G12: a host that holds the pushed config gets the AI config ONCE per boot, not once per open', async () => {
+describe('AWS Code surface through the hook', () => {
+  it('Code and the desktop window asking together push once; Code waits for the restart that applies it, then answers without neko', async () => {
     const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
     await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
-    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied', aiConfigured: false, echo: true });
-    const pushes = () => host.paths.filter(p => p.startsWith('POST /__ezil/control/ice/')).length;
-    for (let i = 0; i < 5; i++) {
-      expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(503);
+    const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied',
+      aiConfigured: false, codeUp: true, nekoDown: true });
+    const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+    const starting = (reason: string) => ({ ok: false, error: 'aws_desktop_starting', reason });
+    const logs: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation((line: unknown) => { logs.push(String(line)); });
+    try {
+      const codeBody = JSON.stringify({ userId: USER, projectId: CID, surface: 'code' });
+      const ask = async (b: string) => {
+        const r = await worker.fetch(await signed('POST', '/sandbox/preview', b), e);
+        return [r.status, await r.json() as Record<string, unknown>] as const;
+      };
+      // Both read "no push" for this boot; the registry lets exactly one of them push.
+      const both = await Promise.all([ask(codeBody), ask(previewBody)]);
+      expect(both.map(([s]) => s)).toEqual([503, 503]);
+      expect(both.map(([, b]) => b.reason).sort()).toEqual(['config_pending', 'config_pushed']);
+      expect(pushes()).toBe(1);
+      expect(host.pushed!.ai!.baseUrl).toBe(`https://aws-8443-${SID}-aws.ezil.work/ai/v1`);
+      // Until the host restarts the desktop with it (code-server restarts with it), Code never answers 200.
+      for (const b of [codeBody, previewBody, codeBody]) expect(await ask(b)).toEqual([503, starting('config_pending')]);
+      expect(pushes()).toBe(1);
+      expect(host.paths).not.toContain('GET /__p/8443/healthz');
+      // Applied; neko still booting: Code answers (no relay fields), the desktop window still waits.
+      host.aiConfigured = true;
+      const [status, body] = await ask(codeBody);
+      expect(status).toBe(200);
+      expect(String(body.codePreviewUrl)).toContain(`https://aws-8443-${SID}-aws.ezil.work/preview-bootstrap?token=`);
+      expect([body.relay, body.turnRelay]).toEqual([undefined, undefined]);
+      expect(await ask(previewBody)).toEqual([503, starting('desktop_starting')]);
+      expect(pushes()).toBe(1);
+      // Each non-200 answer is logged with its code and reason (never a URL or token).
+      const details = logs.map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+        .filter((ev) => ev?.event === 'sandbox.preview.aws').map((ev) => ev!.detail);
+      expect(details).toEqual(expect.arrayContaining(['aws_desktop_starting:config_pushed', 'aws_desktop_starting:config_pending',
+        'aws_desktop_starting:desktop_starting']));
+      for (const d of details) expect(String(d)).not.toMatch(/https?:|token/i);
+      // The surface is part of the signed body: a body changed after signing is refused.
+      const forged = await signed('POST', '/sandbox/preview', previewBody);
+      const tampered = new Request(forged.url, { method: 'POST', body: codeBody, headers: forged.headers });
+      expect((await worker.fetch(tampered, e)).status).toBe(401);
+    } finally {
+      log.mockRestore();
     }
-    expect(pushes()).toBe(1);
-    expect(host.turnCalls).toBe(1);
-    const ns = (e as { AWS_TUNNELS: { get(id: string): AwsTunnelRegistry } }).AWS_TUNNELS;
-    const rec = await (await ns.get(SID).fetch(new Request('https://aws-tunnels/get'))).json() as { record: { aiDelivered?: { bootId: string; expiresAt: number } } };
-    expect(rec.record.aiDelivered).toMatchObject({ bootId: '11111111-1111-4111-8111-111111111111', expiresAt: host.heldExpiresAt });
-    // A new host boot: one more push for it, then quiet again.
-    host.bootId = '22222222-2222-4222-8222-222222222222';
-    for (let i = 0; i < 3; i++) await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
-    expect(pushes()).toBe(2);
-    host.aiConfigured = true;
-    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
-    expect(pushes()).toBe(2);
     expect(host.bad).toEqual([]);
   });
 });
 
+describe('AWS desktop config push bound through the hook', () => {
+  it('a push never applied ends in aws_desktop_config_unapplied; a Restart then waits for its own config instead of failing', async () => {
+    const t0 = 1_800_000_000_000;
+    const now = spyOn(Date, 'now').mockReturnValue(t0);
+    try {
+      const e = env({ AWS_ROUTING_ENABLED: '1', SANDBOX_NEKO_TURN_KEY_ID: 'turn-key-id', SANDBOX_NEKO_TURN_API_TOKEN: 'turn-api-token' });
+      await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e);
+      const host = installAwsHost({ bootId: '11111111-1111-4111-8111-111111111111', configured: true, desktop: 'running', ice: 'applied',
+        aiConfigured: false });
+      const ask = async () => {
+        const r = await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e);
+        return [r.status, await r.json()];
+      };
+      const pending = [503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }];
+      const pushes = () => host.paths.filter((p) => p.startsWith('POST /__ezil/control/ice/')).length;
+      expect(await ask()).toEqual([503, { ok: false, error: 'aws_desktop_starting', reason: 'config_pushed' }]);
+      now.mockReturnValue(t0 + AWS_DESKTOP_CONFIG_APPLY_MS - 1_000);
+      expect(await ask()).toEqual(pending);
+      now.mockReturnValue(t0 + AWS_DESKTOP_CONFIG_APPLY_MS);
+      expect(await ask()).toEqual([502, { ok: false, error: 'aws_desktop_config_unapplied' }]);
+      expect(pushes()).toBe(1);
+      // The user's Restart stages its own fresh config and asks the host to restart the desktop:
+      // the next opens wait for that restart (no push of ours to re-arm it), they do not fail.
+      const restart = await worker.fetch(await signed('POST', `/sandbox/${SID}/restart`, JSON.stringify({ requestId: 'b'.repeat(64) })), e);
+      expect(restart.status).toBe(202);
+      expect(pushes()).toBe(2);
+      expect(await ask()).toEqual(pending);
+      now.mockReturnValue(t0 + 2 * AWS_DESKTOP_CONFIG_APPLY_MS - 1_000);
+      expect(await ask()).toEqual(pending);
+      expect(pushes()).toBe(2);
+      host.aiConfigured = true;
+      expect((await ask())[0]).toBe(200);
+      expect(host.bad).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});
 
 describe('AWS restart route registration', () => {
   it('routes signed retries to the host and refuses unsigned, foreign and fenced requests', async () => {

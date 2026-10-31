@@ -104,7 +104,13 @@ Feedback (`shell/ezil/ui/Settings/tabs/feedback.js`, shown only when `feedback_e
 closing, rendered; full-bleed included) and hidden on the home screen; a MutationObserver
 on `<body>` follows windows opening, closing, minimising and restoring. Top-right corner,
 level with the 30px window head (whose controls are on the left) or centred in the
-full-bleed control strip, right of the centred drawer; never over window controls. A 16px
+full-bleed control strip, right of the centred drawer; never over window controls. The Code
+window's full view (app-code lane A2, 2026-10-30; `docs/APP-CODE-FULL-VIEW.md`) uses the same
+strip and the same `ezil-fullbleed` class, so the icon takes the same position there with no
+Code-specific rule; that window's compact top bar puts the drawer at the left and ends its
+minimise / restore / close at least 36px (fine) / 50px (coarse) short of the right edge, so
+they never sit under the icon. With `floatingControls` on, the icon is hidden in every
+full-bleed window, Code's included. A 16px
 glyph on a 20px disc, low emphasis; hit target 24×24 on a fine pointer, 44×44 under
 `pointer: coarse`. z-index above every app window (phone/tablet windows are `9999999
 !important`), below context menus, the upgrade sheet and the dialog's top layer.
