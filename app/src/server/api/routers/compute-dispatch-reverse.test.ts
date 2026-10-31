@@ -102,8 +102,10 @@ const HOLDING_SQL = "state NOT IN ('committed', 'failed_reopened')";
 /**
  * The fake placement db (real placement statements) plus an in-memory reverse table that answers the store's own SQL.
  * `present: false` is a database without 0012 (production): the probe says so, and any reverse statement throws.
+ * `lastStop`: the computer's last usage stop (`readLastUsageStop`, the stop hold's read); recorded in `fake.statements`.
  */
-function world(placements: Row[], options: { present?: boolean; moves?: Row[]; forwardBusy?: boolean; imageJobs?: Row[]; meta?: Row[] } = {}) {
+function world(placements: Row[], options: { present?: boolean; moves?: Row[]; forwardBusy?: boolean; imageJobs?: Row[]; meta?: Row[];
+    lastStop?: Date | null } = {}) {
     const fake = createFakePlacementDb({ placements, imageJobs: options.imageJobs });
     const moves = (options.moves ?? []).map(r => ({ ...r }));
     const present = options.present ?? true;
@@ -121,6 +123,10 @@ function world(placements: Row[], options: { present?: boolean; moves?: Row[]; f
         // `readPlacementProvider` (the provider behind an image reservation): not modelled by the fake placement db.
         if (text.includes('placement:provider-table')) return [{ present: true }];
         if (text.includes('placement:provider */')) return fake.placements.filter(r => r.computer_id === params[0]).map(r => ({ provider: r.provider }));
+        if (text.includes('placement:usage-last-stop')) {
+            fake.statements.push({ sql: text, params, tx: null });
+            return [{ stopped_at: options.lastStop ?? null }];
+        }
         if (!text.includes('ezil_compute_reverse_moves')) return fake.db.execute(q);
         reverseSql.push(text);
         if (!present) throw new Error('relation "public.ezil_compute_reverse_moves" does not exist');
@@ -250,20 +256,63 @@ describe('the open routes during a move (§5.3, r6): the move\'s answer right af
     });
 });
 
-describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-closed', () => {
-    const stopped = () => world([held()]);
+describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, before routing, fail-closed', () => {
+    /** r7 fixer: the trigger fires only for a computer the D16 hold can open (std-2, `holdOpenable`); `held()` is cmp-4. */
+    const openable = (over: Row = {}) => held({ instance_type: 'm6i.large', ...over });
+    const stopped = () => world([openable()]);
     it('a held STOPPED computer: creates an open row, schedules one immediate drive and answers the waiting value', async () => {
         const w = stopped();
         expect(await open(w.db, 'previewUrl')).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
         expect(h.gate).not.toHaveBeenCalled();
-        // The hosted-app routes and status never trigger.
+        // appPreviewUrl (hosted-app polls), restartDesktop and status never trigger.
         const quiet = stopped();
-        for (const procedure of ['appPreviewUrl', 'codePreviewUrl', 'restartDesktop'] as const) await open(quiet.db, procedure);
+        for (const procedure of ['appPreviewUrl', 'restartDesktop'] as const) await open(quiet.db, procedure);
         await guac(quiet.db).status({ computerId: C });
         expect(quiet.moves).toEqual([]);
     });
+    it('r7 fixer (§5.9): the Browser icon\'s warm sends the same open (its measured screen) and counts as one', async () => {
+        // shell warm.js → session.openDesktop → POST /api/shell/desktop {computerId, sessionId, screen} → previewUrl: nothing in it
+        // tells a hover from a click, and today it already boots the computer under the D16 hold. Option A: it starts the move.
+        const w = stopped();
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen: { width: 1280, height: 800 } })).toEqual(moving);
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+    });
+    it('r7 fixer (§5.9): Code is an open too: a held STOPPED std-2 computer gets an open row and the waiting value', async () => {
+        const w = stopped();
+        expect(await open(w.db, 'codePreviewUrl')).toEqual(moving);
+        expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
+        expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
+        expect(h.gate).not.toHaveBeenCalled();
+        expect(h.sync).not.toHaveBeenCalled();
+        expect(lines()).toEqual([expect.objectContaining({ event: 'aws-preview', surface: 'code', error: 'sandbox_starting', reason: 'computer_moving' })]);
+        // A run that ended over a minute ago is outside the stop hold: still a trigger.
+        const later = world([openable()], { lastStop: new Date(Date.now() - 61_000) });
+        expect(await open(later.db, 'codePreviewUrl')).toEqual(moving);
+        expect(later.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
+    });
+    it('r7 fixer (§5.9): Code within the stop hold creates no row and still answers computer_stopped (a leftover poll)', async () => {
+        h.gate.mockResolvedValue({ allowed: true });
+        const w = world([openable()], { lastStop: new Date(Date.now() - 10_000) });
+        expect(await open(w.db, 'codePreviewUrl')).toMatchObject({ ok: false, errorCode: 'computer_stopped' });
+        expect(w.moves).toEqual([]);
+        expect(h.schedule).not.toHaveBeenCalled();
+        // The desktop open is never held (Settings → Open desktop still starts it): it triggers, and never reads the stop hold.
+        const desk = world([openable()], { lastStop: new Date(Date.now() - 10_000) });
+        expect(await open(desk.db, 'previewUrl')).toEqual(moving);
+        expect(desk.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
+        expect(desk.fake.statements.some(st => st.sql.includes('placement:usage-last-stop'))).toBe(false);
+    });
+    it.each([['cmp-4', 'm6i.xlarge'], ['cmp-8', 'm6i.2xlarge'], ['an unknown size', null]] as const)(
+        'r7 fixer (§5.9): a held-closed computer (%s) never triggers; its opens keep 6a\'s files_on_aws refusal', async (_name, instanceType) => {
+            for (const procedure of ['previewUrl', 'codePreviewUrl'] as const) {
+                const w = world([held({ instance_type: instanceType })]);
+                expect(await open(w.db, procedure)).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
+                expect(w.moves).toEqual([]);
+            }
+            expect(h.schedule).not.toHaveBeenCalled();
+        });
     it.each([
         ['ezil.work account', { email: 'founder@EZIL.work' }],
         ['operator allow-list', { email: 'ops@example.com' }],
@@ -275,6 +324,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
         ['AWS disabled', { env: { EZIL_AWS_COMPUTERS_ENABLED: '0' } }],
         ['RUNNING', { placement: { state: 'RUNNING' } }],
         ['a lifecycle job', { placement: { lifecycle_job_id: J } }],
+        ['held closed (cmp-4)', { placement: { instance_type: 'm6i.xlarge' } }],
         ['a failed_reopened newest row', { moves: [moveRow({ state: 'failed_reopened', last_error: 'copy_stalled' })] }],
         ['forward work', { forwardBusy: true }],
         ['no 0012', { present: false }],
@@ -283,27 +333,31 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
         if (setup.billingFails) h.billingFails = true;
         if (setup.tabOff) h.tabEnabled = false;
         for (const [k, v] of Object.entries((setup.env as Record<string, string>) ?? {})) vi.stubEnv(k, v);
-        const w = world([held(setup.placement as Row)], { moves: setup.moves as Row[], forwardBusy: setup.forwardBusy as boolean, present: setup.present as boolean });
+        const w = world([openable(setup.placement as Row)], { moves: setup.moves as Row[], forwardBusy: setup.forwardBusy as boolean, present: setup.present as boolean });
         const created = await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: setup.email ?? 'person@example.com' });
         expect(created).toBeNull();
         expect(w.moves.filter(r => r.started_by === 'open')).toEqual([]);
         expect(h.schedule).not.toHaveBeenCalled();
+        // Control: the same world with the one condition lifted does trigger (each row tests its own condition).
+        h.subs = []; h.billingFails = false; h.tabEnabled = true; vi.unstubAllEnvs(); for (const [k, v] of Object.entries(AWS_ENV)) vi.stubEnv(k, v);
+        const ok = world([openable()]);
+        expect(await reverseMoveOnOpen(ok.db as never, { userId: U, computerId: C }, { email: 'person@example.com' })).toMatchObject({ startedBy: 'open' });
     });
     it('a switch/restart transition in flight is not a trigger (its stop passes through STOPPED)', async () => {
         const transition = { v: 1, transitionId: J, requestId: 'req-12345678', kind: 'restart', computerId: C, userId: U, current: 'std-2', target: 'std-2',
             phase: 'waking', reason: null, fromGeneration: 7, fromLeaseEpoch: 11, requestedAt: new Date().toISOString(), stoppingAt: null, wakingAt: null, endedAt: null };
-        const w = world([held()], { meta: [{ transition, opening: null }] });
+        const w = world([openable()], { meta: [{ transition, opening: null }] });
         expect(await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: 'person@example.com' })).toBeNull();
     });
     it('a STOPPED computer still carrying its last session\'s lease is a trigger (a stop never clears lease_until)', async () => {
         // A D16 hold session renewed the lease up to an hour ahead, then stopped: the next open moves the files (moveOnOpen).
-        const w = world([held({ lease_until: new Date(Date.now() + 50 * 60_000), presence_at: new Date(Date.now() - 10 * 60_000) })]);
+        const w = world([openable({ lease_until: new Date(Date.now() + 50 * 60_000), presence_at: new Date(Date.now() - 10 * 60_000) })]);
         expect(await open(w.db, 'previewUrl')).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.gate).not.toHaveBeenCalled();
     });
     it('a committed newest row does not stop a new open move (a Free user again after a later paid period)', async () => {
-        const w = world([held()], { moves: [moveRow({ state: 'committed' })] });
+        const w = world([openable()], { moves: [moveRow({ state: 'committed' })] });
         expect(await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: 'person@example.com' }))
             .toMatchObject({ startedBy: 'open', state: 'requested' });
     });
@@ -345,7 +399,7 @@ describe('computer.move.start / retry (§5.9): nested, pinned order, every refus
     it('only user and open rows are ever written (no cron in v1)', async () => {
         const viaClick = world([held()]);
         await ask(viaClick.db, 'start');
-        const viaOpen = world([held()]);
+        const viaOpen = world([held({ instance_type: 'm6i.large' })]);
         await open(viaOpen.db, 'previewUrl');
         expect([...viaClick.moves, ...viaOpen.moves].map(r => r.started_by)).toEqual(['user', 'open']);
     });

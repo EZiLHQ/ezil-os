@@ -118,6 +118,10 @@ describe('moveOnOpen and moveAvailable (§6.1.1)', () => {
         expect(computer({ reverseMove: rm() })).toMatchObject({ reverseMove: null, moveOnOpen: true, moveAvailable: true });
         expect(computer({ reverseMove: rm({ founderOwned: true }) })).toMatchObject({ moveOnOpen: false, moveAvailable: true });
     });
+    it.each([['m6i.xlarge (cmp-4)', 'm6i.xlarge'], ['m6i.2xlarge (cmp-8)', 'm6i.2xlarge'], ['an unknown size', null]] as const)(
+        'r7 fixer: a held-closed computer, %s: moveOnOpen false (the open trigger never fires for it), the click still offered', (_name, instanceType) => {
+            expect(computer({ reverseMove: rm({ placement: aws({ instanceType }) }) })).toMatchObject({ moveOnOpen: false, moveAvailable: true });
+        });
     it('the kill switch, AWS disabled, a paid standing or a Cloudflare placement: neither', () => {
         for (const over of [{ killSwitchOn: true }, { awsEnabled: false }] as const) {
             expect(computer({ reverseMove: rm(over) }), JSON.stringify(over)).toMatchObject({ moveOnOpen: false, moveAvailable: false });

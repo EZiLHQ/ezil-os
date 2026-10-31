@@ -264,6 +264,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             // Phase B (D20, REVERSE-MOVE-CONTRACT §5.9): the next open of a held Free computer starts the move to the Free
             // computer. It runs here, before routing, and fails closed; routing then answers the reverse waiting provider.
+            // r7 fixer: the Browser icon's warm (hover or press, shell warm.js) sends this same open and counts as one, as it
+            // already boots the computer under the D16 hold today (§5.9).
             await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user);
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
@@ -755,6 +757,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            // Phase B (D20, §5.9, r7 fixer): Code is an open of the computer too, so it starts the move as the desktop does
+            // ("the next time you open your computer"). Never within the stop hold: a leftover poll still answers
+            // `computer_stopped` below, and no row is created for it.
+            await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { stopCooldown: true });
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).
             if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId,

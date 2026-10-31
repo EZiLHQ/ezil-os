@@ -12,7 +12,7 @@ import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './cata
 import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
 import { deriveStanding, paidAccess } from './standing';
 import {
-    reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
+    reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
 import { REVERSE_MOVE_HOLDING, type ComputeReverseMove } from '../../lib/compute/provider-reverse-store';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
@@ -222,8 +222,9 @@ export interface ReverseMoveSummaryInput {
 /**
  * §6.1 / §6.1.1 derived fields. Omitted input → no key at all (today's output). `move` stays null for old shells.
  * - `reverseMove`: the newest row while it holds, or for 24 h on the DB clock after it ended.
- * - `moveOnOpen`: held here (files_on_aws on this aws-ec2 placement), no row holds, the newest row is not a failure,
- *   not founder-owned, AWS on and the kill switch off. It picks the pre-move card's copy only; the trigger re-checks.
+ * - `moveOnOpen`: held here (files_on_aws on this aws-ec2 placement), **[r7 fixer]** the D16 hold can open it (`holdOpenable`:
+ *   the trigger never fires for a held-closed computer), no row holds, the newest row is not a failure, not founder-owned, AWS
+ *   on and the kill switch off. It picks the pre-move card's copy only; the trigger re-checks.
  * - `moveAvailable`: held here, AWS on, the kill switch off, and the newest row's failure does not forbid Try again.
  */
 export function reverseMoveFields(input: ReverseMoveSummaryInput | undefined, standing: ComputeStandingV3):
@@ -237,7 +238,7 @@ export function reverseMoveFields(input: ReverseMoveSummaryInput | undefined, st
     const failed = row?.state === 'failed_reopened' || row?.state === 'failed_needs_operator';
     return {
         reverseMove: row && reverseMoveVisible(row) ? reverseMoveView(row, placement) : null,
-        moveOnOpen: held && live && !holding && !failed && !input.founderOwned,
+        moveOnOpen: held && reverseHoldOpenable(placement) === true && live && !holding && !failed && !input.founderOwned,
         moveAvailable: held && live && !reverseTryAgainForbidden(row, placement),
     };
 }

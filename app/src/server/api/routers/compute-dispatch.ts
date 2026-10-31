@@ -60,7 +60,7 @@ import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/comp
 import { migrationStartingAnswer } from '@/server/lib/compute/provider-migrate-placement';
 import { COMPUTER_MOVE_NEEDS_ATTENTION, COMPUTER_MOVING } from '@/server/lib/compute/provider-reverse-placement';
 import {
-    reverseFounderOwned, reverseMoveView, reversePlacementView, reverseTryAgainForbidden, type ReverseMovePlacementView,
+    reverseFounderOwned, reverseHoldOpenable, reverseMoveView, reversePlacementView, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '@/server/lib/compute/provider-reverse';
 import {
     createProviderReverseStore, forwardMoveBusy, ReverseMoveConflictError, reverseMovesTablePresent, type ComputeReverseMove,
@@ -740,17 +740,21 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
 }
 
 /**
- * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` before `routeComputer`, never by reads,
- * `computer.progress`, `status` or the hosted-app routes. Creates a row only when ALL hold: the placement is aws-ec2 STOPPED
- * with no job and no switch/restart transition (§5.9's "no lease (no transition active)"; `lease_until` itself is not read: a
- * stop never clears it, so a STOPPED row's lease is always stale); no reverse row holds it and the newest is not a failure
- * (after a failure only a click starts the next move); the kill switch is off; the account is not founder-owned
- * (§5.9.1); no forward work; standing `files_on_aws`. Cheap checks first: a Cloudflare open adds one placement read.
+ * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` (the desktop, and so also the Browser icon's
+ * warm, which sends the same open) and, **[r7 fixer]**, by `codePreviewUrl` before `routeComputer`; never by reads,
+ * `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl`. Creates a row only when ALL hold: the placement is aws-ec2
+ * STOPPED with no job and no switch/restart transition (§5.9's "no lease (no transition active)"; `lease_until` itself is not
+ * read: a stop never clears it, so a STOPPED row's lease is always stale); **[r7 fixer]** its size is `HOLD_SIZE` (a held-closed
+ * computer keeps 6a's `files_on_aws` refusal: its card offers the move as a click only); no reverse row holds it and the newest
+ * is not a failure (after a failure only a click starts the next move); the kill switch is off; the account is not
+ * founder-owned (§5.9.1); no forward work; standing `files_on_aws`. **[r7 fixer]** With `stopCooldown` (Code), not within
+ * `STOP_COOLDOWN_MS` of the last run's end: a leftover poll never starts anything the owner just stopped (the route then
+ * answers `computer_stopped`, as before). Cheap checks first: a Cloudflare open adds one placement read.
  * 🔴 Fails closed: any throw means no trigger, and the open proceeds as the D16 hold (today's open). The caller then routes,
  * and routing answers the reverse waiting provider for the row created here. Returns the row, or null.
  */
 export async function reverseMoveOnOpen(db: PlacementDb, computer: ComputerRef, user: { email?: unknown },
-    deps: ReverseTriggerDeps = {}): Promise<ComputeReverseMove | null> {
+    deps: ReverseTriggerDeps = {}, options: { stopCooldown?: boolean } = {}): Promise<ComputeReverseMove | null> {
     const env = deps.env ?? process.env;
     const userId = computer.userId.toLowerCase(), computerId = computer.computerId.toLowerCase();
     try {
@@ -761,12 +765,20 @@ export async function reverseMoveOnOpen(db: PlacementDb, computer: ComputerRef, 
         // STOPPED computer often carries a future lease. A wake writes LEASED with its lease in one CAS, so STOPPED with
         // no job (plus the transition check below) already means no transition is active.
         if (p?.provider !== 'aws-ec2' || p.state !== 'STOPPED' || p.lifecycleJobId !== null) return null;
+        // r7 fixer: only a computer the D16 hold can open (`holdOpenable`, §6.1.1); an unknown size is not one.
+        if (reverseHoldOpenable(p) !== true) return null;
         const config = readAwsAdmissionConfig(env);
         if (!config.enabled || config.killSwitch) return null;
         if (!(await reverseMovesTablePresent(db))) return null;
         const store = createProviderReverseStore(db);
         const newest = await store.readByComputer(computerId);
         if (newest && newest.state !== 'committed') return null;
+        if (options.stopCooldown) {
+            // The same window and read as `stopCooldownAnswer` (no row inside it); a failed read is no trigger.
+            const ended = await readLastUsageStop(db, computerId, userId);
+            const age = ended ? now.getTime() - ended.getTime() : null;
+            if (age !== null && age > -STOP_COOLDOWN_MS && age < STOP_COOLDOWN_MS) return null;
+        }
         const meta = await readComputerMeta(db, computer);
         if (meta?.transition && TRANSITION_IN_FLIGHT.includes(resolveTransition(meta.transition, p, now).phase)) return null;
         if (await reverseFounderOwned(user.email, deps.isOperator ?? defaultIsOperator)) return null;
