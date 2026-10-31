@@ -21,6 +21,7 @@
 
 /** DECISION_72 (REVERSE-MOVE-CONTRACT §7.2): lane O is held for v1; the D21 snapshot is the existing DLM policy (§7.1). */
 export type ReverseSnapshotPass = { status: 'held'; reason: 'v1_dlm' };
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- the pinned v1 signature (§7.2); lane O's executor reads it
 export async function advanceReverseSnapshots(_input: { deadlineMs: number }): Promise<ReverseSnapshotPass> {
     return { status: 'held', reason: 'v1_dlm' };
 }
