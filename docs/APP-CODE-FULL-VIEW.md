@@ -33,7 +33,7 @@ App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
 `createFullView(el_window)` is the Browser's former `go_fullbleed` /
 `minimise_to_taskbar`, made shareable:
 
-- **`enter()`** adds `ezil-fullbleed`, calls `enter_fullpage_mode` (which hides the taskbar and the head, sizes the window at 100%, and stashes the previous bounds), writes `data-is_fullpage="1"`, calls `focusWindow()` and flashes the drawer.
+- **`enter()`** first completes any jQuery animation still running on the window (`finish()`). It then adds `ezil-fullbleed`, calls `enter_fullpage_mode` (which hides the taskbar and the head, sizes the window at 100%, and stashes the previous bounds), writes `data-is_fullpage="1"`, calls `focusWindow()` and flashes the drawer.
 - **`exit()`** clears the desire, gives the chrome back and restores the stashed bounds. This is new for Code. The Browser never calls it.
 - **`minimise()`** gives the chrome back and then calls `hideWindow()`. It is chrome-only, and the geometry stays full while the window is hidden.
 - **`settle()`** handles a window that was minimised from full view and is now restored without wanting full view. It goes back to its stashed bounds.
@@ -41,6 +41,47 @@ App-code lane A2, 2026-10-30. Source: `shell/ezil/apps/code.js`,
 - **`forbid()`** means there is no exit, so there is no entry.
 - **Two windows in full view.** Leaving full view gives the taskbar back only when no other visible window is still in full view. Otherwise only that window's head comes back.
 - **`prepare_close()`** is called from both windows' `on_before_exit`, which `$.fn.close` awaits before its own full-page exit. It applies the same rule to closing. When another window is still in full view, it drops this window's `data-is_fullpage`, so `$.fn.close` does not put the taskbar over that window. When there is no other full window it does nothing.
+
+**Full view fills the viewport, on every entry path (2026-10-30).** Until
+this date, Code opened from `/app/code` got the class and the top bar but kept
+its windowed size: `left: 0px; top: 0px; width: 980px; height: 680px`. This
+was measured on real Next and in Chromium. Two writes put the windowed box
+back:
+
+- **UIWindow's opening animation.** UIWindow shows every new window with
+  `$(el).show(0, cb)`. jQuery runs any numeric speed, 0 included, as a "show"
+  animation. It captures the inline width and height the window was built
+  with and writes them back when it completes. On a real load the dock's items
+  are still in their 50ms jQuery entrance, so the completion lands on a later
+  fx tick, about 7ms after `code.js` has entered full view (Chromium trace:
+  `enter_fullpage_mode` 100% at t=244, `f.fx.tick` 980px/680px at t=251). This
+  hit every new window that opens straight into full view: a first load, a
+  reload, Back/Forward to a closed Code, and a dock launch with full
+  remembered. `enter()`'s `finish()` completes that animation before the
+  geometry is written.
+- **`$.fn.showWindow` on a visible window** (`UIWindow.js`). The registry calls
+  `showWindow()` on an already-open single-instance window (a dock click,
+  Back/Forward onto an open app). It wrote the box that `hideWindow`, a drag or
+  a resize had last left in `data-orig-*`, so a full Code shrank to where it
+  was last minimised (230,135 980x680), or to an old viewport's pixels after a
+  resize. It now restores that box only to a window that is minimised. This
+  also fixes the Browser's full-bleed on the same path. A windowed window keeps
+  its box: before, Back onto a windowed Code that had been minimised from full
+  view put it at 0,0 with the old viewport's size.
+
+The browser suites now assert geometry, not only the class:
+`os-chrome-browser-test`, `window-chrome-browser-test` GROUP 6 and
+`app-link-browser-test`, plus `full-view-test` in jsdom. Each check asserts
+that:
+
+- the window rect equals the viewport;
+- the body runs from the strip to the bottom edge;
+- the window is opaque;
+- the window is the element at the centre and at both bottom corners;
+- all of this still holds two frames later, after nothing is moving the window.
+
+Each is paired with a windowed positive control: the 980x680 box, and an exact
+Restore to the stash.
 
 `ezil-shell.css` keys the shared strip, drawer, body offset and resize-handle
 rules on `.ezil-full-view-host`, which `createFullView` adds. The Browser's rules
