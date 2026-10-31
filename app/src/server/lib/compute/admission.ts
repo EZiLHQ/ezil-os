@@ -20,7 +20,9 @@ import {
     withAdmission,
     ENROLLMENT_FAILED,
     createAwsPlacement,
+    ImageJobConflictError,
     leasePlacement,
+    lockComputerUnderAdmission,
     mintAdmissionTicket,
     peekAdmissionCounters,
     readAdmissionCounters,
@@ -31,7 +33,8 @@ import {
     type PlacementDb,
     type PlacementFields,
 } from './placement';
-import { instanceTypeForTier, instanceVcpu, isAwsTier, readAwsAdmissionConfig, type AwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
+import { AWS_REGION_PATTERN, instanceTypeForTier, instanceVcpu, isAwsTier, readAwsAdmissionConfig, type AwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
+import { createProviderReverseStore, REVERSE_MOVE_MAX_ACTIVE } from './provider-reverse-store';
 import { BYTES_PER_GB, usageFor, utcMonthStart } from './usage';
 
 export type AdmissionRefusal =
@@ -176,7 +179,12 @@ export type AdmissionRequest =
 
 export type AdmissionOutcome =
     | { admitted: true; placement: Placement }
-    | { admitted: false; reason: AdmissionRefusal | 'cas_conflict' | 'placement_exists' | 'capacity_waiting'; reasons?: AdmissionRefusal[] };
+    | { admitted: false; reason: AdmissionRefusal | ExportBootRefusal | 'cas_conflict' | 'placement_exists' | 'capacity_waiting'; reasons?: AdmissionRefusal[] };
+/**
+ * `admitExportBoot` only (REVERSE-MOVE-CONTRACT §5.1.1): `move_capacity` is the fleet's reverse-move cap (a wait, like
+ * `max_running`); `region_missing` is this placement's own null or invalid region (permanent for the computer).
+ */
+export type ExportBootRefusal = 'move_capacity' | 'region_missing';
 
 export interface AdmissionDeps {
     env?: Env;
@@ -308,4 +316,80 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         if (!result.ok) return { admitted: false, reason: result.reason === 'illegal_transition' ? 'cas_conflict' : result.reason };
         return { admitted: true, placement: result.placement };
     });
+}
+
+/** An image reservation seen by the claim's own reads or CAS (steps 3, 4, 7): the transaction rolls back, the claim waits. */
+class ExportBootReserved extends Error {}
+const reservedAs = async <T>(read: () => Promise<T>): Promise<T> => {
+    try { return await read(); } catch (error) {
+        if (error instanceof ImageJobConflictError) throw new ExportBootReserved();
+        throw error;
+    }
+};
+
+/**
+ * The reverse move's export-boot claim (REVERSE-MOVE-CONTRACT §5.1.1): ONE `withAdmission` transaction that leases the
+ * held computer's STOPPED placement as a replace (generation N+1, lease epoch E+1) and records the claim on the reverse
+ * row (`recordInTx`) in the same transaction. 🔴 The only new caller of the ticket minter, inside the file that may name it.
+ *
+ * 1. Disabled config refuses before any statement, as `runAdmission`.
+ * 2. Admission lock (withAdmission's first statement), then the computer lock: the claim serialises with the reverse
+ *    create, `releaseExportBoot` and the flip (admission → computer, never the other way).
+ * 3. Counters, under both locks.
+ * 4. The placement: `aws-ec2`, this owner's, `STOPPED`, no job, at `expected`, else `cas_conflict`; a null or invalid region
+ *    is `region_missing` (per computer, permanent) BEFORE `decideAdmission`, which would call it a deployment-wide wait.
+ * 5. `decideAdmission` with the placement's own region and type, minus `user_hours_cap` and `user_egress_cap`: the move is
+ *    EZiL's cost and ends EZiL's AWS cost, so the user's allowance never blocks it; real capacity does.
+ *    5b. At `REVERSE_MOVE_MAX_ACTIVE` rows past `requested`, fleet-wide: `move_capacity` (a wait).
+ * 6. The ticket. 7. The replace lease, keeping the placement's own type and region (no resize).
+ * 8. `recordInTx(tx, leased)`: a throw (for example `lost_race`) rolls the lease back with it.
+ *
+ * An `ImageJobConflictError` from steps 3, 4 or 7 rolls the transaction back and answers `cas_conflict` (§5.2.1), never a
+ * throw. Entitlement start gates do not apply (a Free user's size would be refused), and Free never uses the pool.
+ */
+export async function admitExportBoot(
+    db: PlacementDb,
+    input: {
+        userId: string;
+        computerId: string;
+        /** The STOPPED row's generation N and lease epoch E. */
+        expected: { generation: number; leaseEpoch: number };
+        leaseUntil: Date;
+        /** The boot's job, digest, fence and nonce hash (§5.1.2), written in the lease's own compare-and-swap. */
+        fields: PlacementFields;
+    },
+    recordInTx: (tx: PlacementExecutor, leased: Placement) => Promise<void>,
+    deps: AdmissionDeps = {},
+): Promise<AdmissionOutcome> {
+    const config = readAwsAdmissionConfig(deps.env ?? process.env);
+    if (!config.enabled) return { admitted: false, reason: config.reason, reasons: [config.reason] };
+    const now = (deps.now ?? (() => new Date()))();
+    const userId = input.userId.toLowerCase(), computerId = input.computerId.toLowerCase();
+    try {
+        return await withAdmission(db, async (tx, lock): Promise<AdmissionOutcome> => {
+            await lockComputerUnderAdmission(tx, lock, computerId);
+            const counters = await reservedAs(() => readAdmissionCounters(tx, lock, { userId, computerId, monthStart: utcMonthStart(now), now }));
+            const placement = (await reservedAs(() => readPlacement(tx, computerId))).record;
+            if (!placement || placement.provider !== 'aws-ec2' || placement.ownerUserId !== userId || placement.state !== 'STOPPED'
+                || placement.lifecycleJobId !== null || placement.generation !== input.expected.generation
+                || placement.leaseEpoch !== input.expected.leaseEpoch) return { admitted: false, reason: 'cas_conflict' };
+            if (typeof placement.region !== 'string' || !AWS_REGION_PATTERN.test(placement.region)) return { admitted: false, reason: 'region_missing' };
+            const decision = decideAdmission({ config, counters, userId, now, region: { kind: 'lease', region: placement.region }, instanceType: placement.instanceType });
+            if (!decision.admit) {
+                const reasons = decision.reasons.filter(r => r !== 'user_hours_cap' && r !== 'user_egress_cap');
+                if (reasons.length > 0) return { admitted: false, reason: reasons[0]!, reasons };
+            }
+            if (await createProviderReverseStore(tx).countHostBound() >= REVERSE_MOVE_MAX_ACTIVE) return { admitted: false, reason: 'move_capacity' };
+            const ticket = mintAdmissionTicket(tx, lock, { computerId, userId, kind: 'lease' });
+            const leased = await reservedAs(() => leasePlacement(tx, lock, ticket, {
+                computerId, ownerUserId: userId, expected: input.expected, leaseUntil: input.leaseUntil, replace: true, fields: input.fields,
+            }));
+            if (!leased.ok) return { admitted: false, reason: 'cas_conflict' };
+            await recordInTx(tx, leased.placement);
+            return { admitted: true, placement: leased.placement };
+        });
+    } catch (error) {
+        if (error instanceof ExportBootReserved) return { admitted: false, reason: 'cas_conflict' };
+        throw error;
+    }
 }

@@ -163,7 +163,9 @@ describe('resolveComputeProvider', () => {
             }
             // AWS on with no row also reads the computer's active capacity demand (never a Cloudflare pin while one waits).
             const demandRead = aws === '1' && row === 'none' ? 1 : 0;
-            expect(statements).toHaveLength(2 + demandRead);
+            // Phase B (REVERSE-MOVE-CONTRACT §5.3): an aws-ec2 placement also probes for 0012 (absent here: no reverse move).
+            const reverseProbe = row === 'aws-ec2' ? 1 : 0;
+            expect(statements).toHaveLength(2 + demandRead + reverseProbe);
             if (row !== 'aws-ec2') {
                 expect(provider).toBe(cloudflareComputeProvider);
                 return;
@@ -173,7 +175,7 @@ describe('resolveComputeProvider', () => {
             // AWS on but no caps/regions configured: the real provider refuses before any write.
             if (aws === '1') expect(await ensure).toEqual({ ok: false, error: 'aws_config_invalid', errorCode: 'aws_config_invalid', retryable: false });
             else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
-            expect(statements).toHaveLength(2);
+            expect(statements).toHaveLength(3);
         });
     });
 

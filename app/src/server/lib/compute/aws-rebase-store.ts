@@ -13,6 +13,7 @@ import { buildRebasePreparation, RebaseSnapshotReceiptSchema, validateRebaseSnap
 import { parseRebaseJson, RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
 import { parseRebaseRelease, parseRebaseSourceRelease, RebaseSourceReleaseSchema, RebaseReleaseSchema } from './aws-rebase-release';
 import { ImageJobConflictError, lockImagePlacement, setImageReservation, writeImagePlacement, recordImageUsage, withAdmission, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, readImageAdmissionCounters, type ImagePlacement, type ImagePlacementFields, type AdmissionLock, type PlacementDb, type PlacementExecutor } from './placement';
+import { reverseMoveHolds } from './provider-reverse-store';
 
 export const IMAGE_JOB_PHASES = ['reserved', 'fencing', 'snapshot_pending', 'snapshot_ready', 'launch_pending', 'verifying', 'failed', 'unconfirmed', 'recovery_pending', 'restore_pending', 'rebind_pending', 'succeeded', 'recovered', 'cancelled'] as const;
 export type ImageJobPhase = typeof IMAGE_JOB_PHASES[number];
@@ -403,6 +404,10 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                     WHERE computer_id = ${j.computerId}::uuid
                       AND state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator') LIMIT 2 FOR UPDATE`));
                 if (migrations.length) throw new ImageJobConflictError();
+                // 🔴 Reverse moves exclude a reservation too (REVERSE-MOVE-CONTRACT §5.2.1): a move's placement is STOPPED in
+                // `requested`, after the host retire in `checking`, and in `flipping`, and a reservation then would make the
+                // claim's and the flip's placement reads throw. Same computer lock (re-entrant here); no 0012 = no reverse move.
+                if (await reverseMoveHolds(tx, j.computerId)) throw new ImageJobConflictError();
                 const pool = rowsOf(await tx.execute(sql`SELECT id FROM public.ezil_compute_pool_hosts
                     WHERE leased_computer_id = ${j.computerId}::uuid AND state = 'leased' LIMIT 2 FOR UPDATE`));
                 if (pool.length) throw new ImageJobConflictError();

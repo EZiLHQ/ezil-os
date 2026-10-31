@@ -676,6 +676,129 @@ describe.skipIf(!PG)('reverse moves (0012) on disposable PostgreSQL', () => {
         expect({ rls: rel!.rls, publicGrants: Number(rel!.public_grants), policies: Number(rel!.policies) }).toEqual({ rls: true, publicGrants: 0, policies: 0 });
     });
 
+    // ── r6: lane A's required mutants (contract §12.3) ────────────────────────
+    // "Faked app clock": Date at 2001 and once at 2100 around the read or write named. The app and PostgreSQL share one
+    // host clock, so only a faked app clock tells an app-clock comparison (L4f, R1f, K1) or write (C9) apart.
+    const APP_CLOCKS = ['2001-01-01T00:00:00Z', '2100-01-01T00:00:00Z'] as const;
+    async function underAppClock<T>(at: string, run: () => Promise<T>): Promise<T> {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            vi.setSystemTime(new Date(at));
+            expect(new Date().toISOString()).toBe(new Date(at).toISOString());
+            return await run();
+        } finally { vi.useRealTimers(); }
+    }
+
+    it('L4f: listUnsnapshotted\'s committedForSeconds bound is the DB clock, under an app clock at 2001 and at 2100', async () => {
+        const [old, recent] = [await commit(C), await commit(C2)];
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = clock_timestamp() - interval '61 minutes' WHERE id = '${old.id}'`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET state_entered_at = clock_timestamp() - interval '30 minutes' WHERE id = '${recent.id}'`);
+        expect((await reverse.listUnsnapshotted(10, 3600)).map(m => m.id)).toEqual([old.id]);
+        for (const at of APP_CLOCKS) {
+            expect((await underAppClock(at, () => reverse.listUnsnapshotted(10, 3600))).map(m => m.id), at).toEqual([old.id]);
+            expect((await underAppClock(at, () => reverse.listUnsnapshotted(10, 3600, { includeSpent: true }))).map(m => m.id), at).toEqual([old.id]);
+        }
+    });
+
+    it('R1f: listRetentionExpired\'s retain_until bound is the DB clock, under an app clock at 2001 and at 2100', async () => {
+        const [expired, live] = [await commit(C), await commit(C2)];
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() - interval '1 minute' WHERE id = '${expired.id}'`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET retain_until = clock_timestamp() + interval '1 minute' WHERE id = '${live.id}'`);
+        expect((await reverse.listRetentionExpired(10)).map(m => m.id)).toEqual([expired.id]);
+        for (const at of APP_CLOCKS)
+            expect((await underAppClock(at, () => reverse.listRetentionExpired(10))).map(m => m.id), at).toEqual([expired.id]);
+    });
+
+    it('L5d / L5f: listUnsnapshotted orders by the commit (state_entered_at), never by created_at or commit_sent_at', async () => {
+        // X was created first and sent its commit first; Y was created later and sent its commit later, but Y COMMITTED first.
+        const x = await commit(C), y = await commit(C2);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET created_at = clock_timestamp() - interval '3 hours',
+            commit_sent_at = clock_timestamp() - interval '100 minutes', state_entered_at = clock_timestamp() - interval '60 minutes' WHERE id = '${x.id}'`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET created_at = clock_timestamp() - interval '2 hours',
+            commit_sent_at = clock_timestamp() - interval '90 minutes', state_entered_at = clock_timestamp() - interval '80 minutes' WHERE id = '${y.id}'`);
+        const [order] = await q(`SELECT (SELECT created_at FROM $S.ezil_compute_reverse_moves WHERE id = '${x.id}')
+                < (SELECT created_at FROM $S.ezil_compute_reverse_moves WHERE id = '${y.id}') AS x_created_first,
+            (SELECT commit_sent_at FROM $S.ezil_compute_reverse_moves WHERE id = '${x.id}')
+                < (SELECT commit_sent_at FROM $S.ezil_compute_reverse_moves WHERE id = '${y.id}') AS x_sent_first`);
+        expect(order).toEqual({ x_created_first: true, x_sent_first: true });
+        expect((await reverse.listUnsnapshotted(10)).map(m => m.id)).toEqual([y.id, x.id]);
+        expect((await reverse.listUnsnapshotted(10, 0, { includeSpent: true })).map(m => m.id)).toEqual([y.id, x.id]);
+        expect((await reverse.listUnsnapshotted(1)).map(m => m.id)).toEqual([y.id]);
+    });
+
+    it('C9: a state change writes state_entered_at from PostgreSQL, never the app clock (2001 and 2100)', async () => {
+        for (const [i, at] of APP_CLOCKS.entries()) {
+            const m = await create([C, C2][i]!);
+            const booting = await underAppClock(at, () => reverse.recordExportBoot(m, enrolled));
+            const exporting = await underAppClock(at, () => reverse.advance(booting, 'exporting'));
+            for (const row of [booting, exporting]) {
+                const [near] = await q(`SELECT '${row.stateEnteredAt}'::timestamptz BETWEEN now() - interval '1 minute' AND now() + interval '5 seconds' AS ok`);
+                expect(near!.ok, `${at} ${row.state}`).toBe(true);
+                expect(row.ages.stateEntered, `${at} ${row.state}`).toBeGreaterThanOrEqual(0);
+                expect(row.ages.stateEntered, `${at} ${row.state}`).toBeLessThan(60);
+            }
+            const [stored] = await q(`SELECT state_entered_at BETWEEN now() - interval '1 minute' AND now() + interval '5 seconds' AS ok
+                FROM $S.ezil_compute_reverse_moves WHERE id = '${m.id}'`);
+            expect(stored!.ok, at).toBe(true);
+        }
+    });
+
+    it('K1: claimStale\'s 30 s idle window is the DB clock: idle 31 s is claimed, idle 5 s is not (app clock 2001 and 2100)', async () => {
+        for (const at of APP_CLOCKS) {
+            await q(`TRUNCATE $S.ezil_compute_reverse_moves`);
+            const [idle, busy] = [await create(C), await create(C2)];
+            await q(`UPDATE $S.ezil_compute_reverse_moves SET updated_at = clock_timestamp() - interval '31 seconds' WHERE id = '${idle.id}'`);
+            await q(`UPDATE $S.ezil_compute_reverse_moves SET updated_at = clock_timestamp() - interval '5 seconds' WHERE id = '${busy.id}'`);
+            expect((await underAppClock(at, () => reverse.claimStale(10))).map(m => m.id), at).toEqual([idle.id]);
+        }
+    });
+
+    it('K2: claimStale takes rows past requested first: 9 old requested rows and 1 newer copying row → claimStale(1) is the copying row', async () => {
+        const requested: string[] = [];
+        for (let i = 0; i < 9; i++) requested.push((await create(randomUUID())).id);
+        const copying = await toCopying();
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET updated_at = clock_timestamp() - interval '10 minutes' - make_interval(secs => 1)
+            WHERE id IN (${requested.map(id => `'${id}'`).join(', ')})`);
+        await q(`UPDATE $S.ezil_compute_reverse_moves SET updated_at = clock_timestamp() - interval '1 minute' WHERE id = '${copying.id}'`);
+        expect((await reverse.claimStale(1)).map(m => [m.id, m.state])).toEqual([[copying.id, 'copying']]);
+        // Then the requested rows, oldest first, in the rest of the claim.
+        expect((await reverse.claimStale(10)).map(m => m.state)).toEqual(Array(9).fill('requested'));
+    });
+
+    it('countHostBound (r6, §5.1.1 step 5b): rows in booting … flipping, fleet-wide; requested and terminal rows never count', async () => {
+        expect(await reverse.countHostBound()).toBe(0);
+        await create(C);
+        await reverse.fail(await create(C2), 'failed_needs_operator', 'boot_unsettled');
+        await commit(C3);
+        expect(await reverse.countHostBound()).toBe(0);
+        await reverse.recordExportBoot(await create(C4), boot);
+        await q(`DELETE FROM $S.ezil_compute_reverse_moves WHERE computer_id = '${C}'`);
+        await toCopying();
+        expect(await reverse.countHostBound()).toBe(2);
+        await toFlippingFrom(await create(C5));
+        expect(await reverse.countHostBound()).toBe(3);
+    });
+
+    it('recordCompensation (r6): same state, the marker in last_error, attempts reset; never in flipping; a stale copy loses', async () => {
+        let m = await reverse.recordExportBoot(await create(), boot);
+        m = (await reverse.recordRetry(m, 'unavailable')).move;
+        expect(m.attempts).toBe(1);
+        const c = await reverse.recordCompensation(m, 'compensate:boot_timeout:host');
+        expect(c).toMatchObject({ state: 'booting', attempts: 0, lastError: 'compensate:boot_timeout:host', stateEnteredAt: m.stateEnteredAt });
+        await expect(reverse.recordCompensation(m, 'compensate:boot_timeout')).rejects.toEqual(conflict('lost_race'));
+        // The abort tries count on the same marker, and recordRetry's bound still applies.
+        let r = { move: await reverse.recordCompensation(c, 'compensate:boot_timeout'), exhausted: false };
+        for (let i = 0; i < 5; i++) r = await reverse.recordRetry(r.move, 'compensate:boot_timeout');
+        expect(r.move).toMatchObject({ attempts: 5, lastError: 'compensate:boot_timeout' });
+        expect((await reverse.recordRetry(r.move, 'compensate:boot_timeout')).exhausted).toBe(true);
+        for (const bad of ['boot_timeout', 'compensate:', 'compensate:Boot', 'compensate:x:later', 'compensate:x:host:host'])
+            await expect(reverse.recordCompensation(r.move, bad), bad).rejects.toEqual(conflict('invalid_input'));
+        const flipping = await toFlippingFrom(await create(C2));
+        await expect(reverse.recordCompensation(flipping, 'compensate:entitlement_paid')).rejects.toEqual(conflict('illegal_transition'));
+        const failed = await reverse.fail(r.move, 'failed_reopened', 'boot_timeout');
+        await expect(reverse.recordCompensation(failed, 'compensate:boot_timeout')).rejects.toEqual(conflict('illegal_transition'));
+    });
+
     it('the Drizzle model matches the applied table: columns, nullability, types, checks and indexes', async () => {
         const config = getTableConfig(computeReverseMoves);
         const columns = await q(`SELECT column_name, data_type, is_nullable FROM information_schema.columns

@@ -283,3 +283,23 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
     }
     vi.unstubAllEnvs();
 });
+
+/**
+ * Phase B §5.2 actor (REVERSE-MOVE-CONTRACT): a reverse move's export boot is an ordinary replace on the published row
+ * (N+1/E+1, its own recorded job). The authority only authorizes that exact job, and writes nothing: whether the boot ever
+ * reaches RUNNING is the receipts' export-boot mode (aws-receipts.export-boot.test.ts), never this route's.
+ */
+describe('§5.2 actors: the lifecycle authority and an export boot', () => {
+    it.each(['LEASED', 'STARTING', 'MOUNTING'] as const)('%s: its own job is authorized read-only; any other job or epoch is refused', async state => {
+        const fake = seed([row({ state, generation: 8, lease_epoch: authority.leaseEpoch, instance_type: 't3a.medium' })]);
+        const response = await POST(request());
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ authorized: true, ...authority });
+        expect(fake.statements.every(s => s.sql.startsWith('SELECT') || s.sql.startsWith('/*'))).toBe(true);
+        expect(fake.statements.some(s => /\b(UPDATE|INSERT INTO|DELETE FROM)\b/.test(s.sql))).toBe(false);
+        for (const over of [{ jobId: '0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c' }, { leaseEpoch: authority.leaseEpoch + 1 }]) {
+            const body = JSON.stringify({ ...authority, ...over });
+            await refused(request(body, TIMESTAMP, sign(body)));
+        }
+    });
+});

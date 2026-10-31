@@ -246,6 +246,38 @@ export interface ComputerMoveV3 {
     bytesTotal: string | null;
 }
 
+/**
+ * Phase B (docs/compute/REVERSE-MOVE-CONTRACT.md §6.1): the AWS → Cloudflare move of a held Free user's files, on the
+ * additive key `summary.computer.reverseMove` (never `computer.move`, which an old cached shell renders with a
+ * [Try again] that opens the computer). Also `computer.move.start`'s answer (§5.9), from the same pure builder.
+ */
+export interface ComputerReverseMoveV3 {
+    direction: 'to_cloudflare';
+    /** `REVERSE_MOVE_DTO_STAGE[state]`: saving, copying, checking, flipping, or the terminal state itself. */
+    stage: 'saving' | 'copying' | 'checking' | 'flipping' | 'committed' | 'failed_reopened' | 'failed_needs_operator' | string;
+    /** Decimal: the import's bytes, '0' before copying. */
+    bytesDone: string;
+    /** Decimal: the export head's bytes once known. */
+    bytesTotal: string | null;
+    /** `failed_*` only: the row's code from the closed list (§5.5); null in flight and once committed. */
+    reason: string | null;
+    /** The export head's skipped count; null before the head. */
+    skipped: number | null;
+    /** ISO; committed only (the AWS disk is kept until then). */
+    retainUntil: string | null;
+    /** `failed_*` only, from the §5.5 class: Try again now, only after an AWS session, or never (null otherwise). */
+    retry: 'now' | 'after_aws_session' | 'no' | null;
+    /** `failed_needs_operator` whose commit may have been sent, or whose code blocks Open (§5.3). */
+    openBlocked: boolean;
+    /** The D16 hold can open this AWS computer (its size meters as the hold size); null once it is not an AWS computer. */
+    holdOpenable: boolean | null;
+}
+
+/** `computer.move.start` / `computer.move.retry` refusals (§5.9), in check order. Values, never thrown. */
+export type ComputerMoveRefusalV3 = 'move_unsupported' | 'move_in_progress' | 'move_not_held' | 'move_paused' | 'move_busy'
+    | 'move_unavailable' | 'move_computer_running' | 'move_computer_unsettled';
+export type ComputerMoveStartOutputV3 = { ok: true; move: ComputerReverseMoveV3 } | { ok: false; reason: ComputerMoveRefusalV3 };
+
 export interface BillingSummaryV3 {
     enabled: true;
     version: 3;
@@ -300,6 +332,15 @@ export interface BillingSummaryV3 {
          * computers differ.
          */
         awsSize?: { size: SizeCode; vcpu: number; memoryGiB: number } | null;
+        /**
+         * Phase B (additive, §6.1): the move computer's newest reverse row, while it holds or for 24 h (DB clock) after it
+         * ended; a `failed_needs_operator` row always. Absent or null: none, or this database has no reverse moves.
+         */
+        reverseMove?: ComputerReverseMoveV3 | null;
+        /** Phase B (§6.1): the next open of this held computer starts the move (the pre-move card's copy). */
+        moveOnOpen?: boolean;
+        /** Phase B (§6.1): a Move action can work here; without it no move action is shown. */
+        moveAvailable?: boolean;
     };
     /** EZiL AI credits: the plan's grant, and the live Gateway balance when it can be read. */
     ai: {

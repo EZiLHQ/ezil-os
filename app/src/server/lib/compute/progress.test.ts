@@ -3,6 +3,8 @@ const h = vi.hoisted(() => ({ placement: vi.fn(), migration: vi.fn() }));
 vi.mock('./placement', async original => ({ ...await original<typeof import('./placement')>(), readPlacement: h.placement }));
 vi.mock('./provider-migrate-store', async original => ({ ...await original<typeof import('./provider-migrate-store')>(), createProviderMigrationStore: () => ({ readByComputer: h.migration }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ billingV2EntitlementReader: () => ({ read: async () => null }) }));
+// Phase B: this suite's database has no 0012 (production today), so no reverse move (progress-reverse.test.ts covers one).
+vi.mock('./provider-reverse-store', async original => ({ ...await original<typeof import('./provider-reverse-store')>(), reverseMovesTablePresent: async () => false }));
 import { describeProgress, openingTypicalSeconds, readComputerProgress } from './progress';
 import { PlacementOwnerError, type Placement } from './placement';
 import type { ComputeMigration } from './provider-migrate-store';

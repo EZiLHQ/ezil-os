@@ -67,6 +67,14 @@ export const EXPORT_MAX_BYTES = EXPORT_MAX_CHUNKS * EXPORT_CHUNK_BYTES;
 export const EXPORT_MAX_ENTRIES = 100_000;
 export const REVERSE_MOVE_MAX_ATTEMPTS = 5;
 export const REVERSE_MOVE_RETENTION_DAYS = 14;
+/** Rows past `requested` (each holds, or is about to hold, an export host), fleet-wide (contract §5.1.1 step 5b). */
+export const REVERSE_MOVE_MAX_ACTIVE = 3;
+/** The states `REVERSE_MOVE_MAX_ACTIVE` counts: a claim moved the row there, and only a terminal state leaves them. */
+export const REVERSE_MOVE_HOST_BOUND: readonly ReverseMoveState[] = ['booting', 'exporting', 'copying', 'checking', 'flipping'];
+/** Pre-flip in-flight states: a failure here compensates first (contract §5.7). `flipping` never does. */
+export const REVERSE_MOVE_COMPENSABLE: readonly ReverseMoveState[] = ['requested', 'booting', 'exporting', 'copying', 'checking'];
+/** `compensate:<failure code>` with its sub-step (`recordCompensation`). */
+export const COMPENSATION_MARKER = /^compensate:[a-z_]{1,64}(:host|:unconfirmed)?$/;
 
 /** The export boot's claim on the published placement row (contract §5). Integers are the placement's
  * own counters (`placementGeneration`), never the move's uuid `generation`. `region` is the placement's region
@@ -233,8 +241,9 @@ export async function reverseMoveHolds(tx: PlacementExecutor, computerId: string
 }
 
 /** Whether the forward machine still has work for the computer: an active row, or a failed one whose
- * AWS provision is not released yet (exactly what forward claimStale still picks up). */
-async function forwardMoveBusy(tx: PlacementExecutor, computerId: string): Promise<boolean> {
+ * AWS provision is not released yet (exactly what forward claimStale still picks up). Exported for the triggers'
+ * own check (§5.9 step 5, the open trigger) as a plain read; the create repeats it under the computer lock. */
+export async function forwardMoveBusy(tx: PlacementExecutor, computerId: string): Promise<boolean> {
     return rows(await tx.execute(sql`SELECT 1 AS busy FROM public.ezil_compute_migrations
         WHERE computer_id = ${computerId}::uuid AND (state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
           OR (state IN ('failed_reopened', 'failed_needs_operator') AND workspace_head ? '_awsProvision'
@@ -331,8 +340,19 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             RETURNING ${COLUMNS}`));
         return updated ?? refuse('lost_race');
     }
+    /**
+     * Fleet-wide rows in `booting` … `flipping` (contract §5.1.1 step 5b). A plain count: `admitExportBoot` runs it under the
+     * admission lock, which serialises every claim, so two claims never both see a free slot.
+     */
+    const countHostBound = async (): Promise<number> => {
+        const states = sql.join(REVERSE_MOVE_HOST_BOUND.map(s => sql`${s}`), sql`, `);
+        const n = rows(await db.execute(sql`/* reverse:count-host-bound */ SELECT count(*)::int AS n
+            FROM public.ezil_compute_reverse_moves WHERE state IN (${states})`))[0]?.n;
+        if (!Number.isSafeInteger(Number(n))) throw new Error('reverse move count returned no count');
+        return Number(n);
+    };
     return {
-        readById, readByComputer, readActiveByComputer, readByExportBoot,
+        readById, readByComputer, readActiveByComputer, readByExportBoot, countHostBound,
         /**
          * The computer's holding row, or a new `requested` row. Refuses (`forward_active`) while the
          * forward machine has work for the computer, and (`owner_mismatch`) another owner's row.
@@ -427,6 +447,19 @@ export function createProviderReverseStore(db: PlacementExecutor) {
             return { move: await cas(expected, expected.state, sql`attempts = ${attempts}::int, last_error = ${reason}`), exhausted: false };
         },
         /**
+         * A pre-flip row whose machine decided a failure compensates (contract §5.7) while it KEEPS its state, across passes
+         * (the host retire takes minutes). r6, lane A: the contract pins no carrier for that decision, so it is this row's
+         * `last_error`, `compensate:<code>` (step 1, the Worker abort, pending), `…:host` (step 2: the abort is confirmed or
+         * not needed) or `…:unconfirmed` (the abort still failed after 5 tries). Attempts reset to 0: they count the abort
+         * tries (`recordRetry` with the same marker). `state_entered_at` never moves, so the compensation's bound (the
+         * state's deadline + 30 min) keeps its DB anchor. Never in `flipping`: that state is never compensated.
+         */
+        async recordCompensation(expected: ComputeReverseMove, marker: string): Promise<ComputeReverseMove> {
+            if (!REVERSE_MOVE_COMPENSABLE.includes(expected.state)) refuse('illegal_transition');
+            if (!COMPENSATION_MARKER.test(marker)) refuse('invalid_input');
+            return cas(expected, expected.state, sql`attempts = 0, last_error = ${marker}`);
+        },
+        /**
          * In-flight → `failed_reopened` | `failed_needs_operator`; an operator releases `failed_needs_operator` → `failed_reopened`.
          * `failed_reopened` is refused once `commit_sent_at` is set (the 0012 CHECK refuses it too): an operator who proved
          * the commit never landed clears `commit_sent_at` by hand first (runbook `clear_commit_sent`, contract §5.5.1).
@@ -511,13 +544,18 @@ export function createProviderReverseStore(db: PlacementExecutor) {
                 WHERE state = 'committed' AND retain_until < clock_timestamp()
                 ORDER BY retain_until, id LIMIT ${clamp(limit, REVERSE_RETENTION_LIST_MAX)}`)).map(parse);
         },
-        /** In-flight rows untouched for 30 s, oldest first; claiming bumps `updated_at` only (the caller re-reads), never `state_entered_at`. */
+        /**
+         * In-flight rows untouched for 30 s (DB clock); claiming bumps `updated_at` only (the caller re-reads), never
+         * `state_entered_at`. 🔴 Rows past `requested` (`booting` … `flipping`) come first, then `updated_at, id` (contract §5.4,
+         * r5): at most `REVERSE_MOVE_MAX_ACTIVE` rows hold a host, so every claimable one is driven by the pass, and
+         * `requested` rows share the rest. Ordering by `updated_at` alone let old `requested` rows starve a copy.
+         */
         async claimStale(limit: number): Promise<ComputeReverseMove[]> {
             return rows(await db.execute(sql`WITH stale AS (
                 SELECT id FROM public.ezil_compute_reverse_moves
                 WHERE state IN ('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping')
                   AND updated_at < clock_timestamp() - interval '30 seconds'
-                ORDER BY updated_at, id LIMIT ${clamp(limit, 10)} FOR UPDATE SKIP LOCKED
+                ORDER BY (state = 'requested'), updated_at, id LIMIT ${clamp(limit, 10)} FOR UPDATE SKIP LOCKED
             ) UPDATE public.ezil_compute_reverse_moves m SET updated_at = GREATEST(clock_timestamp(), m.updated_at + interval '1 microsecond')
               FROM stale WHERE m.id = stale.id RETURNING ${columnsOf('m')}`)).map(parse);
         },

@@ -5,11 +5,13 @@ import { gateComputerStart, loadComputeBillingState } from '@/server/billing/v2/
 import { SIZES } from '@/server/billing/v2/contract';
 import { rateWindow } from '@/server/billing/v2/rating';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
-import { handleBillingSessionSweep, HELD_BUDGET_MS, HELD_PAGE_SIZE, HELD_PAGES, HELD_SWEEP_BUDGET_MS, RUNNING_GRACE_MS } from './handler';
+import { handleBillingSessionSweep, HELD_BUDGET_MS, HELD_PAGE_SIZE, HELD_PAGES, HELD_SWEEP_BUDGET_MS, RUNNING_GRACE_MS, reverseMoveInFlightFor } from './handler';
+import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
 vi.mock('@/server/lib/compute/provider-migrate-reconcile', () => ({ reconcilePaidCloudflareUsers: vi.fn() }));
+vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
 
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -486,6 +488,38 @@ describe('paid sessions have no time cap', () => {
         expect(reconcilePaidCloudflareUsers).toHaveBeenCalledExactlyOnceWith(1234);
         expect(vi.mocked(advanceStaleMigrations).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reconcilePaidCloudflareUsers).mock.invocationCallOrder[0]!);
     });
+
+    it('Phase B (§5.4): the reverse pass is the last step, after drain(), with the handler\'s own start', async () => {
+        const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
+        const { reconcilePaidCloudflareUsers } = await import('@/server/lib/compute/provider-migrate-reconcile');
+        vi.mocked(advanceReverseMoves).mockClear();
+        vi.spyOn(Date, 'now').mockReturnValue(4321);
+        const drain = vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockResolvedValue({ claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 });
+        const order: string[] = [];
+        vi.mocked(advanceStaleMigrations).mockImplementationOnce(async () => { order.push('forward'); });
+        vi.mocked(reconcilePaidCloudflareUsers).mockImplementationOnce(async () => { order.push('reconcile'); });
+        drain.mockImplementationOnce(async () => { order.push('drain'); return { claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 }; });
+        vi.mocked(advanceReverseMoves).mockImplementationOnce(async () => { order.push('reverse'); });
+        await fixture().run(1);
+        expect(order).toEqual(['forward', 'reconcile', 'drain', 'reverse']);
+        expect(advanceReverseMoves).toHaveBeenCalledExactlyOnceWith(4321);
+    });
+
+    it('Phase B (§5.4): with metering inactive it still runs, after drain() and before the one log line', async () => {
+        const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
+        vi.mocked(advanceReverseMoves).mockClear(); vi.mocked(advanceStaleMigrations).mockClear();
+        vi.spyOn(Date, 'now').mockReturnValue(777);
+        const order: string[] = [];
+        vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockImplementationOnce(async () => { order.push('drain'); return { claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 }; });
+        vi.mocked(advanceReverseMoves).mockImplementationOnce(async () => { order.push('reverse'); });
+        vi.mocked(console.info).mockImplementation((line: unknown) => { if (String(line).startsWith('{"event":"billing-sweep"')) order.push('finish'); });
+        const f = fixture([]); f.deps.config.enforcementEnabled = false; f.deps.config.tabEnabled = false;
+        await f.run(0);
+        expect(order).toEqual(['drain', 'reverse', 'finish']);
+        expect(advanceReverseMoves).toHaveBeenCalledExactlyOnceWith(777);
+        expect(advanceStaleMigrations).not.toHaveBeenCalled(); // forward moves do not run there (unchanged)
+        expect(f.store.openEpochsForSweep).not.toHaveBeenCalled();
+    });
 });
 
 describe('round 6 R1-01: a held host is bounded by its session alone', () => {
@@ -501,7 +535,8 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
         stoppedSinceClose: over.stoppedSinceClose ?? true, ...(over.computerId ? { computerId: over.computerId } : {}),
     });
     /** A Free (held) owner unless `paid`, whose placement read answers `pages` (one page by default). */
-    function held(epochs: StoredComputeEpoch[], { paid = false, enforcement = true, pages = [[candidate()]] as Candidate[][] } = {}) {
+    function held(epochs: StoredComputeEpoch[], { paid = false, enforcement = true, pages = [[candidate()]] as Candidate[][],
+        reverseMoveInFlight = undefined as SweepInput['reverseMoveInFlight'] } = {}) {
         const f = fixture(epochs, { sku: paid ? 'standard_monthly_v3' : null, allowance: 144000, enforcement });
         if (!paid) f.store.subscriptionsFor.mockResolvedValue(canceled);
         const runningAwsPlacements = vi.fn<NonNullable<SweepInput['runningAwsPlacements']>>(async after => {
@@ -509,7 +544,7 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
             return { candidates: pages[index] ?? [], next: index + 1 < pages.length ? String(index + 1) : null };
         });
         const run = (seconds: number) => handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop,
-            isStillRunning: f.isStillRunning, runningAwsPlacements });
+            isStillRunning: f.isStillRunning, runningAwsPlacements, ...(reverseMoveInFlight ? { reverseMoveInFlight } : {}) });
         return { ...f, runningAwsPlacements, run };
     }
     const lines = (event: string) => [...vi.mocked(console.info).mock.calls, ...vi.mocked(console.warn).mock.calls]
@@ -613,6 +648,58 @@ describe('round 6 R1-01: a held host is bounded by its session alone', () => {
         const paid = held([], { paid: true, pages: [[candidate({ state: 'UNCONFIRMED' })]] });
         await paid.run(0);
         expect(lines('held-unconfirmed')).toHaveLength(2); // a paid row is not held: nothing new
+    });
+
+    it('Phase B (§5.4): an in-flight move\'s export boot (UNCONFIRMED after its release) gives no held-unconfirmed and no stop', async () => {
+        const inFlight = vi.fn(async () => true);
+        const f = held([], { reverseMoveInFlight: inFlight, pages: [[candidate({ state: 'UNCONFIRMED', since: -3600, closedAt: -4000 }),
+            candidate({ computerId: 'other-in-move', state: 'RUNNING' })]] });
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(lines('held-unconfirmed')).toEqual([]);
+        expect(lines('held-overrun')).toEqual([]);
+        expect(inFlight.mock.calls).toEqual([['computer'], ['other-in-move']]);
+        // Asked right after the grace check and before the epoch read: an in-flight computer reads no epoch.
+        expect(f.store.openEpochFor).not.toHaveBeenCalled();
+    });
+
+    it('Phase B (§5.4): failed_needs_operator(abort_unconfirmed) is not in flight: its hold session is bounded (heldOverrun 1)', async () => {
+        const f = held([], { reverseMoveInFlight: async () => false });
+        expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it('Phase B (§5.4): a throw from the reverse read skips the computer (held check failed), never a stop', async () => {
+        const f = held([], { reverseMoveInFlight: async () => { throw new Error('reverse read failed'); } });
+        expect(await f.run(0)).toEqual(zeros);
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(vi.mocked(console.warn).mock.calls.map(c => c[0])).toContain('[billing.sweep] held check failed');
+    });
+
+    it('Phase B: without the dependency (no 0012) the held pass is round 6a\'s exactly', async () => {
+        const f = held([]);
+        expect(await f.run(0)).toEqual({ ...zeros, heldOverrun: 1, stopped: 1 });
+    });
+
+    it('reverseMoveInFlightFor: probes 0012 once per sweep; only requested … flipping is in flight; no 0012 is never in flight', async () => {
+        const run = async (present: boolean, state: string | null) => {
+            const sqls: string[] = [];
+            const executor = { execute: async (q: import('drizzle-orm').SQL) => {
+                const text = new (await import('drizzle-orm/pg-core')).PgDialect().sqlToQuery(q).sql;
+                sqls.push(text);
+                if (text.includes('to_regclass')) return [{ present }];
+                return state === null ? [] : [{ id: 'm', user_id: 'u', computer_id: 'c', started_by: 'open', state, generation: 'g', attempts: 0,
+                    state_entered_at: 't', created_at: 't', updated_at: 't', age_created: 0, age_state_entered: 0 }];
+            } };
+            const inFlight = reverseMoveInFlightFor(executor);
+            const answers = [await inFlight('c1'), await inFlight('c2')];
+            return { answers, probes: sqls.filter(s => s.includes('to_regclass')).length, reads: sqls.filter(s => !s.includes('to_regclass')).length };
+        };
+        expect(await run(false, 'copying')).toEqual({ answers: [false, false], probes: 1, reads: 0 });
+        for (const state of ['requested', 'booting', 'exporting', 'copying', 'checking', 'flipping'])
+            expect(await run(true, state), state).toEqual({ answers: [true, true], probes: 1, reads: 2 });
+        for (const state of ['committed', 'failed_reopened', 'failed_needs_operator', null])
+            expect((await run(true, state)).answers, String(state)).toEqual([false, false]);
     });
 
     it('reads every page until the last, so a held host behind other closes is still found', async () => {

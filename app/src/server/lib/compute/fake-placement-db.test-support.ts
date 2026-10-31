@@ -159,6 +159,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         await yieldStatement();
         // Existing placement-only fixtures have no migration intent; migration tests wrap this executor.
         if (text.startsWith('SELECT') && text.includes('FROM public.ezil_compute_migrations')) return { rows: [] };
+        // The reverse-move table probe (provider-reverse-store.ts `reverseMovesTablePresent`): this model has no 0012, exactly
+        // as production. Reverse-move tests wrap this executor and answer it (and the reverse reads) themselves.
+        if (/^SELECT to_regclass\('public\.ezil_compute_reverse_moves'\) IS NOT NULL AS present$/.test(text)) return { rows: [{ present: false }] };
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
         const writeRows = imageTable ? imageJobs : placements;
         const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;

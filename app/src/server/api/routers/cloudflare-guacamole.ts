@@ -79,7 +79,11 @@ import { awsPreviewRefusal, prepareAwsPoolSession, requestAwsPreview, waitForAws
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { PlacementOwnerError, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { resetCapacityAttempt } from '@/server/lib/compute/aws-pool-demand';
-import { awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, routeComputer, stopCooldownAnswer } from './compute-dispatch';
+import {
+    awsPreviewAnswer, awsStatusAnswer, cloudflareMigrationAnswer, reverseMoveAnswer, reverseMoveOnOpen, routeComputer, stopCooldownAnswer,
+} from './compute-dispatch';
+import type { PlacementDb } from '@/server/lib/compute/placement';
+import type { ComputeProvider } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -147,6 +151,18 @@ function awsAnswered<T extends { ok: boolean }>(kind: string, surface: 'desktop'
         // Round 6: the Worker's allow-listed `aws_desktop_starting` reason (config_pending, code_starting, …) when it gave one.
         ...(refusal?.detail ? { detail: code(refusal.detail) } : {}), ms: Date.now() - startedAt }));
     return answer;
+}
+
+/**
+ * Phase B (REVERSE-MOVE-CONTRACT §5.3, r6): the reverse provider's own ensure answer, as a value with `computeMoving` or
+ * `computeMoveNeedsAttention`, WITHOUT `awsPreviewAnswer`'s rewrite: `error` keeps the provider code, which is the reason
+ * `awsAnswered` logs. The ensure of a reverse provider is a constant: it never boots, adopts or reaches the Worker.
+ */
+async function reverseRouteAnswer(provider: ComputeProvider, correlationId: string, computer: { userId: string; computerId: string }) {
+    const result = await provider.ensure({ correlationId }, computer, { sessionId: computer.computerId, desktopMode: 'neko' });
+    // Unreachable: both reverse providers answer a refusal. Never let an ok through as an open.
+    if (result.ok) throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'reverse_move_answer' });
+    return reverseMoveAnswer(result);
 }
 
 export const cloudflareGuacamoleRouter = createTRPCRouter({
@@ -246,8 +262,15 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     ? {}
                     : { screen: { width: screen.width, height: screen.height } }),
             };
+            // Phase B (D20, REVERSE-MOVE-CONTRACT §5.9): the next open of a held Free computer starts the move to the Free
+            // computer. It runs here, before routing, and fails closed; routing then answers the reverse waiting provider.
+            await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user);
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            // 🔴 Phase B (§5.3): a computer in a move answers the move right after routing: before the billing gate (a held
+            // Free user's gate would refuse it as `billing_*` and break the move overlay), the credential sync and any Worker call.
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'desktop', input.computerId,
+                await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
@@ -529,6 +552,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // when the shell has no separate session concept for it.
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold and the AWS preview).
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'app', input.computerId,
+                await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
@@ -730,6 +756,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId,
+                await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
@@ -1414,6 +1443,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = input.requestId ?? newCorrelationId();
             const computer = { userId: ctx.user.id, computerId: input.computerId };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            // 🔴 Phase B (§5.3): the move's answer first, bare (this route logs no `aws-preview` line). Nothing restarts.
+            if (routed.kind === 'aws-ec2' && routed.reverse) return { ...await reverseRouteAnswer(routed.provider, correlationId, computer), correlationId };
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
