@@ -318,6 +318,22 @@ class EdgePost(EdgeRig):
         self.assertNotIn("export", self.delivered)
         self.assertIsNone(export.read_state(self.cfg))
 
+    def test_content_length_is_bounded_at_1024_even_for_a_valid_body(self):
+        # §2.2: Content-Length 1..1024. A VALID body (whitespace before the closing brace; the digest
+        # fixes the bytes, spacing is not checked) of 1025 bytes is refused before the agent; 1024 is not.
+        g = str(uuid.uuid4())
+        base = body_for(MOVE, g)
+
+        def padded(n):
+            return base[:-1] + b" " * (n - len(base)) + b"}"
+        over = padded(1025)
+        self.assertEqual((len(over), json.loads(over)), (1025, {"v": 1, "moveId": MOVE, "generation": g}))
+        self.assertEqual(self.post(over).json(), (400, {"ok": False, "error": "export_body_invalid"}))
+        self.assertNotIn("export", self.delivered)
+        self.assertIsNone(export.read_state(self.cfg))
+        status, st = self.post(padded(1024)).json()
+        self.assertEqual((status, st["moveId"], st["generation"]), (202, MOVE, g))
+
     def test_the_digest_fixes_the_bytes_so_spacing_and_key_order_are_not_checked(self):
         g = str(uuid.uuid4())
         body = ('{ "generation" : "%s",\n "moveId": "%s", "v": 1 }\n' % (g, MOVE)).encode()
@@ -642,6 +658,25 @@ class Jobs(unittest.TestCase):
                 write_record(self.cfg)
                 record = self.run_with(tamper(kind))
                 self.assertEqual((record["state"], record["error"]), ("failed", "capture_failed"))
+
+    def test_a_wrong_per_chunk_sha_with_a_consistent_archive_sha_is_capture_failed(self):
+        # §2.5 step 6: every chunk is re-hashed against the codec's OWN per-chunk sha256. The head
+        # copies the codec's value, so a wrong one with the right bytes (the archive sha still
+        # matching) must never reach the Worker (it would end the move as chunk_mismatch).
+        def run(cfg, bundle, result_path, timeout=None):
+            rc = CodecRunner(self)(cfg, bundle, result_path)
+            with open(result_path, "rb") as f:
+                result = json.loads(f.read())
+            result["chunks"][0]["sha256"] = "0" * 64
+            with open(result_path, "wb") as f:
+                f.write(json.dumps(result).encode())
+            return rc
+        record = self.run_with(run)
+        self.assertEqual((record["state"], record["error"], record["head"]), ("failed", "capture_failed", None))
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.stateDir, "export", self.g, "head.json")))
+        # Control: the same run without the edit is ready.
+        write_record(self.cfg, importGeneration=self.g)
+        self.assertEqual(self.run_with(CodecRunner(self))["state"], "ready")
 
     def test_finish_keeps_last_served_and_never_touches_another_job(self):
         t = time.time()
