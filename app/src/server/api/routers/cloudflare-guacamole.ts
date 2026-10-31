@@ -225,9 +225,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                  */
                 screen: z.unknown().optional(),
                 /**
-                 * Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C): `'warm'` marks the Browser icon's warm (shell
-                 * `warm.js`, a hover or press), which is not an open. `z.unknown()` for the same reason as `screen`:
-                 * any other value, or none, is an ordinary open, never a 400 of the whole desktop boot.
+                 * Phase B (REVERSE-MOVE-CONTRACT §5.9). **[r9] Opt-in:** only `'open'` (the shell's real open, sent by
+                 * the r9 shell and nothing else) may start the move. **[r8] `'warm'`** marks the Browser icon's warm
+                 * (shell `warm.js`, a hover or press), which is not an open (Option C). No value (every pre-r9 shell
+                 * tab, the legacy canvas, any other client) or any other value is today's open: the D16 hold, never a
+                 * move. `z.unknown()` for the same reason as `screen`: never a 400 of the whole desktop boot.
                  */
                 intent: z.unknown().optional(),
             }),
@@ -271,13 +273,18 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             };
             // Phase B (D20, REVERSE-MOVE-CONTRACT §5.9): the next open of a held Free computer starts the move to the Free
             // computer. It runs here, before routing, and fails closed; routing then answers the reverse waiting provider.
+            // r9 (lead ruling): OPT-IN. Only `intent: 'open'`, which only the r9 shell sends on a real open, runs the
+            // trigger. No intent (a tab still running a pre-r9 bundle, whose hover warm sends none; the legacy canvas; any
+            // other client) or any other value skips it: today's open, the D16 hold, never a move.
             // r8 (Option C): the Browser icon's warm (hover or press, shell warm.js, `intent: 'warm'`) is not an open. On a
             // computer whose open would start the move it creates no row and boots nothing: it gets the stop hold's
             // `computer_stopped` value, which the warm drops and no window is handed (`warm.js` claim() asks a real open).
-            // Any other warm runs exactly as before: an in-flight row still answers the move right after routing.
-            const warm = input.intent === 'warm';
-            const triggered = await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { warm });
-            if (triggered === REVERSE_WARM_HELD) return computerStoppedAnswer();
+            // Any other warm runs exactly as before. Whatever the intent, an in-flight row still answers the move right after routing.
+            if (input.intent === 'open' || input.intent === 'warm') {
+                const triggered = await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {},
+                    { warm: input.intent === 'warm' });
+                if (triggered === REVERSE_WARM_HELD) return computerStoppedAnswer();
+            }
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): a computer in a move answers the move right after routing: before the billing gate (a held
@@ -749,7 +756,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * the same extended `maxDuration` as `../preview-url/route.ts`.
      */
     codePreviewUrl: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({
+            computerId: z.string().uuid(),
+            /**
+             * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` is the r9 shell's Code mint (`apps/code.js`),
+             * the only ask that may start the move. Code has no warm, so no value or any other value (`'warm'` included:
+             * a pre-r9 shell tab, the SDK's `codeUrl`, any other client) is today's open: the D16 hold, never a move.
+             * `z.unknown()`, like `previewUrl`'s `screen` and `intent`: never a 400 of the mint.
+             */
+            intent: z.unknown().optional(),
+        }))
         .query(async ({ ctx, input, signal }) => {
             const startedAt = Date.now();
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
@@ -771,7 +787,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // Phase B (D20, §5.9, r7 fixer, ratified r8): Code is an open of the computer too, so it starts the move as the
             // desktop does ("the next time you open your desktop or Code"). Never within the stop hold: a leftover poll still
             // answers `computer_stopped` below, and no row is created for it.
-            await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { stopCooldown: true });
+            // r9 (lead ruling): OPT-IN, as the desktop: only `intent: 'open'` (the r9 shell's Code mint) runs the trigger;
+            // anything else is today's open (the D16 hold). Whatever the intent, an in-flight row still answers the move.
+            if (input.intent === 'open') {
+                await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { stopCooldown: true });
+            }
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).
             if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId,

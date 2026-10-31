@@ -53,8 +53,10 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  *                          than being killed mid-hold (PLATFORM-NOTES §13).
  *   POST { computerId }  — the long one. Starts/attaches the desktop and
  *                          resolves only at the end, success or a specific
- *                          error. `intent: 'warm'` (the Browser icon's warm,
- *                          Phase B r8) is forwarded to the procedure.
+ *                          error. `intent` is forwarded to the procedure:
+ *                          `'open'` on the r9 shell's real open (the only ask
+ *                          that may start the move, Phase B r9) and `'warm'`
+ *                          on the Browser icon's warm (Phase B r8).
  *
  * Input is deliberately NOT re-validated here: it is forwarded as given and
  * the procedures' own zod schemas reject anything malformed, surfacing as a
@@ -146,10 +148,11 @@ export async function POST(req: Request) {
              */
             screen?: unknown;
             /**
-             * Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C): `'warm'` on
-             * the Browser icon's warm (`shell/ezil/warm.js`), which is not an
+             * Phase B (REVERSE-MOVE-CONTRACT §5.9): `'open'` on the r9 shell's
+             * real open (r9: the opt-in trigger), `'warm'` on the Browser
+             * icon's warm (`shell/ezil/warm.js`, r8 Option C), which is not an
              * open. Forwarded VERBATIM, like `screen`: the procedure types it
-             * `z.unknown()` and reads only `=== 'warm'`.
+             * `z.unknown()` and reads only `=== 'open'` and `=== 'warm'`.
              */
             intent?: unknown;
         };

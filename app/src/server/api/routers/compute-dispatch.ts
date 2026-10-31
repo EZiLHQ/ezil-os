@@ -755,6 +755,8 @@ export const REVERSE_WARM_HELD = 'warm_held' as const;
 /**
  * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` (the desktop) and, **[r7 fixer]**, by
  * `codePreviewUrl` before `routeComputer`; never by reads, `computer.progress`, `status`, `restartDesktop` or `appPreviewUrl`.
+ * **[r9, opt-in]** The routes call it only for an ask carrying `intent: 'open'` (the r9 shell's real open; `previewUrl` also
+ * for `'warm'`, below). An ask with no intent (a pre-r9 shell tab, the legacy canvas, any other client) never reaches it.
  * **[r8, Option C]** With `warm` (the Browser icon's warm, `intent: 'warm'`) it runs every check below and creates NOTHING:
  * when all hold it answers `REVERSE_WARM_HELD` (the caller then answers without routing, so the warm neither moves nor boots
  * the computer), otherwise null exactly as for an open. Creates a row only when ALL hold: the placement is aws-ec2

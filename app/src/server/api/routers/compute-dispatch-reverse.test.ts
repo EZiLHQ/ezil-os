@@ -4,7 +4,8 @@
  * billing, the AWS preview and the Worker are faked.
  * - §5.3: routing returns the reverse providers as `kind: 'aws-ec2'` with their `reverse` marker; every open route answers
  *   the move right after routing, before the billing gate, the stop hold, the credential sync and any Worker call.
- * - §5.9: `computer.move.start`/`retry` (nested), their pinned refusal order, and the next-open trigger in `previewUrl`.
+ * - §5.9: `computer.move.start`/`retry` (nested), their pinned refusal order, and the next-open trigger in `previewUrl` and
+ *   `codePreviewUrl` (r9: opt-in, only an ask saying `intent: 'open'`; r8: the warm's Option C).
  */
 import { initTRPC, TRPCError } from '@trpc/server';
 import type { SQL } from 'drizzle-orm';
@@ -66,6 +67,7 @@ import { cloudflareGuacamoleRouter } from './cloudflare-guacamole';
 import { computerRouter } from './computer';
 import { awsPreviewAnswer, awsStatusAnswer, REVERSE_WARM_HELD, reverseMoveOnOpen, routeComputer, startReverseMove } from './compute-dispatch';
 import { POST as shellDesktopPost } from '@/app/api/shell/desktop/route';
+import { POST as shellCodePost } from '@/app/api/shell/code-preview-url/route';
 import { createFakePlacementDb, placementRow } from '@/server/lib/compute/fake-placement-db.test-support';
 import { reverseBlockedProvider, reverseWaitingProvider } from '@/server/lib/compute/provider-reverse-placement';
 import { REVERSE_MOVE_IN_FLIGHT } from '@/server/lib/compute/provider-reverse-store';
@@ -164,8 +166,16 @@ let info: ReturnType<typeof vi.spyOn>;
 const lines = () => info.mock.calls.map(c => String(c[0])).filter(l => l.includes('"event":"aws-preview"')).map(l => JSON.parse(l) as Row);
 const guac = (db: unknown, email = 'person@example.com') => cloudflareGuacamoleRouter.createCaller({ user: { id: U, email }, db } as never);
 const computers = (db: unknown) => computerRouter.createCaller({ user: { id: U, email: 'person@example.com' }, db } as never);
-const open = (db: unknown, procedure: 'previewUrl' | 'appPreviewUrl' | 'codePreviewUrl' | 'restartDesktop', email?: string) =>
-    procedure === 'previewUrl' ? guac(db, email).previewUrl({ sessionId: C, computerId: C }) : guac(db, email)[procedure]({ computerId: C });
+/**
+ * One ask of an open route. r9 (§5.9, opt-in): `intent` is what the body carries; omitted, the ask has none (a tab still
+ * running a pre-r9 bundle, the legacy canvas, any other client). The r9 shell's real desktop open and Code mint send 'open'.
+ */
+const open = (db: unknown, procedure: 'previewUrl' | 'appPreviewUrl' | 'codePreviewUrl' | 'restartDesktop', email?: string, intent?: unknown) => {
+    const asked = intent === undefined ? {} : { intent };
+    if (procedure === 'previewUrl') return guac(db, email).previewUrl({ sessionId: C, computerId: C, ...asked });
+    if (procedure === 'codePreviewUrl') return guac(db, email).codePreviewUrl({ computerId: C, ...asked });
+    return guac(db, email)[procedure]({ computerId: C });
+};
 
 beforeEach(() => {
     for (const [k, v] of Object.entries(AWS_ENV)) vi.stubEnv(k, v);
@@ -245,6 +255,16 @@ describe('the open routes during a move (§5.3, r6): the move\'s answer right af
             await expect(open(ended.db, procedure)).resolves.toMatchObject({ errorCode: `billing_${refusal}` });
         });
     });
+    it.each([['desktop', 'previewUrl'], ['code', 'codePreviewUrl']] as const)(
+        'r9 (§5.9): %s during a move answers the move whatever the ask\'s intent (none, open, warm, any other), with no new row', async (_surface, procedure) => {
+            for (const intent of [undefined, 'open', 'warm', 'other']) {
+                const w = world([held({ state: 'MOUNTING', instance_type: 'm6i.large', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
+                expect(await open(w.db, procedure, undefined, intent)).toEqual(moving);
+                expect(w.moves).toHaveLength(1);
+            }
+            expect(h.gate).not.toHaveBeenCalled();
+            expect(h.schedule).not.toHaveBeenCalled();
+        });
     it.each(surfaces)('%s: an open-blocked row answers the blocked value (deterministic, no spinner, no re-ask)', async (surface, procedure) => {
         const { db } = world([held()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
         expect(await open(db, procedure)).toEqual(blocked);
@@ -271,9 +291,9 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     /** r7 fixer: the trigger fires only for a computer the D16 hold can open (std-2, `holdOpenable`); `held()` is cmp-4. */
     const openable = (over: Row = {}) => held({ instance_type: 'm6i.large', ...over });
     const stopped = () => world([openable()]);
-    it('a held STOPPED computer: creates an open row, schedules one immediate drive and answers the waiting value', async () => {
+    it('a held STOPPED computer: an open saying intent \'open\' creates an open row, schedules one immediate drive and answers the waiting value', async () => {
         const w = stopped();
-        expect(await open(w.db, 'previewUrl')).toEqual(moving);
+        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
         expect(h.gate).not.toHaveBeenCalled();
@@ -282,6 +302,36 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         for (const procedure of ['appPreviewUrl', 'restartDesktop'] as const) await open(quiet.db, procedure);
         await guac(quiet.db).status({ computerId: C });
         expect(quiet.moves).toEqual([]);
+    });
+    /**
+     * r9 (§5.9, lead ruling: the trigger is opt-in). A tab that loaded the shell before the r9 deploy keeps running that
+     * bundle, whose hover warm and real open both send no intent; so does the legacy canvas and any other client. None of
+     * them may start a move: the ask is today's open, the D16 hold, so it routes and meets the billing gate (refusing here).
+     */
+    it.each(['previewUrl', 'codePreviewUrl'] as const)('r9 (§5.9, opt-in): %s with no intent is the D16 hold: no row, no schedule, the gate decides', async procedure => {
+        const w = stopped();
+        const answer = await open(w.db, procedure);
+        expect(w.moves).toEqual([]); // first: the mutant that triggers on a missing intent (r8's behaviour) fails HERE
+        expect(h.schedule).not.toHaveBeenCalled();
+        expect(answer).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
+        expect(h.gate).toHaveBeenCalledTimes(1);
+        expect(h.gate).toHaveBeenCalledWith(expect.objectContaining({ userId: U, computerId: C, kind: 'aws-ec2', instanceType: 'm6i.large' }));
+        expect(w.fake.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null });
+        // Control: the same computer, asked with intent 'open' (the r9 shell's real open), moves.
+        h.gate.mockClear();
+        expect(await open(w.db, procedure, undefined, 'open')).toEqual(moving);
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+        expect(h.schedule).toHaveBeenCalledTimes(1);
+        expect(h.gate).not.toHaveBeenCalled();
+    });
+    it.each(['previewUrl', 'codePreviewUrl'] as const)('r9 (§5.9, opt-in): with the gate open, %s with no intent reaches the hold boot\'s credential sync, never a row', async procedure => {
+        h.gate.mockResolvedValue({ allowed: true });
+        const w = stopped();
+        await open(w.db, procedure).catch(() => null); // what the AWS ensure answers in this fake world is not the point
+        expect(w.moves).toEqual([]);
+        expect(h.schedule).not.toHaveBeenCalled();
+        expect(h.gate).toHaveBeenCalledTimes(1);
+        expect(h.sync).toHaveBeenCalledTimes(1);
     });
     /** The stop hold's refusal value, reused as the warm's answer (r8, Option C). */
     const warmHeld = { ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
@@ -307,8 +357,8 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         // Another hover answers the same, still with no row.
         expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(warmHeld);
         expect(w.moves).toEqual([]);
-        // The click (the same body, no intent) is the open: it starts the move and answers the waiting value.
-        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen })).toEqual(moving);
+        // The click (the same body with r9's intent 'open') is the open: it starts the move and answers the waiting value.
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'open' })).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledTimes(1);
         expect(h.gate).not.toHaveBeenCalled();
@@ -324,12 +374,23 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         h.subs = [paidSub];
         expect(await reverseMoveOnOpen(paid.db as never, { userId: U, computerId: C }, { email: 'person@example.com' }, {}, { warm: true })).toBeNull();
     });
-    it('r8 (§5.9): an intent other than \'warm\' is an ordinary open (tolerant like `screen`, never a 400 of the boot)', async () => {
-        for (const intent of ['WARM', 'click', 1, null, {}]) {
+    /**
+     * r9 (§5.9): any intent other than 'open' (and, on the desktop, 'warm') is no intent: the D16 hold, never a row. Still
+     * tolerant like `screen` (never a 400 of the boot or the mint). Code has no warm, so 'warm' is no intent there.
+     */
+    it.each([
+        ['previewUrl', ['OPEN', 'Open', ' open', 'opened', 'click', 1, true, null, {}, ['open'], '']],
+        ['codePreviewUrl', ['warm', 'OPEN', 'Open', ' open', 'opened', 'click', 1, true, null, {}, ['open'], '']],
+    ] as const)('r9 (§5.9): %s with any other intent is no intent: no row, the gate decides, never a 400', async (procedure, intents) => {
+        for (const intent of intents) {
             const w = stopped();
-            expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, intent })).toEqual(moving);
-            expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
+            h.gate.mockClear();
+            const answer = await open(w.db, procedure, undefined, intent);
+            expect(w.moves, JSON.stringify(intent)).toEqual([]);
+            expect(answer, JSON.stringify(intent)).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
+            expect(h.gate, JSON.stringify(intent)).toHaveBeenCalledTimes(1);
         }
+        expect(h.schedule).not.toHaveBeenCalled();
     });
     it('r8 (§5.9): a warm on a computer with a move in flight still answers computeMoving (routing unchanged), with no new row', async () => {
         const w = world([openable({ state: 'MOUNTING', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
@@ -346,7 +407,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         ['a held-closed computer (cmp-4)', { placement: { instance_type: 'm6i.xlarge' } }],
         ['a failed_reopened newest row', { moves: [moveRow({ state: 'failed_reopened', last_error: 'copy_stalled' })] }],
         ['a Cloudflare computer', { cloudflare: true }],
-    ] as const)('r8 (§5.9): a warm on %s is exactly today\'s open (same answer, same gate call, no row)', async (_name, setup: Row) => {
+    ] as const)('r8 (§5.9): a warm on %s is exactly today\'s open (same answer, same gate call, no row; r9: as an intent \'open\' click)', async (_name, setup: Row) => {
         if (setup.subs) h.subs = setup.subs as unknown[];
         const make = () => world([setup.cloudflare
             ? placementRow({ computer_id: C, owner_user_id: U, provider: 'cloudflare', workspace_store: 'r2' })
@@ -363,7 +424,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         const warmGate = gateCalls();
         h.gate.mockClear();
         const click = make();
-        const clickAnswer = await guac(click.db, email).previewUrl({ sessionId: C, computerId: C, screen });
+        const clickAnswer = await guac(click.db, email).previewUrl({ sessionId: C, computerId: C, screen, intent: 'open' });
         expect(warmAnswer).toEqual(clickAnswer);
         expect(warmAnswer).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
         expect(warmGate).toHaveLength(1);
@@ -371,9 +432,9 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(warm.moves.filter(r => r.started_by === 'open')).toEqual([]);
         expect(click.moves.filter(r => r.started_by === 'open')).toEqual([]);
     });
-    it('r7 fixer (§5.9): Code is an open too: a held STOPPED std-2 computer gets an open row and the waiting value', async () => {
+    it('r7 fixer (§5.9): Code is an open too: a held STOPPED std-2 computer gets an open row and the waiting value (r9: the mint says intent \'open\')', async () => {
         const w = stopped();
-        expect(await open(w.db, 'codePreviewUrl')).toEqual(moving);
+        expect(await open(w.db, 'codePreviewUrl', undefined, 'open')).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
         expect(h.gate).not.toHaveBeenCalled();
@@ -381,18 +442,18 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(lines()).toEqual([expect.objectContaining({ event: 'aws-preview', surface: 'code', error: 'sandbox_starting', reason: 'computer_moving' })]);
         // A run that ended over a minute ago is outside the stop hold: still a trigger.
         const later = world([openable()], { lastStop: new Date(Date.now() - 61_000) });
-        expect(await open(later.db, 'codePreviewUrl')).toEqual(moving);
+        expect(await open(later.db, 'codePreviewUrl', undefined, 'open')).toEqual(moving);
         expect(later.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
     });
     it('r7 fixer (§5.9): Code within the stop hold creates no row and still answers computer_stopped (a leftover poll)', async () => {
         h.gate.mockResolvedValue({ allowed: true });
         const w = world([openable()], { lastStop: new Date(Date.now() - 10_000) });
-        expect(await open(w.db, 'codePreviewUrl')).toMatchObject({ ok: false, errorCode: 'computer_stopped' });
+        expect(await open(w.db, 'codePreviewUrl', undefined, 'open')).toMatchObject({ ok: false, errorCode: 'computer_stopped' });
         expect(w.moves).toEqual([]);
         expect(h.schedule).not.toHaveBeenCalled();
         // The desktop open is never held (Settings → Open desktop still starts it): it triggers, and never reads the stop hold.
         const desk = world([openable()], { lastStop: new Date(Date.now() - 10_000) });
-        expect(await open(desk.db, 'previewUrl')).toEqual(moving);
+        expect(await open(desk.db, 'previewUrl', undefined, 'open')).toEqual(moving);
         expect(desk.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
         expect(desk.fake.statements.some(st => st.sql.includes('placement:usage-last-stop'))).toBe(false);
     });
@@ -400,7 +461,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         'r7 fixer (§5.9): a held-closed computer (%s) never triggers; its opens keep 6a\'s files_on_aws refusal', async (_name, instanceType) => {
             for (const procedure of ['previewUrl', 'codePreviewUrl'] as const) {
                 const w = world([held({ instance_type: instanceType })]);
-                expect(await open(w.db, procedure)).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
+                expect(await open(w.db, procedure, undefined, 'open')).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
                 expect(w.moves).toEqual([]);
             }
             expect(h.schedule).not.toHaveBeenCalled();
@@ -444,7 +505,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     it('a STOPPED computer still carrying its last session\'s lease is a trigger (a stop never clears lease_until)', async () => {
         // A D16 hold session renewed the lease up to an hour ahead, then stopped: the next open moves the files (moveOnOpen).
         const w = world([openable({ lease_until: new Date(Date.now() + 50 * 60_000), presence_at: new Date(Date.now() - 10 * 60_000) })]);
-        expect(await open(w.db, 'previewUrl')).toEqual(moving);
+        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(moving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.gate).not.toHaveBeenCalled();
     });
@@ -492,7 +553,7 @@ describe('computer.move.start / retry (§5.9): nested, pinned order, every refus
         const viaClick = world([held()]);
         await ask(viaClick.db, 'start');
         const viaOpen = world([held({ instance_type: 'm6i.large' })]);
-        await open(viaOpen.db, 'previewUrl');
+        await open(viaOpen.db, 'previewUrl', undefined, 'open');
         expect([...viaClick.moves, ...viaOpen.moves].map(r => r.started_by)).toEqual(['user', 'open']);
     });
 
@@ -660,7 +721,7 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
     /**
      * r8 (§5.9, Option C): the shell's REAL warm (`warm.js` → `session.openDesktop` → `POST /api/shell/desktop`) through the
      * REAL route into the real `previewUrl`. The hover's ask carries the marker and gets the stop hold's value (no row, no
-     * gate, no boot); the window that claims that warm asks a real open with no marker, which starts the move.
+     * gate, no boot); the window that claims that warm asks a real open (r9: `intent: 'open'`), which starts the move.
      */
     it('warm.js → POST /api/shell/desktop → previewUrl: the hover moves nothing; the claiming click starts the move', async () => {
         const w = world([held({ instance_type: 'm6i.large' })]);
@@ -679,7 +740,7 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         warmJs._resetForTests();
         warmJs.warm(C); // the hover: its first ask leaves now, with the marker
         const res = await warmJs.claim(C); // the click, while the warm is in flight
-        expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'warm' }, { computerId: C }]);
+        expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'open' }]);
         expect(seen[0]!.answer).toEqual({ ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
             provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });
         expect(seen[1]!.answer).toEqual(moving);
@@ -690,6 +751,69 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         expect(h.gate).not.toHaveBeenCalled();
         expect(h.sync).not.toHaveBeenCalled();
         warmJs._resetForTests();
+    });
+
+    /** r9: the real shell routes (desktop and Code) over the real `cloudflareGuacamole` procedures; records each body and answer. */
+    const shellRoutes = (db: unknown) => {
+        h.routeDb = db;
+        const seen: { path: string; body: Row; answer: Row }[] = [];
+        vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+            const url = new URL(String(input), 'https://os.example');
+            const route = url.pathname === '/api/shell/desktop' ? shellDesktopPost
+                : url.pathname === '/api/shell/code-preview-url' ? shellCodePost : null;
+            if (!route || init?.method !== 'POST') throw new Error(`unexpected request ${init?.method} ${url.pathname}`);
+            const res = await route(new Request(url, init));
+            seen.push({ path: url.pathname, body: JSON.parse(String(init.body)) as Row, answer: await res.clone().json() as Row });
+            return res;
+        });
+        return seen;
+    };
+    const post = (route: string, body: Row) => fetch(route, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+    /**
+     * r9 (§5.9, lead ruling: opt-in): the r8 verifier's "NEW app + OLD cached shell". A tab that loaded `/os` before the
+     * deploy keeps the 7a1f2ed1 bundle, which sends no intent on its hover warm, its real open or its Code mint. Through the
+     * real routes each is today's open (the D16 hold): no row, no schedule, the billing gate decides.
+     */
+    it('r9: a pre-r9 tab\'s bodies (no intent) through the real routes move nothing: its hover, its open and its Code mint are the D16 hold', async () => {
+        const w = world([held({ instance_type: 'm6i.large' })]);
+        const seen = shellRoutes(w.db);
+        await post('/api/shell/desktop', { computerId: C, screen: { width: 1280, height: 800 } }); // its hover warm (and its click's body)
+        await post('/api/shell/desktop', { computerId: C });
+        await post('/api/shell/code-preview-url', { computerId: C });
+        expect(w.moves).toEqual([]);
+        expect(h.schedule).not.toHaveBeenCalled();
+        expect(seen.map(s => s.answer)).toEqual(Array(3).fill(expect.objectContaining({ ok: false, errorCode: 'billing_files_on_aws' })));
+        expect(h.gate).toHaveBeenCalledTimes(3);
+    });
+
+    it('r9: the shell\'s real open (warm.js claim(), no warm held → session.openDesktop) says intent \'open\' and the real route starts the move', async () => {
+        const w = world([held({ instance_type: 'm6i.large' })]);
+        const seen = shellRoutes(w.db);
+        const warmJs = await import('../../../../../shell/ezil/warm.js') as { claim(id: string): Promise<Row>; _resetForTests(): void };
+        warmJs._resetForTests();
+        const res = await warmJs.claim(C);
+        expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'open' }]);
+        expect(seen[0]!.answer).toEqual(moving);
+        expect(res).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeMoving: true });
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+        expect(h.gate).not.toHaveBeenCalled();
+        warmJs._resetForTests();
+    });
+
+    it('r9: the Code mint\'s body (pinned to apps/code.js) through the real code-preview-url route starts the move; the route forwards intent', async () => {
+        // code.js needs a DOM to import, so its body is pinned to its source (as readMoveAsk's URL is below); the shell's
+        // code-test.mjs drives the built bundle's mint and checks the same body on the wire.
+        const code = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/apps/code.js'), 'utf8');
+        expect(code).toContain("body: JSON.stringify({ computerId, intent: 'open' }),");
+        const w = world([held({ instance_type: 'm6i.large' })]);
+        const seen = shellRoutes(w.db);
+        await post('/api/shell/code-preview-url', { computerId: C, intent: 'open' });
+        expect(seen.map(s => s.answer)).toEqual([moving]);
+        expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
+        expect(h.schedule).toHaveBeenCalledTimes(1);
+        expect(h.gate).not.toHaveBeenCalled();
+        expect(lines()).toEqual([expect.objectContaining({ event: 'aws-preview', surface: 'code', reason: 'computer_moving' })]);
     });
 
     it('the session loop\'s computer.progress GET (readMoveAsk) reaches the procedure and reads the moving view', async () => {

@@ -93,20 +93,22 @@ describe('shell desktop route through the real router and provider', () => {
     });
 });
 
-describe('POST: the route hands the body to previewUrl as given (Phase B r8, REVERSE-MOVE-CONTRACT §5.9 Option C)', () => {
+describe('POST: the route hands the body to previewUrl as given (Phase B r8 Option C, r9 opt-in trigger; REVERSE-MOVE-CONTRACT §5.9)', () => {
     const post = (body: unknown) => POST(new Request('https://app.example/api/shell/desktop', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
-    it('forwards the warm\'s `intent` verbatim, and none when the body has none (a click)', async () => {
+    it('forwards `intent` verbatim: the r9 open\'s \'open\', the warm\'s \'warm\', none when the body has none (a pre-r9 tab)', async () => {
         const seen: unknown[] = [];
         state.previewUrl = async input => { seen.push(input); return { ok: false, errorCode: 'computer_stopped' }; };
         const screen = { width: 1280, height: 800 };
         expect(await (await post({ computerId, screen, intent: 'warm' })).json()).toEqual({ ok: false, errorCode: 'computer_stopped' });
         await post({ computerId });
         await post({ computerId, sessionId: computerId, intent: 'other' });
+        await post({ computerId, screen, intent: 'open' });
         expect(seen).toStrictEqual([
             { sessionId: computerId, computerId, screen, intent: 'warm' },
             { sessionId: computerId, computerId, screen: undefined, intent: undefined },
             { sessionId: computerId, computerId, screen: undefined, intent: 'other' },
+            { sessionId: computerId, computerId, screen, intent: 'open' },
         ]);
     });
     it('an unsigned POST is rejected before the body is read or previewUrl runs', async () => {

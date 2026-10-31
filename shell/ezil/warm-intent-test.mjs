@@ -1,15 +1,16 @@
-// warm-intent-test.mjs — EZiL-authored. Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C).
+// warm-intent-test.mjs — EZiL-authored. Phase B r8 (REVERSE-MOVE-CONTRACT §5.9, Option C) and r9 (the opt-in trigger).
 //
 // Run:  node --test shell/ezil/warm-intent-test.mjs   (or plain `node`; no bundle, no browser)
 //
-// The next open of a held Free computer starts moving its files to the Free computer, which cannot be undone. The
-// Browser icon's warm (`warm.js`, fired on a hover or press) is not that open. So:
+// The next open of a held Free computer starts moving its files to the Free computer, which cannot be undone. Since r9
+// the server starts it only for an ask that says `intent: 'open'` (a tab still running an older bundle sends none and
+// gets the D16 hold). The Browser icon's warm (`warm.js`, fired on a hover or press) is not that open. So:
 //   - every ask `warm()` sends carries `intent: 'warm'`, and the server answers a computer whose open would move it with
 //     the stop hold's `computer_stopped` (no row, no boot); the warm drops it, with no telemetry;
-//   - a real open (`session.openDesktop` from a window, or `claim()`'s own mint) never carries the marker, and its body
-//     stays byte-identical to the pre-r8 one;
-//   - a claimed warm never carries the marker into the click: its later asks drop it, and when the warm's answer was
-//     `computer_stopped` the claiming window gets a real open's answer instead, never that one.
+//   - r9: a real open (`session.openDesktop` from a window, or `claim()`'s own mint) carries `intent: 'open'`;
+//   - a claimed warm never carries the warm marker into the click: its later asks say `'open'` instead, and when the
+//     warm's answer was `computer_stopped` the claiming window gets a real open's answer instead, never that one;
+//   - r9: a status poll, a frame check, a restart and an app-preview ask carry no intent at all.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import session from './session.js';
@@ -69,48 +70,56 @@ test('warm() sends the marker; the held answer is dropped silently: one ask, no 
     assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'warm' }]);
 });
 
-test('a real open never carries the marker, and its body is byte-identical to the pre-r8 one', async t => {
+test('r9: a real open says intent \'open\' (never the warm marker), with or without a signal, a screen or warm:false', async t => {
     const net = wire(t, () => READY);
     const signal = new AbortController().signal;
     assert.equal((await session.openDesktop(C, { width: 1280, height: 800 }, { signal })).ok, true);
     assert.equal((await session.openDesktop(C)).ok, true);
     assert.equal((await session.openDesktop(C, { width: 1280, height: 800 }, { signal, warm: false })).ok, true);
+    assert.equal((await session.openDesktop(C, undefined, { warm: () => false })).ok, true);
     assert.deepEqual(net.bodies.map(b => JSON.stringify(b)), [
-        JSON.stringify({ computerId: C, screen: { width: 1280, height: 800 } }),
-        JSON.stringify({ computerId: C }),
-        JSON.stringify({ computerId: C, screen: { width: 1280, height: 800 } }),
+        JSON.stringify({ computerId: C, screen: { width: 1280, height: 800 }, intent: 'open' }),
+        JSON.stringify({ computerId: C, intent: 'open' }),
+        JSON.stringify({ computerId: C, screen: { width: 1280, height: 800 }, intent: 'open' }),
+        JSON.stringify({ computerId: C, intent: 'open' }),
     ]);
-    // claim() with no warm held mints the click's own open: no marker.
+    // claim() with no warm held mints the click's own open: intent 'open'.
     assert.equal((await claim(C)).ok, true);
-    assert.deepEqual(net.bodies.at(-1), { computerId: C });
+    assert.deepEqual(net.bodies.at(-1), { computerId: C, intent: 'open' });
 });
 
-test('the click after a dropped warm asks a real open (no marker) and gets the move, never computer_stopped', async t => {
+test('r9: every ask of a real open\'s wake loop says \'open\' (a re-ask after sandbox_starting too)', async t => {
+    const net = wire(t, (_body, n) => (n === 1 ? STARTING : READY));
+    assert.equal((await session.openDesktop(C)).ok, true);
+    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'open' }, { computerId: C, intent: 'open' }]);
+});
+
+test('the click after a dropped warm asks a real open (intent \'open\') and gets the move, never computer_stopped', async t => {
     const net = wire(t, body => (body.intent === 'warm' ? HELD : MOVING));
     warm(C);
     await settle();
     const res = await claim(C);
-    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C }]);
+    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'open' }]);
     assert.equal(res.computeMoving, true, JSON.stringify(res));
     assert.notEqual(res.errorCode, 'computer_stopped');
 });
 
-test('🔴 a click that claims the warm IN FLIGHT never gets its computer_stopped: it asks a real open, with no marker', async t => {
+test('🔴 a click that claims the warm IN FLIGHT never gets its computer_stopped: it asks a real open (intent \'open\')', async t => {
     const net = wire(t, body => (body.intent === 'warm' ? HELD : MOVING));
     warm(C); // the hover's ask is already on the wire, with the marker
     const res = await claim(C); // the click joins it
-    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C }]);
+    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'open' }]);
     assert.equal(res.errorCode, 'sandbox_starting');
     assert.equal(res.computeMoving, true, 'the window gets the move (and takes the wait over on its own signal)');
     assert.deepEqual(net.captured, []);
 });
 
-test('a claimed warm that is still waking: its later asks carry no marker (they are the click\'s), and the answer passes through', async t => {
+test('a claimed warm that is still waking: its later asks say \'open\' (they are the click\'s), and the answer passes through', async t => {
     const net = wire(t, (_body, n) => (n === 1 ? STARTING : READY));
     warm(C);
     const res = await claim(C);
     assert.equal(res.ok, true);
-    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C }]);
+    assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'open' }]);
 });
 
 test('control: an unclaimed warm that is still waking keeps the marker on every ask', async t => {
@@ -130,4 +139,32 @@ test('a warm\'s other failures still reach a claiming window unchanged (only com
     const res = await claim(C);
     assert.equal(res.errorCode, 'billing_files_on_aws');
     assert.deepEqual(net.bodies, [{ computerId: C, intent: 'warm' }]);
+});
+
+test('r9: a status poll, a frame check, a restart and an app-preview ask carry no intent (only a real open or a warm does)', async t => {
+    const seen = [];
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+        seen.push({ url: String(url), method: init?.method ?? 'GET', body: init?.body === undefined ? undefined : JSON.parse(init.body) });
+        const path = String(url).split('?')[0];
+        const data = path === '/api/shell/restart' ? { ok: true }
+            : path === '/api/shell/preview-url' ? { ok: true, appPreviewUrl: 'https://app.example/preview-bootstrap?token=t' }
+            : { ok: true, guacamoleRunning: true, confirmed: true, status: 200 };
+        return { ok: true, status: 200, json: async () => data };
+    });
+    // The restart route is feature-detected from the boot payload (`restartEndpoint`); nothing else here reads it.
+    const hadWindow = 'window' in globalThis;
+    const before = globalThis.window;
+    globalThis.window = { __EZIL_BOOT__: { user: { id: 'u1' }, desktopState: { endpoints: { restart: '/api/shell/restart' } } } };
+    t.after(() => { if ( hadWindow ) globalThis.window = before; else delete globalThis.window; });
+    await session.desktopRunning(C);
+    await session.confirmFrame(C, 'https://viewer.example/');
+    assert.equal((await session.restartDesktop(C)).ok, true);
+    assert.equal((await session.previewUrl(C)).ok, true);
+    assert.deepEqual(seen.map(r => `${r.method} ${r.url.split('?')[0]}`), [
+        'GET /api/shell/desktop', 'GET /api/shell/desktop', 'POST /api/shell/restart', 'POST /api/shell/preview-url',
+    ]);
+    for ( const r of seen ) {
+        assert.ok(! /[?&]intent=/.test(r.url), `no intent in the query: ${r.url}`);
+        if ( r.body !== undefined ) assert.deepEqual(r.body, { computerId: C }, `${r.method} ${r.url}: no intent in the body`);
+    }
 });

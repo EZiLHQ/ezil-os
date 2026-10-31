@@ -77,6 +77,12 @@
 // drops it. A window must never be handed it: `claim()` of a warm stops the
 // marker on the warm's later asks (they are the click's now), and if the
 // warm's answer was that one, it asks a real open, which starts the move.
+//
+// ── Phase B r9: the move starts only on an explicit open (opt-in) ──────────
+// A real open says so: `session.openDesktop` sends `intent: 'open'` on every
+// ask that is not the warm's (`claim()`'s own mint, and a claimed warm's later
+// asks). The server starts the move only for that intent, so a tab still
+// running a pre-r9 bundle (whose warm sends no intent) gets the D16 hold.
 
 import session from './session.js';
 import { measureDesktopBox } from './apps/desktop-screen.js';
@@ -89,7 +95,7 @@ export const WARM_MAX_AGE_MS = 60_000;
 
 /**
  * The one warm this module is holding, if any. `warm`: minted by `warm()` (its asks carry the marker until
- * `claimed`); `claim()`'s own mint is a real open and never is.
+ * `claimed`, then `intent: 'open'`); `claim()`'s own mint is a real open (`intent: 'open'`) and never is.
  * @type {{computerId: string, promise: Promise<unknown>, resolvedAt: number|null, warm: boolean, claimed: boolean} | null}
  */
 let current = null;
@@ -141,7 +147,8 @@ function bootScreen () {
 
 /**
  * Mint a fresh single-flight entry for `computerId` and make it the current one. `warm`: this is `warm()`'s (a hover
- * or press), so each ask carries `intent: 'warm'` until a window claims it; otherwise it is a real open, with no marker.
+ * or press), so each ask carries `intent: 'warm'` until a window claims it (then `'open'`); otherwise it is a real open,
+ * whose every ask carries `intent: 'open'` (r9).
  */
 function mint (computerId, { warm = false } = {}) {
     const entry = { computerId, promise: null, resolvedAt: null, warm, claimed: false };
@@ -201,7 +208,8 @@ export function claim (computerId) {
         && (current.resolvedAt === null || isFresh(current)) ) {
         const entry = current;
         if ( ! entry.warm ) return entry.promise;
-        // 🔴 Phase B r8: the click now owns the warm's loop, so its later asks carry no marker. An answer the warm
+        // 🔴 Phase B r8: the click now owns the warm's loop, so its later asks carry no warm marker (r9: they say
+        // `intent: 'open'`, so a held computer's next ask starts the move). An answer the warm
         // already got for its marker (`isWarmHeld`) is never handed to the window: the click asks a real open.
         entry.claimed = true;
         return entry.promise.then(res => (isWarmHeld(res) ? mint(computerId).promise : res));

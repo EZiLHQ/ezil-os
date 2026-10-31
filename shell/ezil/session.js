@@ -745,10 +745,13 @@ export function openSession () {
  *   `measureDesktopBox`. OPTIONAL in both directions: an older server ignores
  *   an unknown body field, and this client omits the field entirely when it
  *   has nothing to measure, so neither side has to know about the other.
- * @param {{signal?: AbortSignal, movingAnswer?: object, warm?: boolean | (() => boolean)}} [opts] Phase B r8
- *   (§5.9, Option C): `warm` marks the Browser icon's warm (`warm.js` only), read before EACH ask: while it is true the
- *   ask carries `intent: 'warm'`, so the server never starts a move (or boots a held computer) for a hover. A real open
- *   never sets it, and its body stays byte-identical.
+ * @param {{signal?: AbortSignal, movingAnswer?: object, warm?: boolean | (() => boolean)}} [opts] Phase B (§5.9):
+ *   every ask carries an `intent`. **r9 (opt-in trigger):** a real open (no `warm`, or `warm` false) sends
+ *   `intent: 'open'`, the only ask that may start the move; the server treats an ask with no intent (a tab still running
+ *   a pre-r9 bundle) as the D16 hold, never a move. **r8 (Option C):** `warm` marks the Browser icon's warm (`warm.js`
+ *   only), read before EACH ask: while it is true the ask carries `intent: 'warm'` instead, so the server never starts a
+ *   move (or boots a held computer) for a hover; once it reads false (a window claimed the warm) the asks are the
+ *   click's and carry `'open'`.
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
@@ -762,8 +765,8 @@ export async function openDesktop (computerId, screen, { signal, movingAnswer, w
     // `cancelComputerOpens` (Stop/Delete, after the windows close).
     // Phase B: only an open with a `signal` waits on a move; `movingAnswer` (the claimed warm's) starts it inside one.
     const isWarm = typeof warm === 'function' ? warm : () => warm === true;
-    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s, isWarm() === true),
-        { signal, movingAnswer });
+    return cancellableWake(computerId, 'openDesktop',
+        (s) => openDesktopOnce(computerId, screen, s, isWarm() === true ? 'warm' : 'open'), { signal, movingAnswer });
 }
 
 /**
@@ -884,14 +887,17 @@ export async function ensureLocalDesktop (computerId) {
 }
 
 /**
- * One `POST /api/shell/desktop`. The loop that may call it more than once is above. `warm`: this ask is the Browser
- * icon's warm (Phase B r8): the body adds `intent: 'warm'`, and only then.
+ * One `POST /api/shell/desktop`. The loop that may call it more than once is above. `intent` (Phase B §5.9): `'open'` on
+ * a real open (r9: the opt-in trigger, the only ask that may start the move) or `'warm'` on the Browser icon's warm (r8,
+ * Option C). Always sent: the server treats a body without it (a pre-r9 bundle's) as the D16 hold, never a move.
  */
-async function openDesktopOnce (computerId, screen, signal, warm = false) {
-    // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
-    // for. The server treats absent and malformed identically, but a body that
-    // is byte-identical to the pre-change one is the strongest form of "an old
-    // server sees exactly what it always saw". `intent` follows the same rule.
+async function openDesktopOnce (computerId, screen, signal, intent) {
+    // 🔴 The screen field is OMITTED, not sent as null, when there is nothing to
+    // ask for. The server treats absent and malformed identically, but a body
+    // that is byte-identical to the pre-change one is the strongest form of "an
+    // old server sees exactly what it always saw". `intent` is the exception on
+    // purpose (r9): an old server ignores it, and the new one starts a move only
+    // when it is present.
     const usable = screen
         && Number.isInteger(screen.width) && Number.isInteger(screen.height)
         && screen.width > 0 && screen.height > 0;
@@ -900,7 +906,7 @@ async function openDesktopOnce (computerId, screen, signal, warm = false) {
         body: {
             computerId,
             ...(usable ? { screen: { width: screen.width, height: screen.height } } : {}),
-            ...(warm === true ? { intent: 'warm' } : {}),
+            intent: intent === 'warm' ? 'warm' : 'open',
         },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
         signal,
