@@ -134,7 +134,7 @@ for ( const app of ['desktop', 'code', 'preview'] ) {
     test(`${app}: the move's watch runs out: still working on it, never a failure`, async t => {
         const h = await open(t, app, { progress: () => movingProgress({ phase: 'committing' }), answer: () => waitingAnswer() });
         await until(() => label(h.spinner) === 'Moving your files to your Free computer');
-        h.now = (13_200 + 300) * 1000;
+        h.now = (13_200 + 2_400) * 1000;
         await until(() => line(h.spinner).startsWith('This is taking longer than usual.'));
         await wait(60);
         assert.equal(h.spinner.querySelector('.ezil-boot-retry').hidden, true);
@@ -169,7 +169,7 @@ test('desktop: a move handed back after its watch, then committed, opens the Fre
         answer: () => committed ? ready : waitingAnswer(),
     });
     await until(() => label(h.spinner) === 'Moving your files to your Free computer');
-    h.now = (13_200 + 300) * 1000 + 60_000;
+    h.now = (13_200 + 2_400) * 1000 + 60_000;
     await until(() => line(h.spinner).startsWith('This is taking longer than usual.'));
     const asks = h.asks;
     await wait(60);
@@ -189,7 +189,7 @@ test('desktop: a moving answer handed back while every progress read fails is st
         answer: () => committed ? ready : waitingAnswer(),
     });
     await until(() => h.asks >= 1, 'the open');
-    h.now = (13_200 + 300) * 1000 + 60_000; // past the move's watch: the loop hands the moving answer back
+    h.now = (13_200 + 2_400) * 1000 + 60_000; // past the move's watch: the loop hands the moving answer back
     await until(() => line(h.spinner).startsWith('This is taking longer than usual.') || label(h.spinner) === 'This is taking too long',
         'the handed-back answer');
     await wait(60);

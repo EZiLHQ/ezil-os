@@ -13,7 +13,7 @@ import {
 } from './placement';
 import {
     advanceReverseMove, classifyWorkerFailure, exportHeadFor, REVERSE_CALL_FIT_MS, REVERSE_DEADLINE_SECONDS, REVERSE_MOVE_BUDGET_SECONDS,
-    REVERSE_OPERATOR_CODES, REVERSE_REOPEN_FINAL_CODES, reverseBootSettled, reverseCompensation, reverseDeadlineFailure, reverseFailureClass,
+    REVERSE_PASS_BUDGET_MS, REVERSE_PASS_LATEST_START_MS, REVERSE_OPERATOR_CODES, REVERSE_REOPEN_FINAL_CODES, reverseBootSettled, reverseCompensation, reverseDeadlineFailure, reverseFailureClass,
     reverseOpenBlocked, sweepReverseMoves, type ReversePorts, type ReverseWorkerResult,
 } from './provider-reverse';
 import {
@@ -228,6 +228,20 @@ describe('§5.4 deadlines (DB clock, through ages)', () => {
     it('the budget is the sum of the deadlines, 13200 s; copying is 125 min', () => {
         expect(REVERSE_MOVE_BUDGET_SECONDS).toBe(13200);
         expect(REVERSE_DEADLINE_SECONDS.copying).toBe(7500);
+    });
+    // r7 fixer (§5.10): the shell pins its own copies (computer-progress.js), so a re-pin of a deadline here fails until the shell
+    // follows, the same cross-file pattern as MOVE_LIMIT_BYTES. A state ends at its deadline only when a pass sees no progress:
+    // a success observed late still advances, so each state can overrun by one drive gap (3 ticks, a pass budget and a late
+    // tick's start), and the shell's watch margin must cover one gap per state.
+    it('the shell\'s MOVE_BUDGET_SECONDS is the budget, and its watch margin covers one drive gap per state', () => {
+        const shell = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/ui/computer-progress.js'), 'utf8');
+        const budget = shell.match(/^export const MOVE_BUDGET_SECONDS = (\d+);$/m)?.[1];
+        const margin = shell.match(/^export const MOVE_WATCH_MARGIN_SECONDS = (\d+);$/m)?.[1];
+        expect(budget).toBeDefined();
+        expect(Number(budget)).toBe(REVERSE_MOVE_BUDGET_SECONDS);
+        const gap = 3 * 60 + REVERSE_PASS_BUDGET_MS / 1000 + (REVERSE_PASS_LATEST_START_MS - 60_000) / 1000;
+        expect(gap).toBe(360);
+        expect(Number(margin)).toBeGreaterThanOrEqual(Object.keys(REVERSE_DEADLINE_SECONDS).length * gap);
     });
     it.each([
         ['booting', { stateEntered: 900 }, 'boot_timeout'], ['booting', { stateEntered: 899 }, null],

@@ -32,7 +32,7 @@ import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boo
 import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
 // Phase B: what one `computer.progress` read says about a moving open (the moving view's one reader), and the notes
 // this loop leaves the opening surface (Code and Preview hand it plain failures).
-import { moveAskOf, moveOf, noteMoveAnswer, noteMoveRead, MOVE_BUDGET_SECONDS } from './ui/computer-progress.js';
+import { moveAskOf, moveOf, noteMoveAnswer, noteMoveRead, MOVE_BUDGET_SECONDS, MOVE_WATCH_MARGIN_SECONDS } from './ui/computer-progress.js';
 
 const NS = 'ezil-os:';
 
@@ -271,10 +271,11 @@ const PREPARE_MAX_ISSUES = Math.ceil(PREPARE_DEADLINE_MS / WAKE_REASK_MS) + 2;
  * (`computeMoving`), which never boots anything, for as long as the move runs: up to `budgetSeconds` (13 200 s, the
  * sum of the server's own step deadlines). The wake, migration, launch and prepare clocks (215 s to ten minutes) would
  * fail every move half way, so a moving answer REPLACES the loop's deadline and cap with these, from the first moving
- * answer: `budgetSeconds` + 300 s (two cron ticks of pass-detection lag per state), re-asked at most every 30 s.
+ * answer: `budgetSeconds` + `MOVE_WATCH_MARGIN_SECONDS` (2400 s: a late-observed success can overrun each state's deadline by
+ * about one drive gap), re-asked at most every 30 s.
  * Only the server's outcome ends a move; this clock running out is "still working on it", never a failure.
  */
-export const MOVE_WATCH_MS = (MOVE_BUDGET_SECONDS + 300) * 1000;
+export const MOVE_WATCH_MS = (MOVE_BUDGET_SECONDS + MOVE_WATCH_MARGIN_SECONDS) * 1000;
 export const MOVE_REASK_MS = 30_000;
 const MOVE_MAX_ISSUES = Math.ceil(MOVE_WATCH_MS / MOVE_REASK_MS) + 2;
 /** tRPC's GET route (`ui/Settings/trpc.js` documents the wire shape); here with this file's timeout and cancel. */

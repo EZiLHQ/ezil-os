@@ -73,8 +73,15 @@ const time = value => { const at = typeof value === 'string' ? Date.parse(value)
 // ── Phase B: the reverse move (AWS → Cloudflare), reverse move contract §5.10, §6.4 ─────────────
 // While a computer's files move from its AWS computer to its Free computer, `computer.progress` sends the
 // MOVING VIEW (`operation: 'moving'`): nothing in it is an opening, and none of the opening clocks apply.
-/** §5.10 `budgetSeconds`: the sum of the §5.4 deadlines. The shell never ends a move on its own clock before it + 300 s. */
+/** §5.10 `budgetSeconds`: the sum of the §5.4 deadlines. The shell never ends a move on its own clock before it + the margin below. */
 export const MOVE_BUDGET_SECONDS = 13200;
+/**
+ * §5.10 (r7 fixer): what the server's own bound can run past `budgetSeconds`, in seconds. A state ends at its deadline only
+ * when a pass sees no progress; a success the sweep observes late (drives of one row are up to 3 ticks apart, plus late
+ * ticks and the 90 s pass) still advances, so each of the six states can overrun its deadline by about one drive gap
+ * (≤ 360 s). 6 × 360 = 2160 s, rounded up. r6's + 300 s covered one gap only.
+ */
+export const MOVE_WATCH_MARGIN_SECONDS = 2400;
 /**
  * §6.2: the most a move copies (the export cap, lane A's `EXPORT_MAX_BYTES`, which reads this line), in bytes. Shown
  * only in the shell's MB unit (÷ 1,000,000, no decimals), always derived from here: no copy carries the number as a

@@ -30,7 +30,7 @@ import {
 } from '../boot-phases.js';
 
 import { observeComputerProgress, OPENING_COPY, OPENING_MILESTONES, formatElapsed, prefersReducedMotion, openingAt, moveOutcomeCopy,
-    MOVE_COPY, loopMoveOf } from './computer-progress.js';
+    MOVE_COPY, MOVE_WATCH_MARGIN_SECONDS, loopMoveOf } from './computer-progress.js';
 import { isNative } from '../native-runtime.js';
 
 import { LAUNCH_COPY } from '../launch-copy.js';
@@ -369,11 +369,11 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         }
         const view = live ?? open?.moveView ?? null;
         // Rule 5: "still working on it" and Send feedback only past the move's own watch (startedAt + budgetSeconds +
-        // 300 s): never a failure claim, never Try again. A move the open's loop handed back before then (it read an
+        // MOVE_WATCH_MARGIN_SECONDS): never a failure claim, never Try again. A move the open's loop handed back before then (it read an
         // outcome this surface has not) keeps its last view until the outcome is read; with no read of the move at
         // all there is no watch to wait for, and a handed-back move is "still working on it".
         const known = move ?? view?.move ?? null;
-        const watch = Number.isFinite(known?.startedAtMs) ? known.startedAtMs + (known.budgetSeconds + 300) * 1000 : null;
+        const watch = Number.isFinite(known?.startedAtMs) ? known.startedAtMs + (known.budgetSeconds + MOVE_WATCH_MARGIN_SECONDS) * 1000 : null;
         if (watch !== null ? now >= watch : failed) {
             failureCode = 'computer_moving';
             root.classList.add('ezil-app-spinner-running-long');

@@ -6,7 +6,7 @@
 //     prepare latch;
 //   - the outcome, keyed on move.outcome + move.openBlocked only (whatever `stage` says), to an open that watched it;
 //     [Open my AWS computer] only when the hold can open it; the open-blocked card on a bare needs-attention answer;
-//   - past startedAt + budgetSeconds + 300 s, or once the open's loop handed the move back: "still working on it" and
+//   - past startedAt + budgetSeconds + 2400 s, or once the open's loop handed the move back: "still working on it" and
 //     Send feedback, never a failure;
 //   - Code and Preview (read-only callers) render a moving answer as a `sandbox_starting`/`preconditions_unmet`
 //     failure: the surface recognises it; an ordinary failure during a move keeps its own copy.
@@ -193,7 +193,7 @@ test('Code\'s needs-attention failure (preconditions_unmet) over the blocked row
 
 test('Code\'s moving answer handed back past the move\'s watch (sandbox_starting → timeout): still working on it, never a failure', async t => {
     const { s } = await surface(t, movingProgress({ phase: 'importing' }));
-    now = START + (13_200 + 300) * 1000;
+    now = START + (13_200 + 2_400) * 1000;
     s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting' });
     assert.equal(title(s), 'Moving your files to your Free computer');
     assert.equal(status(s), "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
@@ -215,11 +215,11 @@ test('a move handed back BEFORE its watch keeps the last in-flight view (no "sti
     assert.doesNotMatch(visible(s), /still working on it|taking too long|Try again/);
 });
 
-test('past startedAt + budgetSeconds + 300 s with no outcome: "still working on it", never a failure', async t => {
-    now = START + (13_200 + 299) * 1000;
+test('past startedAt + budgetSeconds + 2400 s with no outcome: "still working on it", never a failure', async t => {
+    now = START + (13_200 + 2_399) * 1000;
     const { s } = await surface(t, movingProgress({ phase: 'committing' }));
     assert.equal(status(s), 'Step 4 of 4: Switching to your Free computer.');
-    now = START + (13_200 + 300) * 1000;
+    now = START + (13_200 + 2_400) * 1000;
     s.render({ kind: 'progress' });
     assert.equal(status(s), "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
     assert.equal(retry(s).hidden, true);
@@ -253,7 +253,7 @@ test('committed, then the Free computer\'s open fails (Code\'s failure, no state
 
 test('the desktop window\'s handed-back move (state.move moving) that later commits shows the commit', async t => {
     const { s, set } = await surface(t, movingProgress({ phase: 'committing' }));
-    now = START + (13_200 + 300) * 1000; // its watch ran out: the loop handed the move back
+    now = START + (13_200 + 2_400) * 1000; // its watch ran out: the loop handed the move back
     s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting', move: 'moving' });
     assert.equal(status(s), "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
     await set(terminalProgress({ outcome: 'committed' }));

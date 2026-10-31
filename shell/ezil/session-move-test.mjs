@@ -1,7 +1,7 @@
 // Phase B (reverse move contract §5.3, §6.4 rules 1-6): an open of a computer whose files are moving to its Free
 // computer is answered `computeMoving` (the reverse waiting answer) or `computeMoveNeedsAttention` (the blocked
 // answer). `withWakeAndOneRetry` tests the move FIRST: it replaces the loop's deadline and cap with the move's own
-// (`MOVE_WATCH_MS` = budgetSeconds + 300 s, re-asked at most every `MOVE_REASK_MS`), re-asks only after a
+// (`MOVE_WATCH_MS` = budgetSeconds + 2400 s, re-asked at most every `MOVE_REASK_MS`), re-asks only after a
 // `computer.progress` read shows the move in flight or committed, never after a failed outcome, and re-anchors the
 // wake clocks on the first answer without the flag. Three surfaces: `openDesktop`, `previewUrl` and Code's mint mapping.
 import assert from 'node:assert/strict';
@@ -70,9 +70,9 @@ test('pendingOrRefused carries computeMoving and computeMoveNeedsAttention only 
     }
 });
 
-test('the move clocks are the contract\'s: budgetSeconds + 300 s, re-asked every 30 s', () => {
+test('the move clocks are the contract\'s: budgetSeconds + 2400 s (r7 fixer: one drive gap per state), re-asked every 30 s', () => {
     assert.equal(MOVE_BUDGET_SECONDS, 13_200);
-    assert.equal(MOVE_WATCH_MS, (13_200 + 300) * 1000);
+    assert.equal(MOVE_WATCH_MS, (13_200 + 2_400) * 1000);
     assert.equal(MOVE_REASK_MS, 30_000);
 });
 
