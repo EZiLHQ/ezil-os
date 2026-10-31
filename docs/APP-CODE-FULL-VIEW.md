@@ -65,7 +65,10 @@ back:
   a resize had last left in `data-orig-*`, so a full Code shrank to where it
   was last minimised (230,135 980x680), or to an old viewport's pixels after a
   resize. It now restores that box only to a window that is minimised. This
-  also fixes the Browser's full-bleed on the same path. A windowed window keeps
+  also fixes the Browser's full-bleed on the same path. Measured: a Browser
+  that had been minimised and restored, then relaunched after a resize to
+  1200x760, stayed 1440x900; it now fills 1200x760, and os-chrome checks this
+  at both viewport sizes. A windowed window keeps
   its box: before, Back onto a windowed Code that had been minimised from full
   view put it at 0,0 with the old viewport's size.
 
@@ -80,8 +83,10 @@ that:
 - the window is the element at the centre and at both bottom corners;
 - all of this still holds two frames later, after nothing is moving the window.
 
-Each is paired with a windowed positive control: the 980x680 box, and an exact
-Restore to the stash.
+Each is paired with a windowed positive control: the 980x680 box, and a
+Restore to the stash. The two portable suites (`app-link-browser-test` and
+`os-chrome-browser-test`, which also run on macOS) compare to within 1px.
+`window-chrome-browser-test` (Linux only) compares exactly.
 
 `ezil-shell.css` keys the shared strip, drawer, body offset and resize-handle
 rules on `.ezil-full-view-host`, which `createFullView` adds. The Browser's rules
