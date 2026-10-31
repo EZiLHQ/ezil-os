@@ -1161,7 +1161,21 @@ export async function openDesktopWindow (ctx = {}) {
     let last_failure = null;
     /** The user's own "Try again" (never the automatic paths above): see `session.userRetry`. */
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); }; // stable: identifies this window to userRetry
-    const user_retry = () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); };
+    const user_retry = (action) => {
+        // 🔴 PHASE B (§6.4): [Open my AWS computer] on a move's failed outcome is the user's choice, and it must never
+        // be lost. The surface reads the outcome on its own 5 s poll, up to one 30 s move pause before this window's
+        // open loop does, so the loop may still be waiting on the move: `start_boot` would hand that back and the
+        // click would do nothing. So the click ends the wait (this attempt ends without painting) and asks afresh,
+        // an ordinary open (the D16 hold), once it has stopped.
+        if ( action?.openAws === true && boot_work ) {
+            const settling = boot_work;
+            attempt++;
+            own_open?.abort();
+            void settling.catch(() => {}).then(() => { if ( ! disposed ) void start_boot(); });
+            return;
+        }
+        void session.userRetry(computer.id, last_failure, reopen_after_retry);
+    };
     // ── the ONE opening surface (round 5, D5) ────────────────────────────────
     // `AppSpinner` is the only loading/failure surface in this window. It also
     // carries the legacy `.ezil-boot` hook class, so diagnostics and tests that
@@ -1201,7 +1215,8 @@ export async function openDesktopWindow (ctx = {}) {
         icon: ctx.icon,
         isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        isMoving: () => session.isComputeMoving(computer.id),
+        // Phase B: this window's own open only (its signal), never another surface's loop for the same computer.
+        isMoving: () => !! own_open && session.isComputeMoving(computer.id, own_open.signal),
         onRetry: user_retry,
     });
     el_body.appendChild(spinner.el);
@@ -1408,14 +1423,20 @@ export async function openDesktopWindow (ctx = {}) {
         // open), the first settle corrects it — which is exactly what the live
         // path is for.
         const boot_screen_ask = measure_screen();
-        const ask_fresh = () => {
+        const ask_fresh = (movingAnswer) => {
             own_open = new AbortController();
-            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal });
+            return session.openDesktop(computer.id, boot_screen_ask, { signal: own_open.signal, ...(movingAnswer ? { movingAnswer } : {}) });
         };
         // The first request ends early only on an observed stage change (see
         // `check_aws_wait`); its own wake loop still owns the clock.
         const first_stop = new Promise(resolve => { aws_stop_wait = { t0, resolve, clock: false }; });
         let res = await Promise.race([my_attempt === 1 ? claimWarm(computer.id) : ask_fresh(), first_stop]);
+        // 🔴 PHASE B: the warm (`warm.js`; no window can cancel it) never waits on a move: it hands the moving answer
+        // straight back. This window's own open takes the wait over from that answer (a read first, never a second
+        // ask back to back), on its own signal, so closing the window ends it. Still the first request's stop.
+        if ( my_attempt === 1 && res?.ok !== true && res?.computeMoving === true && ! disposed && my_attempt === attempt ) {
+            res = await Promise.race([ask_fresh(res), first_stop]);
+        }
         aws_stop_wait = null;
 
         // 🔴 A TIMEOUT IS NOT A FAILURE WHILE AWS SAYS IT IS STILL OPENING. A cold

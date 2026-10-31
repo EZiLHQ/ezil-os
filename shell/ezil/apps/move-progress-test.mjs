@@ -27,7 +27,7 @@ const line = spinner => spinner.querySelector('.ezil-app-spinner-sub').textConte
  * `progress()` answers `computer.progress`; `answer()` answers the window's open route. Time is the move's own
  * (MOVE_STARTED + `now`); 5 s polls, 1.5 s wake re-asks and the 30 s move re-ask run in a few ms.
  */
-async function open (t, app, { progress, answer }) {
+async function open (t, app, { progress, answer, launch = true, reaskMs = 5 }) {
     const dom = new JSDOM('<!doctype html><div id="ezil-os-root"></div>', {
         url: 'https://app.example/os', runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: new VirtualConsole(),
     });
@@ -37,7 +37,7 @@ async function open (t, app, { progress, answer }) {
     w.addEventListener('error', e => errors.push(e.message));
     t.after(() => assert.deepEqual(errors, []));
     const timeout = w.setTimeout.bind(w), interval = w.setInterval.bind(w);
-    w.setTimeout = (fn, ms, ...args) => timeout(fn, [5000, 1500, 30_000].includes(ms) ? 5 : ms === 4000 ? 15 : ms, ...args);
+    w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 30_000 ? reaskMs : [5000, 1500].includes(ms) ? 5 : ms === 4000 ? 15 : ms, ...args);
     w.setInterval = (fn, ms, ...args) => interval(fn, ms === 250 ? 5 : ms, ...args);
     w.AbortSignal = { timeout: () => undefined };
     const h = { now: 0, asks: 0, reads: 0, log: [] };
@@ -63,7 +63,9 @@ async function open (t, app, { progress, answer }) {
                 previewUrl: '/api/shell/preview-url', feedback: '/api/shell/feedback' } },
     };
     w.eval(icons); w.eval(bundle);
-    await until(() => w.document.querySelector('.taskbar-item[data-app="desktop"]'), 'the shell');
+    h.dock = await until(() => w.document.querySelector('.taskbar-item[data-app="desktop"]'), 'the shell');
+    h.w = w;
+    if ( ! launch ) return h;
     await w.ezil.registry.launch(app, { payload: w.__EZIL_BOOT__, computer: w.__EZIL_BOOT__.computer, desktopState: w.__EZIL_BOOT__.desktopState });
     const win = await until(() => w.document.querySelector(`.window[data-app="${app}"]`), 'the window');
     h.win = win;
@@ -173,4 +175,67 @@ test('desktop: a move handed back after its watch, then committed, opens the Fre
     committed = true;
     await until(() => frame(h), 'the Free computer\'s frame');
     assert.ok(h.asks > asks);
+});
+
+// ── Review fixes (lane U r6b) ──────────────────────────────────────────────────────────────────────────────────
+
+// R2-M1: the surface polls every 5 s, the open's loop reads every 30 s. Here the 30 s pause outlasts the test, so the
+// only way to a fresh open is the click ending the loop's wait: [Open my AWS computer] is never lost.
+for ( const app of ['desktop', 'code', 'preview'] ) {
+    test(`${app}: [Open my AWS computer] clicked while the open's loop still pauses on the move asks at once`, async t => {
+        let failed = false, opened = false;
+        const h = await open(t, app, { reaskMs: 60_000,
+            progress: () => failed ? terminalProgress({ outcome: 'failed_reopened', reason: 'copy_stalled', stage: 'stopped' }) : movingProgress({ phase: 'exporting' }),
+            answer: () => opened ? ready : waitingAnswer(),
+        });
+        await until(() => label(h.spinner) === 'Moving your files to your Free computer');
+        failed = true;
+        const action = h.spinner.querySelector('.ezil-boot-retry');
+        await until(() => ! action.hidden && action.textContent === 'Open my AWS computer', '[Open my AWS computer]');
+        const asks = h.asks;
+        opened = true;
+        action.click();
+        await until(() => frame(h), 'the hold\'s open, at once');
+        assert.equal(h.asks, asks + 1, 'one ask, from the click');
+    });
+}
+
+// R1-M1: the paint-time warm has no window and no signal. It never waits on a move: one ask, its answer handed back,
+// no read, and nothing asked at the commit for nobody.
+test('desktop: a warm (dock hover) that meets a move and is never claimed asks once, reads nothing, opens nothing at the commit', async t => {
+    let committed = false;
+    const h = await open(t, 'desktop', { launch: false,
+        progress: () => committed ? terminalProgress({ outcome: 'committed' }) : movingProgress({ phase: 'importing' }),
+        answer: () => committed ? ready : waitingAnswer(),
+    });
+    h.dock.dispatchEvent(new h.w.Event('pointerenter'));
+    await until(() => h.asks === 1, 'the warm\'s ask');
+    await wait(80);
+    committed = true;
+    h.now = 3_600_000;
+    await wait(120);
+    assert.equal(h.asks, 1, 'no ask behind no window, before or after the commit');
+    assert.equal(h.reads, 0);
+});
+
+test('desktop: the window that claims the warm owns the wait; closing it mid-move asks nothing more', async t => {
+    let committed = false;
+    const h = await open(t, 'desktop', { launch: false,
+        progress: () => committed ? terminalProgress({ outcome: 'committed' }) : movingProgress({ phase: 'importing' }),
+        answer: () => committed ? ready : waitingAnswer(),
+    });
+    h.dock.dispatchEvent(new h.w.Event('pointerenter'));
+    await h.w.ezil.registry.launch('desktop', { payload: h.w.__EZIL_BOOT__, computer: h.w.__EZIL_BOOT__.computer, desktopState: h.w.__EZIL_BOOT__.desktopState });
+    const win = await until(() => h.w.document.querySelector('.window[data-app="desktop"]'), 'the window');
+    const spinner = win.querySelector('.ezil-app-spinner');
+    await until(() => label(spinner) === 'Moving your files to your Free computer');
+    await until(() => h.asks >= 3, 'the window\'s own re-asks');
+    // The close itself settles later in jsdom (its animation); the window is disposed at once.
+    void h.w.$(win).close();
+    await wait(300);
+    const asks = h.asks;
+    committed = true;
+    h.now = 3_600_000;
+    await wait(150);
+    assert.equal(h.asks, asks, 'a closed window\'s move wait asks nothing, and opens nothing at the commit');
 });
