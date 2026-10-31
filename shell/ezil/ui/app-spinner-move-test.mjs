@@ -15,7 +15,8 @@ import test from 'node:test';
 import { JSDOM } from 'jsdom';
 import { scanCopy } from '../../../e2e/billing-e2e-lib.mjs';
 import { honestyBans } from './Settings/billing-copy-test-helpers.mjs';
-import { MOVE_COMPUTER, MOVE_STARTED, movingProgress, blockedProgress, terminalProgress } from './reverse-move-fixtures.mjs';
+import { MOVE_COMPUTER, MOVE_STARTED, movingProgress, blockedProgress, terminalProgress, blockedAnswer } from './reverse-move-fixtures.mjs';
+import { noteMoveAnswer, noteMoveRead, moveOf } from './computer-progress.js';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true });
 globalThis.document = dom.window.document;
@@ -190,8 +191,9 @@ test('Code\'s needs-attention failure (preconditions_unmet) over the blocked row
     assert.equal(retry(s).hidden, true);
 });
 
-test('Code\'s moving answer handed back (sandbox_starting → timeout) while the move runs: still working on it, never a failure', async t => {
+test('Code\'s moving answer handed back past the move\'s watch (sandbox_starting → timeout): still working on it, never a failure', async t => {
     const { s } = await surface(t, movingProgress({ phase: 'importing' }));
+    now = START + (13_200 + 300) * 1000;
     s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting' });
     assert.equal(title(s), 'Moving your files to your Free computer');
     assert.equal(status(s), "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
@@ -199,6 +201,18 @@ test('Code\'s moving answer handed back (sandbox_starting → timeout) while the
     assert.equal(feedback(s).hidden, false);
     assert.equal(s.el.dataset.kind, 'progress');
     assert.doesNotMatch(visible(s), /taking too long|Try again/);
+});
+
+// Review fix (R1-m2): before the move's own watch, a handed-back move is not "still working on it": the loop handed it
+// back because it read an outcome this surface has not read yet. The last in-flight view stays until it does.
+test('a move handed back BEFORE its watch keeps the last in-flight view (no "still working on it", no Try again)', async t => {
+    now = START + 120_000;
+    const { s } = await surface(t, movingProgress({ phase: 'importing' }));
+    s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting' });
+    assert.equal(title(s), 'Moving your files to your Free computer');
+    assert.equal(status(s), 'Step 2 of 4: Copying your files. 120 MB of 0.4 GB copied.');
+    assert.equal(retry(s).hidden, true);
+    assert.doesNotMatch(visible(s), /still working on it|taking too long|Try again/);
 });
 
 test('past startedAt + budgetSeconds + 300 s with no outcome: "still working on it", never a failure', async t => {
@@ -239,6 +253,7 @@ test('committed, then the Free computer\'s open fails (Code\'s failure, no state
 
 test('the desktop window\'s handed-back move (state.move moving) that later commits shows the commit', async t => {
     const { s, set } = await surface(t, movingProgress({ phase: 'committing' }));
+    now = START + (13_200 + 300) * 1000; // its watch ran out: the loop handed the move back
     s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting', move: 'moving' });
     assert.equal(status(s), "This is taking longer than usual. We're still working on it — you can keep this open or come back later.");
     await set(terminalProgress({ outcome: 'committed' }));
@@ -260,6 +275,126 @@ test('a fresh open never paints an earlier open\'s move outcome (a new move answ
     assert.equal(title(s), 'Moving your files to your Free computer');
     assert.equal(bar(s).dataset.indeterminate, 'true');
     assert.equal(retry(s).hidden, true);
+});
+
+// ── Review fixes (lane U r6b) ────────────────────────────────────────────────────────────────────────────────
+const okFetch = async () => ({ ok: true, status: 200, json: async () => ({ result: { data: { json: payload } } }) });
+let noteIds = 0;
+/** A computer of the test's own: the open loop's notes are per computer and module-wide. */
+const noteComputer = () => `note-computer-${++noteIds}`;
+const BLOCKED_TITLE = "We're finishing moving your files";
+
+// R1-M2 / R2-m2: Code and Preview hand over a plain `preconditions_unmet` (no `state.move`); the loop noted that the latest
+// answer was the blocked one. The card shows at once, whatever this surface's own read is doing.
+for ( const [label, setup] of [
+    ['before its first progress read has answered', () => { globalThis.fetch = () => new Promise(() => {}); }],
+    ['with every progress read failing', () => { globalThis.fetch = async () => { throw new Error('network'); }; }],
+    ['with the tab hidden (no read at all)', () => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); }],
+] ) {
+    test(`Code's blocked failure ${label}: the needs-attention card at once, never "Something went wrong" or Try again`, async t => {
+        setup();
+        t.after(() => { globalThis.fetch = okFetch; delete document.hidden; });
+        const id = noteComputer();
+        const { s } = await surface(t, null, { computerId: id, label: 'Opening Code…' });
+        noteMoveAnswer(id, blockedAnswer());
+        s.render({ kind: 'failed', reason: 'unknown', errorCode: 'preconditions_unmet' });
+        assert.equal(title(s), BLOCKED_TITLE);
+        assert.equal(status(s), "Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.");
+        assert.equal(retry(s).hidden, true, 'no retry');
+        assert.equal(bar(s).hidden, true, 'no spinner');
+        assert.equal(feedback(s).hidden, false);
+        noteMoveAnswer(id, { ok: true }); // another surface's later answer never takes this open's card back
+        s.render({ kind: 'failed', reason: 'unknown', errorCode: 'preconditions_unmet' });
+        assert.equal(title(s), BLOCKED_TITLE);
+        assert.doesNotMatch(visible(s), /Something went wrong|Try again/);
+    });
+}
+
+test('Code\'s blocked failure before its first read: the read that lands says boot_unsettled, and the card follows it', async t => {
+    let answer;
+    globalThis.fetch = () => new Promise(resolve => { answer = resolve; });
+    t.after(() => { globalThis.fetch = okFetch; });
+    const id = noteComputer();
+    const { s } = await surface(t, null, { computerId: id, label: 'Opening Code…' });
+    noteMoveAnswer(id, blockedAnswer());
+    s.render({ kind: 'failed', reason: 'unknown', errorCode: 'preconditions_unmet' });
+    assert.equal(title(s), BLOCKED_TITLE);
+    answer({ ok: true, status: 200, json: async () => ({ result: { data: { json: blockedProgress({ computerId: id, reason: 'boot_unsettled' }) } } }) });
+    await tick();
+    assert.equal(title(s), "We couldn't finish moving your files");
+    assert.equal(status(s), "Your files are safe on your AWS computer and nothing was deleted. Your computer can't open until we've checked it; we're looking into it.");
+    assert.equal(retry(s).hidden, true);
+});
+
+test('a preconditions_unmet failure whose latest answer was NOT the blocked one keeps the ordinary failure', async t => {
+    globalThis.fetch = async () => { throw new Error('network'); };
+    t.after(() => { globalThis.fetch = okFetch; });
+    const id = noteComputer();
+    const { s } = await surface(t, null, { computerId: id, label: 'Opening Code…' });
+    noteMoveAnswer(id, blockedAnswer());
+    noteMoveAnswer(id, { ok: false, errorCode: 'preconditions_unmet' });
+    s.render({ kind: 'failed', reason: 'unknown', errorCode: 'preconditions_unmet' });
+    assert.notEqual(title(s), BLOCKED_TITLE);
+    assert.equal(retry(s).hidden, false);
+});
+
+// R1-m2: the open's loop read the failed outcome before this surface's next 5 s poll and handed the move back. The
+// outcome it read is painted at once (never "still working on it" for a move that has ended).
+test('the loop\'s newer read of a failed outcome is painted the moment the move is handed back', async t => {
+    now = START + 300_000;
+    const id = noteComputer();
+    const { s } = await surface(t, movingProgress({ computerId: id, phase: 'importing' }), { computerId: id });
+    assert.equal(title(s), 'Moving your files to your Free computer');
+    now += 4_000;
+    noteMoveRead(id, moveOf(terminalProgress({ computerId: id, outcome: 'failed_reopened', reason: 'copy_stalled' }), id));
+    s.render({ kind: 'failed', reason: 'timeout', errorCode: 'sandbox_starting', move: 'moving' });
+    assert.equal(title(s), "We couldn't move your files");
+    assert.equal(retry(s).textContent, 'Open my AWS computer');
+    assert.doesNotMatch(visible(s), /still working on it/);
+});
+
+test('an older loop read never overrides this surface\'s newer poll', async t => {
+    now = START + 300_000;
+    const id = noteComputer();
+    noteMoveRead(id, moveOf(terminalProgress({ computerId: id, outcome: 'failed_reopened' }), id), START + 299_000); // before this open
+    const { s } = await surface(t, movingProgress({ computerId: id, phase: 'checking' }), { computerId: id });
+    assert.equal(status(s), 'Step 3 of 4: Checking your files.');
+});
+
+// R1-m3: "full, then the ordinary Cloudflare open": the committed card holds its full bar for a beat, then the Free
+// computer's open is an ordinary open with its own clock and bar (never 100% through its wake), never the move's again.
+test('committed: full for a beat, then the Free computer\'s ordinary open on its own clock; never 100% before its frame', async t => {
+    now = START + 600_000;
+    const { s, set } = await surface(t, movingProgress({ phase: 'committing' }), { isMoving: () => true });
+    await set(terminalProgress({ outcome: 'committed' }));
+    assert.equal(title(s), 'Your files are on your Free computer');
+    assert.equal(pct(s), 100);
+    now += 1_000;
+    s.render({ kind: 'progress' });
+    assert.equal(pct(s), 100, 'still the beat');
+    now += 1_000;
+    s.render({ kind: 'progress' });
+    assert.equal(title(s), 'Opening Browser…', 'the ordinary open, though the loop still reads as moving');
+    assert.ok(!(pct(s) >= 100), `below 100 until the first frame: ${pct(s)}`);
+    now += 5_000;
+    s.render({ kind: 'progress' });
+    assert.equal(meta(s).textContent.startsWith('0:05'), true, `its own clock: ${meta(s).textContent}`);
+    assert.doesNotMatch(visible(s), /Moving your files|Your files are on your Free computer/);
+    s.stamp('first_frame');
+    assert.equal(pct(s), 100);
+});
+
+// R2-M1: the caller is told the action was [Open my AWS computer], so it can end a loop still pausing on the move.
+test('[Open my AWS computer] tells the caller ({openAws: true}); an ordinary Try again does not', async t => {
+    const calls = [];
+    const { s, set } = await surface(t, movingProgress({ phase: 'importing' }), { onRetry: (action) => calls.push(action) });
+    await set(terminalProgress({ outcome: 'failed_reopened', reason: 'copy_stalled' }));
+    retry(s).click();
+    assert.deepEqual(calls, [{ openAws: true }]);
+    s.render({ kind: 'failed', reason: 'unauthorized', errorCode: 'unauthorized' });
+    assert.equal(retry(s).hidden, false);
+    retry(s).click();
+    assert.deepEqual(calls, [{ openAws: true }, undefined]);
 });
 
 test('every move state painted passes the copy guards and names no city or region', () => {
