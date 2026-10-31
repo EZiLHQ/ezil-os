@@ -6,10 +6,10 @@
 // wake clocks on the first answer without the flag. Three surfaces: `openDesktop`, `previewUrl` and Code's mint mapping.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { openDesktop, previewUrl, withWakeAndOneRetry, pendingOrRefused, isComputeMoving, isComputePreparing, isComputeLaunching,
+import { openDesktop, previewUrl, withWakeAndOneRetry, cancellableWake, pendingOrRefused, isComputeMoving, isComputePreparing, isComputeLaunching,
     isComputeMigrating, MOVE_WATCH_MS, MOVE_REASK_MS, LAUNCH_DEADLINE_MS, PREPARE_DEADLINE_MS } from './session.js';
-import { WAKE_DEADLINE_MS } from './boot-phases.js';
-import { MOVE_BUDGET_SECONDS } from './ui/computer-progress.js';
+import { WAKE_DEADLINE_MS, WAKE_REASK_MS } from './boot-phases.js';
+import { MOVE_BUDGET_SECONDS, loopMoveOf } from './ui/computer-progress.js';
 import { MOVE_COMPUTER, waitingAnswer, blockedAnswer, movingProgress, blockedProgress, terminalProgress } from './ui/reverse-move-fixtures.mjs';
 
 const pending = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' };
@@ -18,23 +18,31 @@ const preparing = { ...pending, computePreparing: true };
 const cfStarting = { ok: false, errorCode: 'sandbox_starting' };
 /** apps/code.js `mintCodePreviewUrlOnce`'s mapping: ok passes, anything else is `pendingOrRefused`. */
 const codeAnswer = data => (data?.ok === true ? data : pendingOrRefused(data));
+/** `apps/code.js`'s mint: its own `cancellableWake`, always with its window's signal. */
+const codeMint = (id, signal, opts = {}) => cancellableWake(id, 'codePreviewUrl',
+    async () => codeAnswer(await (await fetch('/api/shell/code-preview-url', { method: 'POST' })).json()), { signal, ...opts });
+// Every real caller that can wait on a move passes its window's signal (the desktop window's own open, Code's and
+// Preview's mints). Without one (the paint-time warm) a loop never waits on a move: tested on its own below.
 const surfaces = [
-    ['openDesktop', id => openDesktop(id), { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } }],
-    ['previewUrl', id => previewUrl(id), { ok: true, appPreviewUrl: 'https://preview.example/' }],
-    ['Code mint', id => withWakeAndOneRetry(async () => codeAnswer(await (await fetch('/api/shell/code-preview-url', { method: 'POST' })).json()), 'codePreviewUrl', id),
-        { ok: true, codePreviewUrl: 'https://code.example/' }],
+    ['openDesktop', (id, signal) => openDesktop(id, undefined, { signal }), { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } }],
+    ['previewUrl', (id, signal) => previewUrl(id, { signal }), { ok: true, appPreviewUrl: 'https://preview.example/' }],
+    ['Code mint', codeMint, { ok: true, codePreviewUrl: 'https://code.example/' }],
 ];
 const READ = '/api/trpc/computer.progress';
+/** A refused `computer.progress` read: tRPC's GET error envelope (its code nests under `error.json.data`). */
+class Refused { constructor (status, code) { this.status = status; this.body = { error: { json: { message: code, code: -32001, data: { code, httpStatus: status, path: 'computer.progress' } } } }; } }
 
 /**
  * A fake clock and network. `answer` answers the open routes, `progress` the `computer.progress` read (return an
- * Error to fail the read). `log` records every ask and read with the clock.
+ * Error to fail the read, a `Refused` to refuse it). `log` records every ask and read with the clock. `signal`: the
+ * caller's (default: a fresh one the test never aborts; null: no signal, as the paint-time warm).
  */
 async function run (t, { open, answer, progress = () => movingProgress(), onWait, frozen = false, computerId = MOVE_COMPUTER, signal } = {}) {
     let now = 0;
     const log = [];
+    const owner = signal === undefined ? new AbortController().signal : signal ?? undefined;
     t.mock.method(Date, 'now', () => now);
-    t.mock.method(globalThis, 'setTimeout', (fn, ms) => { onWait?.({ now, ms }); if ( ! frozen ) now += ms; queueMicrotask(fn); return 0; });
+    t.mock.method(globalThis, 'setTimeout', (fn, ms) => { onWait?.({ now, ms, owner }); if ( ! frozen ) now += ms; queueMicrotask(fn); return 0; });
     t.mock.method(globalThis, 'fetch', async (url) => {
         const u = String(url);
         if ( u.includes(READ) ) {
@@ -42,14 +50,15 @@ async function run (t, { open, answer, progress = () => movingProgress(), onWait
             assert.ok(u.includes(encodeURIComponent(JSON.stringify({ json: { computerId } }))), `the read names the loop's computer: ${u}`);
             const data = progress({ now, log });
             if ( data instanceof Error ) throw data;
+            if ( data instanceof Refused ) return { ok: false, status: data.status, json: async () => data.body };
             return { ok: true, status: 200, json: async () => ({ result: { data: { json: data } } }) };
         }
         log.push({ kind: 'ask', at: now });
         const body = answer({ now, asks: log.filter(e => e.kind === 'ask').length, log });
         return { ok: true, status: 200, json: async () => body };
     });
-    const result = await open(computerId, signal);
-    return { result, log, asks: log.filter(e => e.kind === 'ask'), reads: log.filter(e => e.kind === 'read'), elapsed: now };
+    const result = await open(computerId, owner);
+    return { result, log, asks: log.filter(e => e.kind === 'ask'), reads: log.filter(e => e.kind === 'read'), elapsed: now, owner };
 }
 
 test('pendingOrRefused carries computeMoving and computeMoveNeedsAttention only when boolean true', () => {
@@ -200,17 +209,20 @@ test('openDesktop: a cancel during the move\'s wait asks no more', async t => {
     assert.equal(isComputeMoving(MOVE_COMPUTER), false);
 });
 
-test('a loop with no computer id returns a moving answer to its caller and never re-asks it', async t => {
-    let asks = 0;
+test('a loop with no computer id returns a moving answer to its caller and never re-asks it (and reads nothing)', async t => {
+    let asks = 0, reads = 0;
     t.mock.method(globalThis, 'setTimeout', (fn) => { queueMicrotask(fn); return 0; });
-    const out = await withWakeAndOneRetry(async () => { asks++; return waitingAnswer(); }, 'raw');
+    t.mock.method(globalThis, 'fetch', async () => { reads++; return { ok: true, status: 200, json: async () => ({ result: { data: { json: movingProgress() } } }) }; });
+    // An owner signal, so the no-computer rule (not the no-owner rule) is what returns.
+    const out = await withWakeAndOneRetry(async () => { asks++; return waitingAnswer(); }, 'raw', undefined, undefined, { owner: new AbortController().signal });
     assert.equal(out.computeMoving, true);
     assert.equal(asks, 1);
+    assert.equal(reads, 0, 'no progress read without the computer');
 });
 
 test('the move deadline belongs to the loop: the plain sandbox_starting deadline never cuts it', async t => {
     // A moving answer at 200 s, after 200 s of plain starting answers (216 s would be the wake's give-up).
-    const out = await run(t, { open: id => openDesktop(id), answer: ({ now }) => now < 200_000 ? pending : now < 1_000_000 ? waitingAnswer()
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }), answer: ({ now }) => now < 200_000 ? pending : now < 1_000_000 ? waitingAnswer()
         : { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } },
     progress: ({ now }) => now < 1_000_000 ? movingProgress() : terminalProgress({ outcome: 'committed' }) });
     assert.equal(out.result.ok, true);
@@ -218,9 +230,94 @@ test('the move deadline belongs to the loop: the plain sandbox_starting deadline
 });
 
 test('a moving answer from the server after a committed read keeps waiting (the server still routes the move)', async t => {
-    const out = await run(t, { open: id => previewUrl(id),
+    const out = await run(t, { open: (id, signal) => previewUrl(id, { signal }),
         answer: ({ now }) => now <= 90_000 ? waitingAnswer() : { ok: true, appPreviewUrl: 'https://preview.example/' },
         progress: ({ now }) => now < 90_000 ? movingProgress() : terminalProgress({ outcome: 'committed' }) });
     assert.equal(out.result.ok, true);
     assert.deepEqual(out.asks.map(a => a.at), [0, 30_000, 60_000, 90_000, 120_000]);
+});
+
+// ── Review fixes (lane U r6b): who may wait on a move, what the loop leaves the surface, and the backstops ─────────
+
+// 🔴 Only a loop its caller can cancel waits on a move. The paint-time warm (`warm.js`) has no window and no signal:
+// it would read and ask for hours behind no window and open the Free computer at the commit for nobody.
+for ( const [name, open] of surfaces ) {
+    test(`${name} with no caller signal (the warm): a moving answer goes straight back; no read, no second ask`, async t => {
+        const out = await run(t, { open, signal: null, answer: () => waitingAnswer(), progress: () => terminalProgress({ outcome: 'committed' }) });
+        assert.equal(out.result.computeMoving, true);
+        assert.equal(out.asks.length, 1);
+        assert.equal(out.reads.length, 0);
+        assert.equal(isComputeMoving(MOVE_COMPUTER), false);
+    });
+}
+
+test('the window that claims the warm takes the wait over from its moving answer: a read first, never a second ask back to back', async t => {
+    const ready = { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } };
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal, movingAnswer: waitingAnswer() }),
+        answer: ({ now }) => now < 90_000 ? waitingAnswer() : ready,
+        progress: ({ now }) => now < 90_000 ? movingProgress() : terminalProgress({ outcome: 'committed' }) });
+    assert.equal(out.result.ok, true);
+    assert.deepEqual(out.log[0], { kind: 'read', at: MOVE_REASK_MS }, 'the first request is a read, one pause after the warm\'s answer');
+    assert.deepEqual(out.asks.map(a => a.at), [30_000, 60_000, 90_000]);
+});
+
+test('isComputeMoving with an owner reads that caller\'s own loop only', async t => {
+    const other = new AbortController().signal;
+    const seen = [];
+    await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }),
+        answer: ({ now }) => now < 60_000 ? waitingAnswer() : { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } },
+        progress: ({ now }) => now < 60_000 ? movingProgress() : terminalProgress({ outcome: 'committed' }),
+        onWait: ({ owner }) => seen.push([isComputeMoving(MOVE_COMPUTER, owner), isComputeMoving(MOVE_COMPUTER, other), isComputeMoving(MOVE_COMPUTER)]) });
+    assert.ok(seen.some(([mine]) => mine === true), 'its own loop');
+    assert.ok(seen.every(([, theirs]) => theirs === false), 'never another caller\'s');
+    assert.ok(seen.some(([, , any]) => any === true), 'no owner: any loop for the computer');
+});
+
+test('a progress read refused for the session (HTTP 401) answers `unauthorized` itself and asks nothing more', async t => {
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }), answer: () => waitingAnswer(),
+        progress: ({ now }) => now < 90_000 ? movingProgress() : new Refused(401, 'UNAUTHORIZED') });
+    assert.equal(out.result.ok, false);
+    assert.equal(out.result.errorCode, 'unauthorized');
+    assert.equal(out.result.computeMoving, undefined, 'its sign-in copy, never the move\'s');
+    assert.deepEqual(out.asks.map(a => a.at), [0, 30_000, 60_000]);
+    assert.equal(out.log.at(-1).kind, 'read', 'the refused read is the last request');
+});
+
+test('any other refused read (HTTP 500) is no evidence either way: it waits, and the next in-flight read asks', async t => {
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }),
+        answer: ({ now }) => now < 120_000 ? waitingAnswer() : { ok: true, guacamoleUrl: 'https://viewer.example/', frame: { confirmed: true } },
+        progress: ({ now }) => now === 60_000 ? new Refused(500, 'INTERNAL_SERVER_ERROR') : now < 120_000 ? movingProgress() : terminalProgress({ outcome: 'committed' }) });
+    assert.equal(out.result.ok, true);
+    assert.deepEqual(out.asks.filter(a => a.at <= 90_000).map(a => a.at), [0, 30_000, 90_000]);
+});
+
+// Rule 4's cap: after the commit the loop is an ordinary wake again, capped at asks − 1 + AWS_MAX_ISSUES (not the move's).
+test('frozen clock after a committed read: plain starting answers stop at the re-anchored wake cap, never the move\'s', async t => {
+    const awsMaxIssues = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }), frozen: true,
+        answer: ({ asks }) => asks === 1 ? waitingAnswer() : cfStarting, progress: () => terminalProgress({ outcome: 'committed' }) });
+    assert.equal(out.result.errorCode, 'unknown', 'the structural backstop');
+    assert.equal(out.asks.length, 1 + awsMaxIssues);
+    assert.equal(out.reads.length, 1);
+});
+
+// Rule 6 is keyed on the flag, not on `preconditions_unmet`: a blocked answer with a retryable code is not re-asked either.
+test('a needs-attention answer on a retryable code (sandbox_starting) still returns at once: no re-ask, no read', async t => {
+    const out = await run(t, { open: (id, signal) => openDesktop(id, undefined, { signal }), answer: () => blockedAnswer({ errorCode: 'sandbox_starting', retryable: true }) });
+    assert.equal(out.result.computeMoveNeedsAttention, true);
+    assert.equal(out.asks.length, 1);
+    assert.equal(out.reads.length, 0);
+});
+
+// The notes the loop leaves the opening surface (Code and Preview hand it plain failures).
+test('the loop notes whether the latest answer was the blocked one, and the move its latest read saw', async t => {
+    await run(t, { open: (id, signal) => previewUrl(id, { signal }), answer: () => blockedAnswer() });
+    assert.equal(loopMoveOf(MOVE_COMPUTER).blocked, true);
+    await run(t, { open: (id, signal) => previewUrl(id, { signal }), answer: () => ({ ok: true, appPreviewUrl: 'https://preview.example/' }) });
+    assert.equal(loopMoveOf(MOVE_COMPUTER).blocked, false, 'every answer overwrites it');
+    const out = await run(t, { open: (id, signal) => previewUrl(id, { signal }), answer: () => waitingAnswer(),
+        progress: ({ now }) => now < 60_000 ? movingProgress() : terminalProgress({ outcome: 'failed_reopened', reason: 'copy_stalled' }) });
+    assert.equal(loopMoveOf(MOVE_COMPUTER).move.outcome, 'failed_reopened');
+    assert.equal(loopMoveOf(MOVE_COMPUTER).readAt, out.reads.at(-1).at);
+    assert.equal(loopMoveOf('another-computer'), null);
 });

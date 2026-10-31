@@ -30,8 +30,9 @@ import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boo
 // `RELEASE_PRESENCE_AGO_MS` below so a release and a heartbeat cannot drift
 // apart about what "nobody is here" means.
 import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
-// Phase B: what one `computer.progress` read says about a moving open (the moving view's one reader).
-import { moveAskOf, MOVE_BUDGET_SECONDS } from './ui/computer-progress.js';
+// Phase B: what one `computer.progress` read says about a moving open (the moving view's one reader), and the notes
+// this loop leaves the opening surface (Code and Preview hand it plain failures).
+import { moveAskOf, moveOf, noteMoveAnswer, noteMoveRead, MOVE_BUDGET_SECONDS } from './ui/computer-progress.js';
 
 const NS = 'ezil-os:';
 
@@ -283,7 +284,10 @@ const TRPC_ENDPOINT = '/api/trpc';
 // Concurrent opens cannot clear one another's still-active migration signal.
 const migratingRequests = new Map();
 const launchingRequests = new Map();
-/** Phase B: in-flight asks whose last answer said the computer's files are moving (`computeMoving`). */
+/**
+ * Phase B: in-flight asks whose last answer said the computer's files are moving (`computeMoving`), each with the
+ * signal its caller passed (`owner`), so a window can ask about its own loop only.
+ */
 const movingRequests = new Map();
 /**
  * Round 6 (seam C): in-flight asks whose server answer said the computer's desktop is taking this host
@@ -301,20 +305,31 @@ export function isComputePreparing (computerId) {
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
 }
-export function isComputeMoving (computerId) {
-    return !!computerId && [...movingRequests.values()].includes(computerId);
+/**
+ * Phase B. `owner`: the signal a caller passed `openDesktop` (or `cancellableWake`); only that caller's own loop then
+ * counts. A per-computer answer is not "this open met a move": a Code mint still pausing on a move that has just
+ * failed must not make a fresh desktop open (an ordinary hold open) look like one that watched the move.
+ */
+export function isComputeMoving (computerId, owner) {
+    return !!computerId && [...movingRequests.values()]
+        .some(entry => entry.computerId === computerId && (owner === undefined || entry.owner === owner));
 }
 
 /**
  * Phase B (§6.4 rule 3): one `computer.progress` read for a moving loop. 'ask' only when it shows this computer's move
- * in flight or committed; 'stop' on a failed outcome; 'wait' for anything else, a failed read included.
+ * in flight or committed; 'stop' on a failed outcome; 'unauthorized' when the read was refused for the session (an
+ * ask would be refused the same way, so the loop answers it itself and never asks); 'wait' for anything else, a failed
+ * read included. The move it saw is noted for the opening surface (`noteMoveRead`).
  */
 async function readMoveAsk (computerId, signal) {
     const input = encodeURIComponent(JSON.stringify({ json: { computerId } }));
     const res = await request(`${TRPC_ENDPOINT}/computer.progress?input=${input}`, { timeoutMs: STATUS_TIMEOUT_MS, signal });
-    if ( ! res.ok ) return 'wait';
-    const data = res.data?.result?.data;
-    return moveAskOf(data && typeof data === 'object' && 'json' in data ? data.json : data, computerId);
+    // A tRPC GET nests its code under `error.json.data`, so `request()` reports `HTTP_401`: the status is the signal.
+    if ( ! res.ok ) return res.status === 401 || res.code === 'UNAUTHORIZED' ? 'unauthorized' : 'wait';
+    const raw = res.data?.result?.data;
+    const data = raw && typeof raw === 'object' && 'json' in raw ? raw.json : raw;
+    noteMoveRead(computerId, moveOf(data, computerId));
+    return moveAskOf(data, computerId);
 }
 
 /**
@@ -445,13 +460,22 @@ const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailab
  *      under the Free hold, which the user must choose. The first answer
  *      without the flag re-anchors the wake clocks. A
  *      `computeMoveNeedsAttention` answer is deterministic and returns at once.
+ *      🔴 Only a loop its caller can cancel waits on a move (`owner`): the
+ *      paint-time warm (`warm.js`, no window, no signal) hands a moving answer
+ *      straight back, or it would ask for hours behind no window and open the
+ *      Free computer at the commit for nobody. The window that claims it takes
+ *      the wait over (`movingAnswer`) on its own signal.
  *
  * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
  *   Sends the request once. Must never throw.
  * @param {string} what For the log line only.
  * @param {string} [computerId] Scopes migration progress to this computer.
+ * @param {AbortSignal} [signal] Stops the loop.
+ * @param {{owner?: AbortSignal | null, movingAnswer?: object | null}} [opts] `owner`: the caller's own signal (default
+ *   `signal`; null: no caller can cancel this loop). `movingAnswer`: a `computeMoving` answer this open already got
+ *   (the claimed warm's): the loop starts inside that move's wait, so its first request is a read, never a second ask.
  */
-async function withWakeAndOneRetry (issue, what, computerId, signal) {
+async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = signal, movingAnswer = null } = {}) {
     // `let`: the first answer after a move re-anchors it (rule 4 of contract §6.4).
     let t0 = Date.now();
     let retried = false;
@@ -468,6 +492,8 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
     let moveMaxIssues = 0;
     let moveResumed = true;
     let moveReads = 0;
+    // The claimed warm's moving answer, taken as this loop's first answer (its ask is counted: the warm made it).
+    let carried = movingAnswer?.ok !== true && movingAnswer?.computeMoving === true ? movingAnswer : null;
     const progressKey = Symbol();
     // 🔴 A CANCELLED LOOP NEVER ASKS AGAIN. Every ask runs the server's ensure,
     // and on an UNCONFIRMED + ENROLLMENT_FAILED placement that ensure launches a
@@ -507,11 +533,14 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                 return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
             }
             asks++;
-            const res = await issue();
+            const res = carried ?? await issue();
+            carried = null;
             // Checked before anything reads `res`: an aborted request surfaces as a
             // transport failure, which would otherwise buy the one silent re-ask.
             if ( signal?.aborted ) return cancelled();
             const now = Date.now();
+            // Phase B: the latest answer for this computer, for the opening surface (the blocked card at once).
+            noteMoveAnswer(computerId, res);
             // 🔴 PHASE B FIRST (§6.4 rules 2 and 6), before the migrating, launching and preparing branches and the
             // `sandbox_starting` deadline: none of their clocks may end a move. Keyed on the flags only, never `error`.
             if ( res.ok !== true && res.computeMoveNeedsAttention === true ) {
@@ -524,7 +553,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                 migratingRequests.delete(progressKey);
                 launchingRequests.delete(progressKey);
                 preparingRequests.delete(progressKey);
-                if ( computerId ) movingRequests.set(progressKey, computerId);
+                if ( computerId ) movingRequests.set(progressKey, { computerId, owner });
                 if ( moveStartedAt === null ) {
                     moveStartedAt = now;
                     moveMaxIssues = asks - 1 + MOVE_MAX_ISSUES;
@@ -537,6 +566,12 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                 moveResumed = false;
                 // Rule 3: only a progress read says whether asking is safe. Without the computer there is none.
                 if ( ! computerId ) return res;
+                // 🔴 No caller can cancel this loop (the paint-time warm): it never waits on a move. The window
+                // that claims it takes the wait over on its own signal, so closing that window ends it.
+                if ( ! owner ) {
+                    console.info(`[ezil-os:session] ${what}: the computer's files are moving and no window owns this open; handing the answer back`);
+                    return res;
+                }
                 for (;;) {
                     if ( Date.now() >= deadline ) {
                         // Rule 5: "still working on it", never a failure. The caller reads the move itself.
@@ -561,6 +596,12 @@ async function withWakeAndOneRetry (issue, what, computerId, signal) {
                     const next = await readMoveAsk(computerId, signal);
                     if ( signal?.aborted ) return cancelled();
                     if ( next === 'ask' ) break;
+                    if ( next === 'unauthorized' ) {
+                        // Signed out mid-move: the open route refuses an ask the same way, so answer it here and ask
+                        // nothing (no ask can race a failure into a hold boot). Its sign-in copy, never the move's.
+                        console.info(`[ezil-os:session] ${what}: the move's progress read was refused for the session; not asking again`);
+                        return { ok: false, errorCode: 'unauthorized', message: 'Signed out while the files were moving.' };
+                    }
                     if ( next === 'stop' ) {
                         // Never auto-open the AWS computer: the caller shows the outcome and the user chooses.
                         console.info(`[ezil-os:session] ${what}: the move ended without moving the files; not asking again`);
@@ -706,7 +747,7 @@ export function openSession () {
  * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId, screen, { signal } = {}) {
+export async function openDesktop (computerId, screen, { signal, movingAnswer } = {}) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
@@ -714,7 +755,8 @@ export async function openDesktop (computerId, screen, { signal } = {}) {
     // `cancelOpenDesktop(computerId)` — which also reaches an open the caller
     // did not start itself (the paint-time warm, via `warm.js`) — and by
     // `cancelComputerOpens` (Stop/Delete, after the windows close).
-    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s), { signal });
+    // Phase B: only an open with a `signal` waits on a move; `movingAnswer` (the claimed warm's) starts it inside one.
+    return cancellableWake(computerId, 'openDesktop', (s) => openDesktopOnce(computerId, screen, s), { signal, movingAnswer });
 }
 
 /**
@@ -735,9 +777,10 @@ const openCancels = new Map();
  * @param {string} computerId
  * @param {string} what The loop's name ('openDesktop' | 'previewUrl' | 'codePreviewUrl').
  * @param {(signal: AbortSignal) => Promise<any>} issue One request. Must never throw.
- * @param {{signal?: AbortSignal}} [opts]
+ * @param {{signal?: AbortSignal, movingAnswer?: object}} [opts] Phase B: without `signal` no caller can cancel the
+ *   loop, so it never waits on a move (`withWakeAndOneRetry`'s `owner`); `movingAnswer` as there.
  */
-export function cancellableWake (computerId, what, issue, { signal } = {}) {
+export function cancellableWake (computerId, what, issue, { signal, movingAnswer } = {}) {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     if ( signal?.aborted ) cancel(); else signal?.addEventListener?.('abort', cancel, { once: true });
@@ -746,7 +789,8 @@ export function cancellableWake (computerId, what, issue, { signal } = {}) {
     openCancels.set(key, entry);
     entry.done = (async () => {
         try {
-            return await withWakeAndOneRetry(() => issue(controller.signal), what, computerId, controller.signal);
+            return await withWakeAndOneRetry(() => issue(controller.signal), what, computerId, controller.signal,
+                { owner: signal ?? null, movingAnswer });
         } finally {
             openCancels.delete(key);
             signal?.removeEventListener?.('abort', cancel);

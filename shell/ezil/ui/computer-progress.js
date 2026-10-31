@@ -126,6 +126,34 @@ export function moveAskOf (data, computerId) {
     return data.operation === 'moving' && data.stage === 'moving' ? 'ask' : 'wait';
 }
 
+/**
+ * 🔴 PHASE B: WHAT THE OPEN LOOP LAST LEARNT ABOUT EACH COMPUTER'S MOVE, for the opening surface. `apps/code.js` and
+ * `apps/preview.js` are read-only (§1.1): they hand the surface a plain failure (`preconditions_unmet`,
+ * `sandbox_starting`) without the move flags. So `session.js`'s wake loop notes here, per computer:
+ *   - `blocked`: whether the LATEST open answer was the reverse blocked answer (`computeMoveNeedsAttention`); every
+ *     answer overwrites it. The surface shows the open-blocked card at once from it (§6.2: never a spinner, never a
+ *     retry), before any `computer.progress` read of its own has answered;
+ *   - `move`/`readAt`: the move its latest `computer.progress` read saw (`moveOf`). The surface paints whichever of
+ *     this and its own 5 s poll is newer, so the outcome the loop stopped on is on screen when the loop returns.
+ * Server facts about one computer, whichever loop read them; never "this open watched a move" (that stays per open).
+ * Kept in this file because both `session.js` and the surface already import it, and the loader never loads session.js.
+ */
+const loopMoves = new Map();
+/** `session.js`, after each open answer for `computerId`. */
+export function noteMoveAnswer (computerId, res) {
+    if (!computerId) return;
+    loopMoves.set(computerId, { ...loopMoves.get(computerId), blocked: res?.ok !== true && res?.computeMoveNeedsAttention === true });
+}
+/** `session.js`, after each `computer.progress` read of a moving open that saw this computer's move (`moveOf`, non-null). */
+export function noteMoveRead (computerId, move, at = Date.now()) {
+    if (!computerId || !move) return;
+    loopMoves.set(computerId, { ...loopMoves.get(computerId), move, readAt: at });
+}
+/** The surface's read: `{blocked, move, readAt}` (each possibly absent), or null when no loop has noted anything. */
+export function loopMoveOf (computerId) {
+    return (computerId && loopMoves.get(computerId)) || null;
+}
+
 /** "120 MB of 2.4 GB copied": the Computer tab card's units (`moveView`), never the opening's `formatBytes`. */
 export function moveBytesText (done, total) {
     if (!Number.isFinite(done) || done < 0 || !Number.isFinite(total) || total <= 0) return '';

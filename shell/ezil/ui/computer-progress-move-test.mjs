@@ -131,8 +131,10 @@ test('moveAskOf: in flight or committed asks; a failed outcome stops; anything e
         blockedProgress(), terminalProgress({ outcome: 'failed_reopened', stage: 'running', lifecycleState: 'RUNNING' })] ) {
         assert.equal(moveAskOf(data, ID), 'stop', JSON.stringify(data.move));
     }
-    for ( const data of [null, undefined, {}, movingProgress({ computerId: 'other' }), { ...terminalProgress(), move: null }, { ...movingProgress(), version: 3 }] ) {
-        assert.equal(moveAskOf(data, ID), 'wait');
+    for ( const data of [null, undefined, {}, movingProgress({ computerId: 'other' }), { ...terminalProgress(), move: null }, { ...movingProgress(), version: 3 },
+        // An in-flight move whose view is not the moving view is no evidence the move is in flight: never an ask.
+        { ...movingProgress(), operation: 'none' }, { ...movingProgress(), stage: 'needs_operator' }] ) {
+        assert.equal(moveAskOf(data, ID), 'wait', JSON.stringify([data?.operation, data?.stage]));
     }
 });
 
