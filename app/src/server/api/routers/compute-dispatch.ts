@@ -742,7 +742,8 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
 /**
  * The next-open trigger (D20, §5.9; `startedBy: 'open'`), called by `previewUrl` before `routeComputer`, never by reads,
  * `computer.progress`, `status` or the hosted-app routes. Creates a row only when ALL hold: the placement is aws-ec2 STOPPED
- * with no job, no live lease and no switch/restart transition; no reverse row holds it and the newest is not a failure
+ * with no job and no switch/restart transition (§5.9's "no lease (no transition active)"; `lease_until` itself is not read: a
+ * stop never clears it, so a STOPPED row's lease is always stale); no reverse row holds it and the newest is not a failure
  * (after a failure only a click starts the next move); the kill switch is off; the account is not founder-owned
  * (§5.9.1); no forward work; standing `files_on_aws`. Cheap checks first: a Cloudflare open adds one placement read.
  * 🔴 Fails closed: any throw means no trigger, and the open proceeds as the D16 hold (today's open). The caller then routes,
@@ -756,8 +757,10 @@ export async function reverseMoveOnOpen(db: PlacementDb, computer: ComputerRef, 
         if (!isPlacementReadEnabled(env)) return null;
         const now = (deps.now ?? (() => new Date()))();
         const { record: p } = await readPlacement(db, computerId, userId);
-        if (p?.provider !== 'aws-ec2' || p.state !== 'STOPPED' || p.lifecycleJobId !== null
-            || (p.leaseUntil !== null && p.leaseUntil.getTime() > now.getTime())) return null;
+        // 🔴 Never `leaseUntil`: a stop's receipt does not clear it and presence renews it up to an hour ahead, so a
+        // STOPPED computer often carries a future lease. A wake writes LEASED with its lease in one CAS, so STOPPED with
+        // no job (plus the transition check below) already means no transition is active.
+        if (p?.provider !== 'aws-ec2' || p.state !== 'STOPPED' || p.lifecycleJobId !== null) return null;
         const config = readAwsAdmissionConfig(env);
         if (!config.enabled || config.killSwitch) return null;
         if (!(await reverseMovesTablePresent(db))) return null;

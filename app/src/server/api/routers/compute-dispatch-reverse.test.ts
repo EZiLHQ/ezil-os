@@ -269,7 +269,6 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
         ['AWS disabled', { env: { EZIL_AWS_COMPUTERS_ENABLED: '0' } }],
         ['RUNNING', { placement: { state: 'RUNNING' } }],
         ['a lifecycle job', { placement: { lifecycle_job_id: J } }],
-        ['a live lease', { placement: { lease_until: new Date(Date.now() + 600_000) } }],
         ['a failed_reopened newest row', { moves: [moveRow({ state: 'failed_reopened', last_error: 'copy_stalled' })] }],
         ['forward work', { forwardBusy: true }],
         ['no 0012', { present: false }],
@@ -289,6 +288,13 @@ describe('the next-open trigger (D20, §5.9): previewUrl, before routing, fail-c
             phase: 'waking', reason: null, fromGeneration: 7, fromLeaseEpoch: 11, requestedAt: new Date().toISOString(), stoppingAt: null, wakingAt: null, endedAt: null };
         const w = world([held()], { meta: [{ transition, opening: null }] });
         expect(await reverseMoveOnOpen(w.db as never, { userId: U, computerId: C }, { email: 'person@example.com' })).toBeNull();
+    });
+    it('a STOPPED computer still carrying its last session\'s lease is a trigger (a stop never clears lease_until)', async () => {
+        // A D16 hold session renewed the lease up to an hour ahead, then stopped: the next open moves the files (moveOnOpen).
+        const w = world([held({ lease_until: new Date(Date.now() + 50 * 60_000), presence_at: new Date(Date.now() - 10 * 60_000) })]);
+        expect(await open(w.db, 'previewUrl')).toEqual(moving);
+        expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
+        expect(h.gate).not.toHaveBeenCalled();
     });
     it('a committed newest row does not stop a new open move (a Free user again after a later paid period)', async () => {
         const w = world([held()], { moves: [moveRow({ state: 'committed' })] });
