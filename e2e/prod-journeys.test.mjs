@@ -1078,3 +1078,26 @@ test('an EZiL ID run of ezil-ai loads the UI sign-in, needs no Supabase key, and
     for (const secret of ['qa.user@ezil.work', 'correct-horse-battery']) assert.ok(!text.includes(secret), `leaked ${secret}`);
   } finally { rmSync(out, { recursive: true, force: true }); }
 });
+
+// The readers above use querySelector; the journey also hands these strings to Playwright's own
+// selector engine (the ` i` attribute flag, `:visible` mid-chain, a `text=` screenshot mask).
+test('in Chromium: the locator strings the ezil-ai journey hands to Playwright parse and match', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div class="statusbar-item" id="ezil.ezil-models.ezil-models.aistatus"><a role="button">EZiL AI · 1 credits</a></div>
+      <div class="chat-input-container" style="display:none"><div class="monaco-editor"><div class="view-lines">hidden</div></div></div>
+      <div class="chat-input-container"><div class="monaco-editor"><div class="view-lines">Reply with</div></div></div>
+      <p>Signing in as <span class="who">qa.user@ezil.work</span></p>`);
+    assert.equal(await page.locator(AI_STATUS_ITEM).count(), 1, 'the id suffix matches whatever case the workbench writes');
+    await page.locator(AI_STATUS_ITEM).first().click({ timeout: 2000 });
+    const typed = await page.locator('.chat-input-container .monaco-editor:visible .view-lines').first().innerText();
+    assert.equal(typed.replace(/\s+/g, ' '), 'Reply with', 'the visible input, with Monaco\'s U+00A0 spaces folded as sendChatPrompt does');
+    const mask = page.locator('text=qa.user@ezil.work');
+    assert.equal(await mask.count(), 1);
+    assert.equal(await mask.evaluate(el => el.className), 'who', 'the mask covers the address, not its container');
+  } finally { await browser.close(); }
+});
