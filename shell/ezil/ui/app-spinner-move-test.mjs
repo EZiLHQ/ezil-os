@@ -356,9 +356,23 @@ test('the loop\'s newer read of a failed outcome is painted the moment the move 
 test('an older loop read never overrides this surface\'s newer poll', async t => {
     now = START + 300_000;
     const id = noteComputer();
-    noteMoveRead(id, moveOf(terminalProgress({ computerId: id, outcome: 'failed_reopened' }), id), START + 299_000); // before this open
-    const { s } = await surface(t, movingProgress({ computerId: id, phase: 'checking' }), { computerId: id });
+    const { s, set } = await surface(t, movingProgress({ computerId: id, phase: 'checking' }), { computerId: id });
+    now += 2_000;
+    await set(movingProgress({ computerId: id, phase: 'checking' })); // this surface's own poll, at +2 s
+    noteMoveRead(id, moveOf(terminalProgress({ computerId: id, outcome: 'failed_reopened' }), id), START + 301_000); // inside this open, older
+    s.render({ kind: 'progress' });
     assert.equal(status(s), 'Step 3 of 4: Checking your files.');
+});
+
+test('a loop read from before this open (an earlier open\'s move) is never this open\'s outcome', async t => {
+    globalThis.fetch = async () => { throw new Error('network'); };
+    t.after(() => { globalThis.fetch = okFetch; });
+    now = START + 300_000;
+    const id = noteComputer();
+    noteMoveRead(id, moveOf(terminalProgress({ computerId: id, outcome: 'failed_reopened', reason: 'copy_stalled' }), id), START + 100_000);
+    const { s } = await surface(t, null, { computerId: id, isMoving: () => true });
+    assert.equal(title(s), 'Moving your files to your Free computer');
+    assert.equal(retry(s).hidden, true);
 });
 
 // R1-m3: "full, then the ordinary Cloudflare open": the committed card holds its full bar for a beat, then the Free
