@@ -536,7 +536,8 @@ Closed at integration (branch `feat/os-app-code-20261030`, 2026-10-30):
 Still open:
 
 - In-app links `href="/os?settings=billing…"` (`Settings/tabs/computers.js`
-  545, 602, 711; `Settings/tabs/usage.js` 39) and `/os` links in
+  609, 615 (Round 6's held-computer Upgrade), 688, 802;
+  `Settings/tabs/usage.js` 39) and `/os` links in
   `app/src/app/billing/return/*`, `app/src/app/computers/_components/select-computers.tsx`
   still work through the alias, as full document loads.
 - Settings does not report tab changes, so a URL's `tab` reflects the tab it

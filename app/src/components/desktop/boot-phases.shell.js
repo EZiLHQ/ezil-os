@@ -676,9 +676,10 @@ export const BOOT_FAILURE_COPY = {
     // Round 6 (seam A): the AWS host's desktop never took its new settings within the Worker's bound (150 s),
     // or its restarts are exhausted. Both answer the same on a re-ask until the host changes, so each names
     // the Troubleshoot action that changes it, never "try again" alone. Round 6a: both name Restart computer.
-    // Restart desktop is enabled only while a desktop window is open (Settings/tabs/troubleshoot.js), so a Code
-    // or app preview open would be sent to a disabled button; a restarted computer is a fresh host boot, which
-    // gets its own once-per-boot config push. The title reads the same over the desktop, Code and an app.
+    // Restart desktop was only ever enabled while a desktop window was open, and it has since been removed from
+    // Settings/tabs/troubleshoot.js (app-code lane A2); Restart computer is enabled with any computer, so a Code or
+    // app preview open is never sent to a missing or disabled button. A restarted computer is a fresh host boot,
+    // which gets its own once-per-boot config push. The title reads the same over the desktop, Code and an app.
     desktop_config_unapplied: {
         title: "Your computer's desktop didn't finish setting up",
         body: "Your computer is running, but its desktop, which also runs Code and your app, didn't pick up its new settings in time. Use Restart computer in Settings → Troubleshoot to start it fresh, then open this again. Your files are kept.",

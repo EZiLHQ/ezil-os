@@ -55,8 +55,9 @@ describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_
 // Round 6 (seam A): the Worker's terminal desktop answers (aws-preview.ts WORKER_TERMINAL). The Worker answers
 // both the same on every re-ask until the host's record changes, so neither is retried silently, and each
 // copy names the Troubleshoot action that changes it instead of promising that trying again helps.
-// Round 6a: both name Restart computer. Restart desktop is disabled unless a desktop window is open
-// (Settings/tabs/troubleshoot.js), so naming it sent a Code or app preview open to a disabled button.
+// Round 6a: both name Restart computer. Restart desktop was disabled unless a desktop window was open, and has
+// since been removed from Settings/tabs/troubleshoot.js (app-code lane A2), so naming it would send a Code or app
+// preview open to a button that is not there.
 describe.each([['app', app], ['shell', shell]] as const)('%s terminal desktop copy', (_name, boot) => {
     it.each([
         ['desktop_config_unapplied', "Your computer's desktop didn't finish setting up",
