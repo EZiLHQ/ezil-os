@@ -419,6 +419,19 @@ describe('booting → exporting → copying → checking → flipping → commit
         await w.pass();
         expect(w.calls).toEqual(['pull:0+64', 'begin', 'pull:0+64', 'verify']);
     });
+    it('r7 fixer (§5.5): copying import_not_started after a recorded chunk is import_lost (a fresh begin would clear the Worker\'s records)', async () => {
+        const big = headOf([...Array(100).fill(EXPORT_CHUNK_BYTES), 9]);
+        let pulls = 0;
+        const w = world({ state: 'copying', exportBoot: { ...BOOT, instanceId: I_NEW }, exportHead: big }, bootAt({ state: 'MOUNTING', instanceId: I_NEW }),
+            { worker: { pull: (_m, from, count) => ++pulls === 1 ? ok({ export: { state: 'ready' }, head: null, stored: Array.from({ length: count! }, (_, k) => from! + k), next: 64 })
+                : conflict('import_not_started') } });
+        await w.pass();
+        // Chunks 0-63 recorded, then the key is gone: never retried, never re-begun; compensation toward failed_reopened('import_lost').
+        expect(w.writes.slice(0, 2)).toEqual([`progress:${Array.from({ length: 64 }, (_, k) => k).join(',')}`, 'compensate:import_lost']);
+        expect(w.calls.slice(0, 2)).toEqual(['pull:0+64', 'pull:64+64']);
+        expect(w.calls).not.toContain('begin');
+        expect(w.writes).not.toContain('retry:import_not_started');
+    });
     it('checking: verify, then the host retire; the flip waits for STOPPED at N+1/E+1; not_verified is import_corrupt', async () => {
         const w = world({ state: 'checking', exportBoot: { ...BOOT, instanceId: I_NEW }, exportHead: HEAD }, bootAt({ state: 'MOUNTING', instanceId: I_NEW }));
         expect(await w.pass()).toMatchObject({ state: 'checking' });

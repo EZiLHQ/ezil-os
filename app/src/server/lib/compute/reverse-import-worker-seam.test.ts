@@ -217,4 +217,24 @@ describe('seam A ↔ W: the app\'s import client and runtime against the Worker\
         expect(verify).toEqual({ ok: false, error: 'conflict', reason: 'not_verified' });
         expect(classifyWorkerFailure('verify', verify as never)).toEqual({ kind: 'fail', failure: 'reopen', code: 'import_corrupt' });
     });
+
+    // r7 fixer (§5.5): why a copying `import_not_started` after a recorded chunk is `import_lost`, never "retry and re-begin".
+    it('the DO key lost mid-copy: pull answers import_not_started; a fresh begin forgets the recorded chunks, so verify refuses', async () => {
+        const w = world();
+        await w.worker.begin(w.move);
+        w.ready();
+        const status = await w.worker.pull(w.move, 0, 0);
+        const m = { ...w.move, state: 'copying' as const, exportHead: exportHeadFor(w.move, status.ok ? status.data.head : null) };
+        expect(await w.worker.pull(m, 0, 1)).toMatchObject({ ok: true, data: { stored: [0] } });
+        expect([...w.store.map.keys()]).toContain('ezil:reverseImport:put:0');
+        w.store.map.delete('ezil:reverseImport');                       // an operator action or DO storage loss
+        const lost = await w.worker.pull(m, 1, 64);
+        expect(lost).toEqual({ ok: false, error: 'conflict', reason: 'import_not_started' });
+        // The app keeps chunk 0 in its bitmap and would pull from 1: the Worker's fresh begin cleared put:0, so the copy that looks
+        // complete to the app fails verification. The machine therefore ends the row import_lost (provider-reverse.ts copying).
+        expect(await w.worker.begin(m)).toMatchObject({ ok: true });
+        expect([...w.store.map.keys()]).not.toContain('ezil:reverseImport:put:0');
+        expect(await w.worker.pull(m, 1, 64)).toMatchObject({ ok: true, data: { stored: [1, 2] } });
+        expect(await w.worker.verify({ ...m, state: 'checking' })).toEqual({ ok: false, error: 'conflict', reason: 'not_verified' });
+    });
 });

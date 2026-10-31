@@ -341,6 +341,11 @@ const firstMissing = (m: ComputeReverseMove): number => {
     for (let i = 0; i < head.chunks.length; i++) if (!bitmap || !bitmapHas(bitmap, i)) return i;
     return head.chunks.length;
 };
+/** Whether this row recorded any chunk of its export head (the bitmap of another archive counts for nothing). */
+const anyRecorded = (m: ComputeReverseMove): boolean => {
+    const head = m.exportHead!, bitmap = m.importProgress?.archiveSha256 === head.sha256 ? m.importProgress.bitmap : null;
+    return bitmap !== null && head.chunks.some((_, i) => bitmapHas(bitmap, i));
+};
 
 // ── The step chain ───────────────────────────────────────────────────────
 
@@ -466,7 +471,7 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
     async function copying(m0: ComputeReverseMove): Promise<Progress> {
         let m = m0;
         if (m.lastError === 'import_not_started') {
-            // §5.5: the Worker lost the import; begin again (idempotent for this move and generation).
+            // §5.5: the Worker lost the import before any chunk was recorded; begin again (idempotent for this move and generation).
             if (!fits(REVERSE_CALL_FIT_MS.begin)) return wait(m);
             const begun = await ports.worker.begin(m);
             if (!begun.ok) return answer(m, 'begin', begun);
@@ -475,6 +480,11 @@ export async function advanceReverseMove(ports: ReversePorts, m0: ComputeReverse
             if (importComplete(m)) return next(await ports.store.advance(m, 'checking'));
             if (!fits(REVERSE_CALL_FIT_MS.pull)) return wait(m);
             const pulled = await ports.worker.pull(m, Math.min(firstMissing(m), EXPORT_MAX_CHUNKS - 1), REVERSE_PULL_COUNT);
+            // §5.5 (r7 fixer): once a chunk is recorded, a lost import cannot be re-begun. The Worker's fresh begin clears its
+            // put records while this row keeps its bitmap, so verify would refuse a complete copy: the row reopens `import_lost`,
+            // as verify's own `import_not_started` does. Before any chunk, the retry and the next pass's begin still recover it.
+            if (!pulled.ok && pulled.error === 'conflict' && pulled.reason === 'import_not_started' && anyRecorded(m))
+                return next(await startFailure(m, 'import_lost'));
             if (!pulled.ok) return answer(m, 'pull', pulled);
             const n = m.exportHead!.chunks.length;
             const stored = [...new Set(pulled.data.stored)].filter(i => i < n);
