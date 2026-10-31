@@ -21,7 +21,8 @@
 // no jQuery animation, no CSS transition on the window or the drawer, the mouse
 // parked over the editor (a hover opens the tray). No timed waits.
 //
-// At 1440x900 and 900x700 on a fine pointer, and 390x844 and 1024x768 under
+// At 1440x900 and 900x700 on a fine pointer (1440x900 twice: once with the
+// Next pages' border-box preflight), and 390x844 and 1024x768 under
 // `pointer: coarse` (hasTouch + isMobile), with Feedback enabled and a fake
 // editor in Code's frame whose first row of text sits at the frame's very
 // top-left, so an overlap would hide it:
@@ -82,7 +83,8 @@ const boot = { user: { id: '33333333-3333-4333-8333-333333333333', email: 'fixtu
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
         endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false } } };
-const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+const page_html = (preflight) => `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+${preflight ? '<style>*, ::before, ::after { box-sizing: border-box; }</style>' : ''}
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The Browser's stream: reports decoded frames so its window goes full-bleed.
 const stream_html = `<!doctype html><html><body style="margin:0;background:#14484c"><script>
@@ -97,8 +99,13 @@ html,body{margin:0;padding:0;background:#1e1e1e;color:#d4d4d4;font:13px/18px mon
 #row1{margin:0;padding:0;white-space:pre}</style></head>
 <body><div id="row1">1  FIRST ROW, TOP-LEFT</div><div>2  const strip = 'above me';</div></body></html>`;
 
+// `preflight`: the page also carries the border-box preflight the Next pages'
+// global CSS applies (`*, ::before, ::after { box-sizing: border-box }`), as
+// on real Next, where the shut notch measured 56x16 with its border inside.
+// The strip must centre it the same either way.
 const VIEWPORTS = [
     { width: 1440, height: 900, coarse: false },
+    { width: 1440, height: 900, coarse: false, preflight: true },
     { width: 900, height: 700, coarse: false },
     { width: 390, height: 844, coarse: true },
     { width: 1024, height: 768, coarse: true },
@@ -119,7 +126,7 @@ const browser = await chromium.launch({
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
 
-async function open ({ width, height, coarse }) {
+async function open ({ width, height, coarse, preflight = false }) {
     const context = await browser.newContext({ viewport: { width, height }, hasTouch: coarse, isMobile: coarse });
     const page = await context.newPage();
     page.setDefaultTimeout(15_000);
@@ -130,7 +137,7 @@ async function open ({ width, height, coarse }) {
         const url = new URL(request.url());
         const json = body => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
         if ( url.origin !== origin ) return route.abort('blockedbyclient');
-        if ( url.pathname === '/os' ) return route.fulfill({ contentType: 'text/html', body: page_html });
+        if ( url.pathname === '/os' ) return route.fulfill({ contentType: 'text/html', body: page_html(preflight) });
         if ( url.pathname === '/frame' ) return route.fulfill({ contentType: 'text/html', body: stream_html });
         if ( url.pathname === '/editor' ) return route.fulfill({ contentType: 'text/html', body: editor_html });
         if ( url.pathname === ENDPOINTS.feedback ) return json({ reports: [] });
@@ -224,7 +231,7 @@ const focusInfo = page => page.evaluate(() => {
 
 try {
     for ( const vpo of VIEWPORTS ) {
-        const L = `[${vpo.width}x${vpo.height} ${vpo.coarse ? 'coarse' : 'fine'}]`;
+        const L = `[${vpo.width}x${vpo.height} ${vpo.coarse ? 'coarse' : 'fine'}${vpo.preflight ? ' preflight' : ''}]`;
         const { context, page, errors } = await open(vpo);
         // One viewport's failure is recorded and the next viewport still runs.
         try {
@@ -354,7 +361,7 @@ try {
             }
 
             // ── the icon follows the FRONT full view (once) ──
-            if ( vpo.width === 1440 ) {
+            if ( vpo.width === 1440 && ! vpo.preflight ) {
                 const chipNow = () => page.evaluate(() => {
                     const c = document.querySelector('button.ezil-feedback-chip');
                     const r = c.getBoundingClientRect();

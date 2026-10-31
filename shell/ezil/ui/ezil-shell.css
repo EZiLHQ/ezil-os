@@ -588,7 +588,7 @@ body.device-phone {
  * there for its hairline and the head's double-click / press gestures.
  *
  * Code's strip is LOWER than the Browser's (43px / 59px, set by the shared rule
- * above): 28px on a fine pointer, which fits the 18px notch and the Feedback
+ * above): 28px on a fine pointer, which fits the 16px notch and the Feedback
  * icon's 20px disc with 4px to spare, and 44px under `pointer: coarse`, the
  * touch target both controls get there. The shared body offset and the
  * Feedback icon both read `--ezil-control-strip-height`, so redefining it here
@@ -624,20 +624,25 @@ body.device-phone {
     -webkit-user-select: none;
     user-select: none;
 }
-/* The shut notch, centred vertically INCLUDING its 1px border (the shared rule
- * centres the content box and leaves the Browser's notch 1px low; it is left
- * as it is). Horizontally the shared centring applies: `left: 50%` and
- * dashboard.css's `translateX(-50%)`. */
-.ezil-code-window.ezil-fullbleed > .ezil-app-drawer.collapsed {
-    top: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2 - 1px);
+/* The drawer is laid out border-box, as the Next pages' global preflight
+ * already lays it out (measured on real Next: the shut notch is 56x16 with its
+ * 1px border inside). Stated here so that every host, and a test page without
+ * that preflight, gets the same box: with the border inside `--shut-h`, the
+ * shared `top: (strip - shut-h) / 2` centres the shut notch exactly.
+ * Horizontally the shared centring applies (`left: 50%`, dashboard.css's
+ * `translateX(-50%)`). */
+.ezil-code-window.ezil-fullbleed > .ezil-app-drawer {
+    box-sizing: border-box;
 }
 /* The shut notch's hit pad runs the strip's full height (44px under
  * `pointer: coarse`): from the strip's top edge to its bottom edge, never
- * below it, so it can never take a click meant for the editor. Sideways it
- * keeps dashboard.css's 14px / 16px. */
+ * below it, so it can never take a click meant for the editor. The toggle
+ * fills the notch inside its 1px border, so the pad reaches out by the
+ * notch's offset in the strip plus that border. Sideways it keeps
+ * dashboard.css's 14px / 16px. */
 .ezil-code-window.ezil-fullbleed > .ezil-app-drawer.collapsed .dashboard-app-drawer-toggle::after {
-    top: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2);
-    bottom: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2);
+    top: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2 - 1px);
+    bottom: calc((var(--shut-h) - var(--ezil-control-strip-height)) / 2 - 1px);
 }
 
 /* ── Code: "Reconnecting…" / "Computer stopped" ───────────────────────────
