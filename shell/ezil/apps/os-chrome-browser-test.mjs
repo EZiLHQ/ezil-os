@@ -299,9 +299,21 @@ async function scenarioCodeFullView () {
             tb6 === 'none' && b6.full && b6.drawer !== 'none' && JSON.stringify(b6.rect) === JSON.stringify(b0.rect), JSON.stringify({ tb6, b6 }));
 
         // ── the route: view "full" ──
+        // 🔴 A real `/app/code` load opens Code while the dock's items are still
+        // in their 50ms jQuery entrance (measured when full view is entered), so
+        // the window's own opening `show(0)` animation completes on a LATER fx
+        // tick. Here the dock settled long ago, so a long jQuery animation on an
+        // off-screen element stands in for them while the launch runs: this
+        // launch meets the same race the route does.
         await page.evaluate(async () => {
             const p = window.__EZIL_BOOT__;
-            await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
+            const keeper = $('<div style="position:absolute;left:-10px;top:0;width:1px;height:1px"></div>')
+                .appendTo(document.body).animate({ opacity: 0 }, 60_000);
+            try {
+                await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
+            } finally {
+                keeper.stop(true).remove();
+            }
         });
         await sleep(900);
         const m7 = await measure();
