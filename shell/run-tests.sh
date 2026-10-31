@@ -329,6 +329,7 @@ GEOMETRY_SUITES=(
     "shell/ezil/apps/overlay-paint-browser-test.mjs"
     "shell/ezil/display-notice-browser-test.mjs"
     "shell/ezil/apps/resize-test.mjs"
+    "shell/ezil/apps/code-full-view-browser-test.mjs"
 )
 PORTABLE_SUITES=(
     "shell/touch-focus-browser-test.mjs"
