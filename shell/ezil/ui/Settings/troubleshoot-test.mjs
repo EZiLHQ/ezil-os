@@ -18,9 +18,10 @@ const src = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'ut
     .replace("import telemetry from '../../../telemetry.js';", 'const telemetry = { recentEvents: () => [], capture: () => undefined, redact: v => v };')
     .replace("import { ambientCorrelationId } from '../../../trace.js';", 'const ambientCorrelationId = () => null;')
     .replace("import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';", 'const feedback_enabled = () => false, open_feedback_dialog = () => undefined, list_my_reports = async () => [], delete_my_report = async () => true;')
-    .replace("import { TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition';");
+    .replace("import { MOVE_COPY, TRANSITION_EVENT } from '../../computer-progress.js';", "const TRANSITION_EVENT = 'ezil:computer-transition', MOVE_COPY = globalThis.__moveCopy;");
 assert.ok(! /^import /m.test(src), 'every import is stubbed');
-const { reasonCopy, default: troubleshootTab } = await import(moduleUrl(src));
+globalThis.__moveCopy = (await import('../computer-progress.js')).MOVE_COPY;
+const { reasonCopy, restartMoveReason, default: troubleshootTab } = await import(moduleUrl(src));
 
 let passed = 0;
 function check (name, fn) { fn(); passed++; console.log(`PASS ${name}`); }
@@ -79,4 +80,21 @@ check('🔴 with no desktop window open, Restart computer is enabled and Restart
     assert.doesNotMatch(button('restart-computer'), /\sdisabled\b/, 'Restart computer needs only a computer');
     assert.match(painted, /Open a desktop first/);
 });
-console.log(`\n${passed}/5 Troubleshoot checks passed`);
+// Phase B (§5.3, §6.4; r7 fixer): Restart desktop during a move meets the reverse provider. Its answer carries the move
+// flags (session.restartDesktop passes them through), and the tab says what is true: the move, never "Something went wrong".
+check('during a move, Restart desktop says the move (no generic failure); the blocked answer says the open-blocked sentence', () => {
+    assert.equal(restartMoveReason({ ok: false, errorCode: 'sandbox_starting', computeMoving: true }), 'Moving your files to your Free computer.');
+    assert.equal(restartMoveReason({ ok: false, errorCode: 'preconditions_unmet', computeMoveNeedsAttention: true }),
+        "Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.");
+    // Only the flags decide, and only when boolean true: an ordinary failure keeps its own copy (and its telemetry row).
+    for ( const res of [{ ok: false, errorCode: 'sandbox_starting' }, { ok: false, errorCode: 'restart_busy', computeMoving: 'true' }, null] ) {
+        assert.equal(restartMoveReason(res), null, JSON.stringify(res));
+    }
+    assert.equal(reasonCopy('sandbox_starting'), 'Something went wrong. Please try again.', 'the generic copy the flags replace');
+    assert.deepEqual(scanCopy(restartMoveReason({ computeMoving: true }) + ' ' + restartMoveReason({ computeMoveNeedsAttention: true })), []);
+    // The move's answer is no api_failure: the telemetry capture is skipped for it.
+    const tab = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'utf8');
+    assert.match(tab, /const moving = restartMoveReason\(res\);\s+failReason = moving \?\? reasonCopy\(res\.errorCode\);/);
+    assert.match(tab, /if \( res\.errorCode !== 'unsupported' && ! moving \) \{\s+telemetry\.capture\(/);
+});
+console.log(`\n${passed}/6 Troubleshoot checks passed`);

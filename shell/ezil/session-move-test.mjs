@@ -321,3 +321,20 @@ test('the loop notes whether the latest answer was the blocked one, and the move
     assert.equal(loopMoveOf(MOVE_COMPUTER).readAt, out.reads.at(-1).at);
     assert.equal(loopMoveOf('another-computer'), null);
 });
+
+// r7 fixer (§5.3, §6.4): the restart route answers a move bare. session.restartDesktop hands the move's flags to Troubleshoot
+// (only when boolean true), which then says the move instead of "Something went wrong".
+test('restartDesktop passes computeMoving and computeMoveNeedsAttention through, only when boolean true', async t => {
+    const before = globalThis.window;
+    globalThis.window = { ...(before ?? {}), __EZIL_BOOT__: { user: { id: 'u-1' }, desktopState: { endpoints: { restart: '/api/shell/restart' } } } };
+    t.after(() => { globalThis.window = before; });
+    let body = null;
+    t.mock.method(globalThis, 'fetch', async () => ({ ok: true, status: 200, json: async () => body }));
+    const { restartDesktop } = await import('./session.js');
+    body = { ...waitingAnswer(), correlationId: 'c' };
+    assert.deepEqual(await restartDesktop(MOVE_COMPUTER), { ok: false, errorCode: 'sandbox_starting', message: undefined, computeMoving: true });
+    body = { ...blockedAnswer(), correlationId: 'c' };
+    assert.deepEqual(await restartDesktop(MOVE_COMPUTER), { ok: false, errorCode: 'preconditions_unmet', message: undefined, computeMoveNeedsAttention: true });
+    body = { ok: false, errorCode: 'restart_busy', computeMoving: 'true', computeMoveNeedsAttention: 1 };
+    assert.deepEqual(await restartDesktop(MOVE_COMPUTER), { ok: false, errorCode: 'restart_busy', message: undefined });
+});

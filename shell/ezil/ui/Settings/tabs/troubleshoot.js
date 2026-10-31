@@ -75,7 +75,7 @@ import trpc from '../trpc.js';
 import telemetry from '../../../telemetry.js';
 import { ambientCorrelationId } from '../../../trace.js';
 import { feedback_enabled, open_feedback_dialog, list_my_reports, delete_my_report } from '../../feedback/feedback.js';
-import { TRANSITION_EVENT } from '../../computer-progress.js';
+import { MOVE_COPY, TRANSITION_EVENT } from '../../computer-progress.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -250,6 +250,17 @@ export function reasonCopy (errorCode) {
     }
 }
 
+/**
+ * Phase B (§5.3, §6.4; r7 fixer): Restart desktop during a move meets the reverse provider, which restarts nothing and
+ * answers the move itself (`computeMoving`, or the open-blocked `computeMoveNeedsAttention`). That is no failure of the
+ * restart: the move's own words (§6.4's status line, or the open-blocked sentence), and no telemetry row. Null otherwise.
+ */
+export function restartMoveReason (res) {
+    if ( res?.computeMoveNeedsAttention === true ) return MOVE_COPY.blockedBody;
+    if ( res?.computeMoving === true ) return `${MOVE_COPY.moving}.`;
+    return null;
+}
+
 /** Round 5 (D6): one Restart duration, quoted identically in the description and while it runs. */
 const RESTART_DESKTOP_TIME = 'Restarting usually takes about 45 seconds and can take up to 3 minutes.';
 
@@ -391,14 +402,15 @@ async function handleRestart ($win) {
         window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } }));
     } else {
         status = 'failed';
-        failReason = reasonCopy(res.errorCode);
-        console.error(`[${PHASE}] restart failed: ${res.errorCode}`);
+        const moving = restartMoveReason(res);
+        failReason = moving ?? reasonCopy(res.errorCode);
+        console.error(`[${PHASE}] restart failed: ${res.errorCode}${moving ? ' (the computer\'s files are moving)' : ''}`);
         // `unsupported` is a feature-detection result, not an operational
         // failure — nothing went wrong, the route just is not there yet, so
         // it is not worth a telemetry row (see `session.restartEndpoint()`'s
         // header). Everything else is a real `api_failure`, same convention
         // `code.js`/`preview.js`/`desktop-window.js` use for their own mints.
-        if ( res.errorCode !== 'unsupported' ) {
+        if ( res.errorCode !== 'unsupported' && ! moving ) {
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:settings/troubleshoot#restart', code: res.errorCode,
             });

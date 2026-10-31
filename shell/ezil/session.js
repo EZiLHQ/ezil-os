@@ -1301,7 +1301,11 @@ export async function restartDesktop (computerId) {
     }
     const data = res.data ?? {};
     if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message };
+        // Phase B (§5.3, r7 fixer): during a move the route answers the move itself, bare; its flags reach the caller
+        // (only when boolean true, as `pendingOrRefused`), so Troubleshoot can say so instead of a generic failure.
+        return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message,
+            ...(data.computeMoving === true ? { computeMoving: true } : {}),
+            ...(data.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}) };
     }
     return { ok: true };
 }
