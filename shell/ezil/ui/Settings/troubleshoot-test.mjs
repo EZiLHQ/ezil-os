@@ -90,9 +90,14 @@ check('🔴 with no desktop window open, Restart computer is enabled and there i
     assert.doesNotMatch(painted, /Restart desktop/);
     assert.doesNotMatch(painted, /Open a desktop first/, 'a computer to restart is all Restart computer needs');
 });
-// Phase B (§5.3, §6.4; r7 fixer): Restart desktop during a move meets the reverse provider. Its answer carries the move
-// flags (session.restartDesktop passes them through), and the tab says what is true: the move, never "Something went wrong".
-check('during a move, Restart desktop says the move (no generic failure); the blocked answer says the open-blocked sentence', () => {
+// Phase B (§5.3, §6.4; r7 fixer): a restart during a move must say what is true, never "Something went wrong".
+// Round 6 pinned this on Restart desktop, whose `scope: 'desktop'` answer carries the move flags (session.restartDesktop
+// passes them through). Merged with app-code lane A2 (2026-10-31): Restart desktop is gone (checks 4 and 5), and the
+// tab's one restart is Restart computer, which never meets the reverse provider: `restartWholeComputer` reads the
+// placement and answers `busy` or `not_running` during a move (contract §6.4), forwarded as `restart_<reason>` only. So
+// the point is held on both halves: restartMoveReason still words the flags, and Restart computer's move-time answers
+// each have their own true sentence.
+check('during a move, a restart never says "Something went wrong": the move flags read as the move; Restart computer\'s busy/not_running read as themselves', () => {
     assert.equal(restartMoveReason({ ok: false, errorCode: 'sandbox_starting', computeMoving: true }), 'Moving your files to your Free computer.');
     assert.equal(restartMoveReason({ ok: false, errorCode: 'preconditions_unmet', computeMoveNeedsAttention: true }),
         "Your files are safe and nothing was deleted. Your computer can't open until we've checked this; we're looking into it.");
@@ -102,9 +107,23 @@ check('during a move, Restart desktop says the move (no generic failure); the bl
     }
     assert.equal(reasonCopy('sandbox_starting'), 'Something went wrong. Please try again.', 'the generic copy the flags replace');
     assert.deepEqual(scanCopy(restartMoveReason({ computeMoving: true }) + ' ' + restartMoveReason({ computeMoveNeedsAttention: true })), []);
-    // The move's answer is no api_failure: the telemetry capture is skipped for it.
+    // Restart computer during a move (contract §6.4): the route answers `restart_busy` (the export boot is MOUNTING or
+    // another busy state) or `restart_not_running` (STOPPED), and each has its own sentence, never the generic one.
+    const generic = reasonCopy('sandbox_starting');
+    assert.equal(reasonCopy('restart_busy'), 'Your computer is starting, stopping or switching. Try again in a minute.');
+    assert.equal(reasonCopy('restart_not_running'), "Your computer isn't running. Open the desktop to start it.");
+    for ( const code of ['restart_busy', 'restart_not_running'] ) assert.notEqual(reasonCopy(code), generic, code);
+    assert.deepEqual(scanCopy(reasonCopy('restart_busy') + ' ' + reasonCopy('restart_not_running')), []);
+    // ...and that is the copy the tab paints: Restart computer posts scope 'computer' and words its failure by reasonCopy.
     const tab = readFileSync(new URL('./tabs/troubleshoot.js', import.meta.url), 'utf8');
-    assert.match(tab, /const moving = restartMoveReason\(res\);\s+failReason = moving \?\? reasonCopy\(res\.errorCode\);/);
-    assert.match(tab, /if \( res\.errorCode !== 'unsupported' && ! moving \) \{\s+telemetry\.capture\(/);
+    assert.match(tab, /JSON\.stringify\(\{ computerId, scope: 'computer', requestId: restartRequestId\(computerId\) \}\)/);
+    assert.match(tab, /computerStatus = 'failed';\s+computerReason = reasonCopy\(answer\?\.errorCode\);/);
+    // No Restart desktop caller is left to receive a bare move answer and flatten it into the generic copy.
+    // (Code lines only: the header and reasonCopy's comment still name it.)
+    assert.doesNotMatch(tab, /^(?!\s*(?:\/\/|\*)).*session\.restartDesktop\(/m);
+    // 🔴 Restart computer's answer carries no move flags. If the route ever forwards them for scope 'computer', this
+    // fails, and Restart computer's handler must then use restartMoveReason (and skip its api_failure row for them).
+    const route = readFileSync(new URL('../../../../app/src/app/api/shell/restart/route.ts', import.meta.url), 'utf8');
+    assert.match(route, /return shellJson\(result\.ok \? result : \{ ok: false, errorCode: `restart_\$\{result\.reason\}`, reason: result\.reason \}\);/);
 });
 console.log(`\n${passed}/6 Troubleshoot checks passed`);
