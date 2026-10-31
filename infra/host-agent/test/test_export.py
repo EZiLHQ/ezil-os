@@ -946,8 +946,8 @@ class ExportQuiesce(unittest.TestCase):
     def test_the_edge_and_cloudflared_restart_during_an_export(self):
         self.quiesce()
         with mock.patch.object(edge, "Edge") as e, mock.patch.object(edge, "load_key", return_value=KEY), \
-                mock.patch.object(cli.signal, "signal"):
-            self.assertEqual(cli.step(self.cfg, "edge"), "edge stopped")
+                mock.patch.object(cli.signal, "signal"), mock.patch.object(config, "load", return_value=self.cfg):
+            self.assertEqual(cli.main(["edge"]), 0, "a restarted edge is never a refusal (exit 2) mid-export")
         e.return_value.serve.assert_called_once()
         with mock.patch.object(tunnel, "supervise", return_value=("exit", 1)) as sup:
             self.assertIn("cloudflared supervisor exit", cli.step(self.cfg, "cloudflared"))
