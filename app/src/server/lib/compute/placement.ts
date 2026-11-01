@@ -1969,8 +1969,8 @@ export async function readRetentionCandidates(db: PlacementExecutor): Promise<{ 
 }
 
 /** Lifecycle authority may inspect a migration boot; user routing must keep using readPlacement. */
-export async function readLifecyclePlacement(db: PlacementExecutor, computerId: string): Promise<ResolvedPlacement> {
-    return (await import('./provider-migrate-provision')).readEnrollmentPlacement(db, computerId);
+export async function readLifecyclePlacement(db: PlacementExecutor, computerId: string, jobId?: string): Promise<ResolvedPlacement> {
+    return (await import('./provider-migrate-provision')).readLifecycleAuthorityPlacement(db, computerId, jobId);
 }
 
 export interface PaidMigrationCandidate {
