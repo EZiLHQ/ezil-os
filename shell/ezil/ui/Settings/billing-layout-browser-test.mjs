@@ -115,6 +115,25 @@ try {
             push(`${label} · ${tier}: no horizontal overflow`, m.overflow <= 0 && m.docOverflow <= 0, `pane ${m.overflow} doc ${m.docOverflow}`);
             push(`${label} · ${tier}: the Add AI credits disclosure shows a marker`, m.marker !== 'none' && m.marker !== 'normal', m.marker);
         }
+        // Identity credits (`ai.account`): the headline and the exact details line fit the pane, with a bar over the total.
+        const identity = billingSummary('premium');
+        identity.ai.account = { userId: null, state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: '1500000000', remainingMicro: '1246750000', heldMicro: '500000',
+            usedMicro: '252750000', planBaselineMicro: '1000000000', labelled: true, grants: [
+                { kind: 'plan', creditsMicro: '1000000000', remainingMicro: '746750000', expiresAt: '2026-11-04T00:00:00Z' },
+                { kind: 'added', creditsMicro: '500000000', remainingMicro: '500000000', expiresAt: '2027-06-01T00:00:00Z' }] };
+        const a = await page.evaluate(html => {
+            document.querySelector('[data-role="billing-body"]').innerHTML = html;
+            const pane = document.querySelector('.ezil-settings-billing'), row = document.querySelector('[data-role="meter-ai"]');
+            const details = row.querySelector('[data-role="ai-details"]'), gauge = row.querySelector('[role="meter"]');
+            return { value: row.querySelector('.ezil-billing-meter-value').textContent, details: details.textContent.replace(/\s+/g, ' ').trim(),
+                fits: details.getBoundingClientRect().right <= row.getBoundingClientRect().right + 0.5, gauge: gauge?.getAttribute('aria-valuenow') ?? null,
+                fill: gauge ? Math.round(gauge.querySelector('span').getBoundingClientRect().width / gauge.getBoundingClientRect().width * 100) : null,
+                overflow: pane.scrollWidth - pane.clientWidth, docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+        }, await page.evaluate(summary => window.layout.summaryV3Html(summary), identity));
+        push(`${label} · identity credits: headline over the live-grant total`, a.value === '1,246 credits left of 1,500', a.value);
+        push(`${label} · identity credits: exact details line`, a.details === 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75', a.details);
+        push(`${label} · identity credits: the bar is 83 % (1,246.75 of 1,500) and painted to match`, a.gauge === '83' && Math.abs(a.fill - 83) <= 1, `${a.gauge} / ${a.fill}`);
+        push(`${label} · identity credits: details wrap inside the row; no horizontal overflow`, a.fits && a.overflow <= 0 && a.docOverflow <= 0, `pane ${a.overflow} doc ${a.docOverflow}`);
         await page.close();
     }
 
