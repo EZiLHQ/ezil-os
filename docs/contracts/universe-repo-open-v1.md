@@ -1,0 +1,743 @@
+# CONTRACT v1: universe-repo-open-v1
+
+Universe 2.0 builder repository → EZiL OS staging Code → edit and push through git-preview.ezil.work (Cloudflare Artifacts). Staging only and owner-only. No production change.
+
+| Field | Value |
+|---|---|
+| contractVersion | `1.0.2` (changes since 1.0.0: [Changelog](#changelog)) |
+| Vectors | `docs/contracts/universe-repo-open-v1.vectors.json` (sha256 pinned in `README-universe-repo-open.md`) |
+| Gateway extract | derived by `check.mjs --emit-gateway-extract` for the public EZiL CLI repo; its own sha256 pinned in the README (§18) |
+| Check | `node docs/contracts/universe-repo-open-v1.check.mjs` (also runs under `/root/.bun/bin/bun`) |
+| Base | EZiL-OS a988f28c, branch `feat/u2-repo-open-contract-20261031` |
+| Lane plan | `docs/status/u2-repo-open-20261031/LANES.md` |
+
+**Change control**
+- Only the lead changes this contract or its vectors. After the first seed commit, any change bumps `contractVersion`, updates both pinned sha256 values, and re-copies the vectors (and the gateway extract) into every consuming repo in the same change (§18). Before it, the lead corrects in place at 1.0.0 (nothing consumes them yet).
+- Every lane reads constants and cases from the vectors. Code may hold its own copy of a constant only when a committed test compares it to the vectors.
+- "INF" marks an inference that a named test or E2E must prove. Citations are `sha:path:line` or `path:line` at the named base.
+- Appendix A maps each of the 34 verifier refutations to the section that resolves it. Appendix B maps the C0 checker findings (two checker reports on the draft) to their resolution.
+
+**Lineage.** This contract starts from the judges' winner (rollout-first). It adds the allow-tripwire and 15-minute per-computer grants with revoke-on-signout (from security-first), and the strict file-based credential helper and staging render-env refusals (from reuse-minimal). It then applies the three adversarial verifier reports (Appendix A).
+
+---
+
+## 0. Shape, phases, invariants
+
+**Phases**
+- **Phase A (v1).** Cloudflare (free-tier) computers work end to end. AWS computers (`aws-ec2`) are refused with `workspace_unsupported` BEFORE any Works or Worker call (a988f28c app/src/server/lib/compute/select.ts:147-164).
+- **Phase B (deferred).** AWS goes through a new host-agent op, an edge route and a Worker relay (§13). The code may land but stays inert until the AMI gate passes and the lead commits the activation.
+
+**Invariants.** Each owning lane pins each invariant with a named test that is proven to fail when the guard is mutated.
+- **I1, no secret leaks.** No `egg_` grant and no Auth0 ID token ever appears in a URL, argv, env var, `.git/config`, a git remote URL, a log line, a browser-bound response body, or the stdout of any in-computer process.
+- **I2, production inert at every layer.**
+  - OS: activation (§3.1) is false in production, and production boot payloads carry no `repoOpen` endpoint (§3.4). The production Worker leaves `POST /sandbox/:name/repo-open` unmounted (§8 "Route gate", 1.0.2), and the snapshot codec reads a nested index only in a repo-open folder, so a workspace with no repo-open folder and no top-level `.ezil-staging` node (§9.8 item 1) checkpoints byte-identically to the a988f28c codec (§9.8, 1.0.2). The production OS app is `https://os.ezil.work` (Vercel project `ezil-os-preview`); `os.ezil.org` is only the static landing page (§16, 1.0.2).
+  - Universe: emits no link except on universe-staging.ezil.work.
+  - Works: the DEFAULT deployment answers every existing route exactly as today. The os routes are not mounted on DEFAULT (or while `osClient` is null), so every request to their paths, act-as requests included, gets exactly what an undeclared /v1 path answers for that request today (§1, §6.4).
+  - Gateway: the top-level block, `env.staging` and `.github/workflows/ci.yml` are unchanged.
+- **I3, owner-only at every hop** (§11).
+- **I4, only short-lived grants enter a computer.** Only grants of 15 minutes or less, for one repository, owned by the user. Never a CLI session, refresh token, access token or ID token.
+- **I5, repo-open never starts, pins or moves a computer.** It never calls `provider.ensure`, `gateComputerStart`, `reverseMoveOnOpen` or `routeComputer({pinCloudflare:true})`. The Worker never starts a container: every exec after the step-3 running check is preceded by a non-starting re-check (§8.1), including after a stop during prepare. Only the existing Code mint does those things.
+- **I6, no cross-environment calls.** Staging never calls production Works, a production gateway host or production Artifacts.
+
+## 1. Constants
+
+All values live in the vectors (`constants`, `timeouts`, `regex`). The table names the load-bearing ones.
+
+| Name | Value | Source |
+|---|---|---|
+| OS_STAGING_ORIGIN | `https://os-staging.ezil.work` | a988f28c app/src/utils/forwarded.ts:51-55 |
+| OS_PRODUCTION_APP_ORIGIN | `https://os.ezil.work` (Vercel project `ezil-os-preview`; `os.ezil.org` = OS_LANDING_ORIGIN, the static landing page) [1.0.2] | .github/scripts/release-state.mjs `canonical` (check.mjs compares) |
+| UNIVERSE_STAGING_HOST | `universe-staging.ezil.work` | universe-2.0 9dc58adf deploy/aws/app-host/README.md:393-421 |
+| WORKS_STAGING_ORIGIN | `https://api-preview.ezil.work` [D-NAMES] | new |
+| GIT_STAGING_HOST | `git-preview.ezil.work` [D-NAMES] | new |
+| PREVIEW_SUPABASE_ORIGIN | `https://13-203-99-168.sslip.io` [D-ISSUER] | a988f28c deploy/aws/os-staging/INFRASTRUCTURE.md:76-79 |
+| PRODUCTION_AUTH0_CLIENTS | `Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx` (CLI), `2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl` (Universe web); the production OS app's client is added by a contract bump before any pin if G-READ finds it unlisted (§16, vectors `productionOs`) | EZiL-Works 7974ab6c apps/api/src/auth/ezil-id.ts:8-12 |
+| OS_STAGING_AUTH0_CLIENT_ID | `"UNPINNED"` until G-READ/G-AUTH0. A code constant in OS `app/src/server/repo-open/targets.ts` and Works `apps/api/src/deployment.ts`; NOT a vectors value | new (a public identifier) |
+| UNIVERSE_STAGING_AUTH0_CLIENT_ID | `"UNPINNED"` until G-READ (and D-AUTH0-U if needed). Code constant in Works `deployment.ts` only | Universe README.md:418-420 |
+| UUID_RE | `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` | a988f28c shell/ezil/app-link.js:13 |
+| HANDLE_RE | `^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$` | Works selfserve-repositories-v0.ts:11; Universe WorksApiClient.php:60 |
+| NAME_RE | `^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$` plus `no_double_dot`, `no_git_suffix` | Works 7974ab6c selfserve-repositories-v0.ts:12-13 verbatim; Universe RepositoryNames.php:25-29 |
+| BRANCH_RE | `^[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$` plus no `..`, `//`, `/.`, trailing `/` or `.`, `.lock` suffix | Works adapter bound, tightened |
+| GRANT_RE | `^egg_[0-9a-f]{64}$` | EZiL CLI a9ec994 packages/contract/src/git-gateway.ts:24 |
+| GRANT_TTL | 15 min (= Works `GIT_GRANT_MAX_MS`) | 7974ab6c packages/db/src/repositories/cli-auth.ts:28 |
+| OS_SESSION_TTL | 8 h, fixed at creation, never extended | §6.6 |
+| COMPUTER_LABEL | first 16 hex of `sha256("ezil-os/computer-label/v1\|" + computerId)` | new |
+| REPO_DIR | `repos/<handle>/<name>` under the workspace root | new |
+| STAGING_ROOT_NAME | `.ezil-staging` (top level of the workspace root; clones stage in `.ezil-staging/<uuid>`) | new |
+| SNAPSHOT_INTERNAL_NAMES, SNAPSHOT_CACHE_NAMES, SNAPSHOT_NESTED_INDEX_MAX | the codec's `INTERNAL`, `CACHES` and `MAX_NESTED_INDEXES` (256) [1.0.2] | worker/src/workspace-snapshot-script.ts (lane tests compare) |
+| NUMERIC_REF_RE | `^[1-9][0-9]{0,18}$` plus `int64_max` (≤ 9223372036854775807) | 7974ab6c selfserve-repositories-v0.ts:43 (regex and BigInt bound) |
+
+**Regex relations (vectors `regexRelations`, `regexRelationsRule`, checked by check.mjs).** NAME_RE equals the Works zod schema and Universe `RepositoryNames::validName`. HANDLE_RE equals both handle checks. NAME_RE ⊆ gateway `ROUTE_NAME_PATTERN` (EZiL CLI a9ec994 packages/contract/src/git-gateway.ts:36, parse regex :43, predicates :46) and HANDLE_RE ⊆ gateway `ROUTE_NAMESPACE_PATTERN` (:35, :43), so everything Works can issue, the gateway can route. The subset is checked structurally (per-position character classes and length sets, verified against the patterns by a seeded sample), not only on sample values, so a later NAME_RE edit that leaves the gateway pattern fails the check. Sources are JavaScript; PHP consumers anchor with `\A…\z` and Python consumers use `re.fullmatch` (each regex has a trailing-newline invalid case). `SANDBOX_NAME_RE` is lowercase-only and so stricter than `deriveGuacamoleSandboxId` (a988f28c app/src/server/lib/cloudflare-guacamole-provider.ts:1273-1277 strips with `/gi`); they agree because user and computer ids are lowercase UUIDs, and the Worker refuses, never lowercases, anything else.
+
+**Timeouts (vectors `timeouts`; two-phase, strictly nested, checked).**
+
+```
+kernel git command ≤ 80 s  <  prepare window 85 s  <  Worker deadline 105 s  <  OS→Worker fetch 120 s  <  route maxDuration 150 s
+commit exec ≤ 10 s  <  minimum remaining after tail acquire 15 s  ≤  prepare reserve 20 s
+OS→Worker 120 s + OS→Works 10 s  <  150 s
+```
+
+**UNPINNED and effective pins.** A client pin is *effective* only when it is not `UNPINNED`, not empty and not in PRODUCTION_AUTH0_CLIENTS. That is the whole rule on the OS side: OS activation (§3.1) cannot see the Universe pin. At Works only, the OS pin is also ineffective when it equals the Universe pin (`works.effectivePins`). Consequences (vectors `unpinnedSemantics`, `works.effectivePins`, `works.authCases`, `activation`):
+- OS pin `UNPINNED`, empty or production → OS activation is false (§3.1), and staging Works has `osClient = null`.
+- An OS token while the Works OS pin is `UNPINNED`, empty or production → Works 401 `identity_token_invalid` (not in `v1Clients`; the /v1 middleware rejects it before any route).
+- OS pin equal to the Universe pin → OS activation can be true, Works accepts the OS token as the *Universe* client, `osClient` is null, the os routes are not mounted, and every open answers Works 404 → `repository_unavailable`. X1 P3 refuses to pin two equal ids, and G-READ asserts the two live client ids differ. Since 1.0.2 P3 decides with vectors `productionOs.pinGate` over the two pins and every production OS client id G-READ read (§16).
+- A Universe-staging token on an os route while `osClient` is null → 404, the unmatched-route response.
+- DEFAULT deployment, os route: the routes are not mounted (§6.4), so every request gets exactly what an undeclared /v1 path answers for it today, byte-identical to 7974ab6c (1.0.1 wording; vectors `works.authRule` step 0):
+  - a bearer the /v1 middleware accepts (a production client without an act-as header, or a Supabase bearer with or without one) → 404, the unmatched-route response;
+  - a non-production EZiL ID client (OS-staging or Universe-staging), with or without an act-as header → 401 `identity_token_invalid`, because it is outside DEFAULT `v1Clients` and the middleware refuses it before routing;
+  - a production client with an act-as header → 403 `ezil_id_delegation_forbidden`, as on any /v1 path.
+- Universe-staging client found to be a production client (D-AUTH0-U) → treated as UNPINNED, so staging Works refuses Universe and the lane stays inert.
+
+## 2. Link (Universe → OS)
+
+### 2.1 Shape
+
+On GET `/builder/my-projects/{public_id}` (and the Next project-work mount, §14.4), the board's execution slot (OwnProjectController.php:145-146) renders:
+
+```html
+<a href="https://os-staging.ezil.work/app/code?project=<P>&repo=<R>" target="_blank" rel="noopener noreferrer">Open in EZiL OS</a>
+```
+
+- `P` = `builder_projects.public_id` (BuilderProject.php:31-41).
+- `R` = `builder_projects.repository_id` = Works `project_repositories.id` = `selfserve_projects_v0.repository_id`.
+- Neither value is normalised. Each must already match UUID_RE exactly. `repository_id` is an unvalidated string(64) (migration 2026_10_22_000301:21-22) and fixtures use `'repo-42'`; uppercase is refused, not lowercased.
+- The emitted string is exactly `OS_STAGING_ORIGIN + "/app/code?project=" + P + "&repo=" + R`. Any other string is invalid (vectors `link.emitter`).
+
+### 2.2 When the link renders
+
+Board `execution` JSON: `{state:'ready'|'os_launch_pending'|'blocked'|'unavailable', reason:string|null, message:string, launchUrl:string|null}`. `launchUrl` is non-null only in state `ready`. Evaluation order (vectors `boardExecution`):
+1. `findOwnedProject`, as `board()` calls it today (9dc58adf OwnProjectController.php:122-125). A non-owner gets 404 before anything else, as today.
+2. `EzilHosts::forAppUrl(config('app.url'))`: only `https://universe-staging.ezil.work` (no port, no userinfo) maps to `{osOrigin: OS_STAGING_ORIGIN, gitHost: GIT_STAGING_HOST}`. Anything else → `{null, github.ezil.work}` → `blocked`, reason `os_contract_unavailable`.
+3. `works_repository_ref` null → `unavailable`, `repository_not_connected`.
+4. `public_id` fails UUID_RE → `unavailable`, `project_unsupported`.
+5. `repository_id` fails UUID_RE → `unavailable`, `repository_unsupported`.
+6. `clone_url` is not `https://<gitHost>/…` (wrong host, scheme, port or any userinfo) → `unavailable`, `repository_other_environment`. Universe never re-provisions a row that already has a ref (RepositoryProvisioner.php:20-35), so rows made against another Works keep that Works' ids forever; this check keeps them from rendering a button that can only fail.
+7. `config('services.ezil_os.launch_verified') !== true` → `os_launch_pending`, `launch_not_verified`. The value is hard-coded `false`; a separate, reviewed one-line commit flips it after E2E-A passes.
+8. Otherwise `ready`, with the canonical `launchUrl`.
+
+### 2.3 Where the URL-shape authority lives
+
+- **Authority:** `core/app/Domain/BuilderProjects/OsLaunch.php`, proven by PHP unit and feature tests that load the committed vectors copy (`link.emitter`, `boardExecution`, `ezilHosts`).
+- **Defence in depth:** `osLaunchLink(url)` in ProjectBoard.tsx renders the anchor only when the string is the canonical form (origin, `/app/code`, keys exactly `project` then `repo`, both UUID_RE, no userinfo, port or fragment). Universe core has no JS test runner (9dc58adf core/package.json:4-8), and adding one is a new dependency, so this half is proven by `npm run typecheck` plus E2E-B (Playwright reads `href` and `rel`).
+
+### 2.4 What the parameters mean
+
+- `repo=` is the only authority key. OS authorizes only through the signed-in session, the computer's owner, and Works ownership of R.
+- `project=` is opaque to OS: title fallback and telemetry only. It never authorizes; pairing a foreign P with your own R is harmless.
+- `path=` is optional and follows app-link.js `pathProblem` (vectors `link.path`). Universe v1 never emits it; OS honours it (§9.1).
+- The link never carries a token, URL, ref, folder or account (a988f28c docs/APP-ROUTES.md:91-93). The old `?repo=<ns>/<name>` form (658701df, cbe83f6a) is retired; a988f28c drops it as `project_missing` (vectors `link.parser`).
+- **Not LaunchGrant.** Universe already has an assignment-bound, one-use, 60-second launch code (core/app/Domain/OsContract/LaunchGrant/LaunchGrantService.php:14-24; docs/universe-v2/redesign-plan.md:616,658) whose service defaults to the production `https://os.ezil.work` (:114,:356) and whose session minter is production-disabled. Personal-project launch deliberately does not use it: this link carries no authority, and OS authorizes only through session, computer owner and Works `owned`. U1 never touches `core/app/Domain/OsContract/**` and never uses an `osBaseUrl` default [D-LAUNCH]. Enforced in U1 acceptance: `git diff <U1 seed commit> -- core/app/Domain/OsContract` is empty, and an OsLaunch unit test asserts the origin comes only from `EzilHosts::forAppUrl` and is never `https://os.ezil.work` or `https://os.ezil.org` for any `ezilHosts` case.
+
+## 3. OS identity toward Works
+
+### 3.1 Activation (allow-tripwire)
+
+```
+repoOpenActiveFor({origin, envClientId, pinnedClientId}) ≡
+      REPO_OPEN_TARGETS[origin] !== undefined
+    ∧ pinnedClientId is effective (§1)
+    ∧ envClientId === pinnedClientId
+REPO_OPEN_TARGETS = { "https://os-staging.ezil.work": { worksOrigin: WORKS_STAGING_ORIGIN, gitHost: GIT_STAGING_HOST } }   // hard-coded, no env
+repoOpenActive(req) = repoOpenActiveFor({ origin: ownedPublicOrigin(req.headers, req.url),
+                                          envClientId: <the AUTH0_CLIENT_ID auth0.ts already reads>,
+                                          pinnedClientId: OS_STAGING_AUTH0_CLIENT_ID })
+```
+
+- `repoOpenActiveFor` is a pure function in `app/src/server/repo-open/activation.ts`. Only the production wiring reads headers, env and the constant. A test asserts the production wiring is inactive while the pin is `UNPINNED`.
+- **Injection seams (no env in tests or the I1 harness).** The repo-open service is built by a factory whose every outside input is a dependency: `activation`, `targets`, `cookieSecret` (the seal key material, §3.2), `ownership` (default: the exported `assertOwnedComputer`, §5 step 5), `routing` (default: `routeComputer` plus `createProviderMigrationStore`), `worksFetch`, `workerFetch`, `workerSecret` (default: `CLOUDFLARE_GUACAMOLE_HMAC_SECRET`), `workerUrl` and `now`. The route handler is a thin adapter `handleRepoOpen(request, ctx, service)`; production wiring builds `ctx` from the Supabase session exactly as the other `/api/shell/*` routes do and the service from env. The I1 harness calls `handleRepoOpen` with a synthetic `ctx` (`user.id`, `user.app_metadata.auth0_sub`) and a service built from test values, and never sets env (§17.1). A test proves the production factory passes the exported `assertOwnedComputer` itself, not a copy.
+- **Why the origin alone is not enough.** `ownedPublicOrigin` trusts `x-forwarded-host`, and `OWNED_APP_ORIGINS` lists os-staging in every deployment (a988f28c app/src/utils/forwarded.ts:35-64). The client-id comparison is a deployment fact a header cannot forge (vectors `activation`: spoofed host with a production client → inactive).
+- **When inactive:** `/api/shell/repo-open` answers 404 `repo_open_unavailable` before any Works or Worker call; the callback sets no cookie; signout makes no Works call; the boot payload carries no `repoOpen` endpoint (§3.4).
+- OS staging must therefore sign in with a dedicated, non-production Auth0 client [D-AUTH0]. Until G-READ/G-AUTH0 and the lead's pin commit, the lane is inert by design.
+
+### 3.2 Retained EZiL ID token (`__Host-ezil-id`)
+
+**When it is set.** In `app/src/app/auth/auth0/callback/route.ts`, after `verifyIdToken` and `bridgeAuth0Identity` succeed, and only when `repoOpenActive(request)`.
+- `verifyIdToken` additionally returns the verified `exp` (an additive field).
+- `bridgeAuth0Identity` returns `{ userId }` instead of `void`. This is safe: it already asserts `data.user.id === user.id` (a988f28c app/src/server/auth/bridge.ts:52-58). The callback seals that `userId` as `uid`; a test asserts sealed `uid` equals the bridged id.
+
+**Encoding and key** (vectors `cookie`, deterministic test vector included).
+- Plaintext: JSON `{v:1, idToken, sub, uid, exp}` (`exp` = ID token exp, seconds).
+- Value: `base64url(iv[12] ‖ AES-256-GCM ciphertext ‖ tag[16])`, AAD `"ezil/id-token/v1"`.
+- Key: `hkdfSync('sha256', <AUTH0 secret auth0.ts already reads>, AUTH0_ISSUER, 'ezil/auth0/id-token-seal/v1', 32)`, the auth0.ts:35-38 pattern with a distinct info string. No new env var.
+- Seam: `app/src/server/auth/id-token-cookie.ts` exposes pure `sealIdTokenCookie(payload, secret, iv?)` and `openIdTokenCookie(value, secret)`. Only the production wiring obtains `secret`, through one accessor added to auth0.ts (`idTokenSealSecret()`, which returns `config().secret`, a988f28c auth0.ts:24-27); no other module reads `AUTH0_SECRET_ID`. The callback, signout and the repo-open service receive the secret (or a bound sealer) as a dependency, so tests and the I1 harness pass the vectors' test `ikm`.
+
+**Attributes.** `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=min(exp−now, 28800)`. Not set when `exp−now < 300`.
+
+**Use check** (route and signout). The cookie decrypts; `v===1`; `uid === ctx.user.id`; `sub === ctx.user.app_metadata.auth0_sub`; `exp−now ≥ 120 s`. On any failure the route answers `reauth_required`, signout skips the Works call, and the cookie is cleared.
+
+**Lifecycle.** Overwritten on every callback while active; cleared on signout and on any Works 401. The token never reaches JS and is sent only to WORKS_STAGING_ORIGIN.
+
+**Rejected identity paths** (must not be revived): the OS Supabase bearer (OS-staging enrollment stamps `ezil_role='creator'`, so Works' `builder()` 404s); a CLI session inside the computer (30-day refresh token in a uid-0 guest); an OS→Works HMAC deputy (one compromised OS mints for everyone); project-repo redeem (read-only, ≤5 min); the CLI private grant (read-only, refuses empty repos).
+
+### 3.3 Reauth
+
+- Target: `/auth/auth0/login?returnUrl=` + `encodeURIComponent(<current /app/code?project=…&repo=…[&path=…]>)`. Always `returnUrl` (a988f28c app/src/app/auth/auth0/login/route.ts:8 reads only `returnUrl`); never `returnTo` (vectors `shell.reauthUrlExample`).
+- Deep-link arrival only: the first answered `open` after the Code window adopts a `ctx.project` (a launch, or a relaunch with a different project, §4 step 7) may navigate top-level, and only ONCE per repoId per tab, guarded by sessionStorage `ezil:repo-open:reauth:<repoId>`. The guard is set before the navigation and never cleared in that tab, not even by a success, so neither the open that returns from Auth0 nor a later reload of the tab can bounce again (1.0.2). A Works 401 during that open uses the same single bounce.
+- Every other case shows the banner with its [Sign in again] button, whose target is the same `returnUrl` (the deep link, `path` included), and never navigates by itself: a refresh, a second failure, a later `open` in the same window (Retry, Start, restart, `ezil:desktop-restarted`, stopped→running; §4 step 1), and any reauth for a repoId this tab already bounced for (1.0.2).
+- With a live id.ezil.work SSO session Auth0 returns without UI (INF, E2E-A).
+
+### 3.4 Shell endpoint gating
+
+`SHELL_API_ROUTES.repoOpen = '/api/shell/repo-open'` is added to app/src/server/shell/boot-payload.ts, but every key there is published to `desktopState.endpoints`, and the shell treats keys as feature switches (a988f28c local/src/contract/shell-api.ts:55-70). So:
+- `ShellFeatures` (app/src/server/shell/features.ts) gains `repoOpen: boolean`, false in `NO_SHELL_FEATURES` and in `shellFeaturesFor`.
+- Every boot site sets it from `repoOpenActive(request)`: `app/src/app/api/shell/session/route.ts` (GET :67 and POST :93) and `app/src/app/os/page.tsx` (:167; it also renders `/app/<id>`, the deep-link landing page). Each of the three sites has its own test (a new `session/route.test.ts` covers GET and POST), so dropping the wiring at any one site fails a named test.
+- `toShellDesktopState` drops the `repoOpen` key unless `features.repoOpen`, as it does for `feedback`.
+- The shell runs the repo-open flow only when `desktopState.endpoints.repoOpen` is present and `nativeSurface` is absent; otherwise Code opens exactly as at a988f28c.
+- `local/src/contract/shell-api.ts` is NOT edited. `local/src/contract/shell-api.test.ts` and `local/src/server/shell-contract.test.ts` destructure `repoOpen` as hosted-only (app route count 14 → 15) and assert `'repoOpen' in LOCAL_ROUTES === false`. A boot-payload test asserts a production client id yields no `repoOpen` key.
+
+## 4. Code shell flow (shell/ezil/apps/code.js + new shell/ezil/repo-open-client.js)
+
+`openCodeWindow(ctx)` and `el_window._ezil_relaunch(ctx)` consume `ctx.project = {projectId, repoId, path|null}` (ignored today at code.js:1000-1009). Without `ctx.project`, or without the `repoOpen` endpoint, the request sequence and iframe URLs are byte-identical to a988f28c (snapshot test).
+
+1. **Every `start_boot()` in a window with `ctx.project`** (first open, Retry, Start, restart, `ezil:desktop-restarted`, stopped→running) mints exactly as today, POST `/api/shell/code-preview-url` `{computerId, intent:'open'}` (code.js:216-232), then runs op `open`. `open` is idempotent for an existing folder and reinstalls the grant and helper after a container recycle drops `/run`.
+2. **Open.** `set_title('Opening <name>…')`, then POST `endpoints.repoOpen` `{op:'open', computerId, projectId, repoId, path?}`.
+3. **Wake loop.** Cancellable on window close or relaunch. Retries `computer_not_running`, `workspace_not_ready`, `workspace_busy` with delays 2, 3, 5, 5… s up to 180 s. Never calls ensure. At the cap: banner "Your computer is still starting." and Code opens at its default folder.
+4. **On ok.**
+   - `url = withCodeFolder(mintedUrl, openFolder)` (vectors `withCodeFolder`): AWS shape (host matches AWS_CODE_HOST_RE and path `/preview-bootstrap`) sets `path='/?folder='+encodeURIComponent(openFolder)` (the bootstrap keeps `dest.search` same-origin, aws-origin.ts:324-333); otherwise `folder=openFolder` (Cloudflare passthrough for target `code`, worker/src/preview-bridge.ts:806-814). Set semantics: the folder appears exactly once.
+   - Re-mint first if the minted URL is older than 240 s (5-minute bootstrap TTL).
+   - The iframe `src` is still assigned exactly once per `start_boot()`.
+   - `set_title('<handle>/<name>')`.
+5. **Notices** (vectors `shell.notices`): `initialized_empty`, `pathNotFound`, scope `read`.
+6. **Refresh.** POST `{op:'refresh', …}` at `gitAccessExpiresAt − 5 min` while the window exists; also on `visibilitychange`→visible with under 6 minutes left. Cancelled on close. `reauth_required` during refresh shows a banner and never navigates.
+7. **Relaunch with a different `ctx.project`:** cancel timers, rerun 1-6.
+8. **Refusals:** Code opens at the default folder with a dismissible banner showing the fixed copy (§12). `repo_open_unavailable` is silent.
+
+## 5. OS server route: POST /api/shell/repo-open
+
+Next Route Handler: runtime `nodejs`, `dynamic='force-dynamic'`, `maxDuration=150`.
+
+**Order.** Each step stops on failure.
+1. `isCrossOriginWrite` (request-origin.ts:31-62) → 403 `cross_origin`.
+2. No `ctx.user` → 401 `unauthenticated`.
+3. `repoOpenActive` false → 404 `repo_open_unavailable`. (Production therefore answers every signed-in POST with 404, whatever the body.)
+4. Body: JSON ≤ 2 KiB, strict `{op:'open'|'refresh', computerId, projectId, repoId, path?}` with UUID_RE ids and `path` only on `open` (vectors `osRoute.request`) → else 400 `invalid_request`.
+5. `assertOwnedComputer(ctx.db, ctx.user.id, computerId)` → else 404 `computer_not_found`. This is the existing module-private function at a988f28c app/src/server/api/routers/cloudflare-guacamole.ts:92-114 (ownership plus the placement-owner check), made reachable by adding `export` to it and nothing else (O1a). No second implementation is written (app/src/app/api/shell/screen/route.ts:26-32: "a second implementation of the same rule is free to drift") and no tRPC procedure is added (that would change `sdk/src/surface.test.ts` KNOWN_UNCOVERED). It throws `TRPCError` NOT_FOUND, which maps to `computer_not_found`; any other throw → 500 `workspace_failed`.
+6. **Routing read** (I5). `routeComputer(ctx.db, {userId, computerId})` WITHOUT `pinCloudflare` (reads never pin, select.ts:80-86). Never `reverseMoveOnOpen`, `gateComputerStart` or `provider.ensure`.
+   - throws `TRPCError` NOT_FOUND → 404 `computer_not_found`; any other throw (including `MigrationConflictError`) → 500 `workspace_failed`, no detail;
+   - `kind:'aws-ec2'` with reverse `moving` → 409 `computer_not_running` (retryable);
+   - `kind:'aws-ec2'` with reverse `blocked` → 409 `workspace_unsupported`;
+   - `kind:'aws-ec2'` otherwise: if `createProviderMigrationStore(ctx.db).readActiveByComputer(computerId)` is non-null (a pending Cloudflare→AWS move answers with a waiting provider of kind aws-ec2, provider-migrate-placement.ts:13-35) → 409 `computer_not_running`; else 409 `workspace_unsupported` (Phase A).
+   - All three AWS outcomes make zero Works and zero Worker calls. A stub DB with no placement row records zero placement writes after repo-open (test).
+7. Cookie use check (§3.2) → else 401 `reauth_required`.
+8. Works POST os-grant (§6.5) with bearer = the sealed ID token and body `{computerLabel}`. Timeout 10 s, `redirect:'manual'`, `cache:'no-store'`, response ≤ 16 KiB, no retries.
+9. Strict response validation (vectors `works.osGrantResponse`): exact keys; `username==='ezil'`; `token` GRANT_RE; `repositoryId===repoId`; HANDLE_RE, NAME_RE; `routeName===handle+'/'+name`; `cloneUrl==='https://'+gitHost+'/'+routeName+'.git'`; `expiresAt` in (now, now+15 min+60 s]; `scope` write|read; `defaultBranch` BRANCH_RE. Any failure → 502 `works_invalid_response`.
+10. Worker POST `/sandbox/<deriveGuacamoleSandboxId(user, computer)>/repo-open` (§8), fetch timeout 120 s. A timeout → 409 `workspace_busy` (retryable): a later `open` is idempotent and reports `existing` if the clone finished unseen.
+11. Strict Worker response validation (vectors `errorTable.workerResponses`): a 200 must match `okOpen` for `open` or `okRefresh` for `refresh` exactly (keys, `ok:true`, state, absolute `folder` and `openFolder` with `openFolder` equal to or under `folder`, booleans, BRANCH_RE); anything else is the `worker 200 invalid body` row → 500 `workspace_failed`. Refusals map through `errorTable.upstream`.
+12. Respond.
+
+**Works refusal mapping** (vectors `errorTable.upstream`): 401 (any code) → `reauth_required` and clear the cookie; 403 `identity_conflict` → `identity_mismatch`; 403 `identity_unverified` → `identity_unverified`; 403 `ezil_id_builders_only` → `builder_required`; 403 `account_suspended` → `account_unavailable`; any other 403 or any 404 → `repository_unavailable`; 409 `repository_not_ready` → `repository_not_ready`; 429/5xx/timeout → `works_unavailable`; everything else (3xx, 409 other, 422, unknown) → `works_invalid_response`.
+
+**Worker refusal mapping** (same table): `runtime_not_running` → `computer_not_running`; the other named §8 codes keep their names; 401 `invalid_signature`, 400 `invalid_request`, any unknown code under 409/502/500/401/400, any other status, and a 200 that fails step 11 → `workspace_failed`. check.mjs asserts a Worker catch-all for every status, as it does for Works.
+
+**200 for `open`:** `{ok:true, state:'cloned'|'initialized_empty'|'existing', folder, openFolder, pathNotFound, repo:{handle,name}, scope, gitAccessExpiresAt}`.
+**200 for `refresh`:** `{ok:true, state:'refreshed', scope, gitAccessExpiresAt}`.
+**Refusal:** `{ok:false, errorCode, retryable}` with `retryable` from §12. Never Works text, Worker text, a token or an ID token. Logs carry only `errorCode` and a random `correlationId`.
+
+**Signout** (app/src/app/auth/signout/route.ts:40-79). When active and the cookie passes its use check: best-effort POST os-sessions/revoke `{}` (all labels) inside the existing 3 s budget next to `revokeAiCredentialsOnSignout`; then clear the cookie. A Works timeout still clears it within the budget.
+
+## 6. Works staging (EZiL-Works)
+
+### 6.1 Build
+Start from integ/selfserve-v0 @ 7974ab6c (draft #105), then merge 87ff5ec4 (apps/api/Dockerfile, infra/aws-api-host, project-repo 316a6a97). Merge-base 448cc1e4 (verified). The six overlapping files (`.github/production-migrations.json`, `apps/api/src/routes/manifest.ts`, `apps/api/src/routes/mcp/tools.ts`, `packages/contracts/src/index.ts`, `packages/db/src/schema-files.ts`, `packages/db/src/schema.ts`) are resolved additively inside the merge commit. 87ff5ec4 touches none of server.ts, cli.ts, ezil-id.ts, context.ts, selfserve-*, cli-auth.ts or tools/migrate.ts (verified).
+
+### 6.2 Deployment table (`apps/api/src/deployment.ts`)
+Keyed on the existing optional env `EZIL_API_ORIGIN` (7974ab6c apps/api/src/env.ts:626 → `ServerEnv.apiOrigin`). Vectors `works.deployments`, `works.selection`, `works.effectivePins`.
+
+```
+apiOrigin === "https://api-preview.ezil.work" → STAGING { v1Clients: [universePin, osPin] minus ineffective pins,
+                                                          osClient: osPin if effective else null, gitHost: GIT_STAGING_HOST }
+anything else / unset                          → DEFAULT { v1Clients: EZIL_ID_V1_CLIENTS (frozen, unchanged),
+                                                          osClient: null, gitHost: "github.ezil.work" }
+```
+
+- **One deployment object per server, with a test seam (no env):**
+  - `deploymentFor(apiOrigin, pins = { os: OS_STAGING_AUTH0_CLIENT_ID, universe: UNIVERSE_STAGING_AUTH0_CLIENT_ID })` is pure and implements the effective-pin rule (§1).
+  - `createServer` computes `deps.deployment ?? deploymentFor(deps.env.apiOrigin)` once. `ServerDependencies.deployment?` is a test-only override used by unit tests and the I1 harness to inject test client ids.
+  - The /v1 middleware runs `c.set('deployment', d)` (`AppBindings.deployment`). The os handlers and the self-serve `gitHost` option read that one object. Nothing reads the client constants or `EZIL_API_ORIGIN` anywhere else.
+  - **Mounting.** The two os routes are declared in the self-serve module (so `routes/manifest.ts` and `routes/manifest.test.ts` see them), but `createServer` mounts them only when `d.osClient !== null`: its existing mount loop (7974ab6c server.ts:163-164) passes each module through `mountedRoutes(module, d)` from deployment.ts, a path filter that drops a route matching `works.osPaths` while `osClient` is null. server.ts still names no module. With the routes absent, every request to their paths, whatever the bearer and with or without `X-EZiL-Act-As-Session`, gets exactly what an undeclared /v1 path answers for it, byte-identical to 7974ab6c: the unmatched-route 404 for a bearer the middleware accepts, and the middleware's own 401 or 403 otherwise (§1). (Mounted, an act-as request would reach `delegatedRequest`, delegation.ts:93-121, and answer 403 `act_as_operator_required` or `act_as_route_unavailable`, because the module is in neither `builderModules` nor `builderRouteExceptions`, :19-20.)
+- `@ezil/db` cannot import `apps/api` (packages/db/package.json depends only on @ezil/contracts, drizzle-orm, pg). So `selfserveRepositoriesV0Repository(db, now, { gitHost = 'github.ezil.work' } = {})` takes the host as an option, and the self-serve route passes `deployment.gitHost`. `/cli/whoami` (cli.ts:184) keeps reporting github.ezil.work on staging; this is accepted because the CLI is not wired to git-preview.
+- Tests: DEFAULT deep-equals today's constants; staging v1Clients ∩ PRODUCTION_AUTH0_CLIENTS = ∅; an ineffective pin is never accepted.
+
+### 6.3 Repository refs
+- `owned()` (packages/db/src/repositories/selfserve-repositories-v0.ts:42-54) is unchanged: numeric refs only, on every deployment. clone-token, push-tests and freeze therefore answer a UUID ref exactly as today (404 `not_found`) everywhere.
+- A new repository method `ownedByRepositoryId(owner, repositoryId)` matches `s.repository_id = $::uuid AND s.owner_account_id = owner` with the same joins. Only the os-grant handler calls it, and only with a ref that matches UUID_RE exactly. Uppercase, malformed, unknown and foreign refs → 404 `not_found`, indistinguishable.
+
+### 6.4 Authentication (server.ts /v1 middleware + os handlers)
+Vectors `works.authRule`, `works.authCases`.
+0. Mounting per §6.2: with `osClient` null the os routes do not exist, so steps 2-5 never see an os path on DEFAULT.
+1. `verifyEzilIdToken` additionally returns the matched client (an additive field). The /v1 middleware verifies with `acceptedClients = deployment.v1Clients` (unchanged behaviour in DEFAULT) and stores the client with `c.set('ezilIdClient', client)` (`AppBindings` in routes/context.ts).
+2. Centrally in the middleware, **immediately after `verifyEzilIdToken` returns and before `resolveEzilIdAccount`** (7974ab6c server.ts:124-131): when `deployment.osClient !== null` and the matched client is `osClient` and the request is not an os route (`POST` matching WORKS_OS_GRANT_PATH_RE, or `POST /v1/builder/selfserve-repositories/os-sessions/revoke`) → 401 `identity_token_invalid`. So the retained OS token is useless on clone-token, create, freeze, push-tests and availability, and such a request makes no GoTrue admin call (no `createUser`/`bindAuth0Sub`, and no 503 `identity_unavailable` masking the 401).
+3. The rest of the middleware is unchanged: account resolution, `account_suspended`, `ezil_id_builders_only`, and an act-as header with an EZiL ID bearer → 403 `ezil_id_delegation_forbidden` (server.ts:131-135).
+4. os handlers: `ezilIdClient !== deployment.osClient` (including a Supabase bearer, which sets no client) → 401 `identity_token_invalid`. A Supabase bearer with an act-as header on a mounted os route stops earlier, in `delegatedRequest` (403 `act_as_operator_required` for a non-operator). Defence in depth: a handler reached with `osClient === null` returns `c.notFound()`.
+5. No second JWKS verify (the JWKS cache is keyed by the deps object, ezil-id.ts:28-29,64-70).
+
+### 6.5 POST `/v1/builder/selfserve-repositories/:repositoryRef/os-grant`
+Declared inside `selfserveRepositoriesV0Routes`, so manifest.ts is unchanged; mounted only when `osClient !== null` (§6.2).
+- Gating per §6.4; ref must match UUID_RE else 404 `not_found`.
+- Body strict `{computerLabel: COMPUTER_LABEL_RE}`, ≤ 256 B → else 422 `invalid_request` (the existing body reader and refusal wrapper).
+- `builder(ctx)` (existing); `ownedByRepositoryId` → else 404; state `ready` → else 409 `repository_not_ready`; `selfserveAuthority` (project-repositories.ts:88-102) non-null scope → else 404.
+- `osRepoSession(account, label)` (§6.6), then `issueGrant({session, projectId, repositoryId, taskId:null, taskPublicId:null, maxScope:authority.scope, reason:'selfserve_owner', webClone:false, expiresAt:now+15 min, routePath:'<handle>/<name>.git', candidates:[]})`, within GIT_GRANT_MAX_MS and `git_grants_expiry_chk`.
+- `defaultBranch` = `project_repositories.default_ref` minus `refs/heads/`. A value outside `refs/heads/` or failing BRANCH_RE is a data error: the handler throws (500), which OS maps to `works_unavailable`.
+- **201:** `{username:'ezil', token, expiresAt, cloneUrl:'https://<deployment.gitHost>/<handle>/<name>.git', repositoryId, routeName, handle, name, scope, defaultBranch}`.
+- Audit: the existing `cli_session.created` and `git_grant.issued` events.
+
+### 6.6 OS session row (no schema change)
+In ONE transaction, mirroring `webCloneSession` (cli-auth.ts:278-297):
+1. `select id from ezil_works.accounts where id=$1 for update`;
+2. find a live `cli_sessions` row with `device_label='ezil-os '+label`, `os='ezil-os'`, `cli_version='os-repo-v1'`, `access_hash IS NULL`, `revoked_at IS NULL`, `expires_at > now + 16 min`;
+3. if none, INSERT with `refresh_hash = sha256(<discarded random>)`, `created_at = last_used_at = now`, `expires_at = now + 8 h`.
+
+Never UPDATE `expires_at` (the trigger allows that only for the web-clone shape, 7974ab6c packages/schema/src/selfserve-owner-authority-v0.sql:23-36). No refresh or access token is returned. A concurrent-call test proves one session per (account, label). Column widths fit (device_label ≤ 80, os and cli_version ≤ 32; cli-git-auth.sql:70-72).
+
+### 6.7 POST `/v1/builder/selfserve-repositories/os-sessions/revoke`
+Body `{computerLabel?}` strict. Gating and authentication as §6.4. Revokes the account's live `ezil-os` sessions (only that label, if given) through `cliAuthRepository.revoke(publicId,'logout', human(account))`, which also stamps `revoked_at` on their live grants in the same transaction (cli-auth.ts:255-269). Answers 200 `{revoked:n}`. Idempotent.
+
+### 6.8 Unchanged
+`/cli/*`; gateway authorize (routes/cli.ts:240-290); Universe's clone-token route (60-minute web clone); the schema (nothing beyond the existing selfserve forward migration).
+
+### 6.9 Per-operation authorization at the gateway (unchanged code, corrected expectations)
+Order (cli.ts:258-277; cli-auth.ts:323-338): grant row → grant revoked → session revoked or expired → grant expired → route repository → grant scope → account suspended → live authority. Vectors `gitAuthorize`:
+- pre-freeze write grant, push after freeze → 403 `authority_lapsed` (grant scope passes; live authority is `read`);
+- read grant minted after freeze, push → 403 `scope_read_only`;
+- grant delivered before os-sessions/revoke or sign-out → 401 `grant_revoked` (the revoke stamps the grant itself);
+- clock past the 8 h session end → 401 `session_revoked` (the session check precedes grant expiry);
+- grant past 15 min, session live → 401 `grant_expired`;
+- repo-A grant on repo-B's route → 404 `repository_not_found`;
+- well-formed unknown grant → 401 `grant_invalid`; a malformed grant never reaches Works (the gateway answers 401 itself).
+The Artifacts token lasts ≤ 10 min and is used only by the gateway.
+
+### 6.10 Runtime (existing env names only)
+Secret `ezil-works/staging-api/prod`:
+
+| Key | Value |
+|---|---|
+| `PORT` | `8787` |
+| `DATABASE_URL` | role per G-READ/V3.13 decision `@10.61.20.35:5432/ezil_works` |
+| `SUPABASE_URL` | PREVIEW_SUPABASE_ORIGIN (vectors) [D-ISSUER] |
+| `SUPABASE_JWT_AUDIENCES` | `authenticated` |
+| `SUPABASE_SERVICE_ROLE_KEY` | the preview value |
+| `EZIL_API_ORIGIN` | WORKS_STAGING_ORIGIN |
+| `EZIL_WEB_ORIGIN` | `https://universe-staging.ezil.work` |
+| `GIT_GATEWAY_SECRET` | new random, ≥ 32 characters, distinct from every other secret (env.ts:812-815) |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | per D-ART |
+
+Deliberately unset: `CLOUDFLARE_ARTIFACTS_PUSH_QUEUE_ID`, `OS_LAUNCH_*`, `PROJECT_REPO_*`.
+
+`SUPABASE_URL` matters in two places: (a) GoTrue admin reachability, which EZiL ID account resolution uses on every uncached request (`getUserAuth0Sub`, `findUserByEmail`, `createUser`, `bindAuth0Sub`; 7974ab6c apps/api/src/auth/ezil-id-account.ts:28-99), so an unreachable value makes os-grant answer 503 `identity_unavailable`; (b) Supabase-bearer issuer verification, which this lane does not use (os-grant and Universe calls are EZiL ID bearers, server.ts:121-139). W2's render-env pins the vectors value. G-READ (X1 P0) reads, host names only, the OS-staging app's `SUPABASE_URL` host and the preview GoTrue's `API_EXTERNAL_URL` host. The X1 P3 pin commit records both in its message and compares them with the host of PREVIEW_SUPABASE_ORIGIN; on any mismatch the lead stops, D-ISSUER is revisited, and a corrected value ships only with a contract bump. Universe's own SUPABASE_URL move is off this lane's path and out of scope.
+
+### 6.11 Staging host recipe (W2)
+`infra/aws-api-host` gains `--target prod|staging`. The prod target's behaviour and dry-run output stay byte-identical. The staging preset uses the preview VPC, subnet, DB security group and bucket, the secret prefix `ezil-works/staging-api/`, stacks `ezil-works-api-staging-host` / `-db-access`, `t3.medium`, and PROD_HOSTNAMES exactly `api-preview.ezil.work`.
+- Instance type: `t3.medium`, because 87ff5ec4 app-host.yaml:19-22 allows only `[t3.medium, t3.large, t3.xlarge, t3.2xlarge, m6i.large, m6i.xlarge]` and CloudFormation would refuse `t3.small` at change-set creation in X1 P4. A W2 test asserts the staging preset's instance type is in that AllowedValues list. (Cheaper `t3.small` would need AllowedValues widened in the shared template: a founder choice under D-HOST and a contract bump.)
+- Hostname refusals apply to `--target staging` only (V3.5): any STAGING_FORBIDDEN_HOSTS value, a production prefix, bucket, VPC or DB SG, or any canary hostname is refused.
+- **Canary refused on staging.** `up canary`, `render-env canary` and `sweep-timer` (on and off) are refused for `--target staging` before any AWS call. The staging SSM scripts never start, enable or render the canary instance.
+- **Caddy on staging never has a canary site.** Bootstrap never starts Caddy (87ff5ec4 bootstrap.sh:81-82 only copies the production `Caddyfile` into `caddy/Caddyfile` on first boot); deploy.sh starts it (`up`, deploy.sh:260) and swaps it (`maintenance`, :277-288). For `--target staging`, deploy.sh selects the file before every Caddy (re)start:
+  - `up`: validate, then install `Caddyfile.staging` as `caddy/Caddyfile`; if it changed while Caddy runs, force-recreate Caddy (as `maintenance` does, because `admin off` disables reload).
+  - `maintenance on`: `Caddyfile.maintenance.staging`; `maintenance off`: `Caddyfile.staging`. Never `Caddyfile` or `Caddyfile.maintenance`, whose sites name `{$CANARY_HOSTNAMES}` (Caddyfile:21; Caddyfile.maintenance:5), which compose defaults to `api-aws.ezil.work` even when empty (compose.yaml:35-36, `${CANARY_HOSTNAMES:-…}`).
+  - Both new assets contain only the `{$PROD_HOSTNAMES}` site, are added to make-userdata.py ASSETS and to bootstrap.sh's asset install loop (:76), and need no target signal at boot. Bootstrap gets no Caddy-selection change: UserData is a literal `Fn::Base64: |` (make-userdata.py:39-41, app-host.yaml:132-134) with no target input.
+- render-env.py, compose.yaml and the Caddyfiles are embedded in app-host.yaml's generated UserData (make-userdata.py:11-13,44-46), so the generated block is regenerated (under 16 KiB). The production template bytes change (generated block plus new parameters with production defaults), but no production change set is created or executed from this branch (G-PROD stays "none").
+- render-env.py, for the staging prefix only, refuses: a DATABASE_URL on 10.63.20.252, `*.supabase.co`, a pooler host, btgq, port 6543, or a dbname other than `ezil_works`; `EZIL_API_ORIGIN ≠ WORKS_STAGING_ORIGIN`; `SUPABASE_URL ≠ PREVIEW_SUPABASE_ORIGIN`; any value naming a STAGING_FORBIDDEN_HOSTS host; a set `CLOUDFLARE_ARTIFACTS_PUSH_QUEUE_ID`.
+
+### 6.12 Schema apply (W1a tool, X1 P4)
+`bun tools/migrate.ts --database-url-file <0600 file> | --database-url-stdin, --expect-system-id <digits> --dbname ezil_works [--only <file>] [--apply]`.
+- Default is dry-run: prints the SCHEMA_FILES plan and opens no connection. The `--project` mode is unchanged.
+- The URL is never in argv, never printed. 127.0.0.1 (an SSM port-forward) is allowed only together with `--expect-system-id`, which stays the real guard.
+- `--apply` refuses: a system_identifier mismatch; host 10.63.20.252, `*.supabase.co`, `*.pooler.supabase.com`, btgq, port 6543; dbname ≠ `ezil_works`; an existing `ezil_works` schema without `--only`; a missing `ezil_works_app` role. Optional roles (`ezil_ai_gateway`, `ezil_ai_app`) are reported, never required (every grant is guarded, ai-members.sql:24-39). The tool never creates roles.
+- After apply it asserts policies `cli_sessions_backend` and `git_grants_backend` exist (created at 7974ab6c packages/schema/src/cli-git-auth.sql:252-259) and `ezil_works_app` has USAGE on schema `ezil_works` (granted at packages/schema/src/grants.sql:86, the last SCHEMA_FILES entry, packages/db/src/schema-files.ts:744).
+- **Where it runs:** from the workstation through an SSM port-forward via the new staging Works host (`AWS-StartPortForwardingSessionToRemoteHost` to 10.61.20.35:5432, bound to 127.0.0.1). The Works runtime image (node:22-slim, dist/server.mjs only) cannot run it, and the preview VPC has no peering.
+
+## 7. Grant lifecycle
+
+| Event | Effect |
+|---|---|
+| open, or refresh about every 10 min while Code is open | A new 15-minute grant. A new OS session once the current one has 16 min or less left (about every 7 h 44 min). |
+| freeze | The next os-grant returns scope `read`. A push with a write grant minted before the freeze is refused `authority_lapsed`; a push with a read grant is refused `scope_read_only`. Fetch keeps working. |
+| OS signout | Best-effort `os-sessions/revoke` (all labels) within the 3 s budget, then the cookie is cleared. Every grant already delivered fails its next gateway operation with `grant_revoked`. This also disconnects Git in the user's other OS-staging browser sessions until their next open or refresh (accepted). |
+| Code window closed | No refresh. The delivered grant lapses in ≤ 15 min. |
+| Computer stop, recycle or delete | No revoke in v1; `/run` is dropped on recycle. The next `start_boot` runs `open` and reinstalls. |
+| ID token under 120 s from expiry, or Works 401 | `reauth_required` → single bounce on arrival, banner otherwise. |
+
+**Accepted residual risk.** The guest runs as uid 0 and code-server runs `--auth none` (desktop.py:596; start-neko.sh:1988-1996). Any process in the owner's computer, including repository code, can read the current grant and use it for that ONE repository until it expires (≤ 15 min) or is revoked. The gateway does not bind grants to a computer.
+
+## 8. OS app → Worker: POST `{CLOUDFLARE_GUACAMOLE_WORKER_URL}/sandbox/<sandboxName>/repo-open`
+
+**Route gate (1.0.2, vectors `workerExec.routeGate`).** The Worker mounts this route only when its existing var `EZIL_AI_GATEWAY_URL` equals `https://ai-staging.ezil.work`, os-staging's own Gateway (production's is `https://ai.ezil.work`; pointing production at the staging Gateway would itself break I6). With any other or no value the request falls through, before its body is read or its signature checked, to the Worker's generic 404 for an undeclared path (`{"ok":false,"error":"not_found"}`; the entry's `json()` keeps only the public code), exactly what a988f28c answers for that path. No env var is added. The gate is coupled to the Gateway URL and fails closed: a staging Gateway URL change unmounts the route on staging too.
+
+**Signature** `x-ezil-signature: t=<ms>,v1=hex(HMAC-SHA256(CLOUDFLARE_GUACAMOLE_HMAC_SECRET, "<t>.POST./sandbox/<sandboxName>/repo-open.<sha256hex(body)>"))`. Same construction and 5-minute skew as ai-credential (a988f28c app/src/server/lib/ai-credential.ts:27-31; worker/src/ai-proxy.ts:141-162). It binds its own path; an ai-credential signature replayed on repo-open is refused (vectors `signature`).
+
+**Body** ≤ 4 KiB, strict (vectors `workerRequest`):
+```
+{ v:1, op:'open'|'refresh', repositoryId, handle, name, gitHost, defaultBranch, path:string|null,
+  grant:{ username:'ezil', token, expiresAt, scope } }
+```
+The Worker re-validates every field: `gitHost` ∈ {GIT_STAGING_HOST}; grant `expiresAt` in (now, now+16 min]; `path` null or an app-link path, and only on `open`.
+
+**Processing.** `receivedAt` is taken first; `deadline = receivedAt + 105 s`. Each step stops on failure.
+1. Verify the signature, then the body. 401 / 400.
+2. `awsControlTarget(...)`: ANY non-null result (a tunnel record or a `Response` such as 401 claims mismatch, 502 `aws_origin_unavailable`, 503 `aws_origin_starting`; index.ts:4414-4436) → 409 `workspace_unsupported`. The Response body is never forwarded. No exec and no relay in Phase A.
+3. Container not running → 409 `runtime_not_running`. The Worker NEVER starts it (§8.1 applies to every later exec).
+4. Workspace not mounted and hydrated → 409 `workspace_not_ready`. The root is the DO's mountPath (default `/workspace`, index.ts:690); the `/home/neko/project` fallback is never used.
+5. In-flight (the DO's map, one per sandbox): the same (handle/name, op, path) joins the running call (1.0.2: `path` is part of the join, vectors `workerExec.inflightJoinRule`, so a second open with another path never receives the first one's `openFolder`); any other request on the same handle/name → 409 `workspace_busy`; **any `open` while another `open` runs in this sandbox, for any repository → 409 `workspace_busy`** (retried by the wake loop). So at most one staged clone exists and counts against the budget (§9.4 step 5), and two clones can never each pass at 80 % and together cross 100 %. `refresh` of a different repository proceeds. Each request gets a fresh uuid, added to the map here and removed after step 11.
+6. Fixed-string exec: `install -d -m 0700` of the RUN_DIRS.
+7. `writeFile`: `/run/ezil/bin/ezil-repo-open.mjs` and `/run/ezil/bin/ezil-git-grant.mjs` (bytes bundled in the Worker, sha256-pinned in a generated module written by `worker/tools/gen-repo-open-assets.mjs`, which is not a CI image input (vectors `imageInputs`, 1.0.2); no image change); `/run/ezil/git/incoming/<uuid>.json` (grant, §9.3); `/run/ezil/requests/<uuid>.json` (§9.2, no secret, carries `uuid`, `inflight` = the map's uuids for this sandbox, `deadlineMs` and the Worker-chosen `staging` path).
+8. **Prepare** (op `open`). It holds **neither** the persistence tail **nor** `withRuntimeMutation`. Fixed-string exec `chmod 0500 <kernel> <helper> && chmod 0600 <incoming> <request> && node <kernel> prepare <request>`, exec timeout `min(85 s, deadline − 20 s − now)`. Network work happens only here, only under `<root>/.ezil-staging/<uuid>` and `/run/ezil`. After it returns, re-check per §8.1 before anything else (1.0.2, vectors `workerExec.postPrepareRecheck`). If the computer stopped meanwhile (tombstone set, or the container not running) → 409 `runtime_not_running` with no further exec (staging, `/run` and the lock went with the container). If only a runtime transition is in flight while the container runs (for example `restartDesktopStack`, which keeps the container and `/run`) → 409 `workspace_busy`, and step 11 still runs: its guarded release queues behind `withRuntimeMutation` and executes once the transition ends (a transition still in flight at that point makes the guard skip it, as for a stop).
+9. **Commit** (op `open`): enter `withWorkspacePersistence` (index.ts:2755), never `withRuntimeMutation` (the scheduled flush takes mutation and then the tail, index.ts:3214; the reverse order would deadlock). If `deadline − now < 15 s` after acquiring it: leave the tail and go to step 11 with 409 `workspace_busy` (no commit exec). Otherwise, after the §8.1 check, fixed-string exec `node <kernel> commit <request>` with a 10 s timeout. Nothing that takes the tail is called from inside it.
+10. **Refresh** (op `refresh`): no tail. Fixed-string exec `node <kernel> refresh <request>` (installs the grant and rewrites the `/run/ezil/bin` wrapper only).
+11. Parse the LAST stdout line as kernel JSON (prepare, commit or refresh). If any output contains the grant token or matches `egg_[0-9a-f]{64}` → 500 `workspace_failed`. Then, after the §8.1 check, fixed-string exec `node <kernel> release <request>` (§9.4) on every outcome: success, kernel refusal, the busy path in step 9, a timeout. If the check says stopped, skip it (nothing survives a stop). If `release` itself fails, fall back to fixed-string `rm -rf <root>/.ezil-staging/<uuid>` and `rm -f` of the request and incoming files; a lock left behind is stale at the next prepare because its uuid is no longer in flight (§9.1). Remove the uuid from the in-flight map.
+
+Every interpolated value in an exec string is a Worker-generated UUID or a constant. The grant is never in an exec string or env.
+
+**Exec timeouts (1.0.2, vectors `workerExec`).** Sandbox SDK 0.12.1 does not throw when a sessionless exec reaches its timeout: the container kills the process tree and the call returns exit code 124 with stderr `Command timed out after <N>ms`. The Worker treats a result as a timeout when the exit code is 124 and either the elapsed time is at least the timeout minus 500 ms or stderr ends with that message; a thrown exec counts as a timeout only by elapsed time. A timeout is never parsed as a kernel answer. Refusal per step (`workerExec.timeoutErrorByStep`): prepare and commit → `workspace_busy` (commit answered `workspace_failed` before 1.0.2; the rename may already have happened, and the next open is idempotent), setup and refresh → `workspace_failed`, release → the step-11 fallback.
+
+Why two phases: the scheduled flush takes `withRuntimeMutation` first and then waits on the tail (index.ts:3214), and every Code bridge request goes through `withRuntimeMutation` with a 12 s budget (index.ts:2663-2697, 6824-6831). A clone held inside the tail would stall all Code and desktop traffic for its duration. Tests: a flush alarm queued during a slow fake clone never holds `withRuntimeMutation` longer than one commit; a `runningContainerFetch` issued while prepare runs completes within 12 s; a flush queued while commit waits on the tail still completes; the tail held for 95 s gives `workspace_busy` with no commit exec, `release` run, and the staging path and lock gone, after which an immediate reopen succeeds.
+
+### 8.1 Non-starting exec rule (I5)
+A Sandbox exec on a stopped container starts it. The existing code only execs right after `containerIsRunning()` inside `withRuntimeMutation` (index.ts:3283-3285, 3882-3888). Repo-open cannot hold that lock across prepare (V1.2), so every exec after step 3 is preceded by this check, with no await between its synchronous part and the exec call:
+- `await` WORKSPACE_TERMINATED_KEY (index.ts:1959) is unset; then synchronously `containerIsRunning()` is true and `runtimeTransitionsInFlight === 0` (index.ts:2647-2654).
+- If the check fails: no exec; the response is 409 `runtime_not_running` (→ `computer_not_running`), or for step 11 the release is skipped. Exception (1.0.2): the re-check after prepare (§8 step 8) answers 409 `workspace_busy` when only a runtime transition is in flight in a running container, and step 11 still runs.
+- Short execs outside the tail (steps 6, 7, 11) run inside `withRuntimeMutation` together with their check, as `runningContainerFetch` does (index.ts:2663-2671); each lasts well under the 12 s bridge budget. This excludes terminate and idle stop, which hold mutation (index.ts:3214/3346, 3981-3986). The migration fence holds the tail and a transition but not mutation (index.ts:3479, 3552); the `runtimeTransitionsInFlight` clause catches it.
+- Commit's check runs inside the tail. Every Worker-initiated stop (terminate, idle stop, the migration fence) calls stop only while holding the tail (index.ts:3346, 3552-3553, 4073-4074), so none can interleave with commit.
+- Prepare's exec is dispatched right after its check and holds no lock. A stop during prepare kills the exec with the container; step 8's re-check then refuses without a further exec. The sandbox is created with `keepAlive: true` (index.ts:953). A container crash or platform stop between a check and an exec dispatch is the residual window (INF), proven harmless only by the test below.
+- O1b test: a stop issued while a slow fake prepare runs records zero container starts and no exec after the stop, and the response is `runtime_not_running`.
+
+**Responses.** 200 for `open`: `{ok:true, state, folder, openFolder, pathNotFound, branch, empty}` (vectors `workerResponses.okOpen`); 200 for `refresh`: `{ok:true, state:'refreshed'}` (`okRefresh`); 409 `runtime_not_running|workspace_not_ready|workspace_busy|folder_conflict|workspace_unsupported|repository_too_large`; 502 `network_unavailable|git_auth_rejected|repository_unavailable`; 500 `workspace_failed`; 401 `invalid_signature`; 400 `invalid_request`. App mapping: §5 "Worker refusal mapping" (vectors `errorTable.upstream`).
+
+## 9. Inside the computer
+
+### 9.1 Layout
+- Root `R` = mountPath. Repository folder `F = R/repos/<handle>/<name>`.
+- `openFolder` = `F/path` when `path` is given and `realpath(F/path)` is a directory inside `realpath(F)`; otherwise `F`, with `pathNotFound:true` when a path was given.
+- Clones stage in `R/.ezil-staging/<uuid>` (same filesystem as F, so `rename(2)` works). `.ezil-staging` is a reserved top-level name: the snapshot codec skips that node and its whole subtree (§9.8), so creating or removing it, or anything under it, never changes a stamped entry. Content a user puts there is never checkpointed.
+- Lock (vectors `kernel.lockRule`): the directory `/run/ezil/locks/<handle>__<name>`, taken with `mkdir` by prepare when F is absent, with the request uuid written to `<lock>/owner`. Prepare and commit are separate processes, so the lock is released explicitly: by commit on every outcome (its last act), by `release` (§9.4; the Worker runs it after every outcome, including the busy path after tail acquire), and by prepare itself on failure. A lock is **live** only when its owner uuid is in the request's `inflight` list (the Worker's in-flight map) and it is younger than LOCK_STALE_MS (10 min); otherwise prepare treats it as stale, removes it and takes it. Since the Worker allows one `open` per sandbox (§8 step 5), a lock left by a finished or abandoned request never blocks the next open; LOCK_STALE_MS is only the backstop for a Worker that lost its map (DO eviction) while a kernel process survived.
+
+### 9.2 Request file
+`{v:1, op, phase, uuid, inflight:[uuid…], repositoryId, handle, name, gitHost, defaultBranch, path|null, root, staging, incoming:'/run/ezil/git/incoming/<uuid>.json', deadlineMs, budget:{limitBytes, maxEntries, fraction}}`. Strict: any other key (including a kernel test option, §9.4) → `workspace_failed` before any action. `phase` is also the kernel's argv[2] (`prepare|commit|refresh|release`).
+
+### 9.3 Grant file
+`/run/ezil/git/grants/<handle>__<name>.json`, mode 0600, directory 0700, uid 0:
+`{v:1, protocol:'https', host:<gitHost>, path:'<handle>/<name>.git', username:'ezil', password:<egg_>, expiresAt, scope}`. `path` has no leading slash (git sends it that way). Installation, by the kernel only: lstat the incoming file (regular file), `rename(2)` into place, `chmod 0600`.
+
+### 9.4 Kernel `ezil-repo-open.mjs`
+
+**prepare, F exists.** Read `F/.git/ezil-repo.json` (read-only). `{repositoryId, handle, name, gitHost}` all equal → `state:'existing'`, no network. Otherwise `folder_conflict`; nothing installed or changed.
+
+**prepare, F absent.**
+0. Remove every `R/.ezil-staging/<u>`, `/run/ezil/requests/<u>.json` and `/run/ezil/git/incoming/<u>.json` whose `<u>` is not in `inflight` (leftovers of a request the Worker no longer tracks).
+1. Take the lock (§9.1); install the grant; write the wrapper (§9.6).
+2. In `staging`: `git init -q -b <defaultBranch>` (git < 2.28: `git init -q` then `git symbolic-ref HEAD refs/heads/<defaultBranch>`), then the §9.5 config.
+3. `git ls-remote --symref origin HEAD 'refs/heads/*'`:
+   - no refs → `initialized_empty`, `empty:true`, branch `defaultBranch` (unborn). Still in staging, the kernel writes the unborn branch's upstream: `git config branch.<defaultBranch>.remote origin`, then `git config branch.<defaultBranch>.merge refs/heads/<defaultBranch>` (vectors `gitConfig.branchUpstream`, 1.0.1). So a plain `git push`, as the `initialized_empty` notice says, creates `refs/heads/<defaultBranch>` on any git: `push.autosetupremote` needs git ≥ 2.37 and the local sandbox image's git 2.34.1 ignores it (I1 finding 1). The first push sends an all-zero old SHA, which the gateway parser accepts (EZiL CLI apps/git-gateway/src/pkt-line.ts:27); Artifacts behaviour is unverified (E1).
+   - refs → `git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'` (full history). Default branch: the HEAD symref target, else `defaultBranch` if present, else the first ref; `git checkout -q -b <d> --track origin/<d>`. State `cloned`.
+4. Write `.git/ezil-repo.json` `{v:1, repositoryId, handle, name, gitHost}` in staging.
+5. **Budget** (vectors `repoBudget`, reference in check.mjs). Measured in **tar bytes**, because the codec's limit is tar bytes: it writes a PAX_FORMAT archive and checks `tar.offset + info.size <= LIMIT` and `os.path.getsize(path) <= LIMIT` (a988f28c worker/src/workspace-snapshot-script.ts:159,173,179). Per entry (file, directory or symlink): one 512 B header, plus file content rounded up to 512 B, plus a PAX header (512 B plus its records rounded up to 512 B) when the name or symlink target is 100 or more UTF-8 bytes or not ASCII; paths under `repos/<handle>/<name>/` often are. Add 11264 B for the archive tail. The workspace side (1.0.2, vectors `repoBudget.workspaceRule`) is a bounded scan of R that counts exactly what the codec would archive. It applies the codec's own skip rules: the top-level SNAPSHOT_INTERNAL_NAMES and `.ezil-staging` nodes; outside `.git` paths, any entry named in SNAPSHOT_CACHE_NAMES that is not tracked, backslash names, anything but regular files, directories and symlinks, and absolute or escaping symlinks. It builds `tracked` as the codec does: `git ls-files -z --cached --sparse` over private copies of the root index and of each repo-open folder's index (§9.8 item 2), never inside the user's repository. Where it cannot decide as the codec would (an unreadable root index, a failing realpath), it counts (conservative). Before 1.0.2 it counted every entry, so after one untracked dependency install anywhere in R every open was refused. The scan stops as soon as either sum is over. The staged side counts every entry under its final names (`repos/<handle>/<name>/…`; a fresh checkout holds only tracked files and `.git`), plus `repos` and `repos/<handle>` when absent. Over `floor(0.8 × 512 MiB)` tar bytes or `floor(0.8 × 100000)` entries → remove staging, `repository_too_large`. One `open` per sandbox (§8 step 5) keeps a concurrent clone out of the sum; commit does not re-measure.
+6. On any failure remove only the staging directory, the lock (§9.1), and any grant this op installed.
+
+**Full history, not shallow (decision).** Full history plus the budget refusal bounds V1.1's hazard without relying on Artifacts' shallow negotiation and shallow pushes, neither of which is verified. A repository whose history exceeds the budget is refused with fixed copy; shallow clone with a later unshallow op is a follow-up.
+
+**commit** (inside the tail; no network). Re-read the binding if F exists (state `existing`): equal → rewrite exactly the §9.5 credential and helper keys (repairs any older value), install the grant and wrapper; different → `folder_conflict`, remove the grant this op installed. If F is absent: verify the lock's owner is this uuid (else `workspace_busy`), `mkdir -p R/repos/<handle>`, `rename(2)` staging → F. Then compute `openFolder`. Last act, on every outcome: release the lock it owns.
+
+**refresh.** Install the grant and rewrite the wrapper. No tail, no `.git/config` change, no network. `state:'refreshed'`; output `{ok:true, state:'refreshed'}`.
+
+**release** (outside the tail; idempotent; no network). Remove this request's staging dir; the lock only when `<lock>/owner` holds this uuid; the grant file only when F is absent (a grant for a folder that is not on disk); then this request's request and incoming files. Never touches F. Output `{ok:true}` or `{ok:false, errorCode:'workspace_failed'}`.
+
+**Test seam (vectors `kernel.testSeam`).** The module exports `runKernel(phase, requestPath, testOptions)`. `testOptions = {sslCAInfo, proxy}` adds `-c http.sslCAInfo=<file> -c http.proxy=<loopback CONNECT proxy>` to every git command, so O1b's kernel tests and the I1 harness reach a loopback TLS gateway that presents `git-preview.ezil.work` under a test CA generated at test time (openssl), through a loopback CONNECT proxy. Hosts, the helper's host check and the Worker allow-list stay `git-preview.ezil.work`; nothing adds 127.0.0.1 to any allow-list. `http.proxy` works with any git version (unlike `http.curloptResolve`, git ≥ 2.37). The CLI entry `node <kernel> <phase> <request>`, the only thing the Worker runs, passes no test options and has no other input channel (it reads no environment variable, and a request file carrying a test key is refused by the strict key check). A test proves the CLI entry refuses such a request and that the Worker bundle never imports `runKernel`.
+
+**Git hygiene.** Cleared env except a fixed PATH and HOME; `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`; `-c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always -c submodule.recurse=false`; each git command ≤ `min(80 s, deadlineMs − 20 s − now)`. No submodules. Kernel and helper tests run against the sandbox image's own git.
+
+**Classification** (vectors `kernel.classification`): gateway 401/403 → `git_auth_rejected`; 404 → `repository_unavailable`; DNS/TLS/connect → `network_unavailable`; live lock (§9.1) or deadline reached → `workspace_busy`; over budget → `repository_too_large`; binding mismatch → `folder_conflict`; anything else → `workspace_failed`.
+
+**Post-check:** neither `.git/config` nor `git remote -v` contains userinfo or the token.
+
+**Output:** the last stdout line is `{ok:true,state,folder,openFolder,pathNotFound,branch,empty}` (prepare and commit for `open`), `{ok:true,state:'refreshed'}` (refresh), `{ok:true}` (release) or `{ok:false,errorCode}`.
+
+### 9.5 Repo-local `.git/config` (no secret, no node path)
+Vectors `gitConfig.expectLocalList` (as `git config --local --list` prints it):
+```
+remote.origin.url=https://<gitHost>/<handle>/<name>.git
+remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+credential.https://<gitHost>.helper=
+credential.https://<gitHost>.helper=!f() { if [ -x /run/ezil/bin/ezil-git-grant ]; then exec /run/ezil/bin/ezil-git-grant "$@"; fi; if [ "$1" = get ]; then echo 'EZiL: Git access for this repository is not connected. Reopen it from EZiL OS.' >&2; echo quit=1; fi; }; f
+credential.https://<gitHost>.usehttppath=true
+push.autosetupremote=true
+```
+`branch.*` lines (vectors `gitConfig.branchUpstream`) may follow the first line: `git checkout --track` writes them for `cloned`, and the kernel writes `branch.<defaultBranch>.remote=origin` and `branch.<defaultBranch>.merge=refs/heads/<defaultBranch>` for `initialized_empty` (§9.4 step 3, 1.0.1). An `existing` reopen never writes or rewrites a `branch.*` key. `push.autosetupremote=true` stays: it still covers a new local branch on git ≥ 2.37.
+
+The empty helper line resets inherited helpers (including code-server's askpass). The helper path is fixed; nothing in `.git/config` names node, so an image change cannot break it, and a recycle that empties `/run` yields the hint plus `quit=1`, never a prompt.
+
+### 9.6 Helper
+- **Wrapper** `/run/ezil/bin/ezil-git-grant`, mode 0500, rewritten by every kernel phase: `#!/bin/sh` / `exec '<NODE>' /run/ezil/bin/ezil-git-grant.mjs "$@"`, where `<NODE>` is the kernel's `process.execPath`, validated against NODE_PATH_RE.
+- **Module** `ezil-git-grant.mjs` (vectors `helperTranscripts`):
+  - only `argv[2]==='get'` acts; `store`, `erase`, `capability` and anything else exit 0 silently;
+  - stdin capped at 4 KiB;
+  - the request must carry `protocol=https`, `host`, and `path` matching `<HANDLE_RE>/<NAME_RE>.git`;
+  - the grant file must be a regular file (lstat; no symlink), uid 0, `mode & 0o777 === 0o600`, with `protocol`, `host`, `path` exactly equal to the request's, expiring more than 30 s from now;
+  - success prints `username=ezil`, `password=<token>`, `password_expiry_utc=<epoch s>`;
+  - refusal prints only `quit=1` plus one stderr line: `EZiL: Git access for <handle>/<name> expired. Reopen it from EZiL OS (Code renews it while open).`
+
+### 9.7 Persistence
+`/run` is outside `/workspace`, so it is in neither the R2 hydrate/flush (docs/WORKSPACE-STORE.md:7-13) nor the system-snapshot ROOTS (worker/src/system-snapshot-script.ts:52). A recycle drops grant, helper and wrapper; the next `start_boot` runs `open` and restores them.
+
+### 9.8 Workspace snapshot codec (O1b)
+`worker/src/workspace-snapshot-script.ts` (LIMIT 512 MiB, MAX_ENTRIES 100000, CACHES `node_modules`, `.next`, `.turbo`, `dist`):
+1. Skip the top-level `.ezil-staging` node and its whole subtree in the inventory walk, at the same place and in the same way as INTERNAL (:118-119), so before any per-entry assertion, including the in-git `.lock` assertion (:128). The node itself is never an entry, so `stamp()` (:152-153, which includes directory mtime and ctime) cannot see a staging dir being created or removed outside the tail, and a concurrent flush (including handlePreview's readiness flush) never fails with "workspace changed" because of it. Unlike INTERNAL, the name is not added to `safe_name`'s reserved set (:23), so `install` and restore of older snapshots are unchanged, and pruned entries are not counted as `skipped`. Test: create and remove `.ezil-staging/<uuid>` (with files and a `.git/index.lock`) between the two inventory passes of one capture; the capture succeeds.
+2. Read `repos/<handle>/<name>/.git/index` only for a **repo-open folder** (1.0.2, vectors `repoBudget.repoOpenMarkerRule`): its `.git` is a real directory holding the §9.4 step 4 binding `.git/ezil-repo.json` as a regular file of at most 4096 bytes whose JSON has `v:1` and the folder's own handle and name. The kernel writes that binding into every folder it places, so no new marker is needed. Bounded by the same index and path byte limits as the root index and by SNAPSHOT_NESTED_INDEX_MAX folders (sorted, counted only when marked), its paths are added, prefixed, to `tracked`, so the CACHES skip never drops a tracked `dist/` (or other cache-named directory) inside a repo-open folder. Untracked caches inside repositories are still skipped. A workspace without a repo-open folder, which is every existing production workspace, gains no tracked name from this item; with no top-level `.ezil-staging` node either (item 1 skips it, a988f28c archived it), it checkpoints byte-identically to the a988f28c codec (before 1.0.2 any `repos/*/*/.git` was read, so existing workspaces could grow at the next production Worker deploy). (Never skipping under `repos/` was rejected: it would checkpoint untracked `node_modules` and recreate the size hazard.)
+3. Regenerate the host copy `infra/host-agent/lib/ezil_host/workspace-snapshot-script.py` with `infra/host-agent/ami/sync-codec.py` (byte parity, test_codec_parity.py). That file is also the AWS `EXPORT_CODEC` (a988f28c infra/host-agent/lib/ezil_host/desktop.py:630), so the host-agent `test_export.py` and `test_restore.py` must stay green too. The AMI picks it up only at the next AMI build.
+4. Tests: a captured and restored repo-open clone (binding present) with a tracked `dist/file` keeps the file; a workspace with `repos/a/b/.git`, a tracked `dist/` and no binding gives an archive byte-identical to the a988f28c codec's (a committed fixture copy, 1.0.2); the kernel's workspace entry count equals the codec's entry count for a mixed fixture (1.0.2); a staging tree with a `.git/index.lock` does not abort the flush; staging create and remove between the two inventory passes does not fail the capture; a clone at the budget edge (tar-byte reference just under `floor(0.8 × LIMIT)`, with long PAX names) keeps the next `flushWorkspaceNow` ok and its archive within LIMIT; two concurrent opens of different repositories give one `workspace_busy`.
+
+## 10. Git host and storage
+- EZiL CLI apps/git-gateway/wrangler.jsonc gains env `preview`: `routes:[{pattern:'git-preview.ezil.work', custom_domain:true}]`, `vars:{API_ORIGIN:'https://api-preview.ezil.work'}`, `ratelimits:[{name:'RL', namespace_id:'4203', simple:{limit:120, period:60}}]`. G-READ confirms 4203 is unused account-wide (4201 and 4202 are taken).
+- Secrets `GIT_GATEWAY_SECRET` (equal to staging Works') and `IP_HASH_SALT`, both new random values. Manual deploy only; not in ci.yml.
+- The top-level block (github/git.ezil.work → api.ezil.work, RL 4201) and `env.staging` (git-staging.ezil.work → api.ezil.work, RL 4202) stay byte-identical. CI deploys `env.staging` with the production secret (a9ec994 .github/workflows/ci.yml:74-94), which is why it is never reused.
+- Gateway source unchanged (the authorize body carries no host).
+- Artifacts: staging Works mints per-operation tokens with its own `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN` [D-ART]; namespace `p-<works project uuid>`.
+
+## 11. Owner-only at every hop
+
+| Hop | Check |
+|---|---|
+| Universe | `findOwnedProject`; no button for anyone else; non-owner 404. |
+| OS | Supabase session; `assertOwnedComputer`; cookie `uid` and `sub` equal the session's. |
+| Works | EZiL ID builder account with the bound sub; matched client = OS-staging client; `ownedByRepositoryId` by owner; live `selfserveAuthority`. Not-owned ≡ unknown (404). |
+| Gateway | Grant repository = route repository; live grant and session; live owner authority on every operation. |
+| Computer | Only the owner's computer; the folder binding is keyed by `repositoryId`. |
+
+## 12. Error codes (fixed copy; upstream text is never shown)
+
+Full table, copy and upstream mapping: vectors `errorTable`. `retryable` in the refusal body is true for `wake_loop`, `once` and `once_after_10s`.
+
+| errorCode | HTTP | Retry | Banner |
+|---|---|---|---|
+| unauthenticated | 401 | none | (sign-in page) |
+| cross_origin / invalid_request | 403 / 400 | none | "EZiL OS could not open the repository. Code is open without it." |
+| repo_open_unavailable | 404 | none | (silent) |
+| computer_not_found | 404 | none | "That computer was not found." |
+| workspace_unsupported | 409 | none | "Opening a repository works on Free (Cloudflare) computers in this release." |
+| computer_not_running / workspace_not_ready | 409 | wake loop | "Your computer is still starting." (after the cap) |
+| workspace_busy | 409 | wake loop | "Another Git operation is running here; try again in a moment." |
+| reauth_required | 401 | single bounce | "Sign in again to connect Git." [Sign in again] |
+| identity_mismatch (Works 403 `identity_conflict`) | 403 | none | "This repository belongs to a different EZiL ID than the one signed in to EZiL OS." |
+| identity_unverified (Works 403 `identity_unverified`) | 403 | none | "Verify your EZiL ID email, then reopen." |
+| builder_required (Works 403 `ezil_id_builders_only`) | 403 | none | "A builder account is required." |
+| account_unavailable (Works 403 `account_suspended`) | 403 | none | generic |
+| repository_unavailable (other Works 403, Works 404, gateway 404) | 404 | none | "That repository does not exist or you do not own it." |
+| repository_not_ready | 409 | once after 10 s | "The repository is still being set up in Universe. Try again shortly." |
+| repository_too_large | 409 | none | "This repository is too large to open in your computer's workspace; nothing was changed." |
+| folder_conflict | 409 | none | "Another repository already uses this repository's folder in your workspace; nothing was changed." |
+| works_unavailable (Works 429/5xx/timeout) | 503 | once | generic |
+| works_invalid_response | 502 | none | generic |
+| network_unavailable | 502 | none | "git-preview.ezil.work could not be reached." |
+| git_auth_rejected | 403 | none | "Git access was refused. Reopen the project from Universe." |
+| workspace_failed | 500 | none | generic |
+
+## 13. Phase B: AWS computers (deferred; inert until activated)
+- **Worker** (`worker/src/aws-repo-open.ts`): relays the §8 body to the host edge at `POST /__ezil/control/repo-open/<sha256hex(relay body)>` with the existing `awsControlTarget` and gw1 control signing; polls `/__ezil/control/repo-open-status/<jobId 64-hex>` every 1.5 s within the Worker deadline. Edge 404 (an AMI before the rollout) → `workspace_unsupported` (cbe83f6a aws-workspace.ts:137-141 mapped it to failed; changed here).
+- **Host** (`infra/host-agent` op `repo_open`): one serial worker per host; a per-job sub-cgroup with a `cgroup.kill` drain; one absolute deadline; refuses while a stop or fence is pending or the desktop is not running; writes the sha-pinned kernel and helper plus request and grant into the desktop's `/run/ezil` through runc exec stdin (`/run` is tmpfs, desktop.py:585); argv-only `runc exec` with root `/workspace` (desktop.py:557,586), never `/workspaces`; output sanitizer rejects GRANT_RE. The prepare/commit split applies (commit under the host's workspace lock).
+- **Folder.** `withCodeFolder` sets the AWS `path='/?folder=…'` (§4). Survival through the bootstrap into code-server is INF until E-AWS.
+- **Activation.** A lead commit that removes the Phase-A AWS refusal in `app/src/server/repo-open/service.ts` and switches the Worker dispatch to the relay, made only after the security review, AMI promotion and the canary E2E.
+
+## 14. Universe (U1)
+
+### 14.1 EzilHosts and OsLaunch
+- `core/app/Support/EzilHosts.php::forAppUrl(string $appUrl): {osOrigin, gitHost}` per vectors `ezilHosts`. No env var.
+- `core/config/services.php`: `'ezil_os' => ['launch_verified' => false]`; keep `ezil_works` at :5.
+- `OsLaunch::forProject` implements §2.2 and is the URL-shape authority (§2.3).
+
+### 14.2 Git-host pins
+WorksApiClient.php:63 (create cloneUrl) and :81 (clone-token cloneUrl regex), OwnProjectController.php:99 (clone-token host check) and :378-385 (repositoryData host check), `create.blade.php:40` (the `github.ezil.work/<handle>/` prefix text) and ProjectBoard.tsx `repositoryLink` (:358-365, host from a new board field `repository.gitHost`) all use `EzilHosts` gitHost. On staging `startCommand` and the CLI clone commands render as null, because the CLI is not wired to git-preview. The existing token-in-URL `cloneCommand` (:104) is left as it is and flagged.
+
+### 14.3 render-env
+`deploy/aws/app-host/render-env.py`: PRODUCTION_HOSTS gains `api-staging.ezil.work` and `api-aws.ezil.work`; the staging prefix requires the `EZIL_WORKS_API_BASE` host to equal `api-preview.ezil.work` exactly [D-UNI-WORKS].
+
+### 14.4 Second mount
+The board also renders through the Next project-work route (pages/builder/project-work/show.tsx:3,19). `ProjectWorkController::show` (9dc58adf Next/Builder/ProjectWorkController.php:13-30) returns only Inertia props; the execution slot comes from ProjectBoard's client-side fetch of `boardUrl` (:26). So `ProjectWorkBoardTest` asserts two things: the Next page's `boardUrl` prop equals `route('user.own-project.board', public_id)`, and a GET of that endpoint for the same owner returns the `execution` slot per `boardExecution`. E2E-B also visits the project-work page and reads the anchor.
+
+### 14.5 Forbidden to U1
+`core/app/Domain/OsContract/**`, any `osBaseUrl` default, any new env key.
+
+## 15. Founder decisions (recommended defaults)
+
+| ID | Decision | Recommended |
+|---|---|---|
+| D-AUTH0 | Dedicated "EZiL OS Staging" Auth0 app if G-READ shows OS staging on 2tVk0 or Mzvm4. Replace the VALUES of the existing OS staging `AUTH0_CLIENT_ID`/`AUTH0_SECRET_ID`; no new keys. Every OS-staging user signs in once more. Hard precondition for activation. | Yes |
+| D-AUTH0-U | If G-READ shows Universe staging's `AUTH0_CLIENT_ID` is in PRODUCTION_AUTH0_CLIENTS: create or confirm a dedicated "EZiL Universe Staging" app (callbacks on universe-staging.ezil.work only) and replace the VALUES in `ezil-db/staging/universe-runtime` (G-SECRET). Until then Works treats it as UNPINNED and the lane is inert. | Yes, if needed |
+| D-NAMES | Staging Works `https://api-preview.ezil.work`, git host `git-preview.ezil.work`. Never api-staging.ezil.work (production slot) or git-staging.ezil.work (CI binds the production secret). | These two names |
+| D-GATEWAY | New wrangler env `preview` in the public EZiL CLI repo, manual deploy, own secrets, not in ci.yml. Do not repoint env.staging. The public repo receives only the gateway extract (§18), never the full vectors, which name the production and preview database hosts. | In-repo env, extract only |
+| D-HOST | New paid t3.medium EC2 + EIP + SGs in the preview VPC via `infra/aws-api-host --target staging`. The existing Works VM sits in the production VPC. t3.medium is the smallest type the shared template allows (87ff5ec4 app-host.yaml:19-22); t3.small would mean widening AllowedValues in that template (contract bump). | Yes, t3.medium |
+| D-DB | Separate database `ezil_works` on the preview cluster (not `postgres`, which holds the AI-gateway table `ezil_works.ai_members`). LOGIN role per G-READ (reuse `ezil_works_app` or a distinct `ezil_works_staging_app` that is a member of it). Network exception. No backups: staging data loss accepted. | Yes |
+| D-ART | Staging Artifacts in a SEPARATE Cloudflare account. The same-account fallback is not isolation (the adapter is account-scoped). | Separate account |
+| D-COOKIE | Retain the EZiL ID token on os-staging as an AES-GCM sealed httpOnly cookie, ≤ 8 h, usable only against staging Works (dedicated client, matched-client gating). | Yes |
+| D-WORKS | Auth-surface changes in shared Works code: per-origin client table, matched-client gating, UUID refs on os-grant only, os-grant and os-sessions/revoke. DEFAULT behaviour pinned identical by tests. Stacked on draft #105. | Yes |
+| D-AWS | v1 refuses AWS computers with `workspace_unsupported`; Phase B later. | Phase A first |
+| D-ISSUER | Which preview GoTrue origin staging Works uses: `https://13-203-99-168.sslip.io` (today's issuer and cert, OS staging INFRASTRUCTURE.md:76-79) or `https://db-preview.ezil.work` (founder hostname correction). Moving the issuer requires re-preparing the preview GoTrue (`API_EXTERNAL_URL`, `SITE_URL`, TLS host) and moving OS staging, Universe staging and staging Works together. | Keep sslip.io for v1; move all three together later (contract bump) |
+| D-UNI-WORKS | Setting Universe staging `EZIL_WORKS_API_BASE=https://api-preview.ezil.work` retargets EVERY Universe staging Works feature (valuation evidence, Works board and tasks, push tests, freeze), not only this lane. Needs a written Slot-4 owner acknowledgement naming those surfaces. If the current value is a production-backed host, U1's render-env refuses it on purpose. | Yes, with Slot-4 ack |
+| D-LAUNCH | Personal-project launch uses the plain link (§2.4), not the LaunchGrant one-use code. | Yes |
+
+## 16. Gates (summary; owners and order in LANES.md)
+- **G-READ** (ids and redacted config only, never secret values): OS-staging and Universe-staging `AUTH0_CLIENT_ID` (assert neither is in PRODUCTION_AUTH0_CLIENTS and that the two differ) and the OS ID-token lifetime; the OS-staging app's `SUPABASE_URL` host and the preview GoTrue's `API_EXTERNAL_URL` host (names only; X1 P3 compares both with PREVIEW_SUPABASE_ORIGIN and stops on a mismatch, §6.10); the full current Universe staging `EZIL_WORKS_API_BASE` value (a base URL, not a secret; the X1 rollback restores it); the production `AUTH0_CLIENT_ID` of the production OS app `https://os.ezil.work` (Vercel project `ezil-os-preview`, production target; `.github/scripts/release-state.mjs` `canonical`) and of every other live OS app deployment (ids only, 1.0.2; `https://os.ezil.org` is the static landing Worker and is not an OS app). X1 P3 runs vectors `productionOs.pinGate` over the pins and these ids: a pin equal to any production client, listed or read, is refused, and an id that is not already in PRODUCTION_AUTH0_CLIENTS is first added by a contract bump (vectors, OS `app/src/server/repo-open/targets.ts`, Works `apps/api/src/deployment.ts`, every consumer copy re-seeded) that lands before the pin commit; the production OS app's identity for §17.2 (`https://os.ezil.work/api/health` full SHA if the deployed build serves it, and in every case the release-state.mjs identity: Vercel deployment id and source SHA); Universe staging `APP_URL` host (name only); an id-only count of `ezil_universe.builder_projects` rows with `works_repository_ref` not null, grouped by `clone_url` host; os-staging `/api/health` SHA, Worker version, both STATUS files; preview cluster `pg_database`, `pg_roles` (does `ezil_works_app` exist and for which database), system identifier, network rules, GoTrue reachability from the preview VPC; the preview Postgres server certificate chain and SANs at `10.61.20.35:5432` (1.0.2; certificates only, read with a TLS client and no credential): X1 P4 stops unless the chain ends at a root the Works runtime trusts (EZiL-Works `packages/db/src/node-postgres.ts` `ezilPool` `ca`: the Supabase root 2021 or the EZiL AWS Postgres CA 2026, with `rejectUnauthorized` and an IP-literal identity check) and the leaf carries IP SAN `10.61.20.35`, or a DNS SAN that DATABASE_URL then uses; otherwise a founder or contract decision comes first (for example re-issuing the preview server certificate under the EZiL AWS Postgres CA); Cloudflare RL namespace 4203 free; the sandbox image's git and node versions and paths (git ≥ 2.35 for the codec's `ls-files --sparse`, §19).
+- **G-AUTH0**, **G-DB**, **G-STATEFUL**, **G-COMPUTE/PAID**, **G-PUSH**, **G-SECRET**, **G-DNS**, **G-DEPLOY**: as LANES.md. **G-PROD: none.**
+
+## 17. Tests and E2E
+
+### 17.1 Local cross-repo harness (I1)
+- **Gateway:** `Bun.serve({fetch: r => handle(r, {API_ORIGIN:<local Works>, GIT_GATEWAY_SECRET, IP_HASH_SALT}, {fetch: <rewrite the 32-hex artifacts host to a loopback git http-backend>})})`, copying a9ec994 tests/e2e/git.e2e.test.ts:15,194-199. `wrangler dev` cannot inject fetch and the gateway refuses any non-Artifacts upstream (gateway.ts:36,166,189), so `wrangler deploy --dry-run --env preview` is used only to check config.
+- **TLS in front of the gateway (the kernel is https-only, §9.4).** The kernel and helper run in a container on the harness's isolated Docker network, where `git-preview.ezil.work` is a network alias of a TLS terminator on port 443 that forwards to the Bun.serve gateway. The terminator presents a leaf for `git-preview.ezil.work` signed by a test CA generated at harness start; the CA is installed in that container's system trust store. So I1 runs the real CLI entry (`node <kernel> <phase> <request>`) with no test option, no `GIT_SSL_CAINFO` and no allow-list change. (O1b's host-only kernel tests use the module seam instead, §9.4.)
+- **Works:** `createServer` with `ezilIdFetch`, test client ids via `ServerDependencies.deployment` (§6.2), a fake SupabaseAdmin, and an optional `routeModules` override (a constructor dep added by W1b, test-only) so `selfserveRepositoriesV0Routes({adapter})` and `cliRoutes({adapter})` mount behind the real /v1 middleware (the os routes are mounted because the injected deployment has an `osClient`). The stub adapter returns `https://<32hex>.artifacts.cloudflare.net/git/p-<uuid>/<name>.git`. Schema applied by the W1a tool against a loopback Docker Postgres.
+- **OS:** `handleRepoOpen` with a synthetic `ctx` and a service built from the §3.1 injection seams (activation, targets, cookie secret, ownership, routing, fetchers, Worker secret); never env.
+- **Worker:** the repo-open handler with a fake sandbox whose exec runs the real kernel and helper inside the container above (the desktop image if present locally, else node with the image's git version).
+- Cases: empty-repo init and first push; clone, edit, push; reopen keeps a dirty tree byte-identical; non-owner `repository_unavailable` with no folder; freeze (`authority_lapsed`, then `scope_read_only`); revoke (`grant_revoked`); cross-repo grant (`repository_not_found`); expired grant (helper hint, `quit=1`, no prompt); exact-token grep of `/proc` cmdline and environ, `.git/config`, logs and responses finds nothing.
+
+### 17.2 Staging E2E (X1, gated)
+Real auth, real Artifacts, isolated Docker Playwright runner. **R for E2E-A** comes from (a) a G-READ id-only `select public_id, repository_id from ezil_universe.builder_projects` for the QA user's project, or, if not approved, (b) replaying the idempotent Works create (`idempotencyKey 'bp-<public_id>'`, which returns `repositoryId`) with the QA user's staging token. No pending-state URL is added to the board. The X1 runbook records the source used. E2E-A uses only projects created after P7.
+- **E1 empty repo** (first stateful probe): `initialized_empty` → README commit and a plain `git push` (no `-u`; 1.0.1) → a fresh os-grant plus `git ls-remote` shows the SHA.
+- **E2 non-empty:** state `cloned`, full history; edit, push, SHA verified.
+- **E3 reopen:** `existing`; `git status --porcelain` and file hashes byte-identical.
+- **E4 non-owner:** `repository_unavailable`; no folder and no grant file in their computer.
+- **E5 freeze:** push with the pre-freeze write grant → `authority_lapsed`; next open answers scope `read`; push with that read grant → `scope_read_only`.
+- **E6:** a malformed grant → gateway 401 with no Works call; a well-formed unknown grant → `grant_invalid`; a repo-A grant on repo B → `repository_not_found`.
+- **E7 sign-out:** Works revoke → push with the previously delivered grant → `grant_revoked` → after re-login, refresh works.
+- **E8 expiry:** Playwright clock pauses refresh; after about 16 min (within the 30-minute wait cap) a push prints the helper hint and no prompt; reopen restores access.
+- **E9 hygiene:** grant only at `/run/ezil/git/grants` mode 0600; no token in `/workspace`, `/etc`, `/root`, `/home` or the system snapshot; `.git/config` has no userinfo; after a recycle the grant is gone, `git fetch` prints the hint without a prompt, and reopen restores it.
+- **E9b:** after a container recycle, `git status --porcelain` is empty for a clean clone.
+- **E-B** (after the flip): the Universe button opens a new tab with the exact URL and `rel='noopener noreferrer'`.
+- **Production unchanged:** before/after with measured `date -u` timestamps: api.ezil.work `/health` SHA, github.ezil.work `/health` commit, the production gateway version; the production OS app `https://os.ezil.work`: `/api/health` full SHA if the deployed build serves it, and in every case the release-state.mjs identity (Vercel deployment id and source SHA) (1.0.2); the production Worker `ezil-os-worker` version and its container application version; `https://os.ezil.org` only as the landing page (status and body sha256); Universe production SHA.
+
+## 18. Vectors file and consuming repos
+- `docs/contracts/universe-repo-open-v1.vectors.json` is canonical. `check.mjs` validates it (regexes compile; every valid case matches and every invalid case fails, including predicates; structural regex relations; link emitter and parser, the latter against the real app-link.js; board, activation, Works auth (including act-as and equal-pin rows); error-table completeness with Works and Worker catch-alls and strict Worker 200 shapes; a reference git authorizer over structured `gitAuthorize` inputs; tar-byte budget arithmetic; signature, computer label and cookie vectors recomputed; timeout nesting) and prints its sha256 and the gateway extract's sha256, which must equal the two pins in README-universe-repo-open.md.
+- Works and Universe (private) commit a byte-identical copy at `contracts/universe-repo-open-v1.vectors.json` plus a test asserting its sha256 equals the pinned value; the test fails (never skips) when the file is missing. EZiL CLI is public and commits only the gateway extract at `contracts/universe-repo-open-v1.gateway.json` (built by `check.mjs --emit-gateway-extract` from `gatewayExtract`: the Works and git staging hosts, RL namespaces, the gateway-forbidden hostnames and three regexes; no database, Supabase or IP host), with the same kind of sha256 test. OS lanes read `docs/contracts/` directly. See README-universe-repo-open.md.
+- Grant-shaped strings use `${repeat:<c>:<n>}` and must be expanded before use; no literal `egg_<64 hex>` or JWT-shaped string is committed.
+
+## 19. Pre-existing defects recorded (no owner in this lane)
+- **handlePreview has no `too_large` tolerance** (a988f28c worker/src/index.ts:5076-5081): once a workspace exceeds the codec limits, every later Code, desktop and app mint answers 503 `workspace_checkpoint_failed`, and the user cannot open Code to delete files. Only hydrate tolerates it (index.ts:2840-2843). This lane's budget refusal keeps a repo-open from crossing 80 %, but user activity can still cross 100 %. The fix needs its own owner, assigned by the lead.
+- Universe's `cloneCommand` embeds the grant in a URL (OwnProjectController.php:104).
+- **The codec's index read needs git ≥ 2.35** (`git ls-files … --sparse`, a988f28c worker/src/workspace-snapshot-script.ts:103). The local sandbox image `ezil-os-worker-sandbox:5e96dc3f` ships git 2.34.1, which rejects the option (`error: unknown option 'sparse'`, probed 2026-11-01 with `docker run --network none`). On that git every capture of a workspace whose root is itself a Git repository fails, and no nested index is ever read, so §9.8 item 2 is inert there: a tracked `dist/` in a repo-open folder is not checkpointed. The kernel budget uses the same flags, so it agrees with the codec on either git. The live image's git is a G-READ item. A fallback without `--sparse` changes the production codec and needs its own owner, assigned by the lead (1.0.2).
+
+## 20. Open unknowns
+- Live values: OS-staging and Universe-staging client ids; the OS ID-token lifetime (Auth0 default 10 h, unverified); the production OS app's client id (`https://os.ezil.work`, Vercel `ezil-os-preview`) and that of any other live OS app deployment (1.0.2; `os.ezil.org` is the landing page).
+- Preview Postgres server certificate at `10.61.20.35:5432` (1.0.2): the recorded 2026 server certificate covers only `db.ezil.work` and `10.63.20.252` (EZiL-Works infra/aws-api-host/README.md, Staging). Unless the preview certificate chains to an `ezilPool` root and names `10.61.20.35` (or a DNS name DATABASE_URL uses), the first staging query after `up` fails. Works `/health` touches neither the database nor GoTrue, so X1 P4 adds a readiness call that does (LANES X1 P4).
+- Cloudflare Artifacts with an empty repository (info/refs advertisement; first receive-pack with an all-zero old SHA). If it refuses, the fallback is a Works-side seed commit at create (a Works change, contract bump).
+- Egress from Cloudflare sandbox containers to git-preview.ezil.work; from the new Works host to the preview GoTrue (hairpin, SG).
+- Sandbox image git (≥ 2.28 for `init -b`; credential `quit` support) and node paths (inferred from workspace-snapshot-script.ts:103 and Dockerfile:289).
+  - The local image tag `ezil-os-worker-sandbox:5e96dc3f` ships git 2.34.1 (I1 probe), which ignores `push.autosetupremote` (git ≥ 2.37). Since 1.0.1 no step depends on it: `initialized_empty` gets an explicit upstream (§9.4 step 3, §9.5). The live Worker image's git version is still a G-READ item.
+  - Accepted (1.0.1): in an `initialized_empty` folder, until the first push creates `origin/<defaultBranch>`, `git pull` fails ("no such ref was fetched"), and after the first commit `git status` reports the upstream as gone and suggests `git branch --unset-upstream`, which would undo the upstream. The notice copy is unchanged. The first plain `git push` creates the remote branch and its remote-tracking ref, after which `git status` reports "up to date" (probed on git 2.43 at 1.0.1).
+- Preview cluster: optional roles present; CREATE DATABASE permitted; nft/HAProxy exception for the new host; current system identifier (memory: 7698279149046886433; re-read).
+- The merged Works head's minimal staging env set (refine rules on OS_LAUNCH_ORIGIN, runner origins, SMTP); W2 and X1 render and smoke it.
+- Live os-staging app and Worker heads at deploy time (a988f28c is local and unpushed under the Slot-3 owner).
+- Shared preview GoTrue identity: Works auto-provisioning writes `ezil_role='builder'` and binds `auth0_sub` on users that OS-staging enrollment also touches (`ezil_role='creator'`); the interplay on the same `auth.users` rows is unverified.
+- Whether code-server's workspace-trust prompt or auto-run tasks trigger on a freshly cloned folder (repository code runs as uid 0 in the owner's computer).
+- Phase B: `?folder=` through `/preview-bootstrap` on AWS; `runc exec --cgroup` on the AMI.
+
+---
+
+## Appendix A. Verifier resolutions
+
+V1 = verifier 1 (#1-#9), V2 = verifier 2 (#10-#20), V3 = verifier 3 (#21-#34). "As fixed" means the verifier's fix is applied; otherwise the deviation and its reason are stated.
+
+| # | Ref | Refutation (short) | Resolved in | How |
+|---|---|---|---|---|
+| 1 | V1.1 | Full-history clone ignores the 512 MiB / 100k-entry codec limit; 503 on every mint | §9.4 budget, §9.8, §12 `repository_too_large`, §19 | Budget refusal at 80 % as fixed, measured in tar bytes (headers, padding, PAX) with one `open` per sandbox (Appendix B). **Differently:** kept full history instead of shallow default, because Artifacts shallow negotiation and shallow pushes are unverified; justified against the budget. handlePreview defect recorded with no owner. |
+| 2 | V1.2 | Clone inside the persistence tail stalls `withRuntimeMutation` traffic | §8 steps 8-9, §9.4, §9.8.1 | Network work moved outside the tail (prepare); only a short commit runs inside it; snapshot skips the top-level `.ezil-staging` node before the `.lock` assertion; the two named tests added; prepare holds neither lock and every later exec is non-starting (§8.1, Appendix B). |
+| 3 | V1.3 | `pinCloudflare:true` writes placement; TRPCError and migration unhandled | §5 step 6 | Read-only `routeComputer`; NOT_FOUND → `computer_not_found`; other throws → `workspace_failed`; migration or reverse `moving` → retryable `computer_not_running`; zero-placement-write test. |
+| 4 | V1.4 | Unconditional `SHELL_API_ROUTES.repoOpen` reaches production shells | §3.4 | `ShellFeatures.repoOpen` gates the key at all three boot sites; shell requires the key and no nativeSurface; `local/src/contract/shell-api.ts` untouched; destructure lists and `'repoOpen' in LOCAL_ROUTES === false`. |
+| 5 | V1.5 | Callback has no Supabase user id to seal | §3.2 | `bridgeAuth0Identity` returns `{userId}`; bridge.ts and its test added to O1a; sealed-uid test. |
+| 6 | V1.6 | CACHES skip drops tracked `dist/` in nested repos | §9.8.2, §17.2 E9b | Nested `.git/index` read into `tracked` (the verifier's first option). Never-skip-under-`repos/` rejected (would checkpoint untracked `node_modules`). |
+| 7 | V1.7 | Tail wait not in the timeout budget; Worker fetch timeout unmapped | §1 timeouts, §8 steps 8-9, §5 step 10 | **Differently (re-derived for two phases):** deadline 105 s from receipt; prepare ≤ 85 s; after tail acquire < 15 s left → `workspace_busy`, `release` removes staging and the lock (§9.1 lock lifecycle, Appendix B); OS→Worker timeout → `workspace_busy`. Test holds the tail 95 s (not 70 s, since the clone no longer waits on the tail). |
+| 8 | V1.8 | `/run` lost on recycle; baked node path → password prompt | §4 step 1, §9.4 commit, §9.5, §9.6 | Every `start_boot` with `ctx.project` runs `open`; fixed wrapper path `/run/ezil/bin/ezil-git-grant` rewritten on every phase; commit rewrites the credential keys on `existing`. **Differently:** `refresh` does not touch `.git/config` (with the fixed path there is nothing to repair, and a config write outside the tail would trip the snapshot `.lock` assertion). |
+| 9 | V1.9 | `awsControlTarget` Response leaks; Works 401/403 unmapped | §8 step 2, §5 mapping, §12 | Any non-null result → `workspace_unsupported`, body never forwarded; Works 401 → `reauth_required` (single bounce, cookie cleared). **Differently:** 403 `ezil_id_builders_only` → `builder_required` with its own copy (V2.11) rather than `repository_unavailable`, because the condition is actionable and not about the repository; 403 `account_suspended` → `account_unavailable` with generic copy. |
+| 10 | V2.1 | Universe has no JS test runner for `osLaunchLink` | §2.3, §14.1, LANES U1 | OsLaunch.php is the authority with PHP tests over the vectors copy; TSX is defence in depth proven by typecheck and E2E-B; no new runner; U1's local acceptance no longer claims the anchor attributes (Appendix B). |
+| 11 | V2.2 | Stale refs from another Works render a broken "ready" button | §2.2 step 6, §14.2, §16 G-READ | `repository_other_environment` when the clone host ≠ gitHost (also in repositoryData); G-READ id-only count by clone host; E2E-A uses only post-P7 projects; any reset is a separate G-DB change. |
+| 12 | V2.3 | C-ISSUER undefined; sslip pin contradicts the db-preview correction | §15 D-ISSUER, §1, §6.10 | D-ISSUER added (default: keep sslip.io for v1); PREVIEW_SUPABASE_ORIGIN is a vectors constant; W2 pins it; G-READ/P0 read the OS-staging `SUPABASE_URL` and GoTrue `API_EXTERNAL_URL` hosts and P3 stops on a mismatch; §6.10 states exactly what the value affects (GoTrue admin on every uncached EZiL ID request, and Supabase-bearer issuer, which this lane does not use). |
+| 13 | V2.4 | Universe-staging client may be 2tVk0, which staging Works refuses | §15 D-AUTH0-U, §1 effective pins, §16 | G-READ asserts it is not production; D-AUTH0-U as a hard precondition; Works treats a production value as UNPINNED; vectors `effectivePins` case. |
+| 14 | V2.5 | `EZIL_WORKS_API_BASE` switch retargets all Universe staging Works features; rollback incomplete | §15 D-UNI-WORKS, LANES X1 P7 | Slot-4 written ack naming the surfaces; P0 records the current host name; rollback (ordered since 1.0.2, LANES X1): restore the recorded value (G-SECRET), run `deploy.sh render-env` from a pre-U1 checkout every time (`up` never re-renders `.env`, and U1's render-env refuses any other staging value), `up PREVIOUS_TAG`, then verify. |
+| 15 | V2.6 | E2E-A cannot read `repo=` from the board while unverified | §17.2 | R from a G-READ id-only query, or a replay of the idempotent Works create; no pending-state URL added. |
+| 16 | V2.7 | NAME_RE looser than Works and Universe | §1, vectors `regex.NAME_RE`, `regexRelations` | Works regex adopted verbatim with both predicates; `a-`, `a.`, `a_`, `a..b` invalid cases; W1b and U1 assert equality. |
+| 17 | V2.8 | Git-excluded vectors make committed tests fail or skip in CI | §18, README | Byte-identical committed copy at `contracts/universe-repo-open-v1.vectors.json` with a sha256 test that fails when missing; lead-only updates with the version bump. The public EZiL CLI repo gets only a derived gateway extract with its own pin, no DB or IP hosts (Appendix B). |
+| 18 | V2.9 | Silent departure from the LaunchGrant launch contract | §2.4, §14.5, §15 D-LAUNCH | Paragraph added; D-LAUNCH; U1 forbidden from `OsContract/**` and any `osBaseUrl` default, enforced by an empty `git diff` over `OsContract` and an OsLaunch origin assertion in U1 acceptance. |
+| 19 | V2.10 | I1 cannot exercise the OS route while UNPINNED; no OS seam | §3.1, §17.1 | Pure `repoOpenActiveFor`; injected `activation`/`targets`; Works test entry via `createServer` with `ezilIdFetch`; production-wiring-inactive test. |
+| 20 | V2.11 | create.blade and repositoryLink still pin github; second mount untested; identity refusals misleading | §14.2, §14.4, §12 | Both added to U1 (host from EzilHosts / a `repository.gitHost` board field); Next project-work feature test; `identity_unverified`, `builder_required`, `account_unavailable` codes with fixed copy. |
+| 21 | V3.1 | Freeze yields `authority_lapsed` for a pre-freeze write grant, not `scope_read_only` | §6.9, §7, §17.2 E5, vectors `gitAuthorize` | As fixed: two cases. |
+| 22 | V3.2 | Revoke yields `grant_revoked`, not `session_revoked` | §6.9, §7, §17.2 E7, vectors | As fixed; separate `session_revoked` case by clock past the 8 h session. |
+| 23 | V3.3 | `wrangler dev` cannot reach a loopback Artifacts stand-in; Works adapter not injectable | §17.1, LANES I1 | Bun.serve around `handle()` with a rewriting fetch; dry-run for config only; Works `routeModules` test seam (W1b) mounting adapter-injected modules behind the real middleware; the https-only kernel is reached through a Docker-alias TLS terminator with a test CA (I1) or the kernel module seam (O1b) (Appendix B). |
+| 24 | V3.4 | render-env is embedded in UserData; canary Caddy block on staging | §6.11, LANES W2 | W2 owns app-host.yaml generated block, make-userdata.py asset list, bootstrap.sh asset install loop, `Caddyfile.staging` and `Caddyfile.maintenance.staging`; deploy.sh selects them for `--target staging` before every Caddy (re)start and refuses the canary; staging uses t3.medium (Appendix B); acceptance: `--check` clean, prod dry-run byte-identical, staging SSM scripts never install a production Caddyfile or start a canary; production template bytes change with no production change set. |
+| 25 | V3.5 | Refusing production hostnames for any target breaks prod | §6.11, LANES W2 | Refusals apply to `--target staging` only. |
+| 26 | V3.6 | migrate cannot run on the host image; no route to the DB; URL in argv | §6.12, LANES X1 P4 | SSM port-forward; explicit P4 order; URL from a 0600 file or stdin; loopback allowed only with `--expect-system-id`. |
+| 27 | V3.7 | UUID `owned()` and os routes change DEFAULT behaviour | §6.3, §6.4 step 3 | **Differently (narrower):** UUID refs are accepted only by os-grant through a separate `ownedByRepositoryId`; `owned()` and clone-token/push-tests/freeze stay numeric-only everywhere, so DEFAULT is unchanged by construction; the os routes are not mounted while `osClient` is null, so DEFAULT (act-as requests included) gets the unmatched route, compared against 7974ab6c (Appendix B). |
+| 28 | V3.8 | No seam for a route-level re-verify; OS token valid on every staging /v1 route | §6.4 | **Differently (matched-client variant):** `verifyEzilIdToken` returns the matched client; the middleware accepts `deployment.v1Clients` and centrally refuses an OS-client token off the os routes; os handlers compare `ezilIdClient`. Per-path `acceptedClients=[osClient]` was rejected because it gives 401 instead of the required 404 while `osClient` is null (V3.9). W1b owns ezil-id.ts, context.ts and the middleware block. |
+| 29 | V3.9 | UNPINNED expectations wrong (401 vs 404) | §1, §6.4, vectors `unpinnedSemantics`, `works.authCases` | As fixed. |
+| 30 | V3.10 | Concurrent os-grant can insert duplicate sessions | §6.6 | One transaction with an account-row lock; concurrent-call test. |
+| 31 | V3.11 | NAME_RE vs gateway ROUTE_NAME_PATTERN | §1 relations | Works regex adopted verbatim (option 2) and NAME_RE ⊆ gateway pattern checked structurally (option 1's direction) in check.mjs. |
+| 32 | V3.12 | Works 401 and identity 403s unmapped; tampered-grant expectation wrong | §5 mapping, §12, §17.2 E6 | Works 401 → `reauth_required` + cookie cleared; `identity_unverified` copy; other 403 → `repository_unavailable`; E6 split into malformed (gateway 401, no Works call) and well-formed unknown (`grant_invalid`). |
+| 33 | V3.13 | Role preflight requires optional roles and misses the load-bearing one | §6.12, §15 D-DB, §16 | Hard-require `ezil_works_app` only; report optional roles; post-apply policy and USAGE assertions; G-READ decides reuse vs a distinct LOGIN member role. |
+| 34 | V3.14 | `@ezil/db` cannot import `deployment.ts`; whoami keeps github | §6.2 | `gitHost` option on `selfserveRepositoriesV0Repository`; whoami limitation documented and accepted. |
+
+## Appendix B. C0 checker resolutions
+
+Two checker passes over the draft, each finding verified against the code at the named bases. C1 = checker 1, C2 = checker 2. Founder decisions and live G-READ values stay open by design (§15, §16, §20).
+
+| Finding | Resolved in | How |
+|---|---|---|
+| C1 V1.1: raw bytes vs tar bytes; concurrent opens; missing flush test | §9.4 step 5, §8 step 5, §9.8.4, vectors `repoBudget`, LANES O1b | Budget in tar bytes (512 B header, 512 B padding, PAX for names ≥ 100 B or non-ASCII, 11264 B tail), reference and cases in check.mjs; one `open` per sandbox; budget-edge flush test and two-concurrent-opens test in O1b. |
+| C1 V1.2/I5: an exec after a stop during prepare could start the container | §0 I5, §8 steps 8-11, §8.1 | Prepare holds neither lock; a non-starting re-check (tombstone, `containerIsRunning`, no transition) precedes every later exec; short execs run inside mutation, commit inside the tail; stop-during-prepare test. |
+| C1 V1.7: lock lifecycle across separate prepare and commit processes | §9.1, §9.2, §9.4 (release), §8 step 11, vectors `kernel.lockRule` | Lock records the request uuid; commit releases on every outcome; new `release` phase run after every outcome (busy path included); a lock whose uuid is not in the request's `inflight` is stale; busy-then-reopen test. |
+| C1 V2.1: U1 local acceptance claimed the anchor attributes | LANES U1 | Removed; proven by `npm run typecheck` plus E2E-B, as §2.3 says. |
+| C1 V2.3: PREVIEW_SUPABASE_ORIGIN never read | §6.10, §16 G-READ, LANES X1 P0/P3 | P0 reads the OS-staging `SUPABASE_URL` and GoTrue `API_EXTERNAL_URL` hosts; P3 compares and stops on mismatch (D-ISSUER revisit, contract bump). |
+| C1 V2.9: OsContract prohibition unchecked | §2.4, LANES U1 | Empty `git diff <seed> -- core/app/Domain/OsContract`; OsLaunch unit assertion on the origin. |
+| C1 O1a: `assertOwnedComputer` not exported | §5 step 5, §3.1 seams, LANES O1a | Export-only edit owned by O1a; a test proves the production factory passes that same function. |
+| C1 + C2 W2/V3.4: Caddy canary path; bootstrap has no target | §6.11, LANES W2 | Selection moved to deploy.sh `--target staging` before every Caddy (re)start; `Caddyfile.maintenance.staging` added; canary refused on staging; bootstrap scope limited to the asset loop. |
+| C1: bare `bun` resolves to /usr/bin/bun 1.3.1 | LANES rules and every block | `PATH=/root/.bun/bin:$PATH` prefix; receipts print `bun --version` (must be 1.3.14). |
+| C1: §14.4 test cannot render the slot in one step | §14.4, LANES U1 | Assert `boardUrl` equals the board route, and the board endpoint returns the slot. |
+| C1: `.ezil/staging` node stamps break concurrent flushes | §9.1, §9.8.1, vectors `STAGING_ROOT_NAME` | Staging moved to the top-level reserved `.ezil-staging`, skipped as a node like INTERNAL; create/remove-between-passes test. |
+| C1: activation rule vs OS pin equal to Universe pin | §1, vectors `activation.rule`, `works.authCases`, `unpinnedSemantics` | Equality rule is Works-only; OS-side rule unchanged; new auth case (404 → `repository_unavailable`); P3 refuses equal ids; G-READ asserts distinct ids. |
+| C1: cookie key and route ctx come from env | §3.1, §3.2, §17.1 | Pure seal/open over an injected secret; one `idTokenSealSecret()` accessor in auth0.ts; service factory and `handleRepoOpen(request, ctx, service)` seams. |
+| C1: O1a vitest/eslint not lead-run; session route untested | LANES O1a, §3.4 | Marked lead-run; `session/route.test.ts` (new) owned; endpoint-filter mutation proof covers all three boot sites. |
+| C1: O1b runs only codec parity | §9.8.3, LANES O1b | `test_export.py` and `test_restore.py` added. |
+| C1: X1 P0 recorded only the host | §16, LANES X1 | P0 records the full `EZIL_WORKS_API_BASE` value. |
+| C1: full vectors would be published in the public EZiL CLI repo | §15 D-GATEWAY, §18, README, vectors `gatewayExtract` | EZiL CLI commits only a derived gateway extract (no DB, Supabase or IP host) with its own pinned sha256. |
+| C1: gateway pattern line cites; findOwnedProject line; W1b test file | §1, §2.2, vectors `upstreamPatterns`, LANES W1b | `:35`/`:36`/`:43`/`:46`; `board()` at :122-125; the DB test file marked (new). |
+| C2: `t3.small` not in AllowedValues | §6.11, §15 D-HOST, LANES W2 | Staging uses `t3.medium`; W2 test asserts it is allowed. |
+| C2 V3.7: act-as requests reach `delegatedRequest` on DEFAULT | §0 I2, §6.2, §6.4, vectors `works.authRule`/`authCases` | os routes mounted only when `osClient !== null` (path filter in `createServer`); DEFAULT act-as rows compared against 7974ab6c. |
+| C2 V3.3: https-only kernel vs loopback http tests | §9.4 test seam, §17.1, vectors `kernel.testSeam`, LANES O1b/I1 | O1b: module-only `runKernel` options (CA file and loopback CONNECT proxy) the CLI entry cannot reach; I1: Docker-alias TLS terminator with a test CA in the trust store. |
+| C2: no reference git authorizer | vectors `gitAuthorize`, check.mjs | Structured case inputs; reference authorizer in Works' order; every deny reason has a case; the swapped freeze pair now fails the check. |
+| C2: Worker-side mapping gaps | §5 steps 11-12, §8 responses, vectors `errorTable` | Strict `okOpen`/`okRefresh` shapes with cases; rows for Worker 200 invalid, 400, 401, 409 *, 500 *, 502 *; catch-all assertions. |
+| C2: placement of the central OS-token refusal | §6.4 step 2, vectors `works.authRule` | Immediately after `verifyEzilIdToken`, before `resolveEzilIdAccount`. |
+| C2: sample-based subset relation | §1, vectors `regexRelationsRule`, check.mjs | Structural per-position class and length containment, verified by a seeded sample. |
+| C2: USAGE citation; NUMERIC_REF_RE bound; SANDBOX_NAME_RE case | §6.12, §1, vectors | grants.sql:86; `int64_max` predicate on both sides with overflow cases; strictness note. |
+
+## Changelog
+
+### 1.0.2 (2026-11-01, PATCH)
+The lead's decisions D1-D8 on the final I1 review (16 findings, three reviewers). No OS route, status code, error code, notice copy or request/response shape changes. Two Worker refusals change for the better (a commit exec timeout and a transition in flight after prepare now answer the retryable `workspace_busy`).
+
+1. **D1, production OS host.** Production OS is `https://os.ezil.work` (Vercel project `ezil-os-preview`, release-state.mjs `canonical`), not `os.ezil.org` (the static landing Worker).
+   - Text: §0 I2, §1 (OS_PRODUCTION_APP_ORIGIN; PRODUCTION_AUTH0_CLIENTS note), §16 G-READ (read the production OS app's client and any other live OS app deployment's, ids only; its identity), §17.2 (probe os.ezil.work `/api/health` full SHA if served, plus the release-state.mjs Vercel identity; os.ezil.org only as the landing page), §20.
+   - Rule: X1 P3 refuses a pin equal to any production client, listed or read; an id G-READ reads that is not in PRODUCTION_AUTH0_CLIENTS is added by a contract bump (vectors, OS targets.ts, Works deployment.ts, consumer copies) before the pin commit.
+   - Vectors: constants `OS_PRODUCTION_APP_ORIGIN`, `OS_LANDING_ORIGIN`; new `productionOs` with `pinGate` order, rule and ten cases using placeholders for ids not read yet (no id is invented). `PRODUCTION_AUTH0_CLIENTS` and `OS_PRODUCTION_ORIGINS` are unchanged.
+   - Check: the pin-gate reference; `OS_PRODUCTION_APP_ORIGIN` equals release-state.mjs `canonical`; `PRODUCTION_AUTH0_CLIENTS` may hold more than two ids (it must still include the CLI and Universe web ids); the contract text no longer names os.ezil.org as the OS app.
+2. **D2, image inputs.** The generator moved from `worker/scripts/` (a CI image input: a change there rebuilds the sandbox image and rolls it out to every computer) to `worker/tools/gen-repo-open-assets.mjs`. Text: §8 step 7. Vectors: new `imageInputs`. Check: no repo-open path is under preview.yml `IMAGE_INPUTS`; the generator exists only at its new path. LANES X1 P6 carries the exact `--containers-rollout none` deploy.
+3. **D3, staging database TLS.** §16 G-READ and §20 read the preview Postgres server certificate chain and SANs at 10.61.20.35:5432; X1 P4 stops unless it chains to an `ezilPool` root and names 10.61.20.35 (or a DNS SAN DATABASE_URL uses). LANES adds a readiness call that exercises the database and GoTrue after `up`.
+4. **D4, rollback.** LANES X1 Rollback is explicit ordered steps; every P4 step runs through the README `stg` array (`--target staging`). Appendix A row 14 is updated.
+5. **D5, budget.** The workspace side of `repository_too_large` counts exactly what the codec archives (§9.4 step 5). Vectors: `repoBudget.rule` updated; new `workspaceRule`, `workspaceCasesRule` and eight `workspaceCases` (an untracked `node_modules` does not count; a tracked `dist` in a repo-open folder does); constants `SNAPSHOT_INTERNAL_NAMES`, `SNAPSHOT_CACHE_NAMES`, `SNAPSHOT_NESTED_INDEX_MAX`. Check: a reference over every case.
+6. **D6, codec gate.** The codec reads a nested index only for a repo-open folder: one carrying the kernel's existing `.git/ezil-repo.json` binding with `v:1` and its own handle and name (§9.8 item 2). Workspaces without one, and without a top-level `.ezil-staging` node (§9.8 item 1), checkpoint byte-identically to the a988f28c codec. Vectors: `repoBudget.repoOpenMarkerRule`.
+7. **D7, Worker correctness.** (a) An SDK 0.12.1 exec timeout (exit 124, no throw) is detected and mapped per step (vectors `workerExec.timeoutRule`, `timeoutCases`, `timeoutErrorByStep`). (b) After prepare, a transition in flight is not a stop: `workspace_busy`, and release still runs (`postPrepareRecheck`). (c) The in-flight join includes `path` (`inflightJoinRule`). Text: §8 steps 5 and 8, "Exec timeouts".
+8. **D8, Worker route gate.** `POST /sandbox/:name/repo-open` is mounted only when the existing var `EZIL_AI_GATEWAY_URL` equals os-staging's Gateway origin; production answers the generic 404 (§8 "Route gate", vectors `workerExec.routeGate`). No env var is added.
+9. **Shell reauth (review:2 minor).** The one-per-tab guard is no longer cleared on success, and only the deep-link arrival open may bounce. Every later `reauth_required` shows the [Sign in again] banner with the same `returnUrl`: a restart, Retry, Start, stopped→running, or a later arrival after this tab already bounced for that repoId. Text: §3.3. No vectors change, so both pins are unchanged: `errorTable.copyNotes.reauth` already reads "deep-link arrival navigates once per repoId per tab". Shell: `shell/ezil/repo-open-client.js` and its two suites.
+10. **Recorded, not changed:** §19 notes that the codec's `ls-files --sparse` needs git ≥ 2.35, which the local image's git 2.34.1 lacks (pre-existing since a988f28c).
+11. **Bump.** `contractVersion` is 1.0.2; both README pins are updated. The gateway extract changes only in `contractVersion` and `sourceVectorsSha256`. The OS pins (app, worker and shell vector tests) are updated in the same change. Re-seeding the copies in EZiL-Works, universe-2.0 and EZiL CLI is a separate lead step (§18) and has not happened at this commit.
+
+### 1.0.1 (2026-11-01, PATCH)
+Two issues the I1 local harness found (`docs/status/u2-repo-open-20261031/local/harness.md`, "Findings for the lead" 1 and 2). No route, status code, error code, notice copy or request/response shape changes.
+
+1. **Empty-repository upstream (I1 finding 1).** On git < 2.37, which ignores `push.autosetupremote` (the local sandbox image ships git 2.34.1), a plain `git push` after `initialized_empty` failed with "has no upstream branch", so the notice "Add a file, commit, then run git push." was false there.
+   - Kernel: for `initialized_empty` only, prepare now writes `branch.<defaultBranch>.remote=origin` and `branch.<defaultBranch>.merge=refs/heads/<defaultBranch>` in staging, before the binding file and the post-check. `push.autosetupremote=true` stays. An `existing` reopen writes nothing new, and cloned repositories are unchanged (`checkout --track` already wrote their upstream).
+   - Text: §9.4 step 3, §9.5, §17.2 E1 and §20.
+   - Vectors: new `gitConfig.branchUpstream`, and `gitConfig.match` now allows `branch.*` lines after the first listed line. `expectLocalList` is unchanged.
+   - Check: `check.mjs` checks the branchUpstream lines, that `push.autosetupremote=true` stays, and that the notice still ends with a plain `git push`.
+2. **DEFAULT os-route wording (I1 finding 2).** §1 said "DEFAULT deployment, any token or bearer, os route → 404". What Works answers, and what the Works tests assert, is exactly what an undeclared /v1 path answers for the same request:
+   - 404 for a bearer the middleware accepts;
+   - 401 `identity_token_invalid` for a non-production EZiL ID client (OS-staging, Universe-staging), which is outside DEFAULT `v1Clients`;
+   - 403 `ezil_id_delegation_forbidden` for a production client with an act-as header.
+
+   Behaviour is unchanged.
+   - Text: §0 I2, §1 and §6.2 now say this.
+   - Vectors: `works.authRule` step 0 and `unpinnedSemantics` now say this, and `works.authCases` gains five DEFAULT rows (OS-staging and Universe-staging × os-grant and os-revoke, plus OS-staging with act-as on os-grant), each answering 401 `identity_token_invalid`.
+   - Check: `check.mjs` requires those rows.
+3. **Bump.** `contractVersion` is now 1.0.1, and both README pins are updated. The gateway extract changes only in `contractVersion` and `sourceVectorsSha256`: its constants, forbidden hosts and regexes are unchanged.
+   - The vectors copy was re-seeded into EZiL-Works and universe-2.0, and the extract into EZiL CLI. Each consumer's sha256 and version constants were updated in the same commit (§18).

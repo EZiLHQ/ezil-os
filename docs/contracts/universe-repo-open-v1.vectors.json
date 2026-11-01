@@ -1,0 +1,1138 @@
+{
+  "contract": "universe-repo-open-v1",
+  "contractVersion": "1.0.2",
+  "about": [
+    "Machine-checkable constants and cases for docs/contracts/universe-repo-open-v1.md.",
+    "Only the lead changes this file. Any change bumps contractVersion and the pinned sha256 (README-universe-repo-open.md).",
+    "Consumers commit a byte-identical copy and assert its sha256; they never restate a value from here without a test that compares it to this file.",
+    "No secret values. The only real Auth0 client ids here are the two production ones, listed so staging code can refuse them.",
+    "Regex sources are JavaScript syntax with no flags. PHP consumers anchor with \\A and \\z (PHP $ also matches before a final newline); Python consumers use re.fullmatch.",
+    "Grant-shaped strings are never written literally. Expand ${repeat:<char>:<count>} before use (see expansion)."
+  ],
+  "expansion": {
+    "syntax": "${repeat:<one character>:<decimal count>}",
+    "rule": "Replace every occurrence with <character> repeated <count> times, left to right, before any other use of the string.",
+    "examples": [["egg_${repeat:a:3}", "egg_aaa"], ["x${repeat:0:2}y", "x00y"]]
+  },
+  "constants": {
+    "OS_STAGING_ORIGIN": "https://os-staging.ezil.work",
+    "OS_PRODUCTION_ORIGINS": ["https://os.ezil.org", "https://os.ezil.work"],
+    "OS_PRODUCTION_APP_ORIGIN": "https://os.ezil.work",
+    "OS_LANDING_ORIGIN": "https://os.ezil.org",
+    "UNIVERSE_STAGING_HOST": "universe-staging.ezil.work",
+    "WORKS_STAGING_ORIGIN": "https://api-preview.ezil.work",
+    "GIT_STAGING_HOST": "git-preview.ezil.work",
+    "GIT_PRODUCTION_HOST": "github.ezil.work",
+    "PREVIEW_SUPABASE_ORIGIN": "https://13-203-99-168.sslip.io",
+    "PRODUCTION_AUTH0_CLIENTS": ["Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx", "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"],
+    "CLIENT_ID_UNPINNED": "UNPINNED",
+    "STAGING_FORBIDDEN_HOSTS": [
+      "api.ezil.work", "api-staging.ezil.work", "api-aws.ezil.work",
+      "github.ezil.work", "git.ezil.work", "git-staging.ezil.work",
+      "db.ezil.work", "13-206-183-230.sslip.io"
+    ],
+    "GATEWAY_PREVIEW_RL_NAMESPACE": "4203",
+    "GATEWAY_TAKEN_RL_NAMESPACES": ["4201", "4202"],
+    "OS_ROUTE": "/api/shell/repo-open",
+    "SHELL_ENDPOINT_KEY": "repoOpen",
+    "WORKER_ROUTE_TEMPLATE": "/sandbox/<sandboxName>/repo-open",
+    "WORKS_OS_GRANT_ROUTE_TEMPLATE": "/v1/builder/selfserve-repositories/<repositoryId>/os-grant",
+    "WORKS_OS_REVOKE_ROUTE": "/v1/builder/selfserve-repositories/os-sessions/revoke",
+    "REAUTH_PATH": "/auth/auth0/login",
+    "REAUTH_PARAM": "returnUrl",
+    "REAUTH_FORBIDDEN_PARAM": "returnTo",
+    "REAUTH_SESSION_KEY_PREFIX": "ezil:repo-open:reauth:",
+    "COOKIE_NAME": "__Host-ezil-id",
+    "COOKIE_ATTRIBUTES": "HttpOnly; Secure; SameSite=Lax; Path=/",
+    "COOKIE_PLAINTEXT_VERSION": 1,
+    "COOKIE_AAD": "ezil/id-token/v1",
+    "COOKIE_HKDF_HASH": "sha256",
+    "COOKIE_HKDF_SALT": "https://id.ezil.work/",
+    "COOKIE_HKDF_INFO": "ezil/auth0/id-token-seal/v1",
+    "COOKIE_MAX_AGE_S": 28800,
+    "COOKIE_MIN_SET_REMAINING_S": 300,
+    "COOKIE_MIN_USE_REMAINING_S": 120,
+    "COMPUTER_LABEL_PREFIX": "ezil-os/computer-label/v1|",
+    "COMPUTER_LABEL_HEX_CHARS": 16,
+    "OS_SESSION_DEVICE_LABEL_PREFIX": "ezil-os ",
+    "OS_SESSION_OS": "ezil-os",
+    "OS_SESSION_CLI_VERSION": "os-repo-v1",
+    "GRANT_USERNAME": "ezil",
+    "GRANT_SCOPES": ["write", "read"],
+    "SIGNATURE_HEADER": "x-ezil-signature",
+    "SIGNATURE_FORMAT": "t=<ms>,v1=<hex HMAC-SHA256>",
+    "SIGNATURE_PAYLOAD_TEMPLATE": "<t>.POST./sandbox/<sandboxName>/repo-open.<sha256hex(body)>",
+    "SIGNATURE_MAX_SKEW_MS": 300000,
+    "WORKSPACE_ROOT_DEFAULT": "/workspace",
+    "REPO_DIR_TEMPLATE": "repos/<handle>/<name>",
+    "STAGING_ROOT_NAME": ".ezil-staging",
+    "STAGING_DIR_TEMPLATE": ".ezil-staging/<uuid>",
+    "BINDING_FILE": ".git/ezil-repo.json",
+    "SNAPSHOT_INTERNAL_NAMES": [".ezil-hydrated.json", ".ezil-flush-manifest.json"],
+    "SNAPSHOT_CACHE_NAMES": ["node_modules", ".next", ".turbo", "dist"],
+    "SNAPSHOT_NESTED_INDEX_MAX": 256,
+    "RUN_DIRS": ["/run/ezil", "/run/ezil/bin", "/run/ezil/git", "/run/ezil/git/grants", "/run/ezil/git/incoming", "/run/ezil/requests", "/run/ezil/locks"],
+    "KERNEL_PATH": "/run/ezil/bin/ezil-repo-open.mjs",
+    "HELPER_MODULE_PATH": "/run/ezil/bin/ezil-git-grant.mjs",
+    "HELPER_WRAPPER_PATH": "/run/ezil/bin/ezil-git-grant",
+    "GRANT_FILE_TEMPLATE": "/run/ezil/git/grants/<handle>__<name>.json",
+    "LOCK_TEMPLATE": "/run/ezil/locks/<handle>__<name>",
+    "LOCK_OWNER_TEMPLATE": "/run/ezil/locks/<handle>__<name>/owner",
+    "HELPER_HINT_EXPIRED": "EZiL: Git access for <handle>/<name> expired. Reopen it from EZiL OS (Code renews it while open).",
+    "HELPER_HINT_NOT_CONNECTED": "EZiL: Git access for this repository is not connected. Reopen it from EZiL OS.",
+    "SNAPSHOT_LIMIT_BYTES": 536870912,
+    "SNAPSHOT_MAX_ENTRIES": 100000,
+    "REPO_BUDGET_FRACTION": 0.8,
+    "TAR_BLOCK_BYTES": 512,
+    "TAR_PAX_NAME_BYTES": 100,
+    "TAR_PAX_RECORD_SLACK_BYTES": 64,
+    "TAR_ARCHIVE_TAIL_BYTES": 11264,
+    "BODY_LIMITS_BYTES": {
+      "osRouteRequest": 2048,
+      "worksOsGrantRequest": 256,
+      "worksResponse": 16384,
+      "workerRequest": 4096,
+      "helperStdin": 4096
+    },
+    "WAKE_RETRY_ERROR_CODES": ["computer_not_running", "workspace_not_ready", "workspace_busy"]
+  },
+  "timeouts": {
+    "KERNEL_GIT_COMMAND_MAX_MS": 80000,
+    "PREPARE_WINDOW_MS": 85000,
+    "PREPARE_RESERVE_MS": 20000,
+    "COMMIT_EXEC_MAX_MS": 10000,
+    "COMMIT_MIN_REMAINING_MS": 15000,
+    "WORKER_DEADLINE_MS": 105000,
+    "OS_TO_WORKER_FETCH_MS": 120000,
+    "OS_TO_WORKS_FETCH_MS": 10000,
+    "ROUTE_MAX_DURATION_MS": 150000,
+    "AWS_RELAY_POLL_MS": 1500,
+    "GRANT_TTL_MS": 900000,
+    "OS_ACCEPT_EXPIRY_SLACK_MS": 60000,
+    "WORKER_ACCEPT_EXPIRY_MAX_MS": 960000,
+    "HELPER_MIN_REMAINING_MS": 30000,
+    "OS_SESSION_TTL_MS": 28800000,
+    "OS_SESSION_MIN_REMAINING_MS": 960000,
+    "REFRESH_LEAD_MS": 300000,
+    "VISIBILITY_REFRESH_BELOW_MS": 360000,
+    "REMINT_AFTER_MS": 240000,
+    "BOOTSTRAP_TTL_MS": 300000,
+    "WAKE_DELAYS_MS": [2000, 3000, 5000],
+    "WAKE_REPEAT_DELAY_MS": 5000,
+    "WAKE_CAP_MS": 180000,
+    "REPOSITORY_NOT_READY_RETRY_MS": 10000,
+    "SIGNOUT_BUDGET_MS": 3000,
+    "LOCK_STALE_MS": 600000,
+    "strictChains": [
+      ["KERNEL_GIT_COMMAND_MAX_MS", "PREPARE_WINDOW_MS", "WORKER_DEADLINE_MS", "OS_TO_WORKER_FETCH_MS", "ROUTE_MAX_DURATION_MS"],
+      ["COMMIT_EXEC_MAX_MS", "COMMIT_MIN_REMAINING_MS", "PREPARE_RESERVE_MS"],
+      ["HELPER_MIN_REMAINING_MS", "REFRESH_LEAD_MS", "VISIBILITY_REFRESH_BELOW_MS", "GRANT_TTL_MS", "OS_SESSION_MIN_REMAINING_MS", "OS_SESSION_TTL_MS"],
+      ["REMINT_AFTER_MS", "BOOTSTRAP_TTL_MS"],
+      ["AWS_RELAY_POLL_MS", "WORKER_DEADLINE_MS"]
+    ],
+    "equalities": [
+      ["PREPARE_WINDOW_MS", "WORKER_DEADLINE_MS - PREPARE_RESERVE_MS"],
+      ["WORKER_ACCEPT_EXPIRY_MAX_MS", "GRANT_TTL_MS + OS_ACCEPT_EXPIRY_SLACK_MS"],
+      ["OS_SESSION_MIN_REMAINING_MS", "GRANT_TTL_MS + OS_ACCEPT_EXPIRY_SLACK_MS"]
+    ],
+    "lessThan": [
+      ["OS_TO_WORKER_FETCH_MS + OS_TO_WORKS_FETCH_MS", "ROUTE_MAX_DURATION_MS"]
+    ]
+  },
+  "predicates": {
+    "no_double_dot": "the value does not contain '..'",
+    "no_git_suffix": "the value does not end with '.git'",
+    "no_double_slash": "the value does not contain '//'",
+    "no_trailing_slash": "the value does not end with '/'",
+    "no_lock_suffix": "the value does not end with '.lock'",
+    "no_component_leading_dot": "the value does not contain '/.'",
+    "no_trailing_dot": "the value does not end with '.'",
+    "int64_max": "the value, read as a decimal integer, is at most 9223372036854775807 (Works owned() refuses larger refs)"
+  },
+  "regex": {
+    "UUID_RE": { "source": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "predicates": [] },
+    "HANDLE_RE": { "source": "^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$", "predicates": [] },
+    "NAME_RE": { "source": "^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$", "predicates": ["no_double_dot", "no_git_suffix"] },
+    "BRANCH_RE": { "source": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$", "predicates": ["no_double_dot", "no_double_slash", "no_trailing_slash", "no_lock_suffix", "no_component_leading_dot", "no_trailing_dot"] },
+    "GRANT_RE": { "source": "^egg_[0-9a-f]{64}$", "predicates": [] },
+    "COMPUTER_LABEL_RE": { "source": "^[0-9a-f]{16}$", "predicates": [] },
+    "SANDBOX_NAME_RE": { "source": "^guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}$", "predicates": [], "note": "Stricter than deriveGuacamoleSandboxId (a988f28c app/src/server/lib/cloudflare-guacamole-provider.ts:1273-1277 strips with /[^a-z0-9]/gi and so keeps uppercase). Equal in practice: user and computer ids are lowercase UUIDs. The Worker body check uses this regex; an uppercase name is refused, never lowercased." },
+    "AWS_CODE_HOST_RE": { "source": "^aws-\\d{4,5}-guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}-aws\\.", "predicates": [] },
+    "PATH_SEGMENT_RE": { "source": "^[A-Za-z0-9._-]+$", "predicates": [] },
+    "NODE_PATH_RE": { "source": "^/[A-Za-z0-9._/-]+$", "predicates": [] },
+    "NUMERIC_REF_RE": { "source": "^[1-9][0-9]{0,18}$", "predicates": ["int64_max"] },
+    "WORKS_OS_GRANT_PATH_RE": { "source": "^/v1/builder/selfserve-repositories/[^/]+/os-grant$", "predicates": [] },
+    "WORKER_ROUTE_RE": { "source": "^/sandbox/([^/]+)/repo-open$", "predicates": [] }
+  },
+  "regexCases": {
+    "UUID_RE": {
+      "valid": ["8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "00000000-0000-0000-0000-000000000000"],
+      "invalid": [
+        "8D4C2F1E-3B5A-4C7D-9E8F-0A1B2C3D4E5F", "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5F", "{8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f}",
+        "8d4c2f1e3b5a4c7d9e8f0a1b2c3d4e5f", "repo-42", "42", "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5",
+        "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f\n", " 8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", ""
+      ]
+    },
+    "HANDLE_RE": {
+      "valid": ["a", "0", "acme", "a-b", "a1", "a--b", "${repeat:a:39}"],
+      "invalid": ["", "a-", "-a", "a_b", "a.b", "Acme", "${repeat:a:40}", "a\n", "a b", "a/b"]
+    },
+    "NAME_RE": {
+      "valid": ["a", "0", "git", "site", "a-b", "a.b", "a_b", "my.project_1-2", "web.v2", "a${repeat:b:98}c"],
+      "invalid": [
+        "", "a-", "a.", "a_", "a..b", "a..", "-a", ".a", "_a", "A", "Site", "site.git", "a.git", ".git",
+        "a/b", "a b", "a${repeat:b:99}c", "a\n", "é"
+      ]
+    },
+    "BRANCH_RE": {
+      "valid": ["main", "master", "develop", "feature/x", "release-1.2", "v1_0", "a/b/c", "${repeat:a:244}"],
+      "invalid": ["", "-x", ".x", "a..b", "a//b", "a/", "x.lock", "a/.b", "a.", "a b", "a~1", "a^", "a:b", "a\n", "${repeat:a:245}"]
+    },
+    "GRANT_RE": {
+      "valid": ["egg_${repeat:a:64}", "egg_${repeat:0:64}", "egg_${repeat:f:64}"],
+      "invalid": ["", "egg_${repeat:A:64}", "egg_${repeat:a:63}", "egg_${repeat:a:65}", "ecr_${repeat:a:64}", "egg_${repeat:g:64}", "egg_${repeat:a:64}\n", " egg_${repeat:a:64}"]
+    },
+    "COMPUTER_LABEL_RE": {
+      "valid": ["1ee341fade8595ac", "0000000000000000"],
+      "invalid": ["1EE341FADE8595AC", "1ee341fade8595a", "1ee341fade8595acd", "1ee341fade8595ac\n", ""]
+    },
+    "SANDBOX_NAME_RE": {
+      "valid": ["guac-a-b", "guac-0a1b2c3d4e5f6a7b-6f1c2d3e4a5b4c6d"],
+      "invalid": ["guac--b", "guac-a-", "aws-a-b", "guac-a-b/../x", "guac-${repeat:a:17}-b", "guac-a-b\n", ""]
+    },
+    "AWS_CODE_HOST_RE": {
+      "valid": ["aws-8443-guac-a-b-aws.zone.example", "aws-8443-guac-0a1b2c3d4e5f6a7b-6f1c2d3e4a5b4c6d-aws.computers.example"],
+      "invalid": ["8443-guac-a-b-tok.preview.example", "aws-8443-guac-a-b-awsx.zone.example", "aws-80-guac-a-b-aws.zone.example", "xaws-8443-guac-a-b-aws.zone.example", "aws-8443-guac-a-b-aws"]
+    },
+    "PATH_SEGMENT_RE": {
+      "valid": ["src", "main.ts", "a_b-c.d"],
+      "invalid": ["", "a b", "a/b", "a%2Fb", "é"]
+    },
+    "NODE_PATH_RE": {
+      "valid": ["/usr/bin/node", "/usr/local/bin/node", "/opt/node-v22.11.0/bin/node"],
+      "invalid": ["node", "/usr/bin/no de", "/usr/bin/node;id", "/usr/bin/$(id)", "/usr/bin/node'"]
+    },
+    "NUMERIC_REF_RE": {
+      "valid": ["1", "42", "9223372036854775807"],
+      "invalid": ["0", "042", "-1", "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "${repeat:9:20}", "9223372036854775808", "${repeat:9:19}", "42\n"]
+    },
+    "WORKS_OS_GRANT_PATH_RE": {
+      "valid": ["/v1/builder/selfserve-repositories/3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c/os-grant"],
+      "invalid": ["/v1/builder/selfserve-repositories/os-grant", "/v1/builder/selfserve-repositories/a/b/os-grant", "/v1/builder/selfserve-repositories/a/os-grant/"]
+    },
+    "WORKER_ROUTE_RE": {
+      "valid": ["/sandbox/guac-a-b/repo-open"],
+      "invalid": ["/sandbox/guac-a-b/ai-credential", "/sandbox/guac-a-b/repo-open/", "/sandbox//repo-open"]
+    }
+  },
+  "upstreamPatterns": {
+    "works.selfserveName": { "source": "^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$", "predicates": ["no_double_dot", "no_git_suffix"], "cite": "EZiL-Works 7974ab6c packages/db/src/repositories/selfserve-repositories-v0.ts:12-13" },
+    "works.selfserveHandle": { "source": "^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$", "predicates": [], "cite": "EZiL-Works 7974ab6c packages/db/src/repositories/selfserve-repositories-v0.ts:11" },
+    "universe.validName": { "source": "^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$", "phpSource": "\\A[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\\z", "predicates": ["no_double_dot", "no_git_suffix"], "cite": "universe-2.0 9dc58adf core/app/Domain/BuilderProjects/RepositoryNames.php:25-29" },
+    "universe.handle": { "source": "^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$", "phpSource": "\\A[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\\z", "predicates": [], "cite": "universe-2.0 9dc58adf core/app/Services/WorksApiClient.php:60" },
+    "gateway.routeName": { "source": "^[a-z0-9][a-z0-9._-]{0,99}$", "predicates": ["no_double_dot", "no_git_suffix"], "cite": "EZiL CLI a9ec994 packages/contract/src/git-gateway.ts:36 (ROUTE_NAME_PATTERN), :43 (parse regex), :46 (the .. and .git predicates)" },
+    "gateway.routeNamespace": { "source": "^[a-z0-9][a-z0-9-]{0,63}$", "predicates": [], "cite": "EZiL CLI a9ec994 packages/contract/src/git-gateway.ts:35 (ROUTE_NAMESPACE_PATTERN), :43 (parse regex)" },
+    "gateway.grant": { "source": "^egg_[0-9a-f]{64}$", "predicates": [], "cite": "EZiL CLI a9ec994 packages/contract/src/git-gateway.ts:24" },
+    "os.appLinkUuid": { "source": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "predicates": [], "cite": "EZiL-OS a988f28c shell/ezil/app-link.js:13" },
+    "works.selfserveNumericRef": { "source": "^[1-9][0-9]{0,18}$", "predicates": ["int64_max"], "cite": "EZiL-Works 7974ab6c packages/db/src/repositories/selfserve-repositories-v0.ts:43 (regex and the BigInt <= 9223372036854775807n bound)" }
+  },
+  "regexRelations": [
+    { "kind": "equal", "a": "NAME_RE", "b": "works.selfserveName", "note": "W1b asserts equality with the Works zod schema" },
+    { "kind": "equal", "a": "NAME_RE", "b": "universe.validName", "note": "U1 asserts equality with RepositoryNames::validName" },
+    { "kind": "equal", "a": "HANDLE_RE", "b": "works.selfserveHandle" },
+    { "kind": "equal", "a": "HANDLE_RE", "b": "universe.handle" },
+    { "kind": "equal", "a": "GRANT_RE", "b": "gateway.grant" },
+    { "kind": "equal", "a": "UUID_RE", "b": "os.appLinkUuid" },
+    { "kind": "equal", "a": "NUMERIC_REF_RE", "b": "works.selfserveNumericRef" },
+    { "kind": "subset", "a": "NAME_RE", "b": "gateway.routeName", "note": "everything Works can issue, the gateway can route" },
+    { "kind": "subset", "a": "HANDLE_RE", "b": "gateway.routeNamespace" }
+  ],
+  "regexRelationsRule": "equal: identical source and predicate set. subset: checked structurally, not by sampling. Both patterns must be position-class languages (a first-character class, a middle-character class, a last-character class and a set of lengths); check.mjs derives each class over printable ASCII plus control and non-ASCII probes, verifies the derived profile reproduces the pattern on sampled strings, and requires every class and the length set of a to be contained in b's, and b's predicates to be a subset of a's.",
+  "fixtures": {
+    "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f",
+    "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+    "otherRepositoryId": "5a6b7c8d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+    "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f",
+    "sandboxName": "guac-0a1b2c3d4e5f6a7b-6f1c2d3e4a5b4c6d",
+    "handle": "acme",
+    "name": "site",
+    "defaultBranch": "main",
+    "grant": "egg_${repeat:a:64}",
+    "nowMs": 1793404800000,
+    "clientIds": {
+      "OS_STAGING": "test-os-staging-client",
+      "UNIVERSE_STAGING": "test-universe-staging-client",
+      "PROD_CLI": "Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx",
+      "PROD_UNIVERSE_WEB": "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"
+    }
+  },
+  "link": {
+    "emitterRule": "Universe emits, and ProjectBoard renders, only the canonical string OS_STAGING_ORIGIN + '/app/code?project=' + P + '&repo=' + R, with P and R matching UUID_RE. Any other string is invalid (no normalisation).",
+    "emitter": {
+      "valid": [
+        "https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c"
+      ],
+      "invalid": [
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&path=src", "extra_key"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&token=x", "extra_key"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&ref=main", "extra_key"],
+        ["https://os-staging.ezil.work/app/code?repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "not_canonical"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "not_canonical"],
+        ["https://os-staging.ezil.work/app/code?repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "not_canonical"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C", "repo_invalid"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=repo-42", "repo_invalid"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=https%3A%2F%2Fgithub.ezil.work%2Facme%2Fsite.git", "repo_invalid"],
+        ["https://os-staging.ezil.work/app/code?project=42&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "project_invalid"],
+        ["http://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "origin"],
+        ["https://os-staging.ezil.work:8443/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "origin"],
+        ["https://user:pass@os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "origin"],
+        ["https://os.ezil.org/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "origin"],
+        ["https://os-staging.ezil.work.evil.example/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "origin"],
+        ["https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c#x", "fragment"],
+        ["https://os-staging.ezil.work/app/code/?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path"],
+        ["https://os-staging.ezil.work/os?app=code&project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path"],
+        ["javascript:alert(1)", "origin"],
+        ["", "unparseable"]
+      ]
+    },
+    "parserRule": "OS keeps a988f28c shell/ezil/app-link.js parseAppLink unchanged. These cases pin the behaviour the repo-open lanes rely on; check.mjs runs them against the real module.",
+    "parser": [
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" } } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&path=src/main.ts",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path": "src/main.ts" } } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&path=../x",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" }, "pathRejected": "dot_segment" } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&path=src%2Fmain.ts",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" }, "pathRejected": "encoded_separator" } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&path=",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" }, "pathRejected": "empty" } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&utm_source=universe",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" } } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f",
+        "expect": { "id": "code", "projectRejected": "repo_missing" } },
+      { "location": "/app/code?repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "expect": { "id": "code", "projectRejected": "project_missing" } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C",
+        "expect": { "id": "code", "projectRejected": "repo_invalid" } },
+      { "location": "/app/code?project=acme/site&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "expect": { "id": "code", "projectRejected": "project_invalid" } },
+      { "location": "/app/code?repo=acme/site",
+        "expect": { "id": "code", "projectRejected": "project_missing" } },
+      { "location": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "expect": null },
+      { "location": "/os?app=code&project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "expect": { "id": "code", "project": { "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" } } }
+    ],
+    "path": {
+      "valid": ["src", "src/main.ts", "a.b/c_d-e", "${repeat:a:255}"],
+      "invalid": [
+        ["", "", "empty"],
+        ["/abs", "/abs", "absolute"],
+        ["a\\b", "a\\b", "backslash"],
+        ["../x", "../x", "dot_segment"],
+        ["a/./b", "a/./b", "dot_segment"],
+        ["a//b", "a//b", "segment"],
+        ["a/", "a/", "segment"],
+        ["a b", "a b", "segment"],
+        ["${repeat:a:256}", "${repeat:a:256}", "too_long"],
+        ["src/main.ts", "src%2Fmain.ts", "encoded_separator"],
+        ["src\\main.ts", "src%5Cmain.ts", "encoded_separator"],
+        ["a\u0001b", "a\u0001b", "control"]
+      ]
+    }
+  },
+  "ezilHosts": [
+    { "appUrl": "https://universe-staging.ezil.work", "expect": { "osOrigin": "https://os-staging.ezil.work", "gitHost": "git-preview.ezil.work" } },
+    { "appUrl": "https://universe-staging.ezil.work/", "expect": { "osOrigin": "https://os-staging.ezil.work", "gitHost": "git-preview.ezil.work" } },
+    { "appUrl": "https://ezil.work", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "https://universe.ezil.work", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "http://localhost:8000", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "http://universe-staging.ezil.work", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "https://universe-staging.ezil.work:8443", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "https://universe-staging.ezil.work.evil.example", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } },
+    { "appUrl": "", "expect": { "osOrigin": null, "gitHost": "github.ezil.work" } }
+  ],
+  "boardExecution": {
+    "states": ["ready", "os_launch_pending", "blocked", "unavailable"],
+    "order": ["owner (non-owner is 404 before any of this)", "host", "repository_not_connected", "project_unsupported", "repository_unsupported", "repository_other_environment", "launch_verified", "ready"],
+    "cases": [
+      { "name": "staging, verified, valid ids, staging clone host",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "ready", "reason": null, "launchUrl": "https://os-staging.ezil.work/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" } },
+      { "name": "staging, not yet verified",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": false, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "os_launch_pending", "reason": "launch_not_verified", "launchUrl": null } },
+      { "name": "production host",
+        "input": { "appUrl": "https://ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://github.ezil.work/acme/site.git" },
+        "expect": { "state": "blocked", "reason": "os_contract_unavailable", "launchUrl": null } },
+      { "name": "no repository yet",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": null, "repositoryId": null, "cloneUrl": null },
+        "expect": { "state": "unavailable", "reason": "repository_not_connected", "launchUrl": null } },
+      { "name": "fixture repository id",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "repo-42", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "unavailable", "reason": "repository_unsupported", "launchUrl": null } },
+      { "name": "uppercase repository id is not normalised",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "unavailable", "reason": "repository_unsupported", "launchUrl": null } },
+      { "name": "row provisioned against another Works (V2.2)",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://github.ezil.work/acme/site.git" },
+        "expect": { "state": "unavailable", "reason": "repository_other_environment", "launchUrl": null } },
+      { "name": "clone url missing",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": null },
+        "expect": { "state": "unavailable", "reason": "repository_other_environment", "launchUrl": null } },
+      { "name": "clone url with userinfo",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://ezil:x@git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "unavailable", "reason": "repository_other_environment", "launchUrl": null } },
+      { "name": "invalid project id",
+        "input": { "appUrl": "https://universe-staging.ezil.work", "launchVerified": true, "publicId": "17", "worksRepositoryRef": "42", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        "expect": { "state": "unavailable", "reason": "project_unsupported", "launchUrl": null } }
+    ]
+  },
+  "activation": {
+    "rule": "active = REPO_OPEN_TARGETS[origin] defined AND pinned is OS-effective (not UNPINNED, not empty, not in PRODUCTION_AUTH0_CLIENTS) AND envClientId === pinned. OS cannot see the Universe pin: the 'OS pin equals the Universe pin' rule is enforced by Works (osClient null, works.effectivePins) and by the lead's X1 P3 pin check, which refuses equal ids.",
+    "targets": { "https://os-staging.ezil.work": { "worksOrigin": "https://api-preview.ezil.work", "gitHost": "git-preview.ezil.work" } },
+    "cases": [
+      { "name": "staging deployment, pinned dedicated client", "origin": "https://os-staging.ezil.work", "envClientId": "OS_STAGING", "pinnedClientId": "OS_STAGING", "active": true },
+      { "name": "pin not yet made", "origin": "https://os-staging.ezil.work", "envClientId": "OS_STAGING", "pinnedClientId": "UNPINNED", "active": false },
+      { "name": "spoofed x-forwarded-host on a deployment that logs in with a production client", "origin": "https://os-staging.ezil.work", "envClientId": "PROD_UNIVERSE_WEB", "pinnedClientId": "OS_STAGING", "active": false },
+      { "name": "staging still on the Universe production client", "origin": "https://os-staging.ezil.work", "envClientId": "PROD_UNIVERSE_WEB", "pinnedClientId": "UNPINNED", "active": false },
+      { "name": "pin mistakenly set to a production client", "origin": "https://os-staging.ezil.work", "envClientId": "PROD_CLI", "pinnedClientId": "PROD_CLI", "active": false },
+      { "name": "production canonical origin", "origin": "https://os.ezil.org", "envClientId": "OS_STAGING", "pinnedClientId": "OS_STAGING", "active": false },
+      { "name": "production alias origin", "origin": "https://os.ezil.work", "envClientId": "OS_STAGING", "pinnedClientId": "OS_STAGING", "active": false },
+      { "name": "local dev origin", "origin": "http://localhost:3000", "envClientId": "OS_STAGING", "pinnedClientId": "OS_STAGING", "active": false },
+      { "name": "no client configured", "origin": "https://os-staging.ezil.work", "envClientId": null, "pinnedClientId": "OS_STAGING", "active": false },
+      { "name": "deployment client differs from the pin", "origin": "https://os-staging.ezil.work", "envClientId": "UNIVERSE_STAGING", "pinnedClientId": "OS_STAGING", "active": false }
+    ],
+    "inactiveEffects": [
+      "POST /api/shell/repo-open answers 404 {ok:false,errorCode:'repo_open_unavailable',retryable:false} before any Works or Worker call",
+      "the Auth0 callback sets no __Host-ezil-id cookie",
+      "signout makes no Works call",
+      "desktopState.endpoints has no repoOpen key"
+    ]
+  },
+  "works": {
+    "deploymentRule": "deployment = apiOrigin === WORKS_STAGING_ORIGIN ? STAGING : DEFAULT. A pin is effective only if it is not UNPINNED, not empty and not in PRODUCTION_AUTH0_CLIENTS; at Works only, the OS pin is also ineffective when it equals the Universe pin. createServer mounts the os routes (osPaths) only when deployment.osClient !== null; otherwise their paths are unmatched for every request, including act-as requests.",
+    "deployments": {
+      "DEFAULT": { "v1Clients": ["Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx", "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"], "osClient": null, "gitHost": "github.ezil.work" },
+      "STAGING": { "v1Clients": "[universePin, osPin] with ineffective pins removed", "osClient": "osPin if effective, else null", "gitHost": "git-preview.ezil.work" }
+    },
+    "selection": [
+      { "apiOrigin": null, "deployment": "DEFAULT" },
+      { "apiOrigin": "https://api.ezil.work", "deployment": "DEFAULT" },
+      { "apiOrigin": "https://api-staging.ezil.work", "deployment": "DEFAULT" },
+      { "apiOrigin": "https://api-aws.ezil.work", "deployment": "DEFAULT" },
+      { "apiOrigin": "https://api-preview.ezil.work", "deployment": "STAGING" }
+    ],
+    "effectivePins": [
+      { "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING", "OS_STAGING"], "osClient": "OS_STAGING" } },
+      { "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING"], "osClient": null } },
+      { "pins": { "os": "OS_STAGING", "universe": "UNPINNED" }, "expect": { "v1Clients": ["OS_STAGING"], "osClient": "OS_STAGING" } },
+      { "pins": { "os": "OS_STAGING", "universe": "PROD_UNIVERSE_WEB" }, "expect": { "v1Clients": ["OS_STAGING"], "osClient": "OS_STAGING" }, "note": "D-AUTH0-U: Universe staging still on 2tVk0 is treated as UNPINNED" },
+      { "pins": { "os": "PROD_CLI", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING"], "osClient": null } },
+      { "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING"], "osClient": null }, "note": "OS and Universe must not share a client" },
+      { "pins": { "os": "UNPINNED", "universe": "UNPINNED" }, "expect": { "v1Clients": [], "osClient": null } }
+    ],
+    "osPaths": {
+      "grant": { "method": "POST", "pathRe": "WORKS_OS_GRANT_PATH_RE" },
+      "revoke": { "method": "POST", "path": "/v1/builder/selfserve-repositories/os-sessions/revoke" }
+    },
+    "authRule": [
+      "0. Mounting: createServer drops the two os routes from the mounted selfserve module when deployment.osClient === null (a path filter over the declared module; manifest.ts unchanged). Their paths are then undeclared for every request, whatever the bearer or act-as header, and each request gets exactly what an undeclared /v1 path answers for it today, byte-identical to 7974ab6c: 404 unmatched_route for a bearer the /v1 middleware accepts (a production EZiL ID client without act-as, or a Supabase bearer with or without act-as); otherwise the middleware's own refusal, which precedes routing: 401 identity_token_invalid for an EZiL ID client outside v1Clients (on DEFAULT: OS-staging and Universe-staging), and 403 ezil_id_delegation_forbidden for an accepted EZiL ID bearer with an act-as header.",
+      "1. EZiL ID bearer: verify with acceptedClients = deployment.v1Clients; verifyEzilIdToken returns the matched client. Failure: 401 identity_token_invalid (unchanged middleware).",
+      "2. Middleware, centrally, immediately after verifyEzilIdToken returns and before resolveEzilIdAccount: a token whose matched client is deployment.osClient on any path that is not an os path: 401 identity_token_invalid. No GoTrue admin call is made for such a request.",
+      "3. Then the unchanged middleware: account resolution, account_suspended, ezil_id_builders_only, and an act-as header with an EZiL ID bearer: 403 ezil_id_delegation_forbidden.",
+      "4. A Supabase bearer passes the middleware as today. On a mounted os route, an act-as header reaches delegatedRequest first (403 act_as_operator_required for a non-operator); without one, the os handler refuses it because it carries no matched client: 401 identity_token_invalid.",
+      "5. os handlers: matched client !== osClient: 401 identity_token_invalid. (deployment.osClient === null cannot reach a handler; the handler also returns c.notFound() if it ever does.)",
+      "6. os-grant accepts only a lowercase UUID ref (any other ref: 404 not_found). Every other self-serve route keeps the numeric ref only (NUMERIC_REF_RE with int64_max), on every deployment."
+    ],
+    "authCases": [
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": "handler" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-revoke", "ref": null, "expect": { "status": "handler" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "numeric", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uppercase_uuid", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "create", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "freeze", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "push-tests", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "availability", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": "handler" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "clone-token", "ref": "uuid", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "create", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-revoke", "ref": null, "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": "handler" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "PROD_UNIVERSE_WEB" }, "token": "PROD_UNIVERSE_WEB", "route": "create", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "os-revoke", "ref": null, "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "clone-token", "ref": "uuid", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "freeze", "ref": "uuid", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "push-tests", "ref": "uuid", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "clone-token", "ref": "numeric", "expect": { "status": "handler" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "create", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "clone-token", "ref": "numeric_max", "expect": { "status": "handler" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "clone-token", "ref": "numeric_overflow", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" }, "note": "V3.7: not mounted, so act-as never reaches delegatedRequest" },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": true, "route": "os-revoke", "ref": null, "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": false, "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" }, "note": "1.0.1: a non-production EZiL ID client is outside DEFAULT v1Clients, so the /v1 middleware refuses it before routing, byte-identical to an undeclared /v1 path" },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-revoke", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-revoke", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "DEFAULT", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" }, "note": "1.0.1: token verification precedes the act-as check" },
+      { "deployment": "STAGING", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": false, "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 403, "error": "act_as_operator_required" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 403, "error": "ezil_id_delegation_forbidden" } },
+      { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "actAs": true, "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" }, "note": "the central OS-token refusal precedes account resolution and the act-as check" },
+      { "deployment": "STAGING", "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" }, "note": "OS pin equal to the Universe pin: OS (which cannot see the Universe pin) is active and sends that token; Works has osClient null, so OS maps the 404 to repository_unavailable. X1 P3 refuses equal pins." }
+    ],
+    "refs": { "uuid": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "uppercase_uuid": "3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C", "numeric": "42", "numeric_max": "9223372036854775807", "numeric_overflow": "9223372036854775808" },
+    "osGrantRequest": {
+      "valid": [{ "computerLabel": "1ee341fade8595ac" }],
+      "invalid": [{}, { "computerLabel": "1EE341FADE8595AC" }, { "computerLabel": "1ee341fade8595a" }, { "computerLabel": "1ee341fade8595ac", "extra": 1 }, { "computerLabel": 7 }],
+      "invalidStatus": 422,
+      "invalidError": "invalid_request"
+    },
+    "osRevokeRequest": {
+      "valid": [{}, { "computerLabel": "1ee341fade8595ac" }],
+      "invalid": [{ "computerLabel": "x" }, { "all": true }]
+    },
+    "osGrantPreconditions": [
+      { "case": "owner, ready, unfrozen", "expect": { "status": 201, "scope": "write" } },
+      { "case": "owner, ready, frozen", "expect": { "status": 201, "scope": "read" } },
+      { "case": "owner, not ready", "expect": { "status": 409, "error": "repository_not_ready" } },
+      { "case": "non-owner", "expect": { "status": 404, "error": "not_found" } },
+      { "case": "unknown repository id", "expect": { "status": 404, "error": "not_found" } },
+      { "case": "no live selfserve authority", "expect": { "status": 404, "error": "not_found" } }
+    ],
+    "osSession": {
+      "rule": "In one transaction: lock the account row (select ... for update), find a live row with device_label 'ezil-os '+label, os 'ezil-os', cli_version 'os-repo-v1', access_hash null, revoked_at null and expires_at > now + OS_SESSION_MIN_REMAINING_MS; else insert one with expires_at = now + OS_SESSION_TTL_MS. Never update expires_at.",
+      "cases": [
+        { "existing": null, "expect": "insert" },
+        { "existing": { "remainingMs": 25200000, "revoked": false, "sameLabel": true }, "expect": "reuse" },
+        { "existing": { "remainingMs": 960001, "revoked": false, "sameLabel": true }, "expect": "reuse" },
+        { "existing": { "remainingMs": 960000, "revoked": false, "sameLabel": true }, "expect": "insert" },
+        { "existing": { "remainingMs": 900000, "revoked": false, "sameLabel": true }, "expect": "insert" },
+        { "existing": { "remainingMs": 25200000, "revoked": true, "sameLabel": true }, "expect": "insert" },
+        { "existing": { "remainingMs": 25200000, "revoked": false, "sameLabel": false }, "expect": "insert" }
+      ]
+    },
+    "osGrantResponse": {
+      "keys": ["username", "token", "expiresAt", "cloneUrl", "repositoryId", "routeName", "handle", "name", "scope", "defaultBranch"],
+      "base": {
+        "username": "ezil", "token": "egg_${repeat:a:64}", "expiresAt": { "relativeSeconds": 900 },
+        "cloneUrl": "https://git-preview.ezil.work/acme/site.git", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "routeName": "acme/site", "handle": "acme", "name": "site", "scope": "write", "defaultBranch": "main"
+      },
+      "validMutations": [
+        { "set": { "scope": "read" } },
+        { "set": { "expiresAt": { "relativeSeconds": 960 } } },
+        { "set": { "expiresAt": { "relativeSeconds": 1 } } },
+        { "set": { "defaultBranch": "release/1.2" } },
+        { "set": { "handle": "a-b", "name": "web.v2", "routeName": "a-b/web.v2", "cloneUrl": "https://git-preview.ezil.work/a-b/web.v2.git" } }
+      ],
+      "invalidMutations": [
+        { "set": { "repositoryId": "5a6b7c8d-1e2f-4a3b-8c4d-5e6f7a8b9c0d" }, "why": "repository mismatch" },
+        { "set": { "handle": "Acme", "routeName": "Acme/site", "cloneUrl": "https://git-preview.ezil.work/Acme/site.git" }, "why": "handle" },
+        { "set": { "name": "site-", "routeName": "acme/site-", "cloneUrl": "https://git-preview.ezil.work/acme/site-.git" }, "why": "name" },
+        { "set": { "routeName": "acme/other" }, "why": "routeName" },
+        { "set": { "cloneUrl": "https://github.ezil.work/acme/site.git" }, "why": "production git host" },
+        { "set": { "cloneUrl": "https://ezil:x@git-preview.ezil.work/acme/site.git" }, "why": "userinfo" },
+        { "set": { "cloneUrl": "http://git-preview.ezil.work/acme/site.git" }, "why": "scheme" },
+        { "set": { "token": "egg_${repeat:A:64}" }, "why": "token" },
+        { "set": { "username": "git" }, "why": "username" },
+        { "set": { "expiresAt": { "relativeSeconds": 961 } }, "why": "expiry too far" },
+        { "set": { "expiresAt": { "relativeSeconds": 0 } }, "why": "already expired" },
+        { "set": { "expiresAt": "not-a-date" }, "why": "expiry format" },
+        { "set": { "scope": "admin" }, "why": "scope" },
+        { "set": { "defaultBranch": "a..b" }, "why": "branch" },
+        { "set": { "refreshToken": "x" }, "why": "extra key" },
+        { "delete": "defaultBranch", "why": "missing key" }
+      ]
+    }
+  },
+  "unpinnedSemantics": [
+    { "case": "OS token while the OS client is UNPINNED, os-grant", "source": "works.authCases", "expect": { "status": 401, "error": "identity_token_invalid" } },
+    { "case": "Universe-staging token on an os route while osClient is null", "source": "works.authCases", "expect": { "status": 404, "error": "unmatched_route" } },
+    { "case": "DEFAULT deployment, os route, a bearer the /v1 middleware accepts (a production EZiL ID client without act-as, or a Supabase bearer with or without act-as)", "source": "works.authCases", "expect": { "status": 404, "error": "unmatched_route" } },
+    { "case": "DEFAULT deployment, os route, a non-production EZiL ID client (OS-staging or Universe-staging), with or without act-as: the middleware refuses it before routing, as on an undeclared /v1 path", "source": "works.authCases", "expect": { "status": 401, "error": "identity_token_invalid" } },
+    { "case": "OS activation while the OS client is UNPINNED", "source": "activation.cases", "expect": { "active": false, "osRoute": { "status": 404, "errorCode": "repo_open_unavailable" } } },
+    { "case": "Universe staging client equals a production client (D-AUTH0-U)", "source": "works.effectivePins", "expect": { "universeEffective": "UNPINNED" } },
+    { "case": "OS pin equals the Universe pin: OS activation is true (OS cannot see the Universe pin); Works accepts the token as the Universe client and osClient is null", "source": "works.authCases", "expect": { "status": 404, "error": "unmatched_route", "osErrorCode": "repository_unavailable" } }
+  ],
+  "osRoute": {
+    "request": {
+      "valid": [
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" },
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path": "src/main.ts" },
+        { "op": "refresh", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" }
+      ],
+      "invalid": [
+        { "op": "clone", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" },
+        { "op": "refresh", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path": "src" },
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "path": "../etc" },
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "acme/site" },
+        { "op": "open", "computerId": "6F1C2D3E-4A5B-4C6D-8E9F-0A1B2C3D4E5F", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" },
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "projectId": "8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "cloneUrl": "https://git-preview.ezil.work/acme/site.git" },
+        { "op": "open", "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "repoId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c" }
+      ],
+      "invalidResponse": { "status": 400, "errorCode": "invalid_request" }
+    },
+    "okOpenKeys": ["ok", "state", "folder", "openFolder", "pathNotFound", "repo", "scope", "gitAccessExpiresAt"],
+    "okRefreshKeys": ["ok", "state", "scope", "gitAccessExpiresAt"],
+    "refusalKeys": ["ok", "errorCode", "retryable"],
+    "openStates": ["cloned", "initialized_empty", "existing"]
+  },
+  "workerRequest": {
+    "keys": ["v", "op", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "grant"],
+    "grantKeys": ["username", "token", "expiresAt", "scope"],
+    "gitHostAllowList": ["git-preview.ezil.work"],
+    "base": {
+      "v": 1, "op": "open", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "site",
+      "gitHost": "git-preview.ezil.work", "defaultBranch": "main", "path": null,
+      "grant": { "username": "ezil", "token": "egg_${repeat:a:64}", "expiresAt": { "relativeSeconds": 900 }, "scope": "write" }
+    },
+    "validMutations": [
+      { "set": { "op": "refresh" } },
+      { "set": { "path": "src/main.ts" } },
+      { "setGrant": { "scope": "read" } },
+      { "setGrant": { "expiresAt": { "relativeSeconds": 960 } } }
+    ],
+    "invalidMutations": [
+      { "set": { "v": 2 }, "why": "version" },
+      { "set": { "gitHost": "github.ezil.work" }, "why": "git host" },
+      { "set": { "op": "refresh", "path": "src" }, "why": "path on refresh" },
+      { "set": { "path": "../x" }, "why": "path" },
+      { "set": { "name": "a..b" }, "why": "name" },
+      { "set": { "defaultBranch": "x.lock" }, "why": "branch" },
+      { "set": { "extra": true }, "why": "extra key" },
+      { "setGrant": { "expiresAt": { "relativeSeconds": 961 } }, "why": "expiry window" },
+      { "setGrant": { "expiresAt": { "relativeSeconds": 0 } }, "why": "expired" },
+      { "setGrant": { "token": "egg_${repeat:a:63}" }, "why": "token" },
+      { "setGrant": { "username": "root" }, "why": "username" }
+    ]
+  },
+  "signature": {
+    "secret": "test-hmac-secret-not-a-real-secret",
+    "timestampMs": 1793404800000,
+    "sandboxName": "guac-0a1b2c3d4e5f6a7b-6f1c2d3e4a5b4c6d",
+    "body": "{\"v\":1,\"op\":\"refresh\",\"repositoryId\":\"3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c\",\"handle\":\"acme\",\"name\":\"site\",\"gitHost\":\"git-preview.ezil.work\",\"defaultBranch\":\"main\",\"path\":null,\"grant\":{\"username\":\"ezil\",\"token\":\"egg_${repeat:a:64}\",\"expiresAt\":\"2026-10-31T12:15:00.000Z\",\"scope\":\"write\"}}",
+    "expectBodySha256": "397a547a44d599b9ae3e43e156bc55ac65208cc58db8f9616ee96c449f240b7e",
+    "expectHeader": "t=1793404800000,v1=d6018f4e1a3d729287cc3666bc0ae581e7c9df6c4d2abb83cd3db6216ec2b18b",
+    "replayedAiCredentialHeader": "t=1793404800000,v1=3fe03f9cafb6df9421f0c40b42444b0580986d3c5c0365d9433d41507b487266",
+    "replayExpect": "refused"
+  },
+  "computerLabel": [
+    { "computerId": "6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "label": "1ee341fade8595ac" },
+    { "computerId": "00000000-0000-4000-8000-000000000001", "label": "6dc6320189a06b0a" }
+  ],
+  "cookie": {
+    "ikm": "test-auth0-secret-not-a-real-secret",
+    "expectKeyHex": "de4731a118376eff2b6138d34ce82cda728f052e448f60db8973881ae3779f96",
+    "ivHex": "000102030405060708090a0b",
+    "plaintext": "{\"v\":1,\"idToken\":\"test-header.test-payload.test-signature\",\"sub\":\"auth0|qa-builder-1\",\"uid\":\"11111111-2222-4333-8444-555555555555\",\"exp\":1793433600}",
+    "expectValue": "AAECAwQFBgcICQoLTfsMwiM6YMFPInyyyYA8xqRrvZLmTa30HAoUH15lRhDaNIsyk9OfZO3rJ1eLUo28WCv3-ihQOQw5lrJozWVmI86_u6vGFiOPLz0MWYD9cw9bu3KBdt5Vjw_wYuOzN4UjB0FAYPUr4IP74KTpZTeXVN-A9pLqkFzFCu43rKAs0pVxx6Pz1EeUeI6p9HFscVAEcX-qFUxQ87TFFR3wowCvugOY8ps",
+    "useChecks": [
+      { "case": "valid", "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793404800, "expect": "ok" },
+      { "case": "wrong uid", "session": { "uid": "99999999-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793404800, "expect": "reauth_required" },
+      { "case": "wrong sub", "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|someone-else" }, "nowS": 1793404800, "expect": "reauth_required" },
+      { "case": "less than 120 s left", "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793433481, "expect": "reauth_required" },
+      { "case": "exactly 120 s left", "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793433480, "expect": "ok" },
+      { "case": "tampered ciphertext", "tamperByte": 20, "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793404800, "expect": "reauth_required" },
+      { "case": "wrong key", "ikm": "another-test-secret", "session": { "uid": "11111111-2222-4333-8444-555555555555", "auth0Sub": "auth0|qa-builder-1" }, "nowS": 1793404800, "expect": "reauth_required" }
+    ],
+    "maxAge": [
+      { "expMinusNowS": 36000, "expectMaxAgeS": 28800 },
+      { "expMinusNowS": 3600, "expectMaxAgeS": 3600 },
+      { "expMinusNowS": 300, "expectMaxAgeS": 300 },
+      { "expMinusNowS": 299, "expectMaxAgeS": null }
+    ]
+  },
+  "withCodeFolder": {
+    "rule": "AWS shape = hostname matches AWS_CODE_HOST_RE AND pathname === '/preview-bootstrap': set path to '/?folder=' + encodeURIComponent(openFolder). Otherwise set folder to openFolder. URLSearchParams.set semantics (one value, first position kept). Applied to every navigation of a minted URL in a window that has ctx.project.",
+    "cases": [
+      { "shape": "cloudflare", "input": "https://8443-guac-a-b-tok.preview.example/preview-bootstrap?token=T&folder=%2Fworkspace", "openFolder": "/workspace/repos/acme/site",
+        "expectParams": [["token", "T"], ["folder", "/workspace/repos/acme/site"]] },
+      { "shape": "cloudflare", "input": "https://8443-guac-a-b-tok.preview.example/preview-bootstrap?token=T", "openFolder": "/workspace/repos/acme/site",
+        "expectParams": [["token", "T"], ["folder", "/workspace/repos/acme/site"]] },
+      { "shape": "cloudflare", "input": "https://8443-guac-a-b-tok.preview.example/preview-bootstrap?token=T&folder=%2Fa&folder=%2Fb", "openFolder": "/workspace/repos/acme/site/src",
+        "expectParams": [["token", "T"], ["folder", "/workspace/repos/acme/site/src"]] },
+      { "shape": "aws", "input": "https://aws-8443-guac-a-b-aws.zone.example/preview-bootstrap?token=T&path=%2F", "openFolder": "/workspace/repos/acme/site",
+        "expectParams": [["token", "T"], ["path", "/?folder=%2Fworkspace%2Frepos%2Facme%2Fsite"]], "expectFolderAfterBootstrap": "/workspace/repos/acme/site" },
+      { "shape": "aws", "input": "https://aws-8443-guac-a-b-aws.zone.example/preview-bootstrap?token=T", "openFolder": "/workspace/repos/acme/site/src",
+        "expectParams": [["token", "T"], ["path", "/?folder=%2Fworkspace%2Frepos%2Facme%2Fsite%2Fsrc"]], "expectFolderAfterBootstrap": "/workspace/repos/acme/site/src" },
+      { "shape": "cloudflare", "input": "https://aws-8443-guac-a-b-aws.zone.example/other?token=T", "openFolder": "/workspace/repos/acme/site",
+        "expectParams": [["token", "T"], ["folder", "/workspace/repos/acme/site"]] }
+    ],
+    "inf": "The Cloudflare host shape is synthetic (only the AWS regex decides the branch). That the AWS folder survives /preview-bootstrap into code-server is INF until E-AWS."
+  },
+  "repoBudget": {
+    "rule": "Bytes are tar bytes, as the codec's PAX_FORMAT archive will spend them (worker/src/workspace-snapshot-script.ts:159,173,179), never raw file bytes. entryTarBytes = TAR_BLOCK_BYTES + (regular file ? TAR_BLOCK_BYTES * ceil(size / TAR_BLOCK_BYTES) : 0) + pax, where pax = 0 unless the entry name or symlink target is TAR_PAX_NAME_BYTES or more UTF-8 bytes, or not ASCII; then pax = TAR_BLOCK_BYTES + TAR_BLOCK_BYTES * ceil((nameBytes + linkBytes + TAR_PAX_RECORD_SLACK_BYTES) / TAR_BLOCK_BYTES). Directory and symlink sizes count 0. The workspace side counts exactly the entries the codec would archive (workspaceRule, 1.0.2; before 1.0.2 it counted every entry, so one untracked dependency install refused every open). The staged side is measured under its final names (REPO_DIR_TEMPLATE + '/' + relative path, the folder itself included), plus one directory entry for each of repos and repos/<handle> that does not exist yet. Refuse with repository_too_large unless workspaceTarBytes + stagedTarBytes + TAR_ARCHIVE_TAIL_BYTES <= floor(SNAPSHOT_LIMIT_BYTES * REPO_BUDGET_FRACTION) AND workspaceEntries + stagedEntries <= floor(SNAPSHOT_MAX_ENTRIES * REPO_BUDGET_FRACTION). The workspace scan stops as soon as either sum is over.",
+    "tailNote": "TAR_ARCHIVE_TAIL_BYTES = two end-of-archive blocks (1024) plus the worst-case padding to tarfile's 10240-byte record (10240). The codec's final check is os.path.getsize(path) <= LIMIT, which includes both.",
+    "concurrency": "At most one op 'open' runs per sandbox (Worker in-flight map, contract section 8 step 5), so at most one staged clone is ever counted against the budget. User activity can still cross 100% (contract section 19).",
+    "workspaceRule": "1.0.2. The workspace side applies the snapshot codec's own skip rules (worker/src/workspace-snapshot-script.ts inventory()), in the codec's order, to every entry under the root; a skipped directory's whole subtree is skipped. (1) A top-level name in SNAPSHOT_INTERNAL_NAMES, or the top-level STAGING_ROOT_NAME node. (2) Outside a .git path (no path component equal to .git): an entry whose own name is in SNAPSHOT_CACHE_NAMES (file, directory or symlink) unless its path is in tracked; a name containing a backslash; anything but a regular file, directory or symlink (FIFOs, sockets, devices); a symlink whose target is empty, absolute or contains a backslash, whose normalised dirname(name)/target is '..' or starts with '../', or whose realpath leaves the root. Inside a .git path nothing is skipped. tracked is built exactly as the codec builds it: git ls-files -z --cached --sparse (with /usr/bin/git, -c core.fsmonitor=false, GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL=/dev/null, GIT_OPTIONAL_LOCKS=0) over a private copy of the index (plus sharedindex.* files) of the root .git and of each repos/<handle>/<name>/.git that carries the repo-open binding (repoOpenMarkerRule), in sorted handle then name order, at most SNAPSHOT_NESTED_INDEX_MAX of them; each path and every prefix of it (prefixed with repos/<handle>/<name>/ for a nested index) is tracked. A nested index that cannot be read contributes nothing (as in the codec). A root index that cannot be read fails the codec's whole capture; the kernel then counts every cache-named entry (conservative). Where the kernel cannot decide as the codec would (an unreadable symlink target, a realpath that fails), it counts the entry (conservative, at most one header block plus PAX).",
+    "repoOpenMarkerRule": "1.0.2. A folder repos/<handle>/<name> is a repo-open folder only when <folder>/.git is a real directory (no symlink in repos, <handle>, <name> or .git) holding BINDING_FILE as a regular file of at most 4096 bytes that parses as a JSON object with v === 1 (not a boolean), handle === <handle> and name === <name>. The kernel writes that file into every folder it places (section 9.4 step 4). The codec reads a nested index only for such a folder, so a workspace with no repo-open folder and no top-level STAGING_ROOT_NAME node (section 9.8 item 1, which a988f28c archived) checkpoints byte-identically to the a988f28c codec; the kernel's tracked set uses the same predicate.",
+    "workspaceCasesRule": "Each case lists every entry under the root (type file, dir, symlink or fifo), the paths each index lists (key '' is the root index, otherwise the folder), and the binding content of each folder that has one. expectArchived is the set of entry names the codec would archive under workspaceRule; expectTarBytes and expectEntries are their sums; expectOk is the verdict with the case's staged side. Lane tests build each case on a real filesystem with real git indexes (git adds its own files under each .git, which tests exclude from the comparison) and compare the kernel's archived names and verdict.",
+    "workspaceCases": [
+      { "case": "untracked cache-named entries outside .git never count, whatever their type (one dependency install no longer refuses every open)",
+        "entries": [
+          { "type": "dir", "name": "proj" }, { "type": "file", "name": "proj/package.json", "size": 120 },
+          { "type": "dir", "name": "proj/node_modules" }, { "type": "dir", "name": "proj/node_modules/pkg" },
+          { "type": "file", "name": "proj/node_modules/pkg/big.bin", "size": 471859200 },
+          { "type": "dir", "name": "proj/dist" }, { "type": "file", "name": "proj/dist/bundle.js", "size": 1000 },
+          { "type": "file", "name": "proj/.next", "size": 10 },
+          { "type": "dir", "name": ".turbo" }, { "type": "file", "name": ".turbo/cache.bin", "size": 2048 }
+        ],
+        "indexes": {}, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["proj", "proj/package.json"], "expectTarBytes": 1536, "expectEntries": 2, "expectOk": true },
+      { "case": "the same bytes in an ordinary directory count",
+        "entries": [
+          { "type": "dir", "name": "proj" }, { "type": "file", "name": "proj/package.json", "size": 120 },
+          { "type": "dir", "name": "proj/vendor" }, { "type": "file", "name": "proj/vendor/big.bin", "size": 471859200 }
+        ],
+        "indexes": {}, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["proj", "proj/package.json", "proj/vendor", "proj/vendor/big.bin"], "expectTarBytes": 471861760, "expectEntries": 4, "expectOk": false },
+      { "case": "a tracked dist inside a repo-open folder (binding present) counts; its untracked node_modules does not",
+        "entries": [
+          { "type": "dir", "name": "repos" }, { "type": "dir", "name": "repos/acme" }, { "type": "dir", "name": "repos/acme/site" },
+          { "type": "dir", "name": "repos/acme/site/.git" }, { "type": "file", "name": "repos/acme/site/.git/ezil-repo.json", "size": 120 },
+          { "type": "file", "name": "repos/acme/site/.git/index", "size": 300 }, { "type": "file", "name": "repos/acme/site/README.md", "size": 10 },
+          { "type": "dir", "name": "repos/acme/site/dist" }, { "type": "file", "name": "repos/acme/site/dist/app.js", "size": 471859200 },
+          { "type": "dir", "name": "repos/acme/site/node_modules" }, { "type": "file", "name": "repos/acme/site/node_modules/x.js", "size": 10 }
+        ],
+        "indexes": { "repos/acme/site": ["README.md", "dist/app.js"] },
+        "markers": { "repos/acme/site": { "v": 1, "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "site", "gitHost": "git-preview.ezil.work" } },
+        "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["repos", "repos/acme", "repos/acme/site", "repos/acme/site/.git", "repos/acme/site/.git/ezil-repo.json", "repos/acme/site/.git/index",
+          "repos/acme/site/README.md", "repos/acme/site/dist", "repos/acme/site/dist/app.js"],
+        "expectTarBytes": 471865344, "expectEntries": 9, "expectOk": false },
+      { "case": "the same tracked dist in a repos/<handle>/<name> clone without the binding does not count: the codec reads no index there, exactly as at a988f28c",
+        "entries": [
+          { "type": "dir", "name": "repos" }, { "type": "dir", "name": "repos/acme" }, { "type": "dir", "name": "repos/acme/site" },
+          { "type": "dir", "name": "repos/acme/site/.git" }, { "type": "file", "name": "repos/acme/site/.git/index", "size": 300 },
+          { "type": "file", "name": "repos/acme/site/README.md", "size": 10 },
+          { "type": "dir", "name": "repos/acme/site/dist" }, { "type": "file", "name": "repos/acme/site/dist/app.js", "size": 471859200 },
+          { "type": "dir", "name": "repos/acme/site/node_modules" }, { "type": "file", "name": "repos/acme/site/node_modules/x.js", "size": 10 }
+        ],
+        "indexes": { "repos/acme/site": ["README.md", "dist/app.js"] }, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["repos", "repos/acme", "repos/acme/site", "repos/acme/site/.git", "repos/acme/site/.git/index", "repos/acme/site/README.md"],
+        "expectTarBytes": 4096, "expectEntries": 6, "expectOk": true },
+      { "case": "a binding whose name differs from its folder, or whose v is not 1, marks nothing",
+        "entries": [
+          { "type": "dir", "name": "repos" }, { "type": "dir", "name": "repos/acme" },
+          { "type": "dir", "name": "repos/acme/site" }, { "type": "dir", "name": "repos/acme/site/.git" },
+          { "type": "file", "name": "repos/acme/site/.git/ezil-repo.json", "size": 120 }, { "type": "file", "name": "repos/acme/site/.git/index", "size": 300 },
+          { "type": "dir", "name": "repos/acme/site/dist" }, { "type": "file", "name": "repos/acme/site/dist/app.js", "size": 1000 },
+          { "type": "dir", "name": "repos/acme/blog" }, { "type": "dir", "name": "repos/acme/blog/.git" },
+          { "type": "file", "name": "repos/acme/blog/.git/ezil-repo.json", "size": 120 }, { "type": "file", "name": "repos/acme/blog/.git/index", "size": 300 },
+          { "type": "dir", "name": "repos/acme/blog/dist" }, { "type": "file", "name": "repos/acme/blog/dist/app.js", "size": 1000 }
+        ],
+        "indexes": { "repos/acme/site": ["dist/app.js"], "repos/acme/blog": ["dist/app.js"] },
+        "markers": {
+          "repos/acme/site": { "v": 1, "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "other", "gitHost": "git-preview.ezil.work" },
+          "repos/acme/blog": { "v": 2, "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "blog", "gitHost": "git-preview.ezil.work" }
+        },
+        "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["repos", "repos/acme", "repos/acme/blog", "repos/acme/blog/.git", "repos/acme/blog/.git/ezil-repo.json", "repos/acme/blog/.git/index",
+          "repos/acme/site", "repos/acme/site/.git", "repos/acme/site/.git/ezil-repo.json", "repos/acme/site/.git/index"],
+        "expectTarBytes": 7168, "expectEntries": 10, "expectOk": true },
+      { "case": "a root-index tracked dist counts (a workspace that is itself a repository); its untracked node_modules does not",
+        "entries": [
+          { "type": "dir", "name": ".git" }, { "type": "file", "name": ".git/index", "size": 200 },
+          { "type": "dir", "name": "dist" }, { "type": "file", "name": "dist/x.js", "size": 100 },
+          { "type": "dir", "name": "node_modules" }, { "type": "file", "name": "node_modules/y.js", "size": 100 }
+        ],
+        "indexes": { "": ["dist/x.js"] }, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": [".git", ".git/index", "dist", "dist/x.js"], "expectTarBytes": 3072, "expectEntries": 4, "expectOk": true },
+      { "case": "top-level internal names and the staging node never count; the same names deeper are ordinary content",
+        "entries": [
+          { "type": "file", "name": ".ezil-hydrated.json", "size": 80 }, { "type": "file", "name": ".ezil-flush-manifest.json", "size": 80 },
+          { "type": "dir", "name": ".ezil-staging" }, { "type": "dir", "name": ".ezil-staging/u1" },
+          { "type": "file", "name": ".ezil-staging/u1/big.bin", "size": 471859200 },
+          { "type": "dir", "name": "src" }, { "type": "file", "name": "src/.ezil-hydrated.json", "size": 10 },
+          { "type": "dir", "name": "src/.ezil-staging" }, { "type": "file", "name": "src/.ezil-staging/note.txt", "size": 10 }
+        ],
+        "indexes": {}, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["src", "src/.ezil-hydrated.json", "src/.ezil-staging", "src/.ezil-staging/note.txt"], "expectTarBytes": 3072, "expectEntries": 4, "expectOk": true },
+      { "case": "cache names inside a .git path count; absolute, escaping and backslash names and FIFOs do not",
+        "entries": [
+          { "type": "dir", "name": "a" }, { "type": "dir", "name": "a/.git" }, { "type": "dir", "name": "a/.git/node_modules" },
+          { "type": "file", "name": "a/.git/node_modules/f", "size": 10 },
+          { "type": "symlink", "name": "abs", "linkname": "/etc/passwd" }, { "type": "symlink", "name": "up", "linkname": "../outside" },
+          { "type": "symlink", "name": "a/ok", "linkname": "../src" }, { "type": "symlink", "name": "a/deep", "linkname": "../../x" },
+          { "type": "file", "name": "back\\slash.txt", "size": 5 }, { "type": "fifo", "name": "pipe" }
+        ],
+        "indexes": {}, "markers": {}, "stagedTarBytes": 3072, "stagedEntries": 4,
+        "expectArchived": ["a", "a/.git", "a/.git/node_modules", "a/.git/node_modules/f", "a/ok"], "expectTarBytes": 3072, "expectEntries": 5, "expectOk": true }
+    ],
+    "entryBytes": [
+      { "type": "file", "name": "a.txt", "size": 0, "expect": 512 },
+      { "type": "file", "name": "a.txt", "size": 1, "expect": 1024 },
+      { "type": "file", "name": "a.txt", "size": 512, "expect": 1024 },
+      { "type": "file", "name": "a.txt", "size": 513, "expect": 1536 },
+      { "type": "dir", "name": "src", "size": 4096, "expect": 512 },
+      { "type": "symlink", "name": "l", "linkname": "a.txt", "size": 5, "expect": 512 },
+      { "type": "file", "name": "${repeat:a:99}", "size": 0, "expect": 512 },
+      { "type": "dir", "name": "${repeat:a:99}", "size": 4096, "expect": 512 },
+      { "type": "file", "name": "${repeat:a:100}", "size": 0, "expect": 1536 },
+      { "type": "file", "name": "é.txt", "size": 0, "expect": 1536 },
+      { "type": "symlink", "name": "l", "linkname": "${repeat:a:150}", "size": 150, "expect": 1536 },
+      { "type": "file", "name": "repos/acme/site/${repeat:b:600}", "size": 10, "expect": 2560 }
+    ],
+    "composite": {
+      "workspace": [
+        { "type": "dir", "name": "src", "size": 4096 },
+        { "type": "file", "name": "src/a.ts", "size": 700 }
+      ],
+      "staged": [
+        { "type": "dir", "name": "repos/acme/site", "size": 4096 },
+        { "type": "file", "name": "repos/acme/site/README.md", "size": 10 }
+      ],
+      "newParentDirs": ["repos", "repos/acme"],
+      "expectTarBytes": 15872,
+      "expectEntries": 6,
+      "expectOk": true
+    },
+    "cases": [
+      { "workspaceTarBytes": 0, "stagedTarBytes": 1048576, "workspaceEntries": 10, "stagedEntries": 102, "ok": true },
+      { "workspaceTarBytes": 400000000, "stagedTarBytes": 29485465, "workspaceEntries": 0, "stagedEntries": 0, "ok": true },
+      { "workspaceTarBytes": 400000000, "stagedTarBytes": 29485466, "workspaceEntries": 0, "stagedEntries": 0, "ok": false },
+      { "workspaceTarBytes": 0, "stagedTarBytes": 0, "workspaceEntries": 70000, "stagedEntries": 10000, "ok": true },
+      { "workspaceTarBytes": 0, "stagedTarBytes": 0, "workspaceEntries": 70000, "stagedEntries": 10001, "ok": false },
+      { "workspaceTarBytes": 0, "stagedTarBytes": 40960000, "workspaceEntries": 0, "stagedEntries": 80000, "rawBytes": 0, "ok": true, "note": "80,000 empty files cost 40,960,000 tar bytes although their raw size is 0" }
+    ]
+  },
+  "kernel": {
+    "phases": {
+      "prepare": "outside the persistence tail and outside withRuntimeMutation (holds neither); network allowed; writes only under <root>/.ezil-staging/<uuid> and /run/ezil. First removes every <root>/.ezil-staging/<u>, /run/ezil/requests/<u>.json and /run/ezil/git/incoming/<u>.json whose <u> is not in the request's inflight list.",
+      "commit": "inside the persistence tail (never withRuntimeMutation); no network; binding check, rename(2) into place, binding file, credential keys, grant install; releases the lock it owns on every outcome as its last act",
+      "refresh": "no tail; installs the grant and rewrites the /run/ezil/bin files only",
+      "release": "outside the tail; idempotent; removes this request's staging dir, the lock only when its owner file holds this request's uuid, the grant file only when the repository folder is absent, then this request's request and incoming files. Run by the Worker after every open and refresh outcome (section 8 step 11), including the busy path after tail acquire."
+    },
+    "requestKeys": ["v", "op", "phase", "uuid", "inflight", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "root", "staging", "incoming", "deadlineMs", "budget"],
+    "requestKeysRule": "Strict: a request file with any key outside requestKeys, or a phase outside phases, is refused with workspace_failed before any filesystem or network action. inflight is the Worker in-flight map's uuids for this sandbox at the time the request is written (this request's uuid included).",
+    "lockRule": "prepare (repository folder absent) takes LOCK_TEMPLATE with mkdir and writes this request's uuid to LOCK_OWNER_TEMPLATE. An existing lock is live only when its owner uuid is in the request's inflight list and it is younger than LOCK_STALE_MS; otherwise it is stale and prepare removes it and takes it. Released by commit on every outcome, by release, and by prepare itself on failure.",
+    "testSeam": "The kernel module exports runKernel(phase, requestPath, testOptions). testOptions = { sslCAInfo, proxy } adds -c http.sslCAInfo=<file> -c http.proxy=<loopback CONNECT proxy> to every git command so tests reach a loopback TLS gateway that presents git-preview.ezil.work under a test CA. The CLI entry (node <kernel> <phase> <request>, the only thing the Worker runs) passes no testOptions and has no other input channel: it reads no environment variable, and a request file carrying any test key is refused by requestKeysRule. Hosts, helper checks and allow-lists stay git-preview.ezil.work.",
+    "testSeamKeys": ["sslCAInfo", "proxy"],
+    "resultOpenKeys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty"],
+    "resultRefreshKeys": ["ok", "state"],
+    "resultErrorKeys": ["ok", "errorCode"],
+    "states": ["cloned", "initialized_empty", "existing", "refreshed"],
+    "errorCodes": ["folder_conflict", "repository_too_large", "git_auth_rejected", "repository_unavailable", "network_unavailable", "workspace_busy", "workspace_failed"],
+    "classification": [
+      { "cause": "gateway HTTP 401", "errorCode": "git_auth_rejected" },
+      { "cause": "gateway HTTP 403", "errorCode": "git_auth_rejected" },
+      { "cause": "gateway HTTP 404", "errorCode": "repository_unavailable" },
+      { "cause": "DNS, TLS or connect failure", "errorCode": "network_unavailable" },
+      { "cause": "lock live per lockRule (owner uuid in inflight and younger than LOCK_STALE_MS)", "errorCode": "workspace_busy" },
+      { "cause": "staged clone over the workspace budget", "errorCode": "repository_too_large" },
+      { "cause": "folder exists with a different or missing binding", "errorCode": "folder_conflict" },
+      { "cause": "deadline reached", "errorCode": "workspace_busy" },
+      { "cause": "anything else", "errorCode": "workspace_failed" }
+    ]
+  },
+  "grantFile": {
+    "pathExample": "/run/ezil/git/grants/acme__site.json",
+    "mode": "0600",
+    "dirMode": "0700",
+    "uid": 0,
+    "keys": ["v", "protocol", "host", "path", "username", "password", "expiresAt", "scope"],
+    "example": { "v": 1, "protocol": "https", "host": "git-preview.ezil.work", "path": "acme/site.git", "username": "ezil", "password": "egg_${repeat:a:64}", "expiresAt": "2026-10-31T12:15:00.000Z", "scope": "write" }
+  },
+  "helperWrapper": {
+    "path": "/run/ezil/bin/ezil-git-grant",
+    "mode": "0500",
+    "lines": ["#!/bin/sh", "exec '<NODE>' /run/ezil/bin/ezil-git-grant.mjs \"$@\""],
+    "nodeMustMatch": "NODE_PATH_RE"
+  },
+  "gitConfig": {
+    "example": { "gitHost": "git-preview.ezil.work", "handle": "acme", "name": "site" },
+    "match": "These lines appear in this order in `git config --local --list` (git lowercases section and variable names, never the URL subsection). core.* lines written by git init may precede them; branch.* lines (branchUpstream) may appear after the first of them; no other remote.*, credential.* or url.* line may appear.",
+    "expectLocalList": [
+      "remote.origin.url=https://git-preview.ezil.work/acme/site.git",
+      "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*",
+      "credential.https://git-preview.ezil.work.helper=",
+      "credential.https://git-preview.ezil.work.helper=!f() { if [ -x /run/ezil/bin/ezil-git-grant ]; then exec /run/ezil/bin/ezil-git-grant \"$@\"; fi; if [ \"$1\" = get ]; then echo 'EZiL: Git access for this repository is not connected. Reopen it from EZiL OS.' >&2; echo quit=1; fi; }; f",
+      "credential.https://git-preview.ezil.work.usehttppath=true",
+      "push.autosetupremote=true"
+    ],
+    "branchUpstream": {
+      "example": { "branch": "main" },
+      "lines": ["branch.main.remote=origin", "branch.main.merge=refs/heads/main"],
+      "writtenBy": {
+        "cloned": "git checkout -q -b <branch> --track origin/<branch>, for the branch checked out",
+        "initialized_empty": "the kernel, in prepare (in staging, after ls-remote finds no refs, before the binding file and the post-check): git config branch.<defaultBranch>.remote origin, then git config branch.<defaultBranch>.merge refs/heads/<defaultBranch>",
+        "existing": "never written or rewritten"
+      },
+      "why": "1.0.1: git < 2.37 ignores push.autosetupremote (the local sandbox image's git 2.34.1 does, I1 finding 1). With this upstream a plain `git push` after initialized_empty creates refs/heads/<defaultBranch> on any git (push.default simple), so shell.notices.initialized_empty stays true. push.autosetupremote stays in expectLocalList."
+    },
+    "forbiddenSubstrings": ["@git-preview", "egg_", "password", "/usr/bin/node", "process.execPath"],
+    "rewrittenOn": ["open (existing, inside the tail)", "open (cloned or initialized_empty, before the rename)"],
+    "neverRewritten": ["remote refs", "branches", "index", "working tree"]
+  },
+  "helperTranscripts": [
+    { "case": "get ok", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false },
+      "expectStdout": "username=ezil\npassword=<token>\npassword_expiry_utc=<epoch s>\n", "expectStderr": "" },
+    { "case": "get, wrong host", "argv": "get", "stdin": "protocol=https\nhost=github.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, wrong path", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/other.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, no path attribute", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, http", "argv": "get", "stdin": "protocol=http\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, expired", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": -1, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, 30 s left", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 30, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, 31 s left", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 31, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "username=ezil\npassword=<token>\npassword_expiry_utc=<epoch s>\n", "expectStderr": "" },
+    { "case": "get, mode 0644", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0644", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, uid not 0", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 1000, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, symlink", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": true }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, no grant file", "argv": "get", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": null, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "get, stdin over 4 KiB", "argv": "get", "stdin": { "repeatBytes": 4097 }, "grant": { "remainingS": 600, "mode": "0600", "uid": 0, "symlink": false }, "expectStdout": "quit=1\n", "expectStderr": "hint" },
+    { "case": "store", "argv": "store", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\nusername=ezil\npassword=x\n\n", "grant": null, "expectStdout": "", "expectStderr": "" },
+    { "case": "erase", "argv": "erase", "stdin": "protocol=https\nhost=git-preview.ezil.work\npath=acme/site.git\n\n", "grant": null, "expectStdout": "", "expectStderr": "" },
+    { "case": "capability", "argv": "capability", "stdin": "", "grant": null, "expectStdout": "", "expectStderr": "" }
+  ],
+  "gitAuthorize": {
+    "denyReasons": ["grant_invalid", "grant_expired", "grant_revoked", "session_revoked", "repository_not_found", "repo_not_selected", "scope_read_only", "authority_lapsed", "account_suspended"],
+    "denyStatus": { "grant_invalid": 401, "grant_expired": 401, "grant_revoked": 401, "session_revoked": 401, "repository_not_found": 404, "repo_not_selected": 403, "scope_read_only": 403, "authority_lapsed": 403, "account_suspended": 403 },
+    "checkOrder": ["grant row (invalid)", "grant revoked", "session revoked or session expired", "grant expired", "route repository", "grant scope", "account suspended", "live authority"],
+    "inputRule": "Each case's state is the full input to the reference authorizer in check.mjs, which follows checkOrder exactly as EZiL-Works 7974ab6c apps/api/src/routes/cli.ts:258-277 and packages/db/src/repositories/cli-auth.ts:323-338 do. Defaults (a live owner write grant on its own route, unfrozen): grantShape valid, grantKnown true, grantRevoked false, sessionRevoked false, sessionExpired false, grantExpired false, routeMatches true, grantMaxScope write, accountSuspended false, liveScope write, liveReason null. A case lists only what differs.",
+    "cases": [
+      { "case": "owner push, live write grant, unfrozen", "service": "git-receive-pack", "state": {}, "expect": { "decision": "allow" } },
+      { "case": "fetch with a read grant minted after freeze", "service": "git-upload-pack", "state": { "grantMaxScope": "read", "liveScope": "read" }, "expect": { "decision": "allow" } },
+      { "case": "push with the write grant minted BEFORE freeze", "service": "git-receive-pack", "state": { "grantMaxScope": "write", "liveScope": "read" }, "expect": { "decision": "deny", "status": 403, "reason": "authority_lapsed" } },
+      { "case": "push with the read grant minted AFTER freeze", "service": "git-receive-pack", "state": { "grantMaxScope": "read", "liveScope": "read" }, "expect": { "decision": "deny", "status": 403, "reason": "scope_read_only" } },
+      { "case": "grant delivered before os-sessions/revoke (or sign-out)", "service": "git-upload-pack", "state": { "grantRevoked": true, "sessionRevoked": true }, "expect": { "decision": "deny", "status": 401, "reason": "grant_revoked" } },
+      { "case": "clock past the 8 h ezil-os session end (grant also past expiry)", "service": "git-upload-pack", "state": { "sessionExpired": true, "grantExpired": true }, "expect": { "decision": "deny", "status": 401, "reason": "session_revoked" } },
+      { "case": "grant past its 15 min expiry, session live", "service": "git-upload-pack", "state": { "grantExpired": true }, "expect": { "decision": "deny", "status": 401, "reason": "grant_expired" } },
+      { "case": "repo-A grant on repo-B route", "service": "git-upload-pack", "state": { "routeMatches": false }, "expect": { "decision": "deny", "status": 404, "reason": "repository_not_found" } },
+      { "case": "well-formed unknown grant", "service": "git-upload-pack", "state": { "grantKnown": false }, "expect": { "decision": "deny", "status": 401, "reason": "grant_invalid" } },
+      { "case": "account suspended after the grant", "service": "git-upload-pack", "state": { "accountSuspended": true }, "expect": { "decision": "deny", "status": 403, "reason": "account_suspended" } },
+      { "case": "live authority gone, repository not selected", "service": "git-upload-pack", "state": { "liveScope": null, "liveReason": "repository_access_denied" }, "expect": { "decision": "deny", "status": 403, "reason": "repo_not_selected" } },
+      { "case": "live authority gone for another reason", "service": "git-upload-pack", "state": { "liveScope": null, "liveReason": "authority_ended" }, "expect": { "decision": "deny", "status": 403, "reason": "authority_lapsed" } },
+      { "case": "malformed grant (not GRANT_RE)", "service": "git-upload-pack", "state": { "grantShape": "malformed" }, "expect": { "decision": "gateway_401_no_works_call" } }
+    ]
+  },
+  "errorTable": {
+    "codes": {
+      "unauthenticated":        { "http": 401, "retry": "none",           "copyKey": "signin" },
+      "cross_origin":           { "http": 403, "retry": "none",           "copyKey": "generic" },
+      "invalid_request":        { "http": 400, "retry": "none",           "copyKey": "generic" },
+      "repo_open_unavailable":  { "http": 404, "retry": "none",           "copyKey": "silent" },
+      "computer_not_found":     { "http": 404, "retry": "none",           "copyKey": "computer_not_found" },
+      "workspace_unsupported":  { "http": 409, "retry": "none",           "copyKey": "workspace_unsupported" },
+      "computer_not_running":   { "http": 409, "retry": "wake_loop",      "copyKey": "still_starting" },
+      "workspace_not_ready":    { "http": 409, "retry": "wake_loop",      "copyKey": "still_starting" },
+      "workspace_busy":         { "http": 409, "retry": "wake_loop",      "copyKey": "busy" },
+      "reauth_required":        { "http": 401, "retry": "reauth_bounce",  "copyKey": "reauth" },
+      "identity_mismatch":      { "http": 403, "retry": "none",           "copyKey": "identity_mismatch" },
+      "identity_unverified":    { "http": 403, "retry": "none",           "copyKey": "identity_unverified" },
+      "builder_required":       { "http": 403, "retry": "none",           "copyKey": "builder_required" },
+      "account_unavailable":    { "http": 403, "retry": "none",           "copyKey": "generic" },
+      "repository_unavailable": { "http": 404, "retry": "none",           "copyKey": "repository_unavailable" },
+      "repository_not_ready":   { "http": 409, "retry": "once_after_10s", "copyKey": "repository_not_ready" },
+      "repository_too_large":   { "http": 409, "retry": "none",           "copyKey": "repository_too_large" },
+      "folder_conflict":        { "http": 409, "retry": "none",           "copyKey": "folder_conflict" },
+      "works_unavailable":      { "http": 503, "retry": "once",           "copyKey": "generic" },
+      "works_invalid_response": { "http": 502, "retry": "none",           "copyKey": "generic" },
+      "network_unavailable":    { "http": 502, "retry": "none",           "copyKey": "network_unavailable" },
+      "git_auth_rejected":      { "http": 403, "retry": "none",           "copyKey": "git_auth_rejected" },
+      "workspace_failed":       { "http": 500, "retry": "none",           "copyKey": "generic" }
+    },
+    "retryableFlag": { "none": false, "reauth_bounce": false, "wake_loop": true, "once": true, "once_after_10s": true },
+    "copy": {
+      "signin": null,
+      "silent": null,
+      "generic": "EZiL OS could not open the repository. Code is open without it.",
+      "computer_not_found": "That computer was not found.",
+      "workspace_unsupported": "Opening a repository works on Free (Cloudflare) computers in this release.",
+      "still_starting": "Your computer is still starting.",
+      "busy": "Another Git operation is running here; try again in a moment.",
+      "reauth": "Sign in again to connect Git.",
+      "identity_mismatch": "This repository belongs to a different EZiL ID than the one signed in to EZiL OS.",
+      "identity_unverified": "Verify your EZiL ID email, then reopen.",
+      "builder_required": "A builder account is required.",
+      "repository_unavailable": "That repository does not exist or you do not own it.",
+      "repository_not_ready": "The repository is still being set up in Universe. Try again shortly.",
+      "repository_too_large": "This repository is too large to open in your computer's workspace; nothing was changed.",
+      "folder_conflict": "Another repository already uses this repository's folder in your workspace; nothing was changed.",
+      "network_unavailable": "git-preview.ezil.work could not be reached.",
+      "git_auth_rejected": "Git access was refused. Reopen the project from Universe."
+    },
+    "copyNotes": {
+      "signin": "no banner: the shell's normal sign-in path",
+      "silent": "no banner: Code opens exactly as at a988f28c",
+      "still_starting": "shown only after WAKE_CAP_MS",
+      "reauth": "banner carries a [Sign in again] button; deep-link arrival navigates once per repoId per tab"
+    },
+    "osOriginated": [
+      { "when": "no Supabase session", "errorCode": "unauthenticated" },
+      { "when": "isCrossOriginWrite", "errorCode": "cross_origin" },
+      { "when": "body not strict-valid or over the limit", "errorCode": "invalid_request" },
+      { "when": "repoOpenActive is false", "errorCode": "repo_open_unavailable" },
+      { "when": "assertOwnedComputer fails, or routeComputer throws NOT_FOUND", "errorCode": "computer_not_found" },
+      { "when": "routed kind aws-ec2 without a reverse marker and no active migration (Phase A)", "errorCode": "workspace_unsupported" },
+      { "when": "reverse marker 'blocked'", "errorCode": "workspace_unsupported" },
+      { "when": "active Cloudflare-to-AWS migration (readActiveByComputer non-null) or reverse marker 'moving'", "errorCode": "computer_not_running" },
+      { "when": "MigrationConflictError or any other routing error", "errorCode": "workspace_failed" },
+      { "when": "cookie check fails", "errorCode": "reauth_required" }
+    ],
+    "upstream": [
+      { "source": "works", "status": 401, "code": "*", "errorCode": "reauth_required", "effect": "clear the cookie" },
+      { "source": "works", "status": 403, "code": "identity_conflict", "errorCode": "identity_mismatch" },
+      { "source": "works", "status": 403, "code": "identity_unverified", "errorCode": "identity_unverified" },
+      { "source": "works", "status": 403, "code": "ezil_id_builders_only", "errorCode": "builder_required" },
+      { "source": "works", "status": 403, "code": "account_suspended", "errorCode": "account_unavailable" },
+      { "source": "works", "status": 403, "code": "*", "errorCode": "repository_unavailable" },
+      { "source": "works", "status": 404, "code": "*", "errorCode": "repository_unavailable" },
+      { "source": "works", "status": 409, "code": "repository_not_ready", "errorCode": "repository_not_ready" },
+      { "source": "works", "status": 409, "code": "*", "errorCode": "works_invalid_response" },
+      { "source": "works", "status": 422, "code": "*", "errorCode": "works_invalid_response" },
+      { "source": "works", "status": 429, "code": "*", "errorCode": "works_unavailable" },
+      { "source": "works", "status": "5xx", "code": "*", "errorCode": "works_unavailable" },
+      { "source": "works", "status": "3xx", "code": "*", "errorCode": "works_invalid_response" },
+      { "source": "works", "status": "other", "code": "*", "errorCode": "works_invalid_response" },
+      { "source": "works", "status": 201, "code": "invalid body", "errorCode": "works_invalid_response" },
+      { "source": "transport", "status": "works timeout or network error", "code": "*", "errorCode": "works_unavailable" },
+      { "source": "transport", "status": "works body over 16 KiB", "code": "*", "errorCode": "works_invalid_response" },
+      { "source": "transport", "status": "worker fetch timeout", "code": "*", "errorCode": "workspace_busy" },
+      { "source": "transport", "status": "worker network error", "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 409, "code": "runtime_not_running", "errorCode": "computer_not_running" },
+      { "source": "worker", "status": 409, "code": "workspace_not_ready", "errorCode": "workspace_not_ready" },
+      { "source": "worker", "status": 409, "code": "workspace_busy", "errorCode": "workspace_busy" },
+      { "source": "worker", "status": 409, "code": "folder_conflict", "errorCode": "folder_conflict" },
+      { "source": "worker", "status": 409, "code": "workspace_unsupported", "errorCode": "workspace_unsupported" },
+      { "source": "worker", "status": 409, "code": "repository_too_large", "errorCode": "repository_too_large" },
+      { "source": "worker", "status": 502, "code": "network_unavailable", "errorCode": "network_unavailable" },
+      { "source": "worker", "status": 502, "code": "git_auth_rejected", "errorCode": "git_auth_rejected" },
+      { "source": "worker", "status": 502, "code": "repository_unavailable", "errorCode": "repository_unavailable" },
+      { "source": "worker", "status": 500, "code": "workspace_failed", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 401, "code": "invalid_signature", "errorCode": "workspace_failed", "effect": "log errorCode and correlationId only: an OS/Worker secret or clock mismatch" },
+      { "source": "worker", "status": 400, "code": "invalid_request", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 200, "code": "invalid body", "errorCode": "workspace_failed", "effect": "any 200 that fails workerResponses.okOpen/okRefresh for the op sent" },
+      { "source": "worker", "status": 409, "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 502, "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 500, "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 401, "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": 400, "code": "*", "errorCode": "workspace_failed" },
+      { "source": "worker", "status": "other", "code": "*", "errorCode": "workspace_failed" }
+    ],
+    "workerResponses": {
+      "okOpen": { "status": 200, "keys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty"], "states": ["cloned", "initialized_empty", "existing"] },
+      "okRefresh": { "status": 200, "keys": ["ok", "state"], "states": ["refreshed"] },
+      "okRule": "OS validates every Worker 200 strictly for the op it sent: exact keys; ok === true; state in that shape's states; for open, folder and openFolder are absolute paths with openFolder === folder or under folder + '/', pathNotFound and empty are booleans, branch matches BRANCH_RE. Anything else is the 'worker 200 invalid body' row.",
+      "okCases": [
+        { "op": "open", "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site/src", "pathNotFound": false, "branch": "main", "empty": false }, "valid": true },
+        { "op": "open", "body": { "ok": true, "state": "initialized_empty", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": true, "branch": "main", "empty": true }, "valid": true },
+        { "op": "refresh", "body": { "ok": true, "state": "refreshed" }, "valid": true },
+        { "op": "open", "body": { "ok": true, "state": "refreshed", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false }, "valid": false },
+        { "op": "open", "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/sitex", "pathNotFound": false, "branch": "main", "empty": false }, "valid": false },
+        { "op": "open", "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "token": "x" }, "valid": false },
+        { "op": "open", "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": "no", "branch": "main", "empty": false }, "valid": false },
+        { "op": "refresh", "body": { "ok": true, "state": "cloned" }, "valid": false },
+        { "op": "refresh", "body": { "ok": true, "state": "refreshed", "folder": "/workspace/repos/acme/site" }, "valid": false }
+      ],
+      "refusals": [
+        { "status": 409, "error": ["runtime_not_running", "workspace_not_ready", "workspace_busy", "folder_conflict", "workspace_unsupported", "repository_too_large"] },
+        { "status": 502, "error": ["network_unavailable", "git_auth_rejected", "repository_unavailable"] },
+        { "status": 500, "error": ["workspace_failed"] },
+        { "status": 401, "error": ["invalid_signature"] },
+        { "status": 400, "error": ["invalid_request"] }
+      ],
+      "awsControlTarget": "any non-null result (record or Response) becomes 409 workspace_unsupported; the Response body is never forwarded"
+    }
+  },
+  "shell": {
+    "endpointGate": "desktopState.endpoints.repoOpen is present only when repoOpenActive(request) is true; the shell runs the repo-open flow only when that key is present and nativeSurface is absent",
+    "reauthUrlExample": {
+      "current": "/app/code?project=8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f&repo=3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+      "expect": "/auth/auth0/login?returnUrl=%2Fapp%2Fcode%3Fproject%3D8d4c2f1e-3b5a-4c7d-9e8f-0a1b2c3d4e5f%26repo%3D3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c"
+    },
+    "notices": {
+      "initialized_empty": "Empty repository. Add a file, commit, then run git push.",
+      "pathNotFound": "That folder is not in the repository; opened the repository root.",
+      "scopeRead": "This project is finished: the repository is read-only."
+    },
+    "title": { "opening": "Opening <name>…", "open": "<handle>/<name>" }
+  },
+  "productionOs": {
+    "rule": "1.0.2. Production OS is OS_PRODUCTION_APP_ORIGIN (Vercel project ezil-os-preview; EZiL-OS .github/scripts/release-state.mjs `canonical`, moved from os.ezil.org on 2026-10-18). OS_LANDING_ORIGIN (os.ezil.org) is the static landing Worker, not an OS app, and is probed only as the landing page. G-READ reads the production AUTH0_CLIENT_ID of os.ezil.work and of every other live OS app deployment (ids only). X1 P3 decides with pinGate over the two pins and the ids G-READ read; outcomes in pinGateOrder, first match wins. production_client_unlisted means a contract bump that adds the read id to PRODUCTION_AUTH0_CLIENTS (vectors, OS app/src/server/repo-open/targets.ts, Works apps/api/src/deployment.ts, every consumer copy re-seeded) must land first; the pin commit follows it and pinGate is rerun.",
+    "vercelProject": "ezil-os-preview",
+    "canonicalSource": ".github/scripts/release-state.mjs",
+    "placeholderClientIds": {
+      "about": "Placeholders standing for ids G-READ has not read yet. They are not Auth0 ids and never reach code.",
+      "READ_OS_PRODUCTION": "placeholder-os-ezil-work-production-client",
+      "READ_OTHER_OS_APP": "placeholder-other-live-os-app-client"
+    },
+    "pinGateOrder": ["production_clients_unread", "pin_ineffective", "pin_is_production", "pins_equal", "production_client_unlisted", "pin"],
+    "pinGateRule": "Symbols resolve through fixtures.clientIds, then productionOs.placeholderClientIds; 'UNPINNED' and '' are literal. production_clients_unread: G-READ returned no production OS client id. pin_ineffective: either pin is UNPINNED or empty. pin_is_production: either pin equals a PRODUCTION_AUTH0_CLIENTS id or any id G-READ read. pins_equal: the two pins are equal. production_client_unlisted: some id G-READ read is not in PRODUCTION_AUTH0_CLIENTS. pin: otherwise.",
+    "pinGateCases": [
+      { "case": "os.ezil.work on a listed production client; distinct staging pins", "os": "OS_STAGING", "universe": "UNIVERSE_STAGING", "read": ["PROD_CLI"], "expect": "pin" },
+      { "case": "os.ezil.work on a client not yet listed: a contract bump adds it first", "os": "OS_STAGING", "universe": "UNIVERSE_STAGING", "read": ["READ_OS_PRODUCTION"], "expect": "production_client_unlisted" },
+      { "case": "another live OS app on an unlisted client while os.ezil.work's is listed", "os": "OS_STAGING", "universe": "UNIVERSE_STAGING", "read": ["PROD_UNIVERSE_WEB", "READ_OTHER_OS_APP"], "expect": "production_client_unlisted" },
+      { "case": "OS pin equal to os.ezil.work's own client (os-staging sharing production's client)", "os": "READ_OS_PRODUCTION", "universe": "UNIVERSE_STAGING", "read": ["READ_OS_PRODUCTION"], "expect": "pin_is_production" },
+      { "case": "OS pin equal to a listed production client", "os": "PROD_UNIVERSE_WEB", "universe": "UNIVERSE_STAGING", "read": ["PROD_CLI"], "expect": "pin_is_production" },
+      { "case": "Universe pin equal to a listed production client (D-AUTH0-U first)", "os": "OS_STAGING", "universe": "PROD_CLI", "read": ["PROD_CLI"], "expect": "pin_is_production" },
+      { "case": "equal staging pins", "os": "OS_STAGING", "universe": "OS_STAGING", "read": ["PROD_CLI"], "expect": "pins_equal" },
+      { "case": "OS pin still UNPINNED", "os": "UNPINNED", "universe": "UNIVERSE_STAGING", "read": ["PROD_CLI"], "expect": "pin_ineffective" },
+      { "case": "Universe pin empty", "os": "OS_STAGING", "universe": "", "read": ["PROD_CLI"], "expect": "pin_ineffective" },
+      { "case": "G-READ did not read os.ezil.work's client", "os": "OS_STAGING", "universe": "UNIVERSE_STAGING", "read": [], "expect": "production_clients_unread" }
+    ]
+  },
+  "workerExec": {
+    "timeoutRule": "1.0.2. Sandbox SDK 0.12.1 does not throw when a sessionless exec reaches its timeout: the container kills the process tree and the call returns a normal result with exitCode 124 and stderr 'Command timed out after <N>ms'. The Worker treats an exec result as a timeout when exitCode === 124 AND (elapsedMs >= timeoutMs - 500 OR stderr matches /Command timed out after \\d+ms\\s*$/). The kernel only ever exits 0 or 2. A thrown exec is a timeout only when elapsedMs >= timeoutMs - 500. A timeout is never parsed as a kernel answer; its refusal is timeoutErrorByStep.",
+    "timeoutCases": [
+      { "case": "SDK 0.12.1 timeout result", "exitCode": 124, "stderr": "Command timed out after 85000ms", "elapsedMs": 85010, "timeoutMs": 85000, "timedOut": true },
+      { "case": "the SDK message with a trailing newline, before the full timeout elapsed on the Worker clock", "exitCode": 124, "stderr": "Command timed out after 10000ms\n", "elapsedMs": 120, "timeoutMs": 10000, "timedOut": true },
+      { "case": "exit 124 at the full timeout without the message", "exitCode": 124, "stderr": "", "elapsedMs": 84600, "timeoutMs": 85000, "timedOut": true },
+      { "case": "exit 124 early without the message", "exitCode": 124, "stderr": "", "elapsedMs": 1000, "timeoutMs": 85000, "timedOut": false },
+      { "case": "a kernel refusal (exit 2) at the full timeout", "exitCode": 2, "stderr": "", "elapsedMs": 85000, "timeoutMs": 85000, "timedOut": false },
+      { "case": "the message with another exit code", "exitCode": 1, "stderr": "Command timed out after 85000ms", "elapsedMs": 85000, "timeoutMs": 85000, "timedOut": false },
+      { "case": "the message not at the end of stderr, early", "exitCode": 124, "stderr": "Command timed out after 85000ms; more", "elapsedMs": 10, "timeoutMs": 85000, "timedOut": false }
+    ],
+    "timeoutErrorByStep": { "setup": "workspace_failed", "prepare": "workspace_busy", "commit": "workspace_busy", "refresh": "workspace_failed", "release": "fallback" },
+    "timeoutErrorNote": "commit maps to workspace_busy since 1.0.2 (it was workspace_failed): the rename may already have happened, and the next open is idempotent (existing) or re-clones after release. release falls back to removing exactly this request's staging, request and incoming files (section 8 step 11).",
+    "postPrepareRecheck": {
+      "stopped": { "when": "the tombstone is set or the container is not running", "answer": "runtime_not_running", "release": "skipped: nothing survives a stop" },
+      "transition": { "when": "a runtime transition is in flight (restartDesktopStack, the migration fence) while the container runs", "answer": "workspace_busy", "release": "runs: its guarded exec queues behind withRuntimeMutation and runs once the transition ends (if a transition is still in flight then, the guard skips it like a stop)" }
+    },
+    "inflightJoinRule": "1.0.2. A request joins a running one only when handle/name, op AND path are equal (null equals null). Any other request on the same handle/name, and any open while another open runs in the sandbox, is workspace_busy, which the wake loop retries, so a second open with another path gets its own openFolder. A joiner's own grant is not installed: the installed grant is the joined request's, minted at most one Worker deadline earlier, so the joiner's gitAccessExpiresAt can be later than the installed grant's expiry by about that much; the refresh lead (REFRESH_LEAD_MS) exceeds it (accepted).",
+    "routeGate": {
+      "rule": "1.0.2. POST /sandbox/<name>/repo-open is mounted only when the Worker's existing var EZIL_AI_GATEWAY_URL equals stagingValue (os-staging's own Gateway, which production never uses: I6). Any other or missing value leaves the route unmounted, so the request falls through, before its body is read or its signature checked, to the Worker's generic 404 for an undeclared path (body {\"ok\":false,\"error\":\"not_found\"}: the entry's json() keeps only the public code of 'not_found: POST <path>'), exactly as a988f28c answers that path. No env var is added.",
+      "var": "EZIL_AI_GATEWAY_URL",
+      "stagingValue": "https://ai-staging.ezil.work",
+      "productionValue": "https://ai.ezil.work",
+      "unmountedStatus": 404,
+      "unmountedBody": "{\"ok\":false,\"error\":\"not_found\"}"
+    }
+  },
+  "imageInputs": {
+    "rule": "1.0.2. No repo-open source path is a CI image input (.github/workflows/preview.yml env IMAGE_INPUTS): a change under an image input sets image_changed, rebuilds the sandbox image and deploys the Worker with --containers-rollout immediate, which recycles every live computer. The generator is a dev-time tool in worker/tools/ (it was in worker/scripts/, an image input, before 1.0.2); the kernel and helper reach a computer only as bytes in the Worker bundle (section 8 step 7). X1 P6 deploys the staging Worker with --containers-rollout none after proving git diff --name-only <live source> <deploy sha> -- <IMAGE_INPUTS> is empty.",
+    "workflow": ".github/workflows/preview.yml",
+    "generator": "worker/tools/gen-repo-open-assets.mjs",
+    "retiredGenerator": "worker/scripts/gen-repo-open-assets.mjs",
+    "repoOpenPaths": ["worker/tools/gen-repo-open-assets.mjs", "worker/src/repo-open.ts", "worker/src/repo-open-assets", "worker/src/repo-open-assets.generated.ts", "worker/src/workspace-snapshot-script.ts"]
+  },
+  "gatewayExtract": {
+    "about": "EZiL CLI is a public repository, so it commits this reduced extract instead of the full vectors: no database, Supabase or preview IP hosts. check.mjs builds it deterministically from the canonical vectors (JSON.stringify(extract, null, 2) + newline, keys in the order below) and prints its sha256, which is pinned in README-universe-repo-open.md. Write it with: node docs/contracts/universe-repo-open-v1.check.mjs --emit-gateway-extract > <EZiL CLI>/contracts/universe-repo-open-v1.gateway.json",
+    "file": "contracts/universe-repo-open-v1.gateway.json",
+    "constants": ["WORKS_STAGING_ORIGIN", "GIT_STAGING_HOST", "GIT_PRODUCTION_HOST", "GATEWAY_PREVIEW_RL_NAMESPACE", "GATEWAY_TAKEN_RL_NAMESPACES"],
+    "forbiddenHosts": ["api.ezil.work", "api-staging.ezil.work", "api-aws.ezil.work", "github.ezil.work", "git.ezil.work", "git-staging.ezil.work"],
+    "regex": ["GRANT_RE", "HANDLE_RE", "NAME_RE"]
+  },
+  "requiredConstants": [
+    "OS_STAGING_ORIGIN", "UNIVERSE_STAGING_HOST", "WORKS_STAGING_ORIGIN", "GIT_STAGING_HOST", "GIT_PRODUCTION_HOST",
+    "PREVIEW_SUPABASE_ORIGIN", "PRODUCTION_AUTH0_CLIENTS", "CLIENT_ID_UNPINNED", "STAGING_FORBIDDEN_HOSTS",
+    "GATEWAY_PREVIEW_RL_NAMESPACE", "OS_ROUTE", "SHELL_ENDPOINT_KEY", "WORKER_ROUTE_TEMPLATE",
+    "WORKS_OS_GRANT_ROUTE_TEMPLATE", "WORKS_OS_REVOKE_ROUTE", "REAUTH_PATH", "REAUTH_PARAM", "COOKIE_NAME",
+    "COOKIE_AAD", "COOKIE_HKDF_SALT", "COOKIE_HKDF_INFO", "COMPUTER_LABEL_PREFIX", "OS_SESSION_DEVICE_LABEL_PREFIX",
+    "OS_SESSION_OS", "OS_SESSION_CLI_VERSION", "GRANT_USERNAME", "SIGNATURE_HEADER", "SIGNATURE_MAX_SKEW_MS",
+    "WORKSPACE_ROOT_DEFAULT", "REPO_DIR_TEMPLATE", "STAGING_ROOT_NAME", "STAGING_DIR_TEMPLATE", "HELPER_WRAPPER_PATH", "GRANT_FILE_TEMPLATE",
+    "LOCK_TEMPLATE", "LOCK_OWNER_TEMPLATE", "SNAPSHOT_LIMIT_BYTES", "SNAPSHOT_MAX_ENTRIES", "REPO_BUDGET_FRACTION",
+    "TAR_BLOCK_BYTES", "TAR_PAX_NAME_BYTES", "TAR_PAX_RECORD_SLACK_BYTES", "TAR_ARCHIVE_TAIL_BYTES", "BODY_LIMITS_BYTES",
+    "OS_PRODUCTION_APP_ORIGIN", "OS_LANDING_ORIGIN", "SNAPSHOT_INTERNAL_NAMES", "SNAPSHOT_CACHE_NAMES", "SNAPSHOT_NESTED_INDEX_MAX"
+  ]
+}
