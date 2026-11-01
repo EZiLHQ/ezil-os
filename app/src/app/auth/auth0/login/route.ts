@@ -5,7 +5,9 @@ import { ownedPublicOrigin } from '@/utils/forwarded';
 
 export async function GET(request: NextRequest) {
     try {
-        const url = await buildAuthorizeUrl({ origin: ownedPublicOrigin(request.headers, request.url), returnUrl: request.nextUrl.searchParams.get('returnUrl') });
+        // `prompt=none` exactly, or nothing: the silent re-auth that refreshes the retained ID token.
+        const prompt = request.nextUrl.searchParams.get('prompt') === 'none' ? 'none' : undefined;
+        const url = await buildAuthorizeUrl({ origin: ownedPublicOrigin(request.headers, request.url), returnUrl: request.nextUrl.searchParams.get('returnUrl'), prompt });
         const response = NextResponse.redirect(url);
         response.headers.set('Cache-Control', 'no-store');
         response.headers.set('Referrer-Policy', 'no-referrer');

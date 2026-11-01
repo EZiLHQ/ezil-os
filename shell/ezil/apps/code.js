@@ -108,6 +108,29 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 //     leaving code-server's own reconnect dialog, which this cross-origin
 //     shell cannot see, on screen. Coming back re-mints through
 //     `start_boot()`, the same path as every other open.
+//
+// ── A project's repository (lane O2, 2026-10-31) ─────────────────────────────
+// A launch with `ctx.project` (`/app/code?project=<uuid>&repo=<uuid>`, parsed
+// by `../app-link.js`) asks the SAME mint for that repository:
+// `{computerId, intent:'open', project:{projectId, repoId}}`. The server asks
+// Universe 2.0 for a Git token, has the Worker clone or fetch the repository into
+// the computer, and answers a URL whose `folder=` ends `/projects/<repoId>`; a URL
+// without it is refused here rather than shown, because it would open the
+// person's own files as if they were the project. `path` is not sent (deferred).
+// The window's title becomes the repository's name when the answer carries one
+// (`repository.name`, `<namespace>/<name>`); the server never sends the
+// Cloudflare Artifacts remote, which names its account, and an Artifacts URL is
+// never shown here even if one arrived.
+// A relaunch naming a DIFFERENT project re-mints; the same project, or none,
+// changes nothing. Refusals get their own copy and are never retried silently
+// (`session.js` TERMINAL_ERROR_CODES): `project_not_authorized`,
+// `repo_open_unsupported_provider`, and `IDENTITY_REFRESH_REQUIRED` — the
+// server holds no EZiL ID token for this session — which sends the tab ONCE
+// per project to `/auth/auth0/login?prompt=none&returnUrl=<this project's
+// /app/code URL>` (the silent sign-in; Auth0 falls back to an interactive one
+// itself). A sessionStorage guard (`IDENTITY_REFRESH_KEY`) makes a second
+// refusal show "Sign in again" instead of leaving again, so it cannot loop;
+// that panel's Try again clears it. With no project, nothing here changes.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
@@ -118,9 +141,150 @@ import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import { createFullView } from '../ui/full-view.js';
+import { appUrl } from '../app-history.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
+
+/** A project link's ids, as `../app-link.js` accepts them: lowercase canonical UUIDs. */
+const PROJECT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/**
+ * sessionStorage: the silent EZiL ID refresh this tab last made for a project,
+ * `{projectId, repoId, at}`. Present (and younger than the TTL) for the same
+ * project means the refresh already happened and did not help.
+ */
+export const IDENTITY_REFRESH_KEY = 'ezil-os:code.identity-refresh';
+const IDENTITY_REFRESH_TTL_MS = 10 * 60_000;
+/** Where the silent sign-in starts (`app/src/app/auth/auth0/login/route.ts`). */
+const LOGIN_PATH = '/auth/auth0/login';
+/** The server's refusals of a project open, as it may spell them, to this window's error codes. */
+const PROJECT_REFUSALS = {
+    project_not_authorized: 'project_not_authorized',
+    IDENTITY_REFRESH_REQUIRED: 'identity_refresh_required',
+    repo_open_unsupported_provider: 'repo_open_unsupported_provider',
+};
+const PROJECT_FAILURE_COPY = {
+    project_not_authorized: {
+        title: "You don't have access to this project",
+        body: "Code can't open this repository because your EZiL ID isn't on this project. If you should have access, ask the project's owner to add you.",
+    },
+    identity_refresh_required: {
+        title: 'Sign in again to open this project',
+        body: "Code needs to confirm your EZiL ID before it can open this repository, and that check didn't finish. Choose Try again to sign in.",
+    },
+    repo_open_unsupported_provider: {
+        title: "Projects can't open on this computer yet",
+        body: "Opening a project's repository isn't available on this kind of computer yet. Code still opens your own files from the dock.",
+    },
+    repo_open_failed: {
+        title: "Couldn't open this project's repository",
+        body: 'Something went wrong while getting the repository onto your computer. Try again in a moment.',
+    },
+};
+
+/** `ctx.project` as Code uses it, or null for anything a project link could not have produced. */
+function projectOf (value) {
+    if ( ! value || typeof value !== 'object' ) return null;
+    const { projectId, repoId, path } = value;
+    if ( typeof projectId !== 'string' || ! PROJECT_UUID.test(projectId) ) return null;
+    if ( typeof repoId !== 'string' || ! PROJECT_UUID.test(repoId) ) return null;
+    return typeof path === 'string' && path !== '' ? { projectId, repoId, path } : { projectId, repoId };
+}
+
+/**
+ * The project refusal in a mint answer, wherever the server put it: a route
+ * error's `error.code` or `error.message` (a tRPC FORBIDDEN/CONFLICT carries
+ * the code as its message), or an `{ok:false, errorCode}` answer. Any other
+ * `repo_open_*` / `project_repo_*` code is a failed open. Null otherwise.
+ */
+function projectRefusalOf (data) {
+    for ( const value of [data?.error?.code, data?.error?.message, data?.errorCode, data?.error] ) {
+        if ( typeof value !== 'string' ) continue;
+        if ( Object.hasOwn(PROJECT_REFUSALS, value) ) return PROJECT_REFUSALS[value];
+        if ( /^(repo_open|project_repo)_[a-z_]+$/.test(value) ) return 'repo_open_failed';
+    }
+    return null;
+}
+
+/** The repository's display name from a successful project mint, or null. Never the URL itself. */
+function repositoryNameOf (data) {
+    const repo = data?.repository;
+    const name = typeof repo?.name === 'string' ? repo.name.trim() : '';
+    if ( name ) return name.slice(0, 200);
+    const url = typeof repo?.canonicalURL === 'string' ? repo.canonicalURL : '';
+    const m = /^https:\/\/github\.ezil\.work\/([a-z0-9-]+)\/([a-z0-9._-]+)\.git$/.exec(url);
+    return m ? `${m[1]}/${m[2]}` : null;
+}
+
+/**
+ * Whether a minted Code URL opens THIS repository's folder: exactly one
+ * `folder=`, ending `/projects/<repoId>`. One, because the bridge forwards only
+ * the first (`worker/src/preview-bridge.ts`), so a second could not be the one
+ * code-server opens.
+ */
+function opensRepository (url, project) {
+    try {
+        const folders = new URL(url).searchParams.getAll('folder');
+        return folders.length === 1 && folders[0].endsWith(`/projects/${project.repoId}`);
+    } catch {
+        return false;
+    }
+}
+
+/** This project's `/app/code` URL, plus the page's `computer` (`../app-history.js` PAGE_KEYS) when it has one. */
+function projectReturnUrl (project) {
+    const params = [['project', project.projectId], ['repo', project.repoId]];
+    if ( project.path ) params.push(['path', project.path]);
+    try {
+        const computers = new URLSearchParams(window.location.search).getAll('computer');
+        if ( computers.length === 1 ) params.push(['computer', computers[0]]);
+    } catch { /* no page computer */ }
+    return appUrl('code', params);
+}
+
+/**
+ * The silent EZiL ID refresh, at most once per project per tab. True when the
+ * tab is leaving for it. False when the guard says it already ran for this
+ * project, or when sessionStorage is unusable: without a guard there is no
+ * proof the next answer would not send the tab away again.
+ *
+ * A real top-level navigation (Auth0 needs one), made the way `../auth.js`
+ * signs out: a hidden same-origin form, here a GET carrying `prompt=none` and
+ * the relative `returnUrl` the login route accepts.
+ */
+function refreshIdentityOnce (project) {
+    try {
+        const seen = JSON.parse(sessionStorage.getItem(IDENTITY_REFRESH_KEY) ?? 'null');
+        if ( seen && seen.projectId === project.projectId && seen.repoId === project.repoId
+             && Date.now() - seen.at < IDENTITY_REFRESH_TTL_MS ) return false;
+    } catch ( err ) {
+        if ( ! (err instanceof SyntaxError) ) return false;
+    }
+    try {
+        sessionStorage.setItem(IDENTITY_REFRESH_KEY, JSON.stringify({ projectId: project.projectId, repoId: project.repoId, at: Date.now() }));
+    } catch {
+        return false;
+    }
+    telemetry.flushNow();
+    const form = document.createElement('form');
+    form.method = 'GET';
+    form.action = LOGIN_PATH;
+    form.style.display = 'none';
+    for ( const [name, value] of [['prompt', 'none'], ['returnUrl', projectReturnUrl(project)]] ) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = name;
+        input.value = value;
+        form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+    return true;
+}
+
+function forgetIdentityRefresh () {
+    try { sessionStorage.removeItem(IDENTITY_REFRESH_KEY); } catch { /* nothing to forget */ }
+}
 
 /**
  * sessionStorage: the user's last EXPLICIT view choice for Code in this tab
@@ -184,10 +348,13 @@ const CODE_UNREACHABLE_COPY = {
  * this file's header for why it is not itself a `session.js` export.
  *
  * @param {string} computerId
- * @returns {Promise<{ok: true, url: string, expiresAt?: number}
+ * @param {AbortSignal} [signal]
+ * @param {{projectId: string, repoId: string}|null} [project] Asked for in the
+ *   body when given (lane O2); without it the body is unchanged.
+ * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, signal) {
+async function mintCodePreviewUrl (computerId, signal, project = null) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -203,7 +370,7 @@ async function mintCodePreviewUrl (computerId, signal) {
     // asking after its window closed (Stop closes it first) and re-provisioned the
     // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
     // Stop also reaches it through `session.cancelComputerOpens`.
-    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s), { signal });
+    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project), { signal });
 }
 
 /** The request's signal: its timeout and, when given, the loop's cancel. */
@@ -214,7 +381,7 @@ function mintSignal (cancel) {
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId, cancel) {
+async function mintCodePreviewUrlOnce (computerId, cancel, project) {
     const started = await session.ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
@@ -228,7 +395,10 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
             headers: { 'content-type': 'application/json' },
             // Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and
             // only an ask that says so may start moving a held computer's files. An older server ignores the field.
-            body: JSON.stringify({ computerId, intent: 'open' }),
+            // Lane O2: the project rides along only when there is one, as its two ids and nothing else.
+            body: JSON.stringify(project
+                ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
+                : { computerId, intent: 'open' }),
             signal: mintSignal(cancel),
         });
     } catch ( err ) {
@@ -249,6 +419,11 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
     } catch {
         data = null;
     }
+
+    // Lane O2: a refused project open, as an HTTP error or an `ok:false` answer. Read first, so a 403/409 refusal is
+    // never flattened into `unknown`.
+    const refusal = project ? projectRefusalOf(data) : null;
+    if ( refusal ) return { ok: false, errorCode: refusal };
 
     if ( ! res.ok ) {
         const code = data?.error?.code;
@@ -282,7 +457,16 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
         });
         return { ok: false, errorCode: 'unknown' };
     }
-    return { ok: true, url: data.codePreviewUrl, expiresAt: data.expiresAt };
+    if ( project && ! opensRepository(data.codePreviewUrl, project) ) {
+        // A server that ignored the project (or answered for another one) would open the person's own files under the
+        // project's name. Refused, never shown.
+        console.error(`[${PHASE}] the project mint returned a URL that does not open the repository`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/code#mint', code: 'project_folder_missing',
+        });
+        return { ok: false, errorCode: 'repo_open_failed' };
+    }
+    return { ok: true, url: data.codePreviewUrl, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data) } : {}) };
 }
 
 /**
@@ -298,6 +482,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel) {
  * @param {'full'|'window'} [ctx.view] How to open (the `/app/code` route passes
  *   `'full'`). Absent or anything else: windowed, unless the user's last
  *   explicit choice in this tab was full (`VIEW_STORAGE_KEY`).
+ * @param {{projectId: string, repoId: string, path?: string}} [ctx.project]
+ *   A project's repository to open (lane O2; see the header). Anything that is
+ *   not two lowercase UUIDs is ignored and Code opens as without one.
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openCodeWindow (ctx = {}) {
@@ -319,6 +506,11 @@ export async function openCodeWindow (ctx = {}) {
     // machine in the head's tooltip instead.
     const title = ctx.appName || 'Code';
     const title_tooltip = computer?.name ? `${title} — ${computer.name}` : title;
+    /**
+     * Lane O2: the project this window opens, read by every mint (`start_boot`), replaced only by a relaunch that
+     * names a different one. A local editor has no computer to put a repository in, so it never takes one.
+     */
+    let project = nativeSurface ? null : projectOf(ctx.project);
 
     if ( ! computer?.id ) {
         console.error(`[${PHASE}] refusing to open: the boot payload carries no computer`);
@@ -403,7 +595,11 @@ export async function openCodeWindow (ctx = {}) {
         isLaunching: () => session.isComputeLaunching(computer.id),
         // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
         isPreparing: () => session.isComputePreparing(computer.id),
-        onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); }, failureCopy: nativeFailureCopy,
+        onRetry: () => {
+            // "Sign in again": the person's own click may make one more silent refresh (lane O2).
+            if ( last_failure?.errorCode === 'identity_refresh_required' ) forgetIdentityRefresh();
+            void session.userRetry(computer.id, last_failure, reopen_after_retry);
+        }, failureCopy: nativeFailureCopy,
         onProgressChange: () => {
             const seen = progress.computerProgress();
             if ( ! seen ) return;
@@ -579,7 +775,8 @@ export async function openCodeWindow (ctx = {}) {
         console.info(`[${PHASE}] minting a code-preview URL for computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
         mint_ctl?.abort();
         mint_ctl = new AbortController();
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal));
+        const asked = project;
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -599,6 +796,25 @@ export async function openCodeWindow (ctx = {}) {
                 // lost.
                 trace.step('mint_unavailable');
                 trace.end('skipped');
+                return;
+            }
+            if ( asked && Object.hasOwn(PROJECT_FAILURE_COPY, res.errorCode) ) {
+                // Lane O2: the project could not be opened. Its own words, never the root folder in its place.
+                if ( res.errorCode === 'identity_refresh_required' && refreshIdentityOnce(asked) ) {
+                    // The tab is leaving for the silent sign-in; the opening panel stays up until it does.
+                    console.info(`[${PHASE}] the server holds no EZiL ID for this project open; refreshing it once`);
+                    trace.step('identity_refresh');
+                    trace.end('skipped');
+                    return;
+                }
+                console.warn(`[${PHASE}] the project could not be opened: ${res.errorCode}`);
+                telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#project', code: res.errorCode });
+                progress.render({
+                    ...computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }),
+                    copy: PROJECT_FAILURE_COPY[res.errorCode],
+                });
+                trace.step('project_refused');
+                trace.end(res.errorCode === 'repo_open_failed' ? 'error' : 'skipped');
                 return;
             }
             console.error(`[${PHASE}] code-preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
@@ -638,6 +854,11 @@ export async function openCodeWindow (ctx = {}) {
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
         trace.step('mint_ok');
+        if ( asked ) {
+            // Lane O2: the repository is open, so a later refresh may happen again; the window is named after it.
+            forgetIdentityRefresh();
+            set_title(res.repository || title);
+        }
 
         // 🔴 THE HANDOFF IS NOT A VERDICT. This used to pass
         // `frameConfirmed: false`, which `computeBootUiState` read as "asked
@@ -947,8 +1168,8 @@ export async function openCodeWindow (ctx = {}) {
 
     /**
      * The window's title everywhere it is shown — the head and the drawer's
-     * tray — as TEXT (`textContent`), never markup. A later lane names the
-     * project/repo here. Empty input falls back to the app's name.
+     * tray — as TEXT (`textContent`), never markup. A project open names its
+     * repository here (lane O2). Empty input falls back to the app's name.
      */
     const set_title = (text) => {
         const t = String(text ?? '').trim() || title;
@@ -999,13 +1220,23 @@ export async function openCodeWindow (ctx = {}) {
     // `seam-minimise-browser-test.mjs` pins one provider of that hook.
     /**
      * Single-instance relaunch (contract item 4): the registry calls this on the
-     * existing window, after `showWindow()`, with the launch's ctx. Only
-     * `ctx.view` is read, and only `'full'` / `'window'`; every other key and
-     * value is ignored (a later lane reads `ctx.project`). Not remembered.
+     * existing window, after `showWindow()`, with the launch's ctx. `ctx.view`
+     * is read, only `'full'` / `'window'`, and not remembered. `ctx.project`
+     * (lane O2): a valid project with other ids than this window's re-mints
+     * for it, under the app's name until its repository answers; the same
+     * project (a new `path` is kept, not re-minted) or none changes nothing.
+     * Every other key and value is ignored.
      */
     el_window._ezil_relaunch = (relaunch_ctx) => {
         const view = relaunch_ctx?.view;
         if ( view === 'full' || view === 'window' ) set_view(view);
+        const next = nativeSurface ? null : projectOf(relaunch_ctx?.project);
+        if ( ! next ) return;
+        const same = project && project.projectId === next.projectId && project.repoId === next.repoId;
+        project = next;
+        if ( same ) return;
+        set_title(title);
+        void start_boot();
     };
     // Back from the taskbar: full view again if still wanted, else the
     // windowed bounds a minimise-from-full left stashed. After `showWindow`'s

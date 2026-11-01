@@ -17,6 +17,8 @@ const stub = vi.hoisted(() => ({
     order: [] as string[],
     scopes: [] as (string | undefined)[],
     error: null as { message: string } | null,
+    identityThrows: false,
+    identityAt: [] as number[],
 }));
 
 vi.mock('@/utils/supabase/server', () => ({
@@ -33,6 +35,10 @@ vi.mock('@/utils/supabase/server', () => ({
     }),
 }));
 
+vi.mock('@/server/auth/retained-identity', () => ({
+    // Its own record, so the AI-revocation tests' exact `order` stays as it was: how much had happened when it ran.
+    clearProjectIdentity: async () => { stub.identityAt.push(stub.order.length); if (stub.identityThrows) throw new Error('no request scope'); },
+}));
 vi.mock('@/server/db', () => ({ db: { query: { computers: { findMany: (options: unknown) => stub.list(options) } } } }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/server/lib/cloudflare-guacamole-provider')>(),
@@ -51,6 +57,8 @@ beforeEach(() => {
     stub.list.mockReset().mockResolvedValue(COMPUTERS.map((id) => ({ id })));
     stub.error = null;
     stub.throws = false;
+    stub.identityThrows = false;
+    stub.identityAt = [];
     stub.order = [];
     vi.stubGlobal('fetch', vi.fn(async () => { stub.order.push('delete'); return new Response('{}'); }));
 });
@@ -165,6 +173,20 @@ describe('signout AI revocation', () => {
         await vi.advanceTimersByTimeAsync(AI_LOGOUT_TIMEOUT_MS);
         expect((await result).status).toBe(303);
         expect(fetch).toHaveBeenCalledTimes(2);
+        expect(stub.order).toContain('signout');
+    });
+});
+
+describe('signout clears the retained EZiL ID token', () => {
+    it('before the AI revocation and the Supabase signOut', async () => {
+        await POST(signOutRequest());
+        expect(stub.identityAt).toEqual([0]);
+        expect(stub.order).toEqual(['delete', 'delete', 'signout']);
+    });
+    it('a failure to clear it never blocks the sign-out', async () => {
+        stub.identityThrows = true;
+        const response = await POST(signOutRequest());
+        expect(response.status).toBe(303);
         expect(stub.order).toContain('signout');
     });
 });

@@ -35,6 +35,16 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          bytes, by lines, and per-line; EVERY line is run through
  *          `sanitizeErrorMessage` before it leaves. Kill switch
  *          `EZIL_NEKO_LOGS=off`. See `handleNekoLogs` / `./neko-logs.ts`)
+ *   POST   /sandbox/:name/repo-open → { ok, folder, head?, status }
+ *          (v2-signed only. Clones, or fetches only, one project repository
+ *          (Cloudflare Artifacts, or EZiL Git) into
+ *          `<workspace root>/projects/<repositoryId>/repository` of a RUNNING
+ *          computer, the folder Code opens being `<repositoryId>`;
+ *          the Git token reaches git only through its environment, as a
+ *          Bearer header or an env-fed Basic credential helper, and only for
+ *          a fetch into a private repository, never the person's, within the
+ *          caller's `timeoutMs`. An empty repository opens as an empty clone
+ *          (`created`, no head). See `handleRepoOpen` / `./repo-open.ts`)
  *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
  *                                     wasRunning, runningAfter, mode }
  *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —
@@ -603,6 +613,17 @@ import {
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
+  parseRepoOpenRequest,
+  repoOpenStatus,
+  repoOpenWhenRunning,
+  ownSessionExec,
+  REPO_OPEN_MAX_BODY_BYTES,
+  REPO_OPEN_UNMOUNTED_ROOT,
+  type RepoOpenAnswer,
+  type RepoOpenRequest,
+  type RepoOpenRoot,
+} from './repo-open';
+import {
   aiProxyBaseUrl,
   aiProxyDisabled,
   chooseAiCredential,
@@ -774,7 +795,12 @@ const PUBLIC_ERROR_CODES = [
   'provider_not_routable', 'relay_auth_not_configured', 'relay_bad_request', 'relay_busy',
   'relay_login_failed', 'relay_logout_failed', 'relay_metadata_invalid', 'relay_negotiation_busy',
   'relay_refresh_failed', 'relay_refresh_unconfirmed', 'relay_runtime_changed',
-  'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed', 'request_too_large',
+  'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed',
+  'repo_open_auth_failed', 'repo_open_busy', 'repo_open_failed', 'repo_open_folder_conflict',
+  'repo_open_git_failed', 'repo_open_git_missing', 'repo_open_invalid_request', 'repo_open_not_found',
+  'repo_open_ref_not_found', 'repo_open_timeout', 'repo_open_token_expired', 'repo_open_unreachable',
+  'repo_open_unsupported_provider', 'repo_open_workspace_not_ready', 'repo_open_workspace_unavailable',
+  'request_too_large',
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
   'runtime_running', 'sandbox_runtime_blocked', 'screen_bad_request', 'screen_login_failed_no_token',
@@ -944,6 +970,8 @@ interface EzilWorkspacePersistRpc {
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
+  /** `POST /sandbox/:name/repo-open` (`./repo-open.ts`). A running computer only; never starts one. */
+  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -2669,6 +2697,23 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       return this.ctx.container!.getTcpPort(port).fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     });
   }
+  /**
+   * `POST /sandbox/:name/repo-open`: clone or fetch one repository into this
+   * computer's workspace (`./repo-open.ts`). Checked running under the runtime
+   * lock, like `runningContainerFetch`, because an `exec` on a stopped
+   * computer would cold-start it; the git work itself runs outside the lock,
+   * in a shell session of its own (`ownSessionExec`), so a slow clone holds up
+   * neither viewer traffic nor the probes in the default session.
+   */
+  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer> {
+    return repoOpenWhenRunning({
+      running: () => this.withRuntimeMutation(async () =>
+        this.containerIsRunning() && !(await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY))),
+      touch: () => this.renewActivityTimeout(),
+      exec: ownSessionExec(this),
+    }, request, root);
+  }
+
   override async fetch(request: Request): Promise<Response> {
     // Set only by the authenticated Code bridge. The HTTP entrypoint carries
     // WebSocket responses intact; a DO RPC cannot serialize a WebSocket.
@@ -5277,6 +5322,68 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
 }
 
 /**
+ * The workspace root repositories are opened under: the root `/sandbox/preview`
+ * hands code-server as `folder=` (`codePreviewFolderParams`), resolved from the
+ * same settings `ensureWorkspaceMount` reads, without mounting or hydrating
+ * anything. A store-backed root must already be hydrated in the container
+ * (checked there); with no store configured it is code-server's own default.
+ * Null when the store is misconfigured, which `/sandbox/preview` refuses too.
+ */
+function repoOpenRoot(env: Env): RepoOpenRoot | null {
+  const store = resolveWorkspaceStore(env);
+  if (!store.ok) return null;
+  const config = resolveWorkspaceMountConfig(env);
+  if (store.kind === 's3') {
+    return { path: config?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH), requireHydrated: true };
+  }
+  if (!config) return { path: REPO_OPEN_UNMOUNTED_ROOT, requireHydrated: false };
+  return { path: config.mountPath, requireHydrated: config.mode === 'r2-binding' };
+}
+
+/**
+ * POST /sandbox/:name/repo-open — see `./repo-open.ts` for the contract.
+ *
+ * v2 ONLY. The body carries a git credential, and a v1 token binds no
+ * sandbox, body or route (any fresh v1 token authorizes every route for every
+ * sandbox), so a v1-signed open is refused outright with `hmac_v2_required`,
+ * as `/internal/aws/tunnels` does. `preauthorizeV2` (top of `fetch`) has
+ * already verified the signature over these exact body bytes and that the
+ * claims name THIS sandbox. Cloudflare computers only: an AWS computer's
+ * container is not reachable from here.
+ *
+ * The caller (the OS server) calls this only after `/sandbox/preview` has
+ * answered for the computer, so the workspace is hydrated and the desktop up;
+ * a stopped computer is refused (409 `runtime_not_running`), never started.
+ * Neither the token nor anything git printed is in the response or the logs.
+ */
+async function handleRepoOpen(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  const v2 = verifiedV2Claims.get(request);
+  if (!v2) {
+    const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
+    return json({ ok: false, error }, 401);
+  }
+  if (v2.provider !== 'cloudflare') {
+    return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
+  }
+  const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
+  if (!read.ok) return read.response;
+  const parsed = parseRepoOpenRequest(read.body);
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoOpenStatus(parsed.error));
+  const root = repoOpenRoot(env);
+  if (!root) {
+    return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
+  }
+  let answer: RepoOpenAnswer;
+  try {
+    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root);
+  } catch {
+    answer = { ok: false, error: 'repo_open_failed' };
+  }
+  if (!answer.ok) return json({ ok: false, error: answer.error }, repoOpenStatus(answer.error));
+  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status });
+}
+
+/**
  * HMAC-gated workspace diagnostic endpoint.
  *
  * Mounts the R2/S3 workspace bucket (without launching the desktop) and
@@ -7707,6 +7814,13 @@ export default {
         return json({ ok: false, error: 'twen_disabled' }, 404);
       }
       return handleTwen(request, env, decodeURIComponent(twenMatch[1]));
+    }
+
+    const repoOpenMatch = path.match(/^\/sandbox\/([^/]+)\/repo-open$/);
+    if (method === 'POST' && repoOpenMatch) {
+      // Clone or fetch one project repository into a running computer's
+      // workspace. v2-signed only; see `handleRepoOpen` / `./repo-open.ts`.
+      return handleRepoOpen(request, env, decodeURIComponent(repoOpenMatch[1]));
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);

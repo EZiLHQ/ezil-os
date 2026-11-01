@@ -20,6 +20,7 @@ seed_codeserver_user_settings() {
   if cat >"$temporary" <<'CODESERVER_SETTINGS_JSON'
 {
   "security.workspace.trust.enabled": false,
+  "task.allowAutomaticTasks": "off",
   "files.exclude": {
     "**/.ezil": true
   }
@@ -34,6 +35,13 @@ CODESERVER_SETTINGS_JSON
 
 # Machine settings belong to the image and are refreshed on every prepare.
 # User settings (including JSONC) continue through the existing restore path.
+# `task.allowAutomaticTasks` is "off" here as well as in the user settings
+# (ezil_editor_enforce_user_policy): a repository opened from a project link
+# (<root>/projects/<id>, worker/src/repo-open.ts) is someone else's code, and
+# its `runOn: folderOpen` tasks must not run on this person's computer. In
+# code-server 4.141 (VS Code 1.141) the setting is application-scoped, which
+# the Machine layer cannot set, so the user settings are what decide; this
+# copy is kept for an editor that scopes it otherwise.
 seed_codeserver_machine_settings() {
   local dst="$1/Machine/settings.json" temporary
   mkdir -p "$(dirname "$dst")" || return 1
@@ -61,7 +69,8 @@ seed_codeserver_machine_settings() {
     "EZIL_AI_BASE_URL": null
   },
   "github.copilot.chat.tools.viewImage.enabled": false,
-  "github.copilot.chat.virtualTools.threshold": 64
+  "github.copilot.chat.virtualTools.threshold": 64,
+  "task.allowAutomaticTasks": "off"
 }
 CODESERVER_MACHINE_SETTINGS_JSON
   then
@@ -128,6 +137,116 @@ while (open < original.length && original[open] !== "[") {
 }
 write(original.slice(0, open + 1) + "\n  " + JSON.stringify(entry) + (groups.length ? "," : "") + original.slice(open + 1));
 CODESERVER_CHAT_MODELS_JS
+}
+
+# A project repository's own tasks never run on open (build1-review-os.md #1):
+# force "task.allowAutomaticTasks": "off" into the user's settings on EVERY
+# prepare, over a restored value or an earlier "Allow" (which writes "on").
+# Edits in place so the user's comments and layout survive: every top-level
+# value of the key becomes "off", or the key is added as the last property.
+# An empty or unreadable file is left exactly as it is (1.141's own default
+# is "off"). In 1.141 the setting is application-scoped (scope 1, outside the
+# workspace and folder scopes), so a repository's .vscode/settings.json cannot
+# turn it back on. A project repository's root-level configuration is inert
+# anyway: repo-open puts the repository one level below the folder Code opens
+# (review F3), out of reach of everything code-server reads from a workspace
+# folder's root (.vscode, .mcp.json, .github/hooks, .claude/settings*.json).
+ezil_editor_enforce_user_policy() {
+  local dst="$1/User/settings.json"
+  [ -s "$dst" ] || return 0
+  node - "$dst" <<'CODESERVER_USER_POLICY_JS' || true
+const fs = require("fs");
+const dst = process.argv[2];
+const KEY = "task.allowAutomaticTasks", VALUE = "off";
+// The same JSONC reading as seed_codeserver_chat_models: comments and
+// trailing commas dropped, string contents untouched.
+function jsonc(text) {
+  let out = "", i = 0, inString = false;
+  while (i < text.length) {
+    const c = text[i], n = text[i + 1];
+    if (inString) { out += c; if (c === "\\") { out += n ?? ""; i += 2; continue; } if (c === '"') inString = false; i++; continue; }
+    if (c === '"') { inString = true; out += c; i++; continue; }
+    if (c === "/" && n === "/") { while (i < text.length && text[i] !== "\n") i++; continue; }
+    if (c === "/" && n === "*") { const close = text.indexOf("*/", i + 2); i = close < 0 ? text.length : close + 2; continue; }
+    out += c; i++;
+  }
+  return JSON.parse(out.replace(/,(\s*[\]}])/g, "$1"));
+}
+// Tokens outside comments, with their offsets: strings, punctuation, literals.
+function tokens(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"') {
+      const s = i++;
+      while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
+      if (i >= text.length) return null;
+      out.push({ t: "str", s, e: ++i }); continue;
+    }
+    if (text.startsWith("//", i)) { const n = text.indexOf("\n", i); i = n < 0 ? text.length : n; continue; }
+    if (text.startsWith("/*", i)) { const n = text.indexOf("*/", i + 2); if (n < 0) return null; i = n + 2; continue; }
+    if ("{}[]:,".includes(c)) { out.push({ t: c, s: i, e: i + 1 }); i++; continue; }
+    if (/\s/.test(c)) { i++; continue; }
+    const s = i;
+    while (i < text.length && !/[\s{}\[\]:,"\/]/.test(text[i])) i++;
+    if (i === s) return null;
+    out.push({ t: "lit", s, e: i });
+  }
+  return out;
+}
+const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const original = fs.readFileSync(dst, "utf8");
+let parsed;
+try { parsed = jsonc(original); } catch { process.exit(0); }
+if (!isObject(parsed) || parsed[KEY] === VALUE) process.exit(0);
+const toks = tokens(original);
+if (!toks || toks[0]?.t !== "{") process.exit(0);
+const spans = []; let depth = 0, close = -1;
+for (let k = 0; k < toks.length && close < 0; k++) {
+  const tk = toks[k];
+  if (tk.t === "{" || tk.t === "[") depth++;
+  else if (tk.t === "}" || tk.t === "]") { if (--depth === 0) close = k; }
+  else if (depth === 1 && tk.t === "str" && toks[k + 1]?.t === ":") {
+    let name; try { name = JSON.parse(original.slice(tk.s, tk.e)); } catch { process.exit(0); }
+    if (name !== KEY) continue;
+    const v = toks[k + 2];
+    if (!v) process.exit(0);
+    if (v.t === "str" || v.t === "lit") { spans.push([v.s, v.e]); continue; }
+    if (v.t !== "{" && v.t !== "[") process.exit(0);
+    let d = 0, m = k + 2;
+    for (; m < toks.length; m++) {
+      if (toks[m].t === "{" || toks[m].t === "[") d++;
+      else if ((toks[m].t === "}" || toks[m].t === "]") && --d === 0) break;
+    }
+    if (m >= toks.length) process.exit(0);
+    spans.push([v.s, toks[m].e]);
+  }
+}
+if (close < 0) process.exit(0);
+let next;
+if (spans.length) {
+  next = original;
+  for (const [s, e] of spans.reverse()) next = next.slice(0, s) + JSON.stringify(VALUE) + next.slice(e);
+} else {
+  const prev = toks[close - 1], at0 = toks[close].s;
+  const lineStart = original.lastIndexOf("\n", at0 - 1) + 1;
+  const ownLine = /^\s*$/.test(original.slice(lineStart, at0));
+  const at = ownLine ? lineStart : at0;
+  const comma = prev.t === "{" || prev.t === "," ? "" : ",";
+  next = original.slice(0, prev.e) + comma + original.slice(prev.e, at)
+    + (ownLine ? "" : "\n") + "  " + JSON.stringify(KEY) + ": " + JSON.stringify(VALUE) + "\n" + original.slice(at);
+}
+let check;
+try { check = jsonc(next); } catch { process.exit(0); }
+if (!isObject(check) || check[KEY] !== VALUE) process.exit(0);
+const temporary = dst + "." + process.pid;
+try {
+  fs.writeFileSync(temporary, next, { flag: "wx", mode: fs.statSync(dst).mode & 0o777 });
+  fs.renameSync(temporary, dst);
+} finally {
+  if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+}
+CODESERVER_USER_POLICY_JS
 }
 
 # Copilot/telemetry-only sinks; never github.com or api.github.com. A read-only
@@ -238,6 +357,7 @@ ezil_editor_prepare() (
   # Within the same runtime, relaunches preserve the current editor state.
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
+    ezil_editor_enforce_user_policy "$user_data"
     # History must not block the editor: a failed link leaves today's behaviour.
     ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
     exit 0
@@ -248,6 +368,7 @@ ezil_editor_prepare() (
     fi
   done
   seed_codeserver_user_settings "$user_data" || exit 1
+  ezil_editor_enforce_user_policy "$user_data"
   ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
   # This marker is published only after every restore succeeded. Failed restores
   # cannot launch defaults or let a later capture replace durable user settings.

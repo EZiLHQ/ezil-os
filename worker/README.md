@@ -119,6 +119,7 @@ browser — the browser only ever speaks the Guacamole protocol to the web app.
 | `POST /sandbox/preview` | `{ ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }` |
 | `GET /sandbox/:name/status` | `{ ok, sandboxName, guacamoleRunning, mode, desktopRunning, runningModes, modeSource }` |
 | `DELETE /sandbox/:name` | `{ ok, sandboxName, terminated, stopped, outcome, wasRunning, runningAfter, mode }` |
+| `POST /sandbox/:name/repo-open` | `{ ok, folder, head?, status }` — clones (or fetches only) one project repository (Cloudflare Artifacts with a Bearer token, or EZiL Git with Basic) into `<workspace root>/projects/<repositoryId>/repository` of a running computer (Code opens `<repositoryId>`, so the repository's own `.vscode/` and agent hooks are not at a workspace folder root), within the caller's `timeoutMs`; a repository with no commits yet is an empty clone (`status: 'created'`, no `head`); see `src/repo-open.ts` |
 
 `guacamoleUrl` is the exposed container root (`https://<port>-<id>-desktop.<host>/`),
 which serves the auto-connect landing page that redirects into
@@ -149,6 +150,7 @@ v1 minter is migrated (list and #166 resolution: `docs/AWS-COMPUTERS.md`, C-5).
 | `POST /sandbox/preview` | HMAC token in the JSON body (`token`) |
 | `POST /sandbox/:name/{workspace-diag,cpu-diag,twen}` | HMAC token in the JSON body |
 | `POST /project-files/*` | HMAC token in the JSON body |
+| `POST /sandbox/:name/repo-open` | **v2 only** (`x-ezil-auth`); a v1 token is refused with `hmac_v2_required`, because the body carries a git credential |
 | `DELETE /sandbox/:name` | **HMAC token** — `Authorization: Bearer <token>` (preferred), `?token=`, or a JSON body `{token}` |
 | `GET /preview-bootstrap` (preview host) | sandboxId-bound bootstrap token in `?token=` |
 | `GET /preview-status` (preview host) | `ezil_preview` cookie **or** the sandboxId-bound bootstrap token |
