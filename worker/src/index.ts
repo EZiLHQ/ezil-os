@@ -38,7 +38,8 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *   POST   /sandbox/:name/repo-open → { ok, folder, head?, status }
  *          (v2-signed only. Clones, or fetches only, one project repository
  *          (Cloudflare Artifacts, or EZiL Git) into
- *          `<workspace root>/projects/<repositoryId>` of a RUNNING computer;
+ *          `<workspace root>/projects/<repositoryId>/repository` of a RUNNING
+ *          computer, the folder Code opens being `<repositoryId>`;
  *          the Git token reaches git only through its environment, as a
  *          Bearer header or an env-fed Basic credential helper, and only for
  *          a fetch into a private repository, never the person's, within the

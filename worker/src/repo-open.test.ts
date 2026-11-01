@@ -20,6 +20,7 @@ import {
   REPO_OPEN_SCRIPT,
   REPO_OPEN_EXEC_TIMEOUT_MS,
   REPO_OPEN_MIN_TIMEOUT_MS,
+  REPO_OPEN_NESTED_DIR,
   REPO_OPEN_TOKEN_ENV,
   type RepoOpenExec,
   type RepoOpenRequest,
@@ -213,9 +214,18 @@ describe('repoOpenCommand', () => {
     ]);
     // Nothing fetches `origin` (whatever the folder's config says it is), and nothing with the credential runs in the folder.
     expect(REPO_OPEN_SCRIPT).not.toMatch(/fetch[^\n]* origin/);
-    expect(REPO_OPEN_SCRIPT).toContain(`bounded git -C "$folder" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*'`);
-    expect(REPO_OPEN_SCRIPT).toContain('bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone"');
-    expect(REPO_OPEN_SCRIPT).toContain('git -C "$work/clone" remote set-url origin "$url"');
+    expect(REPO_OPEN_SCRIPT).toContain(`bounded git -C "$repo" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*'`);
+    expect(REPO_OPEN_SCRIPT).toContain('bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$repo"');
+    expect(REPO_OPEN_SCRIPT).toContain('git -C "$repo" remote set-url origin "$url"');
+  });
+
+  it('🔴 a new folder holds only the repository, one level down, so none of its files is at the workspace folder root (review F3)', () => {
+    expect(REPO_OPEN_NESTED_DIR).toBe('repository');
+    expect(REPO_OPEN_SCRIPT).toContain('repo=$work/folder/repository\n');
+    expect(REPO_OPEN_SCRIPT).toContain('mv -T "$work/folder" "$folder"');
+    // An existing folder keeps its layout: the repository at the folder (older opens) or one level down.
+    expect(REPO_OPEN_SCRIPT).toContain('then repo=$folder; else repo=$folder/repository; fi');
+    expect(REPO_OPEN_SCRIPT).not.toMatch(/git -C "\$folder"/);
   });
 });
 

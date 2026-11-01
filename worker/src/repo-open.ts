@@ -1,7 +1,8 @@
 /**
  * `POST /sandbox/:name/repo-open` — put one project repository into a RUNNING
- * Cloudflare computer, at `<workspace root>/projects/<repositoryId>`, so the
- * Code window can open it (`folder=` on the code-server URL).
+ * Cloudflare computer, at `<workspace root>/projects/<repositoryId>/repository`,
+ * so the Code window can open `<workspace root>/projects/<repositoryId>`
+ * (`folder=` on the code-server URL).
  *
  * Pure (runtime-free) helpers, factored out of `index.ts` like `./twen` and
  * `./workspace-diag` so the contract runs under plain `bun test`. The route and
@@ -23,7 +24,8 @@
  * The values are Universe's project repository binding and its Git grant,
  * passed through (`ProjectRepositories::open()` in universe-2.0: the same URL,
  * ref and token rules are enforced here). `git.username` ('ezil') and
- * `git.scope` ('read' | 'write') may ride along unchanged; nothing else may.
+ * `git.scope` ('read' | 'write') may ride along unchanged (the layout is the
+ * same for both); nothing else may.
  * `timeoutMs` is what is left of the OS server's own deadline: every bound
  * inside the computer (lock wait, git, the exec itself) is derived from it, so
  * the Worker never keeps cloning after the caller has given up.
@@ -81,6 +83,21 @@
  * canonical URL, HEAD on the binding's branch (unborn) with its upstream set,
  * any other branches as remote-tracking refs, `status: 'created'`, no `head`.
  *
+ * 🔴 THE LAYOUT keeps the repository's own editor and agent configuration
+ * inert (review F3). Code opens `folder` as its workspace folder, as root, with
+ * workspace trust off, and code-server 4.141 (VS Code 1.141) reads what can
+ * run commands from a workspace folder's ROOT only: `.vscode/` (settings,
+ * tasks, launch, `mcp.json`), `.mcp.json`, `.github/hooks/` and
+ * `.claude/settings*.json` (agent hooks, `chat.useHooks` on by default),
+ * `*.code-workspace`. So the repository is not the folder: it is
+ * `<folder>/repository` (`REPO_OPEN_NESTED_DIR`), and the folder holds nothing
+ * else. Both roles: the Creator opens the Builder's work, and a Builder opens
+ * whatever an earlier (replaced) Builder pushed. Anyone who wants the
+ * repository's own configuration opens `repository` itself, explicitly. A
+ * folder created before this layout (the repository at `<folder>` itself)
+ * keeps it; it is fetched, never moved. Code's git view still finds the
+ * repository (`git.repositoryScanMaxDepth` 1).
+ *
  * Nothing git prints leaves the container: the script classifies git's stderr
  * into one of the codes below and prints a single result line.
  */
@@ -110,6 +127,11 @@ export const REPO_OPEN_MIN_TOKEN_LIFETIME_MS = 5_000;
  * no `folder=`.
  */
 export const REPO_OPEN_UNMOUNTED_ROOT = '/home/neko/project';
+/**
+ * The repository's own directory inside the folder Code opens, so that none of
+ * its files is at the workspace folder's root (see THE LAYOUT above).
+ */
+export const REPO_OPEN_NESTED_DIR = 'repository';
 
 /** Every code this route can answer with besides the shared auth codes. Each is in `PUBLIC_ERROR_CODES`. */
 export const REPO_OPEN_ERRORS = [
@@ -401,12 +423,15 @@ deadline=$(($(date +%s) + limit))
 [ -L "$folder" ] && fail repo_open_folder_conflict
 if [ -d "$folder" ] && [ -z "$(ls -A "$folder" 2>/dev/null)" ]; then rmdir "$folder" 2>/dev/null || fail repo_open_folder_conflict; fi
 if [ -e "$folder" ]; then
-  # Ours from an earlier open, or nothing we will touch. These checks are
-  # about identity, not the credential: no command with the credential ever
-  # reads this repository.
-  { [ -d "$folder/.git" ] && [ ! -L "$folder/.git" ]; } || fail repo_open_folder_conflict
-  [ "$(git -C "$folder" rev-parse --git-dir 2>/dev/null)" = .git ] || fail repo_open_folder_conflict
-  [ "$(git -C "$folder" config --local --get remote.origin.url 2>/dev/null)" = "$url" ] || fail repo_open_folder_conflict
+  # Ours from an earlier open, or nothing we will touch: the repository one
+  # level down, or (opened before that layout) at the folder itself, which
+  # keeps its layout. These checks are about identity, not the credential: no
+  # command with the credential ever reads this repository.
+  if [ -e "$folder/.git" ] || [ -L "$folder/.git" ]; then repo=$folder; else repo=$folder/${REPO_OPEN_NESTED_DIR}; fi
+  [ -L "$repo" ] && fail repo_open_folder_conflict
+  { [ -d "$repo/.git" ] && [ ! -L "$repo/.git" ]; } || fail repo_open_folder_conflict
+  [ "$(git -C "$repo" rev-parse --git-dir 2>/dev/null)" = .git ] || fail repo_open_folder_conflict
+  [ "$(git -C "$repo" config --local --get remote.origin.url 2>/dev/null)" = "$url" ] || fail repo_open_folder_conflict
 fi
 { mkdir "$work/home" && git init --quiet --bare --template= "$mirror" && git --git-dir="$mirror" symbolic-ref HEAD "refs/heads/$branch"; } \
   >/dev/null 2>&1 || fail repo_open_git_failed
@@ -414,39 +439,42 @@ net 2>"$work/err" || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
 if [ -e "$folder" ]; then
   # Fetch only, from the private repository and with no credential in the
   # environment: the working tree, the index and HEAD stay as the person left them.
-  bounded git -C "$folder" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
+  bounded git -C "$repo" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
-  if ! git -C "$folder" rev-parse --verify --quiet HEAD >/dev/null; then
+  if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null; then
     # Still the empty clone of an earlier open. Once the branch exists upstream,
     # check it out; git refuses (and changes nothing) if a file would be overwritten.
-    if [ "$(git -C "$folder" symbolic-ref --quiet HEAD)" = "refs/heads/$branch" ] \
-      && git -C "$folder" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
-      bounded git -C "$folder" checkout --quiet -b "$branch" --track "origin/$branch" >/dev/null 2>&1
+    if [ "$(git -C "$repo" symbolic-ref --quiet HEAD)" = "refs/heads/$branch" ] \
+      && git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+      bounded git -C "$repo" checkout --quiet -b "$branch" --track "origin/$branch" >/dev/null 2>&1
     fi
   fi
-  head=$(git -C "$folder" rev-parse --verify --quiet HEAD) || emit ok:fetched
+  head=$(git -C "$repo" rev-parse --verify --quiet HEAD) || emit ok:fetched
   emit "ok:fetched:$head"
 fi
+# A new folder is assembled whole in the private directory: the folder Code
+# opens, holding nothing but the repository.
+repo=$work/folder/${REPO_OPEN_NESTED_DIR}
 if git --git-dir="$mirror" rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null; then
-  bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone" 2>"$work/err" \
+  bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$repo" 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
-  git -C "$work/clone" remote set-url origin "$url" 2>/dev/null || fail repo_open_git_failed
-  head=$(git -C "$work/clone" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
+  git -C "$repo" remote set-url origin "$url" 2>/dev/null || fail repo_open_git_failed
+  head=$(git -C "$repo" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
   status=cloned:$head
 else
   # The repository has no commits yet (a new Cloudflare Artifacts repository),
   # or not this branch yet: an empty clone, as "git clone" makes of an empty
   # repository, with HEAD on the binding's branch and any other branches as
   # remote-tracking refs.
-  { git init --quiet "$work/clone" && git -C "$work/clone" symbolic-ref HEAD "refs/heads/$branch" \
-    && git -C "$work/clone" remote add origin "$url" \
-    && git -C "$work/clone" config "branch.$branch.remote" origin \
-    && git -C "$work/clone" config "branch.$branch.merge" "refs/heads/$branch"; } >/dev/null 2>&1 || fail repo_open_git_failed
-  bounded git -C "$work/clone" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
+  { git init --quiet "$repo" && git -C "$repo" symbolic-ref HEAD "refs/heads/$branch" \
+    && git -C "$repo" remote add origin "$url" \
+    && git -C "$repo" config "branch.$branch.remote" origin \
+    && git -C "$repo" config "branch.$branch.merge" "refs/heads/$branch"; } >/dev/null 2>&1 || fail repo_open_git_failed
+  bounded git -C "$repo" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
   status=created
 fi
-mv -T "$work/clone" "$folder" 2>/dev/null || fail repo_open_git_failed
+mv -T "$work/folder" "$folder" 2>/dev/null || fail repo_open_git_failed
 emit "ok:$status"
 `;
 

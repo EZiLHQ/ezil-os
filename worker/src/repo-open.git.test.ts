@@ -54,7 +54,9 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runRepoOpen, REPO_OPEN_EXEC_TIMEOUT_MS, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
+import {
+  runRepoOpen, REPO_OPEN_EXEC_TIMEOUT_MS, REPO_OPEN_NESTED_DIR, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest,
+} from './repo-open';
 
 const which = (bin: string) => Bun.spawnSync(['sh', '-c', `command -v ${bin}`]).exitCode === 0;
 /** The real git the shim hands over to: the host's own, or the image's. */
@@ -146,6 +148,9 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   const open = (patch: Partial<RepoOpenRequest> = {}, opts: { requireHydrated?: boolean; root?: string } = {}) =>
     runRepoOpen(exec(patch.token ?? TOKEN), request(patch), { path: opts.root ?? root, requireHydrated: opts.requireHydrated ?? false });
   const git = (cwd: string, ...args: string[]) => sh(['git', ...args], { cwd, env: { HOME: home, GIT_CONFIG_NOSYSTEM: '1' } });
+  /** The folder Code opens, and the repository inside it (review F3). */
+  const folderOf = (id: string) => join(root, 'projects', id);
+  const repoOf = (id: string) => join(folderOf(id), REPO_OPEN_NESTED_DIR);
   const commit = (message: string, file: string, content: string) => {
     writeFileSync(join(seed, file), content);
     git(seed, 'add', file);
@@ -280,8 +285,10 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     const upstreamHead = git(seed, 'rev-parse', 'HEAD');
     const mark = existsSync(argvLog) ? ran().length : 0;
     const answer = await open();
-    expect(answer).toEqual({ ok: true, folder: join(root, 'projects', REPO), head: upstreamHead, status: 'cloned' });
-    const folder = join(root, 'projects', REPO);
+    expect(answer).toEqual({ ok: true, folder: folderOf(REPO), head: upstreamHead, status: 'cloned' });
+    // Code opens the folder; the repository is one level down, and nothing else is there (review F3).
+    expect(readdirSync(folderOf(REPO))).toEqual([REPO_OPEN_NESTED_DIR]);
+    const folder = repoOf(REPO);
     expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# site\n');
     expect(git(folder, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
     // The remote is the canonical URL, with no userinfo; the clone's config names no helper.
@@ -308,14 +315,14 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   });
 
   it('🔴 a second open fetches only: an uncommitted edit and HEAD survive, the remote-tracking ref moves', async () => {
-    const folder = join(root, 'projects', REPO);
+    const folder = repoOf(REPO);
     const before = git(folder, 'rev-parse', 'HEAD');
     writeFileSync(join(folder, 'README.md'), '# site\nwork in progress\n');
     writeFileSync(join(folder, 'notes.txt'), 'untracked\n');
     const next = commit('second', 'CHANGELOG.md', 'v2\n');
     const mark = ran().length;
     const answer = await open();
-    expect(answer).toEqual({ ok: true, folder, head: before, status: 'fetched' });
+    expect(answer).toEqual({ ok: true, folder: folderOf(REPO), head: before, status: 'fetched' });
     expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# site\nwork in progress\n');
     expect(readFileSync(join(folder, 'notes.txt'), 'utf8')).toBe('untracked\n');
     expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
@@ -338,8 +345,9 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
 
   it('a branch the repository does not have yet opens as an empty clone on that branch, the others as remote-tracking refs', async () => {
     const id = '5f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
-    const folder = join(root, 'projects', id);
-    expect(await open({ repositoryId: id, ref: 'refs/heads/nope', branch: 'nope' })).toEqual({ ok: true, folder, status: 'created' });
+    const folder = repoOf(id);
+    expect(await open({ repositoryId: id, ref: 'refs/heads/nope', branch: 'nope' })).toEqual({ ok: true, folder: folderOf(id), status: 'created' });
+    expect(readdirSync(folderOf(id))).toEqual([REPO_OPEN_NESTED_DIR]);
     expect(readdirSync(folder)).toEqual(['.git']);
     expect(git(folder, 'symbolic-ref', 'HEAD')).toBe('refs/heads/nope');
     expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(git(seed, 'rev-parse', 'HEAD'));
@@ -363,8 +371,9 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     it('🔴 opens as an empty clone: origin the canonical URL, HEAD on the binding\'s branch with its upstream, no head', async () => {
       const mark = ran().length;
       for (const id of [first, second]) {
-        const folder = join(root, 'projects', id);
-        expect(await open(bearer({ repositoryId: id, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder, status: 'created' });
+        const folder = repoOf(id);
+        expect(await open(bearer({ repositoryId: id, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: folderOf(id), status: 'created' });
+        expect(readdirSync(folderOf(id))).toEqual([REPO_OPEN_NESTED_DIR]);
         expect(readdirSync(folder)).toEqual(['.git']);
         expect(git(folder, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
         expect(Bun.spawnSync(['git', '-C', folder, 'rev-parse', '--verify', '--quiet', 'HEAD']).exitCode).toBe(1);
@@ -376,26 +385,26 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
       }
       expectIsolated(mark, 2, false);
       // Opened again while still empty: fetched, still no head.
-      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: join(root, 'projects', first), status: 'fetched' });
+      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: folderOf(first), status: 'fetched' });
     });
 
     it('once the branch is pushed, the next open checks it out into the empty clone, unless that would overwrite a file', async () => {
       // The person (in the second clone) has meanwhile written a file the push also brings.
-      writeFileSync(join(root, 'projects', second, 'README.md'), 'mine\n');
+      writeFileSync(join(repoOf(second), 'README.md'), 'mine\n');
       writeFileSync(join(pusher, 'README.md'), '# empty no more\n');
       git(pusher, 'add', 'README.md');
       git(pusher, '-c', 'user.name=t', '-c', 'user.email=t@example.test', 'commit', '-qm', 'first');
       git(pusher, 'push', '-q', 'origin', 'HEAD:main');
       const pushed = git(pusher, 'rev-parse', 'HEAD');
 
-      const a = join(root, 'projects', first);
-      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: a, head: pushed, status: 'fetched' });
+      const a = repoOf(first);
+      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: folderOf(first), head: pushed, status: 'fetched' });
       expect(readFileSync(join(a, 'README.md'), 'utf8')).toBe('# empty no more\n');
       expect(git(a, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
       expect(git(a, 'status', '--porcelain')).toBe('');
 
-      const b = join(root, 'projects', second);
-      expect(await open(bearer({ repositoryId: second, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: b, status: 'fetched' });
+      const b = repoOf(second);
+      expect(await open(bearer({ repositoryId: second, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: folderOf(second), status: 'fetched' });
       expect(readFileSync(join(b, 'README.md'), 'utf8')).toBe('mine\n');
       expect(git(b, 'rev-parse', 'refs/remotes/origin/main')).toBe(pushed);
       expect(Bun.spawnSync(['git', '-C', b, 'rev-parse', '--verify', '--quiet', 'HEAD']).exitCode).toBe(1);
@@ -420,7 +429,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     const id = '8f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
     mkdirSync(join(root, 'projects', id));
     expect(await open({ repositoryId: id })).toMatchObject({ ok: true, status: 'cloned' });
-    expect(existsSync(join(root, 'projects', id, 'CHANGELOG.md'))).toBe(true);
+    expect(existsSync(join(repoOf(id), 'CHANGELOG.md'))).toBe(true);
   });
 
   it('a store-backed root must be hydrated first; a missing root is unavailable', async () => {
@@ -437,8 +446,8 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     const before = seen.length;
     const mark = ran().length;
     const answer = await open(bearer({ repositoryId: id }));
-    const folder = join(root, 'projects', id);
-    expect(answer).toEqual({ ok: true, folder, head: git(seed, 'rev-parse', 'HEAD'), status: 'cloned' });
+    const folder = repoOf(id);
+    expect(answer).toEqual({ ok: true, folder: folderOf(id), head: git(seed, 'rev-parse', 'HEAD'), status: 'cloned' });
     const mine = seen.slice(before);
     expect(mine.length).toBeGreaterThan(0);
     expect(mine.every((s) => s.auth === BEARER)).toBe(true);
@@ -458,11 +467,11 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
 
   it('🔴 Bearer: a second open fetches only, and a wrong token is repo_open_auth_failed and creates nothing', async () => {
     const id = 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
-    const folder = join(root, 'projects', id);
+    const folder = repoOf(id);
     const before = git(folder, 'rev-parse', 'HEAD');
     writeFileSync(join(folder, 'README.md'), '# bearer edit\n');
     const next = commit('bearer fetch', 'BEARER.md', 'b\n');
-    expect(await open(bearer({ repositoryId: id }))).toEqual({ ok: true, folder, head: before, status: 'fetched' });
+    expect(await open(bearer({ repositoryId: id }))).toEqual({ ok: true, folder: folderOf(id), head: before, status: 'fetched' });
     expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# bearer edit\n');
     expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
     const other = 'bf1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
@@ -476,7 +485,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   for (const scheme of ['basic', 'bearer'] as const) {
     it(`🔴 ${scheme}: a credential.helper=store in the clone's own .git/config never runs (review #6)`, async () => {
       const id = scheme === 'basic' ? REPO : 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
-      const folder = join(root, 'projects', id);
+      const folder = repoOf(id);
       const store = join(dir, `local-store-${scheme}`);
       git(folder, 'config', '--local', 'credential.helper', `store --file=${store}`);
       try {
@@ -503,7 +512,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
    */
   const openDespite = async (scheme: 'basic' | 'bearer', edit: (config: string, folder: string) => string, included?: string) => {
     const id = scheme === 'basic' ? REPO : 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
-    const folder = join(root, 'projects', id);
+    const folder = repoOf(id);
     const configPath = join(folder, '.git', 'config');
     const original = readFileSync(configPath, 'utf8');
     if (included !== undefined) writeFileSync(join(folder, '.git', 'evil.cfg'), included);
@@ -517,7 +526,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
       // First what matters: nothing reached the evil host or the proxy (the earlier script fails here).
       expect(evilSeen.slice(evilBefore)).toEqual([]);
       expect(proxied.slice(proxyBefore)).toEqual([]);
-      expect(answer).toEqual({ ok: true, folder, head: git(folder, 'rev-parse', 'HEAD'), status: 'fetched' });
+      expect(answer).toEqual({ ok: true, folder: folderOf(id), head: git(folder, 'rev-parse', 'HEAD'), status: 'fetched' });
       expect(seen.slice(seenBefore).filter((s) => s.leak !== null)).toEqual([]);
       // The real server got the credential in its own scheme (Basic only after git's anonymous first request).
       const auths = new Set(seen.slice(seenBefore).map((s) => s.auth));
@@ -582,6 +591,50 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
       });
     });
   }
+
+  it('🔴 review F3: what code-server would run from a workspace folder\'s root is one level down, never at the folder Code opens', async () => {
+    // Everything code-server 1.141 reads from a workspace folder's root that can start a process.
+    const planted: Record<string, string> = {
+      '.vscode/tasks.json': JSON.stringify({ version: '2.0.0', tasks: [{ label: 'x', type: 'shell', command: 'id', runOptions: { runOn: 'folderOpen' } }] }),
+      '.vscode/settings.json': JSON.stringify({ 'task.allowAutomaticTasks': 'on', 'chat.useClaudeHooks': true, 'chat.mcp.autostart': 'newAndOutdated' }),
+      '.vscode/mcp.json': JSON.stringify({ servers: { x: { type: 'stdio', command: 'id' } } }),
+      '.mcp.json': JSON.stringify({ mcpServers: { x: { command: 'id' } } }),
+      '.github/hooks/run.json': JSON.stringify({ hooks: { SessionStart: [{ type: 'command', command: 'id' }] } }),
+      '.claude/settings.json': JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'id' }] }] } }),
+      'x.code-workspace': JSON.stringify({ folders: [{ path: '.' }] }),
+    };
+    for (const [path, content] of Object.entries(planted)) {
+      mkdirSync(join(seed, path, '..'), { recursive: true });
+      writeFileSync(join(seed, path), content);
+      git(seed, 'add', path);
+    }
+    git(seed, '-c', 'user.name=t', '-c', 'user.email=t@example.test', 'commit', '-qm', 'planted');
+    git(seed, 'push', '-q', 'origin', 'HEAD:main');
+    for (const [id, patch] of [['d1d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b', bearer()], ['d2d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b', {}]] as const) {
+      expect(await open({ repositoryId: id, ...patch })).toMatchObject({ ok: true, folder: folderOf(id), status: 'cloned' });
+      expect(readdirSync(folderOf(id))).toEqual([REPO_OPEN_NESTED_DIR]);
+      for (const path of Object.keys(planted)) {
+        expect(existsSync(join(repoOf(id), path))).toBe(true);
+        expect(existsSync(join(folderOf(id), path))).toBe(false);
+      }
+      // And it stays that way when opened again (fetched in place, one level down).
+      expect(await open({ repositoryId: id, ...patch })).toMatchObject({ ok: true, folder: folderOf(id), status: 'fetched' });
+      expect(readdirSync(folderOf(id))).toEqual([REPO_OPEN_NESTED_DIR]);
+    }
+  });
+
+  it('a folder opened before that layout (the repository at the folder itself) is fetched in place, never moved', async () => {
+    const id = 'e1d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b';
+    sh(['git', 'clone', '-q', join(upstream, 'acme', 'site.git'), folderOf(id)], { env: { HOME: home, GIT_CONFIG_NOSYSTEM: '1' } });
+    git(folderOf(id), 'remote', 'set-url', 'origin', bearerUrl);
+    const before = git(folderOf(id), 'rev-parse', 'HEAD');
+    const next = commit('flat', 'FLAT.md', 'f\n');
+    const mark = ran().length;
+    expect(await open(bearer({ repositoryId: id }))).toEqual({ ok: true, folder: folderOf(id), head: before, status: 'fetched' });
+    expect(git(folderOf(id), 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
+    expect(existsSync(repoOf(id))).toBe(false);
+    expectIsolated(mark, 1);
+  });
 
   it('nothing the whole run left behind holds the token (argv log, trace, workspace, home, /tmp staging)', () => {
     expect(readFileSync(argvLog, 'utf8')).not.toContain(TOKEN);
