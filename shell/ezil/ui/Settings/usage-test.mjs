@@ -689,6 +689,12 @@ try {
     assert.equal(summaries(), before + 1);
     dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
     assert.equal(summaries(), before + 1, 'a focus right after opening does not read again');
+    // Defence in depth: a kept block that does not name its user is still dropped when the signed-in user changes.
+    owner = 'user-c'; success(sample, premiumAI({ ...worked, userId: null })); await refresh();
+    assert.match(win.text(), /1,246 credits left of 1,500/);
+    owner = 'user-d'; success(sample, premiumAI({ ...unreadable, userId: null })); await refresh();
+    assert.doesNotMatch(win.text(), /1,246|1,500/);
+    assert.match(win.text(), /We couldn't read your balance/);
     owner = 'other-owner'; success(); await refresh();
     passed++; console.log('PASS identity credits: account switch, foreign-user refusal, kept balance and refresh triggers');
 
