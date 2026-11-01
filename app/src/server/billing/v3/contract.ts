@@ -382,11 +382,12 @@ export interface BillingSummaryV3 {
         waiting: { credits: number } | null;
     };
     /**
-     * Renewal gap (additive): `renewing` = a Stripe renewal whose invoice is not paid yet and has not failed (no receipt
-     * for the new period, no payment issue), up to RENEWAL_PENDING_SECONDS after the period starts. Not used up: the
-     * period's time is added on payment; a failure is grace.
+     * Renewal gap (additive): `awaiting_payment` = a Stripe period (a renewal, or a first purchase stored before its first
+     * `invoice.paid`) whose invoice is not paid yet, has not failed and was not voided (no receipt for the period, no
+     * payment issue), up to RENEWAL_PENDING_SECONDS after the period starts. Not used up: the period's time is added on
+     * payment; a failure is grace.
      */
-    fairUse: { status: FairUseStatus | 'renewing'; resetsAt: string };
+    fairUse: { status: FairUseStatus | 'awaiting_payment'; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: {
         checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean;

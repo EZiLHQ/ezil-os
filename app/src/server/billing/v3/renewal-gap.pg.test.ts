@@ -57,7 +57,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('renewal gap with Postgr
     }
     async function expectPending(now: Date) {
         const { state, summary, entitlement } = await read(now);
-        expect(summary).toMatchObject({ fairUse: { status: 'renewing' }, computer: { standing: 'paid' }, actions: { upgrade: false } });
+        expect(summary).toMatchObject({ fairUse: { status: 'awaiting_payment' }, computer: { standing: 'paid' }, actions: { upgrade: false } });
         expect(state.allowanceStdSeconds).toBe(0);
         expect(entitlement).toMatchObject({ status: 'expired' });
     }
@@ -125,5 +125,16 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('renewal gap with Postgr
         expect(summary).toMatchObject({ plan: { status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: '2026-12-07T10:00:00Z' },
             computer: { standing: 'grace' }, fairUse: { status: 'ok' }, actions: { upgrade: false } });
         expect(state.allowanceStdSeconds).toBe(STANDARD.fairUseSeconds);
+    });
+
+    it('invoice.voided at T+60 m is a stored voided issue: not pending, standing still paid', async () => {
+        await expectPending(at(30 * MIN));
+        invoices.set('in_renewal', invoice('in_renewal', P2, 'subscription_cycle', 'void'));
+        expect(await invoiceEvent('invoice.voided', 'in_renewal', at(HOUR))).toBe('applied');
+        expect(await store.openPaymentIssues(userId)).toEqual([expect.objectContaining({ stripeInvoiceId: 'in_renewal', subscriptionId,
+            invoiceKind: 'subscription', issue: 'voided', resolvedAt: null })]);
+        const { state, summary } = await read(at(HOUR + MIN));
+        expect(summary).toMatchObject({ plan: { paymentIssue: null }, computer: { standing: 'paid' }, fairUse: { status: 'paused' } });
+        expect(state.allowanceStdSeconds).toBe(0);
     });
 });

@@ -10,7 +10,7 @@ import { createRequire } from 'node:module';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '../config';
-import type { BillingDeps, BillingStore, GrantInsert, GrantRow, PaymentIssueInsert, PaymentIssueRow, StripeApi, StripeInvoice,
+import type { BillingDeps, BillingStore, GrantInsert, GrantRow, PaymentIssueInsert, PaymentIssueRow, StoredComputeEpoch, StripeApi, StripeInvoice,
     StripeInvoicePaymentState, StripeSubscription, SubscriptionUpsert } from '../ports';
 import { processStripeEvent } from '../processor';
 import type { StripeEventLike } from '../stripe/events';
@@ -58,6 +58,7 @@ function memoryStore() {
     const subs = new Map<string, SubscriptionUpsert>();
     const grants: GrantRow[] = [];
     const issues = new Map<string, PaymentIssueRow>();
+    const epochs: StoredComputeEpoch[] = [];
     const methods: Partial<BillingStore> = {
         userForStripeCustomer: async customer => customer === CUSTOMER ? USER : null,
         upsertSubscription: async row => {
@@ -83,7 +84,7 @@ function memoryStore() {
         openPlanChanges: async () => [],
         subscriptionsFor: async userId => [...subs.values()].filter(row => row.userId === userId),
         userCreatedAt: async () => new Date('2026-09-01T00:00:00Z'),
-        epochsFor: async () => [],
+        epochsFor: async () => [...epochs],
         grantsForPeriod: async (userId, window, meters) => grants.filter(grant => grant.userId === userId && meters.includes(grant.meter)
             && grant.periodStart! < window.end && grant.periodEnd! > window.start),
         sizePreference: async () => null,
@@ -94,7 +95,7 @@ function memoryStore() {
             return target[key as keyof typeof target];
         },
     }) as BillingStore;
-    return { store, subs, grants, issues };
+    return { store, subs, grants, issues, epochs };
 }
 
 function invoice(id: string, period: typeof P1, billingReason: string, status = 'paid'): StripeInvoice {
@@ -154,15 +155,16 @@ describe('renewal gap: a renewed Stripe period reads as pending until its invoic
 
     /**
      * The router's reads (billing.summary through compute-access, billing.usage), then the shell's two tabs. With `ai`
-     * (the Gateway read billing.summary adds) the summary is rebuilt from the same rows with it.
+     * (the Gateway read billing.summary adds) the summary is rebuilt from the same rows with it. `usageAt`: billing.usage
+     * is its own request, so it can be read a little before the summary.
      */
-    async function read(now: Date, ai?: Parameters<typeof buildSummaryV3>[0]['ai']) {
+    async function read(now: Date, ai?: Parameters<typeof buildSummaryV3>[0]['ai'], usageAt = now) {
         const state = await loadComputeBillingState(deps(now), USER, now);
         const rows = { config, now, userCreatedAt: new Date('2026-09-01T00:00:00Z'), subs: await f.store.subscriptionsFor(USER),
-            epochs: [], grants: [...f.grants], consent: null, planChanges: [], paymentIssues: await f.store.openPaymentIssues(USER),
-            storage: [], sizePreference: null, hasCustomer: false };
+            epochs: await f.store.epochsFor(USER, P2.start), grants: [...f.grants], consent: null, planChanges: [],
+            paymentIssues: await f.store.openPaymentIssues(USER), storage: [], sizePreference: null, hasCustomer: false };
         const summary = ai ? buildSummaryV3({ ...rows, ai }) : state.summary as BillingSummaryV3;
-        const usage = buildUsageV3(rows);
+        const usage = buildUsageV3({ ...rows, now: usageAt });
         const wire = (value: unknown) => dom.window.JSON.parse(JSON.stringify(value));
         const billing = dom.window.document.createElement('div');
         billing.innerHTML = shell.summaryV3Html(wire(summary), wire(usage));
@@ -173,9 +175,9 @@ describe('renewal gap: a renewed Stripe period reads as pending until its invoic
     }
     const offers = (el: Element) => el.querySelector('[data-action="upgrade"], [data-action="usage-upgrade"], [data-action="checkout"]');
 
-    async function expectPending(now: Date, ai?: Parameters<typeof read>[1]) {
-        const view = await read(now, ai);
-        expect(view.summary.fairUse.status).toBe('renewing');
+    async function expectPending(now: Date, ai?: Parameters<typeof read>[1], usageAt = now) {
+        const view = await read(now, ai, usageAt);
+        expect(view.summary.fairUse.status).toBe('awaiting_payment');
         expect(view.summary.computer.standing).toBe('paid');
         expect(view.summary.actions.upgrade).toBe(false);
         // Nothing is granted before the payment: no allowance, and the AWS entitlement stays unpaid (as at first purchase).
@@ -188,7 +190,7 @@ describe('renewal gap: a renewed Stripe period reads as pending until its invoic
         }
         expect(view.billing.querySelector('[data-role="fair-use-paused"]')).toBeNull();
         expect(view.billing.querySelector('[data-role="meter-time"]')!.textContent).toContain('Pending');
-        expect(view.billing.querySelector('[data-role="fair-use"]')!.getAttribute('data-status')).toBe('renewing');
+        expect(view.billing.querySelector('[data-role="fair-use"]')!.getAttribute('data-status')).toBe('awaiting_payment');
         expect(view.billing.querySelector('[data-role="fair-use"]')!.textContent).toBe("This period's time is added once your payment goes through.");
         expect(view.usageTab.querySelector('[data-usage="compute"]')!.getAttribute('data-state')).toBe('pending');
         expect(view.usageTab.querySelector('[data-usage="compute"]')!.textContent).toContain("This period's time is added once your payment goes through.");
@@ -230,7 +232,7 @@ describe('renewal gap: a renewed Stripe period reads as pending until its invoic
         const failed = await read(at(HOUR + MIN));
         expect(failed.summary.plan).toMatchObject({ status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: '2026-12-07T10:00:00Z' });
         expect(failed.summary.computer.standing).toBe('grace');
-        expect(failed.summary.fairUse.status).not.toBe('renewing');
+        expect(failed.summary.fairUse.status).not.toBe('awaiting_payment');
         expect(failed.summary.actions.upgrade).toBe(false);
         // Unchanged D17: grace keeps the plan's fair use for the unpaid period.
         expect(failed.state.allowanceStdSeconds).toBe(STANDARD.fairUseSeconds);
@@ -241,6 +243,51 @@ describe('renewal gap: a renewed Stripe period reads as pending until its invoic
         stripe.invoices.set('in_renewal', invoice('in_renewal', P2, 'subscription_cycle', 'paid'));
         expect(await deliver(invoiceEvent('invoice.paid', 'in_renewal', at(2 * DAY)))).toBe('applied');
         await expectSettled(at(2 * DAY + MIN));
+    });
+
+    it('invoice.voided: a voided renewal invoice will never be paid, so the period is not pending (reads as before the fix)', async () => {
+        await expectPending(at(30 * MIN));
+        stripe.invoices.set('in_renewal', invoice('in_renewal', P2, 'subscription_cycle', 'void'));
+        expect(await deliver(invoiceEvent('invoice.voided', 'in_renewal', at(HOUR)))).toBe('applied');
+        expect([...f.issues.values()]).toEqual([expect.objectContaining({ stripeInvoiceId: 'in_renewal', subscriptionId: SUB,
+            invoiceKind: 'subscription', issue: 'voided', resolvedAt: null })]);
+        const voided = await read(at(HOUR + MIN));
+        // Standing ignores a voided invoice (still paid, no payment issue); only the pending state is withdrawn.
+        expect(voided.summary.computer.standing).toBe('paid');
+        expect(voided.summary.plan.paymentIssue).toBeNull();
+        expect(voided.summary.fairUse.status).toBe('paused');
+        expect(voided.state.allowanceStdSeconds).toBe(0);
+        expect(voided.billing.querySelector('[data-role="fair-use"][data-status="awaiting_payment"]')).toBeNull();
+        expect(voided.usageTab.querySelector('[data-usage="compute"]')!.getAttribute('data-state')).not.toBe('pending');
+    });
+
+    it('a first purchase stored active before its first invoice.paid (a bank debit) is pending with the same copy, then granted', async () => {
+        // A fresh account, not the renewal set up above: T is the purchase, and the subscription has no earlier receipt.
+        f = memoryStore();
+        stripe = fakeStripe();
+        Object.assign(stripe.subscription, { currentPeriodStart: P2.start, currentPeriodEnd: P2.end });
+        stripe.invoices.set('in_first', invoice('in_first', P2, 'subscription_create', 'open'));
+        expect(await deliver(event('customer.subscription.created', { id: SUB }, T))).toBe('applied');
+        expect(f.subs.get(SUB)).toMatchObject({ status: 'active', currentPeriodStart: P2.start });
+        expect(f.grants).toEqual([]);
+        // A US bank debit confirms in up to 4 business days.
+        for (const ms of [MIN, 2 * DAY]) await expectPending(at(ms));
+        stripe.invoices.set('in_first', invoice('in_first', P2, 'subscription_create'));
+        expect(await deliver(invoiceEvent('invoice.paid', 'in_first', at(3 * DAY)))).toBe('applied');
+        await expectSettled(at(3 * DAY + MIN));
+    });
+
+    it('a session open while pending: no fair-use deadline of "now", so the Usage tab names no end beside Pending', async () => {
+        // Started at T+10 m (nothing refuses it with enforcement off), its heartbeat fresh.
+        f.epochs.push({ id: 'epoch_pending', userId: USER, computerId: 'computer_renewal', size: 'std-2', weight: 1,
+            readyAt: at(10 * MIN).toISOString(), endedAt: null, endReason: null, overheadSeconds: 0, deadlineAt: null,
+            lastHeartbeatAt: at(29 * MIN).toISOString() });
+        // billing.usage answered 30 s before billing.summary: a deadline of the summary's "now" would still be ahead of it.
+        const view = await expectPending(at(30 * MIN), undefined, at(30 * MIN - 30_000));
+        const session = view.usageTab.querySelector('[data-usage="session"]')!.textContent;
+        expect(session).toMatch(/^This session: .* · running$/);
+        expect(session).not.toMatch(/ends/);
+        expect(view.summary.computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: null });
     });
 
     it('AI credits while pending: the last period\'s live credits, never used up', async () => {

@@ -941,10 +941,10 @@ try {
     contains('[data-role="fair-use-paused"]', 'Computer time is used up.');
     contains('[data-role="fair-use-paused"] .ezil-settings-btn-primary', 'Upgrade to Premium');
     has('[data-role="plan-actions"] .ezil-settings-btn-primary', false);
-    // Renewal gap: a renewal whose invoice is not paid yet is pending (the server offers no upgrade), never used up.
-    summary.fairUse.status = 'renewing'; summary.actions.upgrade = false; await refresh();
+    // Renewal gap: a period whose invoice is not paid yet is pending (the server offers no upgrade), never used up.
+    summary.fairUse.status = 'awaiting_payment'; summary.actions.upgrade = false; await refresh();
     contains('[data-role="meter-time"] .ezil-billing-meter-value', 'Pending');
-    contains('[data-role="fair-use"][data-status="renewing"]', "This period's time is added once your payment goes through.");
+    contains('[data-role="fair-use"][data-status="awaiting_payment"]', "This period's time is added once your payment goes through.");
     has('[data-role="fair-use-paused"]', false); has('[data-action="upgrade"]', false);
     assert.doesNotMatch(text(), /used up/i);
     summary.actions.upgrade = true;

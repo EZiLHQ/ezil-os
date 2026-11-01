@@ -502,7 +502,7 @@ describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
     });
 });
 
-describe('renewal gap: a renewed Stripe period with no receipt yet reads as renewing, never used up', () => {
+describe('renewal gap: a Stripe period with no receipt yet reads as awaiting payment, never used up', () => {
     // Stripe started the new period an hour ago; its invoice is still a draft, so no receipt exists for it.
     const renewedAt = new Date(now.getTime() - 3600_000), renewedEnd = new Date(renewedAt.getTime() + 30 * 86_400_000);
     const renewal = (over: Partial<Input['subs'][number]> = {}, sku: SellableSkuV3 = 'standard_monthly_v3'): Input => ({ ...input(sku), grants: [],
@@ -510,29 +510,65 @@ describe('renewal gap: a renewed Stripe period with no receipt yet reads as rene
             cancelAtPeriodEnd: false, ...over }] });
     const receipt = (amount: number): Input['grants'][number] => ({ ...input('standard_monthly_v3').grants[0]!, subscriptionId: 'sub_renewed',
         amount: BigInt(amount), periodStart: renewedAt, periodEnd: renewedEnd });
+    /** An unresolved issue on the period's own (subscription) invoice, recorded now. */
+    const issue = (kind: Input['paymentIssues'][number]['issue'], over: Partial<Input['paymentIssues'][number]> = {}): Input['paymentIssues'][number] => ({
+        stripeInvoiceId: 'in_renewal', userId: 'u', subscriptionId: 'sub_renewed', invoiceKind: 'subscription', issue: kind, hostedInvoiceUrl: null,
+        stripeEventCreated: now, resolvedAt: null, updatedAt: now, ...over });
 
-    it('renewing with no upgrade offer and nothing granted; Premium too', () => {
+    it('awaiting payment with no upgrade offer and nothing granted; Premium too', () => {
         const args = renewal();
-        expect(buildSummaryV3(args)).toMatchObject({ fairUse: { status: 'renewing', resetsAt: isoSeconds(epochSeconds(renewedEnd)) },
+        expect(buildSummaryV3(args)).toMatchObject({ fairUse: { status: 'awaiting_payment', resetsAt: isoSeconds(epochSeconds(renewedEnd)) },
             computer: { standing: 'paid' }, plan: { status: 'active', paymentIssue: null }, actions: { upgrade: false, cancel: true, portal: true } });
         const plan = planFromSubscriptions(args);
-        expect(renewalPending({ plan, standing: 'paid', subs: args.subs, grants: [], now })).toBe(true);
+        expect(renewalPending({ plan, standing: 'paid', subs: args.subs, grants: [], paymentIssues: [], now })).toBe(true);
         expect(fairUseAllowance(plan, [])).toBe(0);
-        expect(buildSummaryV3(renewal({}, 'premium_monthly_v3'))).toMatchObject({ fairUse: { status: 'renewing' }, actions: { upgrade: false, downgrade: true } });
+        expect(buildSummaryV3(renewal({}, 'premium_monthly_v3'))).toMatchObject({ fairUse: { status: 'awaiting_payment' }, actions: { upgrade: false, downgrade: true } });
     });
     it('a cancel at period end set after the renewal still waits for the renewal invoice (plan_ending)', () => {
-        expect(buildSummaryV3(renewal({ cancelAtPeriodEnd: true }))).toMatchObject({ fairUse: { status: 'renewing' }, computer: { standing: 'plan_ending' } });
+        expect(buildSummaryV3(renewal({ cancelAtPeriodEnd: true }))).toMatchObject({ fairUse: { status: 'awaiting_payment' }, computer: { standing: 'plan_ending' } });
+    });
+    it('a first purchase stored active before its first invoice.paid (a bank debit, 2 days in) awaits payment too', () => {
+        // The first period: no earlier grant for this subscription at all.
+        const boughtAt = new Date(now.getTime() - 2 * 86_400_000), firstEnd = new Date(boughtAt.getTime() + 30 * 86_400_000);
+        const first: Input = { ...input('standard_monthly_v3'), grants: [], subs: [{ sku: 'standard_monthly_v3', stripeSubscriptionId: 'sub_first',
+            status: 'active', currentPeriodStart: boughtAt, currentPeriodEnd: firstEnd, cancelAtPeriodEnd: false }] };
+        expect(first.grants.filter(grant => grant.subscriptionId === 'sub_first')).toEqual([]);
+        expect(buildSummaryV3(first)).toMatchObject({ fairUse: { status: 'awaiting_payment', resetsAt: isoSeconds(epochSeconds(firstEnd)) },
+            computer: { standing: 'paid' }, plan: { status: 'active', paymentIssue: null }, actions: { checkout: false, upgrade: false } });
+        // The first invoice.paid writes the first receipt: the period is granted.
+        const paid = { ...first, grants: [{ ...receipt(CATALOG_V3.standard_monthly_v3.fairUseSeconds), subscriptionId: 'sub_first',
+            periodStart: boughtAt, periodEnd: firstEnd }] };
+        expect(buildSummaryV3(paid)).toMatchObject({ fairUse: { status: 'ok' }, actions: { upgrade: true } });
+    });
+    it('an open session while awaiting payment has no fair-use deadline of "now" (no session cap on a paid plan)', () => {
+        const session = epoch({ size: 'std-2', weight: 1, readyAt: '2026-10-19T11:30:00Z' });
+        expect(buildSummaryV3({ ...renewal(), epochs: [session] }).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: null });
+        // Control: once the receipt lands the fair-use deadline is back (ready + 40 h at weight 1).
+        expect(buildSummaryV3({ ...renewal(), epochs: [session], grants: [receipt(CATALOG_V3.standard_monthly_v3.fairUseSeconds)] }).computer)
+            .toMatchObject({ activeDeadline: '2026-10-21T03:30:00Z' });
     });
     it.each<[string, Input, 'ok' | 'paused']>([
         ['the receipt landed (invoice.paid)', { ...renewal(), grants: [receipt(CATALOG_V3.standard_monthly_v3.fairUseSeconds)] }, 'ok'],
         ['a refund reversal for the period (a real zero)', { ...renewal(), grants: [receipt(0)] }, 'paused'],
         ['an operator-granted row (no invoice to wait for)', renewal({ stripeSubscriptionId: 'op_canary_renewed' }), 'paused'],
-        ['a failed payment (grace, D17, keeps its own allowance)', { ...renewal({ status: 'past_due' }), paymentIssues: [{ stripeInvoiceId: 'in_renewal',
-            userId: 'u', subscriptionId: 'sub_renewed', invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null,
-            stripeEventCreated: now, resolvedAt: null, updatedAt: now }] }, 'ok'],
+        ['a failed payment (grace, D17, keeps its own allowance)', { ...renewal({ status: 'past_due' }), paymentIssues: [issue('payment_failed')] }, 'ok'],
+        // Still `active` at Stripe: only the grace guard (standing) tells these apart from awaiting payment.
+        ['an active subscription with an unresolved requires_action issue (grace)', { ...renewal(), paymentIssues: [issue('requires_action')] }, 'ok'],
+        ['an active subscription with an unresolved payment_failed issue (grace)', { ...renewal(), paymentIssues: [issue('payment_failed')] }, 'ok'],
+        // Standing ignores a voided invoice, but it will never be paid: the period reads as before the fix.
+        ['a voided renewal invoice', { ...renewal(), paymentIssues: [issue('voided')] }, 'paused'],
+        ['a renewal invoice voided in the period\'s first second', { ...renewal(), paymentIssues: [issue('voided', { stripeEventCreated: renewedAt })] }, 'paused'],
         ['a subscription that is not active (trialing)', renewal({ status: 'trialing' }), 'paused'],
         ['RENEWAL_PENDING_SECONDS after the period start', renewal({ currentPeriodStart: new Date(now.getTime() - RENEWAL_PENDING_SECONDS * 1000) }), 'paused'],
-    ])('not renewing with %s', (_name, args, status) => {
+    ])('not awaiting payment with %s', (_name, args, status) => {
         expect(buildSummaryV3(args).fairUse.status).toBe(status);
+    });
+    it.each<[string, Input['paymentIssues'][number]]>([
+        ['an earlier period\'s voided invoice', issue('voided', { stripeInvoiceId: 'in_earlier', stripeEventCreated: new Date(renewedAt.getTime() - 1000) })],
+        ['a voided upgrade invoice', issue('voided', { stripeInvoiceId: 'in_upgrade', invoiceKind: 'upgrade' })],
+        ['a voided invoice of another subscription', issue('voided', { stripeInvoiceId: 'in_other', subscriptionId: 'sub_other' })],
+        ['a voided invoice resolved since', issue('voided', { resolvedAt: now })],
+    ])('still awaiting payment with %s', (_name, voided) => {
+        expect(buildSummaryV3({ ...renewal(), paymentIssues: [voided] })).toMatchObject({ fairUse: { status: 'awaiting_payment' }, actions: { upgrade: false } });
     });
 });

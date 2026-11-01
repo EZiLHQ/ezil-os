@@ -6,7 +6,7 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText, RENEWING_COPY } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText, AWAITING_PAYMENT_COPY } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -268,9 +268,9 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
  * Never "standard-hour" or "compute hours" (scanCopy).
  */
 export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
-    // Renewal gap: the new period's time is granted once its invoice is paid. Never "0 h left" or used up meanwhile.
-    if ( fairUse.status === 'renewing' ) return meterRowV3({ role: 'meter-time', label: 'Computer time', value: 'Pending', notes: [
-        { html: `<p class="ezil-billing-note ezil-billing-fair-use" data-role="fair-use" data-status="renewing" role="status">${encode(RENEWING_COPY)}</p>` },
+    // Renewal gap: the period's time is granted once its invoice is paid. Never "0 h left" or used up meanwhile.
+    if ( fairUse.status === 'awaiting_payment' ) return meterRowV3({ role: 'meter-time', label: 'Computer time', value: 'Pending', notes: [
+        { html: `<p class="ezil-billing-note ezil-billing-fair-use" data-role="fair-use" data-status="awaiting_payment" role="status">${encode(AWAITING_PAYMENT_COPY)}</p>` },
     ] });
     // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
