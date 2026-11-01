@@ -120,6 +120,18 @@ boot() { # boot <stage-dir>
 
 inx() { docker exec "$NAME" bash -lc "$*"; }
 
+settings_kept_with_policy() {
+  docker exec -i "$NAME" node - <<'JS'
+const fs = require("fs");
+const read = path => JSON.parse(fs.readFileSync(path, "utf8"));
+const kept = read("/home/neko/project/.ezil/settings.json");
+const user = read("/tmp/code-server-data/User/settings.json");
+const want = { ...kept, "task.allowAutomaticTasks": "off" };
+const entries = o => JSON.stringify(Object.keys(o).sort().map(k => [k, o[k]]));
+process.exit(entries(user) === entries(want) ? 0 : 1);
+JS
+}
+
 container_checks() { # container_checks <report-file>
   local rep="$1" ok=1
   {
@@ -210,7 +222,10 @@ cp "$WS2/.ezil/settings.json" "$UD2/Machine/settings.json"
 echo '[{"name":"Someone else","vendor":"openai","apiKey":"${input:chat.lm.secret.e2e}"}]' >"$UD2/User/chatLanguageModels.json"
 boot "$ST2"
 container_checks "$OUT/returning-container-checks.txt" || fail=1
-inx 'cmp /home/neko/project/.ezil/settings.json /tmp/code-server-data/User/settings.json' || fail=1
+# Restore is exact apart from the one key editor-state.sh enforces on every launch (it keeps a
+# cloned repository's tasks from running on open): task.allowAutomaticTasks is always "off".
+settings_kept_with_policy && echo "PASS  restored user settings equal the workspace copy plus task.allowAutomaticTasks=off" \
+  || { echo "FAIL  restored user settings differ from the workspace copy beyond the enforced task policy"; fail=1; }
 inx 'grep -Eq "\"vendor\": ?\"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
 start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
