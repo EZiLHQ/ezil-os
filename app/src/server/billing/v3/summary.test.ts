@@ -253,6 +253,124 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
     });
 });
 
+describe('identity credits: ai.account from /v1/me/balance (exact microcredits)', () => {
+    const M = (credits: string) => { const [whole, fraction = ''] = credits.split('.'); return (BigInt(whole!) * BigInt(1_000_000) + BigInt(fraction.padEnd(6, '0'))).toString(); };
+    const expiry = (date: Date) => new Date(date.getTime() + 3 * 86_400_000).toISOString();
+    const receipt = (entitlementId: string, credits: number, expiresAt: string) => ({ entitlementId, credits, expiresAt, deliveredAt: start.toISOString() });
+    const premium = receipt(`ezil-os:v1:premium_monthly_v3:sub:${start.toISOString()}`, 1000, expiry(end));
+    type Grant = NonNullable<NonNullable<Input['ai']>['gatewayGrants']>[number];
+    const grant = (credits: string, remaining: string, expiresAt: string, over: Partial<Grant> = {}): Grant =>
+        ({ creditsMicro: M(credits), remainingMicro: M(remaining), expiresAt, live: true, source: 'entitlement', revokedAt: null, ...over });
+    const admin = (credits: string, remaining: string) => grant(credits, remaining, '2027-06-01T00:00:00.000Z', { source: 'admin' });
+    const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
+    type Ai = NonNullable<Input['ai']>;
+    function account(sku: SellableSkuV3 | undefined, ai: Partial<Ai> & Pick<Ai, 'gatewayGrants'>) {
+        const balanceMicro = (ai.gatewayGrants ?? []).filter(g => g.live).reduce((sum, g) => sum + BigInt(g.remainingMicro), BigInt(0)).toString();
+        return buildSummaryV3({ ...input(sku), ai: { receipts: [premium], balanceMicro, heldMicro: '0', userId: 'user-a', ...ai } }).ai.account!;
+    }
+
+    it('worked example: plan 1,000 + added 500, used 252.75, reserved 0.5 → 1,246.75 left of 1,500 (used = total − remaining − held)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '746.75', premium.expiresAt), admin('500', '500')],
+            heldMicro: M('0.5'), gatewayState: 'ok', openHolds: [{ at: ago(1), heldMicro: M('0.5') }] });
+        expect(a).toEqual({ userId: 'user-a', state: 'ok', asOf: '2026-10-19T12:00:00Z',
+            totalMicro: M('1500'), remainingMicro: M('1246.75'), heldMicro: M('0.5'), usedMicro: M('252.75'), planBaselineMicro: M('1000'), labelled: true,
+            grants: [{ kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('746.75'), expiresAt: premium.expiresAt },
+                { kind: 'added', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-06-01T00:00:00.000Z' }] });
+        expect(BigInt(a.totalMicro!) - BigInt(a.remainingMicro!) - BigInt(a.heldMicro!)).toBe(BigInt(a.usedMicro!));
+        // The legacy buckets still split the same read (compatibility): this period's plan grant only.
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants: [grant('1000', '746.75', premium.expiresAt), admin('500', '500')],
+            balanceMicro: M('1246.75') } }).ai;
+        expect(legacy).toMatchObject({ balance: 1246.75, included: { granted: 1000, remaining: 746.75 } });
+    });
+    it('a fractional 996.25 left of 1,000 keeps every microcredit (no integer guard, no rounding)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '996.25', premium.expiresAt)] });
+        expect(a).toMatchObject({ totalMicro: M('1000'), remainingMicro: M('996.25'), usedMicro: M('3.75'), heldMicro: '0' });
+        const odd = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '999.000001', premium.expiresAt)] });
+        expect(odd).toMatchObject({ remainingMicro: '999000001', usedMicro: '999999' });
+    });
+    it('an operator grant above the plan enters the total; the catalog is only the labelled baseline', () => {
+        const standard = receipt(`ezil-os:v1:standard_monthly_v3:sub:${start.toISOString()}`, 200, expiry(end));
+        const a = account('standard_monthly_v3', { receipts: [standard], gatewayGrants: [grant('200', '120', standard.expiresAt), admin('5000', '5000')] });
+        expect(a).toMatchObject({ totalMicro: M('5200'), remainingMicro: M('5120'), usedMicro: M('80'), planBaselineMicro: M('200'), labelled: true });
+        expect(a.grants.map(g => g.kind)).toEqual(['plan', 'added']);
+        // Positive control for the admin rule: an operator grant with the plan receipt's amount and expiry never takes its label.
+        const twin = account('standard_monthly_v3', { receipts: [standard], gatewayGrants: [admin('200', '200'), grant('200', '120', standard.expiresAt)].map((g, i) =>
+            i === 0 ? { ...g, expiresAt: standard.expiresAt } : g) });
+        expect(twin.grants.map(g => [g.kind, g.remainingMicro])).toEqual([['added', M('200')], ['plan', M('120')]]);
+    });
+    it('a top-up and an upgrade proration grant each add to the total; the upgrade is this period\'s plan', () => {
+        const standard = receipt(`ezil-os:v1:standard_monthly_v3:sub:${start.toISOString()}`, 200, expiry(end));
+        const upgrade = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-13T00:00:00.000Z:upgrade', 696, expiry(end));
+        const topup = receipt('ezil-os:v1:topup:ai_pack_10_v1:pi_1', 500, '2027-09-01T00:00:00.000Z');
+        const before = account('premium_monthly_v3', { receipts: [standard, upgrade, topup], gatewayGrants: [grant('200', '150', standard.expiresAt)] });
+        expect(before).toMatchObject({ totalMicro: M('200'), remainingMicro: M('150') });
+        const after = account('premium_monthly_v3', { receipts: [standard, upgrade, topup],
+            gatewayGrants: [grant('200', '150', standard.expiresAt), grant('696', '696', upgrade.expiresAt), grant('500', '500', topup.expiresAt)] });
+        expect(after).toMatchObject({ totalMicro: M('1396'), remainingMicro: M('1346'), usedMicro: M('50'), labelled: true });
+        expect(after.grants.map(g => g.kind)).toEqual(['plan', 'plan', 'purchased']);
+        // An unmatched grant (no receipt) is still counted, as Added.
+        const unmatched = account('premium_monthly_v3', { receipts: [standard], gatewayGrants: [grant('200', '150', standard.expiresAt), grant('77', '77', '2027-01-01T00:00:00.000Z')] });
+        expect(unmatched).toMatchObject({ totalMicro: M('277'), grants: [{ kind: 'plan' }, { kind: 'added' }] });
+    });
+    it('revoked and expired grants never enter the total or the list; a live one beside them does', () => {
+        const live = grant('1000', '900', premium.expiresAt);
+        const a = account('premium_monthly_v3', { gatewayGrants: [live, grant('500', '0', '2026-10-01T00:00:00.000Z', { live: false }),
+            admin('300', '300'), { ...admin('400', '0'), live: false, revokedAt: '2026-10-02T00:00:00.000Z' }] });
+        expect(a).toMatchObject({ totalMicro: M('1300'), remainingMicro: M('1200'), usedMicro: M('100') });
+        expect(a.grants).toHaveLength(2);
+        // Positive control: the same grants all live count in full.
+        const all = account('premium_monthly_v3', { gatewayGrants: [live, grant('500', '0', '2027-10-01T00:00:00.000Z'), admin('300', '300'), admin('400', '0')] });
+        expect(all).toMatchObject({ totalMicro: M('2200') });
+    });
+    it('balance unavailable: no figures at all (never the catalog), state unavailable; the key is still present', () => {
+        const a = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants: null, balanceMicro: null, userId: 'user-a' } }).ai.account!;
+        expect(a).toEqual({ userId: 'user-a', state: 'unavailable', asOf: '2026-10-19T12:00:00Z', totalMicro: null, remainingMicro: null,
+            heldMicro: null, usedMicro: null, planBaselineMicro: M('1000'), labelled: false, grants: [] });
+        // Older v1 callers (no ai input) get no account key: the shell keeps its older rendering for them.
+        expect(buildSummaryV3(input('premium_monthly_v3')).ai).not.toHaveProperty('account');
+    });
+    it('a grant list that does not add up to available_micro gives the remaining only (no total, no used, no labels)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '900', premium.expiresAt)], balanceMicro: M('950') });
+        expect(a).toMatchObject({ remainingMicro: M('950'), totalMicro: null, usedMicro: null, labelled: false, grants: [] });
+        // Unreadable grants: the same.
+        expect(account('premium_monthly_v3', { gatewayGrants: null, balanceMicro: M('950') })).toMatchObject({ remainingMicro: M('950'), totalMicro: null, state: 'ok' });
+    });
+    it('used is null unless this read proves it: hidden or absorbed holds, or a hold that may sit on a grant that has since died', () => {
+        const grants = [grant('1000', '746.75', premium.expiresAt), admin('500', '500')];
+        const base = { gatewayGrants: grants, heldMicro: M('0.5') };
+        const visible = [{ at: ago(1), heldMicro: M('0.5') }];
+        expect(account('premium_monthly_v3', { ...base, openHolds: visible }).usedMicro).toBe(M('252.75'));
+        expect(account('premium_monthly_v3', { ...base, openHolds: null }).usedMicro).toBeNull();
+        // Σ visible holds ≠ held_micro: an open request off the page, or a platform-absorbed one (0021).
+        expect(account('premium_monthly_v3', { ...base, openHolds: [{ at: ago(1), heldMicro: M('0.25') }] }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, openHolds: [] }).usedMicro).toBeNull();
+        // A grant that expired AFTER the open request reserved may carry its slice: null. Expired before it: proven.
+        const died = (expiresAt: string, over: Partial<Grant> = {}) => [...grants, grant('100', '40', expiresAt, { live: false, ...over })];
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: died(ago(0.5)), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: died(ago(10)), openHolds: visible }).usedMicro).toBe(M('252.75'));
+        // Revocation: its time is the revoking transaction's start, so 5 minutes of margin; unknown time never proves.
+        const revoked = (at: string | 'unknown') => died('2027-01-01T00:00:00.000Z', { revokedAt: at });
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked(ago(3)), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked('unknown'), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked(ago(30)), openHolds: visible }).usedMicro).toBe(M('252.75'));
+        // No open request at all: proven without the page. A negative identity is never shown.
+        expect(account('premium_monthly_v3', { gatewayGrants: grants, heldMicro: '0', openHolds: null }).usedMicro).toBe(M('253.25'));
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '1000', premium.expiresAt)], heldMicro: M('0.5'),
+            openHolds: [{ at: ago(1), heldMicro: M('0.5') }] }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { gatewayGrants: grants, heldMicro: null }).usedMicro).toBeNull();
+    });
+    it('labels need readable receipts; the total does not', () => {
+        const a = account('premium_monthly_v3', { receipts: null, gatewayGrants: [grant('1000', '900', premium.expiresAt), admin('500', '500')] });
+        expect(a).toMatchObject({ totalMicro: M('1500'), labelled: false });
+        // Delivered receipts that match nothing (a unit change): unlabelled, total intact.
+        const unit = account('premium_monthly_v3', { gatewayGrants: [grant('1', '1', premium.expiresAt)] });
+        expect(unit).toMatchObject({ totalMicro: M('1'), labelled: false });
+        // The Gateway's own state wins; without it, zero is exhausted.
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '0', premium.expiresAt)] }).state).toBe('exhausted');
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '5', premium.expiresAt)], gatewayState: 'paused_operations' }).state).toBe('paused_operations');
+    });
+});
+
 describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () => {
     const GiB50 = String(50 * 1024 ** 3);
     it.each([['standard_monthly_v3', null], ['premium_monthly_v3', null], ['premium_monthly_v3', 'cmp-8']] as const)('%s (%s) caps at the 50 GiB AWS data volume', (sku, preference) => {

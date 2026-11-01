@@ -468,11 +468,13 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 }
             }
             await enqueueFreeAiCredits(deps.store, ctx.user.id, plan.sku, now);
-            const [{ gatewayGrants, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
+            const [{ gatewayGrants, openHolds, gatewayState, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
-                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
+                // `ai.account` (identity-based credits) is read for the authenticated user only, from /v1/me/balance.
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro, heldMicro: ai.heldMicro, gatewayState, openHolds, userId: ctx.user.id },
+                placementProvider: placement.provider,
                 volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
             });

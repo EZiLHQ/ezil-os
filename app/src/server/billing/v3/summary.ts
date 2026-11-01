@@ -9,14 +9,16 @@ import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf, HOLD_SIZE } from './admission';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
-import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
+import {
+    CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
+} from './contract';
 import { deriveStanding, paidAccess } from './standing';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
 import { REVERSE_MOVE_HOLDING, type ComputeReverseMove } from '../../lib/compute/provider-reverse-store';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
-import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
+import { aiMicroBalanceState, type AiGatewayGrant, type AiOpenHold } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
 import { creditNumber } from '../ai-read';
 
@@ -87,37 +89,47 @@ function receiptBucket(entitlementId: string, plan: ResolvedPlanV3): { bucket: A
 }
 
 const credits = (micro: bigint) => creditNumber(micro.toString());
+const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
+    (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
+
+/**
+ * The Gateway `grants[]` carries no entitlement id, so a live grant is matched to the stored receipt
+ * with the same expiry and amount. An operator grant (`source` 'admin') is never an OS receipt.
+ * `known` false: delivered receipts match nothing (a unit change, or the plan's grant missing).
+ */
+function matchAiGrants(plan: ResolvedPlanV3, input: readonly AiCreditReceipt[] | null, gatewayGrants: readonly AiGatewayGrant[] | null) {
+    const receipts = (input ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
+    const matched = new Map<AiBucket, AiGatewayGrant[]>(), bucketOf = new Map<AiGatewayGrant, AiBucket>();
+    const unused = [...receipts];
+    for (const grant of gatewayGrants ?? []) {
+        if (!grant.live || grant.source === 'admin') continue;
+        const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
+        if (i < 0) continue;
+        const [receipt] = unused.splice(i, 1);
+        matched.set(receipt!.bucket, [...matched.get(receipt!.bucket) ?? [], grant]);
+        bucketOf.set(grant, receipt!.bucket);
+    }
+    const current = receipts.filter(r => r.bucket === 'included');
+    // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
+    // match nothing (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
+    const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
+    const known = gatewayGrants !== null && !(delivered(receipts) && matched.size === 0)
+        && !(delivered(current) && !matched.has('included'));
+    return { receipts, current, matched, bucketOf, known };
+}
 
 /**
  * Round 3 D2/D4: split the Gateway balance into the plan's credits for THIS period,
- * purchased and starter credits. The Gateway `grants[]` carries no entitlement id, so a
- * live grant is matched to the stored receipt with the same expiry and amount; an
- * unmatched grant (earlier periods still inside their 3-day tail, legacy or manual
- * grants) counts in `balance` only. The low/exhausted state never mixes buckets.
+ * purchased and starter credits (`matchAiGrants`); an unmatched grant (earlier periods
+ * still inside their 3-day tail, legacy or manual grants) counts in `balance` only.
+ * The low/exhausted state never mixes buckets. `ai.account` carries the whole total.
  */
 export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
     gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null }): Pick<BillingSummaryV3['ai'],
     'state' | 'included' | 'purchased' | 'starter' | 'previous' | 'pendingFromRenewal'> {
     const { plan } = input;
     const paid = plan.sku === 'standard_monthly_v3' || plan.sku === 'premium_monthly_v3';
-    const receipts = (input.receipts ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
-    const matched = new Map<AiBucket, AiGatewayGrant[]>();
-    const unused = [...receipts];
-    for (const grant of input.gatewayGrants ?? []) {
-        if (!grant.live) continue;
-        const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
-        if (i < 0) continue;
-        const [receipt] = unused.splice(i, 1);
-        matched.set(receipt!.bucket, [...matched.get(receipt!.bucket) ?? [], grant]);
-    }
-    const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
-        (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
-    const current = receipts.filter(r => r.bucket === 'included');
-    // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
-    // match nothing (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
-    const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
-    const known = input.gatewayGrants !== null && !(delivered(receipts) && matched.size === 0)
-        && !(delivered(current) && !matched.has('included'));
+    const { current, matched, known } = matchAiGrants(plan, input.receipts, input.gatewayGrants);
     const includedGrantedMicro = known ? sum(matched.get('included'), 'creditsMicro')
         : current.filter(r => r.deliveredAt !== null).reduce((total, r) => total + BigInt(r.credits) * MICRO, BigInt(0));
     const included = paid ? { granted: credits(includedGrantedMicro) ?? 0,
@@ -142,6 +154,66 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     else state = aiMicroBalanceState(input.balanceMicro, includedGrantedMicro > BigInt(0) ? Number(includedGrantedMicro / MICRO)
         : plan.sku === 'legacy' ? 0 : plan.offer.aiCredits.amount);
     return { state, included, purchased, starter, previous, pendingFromRenewal };
+}
+
+const KIND: Record<AiBucket, AiGrantKindV3> = { included: 'plan', purchased: 'purchased', starter: 'starter', previous: 'previous' };
+/** A grant counts as possibly live this long after its `revoked_at` (the revoking transaction's start, not its commit). */
+const REVOKE_MARGIN_MS = 5 * 60_000;
+/** Postgres keeps microseconds; the wire keeps milliseconds. */
+const EXPIRY_MARGIN_MS = 1_000;
+
+/**
+ * Settled credits on the live grants, only when this read proves it. The Gateway ledger (0001 `ledger`,
+ * `grant_balances`, `balance()`, `settle_locked`; 0021 absorptions): a grant's `remaining_micro` is the sum of
+ * its rows, grant (+) hold (−) hold_release (+) debit (−) revoke (− at revocation only); settlement releases
+ * every hold slice and debits the cost, and `overrun` rows carry no grant. So over the live grants
+ * total − remaining = settled debits + the open hold slices on them, exactly. `held_micro` is Σ `hold_micro`
+ * of ALL open requests, which is the open slices on live grants only when no open slice sits on a grant
+ * that has since expired or been revoked, and no open request was platform-absorbed (slices released, still
+ * 'pending'). Proven here: no open request at all, or every open request visible on the usage page, none
+ * absorbed, and each reserved after every non-live grant had died (a slice is placed only on a live grant).
+ */
+function provenUsedMicro(total: bigint, remaining: bigint, held: bigint, grants: readonly AiGatewayGrant[],
+    openHolds: readonly AiOpenHold[] | null | undefined): bigint | null {
+    const used = total - remaining - held;
+    if (used < BigInt(0)) return null;
+    // Every open request holds something (`requests.hold_micro > 0`): none open, no slice anywhere.
+    if (held === BigInt(0)) return used;
+    if (!openHolds || openHolds.reduce((all, hold) => all + BigInt(hold.heldMicro), BigInt(0)) !== held) return null;
+    const deaths = grants.filter(g => !g.live).map(g => g.revokedAt === 'unknown' ? Infinity : Math.min(
+        Date.parse(g.expiresAt) + EXPIRY_MARGIN_MS, g.revokedAt ? Date.parse(g.revokedAt) + REVOKE_MARGIN_MS : Infinity));
+    return openHolds.every(hold => deaths.every(death => death < Date.parse(hold.at))) ? used : null;
+}
+
+/**
+ * The identity's credits (`AiAccountV3`) from `/v1/me/balance`: the total is every live grant, whatever its
+ * source; receipt matching only labels grants. Exact microcredit strings; nothing is rounded or invented.
+ */
+export function aiAccountV3(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
+    gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null; heldMicro?: string | null;
+    gatewayState?: AiAccountV3['state'] | null; openHolds?: readonly AiOpenHold[] | null; userId?: string | null; now: Date }): AiAccountV3 {
+    const { plan } = input;
+    const remaining = input.balanceMicro === null ? null : BigInt(input.balanceMicro);
+    const held = input.heldMicro == null ? null : BigInt(input.heldMicro);
+    const live = (input.gatewayGrants ?? []).filter(grant => grant.live);
+    // `available_micro` is Σ `remaining_micro` of the live grants (which never goes below 0): anything else is an inconsistent read.
+    const consistent = remaining !== null && input.gatewayGrants !== null && sum(live, 'remainingMicro') === remaining;
+    const total = consistent ? sum(live, 'creditsMicro') : null;
+    const { bucketOf, known } = matchAiGrants(plan, input.receipts, input.gatewayGrants);
+    const used = total !== null && remaining !== null && held !== null ? provenUsedMicro(total, remaining, held, input.gatewayGrants!, input.openHolds) : null;
+    return {
+        userId: input.userId ?? null,
+        state: remaining === null ? 'unavailable' : input.gatewayState ?? (remaining === BigInt(0) ? 'exhausted' : 'ok'),
+        asOf: iso(input.now),
+        totalMicro: total?.toString() ?? null, remainingMicro: remaining?.toString() ?? null, heldMicro: held?.toString() ?? null,
+        usedMicro: used?.toString() ?? null,
+        // The catalog allowance is a label only; it is never a numerator or a denominator.
+        planBaselineMicro: plan.sku === 'legacy' ? null : (BigInt(plan.offer.aiCredits.amount) * MICRO).toString(),
+        labelled: consistent && input.receipts !== null && known,
+        grants: consistent ? [...live].sort((a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt)).map(grant => ({
+            kind: grant.source === 'admin' ? 'added' as const : KIND[bucketOf.get(grant)!] ?? 'added',
+            creditsMicro: grant.creditsMicro, remainingMicro: grant.remainingMicro, expiresAt: grant.expiresAt })) : [],
+    };
 }
 
 const GIB = BigInt(1024) ** BigInt(3);
@@ -248,8 +320,12 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     renewal?: BillingSummaryV3['plan']['renewal'];
     packs?: readonly StripeAiPack[];
     stripeAvailable?: boolean;
-    /** Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape). */
-    ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null };
+    /**
+     * Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape).
+     * `heldMicro`, `gatewayState`, `openHolds` and `userId` (optional) feed `ai.account`.
+     */
+    ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null;
+        heldMicro?: string | null; gatewayState?: AiAccountV3['state'] | null; openHolds?: readonly AiOpenHold[] | null; userId?: string | null };
     /** Round 4: any aws-ec2 placement among the user's live computers; null/omitted = none or unreadable. */
     placementProvider?: 'aws-ec2' | 'cloudflare' | null;
     /**
@@ -336,7 +412,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
-            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
+            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
+                account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },

@@ -380,6 +380,11 @@ export interface BillingSummaryV3 {
         enrollment: 'enrolled' | 'activating' | 'needs_ezil_id';
         /** Round 5 D1 (additive): whole credits granted but parked until enrollment; null when none. */
         waiting: { credits: number } | null;
+        /**
+         * Identity-based credits (additive; always present from this server, so a shell can tell an
+         * unavailable balance from an older server that omits the key). See `AiAccountV3`.
+         */
+        account?: AiAccountV3;
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
@@ -397,6 +402,39 @@ export interface BillingSummaryV3 {
 }
 
 export type BillingSummaryV3Result = BillingSummaryV3 | { enabled: false };
+
+/** How a live Gateway grant is labelled. Receipt matching only labels; it never gates `totalMicro`. */
+export type AiGrantKindV3 = 'plan' | 'purchased' | 'added' | 'starter' | 'previous';
+
+/**
+ * The signed-in identity's AI credits, from the Gateway's `GET /v1/me/balance` only (never `/v1/me/limits`,
+ * which are rate and budget ceilings, not a balance). Amounts are decimal microcredit strings
+ * (1 credit = 1,000,000), exact: never rounded, never derived from the catalog.
+ * - `totalMicro`: Σ `credits_micro` of LIVE grants (unrevoked, unexpired); null when the grant list is
+ *   unreadable or does not add up to `available_micro`.
+ * - `remainingMicro`: `available_micro` (already net of holds); null = balance unavailable.
+ * - `heldMicro`: `held_micro` (credits reserved by requests in progress or being settled).
+ * - `usedMicro`: total − remaining − held, only when that identity is proven for this read (no open
+ *   request, or every open hold visible and placed while all of today's non-live grants were already
+ *   dead); else null. Settled cost on live grants; uncovered `overrun` cost is never part of it.
+ * - `planBaselineMicro`: the plan's catalog allowance per period, a label only (never a denominator).
+ * - `labelled`: false when receipts could not label the grants (no Plan/Added split is shown then).
+ * - `state`: the Gateway's balance state, or 'unavailable' when the balance could not be read.
+ * - `userId`: the user this block was read for; a shell drops a block that is not its signed-in user's.
+ */
+export interface AiAccountV3 {
+    userId: string | null;
+    state: 'ok' | 'exhausted' | 'paused_operations' | 'paused_reconciliation' | 'unavailable';
+    asOf: string;
+    totalMicro: string | null;
+    remainingMicro: string | null;
+    heldMicro: string | null;
+    usedMicro: string | null;
+    planBaselineMicro: string | null;
+    labelled: boolean;
+    /** Live grants only, earliest expiry first. */
+    grants: { kind: AiGrantKindV3; creditsMicro: string; remainingMicro: string; expiresAt: string }[];
+}
 
 export interface PublicOfferV3 {
     sku: PlanSkuV3;
