@@ -240,8 +240,10 @@ decision.
     the agent's stop.
   - Every other answer is final for that sample.
   - The stop sample runs in `shutdown()` after `sync` and before the stamp is cleared and
-    `dataMount` is unmounted, within `storageStopBudgetSeconds` (5 s). It never fails the
-    quiesce.
+    `dataMount` is unmounted. It gets `storageStopBudgetSeconds` (5 s) of wall-clock time: it
+    runs on its own daemon thread, and `shutdown()` waits for it at most that long, so a slow
+    DNS lookup or a stalled reply cannot hold the unmount. A post still in flight is abandoned
+    (logged `storage_stop_timeout`). It never fails the quiesce.
 - **Wire format:** `POST <app origin>/api/compute/aws/storage`. The origin follows
   `pool.app_origin`: the lease's `appOrigin` or the baked `enrollUrl`.
   - The headers are `X-Ezil-Computer-Id`, `X-Ezil-Generation`, `X-Ezil-Lease-Epoch`,

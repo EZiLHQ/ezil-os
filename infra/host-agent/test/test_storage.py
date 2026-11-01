@@ -11,12 +11,15 @@
 Run: python3 -m unittest -v test_storage   (from infra/host-agent/test)."""
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -118,8 +121,13 @@ class Meter(unittest.TestCase):
 
     def test_measures_a_real_directory_with_os_statvfs(self):
         stamp(self.cfg)
-        n = storage.measure(self.cfg, LEASE, is_mounted=lambda p: True)
-        st = os.statvfs(self.cfg.dataMount)
+        # The real os.statvfs (the default), recorded: a second call could see other writers on this
+        # shared filesystem change the used blocks in between.
+        self.assertIs(inspect.signature(storage.measure).parameters["statvfs"].default, os.statvfs)
+        seen = []
+        n = storage.measure(self.cfg, LEASE, is_mounted=lambda p: True, statvfs=lambda p: seen.append((p, os.statvfs(p))) or seen[-1][1])
+        ((path, st),) = seen
+        self.assertEqual(path, self.cfg.dataMount)
         self.assertEqual(n, (st.f_blocks - st.f_bfree) * st.f_frsize)
 
 
@@ -330,6 +338,39 @@ class StopSample(unittest.TestCase):
             raise ValueError("log")
         self.assertEqual(storage.on_stop(self.cfg, LEASE, KEY, bad_log, measure_fn=lambda c, l: None), "not_mounted")
 
+    def test_a_post_that_stalls_inside_one_attempt_is_cut_at_the_wall_clock_budget(self):
+        # A DNS lookup or a reply trickled byte by byte stalls INSIDE one attempt, where post()'s
+        # deadline is never checked: the shutdown still waits at most the budget.
+        release = threading.Event()
+        self.addCleanup(release.set)   # the abandoned post finishes; nothing outlives the test
+
+        def stalled(*a, **k):
+            release.wait(30)
+            return 200, b'{"recorded":true}'
+        self.cfg["storageStopBudgetSeconds"] = 0.3
+        out = []
+        caller = threading.Thread(target=lambda: out.append(storage.on_stop(
+            self.cfg, LEASE, KEY, self.logs.append, measure_fn=lambda c, l: 10, request=stalled)), daemon=True)
+        t0 = time.monotonic()
+        caller.start()
+        caller.join(5)
+        elapsed = time.monotonic() - t0
+        self.assertFalse(caller.is_alive(), "on_stop returned while the post was still stalled")
+        self.assertLess(elapsed, 0.3 + 1.5)
+        self.assertEqual(out, ["storage_stop_timeout"])
+        self.assertEqual(self.logs, ["storage: stop sample storage_stop_timeout"])
+        stuck = [t for t in threading.enumerate() if t.name == "ezil-storage-stop"]
+        self.assertTrue(stuck and all(t.daemon for t in stuck), "the abandoned post never blocks the power-off")
+
+    def test_a_prompt_answer_inside_the_budget_is_still_reported(self):
+        # Positive control for the wall-clock bound: an app that answers at once is recorded, promptly.
+        self.cfg["storageStopBudgetSeconds"] = 2.0
+        t0 = time.monotonic()
+        out = storage.on_stop(self.cfg, LEASE, KEY, self.logs.append, measure_fn=lambda c, l: 10,
+                              request=lambda *a, **k: (200, b'{"recorded":true}'))
+        self.assertEqual(out, "recorded")
+        self.assertLess(time.monotonic() - t0, 2.0, "a settled sample does not wait out the budget")
+
 
 class AgentIntegration(unittest.TestCase):
     def setUp(self):
@@ -368,7 +409,9 @@ class AgentIntegration(unittest.TestCase):
         with mock.patch.object(storage, "measure", return_value=123), \
                 mock.patch.object(storage.http, "request", side_effect=OSError("unreachable")), \
                 mock.patch.object(storage.time, "sleep"):
-            self.cfg["storageStopBudgetSeconds"] = 0.05
+            # Long enough for the stop thread to settle (no real sleep: the first backoff passes the deadline),
+            # short enough to keep the unit fast; the wall-clock cut is test_a_post_that_stalls_... above.
+            self.cfg["storageStopBudgetSeconds"] = 0.5
             real = storage.on_stop   # shutdown_order patches the module attribute; keep the real one
             order, stopped = self.shutdown_order(lambda: real(self.cfg, self.a.lease, self.a.key, self.logs.append))
         self.assertIn("storage", order)

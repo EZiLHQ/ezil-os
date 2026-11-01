@@ -78,7 +78,7 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 **Policy (approved 2026-11-01).** The meter counts the logical primary bytes a user owns, each datum once.
 - **AWS computer:** the sample is the used bytes (`statvfs`: `(f_blocks − f_bfree) × f_frsize`) of the computer's retained data volume. That volume holds `/workspace`, HOME, the overlay upper and the profiles, including editor and chat state, so chat is counted once, inside it.
   - **Who measures:** the HOST agent, outside the guest container (`infra/host-agent/lib/ezil_host/storage.py`), and only while the volume is that lease's guarded mount.
-  - **When:** 60 s after the agent starts, every 15 min, and once on stop. The stop sample runs after the sync and before the unmount, within a 5 s budget.
+  - **When:** 60 s after the agent starts, every 15 min, and once on stop. The stop sample runs after the sync and before the unmount, on its own thread that the shutdown waits for at most 5 s of wall-clock time; a post still in flight then is abandoned.
   - **Endpoint:** it posts to `POST /api/compute/aws/storage` (`app/src/server/billing/http/host-storage.ts`) with `source: 'host-agent'`.
 - **Excluded, as operator cost rather than user quota:** checkpoint generations, S3 noncurrent versions, EBS snapshots and the host root disk.
 - **Credential:**

@@ -20,8 +20,11 @@ once on stop.
   * Posting never blocks a lifecycle operation. Periodic samples run on their own daemon
     thread; transport errors, 429 and 5xx are retried with backoff (1 s doubling to 30 s)
     inside one interval, re-signed each time over the same body (the app is idempotent on
-    measuredAt). The stop sample has a hard budget (storageStopBudgetSeconds) and never
-    raises. Any other answer is final for that sample; the next interval measures again.
+    measuredAt). The stop sample has a hard wall-clock budget (storageStopBudgetSeconds):
+    it runs on its own daemon thread and the shutdown waits for it at most that long, so a
+    DNS lookup, a stalled handshake or a trickled reply (each bounded only per socket
+    operation, if at all) cannot hold the unmount. It never raises. Any other answer is final
+    for that sample; the next interval measures again.
     The app refuses a stop sample once a control-plane stop began (it cleared the key's
     proof at DRAINING); the last periodic sample then stands.
 """
@@ -31,6 +34,7 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 
 from . import guard, http, pool
@@ -164,10 +168,24 @@ def sample_once(cfg, lease, key, reason, deadline, *, measure_fn=measure, clock=
 
 
 def on_stop(cfg, lease, key, log, **kw):
-    """The stop sample: measured after the desktop stopped and the volume synced, posted
-    within storageStopBudgetSeconds. Never raises."""
-    budget = float(cfg.get("storageStopBudgetSeconds", 5))
-    outcome, _ = sample_once(cfg, lease, key, "stop", time.monotonic() + budget, **kw)
+    """The stop sample: measured after the desktop stopped and the volume synced, and given
+    storageStopBudgetSeconds of wall-clock time. post()'s deadline is checked only between
+    attempts and its timeout applies per socket operation (getaddrinfo has none), so the
+    sample runs on a daemon thread that this waits for at most the budget. A post still in
+    flight then is abandoned: statvfs ran before it and holds nothing open on the volume, so
+    the unmount can go ahead, and the thread dies with the power-off. Never raises."""
+    budget = max(0.0, float(cfg.get("storageStopBudgetSeconds", 5)))
+    done = []
+
+    def run():
+        done.append(sample_once(cfg, lease, key, "stop", time.monotonic() + budget, **kw)[0])
+    try:
+        th = threading.Thread(target=run, name="ezil-storage-stop", daemon=True)
+        th.start()
+        th.join(budget)
+        outcome = done[0] if done else "storage_stop_timeout"
+    except Exception as e:  # noqa: BLE001 — metering must never break a stop
+        outcome = f"error_{type(e).__name__}"
     try:
         log(f"storage: stop sample {outcome}")
     except Exception:  # noqa: BLE001

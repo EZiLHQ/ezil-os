@@ -552,7 +552,7 @@ class Agent:
         self.power_off()
 
     def _storage_stop_sample(self):
-        """The stop sample (storage.on_stop): bounded by storageStopBudgetSeconds, and metering
+        """The stop sample (storage.on_stop): at most storageStopBudgetSeconds of wall-clock time, and metering
         only, so nothing here fails the quiesce (an agent without a lease or key skips it)."""
         lease, key = getattr(self, "lease", None), getattr(self, "key", None)
         if isinstance(lease, dict) and key:
