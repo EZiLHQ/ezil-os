@@ -277,6 +277,28 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
             { computerId: 'deleted-unpurged', bytes: BigInt(800_000_000), measuredAt: start }] }).storage)
             .toEqual({ usedBytes: '1800000000', capBytes: String(2 * 1024 ** 3), state: 'low' });
     });
+    it('a v3 disk counts only live computers on it: a deleted computer\'s retained sample never fills the new computer\'s disk', () => {
+        const GiB = BigInt(1024) ** BigInt(3);
+        const args = { ...input('standard_monthly_v3'), volumeGiB: 50, storage: [
+            { computerId: 'deleted-old', bytes: BigInt(30) * GiB, measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: 'CF-LIVE', bytes: BigInt(5) * GiB, measuredAt: now },
+            { computerId: 'aws-live', bytes: BigInt(25) * GiB, measuredAt: now }] };
+        const live = [{ computerId: 'AWS-LIVE', provider: 'aws-ec2' }, { computerId: 'cf-live', provider: 'cloudflare' }];
+        // The reviewer's case: 25 GiB on the live 50 GiB volume is ok, not 55 GiB "exhausted" (ids compare case-insensitively).
+        expect(buildSummaryV3({ ...args, liveComputers: live })).toMatchObject({
+            storage: { usedBytes: String(BigInt(25) * GiB), capBytes: String(BigInt(50) * GiB), state: 'ok' },
+            computer: { disk: { provisionedGiB: 50, usedBytes: String(BigInt(25) * GiB) } } });
+        // Control: a caller that names no live computers keeps the unscoped sum (60 GiB on 50: exhausted).
+        expect(buildSummaryV3(args).storage).toMatchObject({ usedBytes: String(BigInt(60) * GiB), state: 'exhausted' });
+        // No live computer on the disk: unmeasured, never a deleted computer's bytes.
+        expect(buildSummaryV3({ ...args, liveComputers: [] }).storage).toEqual({ usedBytes: null, capBytes: String(BigInt(50) * GiB), state: 'unavailable' });
+        // Free (Cloudflare disk, no cap): only the live Cloudflare computer's sample; not the AWS volume, not the deleted one.
+        expect(buildSummaryV3({ ...input(), storage: args.storage, liveComputers: live }).computer.disk?.usedBytes).toBe(String(BigInt(5) * GiB));
+        // Legacy "Saved storage" is the per-user allowance: deleted-but-unpurged computers still count there.
+        const legacy = { ...args, subs: [{ sku: 'standard_monthly_v2', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }], liveComputers: live };
+        expect(buildSummaryV3(legacy).storage.usedBytes).toBe(String(BigInt(60) * GiB));
+    });
     it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
         const args = input(); args.config.largeStorageEnabled = true;
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: '0', state: 'unavailable' });

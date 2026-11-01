@@ -65,7 +65,9 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 
 ### 3.2 Saved storage
 
-**What counts:** the latest sample per computer, from `ezil_billing_storage_samples`, summed over the user's computers (`latestStorageTotal`). This includes deleted computers that are not yet purged.
+**What counts:** the latest sample per computer, from `ezil_billing_storage_samples` (`latestStorageTotal`), summed over:
+- **Legacy "Saved storage"** (the per-user v1 allowance): every computer of the user, including deleted computers that are not yet purged.
+- **A v3 computer disk** (`computer.disk` and `storage` in `billing.summary`, `storage.disk` in `billing.usage`): only the user's LIVE computers of that disk's kind, the aws-ec2 ones on an AWS volume and the others on a Cloudflare disk (`storageDisk`, with the live computers from the router's placement read). A deleted computer's retained volume is on no disk the user can reach, so it never fills the new computer's disk. A placement read that lists no computers (failed, or placement reads off) counts none, so the disk reads "not measured yet".
 
 **No sample is not zero:** with no sample at all, every summary (v1, v2, v3) returns `usedBytes: null` with state `unavailable`. The shell shows "Measuring…" for an AWS disk and "Space used isn't measured on this computer." where there is no disk figure (Cloudflare), never "0 used", and shows Full / Almost full only for a measured figure.
 
@@ -90,11 +92,11 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 - **Cloudflare computers have no emitter.** Their container is user-reachable, so a sample from inside it would be advisory only. Their storage stays "not measured", and the UI says so.
 - **On Cloudflare/Free, the 512 MiB checkpoint cap binds long before the 2 GB Free figure,** so that allowance cannot be reached there.
 - **No per-user write enforcement exists beyond the volume size.** An AWS disk fills to ENOSPC, and the 80% / 95% states are warnings only.
-- **A deleted computer's last sample counts until a purge marker exists.** No purge state is recorded yet, and the 14-day purge is a dry run.
+- **A deleted computer's last sample counts in legacy "Saved storage" until a purge marker exists.** No purge state is recorded yet, and the 14-day purge is a dry run. The v3 disk never counts it, and no v3 field shows the per-user total yet (the v3 `storage` wire type is pinned).
 - **AWS disks read "Measuring…" until the host AMI that carries `storage.py` is rolled out.** That AMI ships separately from the app deploy.
 - **A stop sample is refused once a control-plane stop has begun.** DRAINING clears the key's proof, so the last periodic sample, at most 15 min old, stands. Idle stops, which the agent initiates, are sampled.
-- **Two AWS computers can read falsely full in the unscoped summary.**
-  - The `billing.summary` and unscoped `billing.usage` compare the sum of every computer's latest sample with the smallest of the user's AWS volumes (`readVolumeGiB`).
+- **Two live AWS computers can read falsely full in the unscoped summary.**
+  - The `billing.summary` and unscoped `billing.usage` compare the sum of the live AWS computers' latest samples with the smallest of their volumes (`readVolumeGiB`).
   - `billing.usage` with a `computerId` compares one computer with its own volume, which is correct.
   - Fixing this needs a product decision: a per-user total or a per-disk meter.
 

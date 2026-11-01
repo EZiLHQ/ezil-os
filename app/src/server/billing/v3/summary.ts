@@ -146,6 +146,9 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
 
 const GIB = BigInt(1024) ** BigInt(3);
 
+/** A live computer and its provider, as the router's placement read lists it (billing.ts `UserPlacement.computers`). */
+export interface DiskComputer { computerId: string; provider: string | null }
+
 /**
  * Round 5 D3: the disk shown when the computer's volume cannot be read (no AWS placement yet, AWS off,
  * a read error or timeout): the smallest paid new-volume size, so the figure never overclaims.
@@ -180,23 +183,35 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
  * keeps it, so the cap is that volume's REAL size (`volumeGiB`, read by the caller from EC2), never a
  * per-configuration table; unreadable falls back to `DISK_FALLBACK_GIB`. Free/Cloudflare has no
  * provisioned figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
+ *
+ * The legacy meter is the per-user "Saved storage" allowance: every computer's latest sample, deleted
+ * ones included until purged (CONTRACT.md §3.2). A v3 disk is one computer's disk, so it counts only
+ * what can be on it: the samples of the user's LIVE computers (`liveComputers`, the router's placement
+ * read) of the disk's kind, aws-ec2 ones on an AWS volume and the others (Cloudflare, or no placement
+ * row yet) on a Cloudflare disk. A deleted computer's retained volume is on no disk the user can reach,
+ * so it never fills this one. Omitted `liveComputers` (callers that read no placement) counts every sample.
  */
 export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
-    largeStorageEnabled: boolean, volumeGiB?: number | null): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
-    const { usedBytes } = latestStorageTotal(storage);
-    // Unmeasured is `unavailable` ("Measuring…"), never the `ok` of a zero nobody measured.
-    const meter = (cap: bigint) => {
+    largeStorageEnabled: boolean, volumeGiB?: number | null, liveComputers?: readonly DiskComputer[]):
+    { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
+    // Unmeasured is `unavailable` ("not measured yet"), never the `ok` of a zero nobody measured.
+    const meter = (usedBytes: bigint | null, cap: bigint) => {
         if (usedBytes === null) return 'unavailable' as const;
         const state = storageState(usedBytes, cap);
         return state === 'over_cap' ? 'exhausted' as const : state;
     };
     if (plan.sku === 'legacy') {
+        const { usedBytes } = latestStorageTotal(storage);
         const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
-        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(cap) };
+        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(usedBytes, cap) };
     }
-    const provisionedGiB = SIZES[size].provider === 'aws' ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
+    const aws = SIZES[size].provider === 'aws';
+    const onDisk = liveComputers === undefined ? null : new Set(liveComputers
+        .filter(computer => (computer.provider === 'aws-ec2') === aws).map(computer => computer.computerId.toLowerCase()));
+    const { usedBytes } = latestStorageTotal(onDisk === null ? storage : storage.filter(sample => onDisk.has(sample.computerId.toLowerCase())));
+    const provisionedGiB = aws ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
-    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(capBytes) };
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(usedBytes, capBytes) };
 }
 
 /**
@@ -260,6 +275,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     volumeGiB?: number | null;
     /** Round 6 (R4-02): the metered size of the user's AWS computer as placed; null/omitted = none, unreadable or mixed. */
     awsSize?: SizeCode | null;
+    /** The user's live computers (`storageDisk`): the disk meter counts only their samples; omitted = every sample. */
+    liveComputers?: readonly DiskComputer[];
     /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
     reverseMove?: ReverseMoveSummaryInput;
 }): BillingSummaryV3 {
@@ -307,7 +324,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     )) : null;
-    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
+    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
