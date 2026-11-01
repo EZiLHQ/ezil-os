@@ -221,6 +221,12 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         expect(summary('premium_monthly_v3', [standard, topup], [grant(500, 400, topup.expiresAt)], M(400)))
             .toMatchObject({ included: { granted: 200, remaining: null }, purchased: null });
     });
+    it('a delivered receipt whose grant was revoked or expired is accounted for, not unknown: this period\'s plan credits are the live ones', () => {
+        const ai = summary('premium_monthly_v3', [standard], [grant(200, 0, standard.expiresAt, false), grant(50, 40, '2027-06-01T00:00:00.000Z')]);
+        expect(ai).toMatchObject({ balance: 40, included: { granted: 0, remaining: 0 }, purchased: null, starter: null });
+        // Before: unmatched, so "known" was false and the meter read the dead receipt's 200 with no remainder.
+        expect(ai.included).not.toMatchObject({ granted: 200 });
+    });
     it('round 6 (R1-10/R4-05): on Free after an immediate cancel, the paid period\'s remainder is its own bucket with its expiry', () => {
         // contact@ on 10-30: 100 starter credits plus 663 left of a cancelled Premium period (kept to periodEnd + 3 days).
         const cancelled = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-27T12:00:00.000Z', 1000, '2026-11-30T12:00:00.000Z');
@@ -321,6 +327,28 @@ describe('identity credits: ai.account from /v1/me/balance (exact microcredits)'
         // Positive control: the same grants all live count in full.
         const all = account('premium_monthly_v3', { gatewayGrants: [live, grant('500', '0', '2027-10-01T00:00:00.000Z'), admin('300', '300'), admin('400', '0')] });
         expect(all).toMatchObject({ totalMicro: M('2200') });
+    });
+    it('a revoked plan grant that matches its delivered receipt is accounted for: still labelled, the operator grant reads Added', () => {
+        // Staging e2e-standard shape: the period's plan grant was revoked, an operator grant carries the balance.
+        const revoked = grant('1000', '0', premium.expiresAt, { live: false, revokedAt: ago(4 * 24 * 60) });
+        const gatewayGrants = [revoked, admin('1000', '982.590906')];
+        const a = account('premium_monthly_v3', { gatewayGrants });
+        expect(a).toMatchObject({ totalMicro: M('1000'), remainingMicro: M('982.590906'), labelled: true,
+            grants: [{ kind: 'added', creditsMicro: M('1000'), remainingMicro: M('982.590906'), expiresAt: '2027-06-01T00:00:00.000Z' }] });
+        // The legacy buckets count live plan grants only: 0 this period, not the dead receipt's 1,000 with an unknown remainder.
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants, balanceMicro: M('982.590906') } }).ai;
+        expect(legacy).toMatchObject({ included: { granted: 0, remaining: 0 }, pendingFromRenewal: null });
+        // A dead grant that matches nothing (a unit change) proves nothing: still unlabelled.
+        const unit = account('premium_monthly_v3', { gatewayGrants: [{ ...revoked, creditsMicro: M('1') }, admin('1000', '982.590906')] });
+        expect(unit).toMatchObject({ totalMicro: M('1000'), labelled: false });
+    });
+    it('a live grant takes its receipt before a dead twin with the same expiry and amount', () => {
+        const dead = grant('1000', '0', premium.expiresAt, { live: false, revokedAt: ago(4 * 24 * 60) });
+        const a = account('premium_monthly_v3', { gatewayGrants: [dead, grant('1000', '600', premium.expiresAt)] });
+        expect(a).toMatchObject({ totalMicro: M('1000'), labelled: true, grants: [{ kind: 'plan', remainingMicro: M('600') }] });
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium],
+            gatewayGrants: [dead, grant('1000', '600', premium.expiresAt)], balanceMicro: M('600') } }).ai;
+        expect(legacy).toMatchObject({ included: { granted: 1000, remaining: 600 } });
     });
     it('balance unavailable: no figures at all (never the catalog), state unavailable; the key is still present', () => {
         const a = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants: null, balanceMicro: null, userId: 'user-a' } }).ai.account!;

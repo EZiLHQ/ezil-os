@@ -95,26 +95,36 @@ const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro
 /**
  * The Gateway `grants[]` carries no entitlement id, so a live grant is matched to the stored receipt
  * with the same expiry and amount. An operator grant (`source` 'admin') is never an OS receipt.
+ * Live grants match first; a receipt left over may then match a revoked or expired grant, which
+ * accounts for it as dead: it funds no bucket, and its receipt no longer reads as unmatched.
  * `known` false: delivered receipts match nothing (a unit change, or the plan's grant missing).
  */
 function matchAiGrants(plan: ResolvedPlanV3, input: readonly AiCreditReceipt[] | null, gatewayGrants: readonly AiGatewayGrant[] | null) {
     const receipts = (input ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
     const matched = new Map<AiBucket, AiGatewayGrant[]>(), bucketOf = new Map<AiGatewayGrant, AiBucket>();
+    const dead = new Set<AiBucket>();
     const unused = [...receipts];
-    for (const grant of gatewayGrants ?? []) {
-        if (!grant.live || grant.source === 'admin') continue;
+    const take = (grant: AiGatewayGrant) => {
         const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
-        if (i < 0) continue;
-        const [receipt] = unused.splice(i, 1);
-        matched.set(receipt!.bucket, [...matched.get(receipt!.bucket) ?? [], grant]);
-        bucketOf.set(grant, receipt!.bucket);
+        return i < 0 ? null : unused.splice(i, 1)[0]!;
+    };
+    const fromOs = (gatewayGrants ?? []).filter(grant => grant.source !== 'admin');
+    for (const grant of fromOs.filter(g => g.live)) {
+        const receipt = take(grant);
+        if (!receipt) continue;
+        matched.set(receipt.bucket, [...matched.get(receipt.bucket) ?? [], grant]);
+        bucketOf.set(grant, receipt.bucket);
+    }
+    for (const grant of fromOs.filter(g => !g.live)) {
+        const receipt = take(grant);
+        if (receipt) dead.add(receipt.bucket);
     }
     const current = receipts.filter(r => r.bucket === 'included');
     // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
-    // match nothing (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
+    // match nothing, live or dead (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
     const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
-    const known = gatewayGrants !== null && !(delivered(receipts) && matched.size === 0)
-        && !(delivered(current) && !matched.has('included'));
+    const known = gatewayGrants !== null && !(delivered(receipts) && matched.size === 0 && dead.size === 0)
+        && !(delivered(current) && !matched.has('included') && !dead.has('included'));
     return { receipts, current, matched, bucketOf, known };
 }
 
