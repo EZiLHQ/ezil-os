@@ -53,6 +53,7 @@ seed_codeserver_machine_settings() {
   "github.copilot.chat.backgroundAgent.enabled": false,
   "github.copilot.chat.cloudAgent.enabled": false,
   "chat.viewSessions.enabled": false,
+  "github.copilot.chat.localIndex.enabled": false,
   "workbench.secondarySideBar.defaultVisibility": "visible",
   "telemetry.telemetryLevel": "off",
   "terminal.integrated.env.linux": {
@@ -155,6 +156,83 @@ embeddings.vscode-cdn.net
 EZIL_BLOCKED_AI_HOSTS
 }
 
+# EZiL Chat history. The editor writes each conversation to
+# <user-data>/User/workspaceStorage/<workspace id>/chatSessions/<session>.jsonl
+# (code-server 4.141.0 ChatSessionStore). That directory becomes a link to
+# <workspace>/.ezil/chat, so the one copy travels with the workspace: checkpoints,
+# restore, reverse move and Cloudflare restarts carry it like any project file.
+# The id is the web workbench's hash of the folder URI vscode-remote://remote<path>
+# (workbench.js QUn/Nr/o0); both bridges drop x-forwarded-port, so the authority is
+# always "remote". Print one id per distinct spelling of the folder path.
+ezil_editor_chat_workspace_ids() {
+  node - "$1" <<'CODESERVER_WORKSPACE_ID_JS'
+const path = require("path");
+const hash = s => { let h = 149417; for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0; return h; };
+// Only paths URI.toString() leaves unencoded; anything else would hash differently.
+for (const p of new Set([process.argv[2], path.resolve(process.argv[2])])) {
+  if (/^\/[A-Za-z0-9._~\/-]*$/.test(p)) console.log(hash("vscode-remote://remote" + p).toString(16));
+}
+CODESERVER_WORKSPACE_ID_JS
+}
+
+# Idempotent; runs before every launch, including warm AWS profiles that already
+# carry .ezil-state-ready. Existing history (AWS profile volume) moves into the
+# workspace once, never overwriting a saved session. Odd entries are moved aside,
+# never followed or deleted.
+ezil_editor_link_chat() (
+  local user_data="$1" workspace="$2" state_dir chat ids id parent link entry name stamp
+  state_dir="${EZIL_EDITOR_STATE_DIR:-$workspace/.ezil}"
+  chat="$state_dir/chat"
+  stamp="$(date +%s)-$BASHPID-$RANDOM"
+  mkdir -p "$state_dir" || exit 1
+  # Self-ignoring: user Git never stages editor state or conversations.
+  if [ ! -e "$state_dir/.gitignore" ] && [ ! -L "$state_dir/.gitignore" ]; then
+    printf '# EZiL editor state and chat history (managed by EZiL)\n*\n' >"$state_dir/.gitignore" || exit 1
+  fi
+  # `mv -T` everywhere: a destination is a name, never a directory to move into.
+  if [ -L "$chat" ] || { [ -e "$chat" ] && [ ! -d "$chat" ]; }; then
+    mv -T -- "$chat" "$chat.ezil-quarantine-$stamp" || exit 1
+  fi
+  mkdir -p "$chat" || exit 1
+  ids="$(ezil_editor_chat_workspace_ids "$workspace")" || exit 1
+  [ -n "$ids" ] || exit 1
+  for id in $ids; do
+    parent="$user_data/User/workspaceStorage/$id"
+    link="$parent/chatSessions"
+    [ "$(readlink "$link" 2>/dev/null)" = "$chat" ] && continue
+    mkdir -p "$parent" || exit 1
+    if [ -d "$link" ] && [ ! -L "$link" ]; then
+      for entry in "$link"/* "$link"/.[!.]* "$link"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        if [ ! -e "$chat/$name" ] && [ ! -L "$chat/$name" ]; then
+          mv -T -- "$entry" "$chat/$name" || exit 1
+        elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$chat/$name"; then
+          rm -f -- "$entry" || exit 1
+        else
+          mkdir -p "$state_dir/chat-conflicts/$stamp" || exit 1
+          mv -T -- "$entry" "$state_dir/chat-conflicts/$stamp/$name" || exit 1
+        fi
+      done
+      rmdir -- "$link" || exit 1
+    elif [ -e "$link" ] || [ -L "$link" ]; then
+      mv -T -- "$link" "$parent/chatSessions.ezil-quarantine-$stamp" || exit 1
+    fi
+    ln -s -- "$chat" "$parent/.chatSessions.$stamp" || exit 1
+    mv -T -- "$parent/.chatSessions.$stamp" "$link" || { rm -f -- "$parent/.chatSessions.$stamp"; exit 1; }
+  done
+)
+
+# Copilot Chat 0.69's local session index (github.copilot.chat.localIndex.enabled,
+# now off in the Machine seed) keeps a second copy of every turn that deleting a
+# conversation never removes. Drop that derived copy; the workspace keeps the history.
+ezil_editor_drop_copilot_session_index() {
+  rm -f -- "$1/User/globalStorage/github.copilot-chat/session-store.db" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-wal" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-shm" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-journal"
+}
+
 ezil_editor_prepare() (
   local user_data="$1" workspace="$2" file
   mkdir -p "$user_data" || exit 1
@@ -163,9 +241,12 @@ ezil_editor_prepare() (
   seed_codeserver_machine_settings "$user_data" || exit 1
   seed_codeserver_chat_models "$user_data" || exit 1
   seed_blocked_ai_hosts || true
+  ezil_editor_drop_copilot_session_index "$user_data" || true
   # Within the same runtime, relaunches preserve the current editor state.
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
+    # History must not block the editor: a failed link leaves today's behaviour.
+    ezil_editor_link_chat "$user_data" "$workspace" || echo "editor-state: chat history link failed; conversations stay in the editor profile" >&2
     exit 0
   fi
   for file in settings.json keybindings.json; do
@@ -174,6 +255,7 @@ ezil_editor_prepare() (
     fi
   done
   seed_codeserver_user_settings "$user_data" || exit 1
+  ezil_editor_link_chat "$user_data" "$workspace" || echo "editor-state: chat history link failed; conversations stay in the editor profile" >&2
   # This marker is published only after every restore succeeded. Failed restores
   # cannot launch defaults or let a later capture replace durable user settings.
   printf '%s\n' "$workspace" >"$user_data/.ezil-state-ready" || exit 1
@@ -216,6 +298,8 @@ ezil_editor_capture() (
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
   [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
+  # A workspace replaced under a running editor keeps the history link usable.
+  [ -L "$state_dir/chat" ] || mkdir -p "$state_dir/chat" 2>/dev/null || true
   for file in settings.json keybindings.json; do
     if [ -f "$user_data/User/$file" ]; then
       if ! cmp -s "$user_data/User/$file" "$state_dir/$file"; then
