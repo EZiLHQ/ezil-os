@@ -156,6 +156,27 @@ embeddings.vscode-cdn.net
 EZIL_BLOCKED_AI_HOSTS
 }
 
+# User Git never stages editor state or conversations. Two rules, both written before
+# every launch and at every capture (30 s and each checkpoint), because the running editor
+# recreates .ezil/chat itself after `git clean -x`/`-X` or a replaced workspace removed
+# it: .ezil/.gitignore (`*`), and `/.ezil/` in the local, never-committed
+# .git/info/exclude of a repository at the workspace root, which `git clean` keeps. A
+# user's file is never replaced, a link never followed, and .git/info never created.
+ezil_editor_ignore_state() {
+  local workspace="$1" state_dir="$2" exclude="$1/.git/info/exclude"
+  mkdir -p "$state_dir" || return 1
+  if [ ! -e "$state_dir/.gitignore" ] && [ ! -L "$state_dir/.gitignore" ]; then
+    printf '# EZiL editor state and chat history (managed by EZiL)\n*\n' >"$state_dir/.gitignore" || return 1
+  fi
+  [ "$state_dir" = "$workspace/.ezil" ] || return 0
+  [ -d "$workspace/.git" ] && [ ! -L "$workspace/.git" ] && [ ! -L "$workspace/.git/info" ] || return 0
+  [ -f "$exclude" ] && [ ! -L "$exclude" ] || return 0
+  grep -qxF '/.ezil/' "$exclude" && return 0
+  # Best effort on top of .gitignore. Keep a last line without a newline intact.
+  if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then printf '\n' >>"$exclude" 2>/dev/null || return 0; fi
+  printf '# EZiL editor state and chat history (managed by EZiL)\n/.ezil/\n' >>"$exclude" 2>/dev/null || true
+}
+
 # EZiL Chat history lives in the workspace: <workspace>/.ezil/chat/<session>.jsonl, one
 # copy that checkpoints, restore, reverse move and Cloudflare restarts carry like any
 # project file. The patched editor (copilot-chat/PATCHES.md, history-root) writes there
@@ -171,11 +192,7 @@ ezil_editor_prepare_chat() (
   state_dir="${EZIL_EDITOR_STATE_DIR:-$workspace/.ezil}"
   chat="$state_dir/chat"
   stamp="$(date +%s)-$BASHPID-$RANDOM"
-  mkdir -p "$state_dir" || exit 1
-  # Self-ignoring: user Git never stages editor state or conversations.
-  if [ ! -e "$state_dir/.gitignore" ] && [ ! -L "$state_dir/.gitignore" ]; then
-    printf '# EZiL editor state and chat history (managed by EZiL)\n*\n' >"$state_dir/.gitignore" || exit 1
-  fi
+  ezil_editor_ignore_state "$workspace" "$state_dir" || exit 1
   # `mv -T` everywhere: a destination is a name, never a directory to move into.
   if [ -L "$chat" ] || { [ -e "$chat" ] && [ ! -d "$chat" ]; }; then
     mv -T -- "$chat" "$chat.ezil-quarantine-$stamp" || exit 1
@@ -274,7 +291,9 @@ ezil_editor_capture() (
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
   [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
-  # A workspace replaced under a running editor keeps its history folder.
+  # A workspace replaced (or .ezil removed) under a running editor gets its ignore rules
+  # and history folder back. Best effort: a failure here must not fail the checkpoint.
+  ezil_editor_ignore_state "$workspace" "$state_dir" 2>/dev/null || true
   [ -L "$state_dir/chat" ] || mkdir -p "$state_dir/chat" 2>/dev/null || true
   for file in settings.json keybindings.json; do
     if [ -f "$user_data/User/$file" ]; then

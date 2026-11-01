@@ -95,8 +95,70 @@ git -C "$workspace" add -A
 printf 'custom\n' >"$workspace/.ezil/.gitignore"
 ezil_editor_prepare "$cf" "$workspace"
 [ "$(cat "$workspace/.ezil/.gitignore")" = 'custom' ] || fail "existing .gitignore overwritten"
+ezil_editor_capture "$cf" "$workspace"
+[ "$(cat "$workspace/.ezil/.gitignore")" = 'custom' ] || fail "existing .gitignore overwritten by capture"
+rm "$workspace/.ezil/.gitignore"
 
-# 7. Copilot's derived session index is off and its old copy is dropped.
+# 7. .ezil removed under the running editor (`git clean -x`, a replaced workspace); the
+#    editor recreates .ezil/chat itself on its next write. Normal files are the controls.
+#    a) A repository at the root: its local exclude keeps .ezil out even before a capture.
+exclude="$workspace/.git/info/exclude"
+ezil_editor_capture "$cf" "$workspace"
+[ "$(grep -cxF '/.ezil/' "$exclude")" -eq 1 ] || fail "exclude line not added exactly once"
+ezil_editor_prepare "$cf" "$workspace"; ezil_editor_capture "$cf" "$workspace"
+[ "$(grep -cxF '/.ezil/' "$exclude")" -eq 1 ] || fail "exclude line duplicated"
+cp -a "$workspace/.ezil" "$root/ezil-saved"
+git -C "$workspace" clean -fdxq
+[ ! -e "$workspace/.ezil" ] || fail "premise: git clean -x kept .ezil"
+mkdir -p "$chat"; printf '{"kind":0}\n' >"$chat/before-capture.jsonl"   # the editor's mkdirp + write
+printf 'y\n' >"$workspace/new.txt"
+status="$(git -C "$workspace" status --porcelain --untracked-files=all)"
+[[ "$status" == *"new.txt"* ]] || fail "positive control: untracked file not listed"
+[[ "$status" != *".ezil"* ]] || fail "session written before a capture visible to git: $status"
+ezil_editor_capture "$cf" "$workspace"
+[ "$(tail -n 1 "$workspace/.ezil/.gitignore")" = '*' ] || fail "capture did not restore .ezil/.gitignore"
+rm -rf "$workspace/.ezil" "$workspace/new.txt"; mv "$root/ezil-saved" "$workspace/.ezil"
+#    b) .git is a file (worktree, separate git dir): .gitignore only, restored by capture.
+gws="$root/gitfile-ws"; mkdir -p "$gws"
+git -C "$gws" init -q --separate-git-dir "$root/gitfile.git"
+ezil_editor_prepare "$root/gitfile-user" "$gws"
+git -C "$gws" clean -fdxq
+[ ! -e "$gws/.ezil" ] || fail "premise: git clean -x kept .ezil (git file)"
+ezil_editor_capture "$root/gitfile-user" "$gws"
+printf '{"kind":0}\n' >"$gws/.ezil/chat/after-capture.jsonl"
+printf 'y\n' >"$gws/new.txt"
+status="$(git -C "$gws" status --porcelain --untracked-files=all)"
+[[ "$status" == *"new.txt"* ]] || fail "positive control: untracked file not listed (git file)"
+[[ "$status" != *".ezil"* ]] || fail "session after capture visible to git (git file): $status"
+! grep -qxF '/.ezil/' "$root/gitfile.git/info/exclude" || fail "followed a .git file"
+#    c) Exclude edge cases: kept when linked, never created, last line kept, links not followed.
+xws="$root/exclude-ws"; mkdir -p "$xws/.git/info"
+ezil_editor_ignore_state "$xws" "$xws/.ezil"
+[ ! -e "$xws/.git/info/exclude" ] || fail "created a missing exclude file"
+printf '*.log' >"$xws/.git/info/exclude"                                   # no final newline
+ezil_editor_ignore_state "$xws" "$xws/.ezil"
+[ "$(sed -n '1p;$p' "$xws/.git/info/exclude" | tr '\n' ' ')" = '*.log /.ezil/ ' ] || fail "user exclude line damaged"
+ezil_editor_ignore_state "$xws" "$root/elsewhere"
+[ -f "$root/elsewhere/.gitignore" ] || fail "positive control: custom state dir not ignored"
+printf 'user\n' >"$root/outside-exclude"
+for linked in exclude info; do
+  lws="$root/link-$linked"; mkdir -p "$lws/.git/info" "$root/outside-info"
+  cp "$root/outside-exclude" "$root/outside-info/exclude"
+  if [ "$linked" = exclude ]; then ln -s "$root/outside-exclude" "$lws/.git/info/exclude"
+  else rmdir "$lws/.git/info"; ln -s "$root/outside-info" "$lws/.git/info"; fi
+  ezil_editor_ignore_state "$lws" "$lws/.ezil"
+  [ -f "$lws/.ezil/.gitignore" ] || fail "positive control: .gitignore missing ($linked link)"
+done
+lws="$root/link-git"; mkdir -p "$lws" "$root/outside-git/info"; cp "$root/outside-exclude" "$root/outside-git/info/exclude"
+ln -s "$root/outside-git" "$lws/.git"
+ezil_editor_ignore_state "$lws" "$lws/.ezil"
+[ "$(cat "$root/outside-exclude")" = user ] && [ "$(cat "$root/outside-info/exclude")" = user ] \
+  && [ "$(cat "$root/outside-git/info/exclude")" = user ] || fail "followed a linked .git, info or exclude"
+sws="$root/state-ws"; mkdir -p "$sws/.git/info"; : >"$sws/.git/info/exclude"
+ezil_editor_ignore_state "$sws" "$root/elsewhere"
+[ ! -s "$sws/.git/info/exclude" ] || fail "excluded /.ezil/ for a state dir outside the workspace"
+
+# 8. Copilot's derived session index is off and its old copy is dropped.
 node - "$cf/Machine/settings.json" <<'JS'
 const assert = require('node:assert/strict');
 const machine = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
@@ -109,4 +171,4 @@ for f in session-store.db session-store.db-wal session-store.db-shm agent-traces
 ezil_editor_prepare "$cf" "$workspace"
 [ ! -e "$store/session-store.db" ] && [ ! -e "$store/session-store.db-wal" ] && [ ! -e "$store/session-store.db-shm" ] || fail "session index copy kept"
 [ -f "$store/agent-traces.db" ] || fail "unrelated extension data removed"
-printf 'Linux chat history folder, profile migration, restart, odd entries, git ignore and Copilot index: passed\n'
+printf 'Linux chat history folder, profile migration, restart, odd entries, git ignore (incl. removal under a running editor) and Copilot index: passed\n'
