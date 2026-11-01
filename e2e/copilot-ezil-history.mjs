@@ -5,7 +5,8 @@
  *   EZIL_E2E_PHASE=verify  after a restart (new container /tmp, same workspace), at a different
  *                          address (new workspace-storage id) and in a new browser profile:
  *                          "Chat history" shows on the empty chat, lists the conversation,
- *                          reopens it, and deleting it removes its file.
+ *                          reopens it, and deleting it removes its file. Then `git clean -X` under
+ *                          the running editor: .ezil stays out of Git, and capture restores its ignore.
  * Exit 2 means not run.
  */
 import { createRequire } from 'node:module';
@@ -120,6 +121,18 @@ try {
       }
       await page.keyboard.press('Escape').catch(() => {});
     }
+    // The create phase ran `git init`, so this launch found a repository at the root. `git clean -X`
+    // removes the ignored .ezil under the running editor, whose next write recreates .ezil/chat
+    // (simulated here; FileService creates missing parents) without .ezil/.gitignore.
+    const exclude = join(FOLDER, '.git', 'info', 'exclude');
+    check('launch added /.ezil/ to the repository\'s local exclude', sh(`grep -qxF /.ezil/ ${quote(exclude)} && echo yes || echo no`).trim() === 'yes');
+    const ezilStatus = () => sh(`cd ${quote(FOLDER)} && git status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
+    sh(`cd ${quote(FOLDER)} && git clean -fdXq && mkdir -p .ezil/chat && echo '{}' > .ezil/chat/after-clean.jsonl && echo x > after-clean.txt`);
+    const status = ezilStatus();
+    check('after git clean -X, a recreated .ezil/chat stays out of Git before any capture (a normal file is listed)',
+      status.some(l => l.includes('after-clean.txt')) && !status.some(l => l.includes('.ezil')), JSON.stringify(status));
+    sh(`bash /usr/local/bin/editor-state.sh capture ${quote(FOLDER)}`);
+    check('the next capture restores .ezil/.gitignore', sh(`tail -n 1 ${quote(join(FOLDER, '.ezil', '.gitignore'))} 2>/dev/null || true`).trim() === '*');
   }
 } catch (e) {
   check('suite completed without an unexpected exception', false, String(e).slice(0, 300));
@@ -130,5 +143,7 @@ try {
 }
 writeFileSync(join(OUT, `history-${PHASE}-checks.json`), JSON.stringify({ codeUrl: CODE_URL, folder: FOLDER, results }, null, 2));
 const failed = results.filter(r => !r.ok);
-console.log(`\n${results.length - failed.length}/${results.length} history checks passed (${PHASE}); artifacts in ${OUT}`);
+const asserted = results.filter(r => !r.info);
+// INFO rows are context, not assertions: count them apart.
+console.log(`\n${asserted.length - failed.length}/${asserted.length} history checks passed, ${results.length - asserted.length} info (${PHASE}); artifacts in ${OUT}`);
 process.exit(failed.length === 0 ? 0 : 1);
