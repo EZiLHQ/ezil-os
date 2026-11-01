@@ -1,7 +1,7 @@
 // Authenticated observations. Durations and balances never advance on the client.
 import trpc from '../trpc.js';
 import session from '../../../session.js';
-import { creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
+import { creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText, AWAITING_PAYMENT_COPY } from '../billing-format.js';
 
 const states = new WeakMap();
 let active = null;
@@ -53,7 +53,9 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : count(period.usedStandardSeconds) && count(period.allowanceStandardSeconds) ? Math.max(0, period.allowanceStandardSeconds - period.usedStandardSeconds) : null;
     const timeLeft = ratio(remainingSeconds, period.allowanceStandardSeconds);
     const timePercent = timeLeft === null ? null : Math.floor(timeLeft);
-    const timeState = timePercent === null ? 'unavailable'
+    // Renewal gap: the period's time is granted once its invoice is paid; pending meanwhile, never used up.
+    const awaitingPayment = summary?.fairUse?.status === 'awaiting_payment';
+    const timeState = awaitingPayment ? 'pending' : timePercent === null ? 'unavailable'
         : summary?.fairUse?.status === 'paused' || remainingSeconds === 0 ? 'danger'
         : summary?.fairUse?.status === 'near' ? 'warn' : 'ok';
     const paused = summary?.fairUse?.status === 'paused' || timeState === 'danger';
@@ -78,7 +80,8 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
     const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
     const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
-    const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
+    const timeNote = awaitingPayment ? esc(AWAITING_PAYMENT_COPY)
+        : period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
@@ -174,7 +177,7 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         ${validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
-        ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
+        ${meter('compute', 'Computer time', awaitingPayment ? 'Pending' : timePercent === null ? 'Not measured' : esc(left), awaitingPayment ? null : timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
         ${meter('ai', 'AI credits', aiValue, aiPercent, `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? split ? ` ${split}.` : '' : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState, aiAction)}
         ${meter('storage', 'Storage', storageValue, storagePercent,

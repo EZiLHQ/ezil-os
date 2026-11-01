@@ -161,6 +161,12 @@ export function heldClosedText (vcpu) {
 }
 
 /**
+ * Renewal gap (summary `fairUse.status: 'awaiting_payment'`): the period's invoice is not paid yet, at a renewal or a first
+ * purchase, the same words on Billing and Usage.
+ */
+export const AWAITING_PAYMENT_COPY = "This period's time is added once your payment goes through.";
+
+/**
  * "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it.
  * Round 6: an equivalent with the current size's vCPU and weight says nothing new, so it is left out
  * (R1-07: "Same as 5 hours at 2 vCPU" under "About 5 hours left at 2 vCPU"). `monthly` (Free: one size,
