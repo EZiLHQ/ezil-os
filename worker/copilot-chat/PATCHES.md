@@ -9,7 +9,7 @@ gates alone). If a code-server bump moves a string, the Docker build fails
 with the offending anchor printed; re-derive it from the new bundle (grep the
 source tree at the matching `microsoft/vscode` tag — the anchors are the
 compiled form of the files named below) and update both the script and this
-table. Only the documented strings, network call sites and visibility filters change: no command id, setting key, contribution point,
+table. Only the documented strings, network call sites, visibility filters and the chat history index (Part 3) change: no command id, setting key, contribution point,
 `product.json` field or LICENSE file is changed. The original work stays
 MIT, Copyright (c) Microsoft Corporation; each patched `.js` gets a one-line
 "Modified at build time by EZiL" notice (see `ATTRIBUTIONS.md`).
@@ -103,8 +103,56 @@ result (Machine layer, both launchers): `github.copilot.chat.backgroundAgent.ena
 / `cloudAgent.enabled: false` (extension's GitHub-only session types),
 `chat.viewSessions.enabled: false` (with BYOK models present the chat view
 otherwise fills its empty state with the in-view "Sessions" list and the
-welcome — where the notice lives — never renders; sessions remain reachable
-from the view's toolbar).
+welcome — where the notice lives — never renders). Upstream, the only other
+way to past chats is the chat title, which rendered only once the open chat
+had a title; Part 3 below makes it render on an empty chat too.
+
+## Part 3 — EZiL Chat history
+
+Facts from the pinned 4.141.0 bundle (`workbench.js`, `server-main.js`):
+
+- Each conversation is a file `<workspaceStorageHome>/<workspace id>/chatSessions/<sessionId>.jsonl`
+  (`.json` is the older flat form, still read). In code-server `workspaceStorageHome` is
+  `vscode-remote:<user-data-dir>/User/workspaceStorage`, so the files are on the computer.
+- The history list comes only from the store's index (storage key `chat.ChatSessionStore.index`,
+  workspace scope). The web workbench keeps workspace scope in browser IndexedDB
+  (`vscode-web-state-db-<workspace id>-<hash of the URL path>`) unless code-server runs with
+  `--enable-remote-storage`. A missing index is the empty index; nothing rebuilds it from the files.
+  So a new browser, a new origin, or a new user-data dir shows no history even when every file exists.
+- The workspace id is `hash("vscode-remote://remote" + folder).toString(16)` (`QUn`/`Nr`/`o0`).
+  The authority is `remote:<x-forwarded-port>` when that header reaches code-server, so the
+  Cloudflare bridge drops it for the code target (the AWS edge drops every `x-forwarded-*`).
+
+`scripts/editor-state.sh` links `chatSessions` for that id to `<workspace>/.ezil/chat` before
+every launch, so the one copy rides on checkpoints, restore and moves (see the script). The
+workbench patches below make the list follow the files.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `history-index` | workbench.js `ChatSessionStore.getIndex`: `async getIndex(){return this.storeQueue.queue(async()=>this.internalGetIndex().entries)}` | On the first read in a window, inside the store queue: list the `chatSessions` directory; drop non-external index entries with neither `.json` nor `.jsonl`; read files missing from the index (newest first, never older than the oldest entry of a full 400-entry index) with the store's own `readSessionFromLocation` and `KSn` metadata, titled like `ChatModel.getDefaultTitle` when there is no custom title; then `trimEntries` and `flushIndex`. A listing error other than not-found changes nothing and is retried on the next read; not-found ends it for the window. Anchor 0, replacement 1. |
+| `history-names` | `KSn`, `sC.getDefaultTitle`, `zSn=400`, `readSessionFromLocation`, `getStorageLocation`, `ba(...)!==1` (not-found) | Checked, never patched: each exact definition occurs once, so the replacement's minified names mean the same thing. |
+| `history-entry` | workbench.js `ChatViewTitleControl.shouldRender(){return!!this.model?.title}` | `shouldRender(){return!0}`: the title, whose click opens the session picker (`workbench.action.chat.pickAgentSession`), also shows on an empty chat. Anchor 0, replacement 1. |
+| `history-label` | workbench.js `static{this.DEFAULT_TITLE=d(12379,null)}` | `static{this.DEFAULT_TITLE="Chat history"}`, the label of that title on an empty chat. Anchor 0, replacement 1. |
+
+`chat.viewSessions.enabled` stays `false`: turning it on hides the welcome (and the notice) and
+its filter menu lists every session-type contribution, including the agent-host Copilot type the
+`target-picker` patch hides. Deleting a chat in the picker runs the store's `deleteSession`, which
+deletes both `<id>.json` and `<id>.jsonl`; through the link that is the workspace file. Export is
+the files in `.ezil/chat`.
+
+Copilot Chat 0.69 also keeps conversation text of its own: `github.copilot.chat.localIndex.enabled`
+(default `true`, tagged `onExp`) writes sessions and turns to
+`User/globalStorage/github.copilot-chat/session-store.db`. The Machine seed turns it off and
+`editor-state.sh` removes that derived copy. Not changed: agent-mode summarisation can write
+`workspaceStorage/<id>/GitHub.copilot-chat/transcripts/<session>.jsonl`, which deleting a chat does
+not remove; the profile keeps it (AWS) or the restart drops it (Cloudflare).
+
+Offline test against the pristine bundle (patches a copy, runs the patched store on real files
+behind the link `editor-state.sh` makes):
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-history-patch.test.cjs
+```
 
 ## R2-D — Gateway status instead of Copilot quota/account surfaces
 
