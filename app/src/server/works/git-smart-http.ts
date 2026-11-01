@@ -3,14 +3,19 @@ import 'server-only';
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
 
+import { ARTIFACTS_REPOSITORY, EZIL_GIT_REPOSITORY, GIT_TOKEN } from './project-repo';
+
 /**
  * A minimal, read-only git client for ONE thing: the files of one branch tip, fetched at depth 1 into memory over
- * git's smart HTTP protocol (v0, stateless RPC), from EZiL Git only. It exists because the app has no git client
- * dependency (`app/node_modules` has no isomorphic-git) and the snapshot fallback (`./repo-snapshot.ts`) must run on
- * the OS server, where the read grant already is, without a computer.
+ * git's smart HTTP protocol (v0, stateless RPC), from a project repository's remote only. It exists because the app
+ * has no git client dependency (`app/node_modules` has no isomorphic-git) and the snapshot fallback
+ * (`./repo-snapshot.ts`) must run on the OS server, where the Git token already is, without a computer.
  *
- * - The grant travels as HTTP Basic in a header, to `https://github.ezil.work` only, with redirects refused. It is
- *   never put in a URL, an error message or a log line.
+ * - The token travels only in the Authorization header, the way the server behind the URL takes it: `Bearer <token>`
+ *   to a Cloudflare Artifacts remote (exactly what EZiL Git's own gateway sends upstream, EZiL CLI
+ *   `apps/git-gateway`), HTTP Basic `<username>:<token>` to EZiL Git (`https://github.ezil.work`). Any other URL is
+ *   refused before a request, redirects are refused, and the token is never put in a URL, an error message or a log
+ *   line.
  * - Every size is capped: the advertisement, the pack, each object, the object count, the tree entries.
  * - SHA-1 repositories only; a thin pack, protocol v2-only server or `object-format=sha256` is `unsupported`.
  *
@@ -18,7 +23,6 @@ import { inflateSync } from 'node:zlib';
  * then one POST of `want <oid> <caps>`, `deepen 1`, flush, `done` to `git-upload-pack`, whose answer is the shallow
  * section, a NAK and the pack (in side-band-64k when offered). The tests run it against `git upload-pack` itself.
  */
-export const EZIL_GIT_ORIGIN = 'https://github.ezil.work';
 
 export interface GitFetchRequest {
     canonicalURL: string;
@@ -303,17 +307,22 @@ export function walkTree(objects: Map<string, { type: number; data: Buffer }>, h
     return entries;
 }
 
-/** The default `RepoFetcher`: one branch tip from EZiL Git, depth 1, in memory. */
+/** The Authorization header for `request`'s remote, or null for a URL that is neither remote. */
+export function gitAuthorization(request: Pick<GitFetchRequest, 'canonicalURL' | 'username' | 'token'>): string | null {
+    if (!GIT_TOKEN.test(request.token)) return null;
+    if (ARTIFACTS_REPOSITORY.test(request.canonicalURL)) return `Bearer ${request.token}`;
+    if (EZIL_GIT_REPOSITORY.test(request.canonicalURL)) return `Basic ${Buffer.from(`${request.username}:${request.token}`, 'utf8').toString('base64')}`;
+    return null;
+}
+
+/** The default `RepoFetcher`: one branch tip from the project's remote, depth 1, in memory. */
 export const fetchRepositoryTree: RepoFetcher = async (request, fetchImpl = fetch) => {
-    let base: URL;
-    try { base = new URL(request.canonicalURL); } catch { return fail('unsupported'); }
-    if (base.origin !== EZIL_GIT_ORIGIN || base.username || base.password || base.search || base.hash || !base.pathname.endsWith('.git')) fail('unsupported');
+    const authorization = gitAuthorization(request);
+    if (authorization === null) return fail('unsupported');
+    const base = new URL(request.canonicalURL);
     if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(request.ref)) fail('unsupported');
     const signal = request.signal ? AbortSignal.any([request.signal, AbortSignal.timeout(TIMEOUT_MS)]) : AbortSignal.timeout(TIMEOUT_MS);
-    const headers = {
-        authorization: `Basic ${Buffer.from(`${request.username}:${request.token}`, 'utf8').toString('base64')}`,
-        'user-agent': 'git/ezil-os-snapshot',
-    };
+    const headers = { authorization, 'user-agent': 'git/ezil-os-snapshot' };
     const call = async (url: string, init: RequestInit, contentType: string, max: number) => {
         let response: Response;
         try { response = await fetchImpl(url, { ...init, redirect: 'error', cache: 'no-store', signal }); }

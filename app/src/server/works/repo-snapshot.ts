@@ -5,8 +5,9 @@ import type { ProjectRepoGrant } from './project-repo';
 
 /**
  * The read-only fallback view of a project repository (os-map-design §5): when the user's computer cannot start,
- * the OS server fetches the branch tip itself with the same Works `open` grant and returns the file tree plus the
- * text of every text file up to 256 KB. The grant never leaves the server: only paths, sizes and file text do.
+ * the OS server fetches the branch tip itself with the same Universe `open` grant and returns the file tree plus the
+ * text of every text file up to 256 KB. The Git token and the remote never leave the server: only paths, sizes and
+ * file text do.
  */
 export const SNAPSHOT_FILE_MAX_BYTES = 256 * 1024;
 export const SNAPSHOT_TEXT_BUDGET_BYTES = 8 * 1024 * 1024;

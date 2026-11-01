@@ -11,11 +11,15 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
 
-import { fetchRepositoryTree, GitFetchError, parseAdvertisement, parseUploadPackResult, readPack, walkTree } from './git-smart-http';
+import { fetchRepositoryTree, gitAuthorization, GitFetchError, parseAdvertisement, parseUploadPackResult, readPack, walkTree } from './git-smart-http';
 
 const hasGit = spawnSync('git', ['--version']).status === 0;
 const TOKEN = `egg_${'7'.repeat(64)}`;
 const URL_ = 'https://github.ezil.work/acme/site.git';
+/** Universe's remote and an opaque Artifacts repo token. */
+const ACCOUNT = '0123456789abcdef'.repeat(2);
+const ARTIFACTS = `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-3333abcd-3333-4333-8333-33333333cdef.git`;
+const ART_TOKEN = 'art_v1_0123456789abcdefABCDEF-_.~+/=';
 let dir: string;
 let repo: string;
 const git = (args: string[], cwd = repo, input?: Buffer) => execFileSync('git', args, { cwd, input, env: { ...process.env,
@@ -24,17 +28,17 @@ const git = (args: string[], cwd = repo, input?: Buffer) => execFileSync('git', 
 const pkt = (s: string) => `${(Buffer.byteLength(s) + 4).toString(16).padStart(4, '0')}${s}`;
 
 /** A fetch that is EZiL Git: info/refs and git-upload-pack served by `git upload-pack --stateless-rpc`. */
-function gitServer(path = repo, { status = 200, contentType }: { status?: number; contentType?: string } = {}) {
+function gitServer(path = repo, { status = 200, contentType, base = URL_ }: { status?: number; contentType?: string; base?: string } = {}) {
     const calls: { url: string; init: RequestInit }[] = [];
     const fetcher = vi.fn(async (input: string | URL, init: RequestInit = {}) => {
         const url = String(input);
         calls.push({ url, init });
         if (status !== 200) return new Response('denied', { status });
-        if (url === `${URL_}/info/refs?service=git-upload-pack` && init.method === 'GET') {
+        if (url === `${base}/info/refs?service=git-upload-pack` && init.method === 'GET') {
             const body = Buffer.concat([Buffer.from(`${pkt('# service=git-upload-pack\n')}0000`), git(['upload-pack', '--stateless-rpc', '--advertise-refs', path], dir)]);
             return new Response(body, { headers: { 'content-type': contentType ?? 'application/x-git-upload-pack-advertisement' } });
         }
-        if (url === `${URL_}/git-upload-pack` && init.method === 'POST') {
+        if (url === `${base}/git-upload-pack` && init.method === 'POST') {
             const body = git(['upload-pack', '--stateless-rpc', path], dir, Buffer.from(init.body as Uint8Array));
             return new Response(body, { headers: { 'content-type': 'application/x-git-upload-pack-result' } });
         }
@@ -98,6 +102,19 @@ describe.skipIf(!hasGit)('fetchRepositoryTree against git upload-pack', () => {
         expect(Buffer.from(calls[1].init.body as Uint8Array).toString()).not.toContain(TOKEN);
     });
 
+    it('🔴 a Cloudflare Artifacts remote gets the token as Bearer, exactly as the git gateway sends it upstream, never Basic or in a URL', async () => {
+        const { fetcher, calls } = gitServer(repo, { base: ARTIFACTS });
+        const tree = await fetchRepositoryTree(request({ canonicalURL: ARTIFACTS, token: ART_TOKEN }), fetcher);
+        expect(tree.head).toBe(git(['rev-parse', 'refs/heads/main']).toString().trim());
+        expect(calls.map(c => c.url)).toEqual([`${ARTIFACTS}/info/refs?service=git-upload-pack`, `${ARTIFACTS}/git-upload-pack`]);
+        for (const { url, init } of calls) {
+            expect(url).not.toContain(ART_TOKEN);
+            expect(init.redirect).toBe('error');
+            expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${ART_TOKEN}`);
+        }
+        expect(Buffer.from(calls[1].init.body as Uint8Array).toString()).not.toContain(ART_TOKEN);
+    });
+
     it('fetches another branch by its ref', async () => {
         const tree = await fetchRepositoryTree(request({ ref: 'refs/heads/other' }), gitServer().fetcher);
         expect(tree.head).toBe(git(['rev-parse', 'refs/heads/other']).toString().trim());
@@ -109,6 +126,16 @@ describe.skipIf(!hasGit)('fetchRepositoryTree against git upload-pack', () => {
         ['credentials in the URL', { canonicalURL: `https://ezil:${TOKEN}@github.ezil.work/acme/site.git` }, 'unsupported'],
         ['a query string', { canonicalURL: `${URL_}?x=1` }, 'unsupported'],
         ['an unsafe ref', { ref: 'HEAD' }, 'unsupported'],
+        ['a 31-hex Artifacts account', { canonicalURL: ARTIFACTS.replace(ACCOUNT, ACCOUNT.slice(1)) }, 'unsupported'],
+        ['an uppercase-hex Artifacts account', { canonicalURL: ARTIFACTS.replace(ACCOUNT, ACCOUNT.toUpperCase()) }, 'unsupported'],
+        ['a lookalike Artifacts host', { canonicalURL: ARTIFACTS.replace('.net/', '.net.evil.test/') }, 'unsupported'],
+        ['userinfo on the Artifacts host', { canonicalURL: ARTIFACTS.replace('https://', 'https://ezil:x@') }, 'unsupported'],
+        ['a port on the Artifacts host', { canonicalURL: ARTIFACTS.replace('.net/', '.net:443/') }, 'unsupported'],
+        ['an Artifacts query', { canonicalURL: `${ARTIFACTS}?x=1` }, 'unsupported'],
+        ['a dot-dot Artifacts name', { canonicalURL: ARTIFACTS.replace('/p-', '/a..p-') }, 'unsupported'],
+        ['a token with a newline (header injection)', { canonicalURL: ARTIFACTS, token: `${ART_TOKEN}\nX-Evil: 1` }, 'unsupported'],
+        ['a token with a space', { canonicalURL: ARTIFACTS, token: 'a b' }, 'unsupported'],
+        ['an empty token', { token: '' }, 'unsupported'],
     ])('refuses %s before any request', async (_name, over, expected) => {
         const { fetcher, calls } = gitServer();
         expect(await code(fetchRepositoryTree(request(over), fetcher))).toBe(expected);
@@ -125,6 +152,15 @@ describe.skipIf(!hasGit)('fetchRepositoryTree against git upload-pack', () => {
         const err = await fetchRepositoryTree(request(), (async () => { throw new Error(TOKEN); }) as unknown as typeof fetch).catch((e: Error) => e);
         expect(err).toBeInstanceOf(GitFetchError);
         expect((err as Error).message).toBe('git_fetch_transport');
+    });
+});
+
+describe('gitAuthorization', () => {
+    it('is Bearer for Artifacts, Basic for EZiL Git, nothing for anything else', () => {
+        expect(gitAuthorization({ canonicalURL: ARTIFACTS, username: 'ezil', token: ART_TOKEN })).toBe(`Bearer ${ART_TOKEN}`);
+        expect(gitAuthorization({ canonicalURL: URL_, username: 'ezil', token: TOKEN })).toBe(`Basic ${Buffer.from(`ezil:${TOKEN}`).toString('base64')}`);
+        expect(gitAuthorization({ canonicalURL: 'https://github.com/acme/site.git', username: 'ezil', token: TOKEN })).toBeNull();
+        expect(gitAuthorization({ canonicalURL: ARTIFACTS, username: 'ezil', token: 'x'.repeat(4097) })).toBeNull();
     });
 });
 
