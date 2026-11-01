@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { isAwsComputersEnabled, type Env } from '@/server/lib/compute/aws-config';
 import { deriveControlKey } from '@/server/lib/compute/aws-enroll';
 import { parseRebaseJson } from '@/server/lib/compute/aws-rebase-json';
-import { RUNNING_CLASS_STATES, type Placement } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementIntegrityError, RUNNING_CLASS_STATES, type Placement } from '@/server/lib/compute/placement';
 import type { StorageSample } from '../ports';
 import { readBillingBody } from './stripe-webhook';
 
@@ -61,7 +61,15 @@ export interface HostStorageDeps {
 }
 
 const answer = (status: number, body: Record<string, unknown>) => Response.json(body, { status, headers: NO_STORE });
-/** One answer for every unauthenticated case, so the endpoint is no oracle for computers or epochs. */
+/**
+ * One answer for every per-computer refusal before the MAC holds: an unknown computer, another provider, a
+ * superseded epoch, a stopping placement, a placement an image job holds or whose row is not a valid
+ * placement, and a bad signature. So the answer never says whether a computer exists, which epoch it is on
+ * or that it is being re-imaged. What still differs before authentication is never about one computer: 404
+ * with AWS computers off, 503 without the secret or with the database down, `storage_signature_stale` for
+ * the header clock, 413/400 for the body. Response time is not equalised: only the current epoch derives a
+ * key before its 401 (an HMAC, microseconds).
+ */
 const unauthenticated = () => answer(401, { error: 'storage_unauthenticated' });
 
 export function storageMacMessage(input: { timestamp: string; computerId: string; generation: number; leaseEpoch: number; body: string }): string {
@@ -96,8 +104,11 @@ export async function handleHostStorageSample(request: Request, deps: HostStorag
     let placement: Placement | null;
     try {
         placement = await deps.placement(computerId);
-    } catch {
-        // A database outage or an image reservation: nothing decided, the host retries (bounded).
+    } catch (error) {
+        // THIS computer's placement cannot be used (an image job holds it, or its row is invalid): the unknown
+        // computer's 401, not a 503 only an existing computer could cause. The next interval tries again.
+        if (error instanceof ImageJobConflictError || error instanceof PlacementIntegrityError) return unauthenticated();
+        // A database outage: nothing decided, the host retries (bounded).
         return answer(503, { error: 'storage_unavailable', retryable: true });
     }
     // The epoch the host names must be this placement's CURRENT aws-ec2 epoch, still holding the

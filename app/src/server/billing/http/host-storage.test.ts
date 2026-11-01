@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 
 import { deriveControlKey } from '@/server/lib/compute/aws-enroll';
-import type { Placement } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementIntegrityError, type Placement } from '@/server/lib/compute/placement';
 import { handleHostStorageSample, storageMacMessage, type HostStorageDeps } from './host-storage';
 
 const SECRET = 'synthetic-app-worker-secret';
@@ -170,6 +170,23 @@ describe('POST /api/compute/aws/storage: host storage samples under the epoch co
         const failing = deps([a], { record: async () => { throw new Error('insert failed'); } });
         expect((await send(signed(a, sampleBody()), failing.d)).status).toBe(503);
         for (const x of [off, unset, down]) expect(x.record).not.toHaveBeenCalled();
+    });
+
+    it('answers a computer whose placement an image job holds, or whose row is invalid, exactly as an unknown computer (no oracle)', async () => {
+        const raw = async (request: Request, d: HostStorageDeps) => {
+            const response = await handleHostStorageSample(request, d);
+            return { status: response.status, cache: response.headers.get('cache-control'), text: await response.text() };
+        };
+        const unknown = await raw(signed(a, sampleBody()), deps([]).d);
+        expect(unknown).toEqual({ status: 401, cache: 'no-store', text: '{"error":"storage_unauthenticated"}' });
+        for (const thrown of [new ImageJobConflictError(), new PlacementIntegrityError('duplicate_placement', A), new PlacementIntegrityError('unknown_state', A)]) {
+            const held = deps([a], { placement: async () => { throw thrown; } });
+            expect(await raw(signed(a, sampleBody()), held.d)).toEqual(unknown);
+            expect(held.record).not.toHaveBeenCalled();
+        }
+        // Positive control: a failure that is not about this computer (the database) stays 503 and retryable.
+        const down = deps([a], { placement: async () => { throw new Error('connection terminated'); } });
+        expect(await send(signed(a, sampleBody()), down.d)).toEqual({ status: 503, body: { error: 'storage_unavailable', retryable: true } });
     });
 
     it('refuses an oversized body before reading any placement', async () => {
