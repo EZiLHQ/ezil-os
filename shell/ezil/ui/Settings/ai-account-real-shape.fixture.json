@@ -1,0 +1,1203 @@
+{
+  "ok": {
+    "enabled": true,
+    "version": 3,
+    "plan": {
+      "sku": "standard_monthly_v3",
+      "name": "Standard",
+      "status": "active",
+      "renewal": null,
+      "cancelsAt": null,
+      "scheduledChange": null,
+      "pendingUpgrade": null,
+      "paymentIssue": null,
+      "graceEndsAt": null,
+      "planEndsAt": null
+    },
+    "computer": {
+      "size": "std-2",
+      "vcpu": 2,
+      "memoryGiB": 8,
+      "sessionMaxSeconds": null,
+      "opening": "standard",
+      "activeDeadline": null,
+      "machineChoice": [
+        {
+          "size": "std-2",
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "weight": 1,
+          "arch": "x86_64",
+          "diskGiB": null
+        }
+      ],
+      "disk": {
+        "provisionedGiB": 50,
+        "usedBytes": null,
+        "growsOnSwitch": false
+      },
+      "standing": "paid",
+      "filesOn": "cloudflare",
+      "heldSince": null,
+      "move": null,
+      "awsSize": null
+    },
+    "ai": {
+      "grant": {
+        "amount": 200,
+        "per": "period"
+      },
+      "balance": 1263.815391,
+      "state": "ok",
+      "enrollment": "enrolled",
+      "waiting": null,
+      "included": {
+        "granted": 200,
+        "remaining": 200,
+        "periodEnd": "2026-11-21T08:04:45Z"
+      },
+      "purchased": null,
+      "starter": {
+        "remaining": 100
+      },
+      "previous": null,
+      "pendingFromRenewal": null,
+      "account": {
+        "userId": "6b1f4c2e-0d6a-4b7e-9c51-2f7a1e9d0a11",
+        "state": "ok",
+        "asOf": "2026-11-01T07:00:00Z",
+        "totalMicro": "1300000000",
+        "remainingMicro": "1263815391",
+        "heldMicro": "17409094",
+        "usedMicro": "18775515",
+        "planBaselineMicro": "200000000",
+        "labelled": true,
+        "grants": [
+          {
+            "kind": "added",
+            "creditsMicro": "1000000000",
+            "remainingMicro": "963815391",
+            "expiresAt": "2026-11-21T07:29:00.000Z"
+          },
+          {
+            "kind": "plan",
+            "creditsMicro": "200000000",
+            "remainingMicro": "200000000",
+            "expiresAt": "2026-11-24T08:04:45.000Z"
+          },
+          {
+            "kind": "starter",
+            "creditsMicro": "100000000",
+            "remainingMicro": "100000000",
+            "expiresAt": "2027-10-21T00:00:00.000Z"
+          }
+        ]
+      },
+      "balanceMicro": "1263815391",
+      "heldMicro": "17409094",
+      "balanceState": "ok",
+      "spendingState": "available",
+      "recentUsage": {
+        "rows": [
+          {
+            "at": "2026-11-01T06:58:12.512Z",
+            "status": "reserved",
+            "heldMicro": "1409094",
+            "chargedMicro": null
+          },
+          {
+            "at": "2026-11-01T06:41:07.104Z",
+            "status": "pending",
+            "heldMicro": "16000000",
+            "chargedMicro": null
+          },
+          {
+            "at": "2026-11-01T06:30:00.000Z",
+            "status": "settled",
+            "heldMicro": "0",
+            "chargedMicro": "220359"
+          }
+        ],
+        "limit": 20,
+        "before": null
+      },
+      "limits": {
+        "policy": {
+          "rpm": null,
+          "tpm": null,
+          "concurrency": null,
+          "maxOutputTokens": null,
+          "dailyBudgetMicro": null,
+          "monthlyBudgetMicro": null,
+          "allowedModels": null
+        },
+        "models": null,
+        "ceilings": null,
+        "counters": null,
+        "pauses": [],
+        "entitlement": {
+          "required": false,
+          "basis": "not_required"
+        }
+      },
+      "usageState": "available",
+      "limitsState": "available"
+    },
+    "fairUse": {
+      "status": "ok",
+      "resetsAt": "2026-11-21T08:04:45Z"
+    },
+    "storage": {
+      "usedBytes": null,
+      "capBytes": "53687091200",
+      "state": "unavailable"
+    },
+    "actions": {
+      "checkout": false,
+      "topup": false,
+      "upgrade": false,
+      "downgrade": false,
+      "cancel": false,
+      "portal": false,
+      "ezilId": null
+    },
+    "catalog": {
+      "version": 3,
+      "offers": [
+        {
+          "sku": "free_v3",
+          "name": "Free",
+          "tagline": "Try EZiL OS and build small projects.",
+          "priceCents": 0,
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "sessionMaxSeconds": 3600,
+          "opening": "standard",
+          "fairUseHours": 8,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "free-cf"
+          ],
+          "aiCredits": {
+            "amount": 100,
+            "per": "once"
+          },
+          "bullets": [
+            "A real desktop in your browser",
+            "VS Code and a browser built in",
+            "2 vCPU · 6 GB computer",
+            "Sessions up to 1 hour"
+          ],
+          "storageGiB": null
+        },
+        {
+          "sku": "standard_monthly_v3",
+          "name": "Standard",
+          "tagline": "For regular work, every day.",
+          "priceCents": 2000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 40,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "std-2"
+          ],
+          "aiCredits": {
+            "amount": 200,
+            "per": "period"
+          },
+          "bullets": [
+            "Your own 2 vCPU · 8 GB computer on AWS (India)",
+            "50 GB disk for your projects",
+            "No session time limit"
+          ],
+          "storageGiB": 50
+        },
+        {
+          "sku": "premium_monthly_v3",
+          "name": "Premium",
+          "tagline": "For bigger projects and long sessions.",
+          "priceCents": 10000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 500,
+          "highlighted": true,
+          "badge": null,
+          "machineChoice": [
+            "std-2",
+            "cmp-4",
+            "cmp-8"
+          ],
+          "aiCredits": {
+            "amount": 1000,
+            "per": "period"
+          },
+          "bullets": [
+            "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
+            "100 GB disk for your projects",
+            "No session time limit",
+            "Bigger sizes count more of your monthly time"
+          ],
+          "storageGiB": 100
+        }
+      ],
+      "packs": [],
+      "customTopup": {
+        "minCents": 1000,
+        "maxCents": 1000000,
+        "centsPerCredit": 10
+      }
+    }
+  },
+  "usageA": {
+    "enabled": true,
+    "version": 1,
+    "asOf": "2026-11-01T07:00:00Z",
+    "session": {
+      "computerId": null,
+      "state": "unavailable",
+      "startedAt": null,
+      "endedAt": null,
+      "observedAt": null,
+      "elapsedSeconds": null
+    },
+    "period": {
+      "startsAt": "2026-10-21T08:04:45Z",
+      "resetsAt": "2026-11-21T08:04:45Z",
+      "usedStandardSeconds": 0,
+      "allowanceStandardSeconds": 144000,
+      "remainingStandardSeconds": 144000,
+      "unit": "standard_seconds",
+      "currentSize": "std-2",
+      "currentWeight": 1,
+      "remainingHoursAtCurrent": 40,
+      "equivalents": [
+        {
+          "size": "std-2",
+          "weight": 1,
+          "hours": 40
+        }
+      ]
+    },
+    "storage": {
+      "state": "unavailable",
+      "capBytes": "53687091200",
+      "disk": {
+        "provisionedGiB": 50,
+        "usedBytes": null,
+        "usedGiB": null,
+        "growsOnSwitch": false
+      },
+      "samples": []
+    },
+    "egress": {
+      "state": "unavailable",
+      "usedBytes": null
+    }
+  },
+  "unproven": {
+    "enabled": true,
+    "version": 3,
+    "plan": {
+      "sku": "standard_monthly_v3",
+      "name": "Standard",
+      "status": "active",
+      "renewal": null,
+      "cancelsAt": null,
+      "scheduledChange": null,
+      "pendingUpgrade": null,
+      "paymentIssue": null,
+      "graceEndsAt": null,
+      "planEndsAt": null
+    },
+    "computer": {
+      "size": "std-2",
+      "vcpu": 2,
+      "memoryGiB": 8,
+      "sessionMaxSeconds": null,
+      "opening": "standard",
+      "activeDeadline": null,
+      "machineChoice": [
+        {
+          "size": "std-2",
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "weight": 1,
+          "arch": "x86_64",
+          "diskGiB": null
+        }
+      ],
+      "disk": {
+        "provisionedGiB": 50,
+        "usedBytes": null,
+        "growsOnSwitch": false
+      },
+      "standing": "paid",
+      "filesOn": "cloudflare",
+      "heldSince": null,
+      "move": null,
+      "awsSize": null
+    },
+    "ai": {
+      "grant": {
+        "amount": 200,
+        "per": "period"
+      },
+      "balance": 1263.815391,
+      "state": "ok",
+      "enrollment": "enrolled",
+      "waiting": null,
+      "included": {
+        "granted": 200,
+        "remaining": 200,
+        "periodEnd": "2026-11-21T08:04:45Z"
+      },
+      "purchased": null,
+      "starter": {
+        "remaining": 100
+      },
+      "previous": null,
+      "pendingFromRenewal": null,
+      "account": {
+        "userId": "6b1f4c2e-0d6a-4b7e-9c51-2f7a1e9d0a11",
+        "state": "ok",
+        "asOf": "2026-11-01T07:00:00Z",
+        "totalMicro": "1300000000",
+        "remainingMicro": "1263815391",
+        "heldMicro": "17409094",
+        "usedMicro": null,
+        "planBaselineMicro": "200000000",
+        "labelled": true,
+        "grants": [
+          {
+            "kind": "added",
+            "creditsMicro": "1000000000",
+            "remainingMicro": "963815391",
+            "expiresAt": "2026-11-21T07:29:00.000Z"
+          },
+          {
+            "kind": "plan",
+            "creditsMicro": "200000000",
+            "remainingMicro": "200000000",
+            "expiresAt": "2026-11-24T08:04:45.000Z"
+          },
+          {
+            "kind": "starter",
+            "creditsMicro": "100000000",
+            "remainingMicro": "100000000",
+            "expiresAt": "2027-10-21T00:00:00.000Z"
+          }
+        ]
+      },
+      "balanceMicro": "1263815391",
+      "heldMicro": "17409094",
+      "balanceState": "ok",
+      "spendingState": "available",
+      "recentUsage": {
+        "rows": [
+          {
+            "at": "2026-11-01T06:30:00.000Z",
+            "status": "settled",
+            "heldMicro": "0",
+            "chargedMicro": "220359"
+          }
+        ],
+        "limit": 20,
+        "before": null
+      },
+      "limits": {
+        "policy": {
+          "rpm": null,
+          "tpm": null,
+          "concurrency": null,
+          "maxOutputTokens": null,
+          "dailyBudgetMicro": null,
+          "monthlyBudgetMicro": null,
+          "allowedModels": null
+        },
+        "models": null,
+        "ceilings": null,
+        "counters": null,
+        "pauses": [],
+        "entitlement": {
+          "required": false,
+          "basis": "not_required"
+        }
+      },
+      "usageState": "available",
+      "limitsState": "available"
+    },
+    "fairUse": {
+      "status": "ok",
+      "resetsAt": "2026-11-21T08:04:45Z"
+    },
+    "storage": {
+      "usedBytes": null,
+      "capBytes": "53687091200",
+      "state": "unavailable"
+    },
+    "actions": {
+      "checkout": false,
+      "topup": false,
+      "upgrade": false,
+      "downgrade": false,
+      "cancel": false,
+      "portal": false,
+      "ezilId": null
+    },
+    "catalog": {
+      "version": 3,
+      "offers": [
+        {
+          "sku": "free_v3",
+          "name": "Free",
+          "tagline": "Try EZiL OS and build small projects.",
+          "priceCents": 0,
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "sessionMaxSeconds": 3600,
+          "opening": "standard",
+          "fairUseHours": 8,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "free-cf"
+          ],
+          "aiCredits": {
+            "amount": 100,
+            "per": "once"
+          },
+          "bullets": [
+            "A real desktop in your browser",
+            "VS Code and a browser built in",
+            "2 vCPU · 6 GB computer",
+            "Sessions up to 1 hour"
+          ],
+          "storageGiB": null
+        },
+        {
+          "sku": "standard_monthly_v3",
+          "name": "Standard",
+          "tagline": "For regular work, every day.",
+          "priceCents": 2000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 40,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "std-2"
+          ],
+          "aiCredits": {
+            "amount": 200,
+            "per": "period"
+          },
+          "bullets": [
+            "Your own 2 vCPU · 8 GB computer on AWS (India)",
+            "50 GB disk for your projects",
+            "No session time limit"
+          ],
+          "storageGiB": 50
+        },
+        {
+          "sku": "premium_monthly_v3",
+          "name": "Premium",
+          "tagline": "For bigger projects and long sessions.",
+          "priceCents": 10000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 500,
+          "highlighted": true,
+          "badge": null,
+          "machineChoice": [
+            "std-2",
+            "cmp-4",
+            "cmp-8"
+          ],
+          "aiCredits": {
+            "amount": 1000,
+            "per": "period"
+          },
+          "bullets": [
+            "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
+            "100 GB disk for your projects",
+            "No session time limit",
+            "Bigger sizes count more of your monthly time"
+          ],
+          "storageGiB": 100
+        }
+      ],
+      "packs": [],
+      "customTopup": {
+        "minCents": 1000,
+        "maxCents": 1000000,
+        "centsPerCredit": 10
+      }
+    }
+  },
+  "unavailable": {
+    "enabled": true,
+    "version": 3,
+    "plan": {
+      "sku": "standard_monthly_v3",
+      "name": "Standard",
+      "status": "active",
+      "renewal": null,
+      "cancelsAt": null,
+      "scheduledChange": null,
+      "pendingUpgrade": null,
+      "paymentIssue": null,
+      "graceEndsAt": null,
+      "planEndsAt": null
+    },
+    "computer": {
+      "size": "std-2",
+      "vcpu": 2,
+      "memoryGiB": 8,
+      "sessionMaxSeconds": null,
+      "opening": "standard",
+      "activeDeadline": null,
+      "machineChoice": [
+        {
+          "size": "std-2",
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "weight": 1,
+          "arch": "x86_64",
+          "diskGiB": null
+        }
+      ],
+      "disk": {
+        "provisionedGiB": 50,
+        "usedBytes": null,
+        "growsOnSwitch": false
+      },
+      "standing": "paid",
+      "filesOn": "cloudflare",
+      "heldSince": null,
+      "move": null,
+      "awsSize": null
+    },
+    "ai": {
+      "grant": {
+        "amount": 200,
+        "per": "period"
+      },
+      "balance": null,
+      "state": "unavailable",
+      "enrollment": "enrolled",
+      "waiting": null,
+      "included": {
+        "granted": 200,
+        "remaining": null,
+        "periodEnd": "2026-11-21T08:04:45Z"
+      },
+      "purchased": null,
+      "starter": null,
+      "previous": null,
+      "pendingFromRenewal": null,
+      "account": {
+        "userId": "6b1f4c2e-0d6a-4b7e-9c51-2f7a1e9d0a11",
+        "state": "unavailable",
+        "asOf": "2026-11-01T07:00:00Z",
+        "totalMicro": null,
+        "remainingMicro": null,
+        "heldMicro": null,
+        "usedMicro": null,
+        "planBaselineMicro": "200000000",
+        "labelled": false,
+        "grants": []
+      },
+      "balanceMicro": null,
+      "heldMicro": null,
+      "balanceState": "unavailable",
+      "spendingState": "unavailable",
+      "recentUsage": null,
+      "limits": null,
+      "usageState": "unavailable",
+      "limitsState": "unavailable"
+    },
+    "fairUse": {
+      "status": "ok",
+      "resetsAt": "2026-11-21T08:04:45Z"
+    },
+    "storage": {
+      "usedBytes": null,
+      "capBytes": "53687091200",
+      "state": "unavailable"
+    },
+    "actions": {
+      "checkout": false,
+      "topup": false,
+      "upgrade": false,
+      "downgrade": false,
+      "cancel": false,
+      "portal": false,
+      "ezilId": null
+    },
+    "catalog": {
+      "version": 3,
+      "offers": [
+        {
+          "sku": "free_v3",
+          "name": "Free",
+          "tagline": "Try EZiL OS and build small projects.",
+          "priceCents": 0,
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "sessionMaxSeconds": 3600,
+          "opening": "standard",
+          "fairUseHours": 8,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "free-cf"
+          ],
+          "aiCredits": {
+            "amount": 100,
+            "per": "once"
+          },
+          "bullets": [
+            "A real desktop in your browser",
+            "VS Code and a browser built in",
+            "2 vCPU · 6 GB computer",
+            "Sessions up to 1 hour"
+          ],
+          "storageGiB": null
+        },
+        {
+          "sku": "standard_monthly_v3",
+          "name": "Standard",
+          "tagline": "For regular work, every day.",
+          "priceCents": 2000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 40,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "std-2"
+          ],
+          "aiCredits": {
+            "amount": 200,
+            "per": "period"
+          },
+          "bullets": [
+            "Your own 2 vCPU · 8 GB computer on AWS (India)",
+            "50 GB disk for your projects",
+            "No session time limit"
+          ],
+          "storageGiB": 50
+        },
+        {
+          "sku": "premium_monthly_v3",
+          "name": "Premium",
+          "tagline": "For bigger projects and long sessions.",
+          "priceCents": 10000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 500,
+          "highlighted": true,
+          "badge": null,
+          "machineChoice": [
+            "std-2",
+            "cmp-4",
+            "cmp-8"
+          ],
+          "aiCredits": {
+            "amount": 1000,
+            "per": "period"
+          },
+          "bullets": [
+            "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
+            "100 GB disk for your projects",
+            "No session time limit",
+            "Bigger sizes count more of your monthly time"
+          ],
+          "storageGiB": 100
+        }
+      ],
+      "packs": [],
+      "customTopup": {
+        "minCents": 1000,
+        "maxCents": 1000000,
+        "centsPerCredit": 10
+      }
+    }
+  },
+  "userB": {
+    "enabled": true,
+    "version": 3,
+    "plan": {
+      "sku": "free_v3",
+      "name": "Free",
+      "status": "free",
+      "renewal": null,
+      "cancelsAt": null,
+      "scheduledChange": null,
+      "pendingUpgrade": null,
+      "paymentIssue": null,
+      "graceEndsAt": null,
+      "planEndsAt": null
+    },
+    "computer": {
+      "size": "free-cf",
+      "vcpu": 2,
+      "memoryGiB": 6,
+      "sessionMaxSeconds": 3600,
+      "opening": "standard",
+      "activeDeadline": null,
+      "machineChoice": [
+        {
+          "size": "free-cf",
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "weight": 1,
+          "arch": "x86_64",
+          "diskGiB": null
+        }
+      ],
+      "disk": {
+        "provisionedGiB": null,
+        "usedBytes": null,
+        "growsOnSwitch": false
+      },
+      "standing": "free",
+      "filesOn": "cloudflare",
+      "heldSince": null,
+      "move": null,
+      "awsSize": null
+    },
+    "ai": {
+      "grant": {
+        "amount": 100,
+        "per": "once"
+      },
+      "balance": 37.25,
+      "state": "ok",
+      "enrollment": "enrolled",
+      "waiting": null,
+      "included": null,
+      "purchased": null,
+      "starter": {
+        "remaining": 37.25
+      },
+      "previous": null,
+      "pendingFromRenewal": null,
+      "account": {
+        "userId": "0c9e7a55-3f2b-4d8e-a6c4-9b1d2e3f4a5b",
+        "state": "ok",
+        "asOf": "2026-11-01T07:00:00Z",
+        "totalMicro": "100000000",
+        "remainingMicro": "37250000",
+        "heldMicro": "0",
+        "usedMicro": "62750000",
+        "planBaselineMicro": "100000000",
+        "labelled": true,
+        "grants": [
+          {
+            "kind": "starter",
+            "creditsMicro": "100000000",
+            "remainingMicro": "37250000",
+            "expiresAt": "2027-10-30T10:00:00.000Z"
+          }
+        ]
+      },
+      "balanceMicro": "37250000",
+      "heldMicro": "0",
+      "balanceState": "ok",
+      "spendingState": "available",
+      "recentUsage": {
+        "rows": [],
+        "limit": 20,
+        "before": null
+      },
+      "limits": {
+        "policy": {
+          "rpm": null,
+          "tpm": null,
+          "concurrency": null,
+          "maxOutputTokens": null,
+          "dailyBudgetMicro": null,
+          "monthlyBudgetMicro": null,
+          "allowedModels": null
+        },
+        "models": null,
+        "ceilings": null,
+        "counters": null,
+        "pauses": [],
+        "entitlement": {
+          "required": false,
+          "basis": "not_required"
+        }
+      },
+      "usageState": "available",
+      "limitsState": "available"
+    },
+    "fairUse": {
+      "status": "ok",
+      "resetsAt": "2026-12-01T00:00:00Z"
+    },
+    "storage": {
+      "usedBytes": null,
+      "capBytes": "0",
+      "state": "unavailable"
+    },
+    "actions": {
+      "checkout": false,
+      "topup": false,
+      "upgrade": false,
+      "downgrade": false,
+      "cancel": false,
+      "portal": false,
+      "ezilId": null
+    },
+    "catalog": {
+      "version": 3,
+      "offers": [
+        {
+          "sku": "free_v3",
+          "name": "Free",
+          "tagline": "Try EZiL OS and build small projects.",
+          "priceCents": 0,
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "sessionMaxSeconds": 3600,
+          "opening": "standard",
+          "fairUseHours": 8,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "free-cf"
+          ],
+          "aiCredits": {
+            "amount": 100,
+            "per": "once"
+          },
+          "bullets": [
+            "A real desktop in your browser",
+            "VS Code and a browser built in",
+            "2 vCPU · 6 GB computer",
+            "Sessions up to 1 hour"
+          ],
+          "storageGiB": null
+        },
+        {
+          "sku": "standard_monthly_v3",
+          "name": "Standard",
+          "tagline": "For regular work, every day.",
+          "priceCents": 2000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 40,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "std-2"
+          ],
+          "aiCredits": {
+            "amount": 200,
+            "per": "period"
+          },
+          "bullets": [
+            "Your own 2 vCPU · 8 GB computer on AWS (India)",
+            "50 GB disk for your projects",
+            "No session time limit"
+          ],
+          "storageGiB": 50
+        },
+        {
+          "sku": "premium_monthly_v3",
+          "name": "Premium",
+          "tagline": "For bigger projects and long sessions.",
+          "priceCents": 10000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 500,
+          "highlighted": true,
+          "badge": null,
+          "machineChoice": [
+            "std-2",
+            "cmp-4",
+            "cmp-8"
+          ],
+          "aiCredits": {
+            "amount": 1000,
+            "per": "period"
+          },
+          "bullets": [
+            "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
+            "100 GB disk for your projects",
+            "No session time limit",
+            "Bigger sizes count more of your monthly time"
+          ],
+          "storageGiB": 100
+        }
+      ],
+      "packs": [],
+      "customTopup": {
+        "minCents": 1000,
+        "maxCents": 1000000,
+        "centsPerCredit": 10
+      }
+    }
+  },
+  "usageB": {
+    "enabled": true,
+    "version": 1,
+    "asOf": "2026-11-01T07:00:00Z",
+    "session": {
+      "computerId": null,
+      "state": "unavailable",
+      "startedAt": null,
+      "endedAt": null,
+      "observedAt": null,
+      "elapsedSeconds": null
+    },
+    "period": {
+      "startsAt": "2026-11-01T00:00:00Z",
+      "resetsAt": "2026-12-01T00:00:00Z",
+      "usedStandardSeconds": 0,
+      "allowanceStandardSeconds": 28800,
+      "remainingStandardSeconds": 28800,
+      "unit": "standard_seconds",
+      "currentSize": "free-cf",
+      "currentWeight": 1,
+      "remainingHoursAtCurrent": 8,
+      "equivalents": [
+        {
+          "size": "free-cf",
+          "weight": 1,
+          "hours": 8
+        }
+      ]
+    },
+    "storage": {
+      "state": "unavailable",
+      "capBytes": null,
+      "disk": {
+        "provisionedGiB": null,
+        "usedBytes": null,
+        "usedGiB": null,
+        "growsOnSwitch": false
+      },
+      "samples": []
+    },
+    "egress": {
+      "state": "unavailable",
+      "usedBytes": null
+    }
+  },
+  "unavailableB": {
+    "enabled": true,
+    "version": 3,
+    "plan": {
+      "sku": "free_v3",
+      "name": "Free",
+      "status": "free",
+      "renewal": null,
+      "cancelsAt": null,
+      "scheduledChange": null,
+      "pendingUpgrade": null,
+      "paymentIssue": null,
+      "graceEndsAt": null,
+      "planEndsAt": null
+    },
+    "computer": {
+      "size": "free-cf",
+      "vcpu": 2,
+      "memoryGiB": 6,
+      "sessionMaxSeconds": 3600,
+      "opening": "standard",
+      "activeDeadline": null,
+      "machineChoice": [
+        {
+          "size": "free-cf",
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "weight": 1,
+          "arch": "x86_64",
+          "diskGiB": null
+        }
+      ],
+      "disk": {
+        "provisionedGiB": null,
+        "usedBytes": null,
+        "growsOnSwitch": false
+      },
+      "standing": "free",
+      "filesOn": "cloudflare",
+      "heldSince": null,
+      "move": null,
+      "awsSize": null
+    },
+    "ai": {
+      "grant": {
+        "amount": 100,
+        "per": "once"
+      },
+      "balance": null,
+      "state": "unavailable",
+      "enrollment": "enrolled",
+      "waiting": null,
+      "included": null,
+      "purchased": null,
+      "starter": null,
+      "previous": null,
+      "pendingFromRenewal": null,
+      "account": {
+        "userId": "0c9e7a55-3f2b-4d8e-a6c4-9b1d2e3f4a5b",
+        "state": "unavailable",
+        "asOf": "2026-11-01T07:00:00Z",
+        "totalMicro": null,
+        "remainingMicro": null,
+        "heldMicro": null,
+        "usedMicro": null,
+        "planBaselineMicro": "100000000",
+        "labelled": false,
+        "grants": []
+      },
+      "balanceMicro": null,
+      "heldMicro": null,
+      "balanceState": "unavailable",
+      "spendingState": "unavailable",
+      "recentUsage": null,
+      "limits": null,
+      "usageState": "unavailable",
+      "limitsState": "unavailable"
+    },
+    "fairUse": {
+      "status": "ok",
+      "resetsAt": "2026-12-01T00:00:00Z"
+    },
+    "storage": {
+      "usedBytes": null,
+      "capBytes": "0",
+      "state": "unavailable"
+    },
+    "actions": {
+      "checkout": false,
+      "topup": false,
+      "upgrade": false,
+      "downgrade": false,
+      "cancel": false,
+      "portal": false,
+      "ezilId": null
+    },
+    "catalog": {
+      "version": 3,
+      "offers": [
+        {
+          "sku": "free_v3",
+          "name": "Free",
+          "tagline": "Try EZiL OS and build small projects.",
+          "priceCents": 0,
+          "vcpu": 2,
+          "memoryGiB": 6,
+          "sessionMaxSeconds": 3600,
+          "opening": "standard",
+          "fairUseHours": 8,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "free-cf"
+          ],
+          "aiCredits": {
+            "amount": 100,
+            "per": "once"
+          },
+          "bullets": [
+            "A real desktop in your browser",
+            "VS Code and a browser built in",
+            "2 vCPU · 6 GB computer",
+            "Sessions up to 1 hour"
+          ],
+          "storageGiB": null
+        },
+        {
+          "sku": "standard_monthly_v3",
+          "name": "Standard",
+          "tagline": "For regular work, every day.",
+          "priceCents": 2000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 40,
+          "highlighted": false,
+          "badge": null,
+          "machineChoice": [
+            "std-2"
+          ],
+          "aiCredits": {
+            "amount": 200,
+            "per": "period"
+          },
+          "bullets": [
+            "Your own 2 vCPU · 8 GB computer on AWS (India)",
+            "50 GB disk for your projects",
+            "No session time limit"
+          ],
+          "storageGiB": 50
+        },
+        {
+          "sku": "premium_monthly_v3",
+          "name": "Premium",
+          "tagline": "For bigger projects and long sessions.",
+          "priceCents": 10000,
+          "vcpu": 2,
+          "memoryGiB": 8,
+          "sessionMaxSeconds": null,
+          "opening": "standard",
+          "fairUseHours": 500,
+          "highlighted": true,
+          "badge": null,
+          "machineChoice": [
+            "std-2",
+            "cmp-4",
+            "cmp-8"
+          ],
+          "aiCredits": {
+            "amount": 1000,
+            "per": "period"
+          },
+          "bullets": [
+            "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
+            "100 GB disk for your projects",
+            "No session time limit",
+            "Bigger sizes count more of your monthly time"
+          ],
+          "storageGiB": 100
+        }
+      ],
+      "packs": [],
+      "customTopup": {
+        "minCents": 1000,
+        "maxCents": 1000000,
+        "centsPerCredit": 10
+      }
+    }
+  },
+  "users": {
+    "a": "6b1f4c2e-0d6a-4b7e-9c51-2f7a1e9d0a11",
+    "b": "0c9e7a55-3f2b-4d8e-a6c4-9b1d2e3f4a5b"
+  }
+}

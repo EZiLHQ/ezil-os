@@ -345,6 +345,7 @@ PORTABLE_SUITES=(
     "shell/ezil/ui/opening-progress-browser-test.mjs"
     "shell/ezil/ui/Settings/appearance-browser-test.mjs"
     "shell/ezil/ui/Settings/billing-layout-browser-test.mjs"
+    "shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs"
     "shell/ezil/ui/feedback-browser-test.mjs"
 )
 
