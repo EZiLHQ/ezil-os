@@ -24,6 +24,13 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_AWS_ARBITRARY": "synthetic"})
 
+    def test_works_project_repo_origin_is_optional(self):
+        # Opening an EZiL Works project in Code (app/src/server/works/project-repo.ts): off unless set.
+        works = {"EZIL_WORKS_PROJECT_REPO_ORIGIN": "https://works.example.invalid"}
+        self.assertEqual(renderer.validate({**self.values, **works}), {**self.values, **works})
+        self.assertIn("EZIL_WORKS_PROJECT_REPO_ORIGIN", renderer.OPTIONAL)
+        self.assertNotIn("EZIL_WORKS_PROJECT_REPO_ORIGIN", renderer.REQUIRED)
+
     def test_feedback_keys_are_optional(self):
         # In-product feedback (docs/feedback-migration.md): off unless set, so
         # every key is optional and none is required for a working app.

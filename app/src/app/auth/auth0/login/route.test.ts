@@ -23,3 +23,17 @@ describe('Auth0 login route', () => {
         expect(set).not.toHaveBeenCalled();
     });
 });
+
+describe('Auth0 login route: silent re-auth', () => {
+    it('passes prompt=none through to Auth0 exactly, and nothing else', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'test-secret');
+        const silent = new URL((await GET(new NextRequest('https://os-staging.ezil.work/auth/auth0/login?prompt=none&returnUrl=/app/code'))).headers.get('location')!);
+        expect(silent.searchParams.get('prompt')).toBe('none');
+        for (const prompt of ['login', 'consent', 'select_account', 'none ', '']) {
+            const url = new URL((await GET(new NextRequest(`https://os-staging.ezil.work/auth/auth0/login?${new URLSearchParams({ prompt })}`))).headers.get('location')!);
+            expect(url.searchParams.has('prompt')).toBe(false);
+        }
+        const plain = new URL((await GET(new NextRequest('https://os-staging.ezil.work/auth/auth0/login'))).headers.get('location')!);
+        expect(plain.searchParams.has('prompt')).toBe(false);
+    });
+});
