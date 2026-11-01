@@ -38,7 +38,10 @@ CODESERVER_SETTINGS_JSON
 # `task.allowAutomaticTasks` is "off" here as well as in the user settings
 # (ezil_editor_enforce_user_policy): a repository opened from a project link
 # (<root>/projects/<id>, worker/src/repo-open.ts) is someone else's code, and
-# its `runOn: folderOpen` tasks must not run on this person's computer.
+# its `runOn: folderOpen` tasks must not run on this person's computer. In
+# code-server 4.141 (VS Code 1.141) the setting is application-scoped, which
+# the Machine layer cannot set, so the user settings are what decide; this
+# copy is kept for an editor that scopes it otherwise.
 seed_codeserver_machine_settings() {
   local dst="$1/Machine/settings.json" temporary
   mkdir -p "$(dirname "$dst")" || return 1
@@ -140,11 +143,13 @@ CODESERVER_CHAT_MODELS_JS
 # prepare, over a restored value or an earlier "Allow" (which writes "on").
 # Edits in place so the user's comments and layout survive: every top-level
 # value of the key becomes "off", or the key is added as the last property.
-# An empty or unreadable file is left exactly as it is (the Machine layer
-# above still says "off"). Known gap: with workspace trust off, a
-# repository's own .vscode/settings.json outranks both layers, and trust
-# cannot be scoped to <root>/projects (trusting the root trusts every folder
-# under it; trusted folders live in the editor's state database, not here).
+# An empty or unreadable file is left exactly as it is (1.141's own default
+# is "off"). In 1.141 the setting is application-scoped (scope 1, outside the
+# workspace and folder scopes), so a repository's .vscode/settings.json cannot
+# turn it back on. A project repository's root-level configuration is inert
+# anyway: repo-open puts the repository one level below the folder Code opens
+# (review F3), out of reach of everything code-server reads from a workspace
+# folder's root (.vscode, .mcp.json, .github/hooks, .claude/settings*.json).
 ezil_editor_enforce_user_policy() {
   local dst="$1/User/settings.json"
   [ -s "$dst" ] || return 0
