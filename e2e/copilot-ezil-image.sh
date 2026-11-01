@@ -13,6 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
+# Passes to run, in order (default all): fresh returning history
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -156,6 +158,11 @@ run_browser() { # run_browser <outdir>
   EZIL_E2E_OUT="$1" node "$here/copilot-ezil.mjs"
 }
 
+run_history() { # run_history <create|verify> <outdir>
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" node "$here/copilot-ezil-history.mjs"
+}
+
 collect_logs() { # collect_logs <prefix>
   local p="$1"
   inx "cat /tmp/copilot-ezil-mock.log" >"$OUT/${p}-mock.log" 2>/dev/null || true
@@ -167,8 +174,9 @@ collect_logs() { # collect_logs <prefix>
 }
 
 # ── Pass 1: fresh user ───────────────────────────────────────────────────────
-echo "[e2e] pass 1 — fresh user, image $IMAGE"
 start_dns_sidecar || exit 1
+if [[ "$PASSES" == *" fresh "* ]]; then
+echo "[e2e] pass 1 — fresh user, image $IMAGE"
 ST1="$WORK/fresh"; WS1="$ST1/home/neko/project"; mkdir -p "$WS1" "$ST1/etc/ezil"
 echo 'hello from the e2e workspace' >"$WS1/README.md"
 printf 'before\n' >"$WS1/existing.txt"
@@ -184,8 +192,10 @@ run_browser "$OUT/fresh" || fail=1
 collect_logs fresh
 network_checks fresh || fail=1
 reset_sink_logs
+fi
 
 # ── Pass 2: returning user ───────────────────────────────────────────────────
+if [[ "$PASSES" == *" returning "* ]]; then
 echo "[e2e] pass 2 — returning user with restored .ezil/ state, a masking User settings.json and a pre-existing BYOK group"
 ST2="$WORK/returning"; WS2="$ST2/home/neko/project"; mkdir -p "$WS2/.ezil" "$ST2/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST2/etc/ezil/models.e2e.json"
@@ -206,6 +216,28 @@ start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
 collect_logs returning
 network_checks returning || fail=1
+reset_sink_logs
+fi
+
+# ── Pass 3: chat history survives a restart (Cloudflare: /tmp is new, the workspace is not) ──
+if [[ "$PASSES" == *" history "* ]]; then
+echo "[e2e] pass 3 — history: chat in a fresh profile, then a new container with the same workspace and a new browser"
+ST3="$WORK/history"; mkdir -p "$ST3/home/neko/project" "$ST3/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST3/etc/ezil/models.e2e.json"
+boot "$ST3"
+start_mock || fail=1
+run_history create "$OUT/history-create" || fail=1
+collect_logs history-create
+network_checks history-create || fail=1
+reset_sink_logs
+ST4="$WORK/history-restart"; mkdir -p "$ST4/home/neko" "$ST4/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST4/etc/ezil/models.e2e.json"
+docker cp "$NAME:/home/neko/project" "$ST4/home/neko/"
+boot "$ST4"
+start_mock || fail=1
+run_history verify "$OUT/history-verify" || fail=1
+collect_logs history-verify
+fi
 
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi
