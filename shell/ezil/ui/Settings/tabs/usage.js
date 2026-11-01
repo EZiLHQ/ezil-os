@@ -269,8 +269,9 @@ function announce(state, body) {
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
 const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
-/** Window focus re-reads the summary (credits after a checkout in another tab) at most this often. */
-const FOCUS_SUMMARY_MS = 30 * 1000;
+/** Window focus re-reads the summary (credits after a checkout in another tab) at most this often: the summary's side
+ * effects (Stripe preview, Gateway reads, free-credit enqueue) keep it at Billing's 5-minute focus rule. */
+const FOCUS_SUMMARY_MS = 5 * 60 * 1000;
 // Every observation, the kept AI balance included, belongs to one user and computer (`scope`): a change of
 // either clears it before anything is shown. Sign-out is a document load, so nothing outlives it either.
 async function load(state, manual = false) {

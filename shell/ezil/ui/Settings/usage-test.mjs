@@ -750,12 +750,15 @@ try {
     success(sample, forUser('user-b', { ...userB, remainingMicro: M('700'), usedMicro: M('100') })); await refresh();
     assert.match(win.text(), /700 credits left of 800/);
     assert.doesNotMatch(win.text(), /Couldn't refresh · as of/);
-    // Focus within 30 s of the last summary: no re-read; after it, one re-read. Reopening the tab always re-reads.
+    // Focus within 5 minutes of the last summary: no re-read; after it, one re-read. Reopening the tab always re-reads.
     const summaries = () => calls.filter(call => call.path === 'billing.summary').length;
     let before = summaries(); success(sample, forUser('user-b', userB));
     dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
     assert.equal(summaries(), before);
-    const realNow = Date.now; Date.now = () => realNow() + 31_000;
+    const realNow = Date.now; Date.now = () => realNow() + 4 * 60_000;
+    try { dom.window.dispatchEvent(new dom.window.Event('focus')); await tick(); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before, 'a focus inside five minutes does not read the summary again');
+    Date.now = () => realNow() + 5 * 60_000 + 1_000;
     try { dom.window.dispatchEvent(new dom.window.Event('focus')); await tick(); } finally { Date.now = realNow; }
     assert.equal(summaries(), before + 1);
     assert.match(win.text(), /777 credits left of 800/);
