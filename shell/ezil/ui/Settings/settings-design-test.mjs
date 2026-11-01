@@ -374,6 +374,23 @@ await check('Billing and Usage: storage is measured in the disk\'s own GiB, so a
     assert.match(clean(section), /3\.4 GB left/);
 });
 
+await check('Billing: an unmeasured AWS disk says "Measuring…"; a computer without a disk figure says it is not measured', () => {
+    const s = billingState('standard'); s.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
+    const row = fragment(summaryV3Html(s)).querySelector('[data-role="meter-storage"]');
+    assert.equal(row.querySelector('.ezil-billing-meter-value').textContent, 'Measuring…');
+    assert.match(clean(row), /50 GB disk for your projects/);
+    assert.equal(row.querySelector('[role="meter"]'), null, 'no bar without a measurement');
+    assert.doesNotMatch(clean(row), /\b0 (MB|GB)\b|used of your|left/);
+    const free = fragment(summaryV3Html(billingState('free'))).querySelector('[data-role="meter-storage"]');
+    assert.match(clean(free), /Space used isn't measured on this computer\./);
+    assert.doesNotMatch(clean(free), /Measuring…|\d+ GB/);
+    // Positive control: measured, the same disk shows a bar, used and left.
+    s.computer.disk.usedBytes = '0';
+    const measured = fragment(summaryV3Html(s)).querySelector('[data-role="meter-storage"]');
+    assert.ok(measured.querySelector('[role="meter"]')); assert.match(clean(measured), /50 GB left/);
+    assert.doesNotMatch(clean(measured), /Measuring…/);
+});
+
 // ── Computer: source module with its imports stubbed (computers-test Part A) ──
 globalThis.__dSession = { currentComputer: () => null, payload: () => null };
 const computersSrc = read('tabs/computers.js')

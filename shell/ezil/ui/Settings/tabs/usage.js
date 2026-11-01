@@ -149,12 +149,14 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 20 ? 'warn' : 'ok';
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     const freePlan = summary?.plan?.sku === 'free_v3';
+    // An AWS disk is measured by its host every 15 minutes: until the first sample it is "Measuring…", never
+    // "0 used". A computer with no disk figure (Cloudflare) has no measurement at all and says so.
     const storageValue = leftBytes !== null ? `${esc(diskBytes(leftBytes))} left`
-        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
+        : diskGB ? 'Measuring…' : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
     const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
         : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
-        : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
+        : freePlan || (storage && storage.capBytes === null) ? `Your files are saved between sessions.${usedBytes === null ? " Space used isn't measured on this computer." : ''}` : '';
     // Round 6 (CR-2): the open session's deadline is said even while its heartbeat is late (the Free hold's
     // 1-hour cut comes with a time). A clock time only within a day of the reading; a paid fair-use
     // deadline weeks away is no time "today".
