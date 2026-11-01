@@ -263,7 +263,7 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
         const seen = []; let sessions = [];
         const P = picker(src); const p = Object.assign(new P(), {
           anchor: undefined, options: undefined,
-          agentSessionsService: { model: { resolve: async type => { seen.push('resolve:' + type); sessions = ['s1']; } } },
+          agentSessionsService: { model: { resolve: async type => { seen.push('resolve:' + type); await new Promise(r => setImmediate(r)); sessions = ['s1']; } } },
           quickInputService: { createQuickPick: () => ({ set items(v) { seen.push('items:' + v.length); }, onDidAccept: () => ({}), onDidTriggerItemButton: () => ({}), onDidHide: () => ({}), show: () => seen.push('show') }) },
           instantiationService: { createInstance: () => ({}) }, createPickerItems: () => sessions.slice(),
         });
