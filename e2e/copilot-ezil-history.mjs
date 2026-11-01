@@ -34,6 +34,9 @@ const results = [];
 const check = (name, ok, detail = '') => { results.push({ name, ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`); };
 const info = (name, detail) => { results.push({ name, ok: true, info: true, detail }); console.log(`INFO  ${name}  — ${detail}`); };
 const sh = command => execFileSync('docker', ['exec', CONTAINER, 'bash', '-c', command], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+// `docker exec` runs as root while the project belongs to the desktop user: Git refuses such a repository
+// ("dubious ownership") unless told to trust it, and a refused status would read as an empty, passing one.
+const GIT = "git -c safe.directory='*'";
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const clean = s => s.replace(/\s+/g, ' ').trim();
 const CHAT = join(FOLDER, '.ezil', 'chat');
@@ -82,7 +85,8 @@ try {
     const copies = profileCopies();
     check('no chat session copy in the editor profile', !copies.some(c => c.includes('/chatSessions/')), JSON.stringify(copies));
     info('other editor-profile files that contain the prompt (Copilot traces/transcripts; not removed by a delete)', JSON.stringify(copies));
-    check('.ezil is ignored by Git', sh(`cd ${quote(FOLDER)} && git init -q 2>/dev/null; git status --porcelain --untracked-files=all | grep -c '^?? .ezil' || true`).trim() === '0');
+    const initStatus = sh(`cd ${quote(FOLDER)} && ${GIT} init -q && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
+    check('.ezil is ignored by Git', !initStatus.some(l => l.includes('.ezil')), JSON.stringify(initStatus.slice(0, 8)));
   } else {
     check('the saved conversation survived the restart', sessionFiles().length === 1, JSON.stringify(sessionFiles()));
     info('browser address (a different host:port than the create phase means a different workspace-storage id)', new URL(CODE_URL).host);
@@ -129,8 +133,8 @@ try {
     // (simulated here; FileService creates missing parents) without .ezil/.gitignore.
     const exclude = join(FOLDER, '.git', 'info', 'exclude');
     check('launch added /.ezil/ to the repository\'s local exclude', sh(`grep -qxF /.ezil/ ${quote(exclude)} && echo yes || echo no`).trim() === 'yes');
-    const ezilStatus = () => sh(`cd ${quote(FOLDER)} && git status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
-    sh(`cd ${quote(FOLDER)} && git clean -fdXq && mkdir -p .ezil/chat && echo '{}' > .ezil/chat/after-clean.jsonl && echo x > after-clean.txt`);
+    const ezilStatus = () => sh(`cd ${quote(FOLDER)} && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
+    sh(`cd ${quote(FOLDER)} && ${GIT} clean -fdXq && mkdir -p .ezil/chat && echo '{}' > .ezil/chat/after-clean.jsonl && echo x > after-clean.txt`);
     const status = ezilStatus();
     check('after git clean -X, a recreated .ezil/chat stays out of Git before any capture (a normal file is listed)',
       status.some(l => l.includes('after-clean.txt')) && !status.some(l => l.includes('.ezil')), JSON.stringify(status));
