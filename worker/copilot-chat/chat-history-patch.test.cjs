@@ -256,6 +256,23 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
       assert(!code.includes('this.title??X2.DEFAULT_TITLE'));
     });
 
+    await t.test('the picker resolves local history before it lists', async () => {
+      const picker = src => new Function('A', 'y6', 'cn', 'd', `return class { ${between(src, 'async pickAgentSession(){', 'createPickerItems(o){')} }`)(
+        class { add(v) { return v; } dispose() {} }, class {}, { Local: 'local' }, () => 'placeholder');
+      const order = async src => {
+        const seen = []; let sessions = [];
+        const P = picker(src); const p = Object.assign(new P(), {
+          anchor: undefined, options: undefined,
+          agentSessionsService: { model: { resolve: async type => { seen.push('resolve:' + type); sessions = ['s1']; } } },
+          quickInputService: { createQuickPick: () => ({ set items(v) { seen.push('items:' + v.length); }, onDidAccept: () => ({}), onDidTriggerItemButton: () => ({}), onDidHide: () => ({}), show: () => seen.push('show') }) },
+          instantiationService: { createInstance: () => ({}) }, createPickerItems: () => sessions.slice(),
+        });
+        await p.pickAgentSession(); return seen;
+      };
+      assert.deepEqual(await order(code), ['resolve:local', 'items:1', 'show']);
+      assert.deepEqual(await order(pristine), ['items:0', 'show'], 'control: upstream listed the unresolved snapshot');
+    });
+
     await t.test('patch and verify reject a moved anchor or a renamed collaborator', () => {
       const fresh = () => { for (const file of files) fs.copyFileSync(path.join(source, file), path.join(root, file)); };
       fresh();
