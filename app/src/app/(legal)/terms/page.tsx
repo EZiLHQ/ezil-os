@@ -94,7 +94,7 @@ const sections: readonly LegalSection[] = [
     {
         id: 'plan-changes-files', title: 'Your files when changing plans',
         content: <>
-            <p>On upgrade, your project files and HOME directory move to the new computer, including dotfiles, SSH keys and git configuration. EZiL Chat conversations are saved in your project folder, in the hidden .ezil/chat folder, and move with your project files. Software installed with apt or npm -g, or in /opt, does not move and must be reinstalled. Running processes stop during the move.</p>
+            <p>On upgrade, your project files and HOME directory move to the new computer, including dotfiles, SSH keys and git configuration. Software installed with apt or npm -g, or in /opt, does not move and must be reinstalled. Running processes stop during the move.</p>
             <p>On downgrade or cancellation at the end of the paid period, your files move back to the Free computer. The paid computer’s disk is kept for 14 days and then deleted. Free storage limits still apply to what is kept.</p>
         </>,
     },
