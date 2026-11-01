@@ -56,6 +56,14 @@ describe('POST /api/compute/aws/storage: host storage samples under the epoch co
     const a = placement(A, OWNER_A);
     const b = placement(B, OWNER_B);
 
+    it('verifies the host agent\'s signature byte for byte (vector shared with infra/host-agent/test/test_storage.py)', () => {
+        const key = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
+        const body = '{"bytes":"1610612736","measuredAt":"2026-11-01T11:59:00Z","reason":"interval"}';
+        expect(body).toBe(sampleBody());
+        const mac = createHmac('sha256', key).update(storageMacMessage({ timestamp: '1793534400', computerId: A.toUpperCase(), generation: 3, leaseEpoch: 7, body })).digest('hex');
+        expect(`v1=${mac}`).toBe('v1=d914aeeec7cf11c04065b5e5d63c86048f5080f25e856bbfc647f0c7b92de40a');
+    });
+
     it('records a validly signed sample for the credential\'s computer and the placement owner (positive control)', async () => {
         const { d, record } = deps([a, b]);
         expect(await send(signed(a, sampleBody()), d)).toEqual({ status: 200, body: { recorded: true } });

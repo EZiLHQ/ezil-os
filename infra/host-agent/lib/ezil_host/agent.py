@@ -5,9 +5,12 @@ Presence and control-plane commands arrive on a root-only unix socket
 key the app returned at enrollment and bound to this lease epoch and a fresh timestamp.
 (The gateway reaches it through the tunnel; that wiring is the gateway lane's.)
 
-This agent NEVER renews its own lease and makes no outbound call: lease renewal is the
-control plane's, from gateway-observed presence (R9). Caps are enforced by the control
-plane regardless of what this agent reports; this agent only:
+This agent NEVER renews its own lease and makes one kind of outbound call only: the storage
+sample (storage.py; every storageSampleSeconds on a daemon thread, and once on stop within
+storageStopBudgetSeconds), signed with the control key. It is metering, best effort: no answer
+or failure changes a lifecycle decision. Lease renewal is the control plane's, from
+gateway-observed presence (R9). Caps are enforced by the control plane regardless of what
+this agent reports; this agent only:
   * idle-stops (guest-initiated, allowed by R9) when the #183 predicate holds:
       A. no presence for idle.inactivitySeconds  (worker isIdleStopDue)
          then, before B: a tmux session or a terminal running a foreground job in the
@@ -58,7 +61,7 @@ import subprocess
 import threading
 import time
 
-from . import canary, desktop, export, guard, terminal_work, tunnel
+from . import canary, desktop, export, guard, storage, terminal_work, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -146,6 +149,7 @@ class Agent:
         self.restart_ids = []
         self._load_restart_requests()
         self.export_thread = None             # the one reverse-move export job (export.Job)
+        self.storage_stop = threading.Event()  # ends the periodic storage sampler (storage.Sampler)
 
     # ---------------------------------------------------------------- control
     def handle(self, raw):
@@ -516,6 +520,9 @@ class Agent:
 
     def shutdown(self, why):
         self.log(f"shutdown: {why}")
+        stop_sampler = getattr(self, "storage_stop", None)
+        if stop_sampler is not None:
+            stop_sampler.set()               # no periodic sample races the quiesce below
         for name in (desktop.STOPPING, SHUTDOWN_PENDING):
             try:
                 self._set_marker(name)       # no desktop may start; a restarted agent resumes
@@ -531,6 +538,8 @@ class Agent:
                          ("record", lambda: self.record_stop(why)),
                          ("overlay", lambda: desktop.overlay_umount(self.cfg)),
                          ("sync", lambda: subprocess.run(["sync"], check=True)),
+                         # Synced, still mounted and stamped: the final size. Bounded, never raises.
+                         ("storage", self._storage_stop_sample),
                          ("stamp", lambda: guard.clear_stamp(self.cfg)),
                          ("data", lambda: subprocess.run(["umount", self.cfg.dataMount], check=True)),
                          ("netns", lambda: desktop.netns_down(self.cfg))):
@@ -541,6 +550,13 @@ class Agent:
                 self.log(f"quiesce step {name} failed: {e}")
         canary.stopped(self.cfg, self.stop_outcome, source="agent", quiesce_ok=quiesce_ok)
         self.power_off()
+
+    def _storage_stop_sample(self):
+        """The stop sample (storage.on_stop): bounded by storageStopBudgetSeconds, and metering
+        only, so nothing here fails the quiesce (an agent without a lease or key skips it)."""
+        lease, key = getattr(self, "lease", None), getattr(self, "key", None)
+        if isinstance(lease, dict) and key:
+            storage.on_stop(self.cfg, lease, key, self.log)
 
     def power_off(self):
         """Run cfg.shutdownCmd until the OS accepts it. A nonzero exit or a failure to run is
@@ -672,6 +688,7 @@ class Agent:
         ev = threading.Event()
         t = threading.Thread(target=self.serve, args=(ev,), daemon=True)
         t.start()
+        self._start_storage_sampler()
         try:
             while True:
                 if self.tick() == "stopped":
@@ -679,6 +696,22 @@ class Agent:
                 time.sleep(self.cfg.idle["intervalSeconds"])
         finally:
             ev.set()
+            self.storage_stop.set()
+
+    def _start_storage_sampler(self):
+        """The periodic storage sample (storage.py) on its own daemon thread. Metering only: a
+        lease without a computer, no app origin or a failure here never stops the agent."""
+        try:
+            sampler = storage.Sampler(self.cfg, self.lease, self.key, self.log)
+            if not sampler.enabled():
+                self.log("storage: sampler off (no computer, app origin or interval)")
+                return None
+            th = threading.Thread(target=sampler.run, args=(self.storage_stop,), name="ezil-storage", daemon=True)
+            th.start()
+            return th
+        except Exception as e:  # noqa: BLE001
+            self.log(f"storage: sampler not started: {type(e).__name__}")
+            return None
 
 
 def client(cfg, key, msg):
