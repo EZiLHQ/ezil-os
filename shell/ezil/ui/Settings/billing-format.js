@@ -110,7 +110,8 @@ const KIND_ORDER = ['plan', 'starter', 'previous', 'purchased', 'added'];
  * Identity credits for Usage and Billing, from `summary.ai.account` only. The headline is whole
  * credits (floor, OS-INTEGRATION-CONTRACT §7): "1,246 credits left of 1,500"; the details are
  * exact to 2 decimals (floored) with every microcredit in `full`. The denominator is the total of
- * the account's live grants, never the catalog. null = no readable balance: say so, show no figure.
+ * the account's live grants, never the catalog, and only when above 0. null = no readable balance:
+ * say so, show no figure.
  * `previous` (the last good block for the same user) stands in when this one is unreadable, with
  * `stale` and its own `asOf`. A block for another user than `userId` is never used.
  */
@@ -141,10 +142,12 @@ export function accountCredits (account, { previous = null, userId = null, planS
         return live.length ? { kind, remaining: creditsLabel(String(live.reduce((sum, grant) => sum + microOf(grant.remainingMicro), 0n))),
             expiresAt: live.map(grant => grant.expiresAt).sort((a, b) => Date.parse(a) - Date.parse(b))[0] } : null;
     }).filter(Boolean);
+    // No live grant (every one expired, or the period's not delivered yet): no "of 0", no bar.
+    const known = total !== null && total > 0n ? total : null;
     return {
         left: creditsLabel(shown.remainingMicro),
-        total: total !== null ? creditsLabel(shown.totalMicro) : null,
-        percent: total !== null && total > 0n ? Number((remaining > total ? total : remaining) * 100n / total) : null,
+        total: known !== null ? creditsLabel(shown.totalMicro) : null,
+        percent: known !== null ? Number((remaining > known ? known : remaining) * 100n / known) : null,
         empty: remaining === 0n,
         details, expiring,
         stale: current === null, asOf: shown.asOf ?? null,

@@ -460,6 +460,32 @@ check('identity credits: unavailable never falls back to the catalog; a kept bal
     assert.doesNotMatch(limited.textContent, /9,000,000|8,000,000|9000000|\b7\b credits/);
     assert.doesNotMatch(rendered(sample, { ...premiumAI(unreadable), ai: { ...premiumAI(unreadable).ai, limits } }).textContent, /9,000,000|8,000,000/);
 });
+check('identity credits: in the payment grace (D17) the period\'s credits wait for the payment; no live grant shows no "of 0" and no bar', () => {
+    // The last period's plan grant still in its tail is the whole total; this period's grant waits for the payment.
+    const tail = { ...worked, totalMicro: M('1000'), remainingMicro: M('640'), heldMicro: '0', usedMicro: M('360'), grants: [
+        { kind: 'previous', creditsMicro: M('1000'), remainingMicro: M('640'), expiresAt: '2026-11-04T00:00:00Z' }] };
+    const none = { ...tail, totalMicro: '0', remainingMicro: '0', usedMicro: '0', grants: [] };
+    const grace = (account, paymentIssue = 'payment_failed') => { const value = premiumAI(account);
+        return { ...value, plan: { ...value.plan, status: 'past_due', paymentIssue },
+            ai: { ...value.ai, included: { granted: 0, remaining: 0, periodEnd: '2026-11-01T00:00:00Z' }, pendingFromRenewal: { credits: 1000, at: '2026-11-01T00:00:00Z' } } }; };
+    const live = rendered(sample, grace(tail));
+    assert.equal(aiValue(live), '640 credits left of 1,000');
+    assert.match(meter(live, 'ai').textContent, /1,000 credits for this period\. Added once your payment goes through\./);
+    assert.doesNotMatch(meter(live, 'ai').textContent, /more from|of 0\b/);
+    const empty = rendered(sample, grace(none));
+    assert.equal(aiValue(empty), '0 credits left');
+    assert.equal(progress(empty, 'ai'), null);
+    assert.equal(meter(empty, 'ai').dataset.state, 'danger');
+    assert.match(meter(empty, 'ai').textContent, /Added once your payment goes through\./);
+    assert.doesNotMatch(meter(empty, 'ai').textContent, /more from|of 0\b/);
+    // Outside the grace a total of 0 has no denominator either.
+    assert.equal(aiValue(rendered(sample, premiumAI(none))), '0 credits left');
+    // Positive control: with no payment issue the renewal is a date again.
+    const paid = rendered(sample, grace(tail, null));
+    assert.match(meter(paid, 'ai').textContent, /1,000 more from/);
+    assert.doesNotMatch(meter(paid, 'ai').textContent, /added once your payment/i);
+    for (const node of [live, empty, paid]) assert.deepEqual(scanCopy(node.textContent), []);
+});
 check('round 6 (CR-2): a stale hold session still says when it ends; a far-off paid deadline shows no clock time', () => {
     const el = rendered(heldUsage, heldSummary);
     assert.match(meter(el, 'session').textContent, new RegExp(`Measuring this session… · ends ${clock('2026-10-30T06:42:00Z')}`));

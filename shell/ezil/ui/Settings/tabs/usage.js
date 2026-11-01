@@ -147,11 +147,15 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
         aiValue = identity === null ? 'Unavailable' : esc(headline);
         aiText = identity === null ? '' : `${headline}.`;
         const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
+        const pending = ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+        // Round 4 D17 (as Billing): in the payment grace this period's plan credits arrive with the payment, never "more from <renewal>".
+        const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
         aiNote = identity === null ? "We couldn't read your balance." : [
             identity.stale ? esc(staleCreditsCopy(identity.asOf)) : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : '',
             accountDetailsHtml(identity.details, esc),
             ...identity.expiring.map(item => `${esc(item.remaining)} ${expiry[item.kind]} · expire ${timestamp(item.expiresAt)}`),
-            ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
+            awaitingPayment ? `${esc(creditsLabel(null, pending.credits))} credits for this period. Added once your payment goes through.`
+                : pending ? `${esc(creditsLabel(null, pending.credits))} more from ${timestamp(pending.at)}` : '',
             identity.stale ? '' : ai?.included && validDate(ai.included.periodEnd) ? `Resets ${timestamp(ai.included.periodEnd)}` : grant?.per === 'period' && grantLabel ? `Your plan adds ${grantLabel} every month` : '',
         ].filter(Boolean).join('<br>');
     }

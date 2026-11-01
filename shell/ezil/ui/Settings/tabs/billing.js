@@ -308,6 +308,8 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
         notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
     const tone = view.empty ? 'danger' : ! view.stale && ai.state === 'low' ? 'warn' : 'ok';
     const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+    // Round 4 D17: in the payment grace this period's plan credits arrive with the payment, never "more from <renewal>".
+    const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
     const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
     const periodEnd = ai.included && Number.isFinite(Date.parse(ai.included.periodEnd ?? '')) ? ai.included.periodEnd : null;
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
@@ -315,7 +317,8 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
             view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
             { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
             ...view.expiring.map(item => `${item.remaining} ${expiry[item.kind]} · expire ${dateLabel(item.expiresAt, true)}`),
-            pending ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
+            awaitingPayment ? `${whole(pending.credits)} credits for this period. Added once your payment goes through.`
+                : pending ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
             // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
             view.stale ? '' : periodEnd ? dateLabel(periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(periodEnd)}.` : ''
                 : ai.grant?.per === 'period' && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? `Your plan adds ${whole(ai.grant.amount)} credits each month.` : '',

@@ -1027,6 +1027,28 @@ try {
         Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
         contains('[data-role="meter-ai"]', '640 of 1,000 left');
         assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/i);
+        // The same grace with identity credits (`ai.account`, which this server always sends): the last period's grant
+        // in its tail is the total, and this period's still waits for the payment. No live grant: no "of 0", no bar.
+        {
+            const M = credits => (BigInt(credits) * 1000000n).toString();
+            const tail = { userId: 'test-user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M(1000), remainingMicro: M(640), heldMicro: '0', usedMicro: M(360),
+                planBaselineMicro: M(1000), labelled: true, grants: [{ kind: 'previous', creditsMicro: M(1000), remainingMicro: M(640), expiresAt: '2026-11-04T00:00:00Z' }] };
+            const none = { ...tail, totalMicro: '0', remainingMicro: '0', usedMicro: '0', grants: [] };
+            const meterAi = () => q('[data-role="meter-ai"]');
+            Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: null, account: tail }); await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '640 credits left of 1,000');
+            contains('[data-role="meter-ai"]', '1,000 credits for this period. Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            summary.ai.account = none; await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '0 credits left');
+            has('[data-role="meter-ai"] [role="meter"]', false);
+            contains('[data-role="meter-ai"]', 'Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            // Positive control: with no payment issue the renewal is a date again.
+            summary.plan.paymentIssue = null; summary.ai.account = tail; await refresh();
+            contains('[data-role="meter-ai"]', '1,000 more from');
+            assert.doesNotMatch(meterAi().textContent, /added once your payment/i);
+        }
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
         Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');
