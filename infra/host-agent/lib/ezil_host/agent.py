@@ -705,7 +705,6 @@ class Agent:
         t = threading.Thread(target=self.serve, args=(ev,), daemon=True)
         t.start()
         self._start_storage_sampler()
-        threading.Thread(target=self.repo_open.startup, name="repo-open-startup", daemon=True).start()
         try:
             while True:
                 if self.tick() == "stopped":

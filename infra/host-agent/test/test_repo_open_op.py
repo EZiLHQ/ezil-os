@@ -295,14 +295,17 @@ class FakeDesktop:
                         "refresh": line({"ok": True, "state": "refreshed"}), "release": line({"ok": True})}
         self.outputs.update(outputs or {})
         self.fail, self.before = fail, before
-        self.calls, self.deadlines, self.tags = [], [], set()
+        self.calls, self.deadlines, self.cleanups, self.tags = [], [], [], set()
 
-    def exec_(self, cfg, argv, deadline, data=None, limit=ro.STDOUT_MAX, tag=None, cgroup_root=None, clock=None):
+    def exec_(self, cfg, argv, deadline, data=None, limit=ro.STDOUT_MAX, tag=None, cgroup_root=None, clock=None,
+              cleanup_by=None):
         assert isinstance(argv, list) and ro.TAG_RE.match(tag) and cgroup_root == "/fake/cgroup"
+        assert cleanup_by is not None and cleanup_by >= deadline, "every job exec bounds its own cleanup"
         if self.before:
             self.before(argv)
         self.calls.append((list(argv), data))
         self.deadlines.append(deadline)
+        self.cleanups.append(cleanup_by)
         self.tags.add(tag)
         if self.fail:
             out = self.fail(argv)
@@ -333,21 +336,33 @@ class JobBase(unittest.TestCase):
         self.logs = []
         self.a = agentmod.Agent(self.cfg, dict(LEASE), log=self.logs.append)
         self.runner = self.a.repo_open
-        self.runner.busy = False          # as after startup() confirmed a clear host
+        self.assertFalse(self.runner.busy, "nothing holds the slot at agent start")
         self.seq = 0
         self.stamp()
         self.probe = ("running", 4242)
+        self.slow_probe = None            # callable(timeout): a slow or hung runc state
+        self.probe_calls = []             # (monotonic time of the call, its timeout)
         for target, value in (("reap_cgroups", mock.Mock(return_value=0)),
-                              ("desktop_probe", lambda cfg, timeout=10.0: self._probe()),
+                              ("desktop_probe", lambda cfg, timeout=10.0: self._probe(timeout)),
                               ("cgroup_root_of", lambda pid: "/fake/cgroup")):
             p = mock.patch.object(ro, target, value)
             p.start()
             self.addCleanup(p.stop)
 
-    def _probe(self):
-        if self.probe is None:
+    def _probe(self, timeout):
+        """self.probe: (status, pid); None = no container; an exception = runc state failed; a
+        list = one answer per probe, the last one repeating."""
+        self.probe_calls.append((time.monotonic(), timeout))
+        if self.slow_probe:
+            self.slow_probe(timeout)
+        p = self.probe
+        if isinstance(p, list):
+            p = p.pop(0) if len(p) > 1 else p[0]
+        if p is None:
             raise ro.ContainerAbsent()
-        return self.probe
+        if isinstance(p, BaseException):
+            raise p
+        return p
 
     def stamp(self, **over):
         with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
@@ -451,6 +466,16 @@ class Job(JobBase):
         self.assertLessEqual(prepare_deadline, admitted_mono + (ro.HOST_DEADLINE_MS - ro.PREPARE_RESERVE_MS) / 1000 + 1)
         self.assertLessEqual(max(fake.deadlines[:10]), admitted_mono + ro.HOST_DEADLINE_MS / 1000 + 1)
         self.assertEqual(fake.tags, {JOB[:16]})
+        # every exec's own cleanup is bounded: setup, prepare and commit by the job deadline,
+        # release by the deadline plus RELEASE_GRACE; every runc state by the time left
+        job_deadline = fake.cleanups[0]
+        self.assertAlmostEqual(job_deadline, admitted_mono + ro.HOST_DEADLINE_MS / 1000, delta=1)
+        self.assertEqual(fake.cleanups[:9], [job_deadline] * 9)
+        self.assertEqual(fake.cleanups[9:], [job_deadline + ro.RELEASE_GRACE_MS / 1000] * 2)
+        self.assertEqual(len(self.probe_calls), 13, "step 3, one per exec, and the re-check after prepare")
+        for at, timeout in self.probe_calls:
+            self.assertLessEqual(timeout, ro.PROBE_MAX_S)
+            self.assertLessEqual(at + timeout, job_deadline + ro.RELEASE_GRACE_MS / 1000 + ro.PROBE_MIN_S)
         self.assert_no_secret_anywhere(fake, result)
         self.assertIn("repo_open op=open outcome=ok", self.logs)
 
@@ -571,6 +596,111 @@ class Job(JobBase):
         fake = FakeDesktop(before=before)
         self.assertEqual(self.run_job(fake), ro.refusal("runtime_not_running"))
         self.assertEqual(len(fake.calls), 4, "the incoming write was the last exec")
+
+    # ------------------------------------------------ the re-check after prepare (vectors postPrepareRecheck)
+    def test_a_restart_requested_during_prepare_is_busy_and_release_still_runs(self):
+        """vectors workerExec.postPrepareRecheck.transition: a transition in flight while the
+        desktop still runs is workspace_busy, NOT runtime_not_running, and release still runs
+        (here the restart is over by the time release's own check runs)."""
+        fake = FakeDesktop()
+        seen = {"held": 0}
+
+        def transition():
+            if fake.phases() == ["prepare"] and seen["held"] == 0:
+                seen["held"] += 1
+                return True                  # seen by the re-check after prepare only
+            return False
+        with mock.patch.object(self.runner, "transition", side_effect=transition):
+            self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"))
+        self.assertEqual(seen["held"], 1)
+        self.assertEqual(fake.phases(), ["prepare", "release"], "no commit; release runs")
+
+    def test_a_restart_still_pending_at_release_skips_release_and_its_fallback(self):
+        """The agent's own restart flag, set while prepare runs and never cleared: busy after
+        prepare, and release's own check refuses it (and so the fallback too): no exec at all."""
+        for flag in ("restart_request", "restart_in_progress"):
+            self.setUp()
+
+            def before(argv, flag=flag):
+                if argv[:3] == ["node", ro.KERNEL_PATH, "prepare"]:
+                    setattr(self.a, flag, True)
+            fake = FakeDesktop(before=before)
+            self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"), flag)
+            self.assertEqual(fake.argvs()[-1][:3], ["node", ro.KERNEL_PATH, "prepare"], "nothing after prepare")
+
+    def test_an_uncertain_check_after_prepare_is_busy_and_release_runs_once_it_clears(self):
+        def before(argv):
+            if argv[:3] == ["node", ro.KERNEL_PATH, "prepare"]:
+                self.probe = [OSError("desktop_state_timeout"), ("running", 4242)]
+        fake = FakeDesktop(before=before)
+        self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"))
+        self.assertEqual(fake.phases(), ["prepare", "release"])
+
+    def test_a_restart_requested_during_setup_is_not_running_and_nothing_more_runs(self):
+        """§8.1 for every check but the one after prepare: a transition is runtime_not_running;
+        release's own check (still held) refuses release and its fallback."""
+        def before(argv):
+            if argv[:3] == ["/bin/sh", "-c", ro.WRITE_PROGRAM] and argv[4].startswith("/run/ezil/bin/.ezil-git-grant."):
+                self.a.restart_request = True
+        fake = FakeDesktop(before=before)
+        self.assertEqual(self.run_job(fake), ro.refusal("runtime_not_running"))
+        self.assertEqual(len(fake.calls), 3, "the helper write was the last exec")
+
+    def test_uncertain_host_checks_answer_busy_and_run_nothing(self):
+        """Host only (no Cloudflare equivalent): when runc state fails or times out, the stamp
+        cannot be read, or the cgroup cannot be found, nothing runs and the answer is
+        workspace_busy, so the caller retries (a refresh keeps refreshing instead of going quiet)."""
+        self.probe = OSError("desktop_state_timeout")
+        fake = FakeDesktop()
+        self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"), "at the start")
+        self.assertEqual(fake.calls, [])
+
+        self.setUp()
+
+        def before(argv):
+            if argv[:3] == ["/bin/sh", "-c", ro.INSTALL_PROGRAM]:
+                self.probe = OSError("desktop_state_unavailable")
+        fake = FakeDesktop(before=before)
+        self.assertEqual(self.run_job(fake, op="refresh"), ro.refusal("workspace_busy"), "before the refresh exec")
+        self.assertEqual(fake.phases(), [])
+        self.assertEqual(fake.argvs()[-1][:3], ["/bin/sh", "-c", ro.INSTALL_PROGRAM], "no release, no fallback")
+
+        self.setUp()
+
+        def corrupt(argv):
+            if argv[:3] == ["node", ro.KERNEL_PATH, "prepare"]:
+                with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
+                    f.write("{not json")
+        fake = FakeDesktop(before=corrupt)
+        self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"), "an unreadable stamp mid-job")
+        self.assertEqual(fake.phases(), ["prepare"])
+
+        self.setUp()
+        with mock.patch.object(ro, "cgroup_root_of", side_effect=OSError("desktop_cgroup_unavailable")):
+            fake = FakeDesktop()
+            self.assertEqual(self.run_job(fake), ro.refusal("workspace_busy"), "no cgroup")
+        self.assertEqual(fake.calls, [])
+
+    def test_an_export_state_that_cannot_be_read_blocks_every_exec(self):
+        """Fail closed on an unexpected export.pending failure (the EXPORT_QUIESCE marker is the
+        primary guarantee; export.pending itself answers False for an unreadable record)."""
+        with mock.patch.object(ro.export, "pending", side_effect=OSError("EIO")):
+            fake = FakeDesktop()
+            self.assertEqual(self.run_job(fake), ro.refusal("runtime_not_running"))
+        self.assertEqual(fake.calls, [])
+
+        self.setUp()
+        broken = {"now": False}
+
+        def pending(cfg):
+            if broken["now"]:
+                raise ValueError("export record")
+            return False
+        fake = FakeDesktop(before=lambda argv: broken.update(now=True) if argv[:3] == ["node", ro.KERNEL_PATH, "prepare"]
+                           else None)
+        with mock.patch.object(ro.export, "pending", side_effect=pending):
+            self.assertEqual(self.run_job(fake), ro.refusal("runtime_not_running"))
+        self.assertEqual(fake.phases(), ["prepare"], "no commit and no release")
 
     # ------------------------------------------------ time, failures, release
     def test_prepare_timeout_is_busy_and_release_still_runs(self):
@@ -710,15 +840,38 @@ class Job(JobBase):
         self.assertEqual(self.runner.jobs, {})
         self.assertFalse(self.runner.busy)
 
-    def test_the_slot_is_busy_from_agent_start_until_the_startup_reap_is_clear(self):
+    def test_agent_start_runs_nothing_and_the_first_job_pre_clears_before_any_exec(self):
+        """Inert at agent start (no thread, no runc call); the first job's pre-clear kills and
+        confirms an earlier agent process's leftovers before its first exec."""
         a = agentmod.Agent(self.cfg, dict(LEASE), log=self.logs.append)
-        self.assertTrue(a.repo_open.busy)
-        self.assertEqual(a.repo_open.start(JOB, body()), {"ok": False, "error": "workspace_busy"})
-        results = iter([2, 1, 0])
-        with mock.patch.object(ro, "reap_cgroups", side_effect=lambda cfg: next(results)), \
-                mock.patch.object(ro, "REAP_RETRY_SECONDS", 0.01):
-            a.repo_open.startup()
         self.assertFalse(a.repo_open.busy)
+        self.assertFalse(hasattr(a.repo_open, "startup"))
+        targets = []
+
+        class Recorder:
+            def __init__(self, *args, target=None, **kw):
+                targets.append(target)
+
+            def start(self):
+                pass
+        with mock.patch.object(agentmod.threading, "Thread", Recorder), mock.patch.object(a, "tick", return_value="stopped"), \
+                mock.patch.object(agentmod.export, "pending", return_value=False), \
+                mock.patch.object(ro, "desktop_probe", side_effect=AssertionError("no runc call at agent start")):
+            a.run()
+        self.assertEqual(targets, [a.serve], "the agent starts only its control server")
+
+        self.a, self.runner = a, a.repo_open
+        order = []
+        results = iter([2, 1, 0])
+
+        def reap(cfg, timeout=None):
+            left = next(results, 0)
+            order.append(("reap", left))
+            return left
+        fake = FakeDesktop(before=lambda argv: order.append(("exec", argv[0])))
+        with mock.patch.object(ro, "reap_cgroups", side_effect=reap):
+            self.assertEqual(self.run_job(fake), {"status": 200, "body": OPEN_OK})
+        self.assertEqual(order[:4], [("reap", 2), ("reap", 1), ("reap", 0), ("exec", "install")])
 
     def test_a_message_for_another_epoch_is_refused(self):
         self.seq += 1
@@ -760,10 +913,10 @@ class Job(JobBase):
         self.run_job(FakeDesktop())
         self.assertFalse(self.runner.busy)
 
-    def test_unconfirmed_cleanup_publishes_the_failure_and_stays_busy_until_reaped(self):
+    def test_unconfirmed_cleanup_publishes_the_steps_answer_and_stays_busy_until_reaped(self):
         remaining = {"n": 3, "calls": 0}
 
-        def reap(cfg):
+        def reap(cfg, timeout=None):
             remaining["calls"] += 1
             if remaining["calls"] == 1:
                 return 0                       # the pre-job clear: nothing left from before
@@ -772,17 +925,59 @@ class Job(JobBase):
         fake = FakeDesktop({"prepare": ro.CleanupPending()})
         with mock.patch.object(ro, "reap_cgroups", side_effect=reap), mock.patch.object(ro, "REAP_RETRY_SECONDS", 0.01):
             result = self.run_job(fake)
-        self.assertEqual(result, ro.refusal("workspace_failed"))
+        self.assertEqual(result, ro.refusal("workspace_busy"), "prepare's outcome is unknown: retryable")
+        self.assertEqual(fake.phases(), ["prepare"], "an unconfirmed cleanup ends the job: no further exec")
         self.assertEqual(remaining["n"], 0, "idle only once the reaper confirmed a clear host")
-        self.assertIn("repo_open op=open outcome=cleanup_pending", self.logs)
+        self.assertIn("repo_open op=open outcome=workspace_busy cleanup=pending", self.logs)
+
+    def test_unconfirmed_cleanup_codes_are_the_timeout_codes(self):
+        by_step = dict(V["workerExec"]["timeoutErrorByStep"])
+        self.assertEqual(by_step.pop("release"), "fallback")
+        self.assertEqual(ro.UNCONFIRMED_ERROR_BY_STEP, by_step)
+
+    def test_unconfirmed_cleanup_after_the_answer_publishes_the_answer(self):
+        """A computed answer (a successful commit included) is never discarded because release's
+        cleanup could not be confirmed; before the answer exists, the step's timeout code."""
+        cases = [
+            ("open", FakeDesktop({"release": ro.CleanupPending()}), {"status": 200, "body": OPEN_OK},
+             ["prepare", "commit", "release"]),
+            ("open", FakeDesktop({"prepare": line({"ok": False, "errorCode": "folder_conflict"}),
+                                  "release": ro.CleanupPending()}), ro.refusal("folder_conflict"), ["prepare", "release"]),
+            ("open", FakeDesktop({"commit": ro.CleanupPending()}), ro.refusal("workspace_busy"), ["prepare", "commit"]),
+            ("open", FakeDesktop(fail=lambda argv: ro.CleanupPending() if argv[0] == "install" else None),
+             ro.refusal("workspace_failed"), []),
+            ("refresh", FakeDesktop({"refresh": ro.CleanupPending()}), ro.refusal("workspace_failed"), ["refresh"]),
+            ("refresh", FakeDesktop({"release": ro.CleanupPending()}), {"status": 200, "body": {"ok": True, "state": "refreshed"}},
+             ["refresh", "release"]),
+            # the sanitizer still applies on this path
+            ("open", FakeDesktop({"commit": OTHER_GRANT.encode() + b"\n" + line(OPEN_OK), "release": ro.CleanupPending()}),
+             ro.refusal("workspace_failed"), ["prepare", "commit", "release"]),
+        ]
+        for op, fake, want, phases in cases:
+            self.setUp()
+            self.assertEqual(self.run_job(fake, op=op), want, (op, phases))
+            self.assertEqual(fake.phases(), phases)
+            self.assertFalse(any(a[:3] == ["/bin/sh", "-c", ro.FALLBACK_PROGRAM] for a in fake.argvs()), "no fallback")
+            self.assertTrue(any(entry.endswith("cleanup=pending") for entry in self.logs))
+            self.assert_no_secret_anywhere(fake, want)
 
     def test_leftovers_that_cannot_be_cleared_refuse_new_work(self):
         fake = FakeDesktop()
         clears = iter([False, True])
         with mock.patch.object(self.runner, "_clear", side_effect=lambda deadline=None: next(clears)):
             result = self.run_job(fake)
-        self.assertEqual(result, ro.refusal("workspace_failed"))
+        self.assertEqual(result, ro.refusal("workspace_busy"), "retryable: the slot frees once the reaper confirms")
         self.assertEqual(fake.calls, [], "nothing ran beside an uncleared leftover")
+        self.assertIn("repo_open op=open outcome=workspace_busy cleanup=pending", self.logs)
+
+    def test_an_unconfirmed_cleanup_is_retried_with_backoff(self):
+        waits = []
+        left = iter([1, 1, 1, 1, 0])
+        with mock.patch.object(ro, "reap_cgroups", side_effect=lambda cfg, timeout=None: next(left)), \
+                mock.patch.object(self.runner, "sleep", side_effect=waits.append):
+            self.assertTrue(self.runner._clear())
+        self.assertEqual(waits, [ro.REAP_RETRY_SECONDS, min(2 * ro.REAP_RETRY_SECONDS, ro.REAP_RETRY_MAX_SECONDS),
+                                 min(4 * ro.REAP_RETRY_SECONDS, ro.REAP_RETRY_MAX_SECONDS), ro.REAP_RETRY_MAX_SECONDS])
 
     def test_the_agent_answers_on_the_control_path_without_waiting_for_the_job(self):
         gate = threading.Event()
@@ -797,11 +992,106 @@ class Job(JobBase):
             self.wait_idle()
 
 
+class TimingChain(JobBase):
+    """The result is published by HOST_DEADLINE + RELEASE_GRACE even when runc state hangs, the
+    kernel works to the end of every window, or a drain never confirms. The job's own windows are
+    scaled down 50x; PROBE_MAX_S, KILL_WAIT_S and DRAIN_CAP stay full size, so any runc state or
+    cleanup that is not cut to the time left overshoots by seconds, not milliseconds. The fake
+    exec honours `cleanup_by` exactly as bounded_runc_exec does (BoundedExec proves that half)."""
+    SCALE = 50
+    TOLERANCE = 0.5
+
+    def setUp(self):
+        super().setUp()
+        for name in ("HOST_DEADLINE_MS", "RELEASE_GRACE_MS", "PREPARE_WINDOW_MS", "PREPARE_RESERVE_MS",
+                     "COMMIT_MIN_REMAINING_MS", "COMMIT_EXEC_MAX_MS", "SHORT_EXEC_MS"):
+            p = mock.patch.object(ro, name, getattr(ro, name) / self.SCALE)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ro, "PROBE_MIN_S", 0.002)
+        p.start()
+        self.addCleanup(p.stop)
+        self.budget = (ro.HOST_DEADLINE_MS + ro.RELEASE_GRACE_MS) / 1000
+
+    def slow_exec(self, fake, work=lambda argv, left: 0.0, hang_drain=()):
+        def exec_(cfg, argv, deadline, data=None, limit=ro.STDOUT_MAX, tag=None, cgroup_root=None, clock=None,
+                  cleanup_by=None):
+            answer = fake.exec_(cfg, argv, deadline, data, limit, tag, cgroup_root, clock, cleanup_by)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ro.ExecLimit(True)
+            time.sleep(max(0.0, min(work(argv, left), left)))
+            step = argv[2] if argv[:2] == ["node", ro.KERNEL_PATH] else argv[0]
+            if step in hang_drain:
+                give_up = cleanup_by if cleanup_by is not None else time.monotonic() + ro.KILL_WAIT_S + ro.DRAIN_CAP
+                time.sleep(max(0.0, give_up - time.monotonic()))
+                raise ro.CleanupPending()
+            return answer
+        return exec_
+
+    def timed(self, exec_, **over):
+        started, started_mono = time.time(), time.monotonic()
+        with mock.patch.object(ro, "bounded_runc_exec", exec_):
+            self.assertEqual(self.send("repo_open", request=relayed(**over)), {"ok": True, "state": "running"})
+            st = self.wait_done()
+            elapsed = self.runner.jobs[JOB]["at"] - started
+            self.wait_idle()
+        for at, timeout in self.probe_calls:
+            self.assertLessEqual(at + timeout - started_mono, self.budget + ro.PROBE_MIN_S + 0.25,
+                                 "every runc state ends by the publication bound")
+        self.assertLessEqual(elapsed, self.budget + self.TOLERANCE, f"published {elapsed:.2f}s after admission")
+        return st["result"], elapsed
+
+    def hang(self, timeout):
+        time.sleep(timeout)
+
+    def test_a_hung_runc_state_at_the_start_answers_busy_by_the_deadline(self):
+        self.slow_probe, self.probe = self.hang, OSError("desktop_state_timeout")
+        fake = FakeDesktop()
+        result, elapsed = self.timed(self.slow_exec(fake))
+        self.assertEqual(result, ro.refusal("workspace_busy"))
+        self.assertEqual(fake.calls, [])
+        self.assertLessEqual(elapsed, ro.HOST_DEADLINE_MS / 1000 + self.TOLERANCE)
+
+    def test_a_hung_check_after_a_full_prepare_and_at_release_still_publishes_in_time(self):
+        fake = FakeDesktop()
+
+        def work(argv, left):
+            if argv[:3] == ["node", ro.KERNEL_PATH, "prepare"]:
+                self.slow_probe, self.probe = self.hang, OSError("desktop_state_timeout")
+                return left - 0.005          # prepare works to the end of its window
+            return 0.0
+        result, _ = self.timed(self.slow_exec(fake, work))
+        self.assertEqual(result, ro.refusal("workspace_busy"))
+        self.assertEqual(fake.phases(), ["prepare"], "release's own check could not complete either")
+
+    def test_kernels_working_to_the_end_of_every_window_still_publish_in_time(self):
+        fake = FakeDesktop()
+        result, _ = self.timed(self.slow_exec(
+            fake, lambda argv, left: left - 0.005 if argv[:2] == ["node", ro.KERNEL_PATH] else 0.01))
+        self.assertEqual(result, {"status": 200, "body": OPEN_OK})
+        self.assertEqual(fake.phases(), ["prepare", "commit", "release"])
+
+    def test_a_drain_that_never_confirms_after_commit_publishes_the_commit_answer_in_time(self):
+        fake = FakeDesktop()
+        result, _ = self.timed(self.slow_exec(fake, hang_drain=("release",)))
+        self.assertEqual(result, {"status": 200, "body": OPEN_OK})
+        self.assertIn("repo_open op=open outcome=ok cleanup=pending", self.logs)
+
+    def test_a_drain_that_never_confirms_after_prepare_answers_busy_by_the_deadline(self):
+        fake = FakeDesktop()
+        result, elapsed = self.timed(self.slow_exec(fake, hang_drain=("prepare",)))
+        self.assertEqual(result, ro.refusal("workspace_busy"))
+        self.assertLessEqual(elapsed, ro.HOST_DEADLINE_MS / 1000 + self.TOLERANCE)
+
+
 # ─────────────────────────────────────────────────────────────────────────── real cgroup v2
 STUB_RUNC = """#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 ROOT = {root!r}
 a = sys.argv[1:]
+with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "runc-argv.json"), "w") as f:
+    json.dump(a, f)                          # what the agent asked runc for
 i = a.index("--cgroup")
 name, rest = a[i + 1], a[i + 2:]          # <containerId> <argv...>
 with open(os.path.join(ROOT, name, "cgroup.procs"), "w") as f:
@@ -857,6 +1147,46 @@ class BoundedExec(unittest.TestCase):
         self.assertEqual(self.run_exec(["cat"], 10, b"hello"), (0, b"hello"))
         self.assertEqual(self.run_exec(["sh", "-c", "exit 3"], 10)[0], 3)
         self.assertEqual(self.leftovers(), [])
+
+    def test_the_runc_argv_overrides_nothing_in_the_desktops_process_spec(self):
+        """runc exec inherits the container's process spec (user, capabilities, noNewPrivileges,
+        AppArmor profile, env, cwd) and seccomp unless a flag overrides it: the agent passes
+        none (threat model: runc exec into a container without a user namespace)."""
+        self.assertEqual(self.run_exec(["sh", "-c", "exit 0"], 10, tag="ab" * 8)[0], 0)
+        with open(os.path.join(self.d, "runc-argv.json")) as f:
+            asked = json.load(f)
+        self.assertRegex(asked[5], r"\Aezil-repo-open-(ab){8}-[0-9a-f]{16}\Z")
+        self.assertEqual(asked, ["--root", os.path.join(self.cfg.runDir, "runc"), "--systemd-cgroup", "exec", "--cgroup",
+                                 asked[5], self.cfg.containerId, "sh", "-c", "exit 0"])
+
+    def test_cleanup_is_cut_to_cleanup_by(self):
+        real_drain, caps, waits = ro._drain_cgroup, [], []
+
+        def drain(path, cap=ro.DRAIN_CAP, **kw):
+            caps.append(cap)
+            return real_drain(path, cap=cap, **kw)
+        real_popen = subprocess.Popen
+
+        class Recording(real_popen):
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return super().wait(timeout)
+        with mock.patch.object(ro, "_drain_cgroup", drain), mock.patch.object(ro.subprocess, "Popen", Recording):
+            self.assertEqual(self.run_exec(["true"], 10)[0], 0)
+            self.assertEqual((caps[-1], waits[-1]), (ro.DRAIN_CAP, ro.KILL_WAIT_S), "no cleanup_by: the full caps")
+            by = time.monotonic() + 0.5
+            self.assertEqual(self.run_exec(["true"], 10, cleanup_by=by)[0], 0)
+            self.assertLessEqual(caps[-1], 0.5)
+            self.assertLessEqual(waits[-1], 0.5)
+            self.assertEqual(self.run_exec(["true"], 10, cleanup_by=time.monotonic() - 1)[0], 0)
+            self.assertEqual((caps[-1], waits[-1]), (ro.CLEANUP_MIN_S, ro.CLEANUP_MIN_S))
+        self.assertEqual(self.leftovers(), [])
+        # a drain that never confirms gives up at cleanup_by, not after DRAIN_CAP
+        started = time.monotonic()
+        with mock.patch.object(ro, "_cgroup_populated", return_value=True):
+            with self.assertRaises(ro.CleanupPending):
+                self.run_exec(["true"], 10, cleanup_by=started + 0.4)
+        self.assertLess(time.monotonic() - started, 2.0)
 
     def test_stdin_is_an_unlinked_private_file_never_a_pipe_or_argv(self):
         rc, out = self.run_exec(["sh", "-c", "readlink /proc/self/fd/0; stat -L -c %a /proc/self/fd/0"], 10, b"secret")
@@ -1169,7 +1499,8 @@ class RealKernel(JobBase):
         return subprocess.run(["docker", "exec", self.name, "/bin/sh", "-c", script], capture_output=True, text=True,
                               timeout=60)
 
-    def docker_exec(self, cfg, argv, deadline, data=None, limit=ro.STDOUT_MAX, tag=None, cgroup_root=None, clock=None):
+    def docker_exec(self, cfg, argv, deadline, data=None, limit=ro.STDOUT_MAX, tag=None, cgroup_root=None, clock=None,
+                    cleanup_by=None):
         self.argvs.append(list(argv))
         r = subprocess.run(["docker", "exec", "-i", self.name, *argv], input=data or b"", stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL, timeout=max(1.0, deadline - time.monotonic()))
