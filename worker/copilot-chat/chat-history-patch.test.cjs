@@ -250,6 +250,10 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
       };
       assert.deepEqual(render(code), { visible: true, label: 'Chat history' });
       assert.deepEqual(render(pristine), { visible: false, label: '' }, 'control: upstream rendered nothing');
+      // The label the toolbar creates later reads the same default (measured live: it was empty).
+      const provider = between(code, 'actionViewItemProvider:i=>{if(i.id===X2.PICK_AGENT_SESSION_ACTION_ID)', 'hiddenItemStrategy:');
+      assert(provider.includes('updateTitle(this.title||X2.DEFAULT_TITLE)'), provider);
+      assert(!code.includes('this.title??X2.DEFAULT_TITLE'));
     });
 
     await t.test('patch and verify reject a moved anchor or a renamed collaborator', () => {

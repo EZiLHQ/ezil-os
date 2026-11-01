@@ -138,7 +138,7 @@ so the one copy rides on checkpoints, restore and moves.
 | `history-names` | `KSn`, `sC.getDefaultTitle`, `zSn=400`, `readSessionFromLocation`, `getStorageLocation`, `ba(...)!==1` (not-found), the constructor's `f` (workspace) and `Ve` (joinPath) | Checked, never patched: each exact definition occurs once, so the replacement's minified names mean the same thing. |
 | `history-entry` | workbench.js `ChatViewTitleControl.shouldRender(){return!!this.model?.title}` | `shouldRender(){return!0}`: the title, whose click opens the session picker (`workbench.action.chat.pickAgentSession`), also shows on an empty chat. Anchor 0, replacement 1. |
 | `history-label` | workbench.js `static{this.DEFAULT_TITLE=d(12379,null)}` | `static{this.DEFAULT_TITLE="Chat history"}`, the label of that title on an empty chat. Anchor 0, replacement 1. |
-| `history-empty-title` | workbench.js `doUpdate`: `this.updateTitle(this.title??X2.DEFAULT_TITLE)` | `this.title||X2.DEFAULT_TITLE`: an empty chat's title is `""`, not nullish, so upstream rendered an empty label. Anchor 0, replacement 1. |
+| `history-empty-title` | workbench.js `ChatViewTitleControl`: `this.title??X2.DEFAULT_TITLE` (in `doUpdate` and in the label the toolbar creates, which can be created after `doUpdate` ran) | `this.title||X2.DEFAULT_TITLE`: an empty chat's title is `""`, not nullish, so upstream rendered an empty label. Anchor 0, replacement 2. |
 
 `chat.viewSessions.enabled` stays `false`: turning it on hides the welcome (and the notice) and
 its filter menu lists every session-type contribution, including the agent-host Copilot type the

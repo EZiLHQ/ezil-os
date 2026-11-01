@@ -165,9 +165,10 @@ A_HISTORY_ENTRY='shouldRender(){return!!this.model?.title}'
 R_HISTORY_ENTRY='shouldRender(){return!0}'
 A_HISTORY_LABEL='static{this.DEFAULT_TITLE=d(12379,null)}'
 R_HISTORY_LABEL='static{this.DEFAULT_TITLE="Chat history"}'
-# An empty chat's title is "" (not nullish), so the default label never showed.
-A_HISTORY_EMPTY_TITLE='this.updateTitle(this.title??X2.DEFAULT_TITLE)'
-R_HISTORY_EMPTY_TITLE='this.updateTitle(this.title||X2.DEFAULT_TITLE)'
+# An empty chat's title is "" (not nullish), so the default label never showed: both the
+# update path and the label created when the toolbar renders (which can come after it).
+A_HISTORY_EMPTY_TITLE='this.title??X2.DEFAULT_TITLE'
+R_HISTORY_EMPTY_TITLE='this.title||X2.DEFAULT_TITLE'
 
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
@@ -201,7 +202,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch history-index  "$WB"  1  "$A_HISTORY_INDEX" "$R_HISTORY_INDEX"
   patch history-entry  "$WB"  1  "$A_HISTORY_ENTRY" "$R_HISTORY_ENTRY"
   patch history-label  "$WB"  1  "$A_HISTORY_LABEL" "$R_HISTORY_LABEL"
-  patch history-empty-title "$WB" 1 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
+  patch history-empty-title "$WB" 2 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -249,7 +250,7 @@ gate history-root     "$WB"  0  "$A_HISTORY_ROOT";  gate history-root     "$WB" 
 gate history-index    "$WB"  0  "$A_HISTORY_INDEX"; gate history-index    "$WB"  1  "$R_HISTORY_INDEX"
 gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB"  1  "$R_HISTORY_ENTRY"
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
-gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 1 "$R_HISTORY_EMPTY_TITLE"
+gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"
