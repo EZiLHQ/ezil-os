@@ -75,8 +75,13 @@ const REAL_GIT = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() ? '/usr/bin/git'
 const IMAGE = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() || '';
 const AVAILABLE = which('git') && which('openssl') && which('perl') && (!IMAGE || which('docker'));
 
-/** Opaque, and full of what a shell or a config parser would trip on: it must arrive byte for byte. */
-const TOKEN = `art_v1_${'7e57'.repeat(16)}$(id)\`x\`"'\\;|&~+/=%s`;
+/**
+ * Opaque, and full of what a shell or a config parser would trip on: it must
+ * arrive byte for byte. Unique to the run, because the shim and the walker
+ * look through every process on the machine: another run of this file must
+ * not count as a leak.
+ */
+const TOKEN = `art_v1_${'7e57'.repeat(8)}${crypto.randomUUID().replace(/-/g, '')}$(id)\`x\`"'\\;|&~+/=%s`;
 const WRONG = `art_v1_${'0bad'.repeat(16)}`;
 const BEARER = `Bearer ${TOKEN}`;
 const BASIC = `Basic ${btoa(`ezil:${TOKEN}`)}`;
