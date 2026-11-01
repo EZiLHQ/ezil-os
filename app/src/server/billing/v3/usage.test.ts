@@ -190,9 +190,12 @@ describe('round 5 D3: usage shows the REAL volume and used space in GiB', () => 
             { computerId: c2, bytes: BigInt(45) * BigInt(GiB), measuredAt: now }];
         const scoped = buildUsageV3({ ...args, computerId: c1, volumeGiB: 50 }).storage;
         expect(scoped).toMatchObject({ capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: String(10 * GiB), usedGiB: 10 } });
-        // The upper-case id the router accepts scopes the same computer; the raw samples list stays complete.
+        // The upper-case id the router accepts scopes the same computer. The samples beside the disk are the ones
+        // it counted: an older shell sums `samples` when `disk.usedBytes` is null, so another computer's never shows.
         expect(buildUsageV3({ ...args, computerId: c1.toUpperCase(), volumeGiB: 50 }).storage.disk).toMatchObject({ usedGiB: 10 });
-        expect(scoped.samples.map(sample => sample.computerId).sort()).toEqual([c1, c2]);
+        expect(scoped.samples.map(sample => sample.computerId)).toEqual([c1]);
+        const fresh = buildUsageV3({ ...args, computerId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', volumeGiB: 50 }).storage;
+        expect(fresh).toMatchObject({ state: 'unavailable', samples: [], disk: { usedBytes: null, usedGiB: null } });
         // No computer named: every computer's latest sample, as before.
         expect(buildUsageV3({ ...args, volumeGiB: 50 }).storage.disk).toMatchObject({ usedGiB: 55 });
     });

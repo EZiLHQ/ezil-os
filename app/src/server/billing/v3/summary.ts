@@ -191,9 +191,11 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
  * row yet) on a Cloudflare disk. A deleted computer's retained volume is on no disk the user can reach,
  * so it never fills this one. Omitted `liveComputers` (callers that read no placement) counts every sample.
  */
-export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
+export function storageDisk<S extends { computerId: string; bytes: bigint; measuredAt: Date }>(plan: ResolvedPlanV3, size: SizeCode, storage: readonly S[],
     largeStorageEnabled: boolean, volumeGiB?: number | null, liveComputers?: readonly DiskComputer[]):
-    { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
+    { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'];
+        /** The samples this meter counted, for any per-sample detail shown beside it (billing.usage `storage.samples`). */
+        counted: readonly S[] } {
     // Unmeasured is `unavailable` ("not measured yet"), never the `ok` of a zero nobody measured.
     const meter = (usedBytes: bigint | null, cap: bigint) => {
         if (usedBytes === null) return 'unavailable' as const;
@@ -203,15 +205,16 @@ export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: reado
     if (plan.sku === 'legacy') {
         const { usedBytes } = latestStorageTotal(storage);
         const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
-        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(usedBytes, cap) };
+        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(usedBytes, cap), counted: storage };
     }
     const aws = SIZES[size].provider === 'aws';
     const onDisk = liveComputers === undefined ? null : new Set(liveComputers
         .filter(computer => (computer.provider === 'aws-ec2') === aws).map(computer => computer.computerId.toLowerCase()));
-    const { usedBytes } = latestStorageTotal(onDisk === null ? storage : storage.filter(sample => onDisk.has(sample.computerId.toLowerCase())));
+    const counted = onDisk === null ? storage : storage.filter(sample => onDisk.has(sample.computerId.toLowerCase()));
+    const { usedBytes } = latestStorageTotal(counted);
     const provisionedGiB = aws ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
-    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(usedBytes, capBytes) };
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(usedBytes, capBytes), counted };
 }
 
 /**

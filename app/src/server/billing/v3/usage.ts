@@ -57,11 +57,6 @@ export function buildUsageV3(input: Input) {
     const currentSize = running?.size ?? preferred;
     const currentWeight = running?.weight ?? SIZES[currentSize].weight;
     const remaining = Math.max(0, allowance - used);
-    const samples = new Map<string, Input['storage'][number]>();
-    for (const sample of input.storage) {
-        if (!samples.has(sample.computerId) || samples.get(sample.computerId)!.measuredAt < sample.measuredAt)
-            samples.set(sample.computerId, sample);
-    }
     // The computer's real volume (round 5 D3); the preferred size only decides AWS vs Free, not the figure.
     // Usage for one computer meters that computer's used space against that computer's volume (the router
     // scopes the volume the same way); without a computer, every LIVE computer's latest sample on that disk
@@ -69,6 +64,13 @@ export function buildUsageV3(input: Input) {
     const scopedId = input.computerId?.toLowerCase();
     const scopedStorage = scopedId ? input.storage.filter(sample => sample.computerId.toLowerCase() === scopedId) : input.storage;
     const disk = storageDisk(rated, preferred, scopedStorage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
+    // The per-computer samples beside the disk are exactly the ones it counted: an older shell sums `samples`
+    // when `disk.usedBytes` is null, so a sample the disk left out (another or a deleted computer) never comes back there.
+    const samples = new Map<string, Input['storage'][number]>();
+    for (const sample of disk.counted) {
+        if (!samples.has(sample.computerId) || samples.get(sample.computerId)!.measuredAt < sample.measuredAt)
+            samples.set(sample.computerId, sample);
+    }
     return {
         enabled: true as const, version: 1 as const, asOf: isoSeconds(now),
         session: { computerId: epoch?.computerId ?? input.computerId ?? null, state,

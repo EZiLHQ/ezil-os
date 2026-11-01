@@ -1440,11 +1440,21 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         const live = String(25 * GiB);
         await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50, usedBytes: live } },
             storage: { usedBytes: live, capBytes: String(50 * GiB), state: 'ok' } });
-        await expect(f.caller.usage()).resolves.toMatchObject({ storage: { capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: live, usedGiB: 25 } } });
+        // The samples beside the disk are only the ones it counted (an older shell sums them when disk.usedBytes is null).
+        const usage = await f.caller.usage();
+        expect(usage).toMatchObject({ storage: { state: 'sampled', capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: live, usedGiB: 25 } } });
+        if (!usage.enabled) throw new Error('usage disabled');
+        expect(usage.storage.samples.map(sample => sample.computerId)).toEqual([C1]);
+        // A live computer not measured yet (scoped): nothing to sum, not the deleted or the Cloudflare computer's bytes.
+        f.store.latestStorageFor.mockResolvedValue([
+            { computerId: DELETED, bytes: BigInt(30 * GiB), measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: C2, bytes: BigInt(5 * GiB), measuredAt: now }]);
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [],
+            disk: { provisionedGiB: 50, usedBytes: null, usedGiB: null } } });
         // Fail closed: a placement read that lists no computers counts none ("not measured yet"), never the deleted 30 GiB.
         f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: volumes });
         await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { usedBytes: null } }, storage: { usedBytes: null, state: 'unavailable' } });
-        await expect(f.caller.usage()).resolves.toMatchObject({ storage: { disk: { usedBytes: null, usedGiB: null } } });
+        await expect(f.caller.usage()).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [], disk: { usedBytes: null, usedGiB: null } } });
         warn.mockRestore();
     });
 
