@@ -988,7 +988,27 @@ try {
         assert.equal(ai().classList.contains('is-warn'), true);
         contains('[data-role="meter-ai"]', '! Running low');
         assert.deepEqual(primaries(), ['Add AI credits']);
-        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload, the total\'s own warning');
+        // Billing's own reset: the pane re-activated for another signed-in user (B) drops A's kept balance, even a block
+        // that does not name its user. The same user keeps it (positive control).
+        const userA = payload.user;
+        try {
+            await open();
+            summary = withAccount({ ...worked, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            summary = withAccount({ ...unreadable, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            contains('[data-role="meter-ai"]', "Couldn't refresh · as of");
+            payload.user = { id: 'user-b', name: 'User B' }; await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+            contains('[data-role="meter-ai"]', "We couldn't read your credits.");
+            summary = withAccount({ ...unreadable, userId: 'user-b' }); await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+        } finally { payload.user = userA; }
+        // The shared guard on its own (Usage's lifecycle reaches it; here Billing's reset always runs first): a kept block
+        // named for another user is never used, and the same user's is.
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'user-b' }), null);
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'test-user' })?.left, '1,246');
+        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload, the total\'s own warning, user switch');
     }
     // Hotfix r5 (ACCEPT #3): the smaller-configuration advice only when the plan allows a size with a
     // smaller time weight than the current one. Standard (2 vCPU only) and Premium on 2 vCPU have none.
