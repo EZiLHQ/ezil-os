@@ -367,8 +367,10 @@ const diskText = bytes => bytes >= GIB ? `${(bytes / GIB).toLocaleString('en-US'
     : `${Math.floor(bytes / 2 ** 20).toLocaleString('en-US')} MB`;
 /**
  * Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it.
- * An AWS disk is measured by its host (every 15 min), so until the first sample it says "Measuring…";
- * a computer with no disk figure (Cloudflare) has no measurement at all and says so.
+ * An AWS disk is measured by its host (every 15 min, once its image carries the sampler): until the
+ * first sample it shows the disk's size and says space used isn't measured yet, never "0 used" and
+ * never a "Measuring…" that may wait for an image rollout; a computer with no disk figure
+ * (Cloudflare) has no measurement at all and says so.
  */
 function storageMeterV3 ({ computer }) {
     const disk = computer.disk;
@@ -376,7 +378,8 @@ function storageMeterV3 ({ computer }) {
     const usedBytes = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) : null;
     if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved',
         notes: ['Your files are saved between sessions.', usedBytes === null ? "Space used isn't measured on this computer." : `${diskText(usedBytes)} used`] });
-    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Measuring…', notes: [`${gb} GB disk for your projects`] });
+    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`,
+        notes: [`${gb} GB disk for your projects`, "Space used isn't measured yet."] });
     // ADV-2: the disk is provisionedGiB × 2^30 bytes (the server's cap), so used and left use the same unit.
     const capBytes = gb * GIB;
     const leftBytes = Math.max(0, capBytes - usedBytes);

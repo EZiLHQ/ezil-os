@@ -75,7 +75,7 @@ export function workspaceState(remaining: number, allowance: number): MeterState
  * The storage meter's one rule (docs/billing/CONTRACT.md §3.2): the NEWEST sample of each
  * computer, summed over the user's computers (deleted ones included until purged). Storage is a
  * level, not a flow, so older samples never add. No sample at all is `usedBytes: null`
- * ("Measuring…"), never a zero nobody measured.
+ * ("not measured yet"), never a zero nobody measured.
  */
 export function latestStorageTotal(storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[]): { usedBytes: bigint | null; measuredAt: Date | null } {
     const newest = new Map<string, { bytes: bigint; measuredAt: Date }>();

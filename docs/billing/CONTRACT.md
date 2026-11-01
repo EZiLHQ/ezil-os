@@ -69,7 +69,7 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 - **Legacy "Saved storage"** (the per-user v1 allowance): every computer of the user, including deleted computers that are not yet purged.
 - **A v3 computer disk** (`computer.disk` and `storage` in `billing.summary`, `storage.disk` in `billing.usage`): only the user's LIVE computers of that disk's kind, the aws-ec2 ones on an AWS volume and the others on a Cloudflare disk (`storageDisk`, with the live computers from the router's placement read). A deleted computer's retained volume is on no disk the user can reach, so it never fills the new computer's disk. A placement read that lists no computers (failed, or placement reads off) counts none, so the disk reads "not measured yet".
 
-**No sample is not zero:** with no sample at all, every summary (v1, v2, v3) returns `usedBytes: null` with state `unavailable`. The shell shows "Measuring…" for an AWS disk and "Space used isn't measured on this computer." where there is no disk figure (Cloudflare), never "0 used", and shows Full / Almost full only for a measured figure.
+**No sample is not zero:** with no sample at all, every summary (v1, v2, v3) returns `usedBytes: null` with state `unavailable`. The shell shows an unmeasured AWS disk as its size with "Space used isn't measured yet." (the disk figure it showed before the sampler existed) and "Space used isn't measured on this computer." where there is no disk figure (Cloudflare), never "0 used", and shows a bar and Full / Almost full only for a measured figure.
 
 **Units:** bytes are stored as `bigint`. Every figure shown is GiB (1024³ bytes), labelled "GB" like every disk size. The v1 caps were decimal (2,000,000,000 bytes) until 2026-11-01. Making them GiB only ever grants more.
 
@@ -93,7 +93,7 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 - **On Cloudflare/Free, the 512 MiB checkpoint cap binds long before the 2 GB Free figure,** so that allowance cannot be reached there.
 - **No per-user write enforcement exists beyond the volume size.** An AWS disk fills to ENOSPC, and the 80% / 95% states are warnings only.
 - **A deleted computer's last sample counts in legacy "Saved storage" until a purge marker exists.** No purge state is recorded yet, and the 14-day purge is a dry run. The v3 disk never counts it, and no v3 field shows the per-user total yet (the v3 `storage` wire type is pinned).
-- **AWS disks read "Measuring…" until the host AMI that carries `storage.py` is rolled out.** That AMI ships separately from the app deploy.
+- **AWS disks read "Space used isn't measured yet." until the host AMI that carries `storage.py` is rolled out,** and on each computer until its first sample (60 s after its agent starts). That AMI ships separately from the app deploy. Until then the disk shows its size, as before, so the app deploy changes nothing visible for AWS users and needs no rollback flag. The plan's `STORAGE_METER_V2` flag and its `layer_breakdown` / `measurement_kind` columns and unique index were not added (no schema change in this run).
 - **A stop sample is refused once a control-plane stop has begun.** DRAINING clears the key's proof, so the last periodic sample, at most 15 min old, stands. Idle stops, which the agent initiates, are sampled.
 - **Two live AWS computers can read falsely full in the unscoped summary.**
   - The `billing.summary` and unscoped `billing.usage` compare the sum of the live AWS computers' latest samples with the smallest of their volumes (`readVolumeGiB`).

@@ -159,7 +159,7 @@ describe('billing summary wire contract', () => {
         ] });
         expect(result.meters.storage.usedBytes).toBe('1000');
         expect(result.meters.storage.measuredAt).toBe(now.toISOString());
-        // Nothing measured is null with `unavailable` ("Measuring…"), never a measured-looking '0'.
+        // Nothing measured is null with `unavailable` ("not measured yet"), never a measured-looking '0'.
         expect(summary().meters.storage.usedBytes).toBeNull();
         expect(summary().meters.storage.state).toBe('unavailable');
         expect(summary().meters.storage.measuredAt).toBeNull();

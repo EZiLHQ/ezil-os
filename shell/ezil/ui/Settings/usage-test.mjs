@@ -253,12 +253,13 @@ check('round 3: storage is the provisioned disk; used only when measured; Free s
     assert.doesNotMatch(meter(free, 'storage').textContent, /\d+ GB|Limit/);
     assert.match(meter(free, 'storage').textContent, /Your files are saved between sessions\./);
 });
-check('storage honesty: an unmeasured AWS disk is "Measuring…", a Cloudflare computer says it is not measured, never "0 used"', () => {
+check('storage honesty: an unmeasured AWS disk shows its size and "not measured yet", a Cloudflare computer says it is not measured, never "0 used"', () => {
     const unmeasured = { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: null }, samples: [] };
     const aws = meter(rendered({ ...sample, storage: unmeasured }), 'storage');
-    assert.equal(aws.querySelector('.usage-value').textContent, 'Measuring…');
-    assert.match(aws.textContent, /50 GB disk for your projects/);
-    assert.doesNotMatch(aws.textContent, /\b0 (bytes|MB|GB)\b|used of your|Full|Almost full|isn't measured/);
+    // The disk's size, as before the sampler existed; no "Measuring…" that may wait on a host image rollout.
+    assert.equal(aws.querySelector('.usage-value').textContent, '50 GB disk');
+    assert.match(aws.textContent, /50 GB disk for your projects\. Space used isn't measured yet\./);
+    assert.doesNotMatch(aws.textContent, /Measuring…|\b0 (bytes|MB|GB)\b|used of your|left|Full|Almost full|on this computer/);
     assert.equal(aws.dataset.state, 'unavailable');
     // Even a "danger" summary state never brings Full copy without a measurement.
     const forced = meter(rendered({ ...sample, storage: unmeasured }, { ...summary, storage: { ...summary.storage, usedBytes: null, state: 'exhausted' } }), 'storage');
@@ -266,11 +267,11 @@ check('storage honesty: an unmeasured AWS disk is "Measuring…", a Cloudflare c
     const cf = meter(rendered({ ...sample, storage: { state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null }, samples: [] } },
         { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, storage: { usedBytes: null, capBytes: '0', state: 'unavailable' } }), 'storage');
     assert.match(cf.textContent, /Space used isn't measured on this computer\./);
-    assert.doesNotMatch(cf.textContent, /Measuring…|\b0 (bytes|MB|GB)\b/);
+    assert.doesNotMatch(cf.textContent, /Measuring…|measured yet|\b0 (bytes|MB|GB)\b/);
     // Positive controls: once measured, the same disk shows used and left, and 96% used is Almost full / 100% Full.
     const measured = meter(rendered({ ...sample, storage: { ...unmeasured, state: 'sampled', disk: { provisionedGiB: 50, usedBytes: '0' } } }), 'storage');
     assert.match(measured.textContent, /50 GB left/); assert.match(measured.textContent, /0 bytes used of your 50 GB disk/);
-    assert.doesNotMatch(measured.textContent, /Measuring…/);
+    assert.doesNotMatch(measured.textContent, /Measuring…|isn't measured/);
     const almost = meter(rendered({ ...sample, storage: { ...unmeasured, disk: { provisionedGiB: 50, usedBytes: String(48 * 2 ** 30) } } }), 'storage');
     assert.match(almost.textContent, /Almost full/);
     const full = meter(rendered({ ...sample, storage: { ...unmeasured, disk: { provisionedGiB: 50, usedBytes: String(50 * 2 ** 30) } } }), 'storage');
