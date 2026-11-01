@@ -320,12 +320,16 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     writeFileSync(join(folder, 'README.md'), '# site\nwork in progress\n');
     writeFileSync(join(folder, 'notes.txt'), 'untracked\n');
     const next = commit('second', 'CHANGELOG.md', 'v2\n');
+    git(seed, 'tag', 'v2');
+    git(seed, 'push', '-q', 'origin', 'v2');
     const mark = ran().length;
     const answer = await open();
     expect(answer).toEqual({ ok: true, folder: folderOf(REPO), head: before, status: 'fetched' });
     expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# site\nwork in progress\n');
     expect(readFileSync(join(folder, 'notes.txt'), 'utf8')).toBe('untracked\n');
     expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
+    // Tags on the fetched history follow, as they did with `git fetch origin`.
+    expect(git(folder, 'rev-parse', 'refs/tags/v2')).toBe(next);
     expect(git(folder, 'rev-parse', 'HEAD')).toBe(before);
     expect(git(folder, 'config', '--local', '--get', 'remote.origin.url')).toBe(url);
     expect(filesContaining(folder, TOKEN)).toEqual([]);
