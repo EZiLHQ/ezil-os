@@ -45,8 +45,15 @@
  *      remote (`http.<canonicalURL>.extraHeader`, as EZiL Works' runner sends
  *      it, or `credential.https://<host>.helper`);
  *   2. the person's folder is then updated (or created) from that private
- *      repository by a LOCAL fetch or clone whose environment holds no token,
- *      and the private repository is deleted.
+ *      repository by a LOCAL fetch or clone, and the private repository is
+ *      deleted. That runs git in the folder, and git runs what the folder's
+ *      config names (`core.alternateRefsCommand`, a smudge filter, …) as root,
+ *      and root can read any process's `/proc/<pid>/environ`, which keeps
+ *      what the process image was started with even after an `unset`. So this
+ *      step runs in a process image that was never started with the token
+ *      (the script `exec`s itself between steps, see `REPO_OPEN_SCRIPT`),
+ *      under ancestors that were not either, and holds the computer's lock
+ *      alone, so no open's network fetch is running meanwhile.
  * The token is sent the way the server behind the URL expects it:
  *   - Cloudflare Artifacts: `Authorization: Bearer <token>`, exactly what EZiL
  *     Git's own gateway sends upstream (EZiL CLI `apps/git-gateway`). The
@@ -59,15 +66,27 @@
  *   - it arrives through the Sandbox SDK's per-command `env` (exported in the
  *     session shell for this command only, then restored — never part of the
  *     command string, which the SDK logs);
- *   - the script moves it into a shell variable, unsets the exported name, and
- *     hands it back only to the network `git` itself, as an environment prefix
- *     (`NAME=… git …`), never as an argument;
+ *   - the command moves it onto a pipe before it starts any process
+ *     (`repoOpenCommand`); the script reads it into a shell variable and
+ *     hands it back only to the network `git` itself, as an environment
+ *     prefix (`NAME=… git …`), never as an argument;
  *   - git is configured through `GIT_CONFIG_COUNT` (command scope, not written
  *     anywhere), so a `store` helper or a header can never be written to a file.
  * So it never appears in argv, a URL, any `.git/config`, the response, or the
  * Worker's logs. The clone's `remote.origin.url` is the canonical URL, with no
  * userinfo. `repo-open.git.test.ts` proves each of these against real git, in
- * both schemes, including a clone whose config tries to redirect the fetch.
+ * both schemes, including a clone whose config tries to redirect the fetch,
+ * and one whose config runs a command that looks for the token in every
+ * process while the folder is updated (and while another open is under way).
+ *
+ * What this does not stop: a hostile root process already running on the
+ * computer can read the network git's environment during the seconds it
+ * runs (everything on the computer is root), and the session shell and the
+ * Sandbox SDK's server hold the token in memory during the exec, readable
+ * only with ptrace-class access. A config written into the folder can start
+ * such a resident process without repo-open: Code's own background git runs
+ * what it names too. What repo-open no longer does is start that command
+ * itself while a token is live.
  *
  * An existing folder with the same origin is fetched only: the working tree,
  * the index and HEAD are not touched, so uncommitted work stays. The one
@@ -111,9 +130,10 @@ export const REPO_OPEN_GIT_USERNAME = 'ezil';
 /**
  * The longest one open may take, and the default when the caller sends no
  * `timeoutMs`. Every bound inside the container is derived from the exec
- * bound (`repoOpenBounds`): at this maximum, 30 s waiting for another open of
- * the same repository, then 90 s of git plus its 5 s kill grace, with 5 s to
- * spare, so the Worker never answers while the script is still working.
+ * bound (`repoOpenBounds`): at this maximum, one 120 s deadline for up to 30 s
+ * waiting at a time for the computer's lock (`REPO_OPEN_LOCK`) and for git,
+ * plus git's 5 s kill grace, with 5 s to spare, so the Worker never answers
+ * while the script is still working.
  */
 export const REPO_OPEN_EXEC_TIMEOUT_MS = 130_000;
 /** The shortest `timeoutMs` the Worker will start git under. */
@@ -132,6 +152,12 @@ export const REPO_OPEN_UNMOUNTED_ROOT = '/home/neko/project';
  * its files is at the workspace folder's root (see THE LAYOUT above).
  */
 export const REPO_OPEN_NESTED_DIR = 'repository';
+/**
+ * The computer's one repo-open lock: every open's network fetch holds it
+ * shared, and the step that touches a person's folder holds it alone (see
+ * `REPO_OPEN_SCRIPT`), so the two never overlap, across repositories too.
+ */
+export const REPO_OPEN_LOCK = '/tmp/ezil-repo-open.lock';
 
 /** Every code this route can answer with besides the shared auth codes. Each is in `PUBLIC_ERROR_CODES`. */
 export const REPO_OPEN_ERRORS = [
@@ -283,8 +309,9 @@ export function parseRepoOpenRequest(
  * The script's bounds for an open that must be over within `timeoutMs`: the
  * lock wait and the git limit (seconds), leaving 5 s for git's kill grace and
  * 5 s for everything else (rev-parse, the move, the exec's own round trip).
- * The git limit is one deadline shared by every bounded git command (the
- * network fetch, then the local fetch or clone), not a limit per command.
+ * Together they are one deadline, set when the script starts and shared by
+ * both waits for the lock (each at most the lock wait) and every bounded git
+ * command (the network fetch, then the local fetch or clone).
  */
 export function repoOpenBounds(timeoutMs: number): { lockWaitS: number; gitTimeoutS: number } {
   const total = Math.floor(Math.min(Math.max(timeoutMs, REPO_OPEN_MIN_TIMEOUT_MS), REPO_OPEN_EXEC_TIMEOUT_MS) / 1000) - 10;
@@ -321,11 +348,27 @@ function shq(value: string): string {
 }
 
 /**
- * The container-side script. Positional arguments: root, repositoryId, URL,
- * branch, require-hydrated (1|0), auth (bearer|basic), lock wait (s), git
- * limit (s). The token arrives only as `$EZIL_REPO_OPEN_TOKEN`. Always exits 0
- * after printing exactly one `ezil-repo-open:` line; git's own output is
- * classified, never printed.
+ * The container-side script. Positional arguments: the step (`fetch` from
+ * `repoOpenCommand`), root, repositoryId, URL, branch, require-hydrated
+ * (1|0), auth (bearer|basic), lock wait (s), git limit (s). The token arrives
+ * only on fd 3, never in its environment. Always exits 0 after printing
+ * exactly one `ezil-repo-open:` line; git's own output is classified, never
+ * printed.
+ *
+ * It runs as two process images in turn, one PID (`fetch` `exec`s `bash -c`
+ * of this same text), because `/proc/<pid>/environ` shows what a process
+ * image was started with, `unset` or not, to any root process, and memory
+ * outlives an `unset`:
+ *   fetch  reads the token from fd 3, waits for the computer's lock
+ *          (shared), then runs the network fetch into the private repository
+ *          (`net()`, the only command given the token, in its environment),
+ *          which has ended before it hands over to
+ *   place  never given the token: waits for the lock (exclusive), then
+ *          everything that reads or writes the person's folder. Whatever the
+ *          folder's own config makes git run (an `alternateRefsCommand`, a
+ *          smudge filter) runs as a descendant of no process started with the
+ *          token, while no network fetch of any open (and so no process given
+ *          a token) is running.
  *
  * This is a template literal: each `${…}` below is a TypeScript constant; the
  * shell's own expansions are all the brace-free `$name` form.
@@ -333,10 +376,26 @@ function shq(value: string): string {
 export const REPO_OPEN_SCRIPT = String.raw`
 emit() { printf 'ezil-repo-open:%s\n' "$1"; exit 0; }
 fail() { emit "error:$1"; }
+# Never started with the token in the environment (see repoOpenCommand).
+[ -z "$EZIL_REPO_OPEN_TOKEN" ] || fail repo_open_invalid_request
+step=$1; shift
+case "$step" in
+fetch)
+  IFS= read -r tok <&3
+  exec 3<&-
+  [ -n "$tok" ] || fail repo_open_invalid_request
+  work=$(mktemp -d /tmp/ezil-repo-open.XXXXXX) || fail repo_open_git_failed
+  trap 'rm -rf "$work"' EXIT ;;
+place)
+  work=$1; deadline=$2; shift 2
+  case "$work" in /tmp/ezil-repo-open.??????) ;; *) fail repo_open_invalid_request ;; esac
+  case "$deadline" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
+  trap 'rm -rf "$work"' EXIT ;;
+*) fail repo_open_invalid_request ;;
+esac
+cd "$work" || fail repo_open_git_failed
+mirror=$work/mirror
 root=$1; id=$2; url=$3; branch=$4; hydrated=$5; auth=$6; lockwait=$7; limit=$8
-tok=$EZIL_REPO_OPEN_TOKEN
-unset EZIL_REPO_OPEN_TOKEN
-[ -n "$tok" ] || fail repo_open_invalid_request
 case "$auth" in bearer|basic) ;; *) fail repo_open_invalid_request ;; esac
 case "$lockwait" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
 case "$limit" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
@@ -358,11 +417,18 @@ export GIT_CONFIG_KEY_2=core.hooksPath GIT_CONFIG_VALUE_2=/dev/null
 export GIT_CONFIG_KEY_3=core.fsmonitor GIT_CONFIG_VALUE_3=false
 export GIT_CONFIG_KEY_4=core.askPass GIT_CONFIG_VALUE_4=
 export GIT_CONFIG_KEY_5=protocol.allow GIT_CONFIG_VALUE_5=never
-# One deadline for every bounded git command (set once the lock is held).
+# One deadline for the whole open, lock waits included (set by fetch, passed to place).
 bounded() {
   s=$((deadline - $(date +%s)))
   [ "$s" -ge 1 ] || return 124
   timeout -k 5 "$s" "$@"
+}
+# The computer's lock (fd 9), -s or -x: at most the lock wait, within the deadline.
+waitlock() {
+  w=$((deadline - $(date +%s)))
+  [ "$w" -ge 1 ] || return 124
+  [ "$w" -le "$lockwait" ] || w=$lockwait
+  flock "$1" -w "$w" 9
 }
 # 🔴 The ONLY command that carries the credential: one fetch of every branch
 # and tag of the canonical URL, named explicitly, into the private bare
@@ -370,18 +436,17 @@ bounded() {
 # private directory. It never reads the person's repository or its config,
 # so nothing there can send it elsewhere. The credential is scoped to that
 # URL (Bearer) or its host (Basic) and goes only into this command's
-# environment.
+# environment, and nothing it starts outlives it (no auto-maintenance).
 net() {
   (
-    cd "$work" || exit 1
     export HOME="$work/home" GIT_ALLOW_PROTOCOL=https GIT_CONFIG_COUNT=10 \
       GIT_CONFIG_KEY_6=protocol.https.allow GIT_CONFIG_VALUE_6=always \
       GIT_CONFIG_KEY_7=http.followRedirects GIT_CONFIG_VALUE_7=false \
       GIT_CONFIG_KEY_8=http.sslVerify GIT_CONFIG_VALUE_8=true
     s=$((deadline - $(date +%s)))
     [ "$s" -ge 1 ] || exit 124
-    set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head -- \
-      "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+    set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head \
+      --no-auto-maintenance -- "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
     if [ "$auth" = bearer ]; then
       export GIT_CONFIG_KEY_9="http.$url.extraHeader"
       GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"
@@ -409,36 +474,37 @@ classify() {
 case "$root" in /*) ;; *) fail repo_open_workspace_unavailable ;; esac
 [ -d "$root" ] || fail repo_open_workspace_unavailable
 if [ "$hydrated" = 1 ] && [ ! -f "$root/.ezil-hydrated.json" ]; then fail repo_open_workspace_not_ready; fi
+exec 9>"${REPO_OPEN_LOCK}" || fail repo_open_busy
+if [ "$step" = fetch ]; then
+  deadline=$(($(date +%s) + lockwait + limit))
+  host=$(printf '%s' "$url" | cut -d/ -f3)
+  { mkdir "$work/home" && git init --quiet --bare --template= "$mirror" && git --git-dir="$mirror" symbolic-ref HEAD "refs/heads/$branch"; } \
+    >/dev/null 2>&1 || fail repo_open_git_failed
+  # Shared: network fetches run side by side, but never while a place step
+  # (which holds the lock alone) runs what a person's config names.
+  waitlock -s || { rc=$?; [ "$rc" = 124 ] && fail repo_open_timeout; fail repo_open_busy; }
+  net 2>"$work/err" || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
+  exec 9>&-
+  exec bash -c "$BASH_EXECUTION_STRING" ezil-repo-open place "$work" "$deadline" "$@"
+fi
+waitlock -x || { rc=$?; [ "$rc" = 124 ] && fail repo_open_timeout; fail repo_open_busy; }
 parent=$root/projects
 folder=$parent/$id
 if [ -L "$parent" ] || { [ -e "$parent" ] && [ ! -d "$parent" ]; }; then fail repo_open_folder_conflict; fi
 mkdir -p "$parent" 2>/dev/null || fail repo_open_workspace_unavailable
-work=$(mktemp -d /tmp/ezil-repo-open.XXXXXX) || fail repo_open_git_failed
-trap 'rm -rf "$work"' EXIT
-mirror=$work/mirror
-host=$(printf '%s' "$url" | cut -d/ -f3)
-exec 9>"/tmp/ezil-repo-open-$id.lock" || fail repo_open_busy
-flock -w "$lockwait" 9 || fail repo_open_busy
-deadline=$(($(date +%s) + limit))
 [ -L "$folder" ] && fail repo_open_folder_conflict
 if [ -d "$folder" ] && [ -z "$(ls -A "$folder" 2>/dev/null)" ]; then rmdir "$folder" 2>/dev/null || fail repo_open_folder_conflict; fi
 if [ -e "$folder" ]; then
   # Ours from an earlier open, or nothing we will touch: the repository one
   # level down, or (opened before that layout) at the folder itself, which
-  # keeps its layout. These checks are about identity, not the credential: no
-  # command with the credential ever reads this repository.
+  # keeps its layout.
   if [ -e "$folder/.git" ] || [ -L "$folder/.git" ]; then repo=$folder; else repo=$folder/${REPO_OPEN_NESTED_DIR}; fi
   [ -L "$repo" ] && fail repo_open_folder_conflict
   { [ -d "$repo/.git" ] && [ ! -L "$repo/.git" ]; } || fail repo_open_folder_conflict
   [ "$(git -C "$repo" rev-parse --git-dir 2>/dev/null)" = .git ] || fail repo_open_folder_conflict
   [ "$(git -C "$repo" config --local --get remote.origin.url 2>/dev/null)" = "$url" ] || fail repo_open_folder_conflict
-fi
-{ mkdir "$work/home" && git init --quiet --bare --template= "$mirror" && git --git-dir="$mirror" symbolic-ref HEAD "refs/heads/$branch"; } \
-  >/dev/null 2>&1 || fail repo_open_git_failed
-net 2>"$work/err" || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
-if [ -e "$folder" ]; then
-  # Fetch only, from the private repository and with no credential in the
-  # environment: the working tree, the index and HEAD stay as the person left them.
+  # Fetch only, from the private repository: the working tree, the index and
+  # HEAD stay as the person left them.
   bounded git -C "$repo" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
   if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null; then
@@ -482,6 +548,14 @@ emit "ok:$status"
  * The exec command for one open. Takes the URL as given: validation is
  * `parseRepoOpenRequest`'s job (the real-git test points this at a local
  * server). The token is NOT a parameter, by construction.
+ *
+ * The SDK runs it in its session shell, which `export`s the token for this
+ * command only, long after that shell was started: so the token is in the
+ * shell's variables but not its `/proc/<pid>/environ`, nor that of the
+ * subshell forked from it here, which moves the token onto a pipe (fd 3;
+ * bash 5.1+ makes a here-string this short one) and replaces itself with the
+ * script. No process the open starts is ever started with the token in its
+ * environment, save `net()`'s git.
  */
 export function repoOpenCommand(params: {
   root: string;
@@ -493,9 +567,10 @@ export function repoOpenCommand(params: {
   timeoutMs: number;
 }): string {
   const { lockWaitS, gitTimeoutS } = repoOpenBounds(params.timeoutMs);
-  return ['bash', '-c', shq(REPO_OPEN_SCRIPT), 'ezil-repo-open', shq(params.root), shq(params.repositoryId),
+  const script = ['bash', '-c', shq(REPO_OPEN_SCRIPT), 'ezil-repo-open', 'fetch', shq(params.root), shq(params.repositoryId),
     shq(params.url), shq(params.branch), params.requireHydrated ? '1' : '0', params.auth === 'bearer' ? 'bearer' : 'basic',
     String(lockWaitS), String(gitTimeoutS)].join(' ');
+  return `(t=$${REPO_OPEN_TOKEN_ENV}; unset ${REPO_OPEN_TOKEN_ENV}; exec ${script} 3<<<"$t")`;
 }
 
 /** The script's result line (the last `ezil-repo-open:` line), or null when there is none or it is malformed. */

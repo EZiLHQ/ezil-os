@@ -21,6 +21,7 @@ import {
   REPO_OPEN_EXEC_TIMEOUT_MS,
   REPO_OPEN_MIN_TIMEOUT_MS,
   REPO_OPEN_NESTED_DIR,
+  REPO_OPEN_LOCK,
   REPO_OPEN_TOKEN_ENV,
   type RepoOpenExec,
   type RepoOpenRequest,
@@ -163,8 +164,8 @@ describe('repoOpenCommand', () => {
     auth: 'bearer', timeoutMs: REPO_OPEN_EXEC_TIMEOUT_MS });
 
   it('is one bash invocation whose arguments are single-quoted, and never takes the token', () => {
-    expect(cmd.startsWith("bash -c '")).toBe(true);
-    expect(cmd.endsWith(` ezil-repo-open '/workspace' '${REPO}' '${ARTIFACTS}' 'main' 1 bearer 30 90`)).toBe(true);
+    expect(cmd.startsWith(`(t=$${REPO_OPEN_TOKEN_ENV}; unset ${REPO_OPEN_TOKEN_ENV}; exec bash -c '`)).toBe(true);
+    expect(cmd.endsWith(` ezil-repo-open fetch '/workspace' '${REPO}' '${ARTIFACTS}' 'main' 1 bearer 30 90 3<<<"$t")`)).toBe(true);
     expect(cmd).not.toContain('egg_');
     expect(cmd).not.toContain('art_v1_');
     // `repoOpenCommand` has no token parameter at all: the only route in is the env.
@@ -175,7 +176,7 @@ describe('repoOpenCommand', () => {
     const odd = repoOpenCommand({ root: "/w'; rm -rf /; '", repositoryId: REPO, url: 'u', branch: 'b', requireHydrated: false,
       auth: 'basic', timeoutMs: REPO_OPEN_MIN_TIMEOUT_MS });
     expect(odd).toContain(`'/w'\\''; rm -rf /; '\\'''`);
-    expect(odd.endsWith(' 0 basic 2 8')).toBe(true);
+    expect(odd.endsWith(' 0 basic 2 8 3<<<"$t")')).toBe(true);
   });
 
   it('configures git only through the environment, resetting inherited helpers and headers first, never following redirects', () => {
@@ -204,11 +205,12 @@ describe('repoOpenCommand', () => {
     // A fresh bare repository with no template (so no hooks), in the private directory, HOME an empty private directory.
     expect(cmd).toContain('git init --quiet --bare --template= "$mirror"');
     expect(cmd).toContain('export HOME="$work/home"');
-    expect(cmd).toContain('set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head -- \\\n      "$url" ');
+    expect(cmd).toContain('set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head \\\n'
+      + '      --no-auto-maintenance -- "$url" ');
     // Besides the presence check, the only lines that use the token are the network fetch's, inside net().
     const tokenLines = REPO_OPEN_SCRIPT.split('\n').filter((l) => l.includes('$tok'));
     expect(tokenLines).toEqual([
-      '[ -n "$tok" ] || fail repo_open_invalid_request',
+      '  [ -n "$tok" ] || fail repo_open_invalid_request',
       '      GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"',
       '      EZIL_REPO_OPEN_TOKEN=$tok timeout -k 5 "$s" "$@"',
     ]);
@@ -217,6 +219,28 @@ describe('repoOpenCommand', () => {
     expect(REPO_OPEN_SCRIPT).toContain(`bounded git -C "$repo" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*'`);
     expect(REPO_OPEN_SCRIPT).toContain('bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$repo"');
     expect(REPO_OPEN_SCRIPT).toContain('git -C "$repo" remote set-url origin "$url"');
+  });
+
+  it('🔴 nothing is started with the token in its environment but the network git, and the folder is touched only by a new image, alone (review F1, repair round)', () => {
+    // A subshell of the session shell (which exported it after it started) hands it on through fd 3 only.
+    expect(cmd).toMatch(/^\(t=\$EZIL_REPO_OPEN_TOKEN; unset EZIL_REPO_OPEN_TOKEN; exec bash -c '/);
+    // The script will not run at all if it was started with it in its environment.
+    expect(REPO_OPEN_SCRIPT).toContain('\n[ -z "$EZIL_REPO_OPEN_TOKEN" ] || fail repo_open_invalid_request\nstep=$1; shift\n');
+    expect(REPO_OPEN_SCRIPT).toContain('\nfetch)\n  IFS= read -r tok <&3\n  exec 3<&-\n');
+    const handover = 'exec bash -c "$BASH_EXECUTION_STRING" ezil-repo-open place "$work" "$deadline" "$@"\n';
+    const [fetch, place, ...rest] = REPO_OPEN_SCRIPT.split(handover);
+    expect(rest).toEqual([]);
+    // The network fetch, under the computer's lock shared, has ended and let go of it before the new image.
+    expect(fetch).toMatch(/\n  waitlock -s [^\n]*\n  net 2>"\$work\/err" [^\n]*\n  exec 9>&-\n  $/);
+    expect(fetch).not.toMatch(/git -C|\$folder|\$repo\b/);
+    // Everything that reads or writes the folder runs in the new image (never given the token), holding the lock alone.
+    expect(place!.startsWith('fi\nwaitlock -x ')).toBe(true);
+    expect(place).not.toMatch(/\$tok\b/);
+    expect(place).toContain('bounded git -C "$repo" fetch ');
+    expect(place).toContain('bounded git -C "$repo" checkout ');
+    expect(REPO_OPEN_SCRIPT).toContain(`exec 9>"${REPO_OPEN_LOCK}"`);
+    // Nothing the network git starts outlives it.
+    expect(fetch).toContain(' --no-auto-maintenance -- "$url" ');
   });
 
   it('🔴 a new folder holds only the repository, one level down, so none of its files is at the workspace folder root (review F3)', () => {
@@ -281,7 +305,7 @@ describe('runRepoOpen', () => {
     // The caller's deadline (the default here), above the script's worst case: 30 s lock wait + 90 s git + 5 s kill grace.
     expect(options.timeout).toBe(REPO_OPEN_EXEC_TIMEOUT_MS);
     expect(options.timeout).toBeGreaterThan((30 + 90 + 5) * 1000);
-    expect(command.endsWith(' bearer 30 90')).toBe(true);
+    expect(command.endsWith(' bearer 30 90 3<<<"$t")')).toBe(true);
     expect(JSON.stringify(answer)).not.toContain(TOKEN);
   });
 
@@ -291,7 +315,7 @@ describe('runRepoOpen', () => {
     const [command, options] = calls[0]!;
     expect(options.timeout).toBe(40_000);
     const { lockWaitS, gitTimeoutS } = repoOpenBounds(40_000);
-    expect(command.endsWith(` bearer ${lockWaitS} ${gitTimeoutS}`)).toBe(true);
+    expect(command.endsWith(` bearer ${lockWaitS} ${gitTimeoutS} 3<<<"$t")`)).toBe(true);
     expect((lockWaitS + gitTimeoutS + 5) * 1000).toBeLessThan(40_000);
   });
 

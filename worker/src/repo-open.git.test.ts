@@ -8,8 +8,9 @@
  * what EZiL Git's gateway (github.ezil.work) takes.
  *
  * The script runs through `runRepoOpen` with an exec that does what the
- * Sandbox SDK does with a per-command `env` (the value is in the shell's
- * environment for that one command, never in the command string). What it
+ * Sandbox SDK does with a per-command `env` (the value is exported in a
+ * long-lived session shell for that one command, never in the command
+ * string). What it
  * proves, with the token known to the test:
  *   - it is in no argv: not of any `git` the script runs (a `git` shim first
  *     on PATH logs every invocation's arguments, its working directory, and
@@ -20,8 +21,16 @@
  *     so the checks are not vacuous. Nor in anything the script printed, nor
  *     in any URL the server saw;
  *   - 🔴 exactly one git command per open has the token in its environment,
- *     the network fetch into the private repository under /tmp, and no git
- *     command that names or runs in the person's folder has it;
+ *     the network fetch into the private repository under /tmp, and every
+ *     other git (all that name or run in the person's folder among them) has
+ *     it neither in its own environment nor in any ANCESTOR's
+ *     `/proc/<pid>/environ`, which keeps what a process was started with
+ *     whatever it has unset since;
+ *   - 🔴 a command the folder's own config makes git run while updating it
+ *     (`core.alternateRefsCommand` during the fetch, a smudge filter during
+ *     the empty clone's checkout) looks through every process it can see and
+ *     finds none started with the token, not even while another open is
+ *     under way;
  *   - 🔴 a clone whose config tries to send the fetch elsewhere cannot: a
  *     prepended `remote.origin.url`, an `include.path` / `includeIf` file with
  *     `url.<evil>.insteadOf` and `http.<evil>.sslVerify=false`, an included
@@ -46,13 +55,14 @@
  *
  * Runs on the host's git by default. `EZIL_REPO_OPEN_IT_IMAGE=cloudflare/sandbox:0.12.1`
  * runs the same script inside that image instead (git 2.34.1, the computer's
- * own), with the token passed to `docker run -e NAME` from the environment.
- * Skipped when git or openssl is missing.
+ * own): one container for the whole file, like one computer, each open a
+ * `docker exec` of that session shell.
+ * Skipped when git, openssl or perl is missing.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   runRepoOpen, REPO_OPEN_EXEC_TIMEOUT_MS, REPO_OPEN_NESTED_DIR, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest,
@@ -63,7 +73,7 @@ const which = (bin: string) => Bun.spawnSync(['sh', '-c', `command -v ${bin}`]).
 const REAL_GIT = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() ? '/usr/bin/git'
   : Bun.spawnSync(['sh', '-c', 'command -v git']).stdout.toString().trim();
 const IMAGE = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() || '';
-const AVAILABLE = which('git') && which('openssl') && (!IMAGE || which('docker'));
+const AVAILABLE = which('git') && which('openssl') && which('perl') && (!IMAGE || which('docker'));
 
 /** Opaque, and full of what a shell or a config parser would trip on: it must arrive byte for byte. */
 const TOKEN = `art_v1_${'7e57'.repeat(16)}$(id)\`x\`"'\\;|&~+/=%s`;
@@ -104,6 +114,19 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   let argvLog: string;
   let tokenHex: string;
   let bin: string;
+  /** The image's container (`EZIL_REPO_OPEN_IT_IMAGE`): one for the file, like one computer. */
+  let container = '';
+  /**
+   * A command for the person's `.git/config` to name (perl, in the image too):
+   * it scans every `/proc/<pid>/environ` it can see for the token (as bytes
+   * from the hex file) and appends `<label> <passes> <processes> <hits>` to
+   * `walkerLog`, never the token. `<label> <seconds>` are its first arguments;
+   * it keeps scanning for that long, and touches `walkerLog.started` first.
+   */
+  let walker: string;
+  let walkerLog: string;
+  /** A repository with refs, for `objects/info/alternates` (so `core.alternateRefsCommand` runs). */
+  let altRepo: string;
   let server: ReturnType<typeof Bun.serve>;
   /** Another HTTPS host, with a certificate the same CA vouches for: anything sent here would have been accepted. */
   let evil: ReturnType<typeof Bun.serve>;
@@ -119,23 +142,33 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   const proxied: string[] = [];
   const printed: string[] = [];
 
-  /** The SDK's per-command env, applied the way the session shell applies it. */
+  /**
+   * The SDK's per-command env, applied the way its session shell applies it
+   * (`buildScopedEnvBlocks` in the container server): a `bash --norc` started
+   * WITHOUT the token reads `export NAME='value'` and the command on its
+   * stdin, and runs the command in a group with stdin from /dev/null. So, as
+   * there, the token is in that shell's variables but in no argv and in no
+   * `/proc/<pid>/environ` of the shell.
+   */
   const exec = (token: string): RepoOpenExec => async (command, options) => {
     expect(command).not.toContain(token);
     expect(Object.keys(options.env)).toEqual([REPO_OPEN_TOKEN_ENV]);
     const shimmed = `${bin}:${IMAGE ? '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' : process.env.PATH!}`;
     const envFor = { PATH: shimmed, HOME: home, GIT_SSL_CAINFO: cert, GIT_TRACE: trace, EZIL_IT_ARGV_LOG: argvLog,
-      EZIL_IT_TOKEN_HEX: tokenHex, ...options.env };
+      EZIL_IT_TOKEN_HEX: tokenHex };
     // In docker, `-e NAME` (no value) copies NAME from the docker CLI's own
-    // environment, so the token is never on docker's command line either. PATH
-    // is the exception: the CLI needs the host's to find docker, so the
-    // container's (not secret) is given by value.
+    // environment. PATH is the exception: the CLI needs the host's to find
+    // docker, so the container's is given by value. None of them is secret.
     const argv = IMAGE
-      ? ['docker', 'run', '--rm', '--network', 'host', '-v', `${dir}:${dir}`, '--entrypoint', 'bash', '-e', `PATH=${shimmed}`,
-        ...Object.keys(envFor).filter((k) => k !== 'PATH').flatMap((k) => ['-e', k]), IMAGE, '-c', command]
-      : ['bash', '-c', command];
+      ? ['docker', 'exec', '-i', '-e', `PATH=${shimmed}`,
+        ...Object.keys(envFor).filter((k) => k !== 'PATH').flatMap((k) => ['-e', k]), container, 'bash', '--norc']
+      : ['bash', '--norc'];
     for (const arg of argv) expect(arg).not.toContain(token);
-    const proc = Bun.spawn(argv, { env: IMAGE ? { ...envFor, PATH: process.env.PATH! } : envFor, stdout: 'pipe', stderr: 'pipe' });
+    const exports = Object.entries(options.env).map(([k, v]) => `  export ${k}='${v.replace(/'/g, `'\\''`)}'\n`).join('');
+    const proc = Bun.spawn(argv, {
+      env: IMAGE ? { ...envFor, PATH: process.env.PATH! } : envFor,
+      stdin: new Blob([`{\n${exports}${command}\n} < /dev/null\n`]), stdout: 'pipe', stderr: 'pipe',
+    });
     const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     printed.push(stdout, stderr);
     return { exitCode, stdout, stderr };
@@ -158,33 +191,45 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     git(seed, 'push', '-q', 'origin', 'HEAD:main');
     return git(seed, 'rev-parse', 'HEAD');
   };
-  /** The shim's log: one entry per `git` the script ran, with whether its environment held the token. */
+  /**
+   * The shim's log: one entry per `git` the script ran, with whether its own
+   * environment held the token, and whether any ancestor's
+   * `/proc/<pid>/environ` did.
+   */
   const ran = () => readFileSync(argvLog, 'utf8').split('\n').filter(Boolean).map((line) => {
-    const [env, cwd, ...argv] = line.split('\t');
-    return { token: env === 'token', cwd: cwd!, argv: argv.join('\t') };
+    const [env, ancestors, cwd, ...argv] = line.split('\t');
+    return { token: env === 'token', ancestor: ancestors === 'token', cwd: cwd!, argv: argv.join('\t') };
+  });
+  /** The walker's log since the start: one entry per time the person's config ran it. */
+  const walked = () => (existsSync(walkerLog) ? readFileSync(walkerLog, 'utf8') : '').split('\n').filter(Boolean).map((line) => {
+    const [label, passes, seenProcesses, hits] = line.split(' ');
+    return { label: label!, passes: Number(passes), processes: Number(seenProcesses), hits: Number(hits) };
   });
   /**
    * 🔴 The isolation invariant, for the `opens` opens logged since `mark`: each
    * had exactly one git command with the token in its environment, the network
    * fetch of the canonical URL into the private repository, run in the private
    * directory; every other command, and so everything that named or ran in an
-   * existing folder in the workspace (`fetched`: some must have), had none.
+   * existing folder in the workspace (`fetched`: some must have), had none,
+   * and ran under no process that was started with it.
    */
   const expectIsolated = (mark: number, opens: number, fetched = true) => {
     const mine = ran().slice(mark);
+    expect(mine.filter((r) => !r.token && r.ancestor)).toEqual([]);
     const withToken = mine.filter((r) => r.token);
     expect(withToken).toHaveLength(opens);
     for (const r of withToken) {
       expect(r.cwd).toMatch(/^\/tmp\/ezil-repo-open\.[A-Za-z0-9]+$/);
       expect(r.argv).toMatch(new RegExp(String.raw`^git --git-dir=/tmp/ezil-repo-open\.[A-Za-z0-9]+/mirror fetch --quiet --no-tags `
-        + String.raw`--no-recurse-submodules --no-write-fetch-head -- https://127\.0\.0\.1:${server.port}/(bearer/)?acme/[a-z]+\.git `
+        + String.raw`--no-recurse-submodules --no-write-fetch-head --no-auto-maintenance -- `
+        + String.raw`https://127\.0\.0\.1:${server.port}/(bearer/|slow/)?acme/[a-z]+\.git `
         + String.raw`\+refs/heads/\*:refs/heads/\* \+refs/tags/\*:refs/tags/\*$`));
       expect(r.argv).not.toContain(TOKEN);
     }
     expect(mine.length).toBeGreaterThan(opens);
     const workspace = mine.filter((r) => r.argv.includes(root) || r.cwd.startsWith(root));
     if (fetched) expect(workspace.length).toBeGreaterThan(0);
-    expect(workspace.filter((r) => r.token)).toEqual([]);
+    expect(workspace.filter((r) => r.token || r.ancestor)).toEqual([]);
   };
 
   beforeAll(() => {
@@ -198,16 +243,47 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     bin = join(dir, 'bin');
     for (const d of [upstream, home, root, bin]) mkdirSync(d, { recursive: true });
     // Records, for every `git` the script runs, whether the token is anywhere in
-    // its environment (matched as hex, so neither this file nor the log holds
-    // the token), its working directory and its arguments; then runs the real one.
+    // its environment, and in any ancestor's `/proc/<pid>/environ` (matched as
+    // hex, so neither this file nor the log holds the token), its working
+    // directory and its arguments; then runs the real one.
     tokenHex = join(dir, 'token.hex');
     writeFileSync(tokenHex, Buffer.from(TOKEN).toString('hex'));
     writeFileSync(join(bin, 'git'), [
       '#!/bin/sh',
-      `if env | od -An -v -tx1 | tr -d ' \\n' | grep -qF "$(cat "$EZIL_IT_TOKEN_HEX")"; then t=token; else t=clean; fi`,
-      `printf '%s\\t%s\\tgit %s\\n' "$t" "$(pwd)" "$*" >> "$EZIL_IT_ARGV_LOG"`,
+      'h=$(cat "$EZIL_IT_TOKEN_HEX")',
+      `if env | od -An -v -tx1 | tr -d ' \\n' | grep -qF "$h"; then t=token; else t=clean; fi`,
+      'a=clean; p=$PPID',
+      'while [ "$p" -gt 1 ] 2>/dev/null; do',
+      `  od -An -v -tx1 "/proc/$p/environ" 2>/dev/null | tr -d ' \\n' | grep -qF "$h" && a=token`,
+      `  p=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$p/status" 2>/dev/null)`,
+      'done',
+      `printf '%s\\t%s\\t%s\\tgit %s\\n' "$t" "$a" "$(pwd)" "$*" >> "$EZIL_IT_ARGV_LOG"`,
       `exec ${REAL_GIT} "$@"`, '',
     ].join('\n'), { mode: 0o755 });
+    walker = join(dir, 'walker.pl');
+    walkerLog = join(dir, 'walker.log');
+    writeFileSync(walker, [
+      '#!/usr/bin/perl',
+      'use strict; use warnings;',
+      'my ($label, $seconds) = @ARGV;',
+      `open(my $mark, '>', '${walkerLog}.started') or die; close $mark;`,
+      `open(my $hf, '<', '${tokenHex}') or die; my $hex = <$hf>; close $hf; chomp $hex;`,
+      "my $needle = pack('H*', $hex);",
+      'my ($passes, $seen, $hits, $until) = (0, 0, 0, time + $seconds);',
+      'do {',
+      "  for my $e (glob '/proc/[0-9]*/environ') {",
+      "    open(my $f, '<', $e) or next; local $/; my $d = <$f>; close $f;",
+      '    next unless defined $d; $seen++; $hits++ if index($d, $needle) >= 0;',
+      '  }',
+      '  $passes++;',
+      '} while (time < $until);',
+      `open(my $log, '>>', '${walkerLog}') or die; print $log "$label $passes $seen $hits\\n"; close $log;`, '',
+    ].join('\n'), { mode: 0o755 });
+    altRepo = join(dir, 'alt.git');
+    sh(['git', 'init', '-q', '--bare', altRepo]);
+    if (IMAGE) {
+      container = sh(['docker', 'run', '-d', '--rm', '--network', 'host', '-v', `${dir}:${dir}`, '--entrypoint', 'sleep', IMAGE, 'infinity']);
+    }
     // The computer's own git config asks for a credential store. It must never run.
     writeFileSync(join(home, '.gitconfig'), '[credential]\n\thelper = store\n');
     sh(['git', 'init', '-q', '--bare', join(upstream, 'acme', 'site.git')]);
@@ -228,10 +304,16 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
         if (req.headers.get('authorization') !== (isBearer ? BEARER : BASIC)) {
           return new Response('authentication required', { status: 401, headers: { 'www-authenticate': 'Basic realm="ezil-it"' } });
         }
+        // `/slow/` (Basic): the same repositories, each answer a second late, so a fetch stays in flight.
+        let path = isBearer ? u.pathname.slice('/bearer'.length) : u.pathname;
+        if (path.startsWith('/slow/')) {
+          path = path.slice('/slow'.length);
+          await Bun.sleep(1000);
+        }
         const proc = Bun.spawn(['git', 'http-backend'], {
           env: {
             PATH: process.env.PATH!, GIT_PROJECT_ROOT: upstream, GIT_HTTP_EXPORT_ALL: '1',
-            REQUEST_METHOD: req.method, PATH_INFO: isBearer ? u.pathname.slice('/bearer'.length) : u.pathname, QUERY_STRING: u.search.slice(1),
+            REQUEST_METHOD: req.method, PATH_INFO: path, QUERY_STRING: u.search.slice(1),
             CONTENT_TYPE: req.headers.get('content-type') ?? '', REMOTE_ADDR: '127.0.0.1', REMOTE_USER: 'ezil',
             ...(req.headers.get('git-protocol') ? { GIT_PROTOCOL: req.headers.get('git-protocol')! } : {}),
             ...(req.headers.get('content-encoding') ? { HTTP_CONTENT_ENCODING: req.headers.get('content-encoding')! } : {}),
@@ -278,6 +360,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     server?.stop(true);
     evil?.stop(true);
     proxy?.stop(true);
+    if (container) Bun.spawnSync(['docker', 'rm', '-f', container]);
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -301,7 +384,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(traced).toMatch(/run_command:.*f\(\) \{ test "\$1" = get/);
     expect(traced).not.toContain(TOKEN);
     const logged = readFileSync(argvLog, 'utf8');
-    expect(logged).toContain(`--no-write-fetch-head -- ${url} `);
+    expect(logged).toContain(`--no-auto-maintenance -- ${url} `);
     expect(logged).toMatch(/git clone --quiet --branch main --origin origin -- \/tmp\/ezil-repo-open\.[A-Za-z0-9]+\/mirror /);
     expect(logged).not.toContain(TOKEN);
     expectIsolated(mark, 1, false);
@@ -463,7 +546,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(filesContaining(folder, TOKEN)).toEqual([]);
     expect(readFileSync(trace, 'utf8')).not.toContain(TOKEN);
     expect(readFileSync(trace, 'utf8')).not.toContain('Bearer');
-    expect(readFileSync(argvLog, 'utf8')).toContain(`--no-write-fetch-head -- ${bearerUrl} `);
+    expect(readFileSync(argvLog, 'utf8')).toContain(`--no-auto-maintenance -- ${bearerUrl} `);
     expect(readFileSync(argvLog, 'utf8')).not.toContain(TOKEN);
     expect(printed.join('\n')).not.toContain(TOKEN);
     expectIsolated(mark, 1, false);
@@ -596,6 +679,111 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     });
   }
 
+  /**
+   * 🔴 Review F1, repair round. Updating the person's folder runs git in it, and
+   * git runs what its config names, as root: `core.alternateRefsCommand`
+   * (given an `objects/info/alternates`) during the fetch, a smudge filter
+   * during the empty clone's checkout. The walker stands in for that command.
+   * The token must be in no process it can see: `unset` in a shell does not
+   * change `/proc/<pid>/environ`, so the earlier script, still running (and
+   * waiting on the update) under the bash the SDK started with the token,
+   * failed every one of these at `hits`.
+   */
+  describe('a command the folder\'s own config runs while it is updated (review F1, repair round)', () => {
+    const planted = (folder: string, command: string) => {
+      const configPath = join(folder, '.git', 'config');
+      const original = readFileSync(configPath, 'utf8');
+      const alternates = join(folder, '.git', 'objects', 'info', 'alternates');
+      mkdirSync(dirname(alternates), { recursive: true });
+      writeFileSync(alternates, `${altRepo}/objects\n`);
+      git(folder, 'config', '--local', 'core.alternateRefsCommand', command);
+      return () => {
+        writeFileSync(configPath, original);
+        rmSync(alternates, { force: true });
+      };
+    };
+    const expectRanClean = (since: number, label: string) => {
+      const runs = walked().slice(since);
+      expect(runs.length).toBeGreaterThan(0);
+      for (const run of runs) {
+        expect(run.label).toBe(label);
+        expect(run.processes).toBeGreaterThan(1);
+        expect(run.hits).toBe(0);
+      }
+      return runs;
+    };
+
+    for (const scheme of ['basic', 'bearer'] as const) {
+      it(`🔴 ${scheme}: core.alternateRefsCommand during the fetch finds no process holding the token`, async () => {
+        const id = scheme === 'basic' ? REPO : 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
+        const folder = repoOf(id);
+        const restore = planted(folder, `${walker} alternates-${scheme} 0`);
+        const next = commit(`walker ${scheme}`, 'WALKER.md', `${scheme}\n`);
+        const [since, mark] = [walked().length, ran().length];
+        try {
+          const answer = await open(scheme === 'basic' ? { repositoryId: id } : bearer({ repositoryId: id }));
+          expectRanClean(since, `alternates-${scheme}`);
+          expect(answer).toEqual({ ok: true, folder: folderOf(id), head: git(folder, 'rev-parse', 'HEAD'), status: 'fetched' });
+          expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
+          expectIsolated(mark, 1);
+        } finally {
+          restore();
+        }
+      });
+    }
+
+    it('🔴 a smudge filter during the empty clone\'s first checkout finds no process holding the token', async () => {
+      const id = 'c3d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b';
+      sh(['git', 'init', '-q', '--bare', join(upstream, 'acme', 'blank.git')]);
+      sh(['git', 'symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: join(upstream, 'acme', 'blank.git') });
+      const blankUrl = `${base}/bearer/acme/blank.git`;
+      expect(await open(bearer({ repositoryId: id, canonicalURL: blankUrl }))).toEqual({ ok: true, folder: folderOf(id), status: 'created' });
+      const folder = repoOf(id);
+      mkdirSync(join(folder, '.git', 'info'), { recursive: true });
+      writeFileSync(join(folder, '.git', 'info', 'attributes'), '* filter=walk\n');
+      git(folder, 'config', '--local', 'filter.walk.smudge', `${walker} smudge 0 </dev/null; cat`);
+      const pusher = join(dir, 'blank-pusher');
+      sh(['git', 'init', '-q', pusher]);
+      git(pusher, 'remote', 'add', 'origin', join(upstream, 'acme', 'blank.git'));
+      writeFileSync(join(pusher, 'README.md'), '# blank no more\n');
+      git(pusher, 'add', 'README.md');
+      git(pusher, '-c', 'user.name=t', '-c', 'user.email=t@example.test', 'commit', '-qm', 'first');
+      git(pusher, 'push', '-q', 'origin', 'HEAD:main');
+      const [since, mark] = [walked().length, ran().length];
+      const answer = await open(bearer({ repositoryId: id, canonicalURL: blankUrl }));
+      expectRanClean(since, 'smudge');
+      expect(answer).toEqual({ ok: true, folder: folderOf(id), head: git(pusher, 'rev-parse', 'HEAD'), status: 'fetched' });
+      expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# blank no more\n');
+      expectIsolated(mark, 1);
+    });
+
+    it('🔴 nor while another open is under way: its network fetch waits until the update is done, and nothing waiting holds the token', async () => {
+      const folder = repoOf(REPO);
+      // Scans for 4 s from inside the update, while a second open (of another
+      // folder, from a server that answers a second late) starts.
+      const restore = planted(folder, `${walker} concurrent 4`);
+      const next = commit('walker concurrent', 'WALKER.md', 'concurrent\n');
+      const other = 'f1d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b';
+      rmSync(`${walkerLog}.started`, { force: true });
+      const [since, mark] = [walked().length, ran().length];
+      try {
+        const first = open();
+        for (let i = 0; i < 400 && !existsSync(`${walkerLog}.started`); i++) await Bun.sleep(25);
+        expect(existsSync(`${walkerLog}.started`)).toBe(true);
+        const second = open({ repositoryId: other, canonicalURL: `${base}/slow/acme/site.git` });
+        const [a, b] = await Promise.all([first, second]);
+        const runs = expectRanClean(since, 'concurrent');
+        expect(runs.some((run) => run.passes > 1)).toBe(true);
+        expect(a).toMatchObject({ ok: true, status: 'fetched' });
+        expect(b).toMatchObject({ ok: true, folder: folderOf(other), status: 'cloned' });
+        expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
+        expectIsolated(mark, 2);
+      } finally {
+        restore();
+      }
+    }, 60_000);
+  });
+
   it('🔴 review F3: what code-server would run from a workspace folder\'s root is one level down, never at the folder Code opens', async () => {
     // Everything code-server 1.141 reads from a workspace folder's root that can start a process.
     const planted: Record<string, string> = {
@@ -647,6 +835,8 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(filesContaining(home, TOKEN)).toEqual([]);
     expect(existsSync(join(home, '.git-credentials'))).toBe(false);
     expect(printed.join('\n')).not.toContain(TOKEN);
-    expect(readdirSync('/tmp').filter((n) => n.startsWith('ezil-repo-open.'))).toEqual([]);
+    const tmp = IMAGE ? sh(['docker', 'exec', container, 'ls', '-A', '/tmp']).split('\n') : readdirSync('/tmp');
+    // No private directory is left (the computer's lock file stays, empty).
+    expect(tmp.filter((n) => /^ezil-repo-open\.[A-Za-z0-9]{6}$/.test(n))).toEqual([]);
   });
 });
