@@ -46,7 +46,7 @@ const meter = (id, label, value, percent, text, note, state, action = '') => `<s
  * `lastAccount`: the last readable `ai.account` for `userId` (the signed-in user), shown with "Couldn't refresh ·
  * as of HH:MM" when this summary has no readable balance or failed.
  */
-export function usageHtml(data, summary = null, { stale = false, lastAccount = null, userId = null } = {}) {
+export function usageHtml(data, summary = null, { stale = false, lastAccount = null, userId = null, summaryLoading = false } = {}) {
     if (data != null && data.enabled !== false && (data.enabled !== true || data.version !== 1 || !data.session || data.period?.unit !== 'standard_seconds' || !data.storage)) throw Error('Unsupported usage response');
     if (summary?.enabled !== true || summary.version !== 3) summary = null;
     const usage = data?.enabled === true ? data : null;
@@ -158,6 +158,10 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
                 : pending ? `${esc(creditsLabel(null, pending.credits))} more from ${timestamp(pending.at)}` : '',
             identity.stale ? '' : ai?.included && validDate(ai.included.periodEnd) ? `Resets ${timestamp(ai.included.periodEnd)}` : grant?.per === 'period' && grantLabel ? `Your plan adds ${grantLabel} every month` : '',
         ].filter(Boolean).join('<br>');
+    }
+    // Usage can answer before the summary: until the first summary arrives the credits are being read, not unreadable.
+    if (summaryLoading && !ai && identity === undefined) {
+        aiState = 'pending'; aiPercent = null; aiValue = 'Checking…'; aiText = 'Checking your AI credits.'; aiNote = '';
     }
     const aiAction = enrollment === 'needs_ezil_id' ? ezilHref ? `<a class="ezil-settings-btn" data-action="ezil-id" href="${esc(ezilHref)}">Sign in with EZiL ID</a>` : ''
         : enrollment === 'enrolled' && actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '';
@@ -331,7 +335,7 @@ async function load(state, manual = false) {
         }
         if (!currentRequest()) return;
         paint(body, usageHtml(state.usage, state.summary, { stale: failed.has('usage') || pending.has('usage'),
-            lastAccount: state.lastAccount ?? null, userId: requested.ownerId ?? null }));
+            lastAccount: state.lastAccount ?? null, userId: requested.ownerId ?? null, summaryLoading: pending.has('summary') && !state.summary }));
         if (!pending.size) {
             body.attr('aria-busy', 'false');
             status.toggleClass('usage-warning', failed.size > 0).html(failed.size

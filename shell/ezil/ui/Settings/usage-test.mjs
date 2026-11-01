@@ -792,4 +792,13 @@ try {
     passed++; console.log('PASS overlapping, hidden and detached-window late responses cannot repaint');
     tab.onDeactivate();
 } finally { tab.onDeactivate(); globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; dom.window.close(); }
+{
+    // Live staging (2026-11-01): usage answered first and the row read "Unavailable" for up to 3.6 s.
+    const loading = usageHtml(sample, null, { summaryLoading: true });
+    assert.match(loading, /Checking…/);
+    assert.doesNotMatch(loading, /couldn't read your balance|>Unavailable</);
+    // Positive control: once the summary has failed (not loading) the row says so.
+    assert.match(usageHtml(sample, null, { summaryLoading: false }), /couldn't read your balance/);
+    passed++; console.log('PASS the AI row says Checking… while the summary loads, and unreadable only after it fails');
+}
 console.log(`PASS ${passed} Usage checks; 0 failed`);
