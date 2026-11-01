@@ -46,7 +46,7 @@ const meter = (id, label, value, percent, text, note, state, action = '') => `<s
  * `lastAccount`: the last readable `ai.account` for `userId` (the signed-in user), shown with "Couldn't refresh ·
  * as of HH:MM" when this summary has no readable balance or failed.
  */
-export function usageHtml(data, summary = null, { stale = false, lastAccount = null, userId = null, summaryLoading = false } = {}) {
+export function usageHtml(data, summary = null, { stale = false, lastAccount = null, userId = null, summaryLoading = false, usageLoading = false } = {}) {
     if (data != null && data.enabled !== false && (data.enabled !== true || data.version !== 1 || !data.session || data.period?.unit !== 'standard_seconds' || !data.storage)) throw Error('Unsupported usage response');
     if (summary?.enabled !== true || summary.version !== 3) summary = null;
     const usage = data?.enabled === true ? data : null;
@@ -79,11 +79,12 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     const free = plan?.sku === 'free_v3' || ['files_on_aws', 'free'].includes(summary?.computer?.standing);
     const lines = hoursLeftLines(hoursPeriod, choices, { monthly: free });
     const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
-    const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
+    // Nothing read yet is a load in progress, never a failure (live staging 2026-11-01: a 0.2 s "couldn't read" flash).
+    const left = !lines ? usageLoading ? 'Checking…' : 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
     const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
     const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
-        : timePercent === null ? "We couldn't read your usage. Try Refresh."
+        : timePercent === null ? usageLoading ? '' : "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
         : lines?.equivalents ? esc(lines.equivalents)
@@ -186,7 +187,7 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     // sample it shows the disk and says space used isn't measured yet, never "0 used". A computer with no disk
     // figure (Cloudflare) has no measurement at all and says so.
     const storageValue = leftBytes !== null ? `${esc(diskBytes(leftBytes))} left`
-        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
+        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : usageLoading ? 'Checking…' : 'Not measured yet';
     const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
         : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects. Space used isn't measured yet.`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
@@ -206,7 +207,7 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
     ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
-    <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : 'Plan unavailable'}</h4>
+    <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : summaryLoading ? 'Checking your plan…' : 'Plan unavailable'}</h4>
         ${validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
@@ -221,9 +222,9 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
         <details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
             ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
-            <p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p></details>
+            ${usageLoading ? '' : `<p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p>`}</details>
         <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Storage is the disk on your computer; some space is used by the system. A used figure appears once it is measured.</p></details>
-        <details data-usage-detail="session"><summary>Session details</summary><dl>${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}</dl></details>
+        <details data-usage-detail="session"><summary>Session details</summary><dl>${usageLoading ? '' : `${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}`}</dl></details>
     </div>`;
 }
 
@@ -286,7 +287,7 @@ async function load(state, manual = false) {
     if (!sameScope(state.observedScope, requested)) {
         state.usage = null; state.summary = null; state.summaryAt = undefined; state.meterStates = null; state.observedScope = requested;
         state.lastAccount = null;
-        body.html(usageHtml(null)); state.win.find('[data-role="usage-announcement"]').empty();
+        body.html(usageHtml(null, null, { usageLoading: true, summaryLoading: true })); state.win.find('[data-role="usage-announcement"]').empty();
     }
     status.removeAttr('role').removeClass('usage-warning').text(state.usage ? 'Refreshing…' : 'Loading usage…');
     body.attr('aria-busy', 'true');
@@ -335,7 +336,8 @@ async function load(state, manual = false) {
         }
         if (!currentRequest()) return;
         paint(body, usageHtml(state.usage, state.summary, { stale: failed.has('usage') || pending.has('usage'),
-            lastAccount: state.lastAccount ?? null, userId: requested.ownerId ?? null, summaryLoading: pending.has('summary') && !state.summary }));
+            lastAccount: state.lastAccount ?? null, userId: requested.ownerId ?? null, summaryLoading: pending.has('summary') && !state.summary,
+            usageLoading: pending.has('usage') && !state.usage }));
         if (!pending.size) {
             body.attr('aria-busy', 'false');
             status.toggleClass('usage-warning', failed.size > 0).html(failed.size

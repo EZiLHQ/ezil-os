@@ -643,10 +643,14 @@ try {
     let u = deferred(), s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise };
     tab.onActivate(win);
     assert.match(win.text(), /Loading usage/);
+    // The first painted frame (nothing answered yet) is a load, not a failure.
+    assert.doesNotMatch(win.text(), /couldn't read|Plan unavailable|Unavailable/);
     assert.deepEqual(calls.slice(0, 2), [{ path: 'billing.usage', input: { computerId: 'computer-a' } }, { path: 'billing.summary', input: undefined }]);
     u.resolve({ ok: true, data: sample }); await tick();
     assert.match(win.text(), /About 16 hours left at 2 vCPU/);
-    assert.match(win.text(), /Plan unavailable/);
+    // The summary is still on its way: its rows are loading, not failed.
+    assert.match(win.text(), /Checking your plan…/);
+    assert.doesNotMatch(win.text(), /Plan unavailable|couldn't read your balance/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'true');
     s.resolve({ ok: true, data: summary }); await tick();
     assert.match(win.text(), /120 of 200 left/);
@@ -799,6 +803,12 @@ try {
     assert.doesNotMatch(loading, /couldn't read your balance|>Unavailable</);
     // Positive control: once the summary has failed (not loading) the row says so.
     assert.match(usageHtml(sample, null, { summaryLoading: false }), /couldn't read your balance/);
+    // The first frame, before anything answered: every row is loading, none says it failed.
+    const first = usageHtml(null, null, { usageLoading: true, summaryLoading: true });
+    assert.doesNotMatch(first, /couldn't read|Unavailable|Plan unavailable|Not measured yet/);
+    assert.match(first, /Checking your plan…/);
+    // Positive control: with nothing loading, the same empty frame reports the failures.
+    assert.match(usageHtml(null, null), /Plan unavailable/);
     passed++; console.log('PASS the AI row says Checking… while the summary loads, and unreadable only after it fails');
 }
 console.log(`PASS ${passed} Usage checks; 0 failed`);
