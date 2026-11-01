@@ -1067,7 +1067,10 @@ class RepoOpenEdge(unittest.TestCase):
     def test_framing_signature_and_method_are_enforced_before_the_agent(self):
         data = json.dumps(relayed()).encode()
         d = hashlib.sha256(data).hexdigest()
-        big = b" " * (edge_mod.MAX_REPO_OPEN_BODY + 1)
+        # Oversize but otherwise valid (JSON allows trailing whitespace, the digest matches), so only the
+        # size bound refuses it.
+        big = data + b" " * (edge_mod.MAX_REPO_OPEN_BODY + 1 - len(data))
+        self.assertIsNotNone(ro.decode_relay(big))
         cases = [
             (self.start_req(data, gw=False), 401),
             (self.start_req(data, ts=int(time.time()) - 200), 401),                         # stale gw1
