@@ -51,6 +51,29 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('host storage samples ar
         })).rejects.toBeInstanceOf(Rollback);
     });
 
+    it('waits for the per-computer lock, so a twin committed by the holder is seen and not inserted again', async () => {
+        const store = createBillingStore(db);
+        const userId = randomUUID();
+        const computerId = randomUUID();
+        await db.insert(authUsers).values({ id: userId });
+        const measuredAt = new Date('2026-11-01T12:45:00Z');
+        let settled = false;
+        let pending: Promise<'recorded' | 'duplicate'> | undefined;
+        // Another writer holds the computer's lock and inserts the same sample, uncommitted.
+        await client.begin(async sql => {
+            await sql`select pg_advisory_xact_lock(hashtextextended(${`billing:storage_sample:${computerId}`}, 0))`;
+            await sql`insert into ezil_billing_storage_samples (user_id, computer_id, bytes, measured_at, source)
+                values (${userId}, ${computerId}, 512, ${measuredAt.toISOString()}::timestamptz, 'host-agent')`;
+            pending = store.insertStorageSampleOnce!(userId, { computerId, bytes: BigInt(512), measuredAt, source: 'host-agent' });
+            void pending.then(() => { settled = true; }, () => { settled = true; });
+            await new Promise(resolve => setTimeout(resolve, 400));
+            expect(settled).toBe(false);   // blocked on the lock, not racing past an uncommitted twin
+        });
+        expect(await pending).toBe('duplicate');
+        const rows = await db.select().from(billingStorageSamples).where(eq(billingStorageSamples.computerId, computerId));
+        expect(rows).toHaveLength(1);
+    });
+
     it('records one row when eight retries of the same sample race on separate connections', async () => {
         const store = createBillingStore(db);
         const userId = randomUUID();

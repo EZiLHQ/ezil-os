@@ -102,6 +102,8 @@ export async function handleHostStorageSample(request: Request, deps: HostStorag
     }
     // The epoch the host names must be this placement's CURRENT aws-ec2 epoch, still holding the
     // consumed-nonce proof the key is derived from (cleared at DRAINING/RETIRING and every new lease).
+    // The MAC below binds the same epoch again (key and message use the placement's values); this
+    // early comparison only answers a superseded epoch without deriving a key.
     if (!placement || placement.provider !== 'aws-ec2' || placement.computerId.toLowerCase() !== computerId
         || placement.generation !== Number(generation) || placement.leaseEpoch !== Number(leaseEpoch)
         || !RUNNING_CLASS_STATES.includes(placement.state) || !placement.instanceId
