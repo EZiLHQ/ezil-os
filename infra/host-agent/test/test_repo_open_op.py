@@ -720,6 +720,13 @@ class Job(JobBase):
             a.repo_open.startup()
         self.assertFalse(a.repo_open.busy)
 
+    def test_a_message_for_another_epoch_is_refused(self):
+        self.seq += 1
+        msg = {"op": "repo_open", "leaseEpoch": 3, "ts": time.time(), "seq": self.seq, "request": relayed()}
+        msg["mac"] = agentmod.sign(b"k" * 32, msg)
+        self.assertEqual(self.a.handle(json.dumps(msg)), {"ok": False, "error": "wrong_epoch"})
+        self.assertEqual(self.runner.jobs, {})
+
     def test_invalid_messages_are_refused_before_the_seq_is_used(self):
         last = self.a.last_seq
         for fields in ({"request": relayed(name="../x")}, {"request": relayed(), "extra": 1}, {"request": "x"},
@@ -1075,6 +1082,8 @@ class RepoOpenEdge(unittest.TestCase):
             (self.start_req(data, gw=False), 401),
             (self.start_req(data, ts=int(time.time()) - 200), 401),                         # stale gw1
             (self.start_req(data, gw=test_edge.gw_header("POST", f"/__ezil/control/repo-open/{'0' * 64}")), 401),
+            (self.start_req(data, gw=test_edge.gw_header("POST", f"/__ezil/control/repo-open/{d}",
+                                                         binding={**test_edge.LEASE, "leaseEpoch": 3})), 401),   # another epoch
             (self.start_req(big, digest=hashlib.sha256(big).hexdigest()), 400),             # oversize
             (self.req("POST", f"/__ezil/control/repo-open/{d}", headers=["Transfer-Encoding: chunked"],
                       body=b"%x\r\n" % len(data) + data + b"\r\n0\r\n\r\n"), 400),           # chunked
