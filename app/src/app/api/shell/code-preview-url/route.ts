@@ -7,7 +7,7 @@ import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-c
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import { requestRepoOpen, withRepositoryFolder } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
-import { projectIds, projectInvalid, retainedIdentityOrRefusal, shellRefusal, worksGrantOrRefusal } from '@/server/works/shell-project';
+import { projectGrantOrRefusal, projectIds, projectInvalid, retainedIdentityOrRefusal, shellRefusal } from '@/server/works/shell-project';
 
 /**
  * `/api/shell/code-preview-url` — mint a fresh code-server window URL for one
@@ -149,7 +149,7 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, computerId: str
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
 
-    const grant = await worksGrantOrRefusal(identity, ids, 'code-preview-url');
+    const grant = await projectGrantOrRefusal(identity, ids, 'code-preview-url');
     if (grant instanceof Response) return grant;
 
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.

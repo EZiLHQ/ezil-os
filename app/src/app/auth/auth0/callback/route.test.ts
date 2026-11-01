@@ -101,7 +101,7 @@ describe('Auth0 callback', () => {
     });
 });
 
-describe('Auth0 callback retains the verified ID token for EZiL Works', () => {
+describe('Auth0 callback retains the verified ID token for Universe', () => {
     it('retains the exact token only after the bridge minted the session it is bound to', async () => {
         const response = await GET(request());
         expect(stub.retain).toHaveBeenCalledWith('private-id-token');

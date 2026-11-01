@@ -182,7 +182,7 @@ export function logoutUrl(origin: string): URL {
 }
 
 /**
- * Re-verify a retained ID token before it is handed to EZiL Works (ported from 1ac89c72). Independent of
+ * Re-verify a retained ID token before it is handed to Universe 2.0 (ported from 1ac89c72). Independent of
  * `verifyIdToken`: no nonce (the login transaction is gone), no expiry leeway, an exact audience, and only the
  * issuer and subject come back, never the email.
  */

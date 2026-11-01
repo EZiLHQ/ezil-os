@@ -1,6 +1,6 @@
 /**
  * `POST /api/shell/code-repo-snapshot` (os-map-design §5 fallback). The session and the retained identity are
- * stubbed; the Works client is real behind a stubbed `fetch`; the git fetcher is the pluggable boundary
+ * stubbed; the Universe client is real behind a stubbed `fetch`; the git fetcher is the pluggable boundary
  * (`@/server/works/git-smart-http`), replaced here so the route is pinned without a git server.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,13 +11,16 @@ const USER = '11111111-1111-4111-8111-111111111111';
 const PROJECT = '3333abcd-3333-4333-8333-33333333cdef';
 const REPO = '44444444-4444-4444-8444-44444444abcd';
 const ID_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.private-retained-id-token.signature';
-const GIT_TOKEN = `egg_${'3'.repeat(64)}`;
-const WORKS = 'https://works-staging.example';
+/** An opaque Cloudflare Artifacts repo token, as Universe hands it out. */
+const GIT_TOKEN = `art_v1_${'3'.repeat(64)}`;
+const ACCOUNT = '0123456789abcdef'.repeat(2);
+const ARTIFACTS = `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-${PROJECT}.git`;
+const UNIVERSE = 'https://universe-staging.example';
 
 const s = vi.hoisted(() => ({
     signedIn: true,
     identity: true,
-    works: null as null | (() => Response),
+    universe: null as null | (() => Response),
     tree: null as null | (() => Promise<unknown>),
     fetched: [] as unknown[],
     order: [] as string[],
@@ -41,20 +44,20 @@ import { GitFetchError } from '@/server/works/git-smart-http';
 import { POST } from './route';
 
 const grant = () => ({
-    binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main', bindingVersion: 'a'.repeat(64) },
+    binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main', bindingVersion: '1' },
     access: { role: 'client' },
     git: { username: 'ezil', token: GIT_TOKEN, expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: 'read' },
 });
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
     Object.assign(s, { signedIn: true, identity: true, fetched: [], order: [], cleared: 0,
-        works: () => Response.json(grant()),
+        universe: () => Response.json(grant()),
         tree: async () => ({ head: 'c'.repeat(40), entries: [{ path: 'README.md', kind: 'file', mode: '100644', size: 3, content: Buffer.from('hi\n') }] }) });
-    vi.stubEnv('EZIL_WORKS_PROJECT_REPO_ORIGIN', WORKS);
+    vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', UNIVERSE);
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
-        if (new URL(String(input)).origin !== WORKS) throw new Error('unexpected fetch');
-        s.order.push('works');
-        return s.works!();
+        if (new URL(String(input)).origin !== UNIVERSE) throw new Error('unexpected fetch');
+        s.order.push('universe');
+        return s.universe!();
     }));
     logs = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'info').mockImplementation(() => {}),
         vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
@@ -67,19 +70,19 @@ const snapshot = (project: unknown = { projectId: PROJECT, repoId: REPO }) => po
 async function expectNoSecrets(response: Response) {
     const text = await response.clone().text();
     const logged = JSON.stringify(logs.flatMap(l => l.mock.calls));
-    for (const secret of [GIT_TOKEN, 'egg_', ID_TOKEN, 'eyJ']) { expect(text).not.toContain(secret); expect(logged).not.toContain(secret); }
+    for (const secret of [GIT_TOKEN, 'art_v1_', ID_TOKEN, 'eyJ', ACCOUNT, 'artifacts.cloudflare.net']) { expect(text).not.toContain(secret); expect(logged).not.toContain(secret); }
 }
 
 describe('POST /api/shell/code-repo-snapshot', () => {
-    it('authorizes with Works, fetches on the server with the grant, and answers only the tree and text', async () => {
+    it('authorizes with Universe, fetches on the server with the grant, and answers only the tree and text', async () => {
         const response = await snapshot();
         expect(response.status).toBe(200);
         expect(response.headers.get('cache-control')).toContain('no-store');
         expect(await response.clone().json()).toEqual({ ok: true, snapshot: {
             projectId: PROJECT, repositoryId: REPO, ref: 'refs/heads/main', head: 'c'.repeat(40), role: 'client', truncated: false,
             entries: [{ path: 'README.md', kind: 'file', size: 3, text: 'hi\n' }] } });
-        expect(s.order).toEqual(['identity', 'works', 'git']);
-        expect(s.fetched[0]).toMatchObject({ canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main', username: 'ezil', token: GIT_TOKEN });
+        expect(s.order).toEqual(['identity', 'universe', 'git']);
+        expect(s.fetched[0]).toMatchObject({ canonicalURL: ARTIFACTS, ref: 'refs/heads/main', username: 'ezil', token: GIT_TOKEN });
         await expectNoSecrets(response);
     });
 
@@ -105,7 +108,7 @@ describe('POST /api/shell/code-repo-snapshot', () => {
         expect(s.order).toEqual([]);
     });
 
-    it('no retained identity is IDENTITY_REFRESH_REQUIRED (409) and Works is not asked', async () => {
+    it('no retained identity is IDENTITY_REFRESH_REQUIRED (409) and Universe is not asked', async () => {
         s.identity = false;
         const response = await snapshot();
         expect(response.status).toBe(409);
@@ -113,8 +116,8 @@ describe('POST /api/shell/code-repo-snapshot', () => {
         expect(s.order).toEqual(['identity']);
     });
 
-    it('Works 403 is project_not_authorized and nothing is fetched', async () => {
-        s.works = () => Response.json({ error: 'project_repo_not_authorized', message: 'x' }, { status: 403 });
+    it('Universe 403 is project_not_authorized and nothing is fetched', async () => {
+        s.universe = () => Response.json({ error: 'project_repo_not_authorized', message: 'x' }, { status: 403 });
         const response = await snapshot();
         expect(response.status).toBe(403);
         expect((await response.clone().json()).error.code).toBe('project_not_authorized');
@@ -122,8 +125,8 @@ describe('POST /api/shell/code-repo-snapshot', () => {
         await expectNoSecrets(response);
     });
 
-    it('Works 401 drops the retained token and asks for a refresh', async () => {
-        s.works = () => Response.json({ error: 'project_repo_invalid_identity', message: 'x' }, { status: 401 });
+    it('Universe 401 drops the retained token and asks for a refresh', async () => {
+        s.universe = () => Response.json({ error: 'project_repo_invalid_identity', message: 'x' }, { status: 401 });
         expect((await (await snapshot()).json()).error.code).toBe('IDENTITY_REFRESH_REQUIRED');
         expect(s.cleared).toBe(1);
     });

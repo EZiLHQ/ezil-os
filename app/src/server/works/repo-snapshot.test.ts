@@ -6,11 +6,12 @@ import { buildSnapshot, SNAPSHOT_FILE_MAX_BYTES, SNAPSHOT_MAX_ENTRIES, SNAPSHOT_
 import type { GitTreeEntry } from './git-smart-http';
 import type { ProjectRepoGrant } from './project-repo';
 
-const TOKEN = `egg_${'5'.repeat(64)}`;
+const TOKEN = `art_v1_${'5'.repeat(64)}`;
 const grant: ProjectRepoGrant = {
     binding: { projectId: '3333abcd-3333-4333-8333-33333333cdef', repositoryId: '44444444-4444-4444-8444-44444444abcd',
-        canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main', bindingVersion: 'd'.repeat(64) },
-    role: 'client', git: { username: 'ezil', token: TOKEN, expiresAt: '2026-10-31T12:05:00.000Z' },
+        canonicalURL: `https://${'0123456789abcdef'.repeat(2)}.artifacts.cloudflare.net/git/universe-staging/p-3333abcd-3333-4333-8333-33333333cdef.git`,
+        ref: 'refs/heads/main', bindingVersion: '1' },
+    role: 'client', git: { username: 'ezil', token: TOKEN, expiresAt: '2026-10-31T12:05:00.000Z', scope: 'read' },
 };
 const file = (path: string, content: Uint8Array | string, mode = '100644'): GitTreeEntry => {
     const bytes = typeof content === 'string' ? Buffer.from(content) : content;

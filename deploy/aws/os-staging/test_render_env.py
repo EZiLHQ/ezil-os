@@ -24,12 +24,17 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_AWS_ARBITRARY": "synthetic"})
 
-    def test_works_project_repo_origin_is_optional(self):
-        # Opening an EZiL Works project in Code (app/src/server/works/project-repo.ts): off unless set.
-        works = {"EZIL_WORKS_PROJECT_REPO_ORIGIN": "https://works.example.invalid"}
-        self.assertEqual(renderer.validate({**self.values, **works}), {**self.values, **works})
-        self.assertIn("EZIL_WORKS_PROJECT_REPO_ORIGIN", renderer.OPTIONAL)
-        self.assertNotIn("EZIL_WORKS_PROJECT_REPO_ORIGIN", renderer.REQUIRED)
+    def test_universe_project_repo_origin_is_optional(self):
+        # Opening a Universe project in Code (app/src/server/works/project-repo.ts): off unless set.
+        universe = {"UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe-staging.example.invalid"}
+        self.assertEqual(renderer.validate({**self.values, **universe}), {**self.values, **universe})
+        self.assertIn("UNIVERSE_PROJECT_REPO_ORIGIN", renderer.OPTIONAL)
+        self.assertNotIn("UNIVERSE_PROJECT_REPO_ORIGIN", renderer.REQUIRED)
+
+    def test_the_old_works_origin_name_is_refused(self):
+        # Renamed when the authority moved to Universe: a secret still holding the old key fails rendering.
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.values, "EZIL_WORKS_PROJECT_REPO_ORIGIN": "https://works.example.invalid"})
 
     def test_feedback_keys_are_optional(self):
         # In-product feedback (docs/feedback-migration.md): off unless set, so

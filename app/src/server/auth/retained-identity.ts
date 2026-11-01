@@ -8,7 +8,7 @@ import { AUTH0_COOKIE_OPTIONS, verifyProjectIdToken } from './auth0';
 import { Vault } from './vault';
 
 /**
- * The person's verified EZiL ID token, kept on the server for the one thing that needs it: asking EZiL Works for a
+ * The person's verified EZiL ID token, kept on the server for the one thing that needs it: asking Universe 2.0 for a
  * project repository (`../works/project-repo.ts`). Ported from the identity part of 1ac89c72.
  *
  * - The token lives only in this process's memory. The browser holds a random handle in an httpOnly cookie, never the
@@ -20,7 +20,7 @@ import { Vault } from './vault';
  */
 export const IDENTITY_COOKIE = '__Host-ezil-project-identity';
 
-/** A token this close to expiry is refreshed first: Works caps the git grant at the token's own expiry. */
+/** A token this close to expiry is refreshed first: Universe caps the Git token at the ID token's own expiry. */
 export const IDENTITY_MIN_VALIDITY_MS = 60_000;
 
 export interface RetainedIdentity { token: string; issuer: string; subject: string; expiresAt: number; userId: string; sessionId: string }
@@ -61,7 +61,7 @@ export async function retainedIdentity(userId: string, now = Date.now): Promise<
     return record;
 }
 
-/** Sign-out, or Works refusing the token: the next project open must refresh it. */
+/** Sign-out, or Universe refusing the token: the next project open must refresh it. */
 export async function clearProjectIdentity(): Promise<void> {
     const jar = await cookies();
     identities.delete(jar.get(IDENTITY_COOKIE)?.value);
