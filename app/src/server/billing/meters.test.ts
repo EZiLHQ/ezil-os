@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { AI_PACKS, catalogPro, PRO_PLAN } from './catalog';
+import { AI_PACKS, catalogPro, FREE_PLAN, PRO_PLAN } from './catalog';
 import { readBillingConfig } from './config';
 import {
     buildSummary,
     freeWindow,
+    latestStorageTotal,
     resolvePlan,
     storageState,
     workspaceState,
@@ -155,6 +156,43 @@ describe('storageState', () => {
     ] as const)('%s bytes of %s is %s', (used, cap, expected) => {
         expect(storageState(BigInt(used), BigInt(cap))).toBe(expected);
     });
+
+    // The Free cap is 2 GiB: 80% and 95% fall on GiB bytes (the first byte at or past each), not on decimal GB.
+    const atLeast = (percent: number) => (FREE_PLAN.storageBytes * BigInt(percent) + BigInt(99)) / BigInt(100);
+    it.each([
+        [atLeast(80) - BigInt(1), 'ok'],
+        [atLeast(80), 'low'],
+        [atLeast(95) - BigInt(1), 'low'],
+        [atLeast(95), 'exhausted'],
+        [FREE_PLAN.storageBytes, 'exhausted'],
+        [FREE_PLAN.storageBytes + BigInt(1), 'over_cap'],
+        [BigInt(2_000_000_000), 'low'],
+    ] as const)('%s bytes of the 2 GiB Free cap is %s', (used, expected) => {
+        expect(FREE_PLAN.storageBytes).toBe(BigInt(2) * BigInt(1024) ** BigInt(3));
+        expect(storageState(used, FREE_PLAN.storageBytes)).toBe(expected);
+    });
+});
+
+describe('latestStorageTotal', () => {
+    const at = (iso: string) => new Date(iso);
+    it('is null, not zero, when no computer has been measured', () => {
+        expect(latestStorageTotal([])).toEqual({ usedBytes: null, measuredAt: null });
+    });
+
+    it('sums the newest sample of each computer, a deleted-unpurged one included, and never sums history', () => {
+        const total = latestStorageTotal([
+            { computerId: 'live', bytes: BigInt(5), measuredAt: at('2026-10-11T10:00:00Z') },
+            { computerId: 'live', bytes: BigInt(9), measuredAt: at('2026-10-11T11:00:00Z') },
+            { computerId: 'LIVE', bytes: BigInt(1), measuredAt: at('2026-10-11T09:00:00Z') },
+            { computerId: 'deleted-unpurged', bytes: BigInt(100), measuredAt: at('2026-10-01T00:00:00Z') },
+        ]);
+        expect(total).toEqual({ usedBytes: BigInt(109), measuredAt: at('2026-10-11T11:00:00Z') });
+    });
+
+    it('keeps a measured zero as zero (a positive control for the null above)', () => {
+        expect(latestStorageTotal([{ computerId: 'a', bytes: BigInt(0), measuredAt: at('2026-10-11T11:00:00Z') }]))
+            .toEqual({ usedBytes: BigInt(0), measuredAt: at('2026-10-11T11:00:00Z') });
+    });
 });
 
 describe('resolvePlan', () => {
@@ -293,7 +331,7 @@ describe('buildSummary', () => {
                     usedSeconds: 0, allowanceSeconds: 28800, remainingSeconds: 28800,
                     resetsAt: '2026-11-01T00:00:00.000Z', state: 'ok',
                 },
-                storage: { usedBytes: '0', capBytes: '2000000000', state: 'ok', measuredAt: null },
+                storage: { usedBytes: null, capBytes: '2147483648', state: 'unavailable', measuredAt: null },
                 ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
             },
             actions: { checkout: false, portal: false, topup: false },
@@ -304,10 +342,10 @@ describe('buildSummary', () => {
     });
 
     it.each([
-        ['free', false, '2000000000'],
-        ['free', true, '2000000000'],
-        ['pro', false, '2000000000'],
-        ['pro', true, '20000000000'],
+        ['free', false, '2147483648'],
+        ['free', true, '2147483648'],
+        ['pro', false, '2147483648'],
+        ['pro', true, '21474836480'],
     ] as const)('uses the storage gate for %s (enabled: %s)', (plan, largeStorageEnabled, capBytes) => {
         const result = summary({
             config: { ...readBillingConfig({}), largeStorageEnabled },
@@ -355,7 +393,7 @@ describe('buildSummary', () => {
             { computerId: 'computer-b', bytes: BigInt(1), measuredAt: new Date('2026-10-10T11:30:00.000Z') },
         ];
         expect(summary({ storage }).meters.storage).toEqual({
-            usedBytes: '9007199254741001', capBytes: '2000000000', state: 'over_cap',
+            usedBytes: '9007199254741001', capBytes: '2147483648', state: 'over_cap',
             measuredAt: '2026-10-11T11:30:00.000Z',
         });
         expect(summary().meters.storage.measuredAt).toBeNull();

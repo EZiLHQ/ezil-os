@@ -71,6 +71,29 @@ export function workspaceState(remaining: number, allowance: number): MeterState
     return 'ok';
 }
 
+/**
+ * The storage meter's one rule (docs/billing/CONTRACT.md §3.2): the NEWEST sample of each
+ * computer, summed over the user's computers (deleted ones included until purged). Storage is a
+ * level, not a flow, so older samples never add. No sample at all is `usedBytes: null`
+ * ("Measuring…"), never a zero nobody measured.
+ */
+export function latestStorageTotal(storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[]): { usedBytes: bigint | null; measuredAt: Date | null } {
+    const newest = new Map<string, { bytes: bigint; measuredAt: Date }>();
+    for (const sample of storage) {
+        const key = sample.computerId.toLowerCase();
+        const seen = newest.get(key);
+        if (!seen || sample.measuredAt.getTime() > seen.measuredAt.getTime()) newest.set(key, sample);
+    }
+    if (newest.size === 0) return { usedBytes: null, measuredAt: null };
+    let usedBytes = BigInt(0);
+    let measuredAt: Date | null = null;
+    for (const sample of newest.values()) {
+        usedBytes += sample.bytes;
+        if (measuredAt === null || sample.measuredAt.getTime() > measuredAt.getTime()) measuredAt = sample.measuredAt;
+    }
+    return { usedBytes, measuredAt };
+}
+
 /** Integer comparisons preserve exact thresholds even above JavaScript's safe number range. */
 export function storageState(used: bigint, cap: bigint): MeterState {
     if (used > cap) return 'over_cap';
@@ -147,19 +170,7 @@ export function buildSummary(input: {
     // Only the newest sample per computer counts, even if a caller passes
     // history: storage is a level, not a flow, so summing samples over time
     // would multiply it.
-    const newest = new Map<string, { bytes: bigint; measuredAt: Date }>();
-    for (const sample of storage) {
-        const seen = newest.get(sample.computerId);
-        if (!seen || sample.measuredAt.getTime() > seen.measuredAt.getTime()) newest.set(sample.computerId, sample);
-    }
-    let usedBytes = BigInt(0);
-    let measuredAt: Date | null = null;
-    for (const sample of newest.values()) {
-        usedBytes += sample.bytes;
-        if (measuredAt === null || sample.measuredAt.getTime() > measuredAt.getTime()) {
-            measuredAt = sample.measuredAt;
-        }
-    }
+    const { usedBytes, measuredAt } = latestStorageTotal(storage);
     const checkout = checkoutAvailable(config);
 
     return {
@@ -182,9 +193,9 @@ export function buildSummary(input: {
                 state: workspaceState(remainingSeconds, allowanceSeconds),
             },
             storage: {
-                usedBytes: usedBytes.toString(),
+                usedBytes: usedBytes?.toString() ?? null,
                 capBytes: capBytes.toString(),
-                state: storageState(usedBytes, capBytes),
+                state: usedBytes === null ? 'unavailable' : storageState(usedBytes, capBytes),
                 measuredAt: measuredAt?.toISOString() ?? null,
             },
             ai: {

@@ -1,7 +1,7 @@
 import type { StripeAiPack } from '../stripe/packs';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
-import { storageState } from '../meters';
+import { latestStorageTotal, storageState } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
@@ -183,13 +183,11 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
  */
 export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
     largeStorageEnabled: boolean, volumeGiB?: number | null): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
-    const newest = new Map<string, typeof storage[number]>();
-    for (const sample of storage) {
-        if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
-    }
-    const usedBytes = newest.size ? [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0)) : null;
+    const { usedBytes } = latestStorageTotal(storage);
+    // Unmeasured is `unavailable` ("Measuring…"), never the `ok` of a zero nobody measured.
     const meter = (cap: bigint) => {
-        const state = storageState(usedBytes ?? BigInt(0), cap);
+        if (usedBytes === null) return 'unavailable' as const;
+        const state = storageState(usedBytes, cap);
         return state === 'over_cap' ? 'exhausted' as const : state;
     };
     if (plan.sku === 'legacy') {
@@ -198,7 +196,7 @@ export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: reado
     }
     const provisionedGiB = SIZES[size].provider === 'aws' ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
-    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(capBytes) };
 }
 
 /**
@@ -339,7 +337,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
-        storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
+        // No sample yet: usedBytes null with 'unavailable', never a measured-looking '0'.
+        storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,

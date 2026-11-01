@@ -61,10 +61,11 @@ describe('billing catalog contract', () => {
     });
 
     it('raises only Pro storage and only after the large-storage gate', () => {
-        expect(storageCapBytes('pro', true)).toBe(BigInt(20_000_000_000));
-        expect(storageCapBytes('pro', false)).toBe(BigInt(2_000_000_000));
-        expect(storageCapBytes('free', true)).toBe(BigInt(2_000_000_000));
-        expect(storageCapBytes('free', false)).toBe(BigInt(2_000_000_000));
+        // GiB (1024³), the unit of every v3 disk (decision 2026-11-01; was decimal GB until then).
+        expect(storageCapBytes('pro', true)).toBe(BigInt(20) * BigInt(1024) ** BigInt(3));
+        expect(storageCapBytes('pro', false)).toBe(BigInt(2_147_483_648));
+        expect(storageCapBytes('free', true)).toBe(BigInt(2_147_483_648));
+        expect(storageCapBytes('free', false)).toBe(BigInt(2_147_483_648));
     });
 });
 
