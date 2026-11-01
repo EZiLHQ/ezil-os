@@ -17,6 +17,7 @@ import {
   readDockProbe, readinessSettled, readinessTimings, redactDeep, revealDock, redactEmail, redactText, remainingMs, runDeadlines,
   runProdJourneys, selectJourneys, shapeApiFailure, shapeConsoleError, shapeVisibleErrors, stepRecord,
   summarizeFeedbackRequest, trackReadiness, userReadiness, wantsBody,
+  FRESH_TERMINAL, PRIOR_TERMINAL_ATTR, XTERM, markPriorTerminals, screenshotStyle, takeShot,
 } from './prod-journeys.mjs';
 
 const APP = 'https://os-prod.ezil.work';
@@ -127,6 +128,75 @@ test('driver errors keep their first line only, redacted and capped', () => {
   assert.equal(describeError('x'.repeat(1000)).length, 300);
   assert.equal(capText('abcdef', 4), 'abc…');
   assert.equal(describeError(undefined), 'Unknown error');
+});
+
+/**
+ * What Playwright raises for a click that never became possible (the shape is
+ * the one a real timeout produces: each line dimmed, retries nested, repeats
+ * folded into "2 ×"), plus the header and navigation lines it also logs.
+ */
+const dim = text => `\u001b[2m${text}\u001b[22m`;
+const CLICK_TIMEOUT = [
+  'locator.click: Timeout 2000ms exceeded.', 'Call log:',
+  dim('  - navigating to "https://os-prod.ezil.work/os?token=abc123", waiting until "domcontentloaded"'),
+  dim('  - cookie: __Host-ezil-os-auth=base64-' + 'a'.repeat(40)),
+  dim("  - waiting for locator('.xterm:not([data-e2e-prior]):visible').last().locator('.xterm-screen')"),
+  dim('    - locator resolved to <div class="xterm-screen" style="width: 7px">…</div>'),
+  dim('  - attempting click action'),
+  dim('    2 × waiting for element to be visible, enabled and stable'),
+  dim('      - element is not visible'),
+  dim('    - retrying click action'),
+  dim('    - waiting 20ms'),
+  dim('    2 × waiting for element to be visible, enabled and stable'),
+  dim('      - element is not visible'),
+  dim('      - <div class="terminal-command-decoration codicon">…</div> intercepts pointer events'),
+  dim('    - retrying click action'),
+  dim('      - waiting 100ms'),
+].join('\n');
+
+test('with callLog, a driver error keeps Playwright\'s action steps, once each, and nothing else', () => {
+  assert.equal(describeError(new Error(CLICK_TIMEOUT), { callLog: true }), 'locator.click: Timeout 2000ms exceeded. [call log: '
+    + ["waiting for locator('.xterm:not([data-e2e-prior]):visible').last().locator('.xterm-screen')",
+      'locator resolved to <div class="xterm-screen">', 'attempting click action',
+      'waiting for element to be visible, enabled and stable', 'element is not visible', 'retrying click action',
+      '<div class="terminal-command-decoration codicon"> intercepts pointer events'].join(' | ') + ']');
+  assert.equal(describeError(new Error(CLICK_TIMEOUT)), 'locator.click: Timeout 2000ms exceeded.', 'the default is unchanged');
+});
+
+test('the call log never carries headers, cookies, URLs, typed values or element attributes', () => {
+  const dirty = new Error([CLICK_TIMEOUT,
+    '  - set-cookie: sb-abc-auth-token=zzz-session-value',
+    dim('  - <- 200 OK'), dim('  - fill("correct-horse-battery")'),
+    dim('    6 × locator resolved to hidden <input type="password" value="correct-horse-battery" class="gone">'),
+    '  - locator resolved to <input type="password" value="correct-horse-battery" class="field">',
+    "  - waiting for getByText('qa.user@ezil.work')"].join('\n'));
+  const text = describeError(dirty, { callLog: true, secrets: ['correct-horse-battery'] });
+  for (const leak of ['abc123', '__Host', 'base64-', 'set-cookie', 'zzz-session-value', '200 OK', 'correct-horse-battery',
+    'navigating', 'qa.user@', 'width: 7px', 'type="password"']) {
+    assert.ok(!text.includes(leak), `leaked ${leak}`);
+  }
+  assert.ok(text.includes('locator resolved to <input class="field">'));
+  assert.ok(text.includes('locator resolved to hidden <input class="gone">'), 'a hidden match says so, without its attributes');
+  assert.ok(text.includes("waiting for getByText('q***@ezil.work')"), 'locator text is still redacted');
+});
+
+test('the call log is capped, and an error with none (or only unsafe lines) gains nothing', () => {
+  const noisy = new Error(['x: failed', 'Call log:', ...Array.from({ length: 40 }, (_, i) => `  - waiting for locator('.row-${i}')`)].join('\n'));
+  const text = describeError(noisy, { callLog: true });
+  assert.deepEqual(text.match(/row-\d+/g), ['row-0', 'row-1', 'row-34', 'row-35', 'row-36', 'row-37', 'row-38', 'row-39'],
+    'eight steps: the first two and the last six');
+  assert.ok(text.length <= 'x: failed [call log: '.length + 600 + 1);
+  assert.equal(describeError(new Error('plain failure'), { callLog: true }), 'plain failure');
+  assert.equal(describeError(new Error('x: failed\nCall log:\n  - cookie: a=b\n  - -> GET https://x.test/?token=t'), { callLog: true }), 'x: failed');
+});
+
+test('a wrapper error shows the call log of its cause, and says what the cause was', () => {
+  const cause = new Error(CLICK_TIMEOUT);
+  const wrapper = new Error('Code command unavailable: Terminal: Create New Terminal (locator.click: Timeout 2000ms exceeded.)', { cause });
+  const text = describeError(wrapper, { callLog: true });
+  assert.match(text, /^Code command unavailable: Terminal: Create New Terminal \(locator\.click: Timeout 2000ms exceeded\.\) \[call log: waiting for locator/);
+  assert.match(text, /element is not visible/);
+  assert.equal(describeError(wrapper), 'Code command unavailable: Terminal: Create New Terminal (locator.click: Timeout 2000ms exceeded.)');
 });
 
 // ── failure evidence ───────────────────────────────────────────────────────
@@ -838,6 +908,20 @@ test('a failing step records the failing API codes, console errors, visible text
   } finally { rmSync(out, { recursive: true, force: true }); }
 });
 
+test('a failed step reports the driver\'s action log in its error, and still no header or cookie', async () => {
+  const out = mkdtempSync(join(tmpdir(), 'prod-journeys-test-'));
+  try {
+    const fake = fakeDependencies({ signInError: new Error(`locator.fill: Timeout 1000ms exceeded.\nCall log:\n  - cookie: ${JWT}\n`
+      + "  - waiting for locator('input[type=email]')\n  -   element is not visible\n  - <- 401 Bearer " + JWT) });
+    const report = await runProdJourneys({ env: { ...baseEnv, EZIL_E2E_OUT: out, EZIL_E2E_JOURNEYS: 'free-open-apps' },
+      emit: () => {}, loadDependencies: fake.load });
+    const failed = report.journeys[0].steps[0];
+    assert.equal(failed.error, "locator.fill: Timeout 1000ms exceeded. [call log: waiting for locator('input[type=email]') | element is not visible]");
+    assert.ok(!readFileSync(join(out, 'prod-journeys.json'), 'utf8').includes(JWT));
+    assert.equal(failed.evidence.appScreenshot, undefined, 'a step that names no app takes no frames-visible shot');
+  } finally { rmSync(out, { recursive: true, force: true }); }
+});
+
 // ── EZiL ID sign-in mode ───────────────────────────────────────────────────
 
 const ezilIdEnv = Object.freeze({ EZIL_E2E_APP: APP, EZIL_E2E_EMAIL: 'qa.user@ezil.work', EZIL_E2E_PASSWORD: 'correct-horse-battery',
@@ -1100,4 +1184,111 @@ test('in Chromium: the locator strings the ezil-ai journey hands to Playwright p
     assert.equal(await mask.count(), 1);
     assert.equal(await mask.evaluate(el => el.className), 'who', 'the mask covers the address, not its container');
   } finally { await browser.close(); }
+});
+
+// ── terminal-echo: the fresh terminal and the evidence of a failure ────────
+
+test('screenshots hide frames and pixels unless asked, and always hide form values and the account pane', () => {
+  assert.match(screenshotStyle(), /^iframe, video, canvas, object, embed, /);
+  assert.equal(screenshotStyle(false), screenshotStyle());
+  assert.ok(!/iframe|video|canvas/.test(screenshotStyle(true)));
+  for (const style of [screenshotStyle(false), screenshotStyle(true)]) {
+    assert.match(style, /\[data-pane="account"\] \{ visibility: hidden !important; \}/);
+    assert.match(style, /input, textarea \{ color: transparent !important/);
+  }
+});
+
+test('in Chromium: only the terminal created after the tagging is found, and its screen, input and tree are inside it', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    // xterm's structure: the screen, the helper textarea and the accessibility tree are children of one .xterm root.
+    const terminal = (id, hidden = false) => `<div class="terminal-wrapper" ${hidden ? 'style="display:none"' : ''}>
+      <div class="terminal xterm" data-id="${id}"><div class="xterm-accessibility"><div class="xterm-accessibility-tree">${id} output</div></div>
+      <div class="xterm-screen" style="width:160px;height:40px"></div><div class="xterm-helpers"><textarea class="xterm-helper-textarea"></textarea></div></div></div>`;
+    await page.setContent(`<div id="host">${terminal('persisted', true)}${terminal('previous')}</div>`);
+    const idOf = locator => locator.evaluate(element => element.closest('.xterm').dataset.id);
+    const fresh = page.locator(FRESH_TERMINAL).last();
+
+    // Before tagging, the previous terminal is what the selector would find.
+    assert.equal(await idOf(page.locator(FRESH_TERMINAL).last()), 'previous');
+    await page.evaluate(markPriorTerminals, { selector: XTERM, attr: PRIOR_TERMINAL_ATTR });
+    assert.equal(await page.locator(FRESH_TERMINAL).count(), 0, 'every earlier terminal is tagged, hidden or visible');
+
+    // The new terminal appears while the previous one is still visible; a persisted one is revived after it, hidden.
+    await page.evaluate(html => document.getElementById('host').insertAdjacentHTML('beforeend', html), terminal('new') + terminal('revived', true));
+    assert.equal(await page.locator(FRESH_TERMINAL).count(), 1, 'the revived terminal is untagged but hidden');
+    assert.equal(await idOf(page.locator('.xterm-screen').last()), 'revived', 'what .last() on the screen would have hit');
+    assert.equal(await idOf(page.locator('.xterm-helper-textarea').last()), 'revived');
+    for (const part of ['.xterm-screen', '.xterm-helper-textarea', '.xterm-accessibility-tree']) {
+      assert.equal(await idOf(fresh.locator(part)), 'new', part);
+    }
+    assert.equal(await fresh.locator('.xterm-accessibility-tree').innerText(), 'new output');
+    await fresh.locator('.xterm-screen').click({ timeout: 2000, force: true });
+
+    // Once the previous terminal is hidden, nothing changes.
+    await page.evaluate(() => { document.querySelector('[data-id="previous"]').parentElement.style.display = 'none'; });
+    assert.equal(await idOf(fresh.locator('.xterm-screen')), 'new');
+    assert.equal(await page.locator(`${XTERM}:visible`).count(), 1);
+  } finally { await browser.close(); }
+});
+
+test('in Chromium: the call log of a real Playwright timeout is kept, and only its action steps', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div class="gone" style="display:none" data-secret="s3cr3t">x</div><div class="here">y</div>');
+    const click = describeError(await page.locator('.gone').click({ timeout: 300 }).catch(error => error), { callLog: true });
+    assert.match(click, /^locator\.click: Timeout 300ms exceeded\. \[call log: waiting for locator\('\.gone'\) \| locator resolved to <div class="gone"> \|/);
+    for (const step of ['attempting click action', 'waiting for element to be visible, enabled and stable', 'element is not visible', 'retrying click action']) {
+      assert.ok(click.includes(step), step);
+    }
+    const waited = describeError(await page.locator('.gone').waitFor({ state: 'visible', timeout: 300 }).catch(error => error), { callLog: true });
+    assert.match(waited, /^locator\.waitFor: Timeout 300ms exceeded\. \[call log: waiting for locator\('\.gone'\) to be visible \| locator resolved to hidden <div class="gone">\]$/);
+    const missing = describeError(await page.locator('.here .nope').innerText({ timeout: 300 }).catch(error => error), { callLog: true });
+    assert.equal(missing, "locator.innerText: Timeout 300ms exceeded. [call log: waiting for locator('.here .nope')]");
+    for (const text of [click, waited, missing]) assert.ok(!/s3cr3t|\u001b/.test(text), 'no attribute value, no terminal escapes');
+  } finally { await browser.close(); }
+});
+
+test('in Chromium: a window shot shows that app\'s frame only when asked, and never the rest of the page', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  const out = mkdtempSync(join(tmpdir(), 'prod-journeys-test-'));
+  try {
+    const page = await browser.newPage({ viewport: { width: 400, height: 200 } });
+    const windowOf = (app, left, color, extra = '') => `<div class="window" data-app="${app}" ${extra}
+      style="position:absolute;top:20px;left:${left}px;width:120px;height:80px"><iframe style="border:0;width:100%;height:100%"
+      srcdoc="<body style='margin:0;background:${color}'>"></iframe></div>`;
+    await page.setContent(`<body style="margin:0;background:rgb(255,255,255)">${windowOf('code', 20, 'rgb(255,0,0)')}${windowOf('desktop', 200, 'rgb(0,0,255)')}`);
+    await page.waitForFunction(() => [...document.querySelectorAll('iframe')].every(frame => frame.contentDocument?.readyState === 'complete'));
+    const shot = async (name, options) => {
+      const path = join(out, `${name}.png`);
+      await takeShot(page, path, options);
+      return readFileSync(path).toString('base64');
+    };
+    // Decode a PNG in the page: its size and the colour at (x, y).
+    const read = (base64, x, y) => page.evaluate(async ({ base64, x, y }) => {
+      const bitmap = await createImageBitmap(await (await fetch(`data:image/png;base64,${base64}`)).blob());
+      const context = new OffscreenCanvas(bitmap.width, bitmap.height).getContext('2d');
+      context.drawImage(bitmap, 0, 0);
+      return { size: [bitmap.width, bitmap.height], rgb: [...context.getImageData(x, y, 1, 1).data].slice(0, 3) };
+    }, { base64, x, y });
+
+    assert.deepEqual(await read(await shot('page', {}), 60, 60), { size: [400, 200], rgb: [255, 255, 255] }, 'frames are hidden by default');
+    assert.deepEqual(await read(await shot('hidden-window', { app: 'code' }), 60, 40), { size: [120, 80], rgb: [255, 255, 255] },
+      'a window shot hides its frame unless asked');
+    assert.deepEqual(await read(await shot('code-window', { app: 'code', showFrames: true }), 60, 40), { size: [120, 80], rgb: [255, 0, 0] },
+      'the Code window\'s frame shows, cropped to the window: no other window is in the picture');
+    await page.evaluate(() => document.querySelector('[data-app="code"]').setAttribute('data-closing', '1'));
+    await assert.rejects(shot('closing', { app: 'code', showFrames: true, timeout: 500 }), 'a closing window is not shot');
+  } finally { rmSync(out, { recursive: true, force: true }); await browser.close(); }
 });

@@ -38,6 +38,7 @@ Browser-free validation: `node --test e2e/sign-in-ezilid.test.mjs`. With `PLAYWR
 - console errors and uncaught page errors (redacted, URL queries stripped);
 - the error text the user can see (a failed opening panel, Code's "isn't reachable" panel, alerts, the feedback result);
 - a screenshot of the shell. Remote pixels, frames, form values and Settings' Account pane are hidden; shell text is not, because the error copy is the evidence.
+- the driver's own error line plus the action steps of its call log (what it waited for, which element it resolved to as a tag and class, why it retried); headers, cookies and URLs in that log are dropped. A failed `terminal-echo` also saves `<journey>-terminal-echo-code-window.png` (`appScreenshot` in the report): the Code window alone with its frame visible, because the shell shot hides frames and Code would look blank.
 
 ```sh
 EZIL_E2E_APP=https://os-prod.ezil.work EZIL_E2E_EMAIL=… EZIL_E2E_PASSWORD=… \
