@@ -2,10 +2,12 @@
  * OS server → Worker: put one project repository into the user's own Cloudflare computer (os-map-design §2).
  *
  *   signed v2 (body digest) POST /sandbox/<name>/repo-open
- *     {repositoryId, canonicalURL, ref, git:{token, expiresAt}}  →  {folder:"<root>/projects/<repositoryId>", head}
+ *     {repositoryId, canonicalURL, ref, git:{token, expiresAt}, timeoutMs}  →  {folder:"<root>/projects/<repositoryId>", head}
  *
- * The Worker clones or fetches with the token handed to git through a one-shot credential helper, never argv, a URL
- * or `.git/config`. This side:
+ * The Worker clones or fetches with the token handed to git through its environment only (a Bearer header for a
+ * Cloudflare Artifacts remote, a one-shot Basic credential helper for EZiL Git), never argv, a URL or `.git/config`,
+ * and bounds everything it does inside the computer by `timeoutMs`: what is left of the caller's deadline, so the
+ * clone stops when this side stops waiting. This side:
  * - signs v2 over the EXACT body string it sends, with no query string (the Worker refuses an unsigned one);
  * - never sends an AWS computer here: its controls are v2 `aws-ec2` and repo-open is Cloudflare only today, so it
  *   answers `repo_open_unsupported_provider` without a request;
@@ -24,6 +26,8 @@ export interface RepoOpenRequest {
     canonicalURL: string;
     ref: string;
     git: { token: string; expiresAt: string };
+    /** The Worker's whole bound for this open, ms (`worker/src/repo-open.ts` REPO_OPEN_MIN/EXEC_TIMEOUT_MS). */
+    timeoutMs: number;
 }
 
 export type RepoOpenResult =
@@ -32,8 +36,11 @@ export type RepoOpenResult =
 
 const LOG_CODE = /^[a-z0-9_]{1,64}$/;
 const RESPONSE_MAX_BYTES = 16_384;
-/** A first clone of a fresh repository runs inside this; the route's own `maxDuration` is 300 s. */
-const REPO_OPEN_TIMEOUT_MS = 120_000;
+/** The Worker's own bounds for `timeoutMs` (`worker/src/repo-open.ts`): it refuses anything outside them. */
+export const REPO_OPEN_MIN_TIMEOUT_MS = 20_000;
+export const REPO_OPEN_MAX_TIMEOUT_MS = 130_000;
+/** How long past `timeoutMs` this side waits for the Worker's answer to come back. */
+export const REPO_OPEN_TRANSPORT_MARGIN_MS = 5_000;
 
 /** `<absolute root>/projects/<repositoryId>`, every segment plain: no `.`/`..`, no empty segment, no odd bytes. */
 export function isRepositoryFolder(folder: unknown, repositoryId: string): folder is string {
@@ -56,7 +63,7 @@ export async function requestRepoOpen(
     target: ControlTarget,
     computer: ComputerRef,
     request: RepoOpenRequest,
-    deps: { fetch?: typeof fetch; now?: () => number; correlationId?: string } = {},
+    deps: { fetch?: typeof fetch; now?: () => number; correlationId?: string; signal?: AbortSignal } = {},
 ): Promise<RepoOpenResult> {
     if (target.auth.kind === 'v2' && target.auth.claims.provider === 'aws-ec2') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
     const failed = (status: number | null, code: unknown) => {
@@ -66,12 +73,15 @@ export async function requestRepoOpen(
         return { ok: false as const, errorCode: 'repo_open_failed' as const };
     };
     if (!hmacSecret.trim()) return failed(null, 'hmac_secret_not_configured');
+    if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS || request.timeoutMs > REPO_OPEN_MAX_TIMEOUT_MS) {
+        return failed(null, 'timeout_out_of_range');
+    }
     try {
         const endpoint = new URL(`/sandbox/${encodeURIComponent(target.sandboxName)}/repo-open`, workerUrl);
         // Fixed key order: the Worker re-reads exactly these fields from exactly this string.
         const body = JSON.stringify({
             repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
-            git: { token: request.git.token, expiresAt: request.git.expiresAt },
+            git: { token: request.git.token, expiresAt: request.git.expiresAt }, timeoutMs: request.timeoutMs,
         });
         // A Cloudflare computer's v2 claims, as `compute/cloudflare.ts` `authOf` mints them: no generation or lease,
         // and no store claim.
@@ -80,8 +90,9 @@ export async function requestRepoOpen(
             provider: 'cloudflare' as const, store: '' as const, generation: 0, leaseEpoch: 0,
         };
         const token = mintPreviewTokenV2(hmacSecret, { ...claims, ts: (deps.now ?? Date.now)() }, { method: 'POST', path: endpoint.pathname, body });
+        const own = AbortSignal.timeout(request.timeoutMs + REPO_OPEN_TRANSPORT_MARGIN_MS);
         const response = await (deps.fetch ?? fetch)(endpoint, {
-            method: 'POST', body, redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(REPO_OPEN_TIMEOUT_MS),
+            method: 'POST', body, redirect: 'error', cache: 'no-store', signal: deps.signal ? AbortSignal.any([deps.signal, own]) : own,
             headers: { 'content-type': 'application/json', [PREVIEW_TOKEN_V2_HEADER]: token,
                 ...(deps.correlationId ? { [CORRELATION_HEADER]: deps.correlationId } : {}) },
         });
@@ -95,6 +106,7 @@ export async function requestRepoOpen(
         const head = typeof value.head === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.head) ? value.head : undefined;
         return { ok: true, folder: value.folder, ...(head ? { head } : {}) };
     } catch (err) {
-        return failed(null, err instanceof Error && err.name === 'TimeoutError' ? 'timeout' : 'transport');
+        const name = err instanceof Error ? err.name : '';
+        return failed(null, name === 'TimeoutError' ? 'timeout' : name === 'AbortError' ? 'aborted' : 'transport');
     }
 }

@@ -6,7 +6,8 @@
  * one stubbed `fetch`, so these pin the exact bytes each one sends. What they prove:
  *  - ownership is checked before Universe is asked anything, and Universe before the Worker;
  *  - the git token and the Artifacts remote reach the Worker request body and nothing else: not the answer, not a log line;
- *  - an uppercase UUID never gets past the route, and a Universe 403 never yields a `folder=`.
+ *  - an uppercase UUID never gets past the route, and a Universe 403 never yields a `folder=`;
+ *  - one deadline from the request's arrival bounds Universe and the Worker, and the Worker is told what is left.
  */
 import { createHash, createHmac } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -35,6 +36,9 @@ const s = vi.hoisted(() => ({
     identity: 'ok' as 'ok' | 'missing',
     aws: [false, false] as boolean[],
     preview: { ok: true } as Record<string, unknown>,
+    /** How long the stubbed Code mint takes, ms of `Date.now()`. */
+    mintTakes: 0,
+    skew: 0,
     universe: null as null | ((body: unknown) => Response),
     worker: null as null | ((body: string) => Response),
     requests: [] as { url: URL; init: RequestInit }[],
@@ -48,7 +52,7 @@ vi.mock('@/server/api/root', () => ({ appRouter: { createCaller: () => ({
         if (!s.owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
         return { id };
     } },
-    cloudflareGuacamole: { codePreviewUrl: async () => { s.order.push('codePreviewUrl'); return s.preview; } },
+    cloudflareGuacamole: { codePreviewUrl: async () => { s.order.push('codePreviewUrl'); s.skew += s.mintTakes; return s.preview; } },
 }) } }));
 vi.mock('@/server/auth/retained-identity', () => ({
     retainedIdentity: async (userId: string) => {
@@ -81,7 +85,7 @@ const grant = (over: Record<string, unknown> = {}) => ({
 
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
-    Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0,
+    Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0,
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }) });
@@ -96,6 +100,8 @@ beforeEach(() => {
     }));
     logs = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'info').mockImplementation(() => {}),
         vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + s.skew);
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -114,12 +120,14 @@ async function expectNoSecrets(response: Response) {
 }
 
 describe('opening a project in Code', () => {
-    it('checks ownership, identity, provider and readiness, THEN Universe, THEN the Worker, and answers the folder URL', async () => {
+    it('checks ownership, provider, identity and readiness, THEN Universe, THEN the Worker, and answers the folder URL', async () => {
         const response = await open();
         expect(response.status).toBe(200);
-        expect(s.order).toEqual(['computer.get', 'identity', 'target', 'codePreviewUrl', 'universe', 'target', 'worker']);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'codePreviewUrl', 'universe', 'target', 'worker']);
         const body = await response.clone().json();
         expect(body.url).toBe(body.codePreviewUrl);
+        // The window title's name (review #7): <namespace>/<name>, never the remote, which names the Cloudflare account.
+        expect(body.repository).toEqual({ name: `universe-staging/p-${PROJECT}` });
         const url = new URL(body.url);
         expect(url.searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}`]);
         expect(url.searchParams.get('token')).toBe('t');
@@ -142,8 +150,9 @@ describe('opening a project in Code', () => {
         expect(url.pathname).toBe(`/sandbox/${SANDBOX}/repo-open`);
         expect(url.search).toBe('');
         const body = String(init.body);
-        expect(JSON.parse(body)).toMatchObject({ repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main',
-            git: { token: GIT_TOKEN, expiresAt: expect.any(String) } });
+        expect(JSON.parse(body)).toStrictEqual({ repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main',
+            git: { token: GIT_TOKEN, expiresAt: expect.any(String) }, timeoutMs: 130_000 });
+        expect(init.signal).toBeInstanceOf(AbortSignal);
         const auth = (init.headers as Record<string, string>)['x-ezil-auth'];
         const [v, claims64, sig] = auth.split('.');
         expect(v).toBe('v2');
@@ -185,16 +194,17 @@ describe('opening a project in Code', () => {
         const response = await open();
         expect(response.status).toBe(409);
         expect((await response.json()).error.code).toBe('IDENTITY_REFRESH_REQUIRED');
-        expect(s.order).toEqual(['computer.get', 'identity']);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity']);
         expect(s.requests).toEqual([]);
     });
 
-    it('an AWS computer is repo_open_unsupported_provider (409) without starting it or asking Universe', async () => {
+    it('an AWS computer is repo_open_unsupported_provider (409) without a sign-in, starting it or asking Universe (review #9)', async () => {
         s.aws = [true];
+        s.identity = 'missing';
         const response = await open();
         expect(response.status).toBe(409);
         expect((await response.json()).error.code).toBe('repo_open_unsupported_provider');
-        expect(s.order).not.toContain('codePreviewUrl');
+        expect(s.order).toEqual(['computer.get', 'target']);
         expect(s.requests).toEqual([]);
     });
 
@@ -257,11 +267,47 @@ describe('opening a project in Code', () => {
         await expectNoSecrets(response);
     });
 
-    it('an unconfigured Universe origin is project_repo_unavailable, never a 500', async () => {
-        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', 'https://universe.example/path');
+    it('an unconfigured Universe origin is project_repo_unavailable before the computer is woken, never a 500 (review #9)', async () => {
+        for (const value of ['https://universe.example/path', '']) {
+            s.order = [];
+            vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', value);
+            const response = await open();
+            expect(response.status).toBe(503);
+            expect((await response.json()).error.code).toBe('project_repo_unavailable');
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.requests).toEqual([]);
+        }
+    });
+
+    it('🔴 one deadline (review #2): the Worker is told what is left of it, minus the way back', async () => {
+        s.mintTakes = 100_000;
+        expect((await open()).status).toBe(200);
+        const { init } = s.requests.find(r => r.url.origin === WORKER)!;
+        const { timeoutMs } = JSON.parse(String(init.body));
+        // 200 s from arrival, 100 s spent minting, 5 s kept for the answer to come back.
+        expect(timeoutMs).toBeGreaterThan(90_000);
+        expect(timeoutMs).toBeLessThanOrEqual(95_000);
+    });
+
+    it('🔴 a cold start that spent the deadline is repo_open_timeout (504) before Universe mints a grant', async () => {
+        s.mintTakes = 170_000;
         const response = await open();
-        expect(response.status).toBe(503);
+        expect(response.status).toBe(504);
+        expect((await response.clone().json()).error.code).toBe('repo_open_timeout');
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'codePreviewUrl']);
         expect(s.requests).toEqual([]);
+        await expectNoSecrets(response);
+    });
+
+    it('the browser going away aborts the Universe and Worker requests (the route\'s signal is part of the deadline)', async () => {
+        const browser = new AbortController();
+        const seen: boolean[] = [];
+        s.universe = () => Response.json(grant());
+        s.worker = () => { browser.abort(); return Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }); };
+        await POST(new Request('https://os-staging.example/api/shell/code-preview-url', { method: 'POST', signal: browser.signal,
+            headers: { 'content-type': 'application/json' }, body: JSON.stringify({ computerId: COMPUTER, intent: 'open', project: { projectId: PROJECT, repoId: REPO } }) }));
+        for (const { init } of s.requests) seen.push(init.signal!.aborted);
+        expect(seen).toEqual([true, true]);
     });
 
     it.each([
