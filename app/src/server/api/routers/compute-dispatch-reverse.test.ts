@@ -805,7 +805,10 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         // code.js needs a DOM to import, so its body is pinned to its source (as readMoveAsk's URL is below); the shell's
         // code-test.mjs drives the built bundle's mint and checks the same body on the wire.
         const code = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/apps/code.js'), 'utf8');
-        expect(code).toContain("body: JSON.stringify({ computerId, intent: 'open' }),");
+        // Lane O2 made the body conditional on a project; without one it is still exactly { computerId, intent: 'open' }
+        // (code-test.mjs 8d checks that on the wire).
+        expect(code).toContain("body: JSON.stringify(project\n");
+        expect(code).toContain(": { computerId, intent: 'open' }),");
         const w = world([held({ instance_type: 'm6i.large' })]);
         const seen = shellRoutes(w.db);
         await post('/api/shell/code-preview-url', { computerId: C, intent: 'open' });
