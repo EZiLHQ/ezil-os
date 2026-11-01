@@ -18,6 +18,9 @@ Routing is by the signed path only:
                                        then the job's status from disk;
   GET /__ezil/control/export/{status,head,chunk/<i>} -> served by the edge FROM DISK
                                        (export.py's state and staged chunks), never the agent.
+  POST /__ezil/control/repo-open/<sha256(body)>, POST /__ezil/control/repo-open-status/<jobId>
+                                    -> the agent's `repo_open` / `repo_open_status` (contract
+                                       universe-repo-open-v1 §13; wire pinned in repo_open.py).
 Anything else is 404.
 
 One request per connection (the upstream gets `Connection: close`), so a second request on
@@ -46,6 +49,7 @@ import time
 from . import agent as agentmod
 from . import desktop
 from . import export
+from . import repo_open
 from .fsops import Refused
 
 GW_HEADER = "x-ezil-gw"
@@ -81,6 +85,12 @@ STREAM_BLOCK = 65536
 # answer that is not ok, an empty one included, is 503 agent_unavailable.
 AGENT_REFUSALS = frozenset({"export_invalid", "bad_json", "bad_mac", "wrong_epoch", "bad_ts", "stale_request",
                             "bad_seq", "replayed"})
+# Repo-open (contract §13; repo_open.py pins the wire). Start: like `ice`, the JSON body's sha256 is
+# in the signed path and the body must hash to it. Status: the 256-bit job id is in the signed path.
+REPO_OPEN_RE = re.compile(r"^/__ezil/control/repo-open/([0-9a-f]{64})$")
+REPO_OPEN_STATUS_RE = re.compile(r"^/__ezil/control/repo-open-status/([0-9a-f]{64})$")
+REPO_OPEN_CL_RE = re.compile(r"[0-9]{1,5}")
+MAX_REPO_OPEN_BODY = repo_open.RELAY_MAX_BYTES
 FORWARDING_HEADERS = {"forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
                       "cf-connecting-ipv6", "cf-pseudo-ipv4", "cf-visitor"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
@@ -384,6 +394,14 @@ class Edge:
         if path in (EXPORT_STATUS_PATH, EXPORT_HEAD_PATH) or EXPORT_CHUNK_RE.match(path):
             self._export_get(client, head, path, query)
             return
+        m = REPO_OPEN_RE.match(path)
+        if m:
+            self._repo_open(client, head, m.group(1), query)
+            return
+        m = REPO_OPEN_STATUS_RE.match(path)
+        if m:
+            self._repo_open_status(client, head, m.group(1), query)
+            return
         m = CONTROL_RE.match(path)
         if m:
             self._control(client, head, m)
@@ -459,6 +477,62 @@ class Edge:
             _reply(client, 400, {"ok": False, "error": "ice_config_invalid"})
             return
         self._agent(client, "ice", config=config)
+
+    # ------------------------------------------------------------ repo-open (contract §13)
+    def _repo_open(self, client, head, digest, query):
+        """POST /__ezil/control/repo-open/<sha256>: exactly Content-Length bytes (1..MAX, no
+        chunking), hashed BEFORE parsing and compared with the signed digest, then relayed as the
+        agent's `repo_open`. The body carries a Git grant: never logged, never echoed."""
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if head.method != "POST" or query:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        if te or len(cl) != 1 or not REPO_OPEN_CL_RE.fullmatch(cl[0]) or not 0 < int(cl[0]) <= MAX_REPO_OPEN_BODY:
+            _reply(client, 400, {"ok": False, "error": "repo_open_body_invalid"})
+            return
+        try:
+            body, _ = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "repo_open_body_invalid"})
+            return
+        if not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+            _reply(client, 400, {"ok": False, "error": "repo_open_digest_mismatch"})
+            return
+        request = repo_open.decode_relay(body)
+        if request is None:
+            _reply(client, 400, {"ok": False, "error": "repo_open_body_invalid"})
+            return
+        self._repo_open_agent(client, repo_open.START_REFUSALS, "repo_open", request=request)
+
+    def _repo_open_status(self, client, head, job_id, query):
+        lengths = head.get("content-length")
+        if head.method != "POST" or query or head.get("transfer-encoding") or lengths not in ([], ["0"]) or head.rest:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        self._repo_open_agent(client, repo_open.STATUS_REFUSALS, "repo_open_status", jobId=job_id)
+
+    def _repo_open_agent(self, client, refusals, op, **fields):
+        """200 for the agent's ok; 409 for a refusal it actually sent; 503 for anything else (an
+        empty or malformed reply means the agent failed, not the request). Only allow-listed keys
+        pass; `result` is the §8 answer the agent already reduced and validated."""
+        try:
+            resp = self.seq.send(op, **fields)
+        except (OSError, ValueError, AttributeError):
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        if not isinstance(resp, dict):
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        out = {k: resp[k] for k in ("ok", "state", "error") if k in resp}
+        result = resp.get("result")
+        if isinstance(result, dict) and set(result) == {"status", "body"}:
+            out["result"] = {"status": result["status"], "body": result["body"]}
+        if resp.get("ok") is True:
+            _reply(client, 200, out)
+        elif resp.get("error") in refusals or resp.get("error") in AGENT_REFUSALS:
+            _reply(client, 409, {"ok": False, "error": resp["error"]})
+        else:
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):
