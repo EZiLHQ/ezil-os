@@ -64,11 +64,11 @@ element equal. Resolve indices from the pinned `out/nls.keys.json`; they move be
 
 Gates: every anchor 0, every replacement at its count, `By continuing with {0} Copilot` 0, both files parse (`.js` evaluated in a VM, `.json` parsed) and are identical element-wise.
 
-### Welcome disclaimer visibility — `out/vs/code/browser/workbench/workbench.css`
+### EZiL notice under the chat input — `out/vs/code/browser/workbench/workbench.css`
 
 | id | source | anchor | replacement | count | why |
 |---|---|---|---|---|---|
-| `welcome-disclaimer` | `vs/workbench/contrib/chat/browser/widget/media/chatViewWelcome.css` `.interactive-session.chat-view-getting-started-disabled { … }` | `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}` | `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-tips{display:none}` | 1 | `chatWidget.ts` adds `chat-view-getting-started-disabled` whenever `sentiment.completed \|\| hasByokModels` — always, with the `ezil` group present — and this rule then hides the welcome icon, title, message, **disclaimer** and tips ("make some space" for the in-view sessions list). The disclaimer is where the EZiL notice lives, so it is taken out of the hidden list; icon/title/message/tips stay hidden as upstream intends. Paired with `chat.viewSessions.enabled: false` (Machine settings) so an empty chat shows the welcome at all. |
+| `chat-notice` | `vs/workbench/contrib/chat/browser/widget/media/chatViewWelcome.css` `.interactive-session.chat-view-getting-started-disabled { … }` (nested) | `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}`, left as it is (gated once) | appended to the end of the file, top level: `.chat-viewpane .interactive-session>.interactive-input-part::after{content:"AI responses may be inaccurate. Review changes before applying them.";…}` | 1 | `chatWidget.ts` adds `chat-view-getting-started-disabled` whenever `sentiment.completed \|\| hasByokModels` — always, with the `ezil` group present — and the upstream rule hides the welcome's message, disclaimer and tips; with the Sessions list on (Part 3), an empty chat shows that list instead of the welcome anyway. The notice therefore leaves the welcome: one muted line under the chat view's input, in every chat state (empty, running, finished), counted in the input part's height so the Sessions list and transcript lay out above it. Only the chat view (`.chat-viewpane`), not inline or editor chats. Appended, not placed beside the upstream rule: that rule sits in a nested block, so a neighbour would be nested too and match nothing (measured in the image e2e). Gates: the upstream rule once, the notice rule once, and at brace depth 0. |
 
 ### Accounts menu — `out/vs/code/browser/workbench/workbench.js`
 
@@ -101,11 +101,9 @@ code-server`) is untouched; `github.copilot.*` log lines in the extension's
 output channel are diagnostics, not UI. Settings that carry part of the
 result (Machine layer, both launchers): `github.copilot.chat.backgroundAgent.enabled`
 / `cloudAgent.enabled: false` (extension's GitHub-only session types),
-`chat.viewSessions.enabled: false` (with BYOK models present the chat view
-otherwise fills its empty state with the in-view "Sessions" list and the
-welcome — where the notice lives — never renders). Upstream, the only other
-way to past chats is the chat title, which rendered only once the open chat
-had a title; Part 3 below makes it render on an empty chat too.
+`chat.viewSessions.enabled: true` with `chat.viewSessions.orientation: "stacked"`
+(Part 3: the in-view Sessions list over an empty chat; the notice moved under
+the input, `chat-notice` above).
 
 ## Part 3 — EZiL Chat history
 
@@ -161,11 +159,17 @@ rejected: it would remove conversations the user never deleted.
 | `history-entry` | workbench.js `ChatViewTitleControl.shouldRender(){return!!this.model?.title}` | `shouldRender(){return!0}`: the title, whose click opens the session picker (`workbench.action.chat.pickAgentSession`), also shows on an empty chat. Anchor 0, replacement 1. |
 | `history-label` | workbench.js `static{this.DEFAULT_TITLE=d(12379,null)}` | `static{this.DEFAULT_TITLE="Chat history"}`, the label of that title on an empty chat. Anchor 0, replacement 1. |
 | `history-empty-title` | workbench.js `ChatViewTitleControl`: `this.title??X2.DEFAULT_TITLE` (in `doUpdate` and in the label the toolbar creates, which can be created after `doUpdate` ran) | `this.title||X2.DEFAULT_TITLE`: an empty chat's title is `""`, not nullish, so upstream rendered an empty label. Anchor 0, replacement 2. |
+| `session-filter` | workbench.js `registerProviderActions` of the Sessions filter: `r=[{id:cn.Local,label:n(cn.Local)}];for(let l of this.chatSessionsService.getAllChatSessionContributions()){…r.push({id:u,label:n(u)})}` | `r=[{id:cn.Local,label:n(cn.Local)}];`: the filter offers Local only. Upstream it adds every `chatSessions` contribution — the GitHub-hosted agent types (Copilot CLI, cloud, agent host) that the Machine settings and `target-picker` keep out of EZiL Chat — and the menu read "Copilot". Anchor 0, replacement 1. |
 | `history-picker` | workbench.js `R9e.pickAgentSession`: `async pickAgentSession(){let o=new A,e=o.add(this.quickInputService.createQuickPick({useSeparators:!0}))` | First `await this.agentSessionsService.model.resolve(cn.Local)` (errors ignored). The picker shows a snapshot of the agent-sessions model and never refreshes; opened before the local provider's first resolve it stayed empty (measured in the image e2e). Anchor 0, replacement 1. |
 
-`chat.viewSessions.enabled` stays `false`: turning it on hides the welcome (and the notice) and
-its filter menu lists every session-type contribution, including the agent-host Copilot type the
-`target-picker` patch hides. Deleting a chat in the picker runs the store's `deleteSession`, which
+**Sessions list (Machine settings `chat.viewSessions.enabled: true`, `chat.viewSessions.orientation: "stacked"`).**
+Upstream "Go Back" (the arrow in the chat title, `workbench.action.chat.newChat`) starts a new, empty
+chat and leaves the one on screen running. With the list off, nothing on screen led back to a chat
+that was still answering (reported from os-staging, 2026-11-01). Stacked, an empty chat shows the
+list: a running chat reads "Working…" and opens live, mid-answer; finished ones follow, newest first.
+Stacked keeps Go Back in the title (side by side hides it) and adds no second sidebar to a narrow
+panel. The list reads the same index the title picker does, so it shows the history above in a new
+browser too. Its filter lists Local only (`session-filter`). Deleting a chat in the picker runs the store's `deleteSession`, which
 deletes both `<id>.json` and `<id>.jsonl` in `.ezil/chat`. Export is the files in `.ezil/chat`.
 Moving profile history in takes every profile `chatSessions` folder: conversations from another
 folder opened in the same profile join the EZiL workspace's history (EZiL opens one folder).

@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history} "
+# Passes to run, in order (default all): fresh returning history sessions
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -170,7 +170,7 @@ run_browser() { # run_browser <outdir>
   EZIL_E2E_OUT="$1" node "$here/copilot-ezil.mjs"
 }
 
-run_history() { # run_history <create|verify> <outdir>
+run_history() { # run_history <create|verify|sessions> <outdir>
   EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
   EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" node "$here/copilot-ezil-history.mjs"
 }
@@ -255,6 +255,20 @@ boot "$ST4"
 start_mock || fail=1
 run_history verify "$OUT/history-verify" || fail=1
 collect_logs history-verify
+reset_sink_logs
+fi
+
+# ── Pass 4: a chat left while it answers stays reachable (the in-view Sessions list) ──
+if [[ "$PASSES" == *" sessions "* ]]; then
+echo "[e2e] pass 4 — sessions: Go Back while an answer streams, reopen it from Sessions, then a new browser"
+ST5="$WORK/sessions"; mkdir -p "$ST5/home/neko/project" "$ST5/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST5/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST5"
+start_mock || fail=1
+run_history sessions "$OUT/sessions" || fail=1
+collect_logs sessions
+network_checks sessions || fail=1
 fi
 
 rm -rf "$WORK" 2>/dev/null || true

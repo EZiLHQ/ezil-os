@@ -7,6 +7,9 @@
  *                          "Chat history" shows on the empty chat, lists the conversation,
  *                          reopens it, and deleting it removes its file. Then `git clean -X` under
  *                          the running editor: .ezil stays out of Git, and capture restores its ignore.
+ *   EZIL_E2E_PHASE=sessions  the Sessions list over an empty chat: Go Back while an answer is still
+ *                          streaming leaves that chat running and listed as in progress; choosing it
+ *                          reopens the same chat, which finishes and is saved once; a new browser lists it.
  * Exit 2 means not run.
  */
 import { createRequire } from 'node:module';
@@ -26,8 +29,11 @@ const OUT = process.env.EZIL_E2E_OUT ?? './ezil-e2e-out';
 const CONTAINER = process.env.EZIL_E2E_CONTAINER ?? '';
 const PHASE = process.env.EZIL_E2E_PHASE ?? '';
 const PROMPT = 'EZIL_E2E_HISTORY: remember this conversation';
+// The mock streams this answer in numbered parts a second apart, then EZIL_SLOW_DONE.
+const SLOW = 'EZIL_E2E_SLOW: keep answering while I look away';
+const NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
 const T = Number(process.env.EZIL_E2E_TIMEOUT_MS ?? 120_000);
-if (!['create', 'verify'].includes(PHASE) || !CONTAINER) { console.error('SKIP: set EZIL_E2E_PHASE=create|verify and EZIL_E2E_CONTAINER'); process.exit(2); }
+if (!['create', 'verify', 'sessions'].includes(PHASE) || !CONTAINER) { console.error('SKIP: set EZIL_E2E_PHASE=create|verify|sessions and EZIL_E2E_CONTAINER'); process.exit(2); }
 mkdirSync(OUT, { recursive: true });
 
 const results = [];
@@ -41,18 +47,47 @@ const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const clean = s => s.replace(/\s+/g, ' ').trim();
 const CHAT = join(FOLDER, '.ezil', 'chat');
 // Session files that mention the prompt: in the workspace, and anywhere in the editor profile.
-const sessionFiles = () => sh(`grep -l -F ${quote(PROMPT)} ${quote(CHAT)}/*.jsonl ${quote(CHAT)}/*.json 2>/dev/null || true`).split('\n').filter(Boolean);
+const filesWith = text => sh(`grep -l -F ${quote(text)} ${quote(CHAT)}/*.jsonl ${quote(CHAT)}/*.json 2>/dev/null || true`).split('\n').filter(Boolean);
+const sessionFiles = () => filesWith(PROMPT);
 const profileCopies = () => sh(`grep -rl -F ${quote(PROMPT)} /tmp/code-server-data/User 2>/dev/null || true`).split('\n').filter(Boolean);
 
 const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined });
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 // Only code-server itself; anything else is aborted (the image suite asserts the sink).
 const codeHost = new URL(CODE_URL).host;
-await context.route('**/*', route => (new URL(route.request().url()).host === codeHost ? route.continue() : route.abort()));
-const page = await context.newPage();
-const aux = page.locator('.part.auxiliarybar');
+const newContext = async () => {
+  const created = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  await created.route('**/*', route => (new URL(route.request().url()).host === codeHost ? route.continue() : route.abort()));
+  return created;
+};
+const context = await newContext();
+let page = await context.newPage();
+let aux = page.locator('.part.auxiliarybar');
 const transcript = async () => clean(await aux.locator('.interactive-list').first().innerText().catch(() => ''));
 const rows = async () => (await page.locator('.quick-input-widget .monaco-list-row').allInnerTexts()).map(clean).filter(Boolean);
+// The chat view's own Sessions list (chat.viewSessions.enabled, stacked over an empty chat).
+const sessionRows = async () => (await aux.locator('.agent-sessions-control-container .monaco-list-row').allInnerTexts()).map(clean).filter(Boolean);
+const openWorkbench = async () => {
+  await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
+  await page.locator('.monaco-workbench').waitFor({ state: 'visible', timeout: T });
+  await aux.locator('.chat-input-container').first().waitFor({ state: 'visible', timeout: T });
+};
+const sendPrompt = async text => {
+  const editor = aux.locator('.chat-input-container .monaco-editor').first();
+  await until(async () => /Qwen3 Coder Next/.test(await aux.locator('.chat-input-container').first().innerText().catch(() => '')), 'model picker ready', 60_000);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await editor.locator('.view-lines').first().click({ force: true });
+    await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
+    await page.keyboard.type(text, { delay: 3 });
+    if (clean(await editor.innerText()).includes(text.slice(0, 20))) { await page.keyboard.press('Enter'); return true; }
+  }
+  return false;
+};
+// One line under the chat view's input (workbench.css `chat-notice`), whatever the chat shows.
+const noticeShown = () => page.evaluate(text => {
+  const part = document.querySelector('.part.auxiliarybar .chat-viewpane .interactive-session > .interactive-input-part');
+  const after = part && getComputedStyle(part, '::after');
+  return Boolean(part?.offsetHeight) && after.display !== 'none' && after.content.includes(text) && part.getBoundingClientRect().bottom <= innerHeight;
+}, NOTICE);
 const until = async (predicate, label, ms = T) => {
   const started = Date.now();
   while (Date.now() - started < ms) { if (await predicate()) return true; await page.waitForTimeout(500); }
@@ -61,22 +96,11 @@ const until = async (predicate, label, ms = T) => {
 };
 
 try {
-  await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
-  await page.locator('.monaco-workbench').waitFor({ state: 'visible', timeout: T });
-  await aux.locator('.chat-input-container').first().waitFor({ state: 'visible', timeout: T });
+  await openWorkbench();
   check('the history folder exists before the editor starts', sh(`test -d ${quote(CHAT)} && ! test -L ${quote(CHAT)} && echo yes || echo no`).trim() === 'yes');
 
   if (PHASE === 'create') {
-    const editor = aux.locator('.chat-input-container .monaco-editor').first();
-    await until(async () => /Qwen3 Coder Next/.test(await aux.locator('.chat-input-container').first().innerText().catch(() => '')), 'model picker ready', 60_000);
-    let sent = false;
-    for (let attempt = 0; attempt < 3 && !sent; attempt++) {
-      await editor.locator('.view-lines').first().click({ force: true });
-      await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
-      await page.keyboard.type(PROMPT, { delay: 3 });
-      if (clean(await editor.innerText()).includes(PROMPT.slice(0, 20))) { await page.keyboard.press('Enter'); sent = true; }
-    }
-    check('prompt sent', sent);
+    check('prompt sent', await sendPrompt(PROMPT));
     check('the gateway answered in the chat', await until(async () => (await transcript()).includes('EZiL Chat'), 'response'), (await transcript()).slice(0, 160));
     // The store writes on its storage flush; give it time, then require exactly one file.
     await until(async () => sessionFiles().length > 0, 'session file in the workspace', 90_000);
@@ -87,15 +111,14 @@ try {
     info('other editor-profile files that contain the prompt (Copilot traces/transcripts; not removed by a delete)', JSON.stringify(copies));
     const initStatus = sh(`cd ${quote(FOLDER)} && ${GIT} init -q && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
     check('.ezil is ignored by Git', !initStatus.some(l => l.includes('.ezil')), JSON.stringify(initStatus.slice(0, 8)));
-  } else {
+  } else if (PHASE === 'verify') {
     check('the saved conversation survived the restart', sessionFiles().length === 1, JSON.stringify(sessionFiles()));
     info('browser address (a different host:port than the create phase means a different workspace-storage id)', new URL(CODE_URL).host);
     const title = aux.locator('.chat-view-title-container.visible .chat-view-title-label').first();
     const shown = await until(async () => (await title.isVisible().catch(() => false)), '"Chat history" title', 30_000);
     const label = shown ? clean(await title.innerText()) : '';
     check('an empty chat shows the "Chat history" title', /chat history/i.test(label), JSON.stringify(label));
-    const notice = clean(await aux.locator('.chat-welcome-view-disclaimer').first().innerText().catch(() => ''));
-    check('the EZiL notice still shows on the empty chat', notice.includes('AI responses may be inaccurate'), notice.slice(0, 120));
+    check('the EZiL notice still shows on the empty chat', await noticeShown());
     await page.screenshot({ path: join(OUT, 'history-empty-chat.png') });
     await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();
     await page.locator('.quick-input-widget').waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
@@ -140,6 +163,44 @@ try {
       status.some(l => l.includes('after-clean.txt')) && !status.some(l => l.includes('.ezil')), JSON.stringify(status));
     sh(`bash /usr/local/bin/editor-state.sh capture ${quote(FOLDER)}`);
     check('the next capture restores .ezil/.gitignore', sh(`tail -n 1 ${quote(join(FOLDER, '.ezil', '.gitignore'))} 2>/dev/null || true`).trim() === '*');
+  } else {
+    // The founder's report: send, press Go Back while the answer streams, and the running chat is
+    // gone from view. Upstream Go Back starts a new chat and leaves the old one running; the Sessions
+    // list over an empty chat is what leads back to it.
+    const sessionsList = aux.locator('.agent-sessions-container').first();
+    check('an empty chat shows the Sessions list', await until(async () => sessionsList.isVisible().catch(() => false), 'Sessions list', 30_000));
+    check('the EZiL notice shows under the chat input', await noticeShown());
+    // Without the list there is no filter button; carry on, so a build without the list fails on the report itself.
+    await aux.locator('.agent-sessions-toolbar .codicon-filter').first().click({ timeout: 10_000 }).catch(() => {});
+    await page.locator('.monaco-menu .action-item').first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
+    const menu = (await page.locator('.monaco-menu .action-item').allInnerTexts()).map(clean).filter(Boolean);
+    check('the Sessions filter offers Local sessions and no GitHub session type', menu.includes('Local') && !menu.some(t => /copilot|github|cloud|claude|codex/i.test(t)), JSON.stringify(menu));
+    await page.keyboard.press('Escape');
+    check('slow prompt sent', await sendPrompt(SLOW));
+    const parts = async () => Math.max(0, ...[...(await transcript()).matchAll(/part (\d+)\./g)].map(m => Number(m[1])));
+    check('the answer is still streaming', await until(async () => (await parts()) >= 1 && !(await transcript()).includes('EZIL_SLOW_DONE'), 'first streamed part', 60_000), (await transcript()).slice(0, 160));
+    await aux.locator('.chat-view-title-navigation-toolbar .codicon-arrow-left').first().click();
+    check('Go Back leaves an empty chat', await until(async () => !(await transcript()).includes('EZIL_E2E_SLOW'), 'empty chat', 15_000), (await transcript()).slice(0, 160));
+    const running = page.locator('.part.auxiliarybar .agent-sessions-control-container .monaco-list-row').filter({ hasText: /Working|In progress/i }).first();
+    check('the running chat is listed in Sessions as in progress', await until(async () => running.isVisible().catch(() => false), 'running session row', 15_000), JSON.stringify(await sessionRows()));
+    await page.screenshot({ path: join(OUT, 'sessions-running.png') });
+    await running.click();
+    check('choosing it reopens the same chat', await until(async () => (await transcript()).includes(SLOW), 'reopened chat', 15_000), (await transcript()).slice(0, 160));
+    const reopenedAt = await parts();
+    check('the answer keeps arriving after reopening and finishes', await until(async () => (await transcript()).includes('EZIL_SLOW_DONE'), 'finished answer', 60_000) && (await parts()) > reopenedAt, `reopened at part ${reopenedAt}, now ${await parts()}`);
+    await page.screenshot({ path: join(OUT, 'sessions-finished.png') });
+    const saved = () => filesWith(SLOW).filter(f => sh(`grep -c -F EZIL_SLOW_DONE ${quote(f)} || true`).trim() !== '0');
+    check('the finished chat is saved once in .ezil/chat, whole answer included', await until(async () => saved().length === 1, 'saved finished chat', 90_000) && filesWith(SLOW).length === 1, JSON.stringify(filesWith(SLOW)));
+    // A new browser has no IndexedDB index: the list comes from the session files.
+    const other = await newContext();
+    page = await other.newPage(); aux = page.locator('.part.auxiliarybar');
+    await openWorkbench();
+    const finished = page.locator('.part.auxiliarybar .agent-sessions-control-container .monaco-list-row').first();
+    check('a new browser lists the chat, finished', await until(async () => (await sessionRows()).length === 1, 'listed in a new browser', 30_000) && !(await sessionRows()).some(r => /Working|In progress/i.test(r)), JSON.stringify(await sessionRows()));
+    await finished.click().catch(() => {});
+    check('and reopens it with the whole answer', await until(async () => (await transcript()).includes('EZIL_SLOW_DONE'), 'reopened in a new browser', 30_000), (await transcript()).slice(-120));
+    await page.screenshot({ path: join(OUT, 'sessions-new-browser.png') });
+    await other.close();
   }
 } catch (e) {
   check('suite completed without an unexpected exception', false, String(e).slice(0, 300));

@@ -4,7 +4,7 @@ import { Readable } from 'node:stream';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMock, validateBody, QWEN, KIMI } from './copilot-ezil-messages-mock.mjs';
+import { createMock, validateBody, QWEN, KIMI, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
 
 const base = () => ({ model: QWEN, max_tokens: 16, stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
 const tool = name => ({ name, input_schema: { type: 'object', properties: {} } });
@@ -90,6 +90,39 @@ test('authenticated request handler, Qwen SSE, Kimi JSON and scripted tool seque
     assert.equal(captures.length, 10);
     assert.equal(captures.filter(record => !record.authorized).length, 2);
     assert.equal(readFileSync(join(captureDir, '0002.body.json'), 'utf8'), JSON.stringify(base()));
+  } finally {
+    server.close();
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test('a slow answer streams its parts over time, stops for a closed client, and answers whole unstreamed', async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), 'ezil-messages-slow-'));
+  const server = createMock({ token: 'test-only', folder: '/project', captureDir, slow: { parts: 3, ms: 40 } });
+  const handle = server.listeners('request')[0];
+  const call = async (body, { closeAfter } = {}) => {
+    const request = Readable.from([Buffer.from(JSON.stringify(body))]);
+    Object.assign(request, { method: 'POST', url: '/ai/v1/messages', headers: { authorization: 'Bearer test-only' } });
+    const writes = [];
+    const response = { destroyed: false, writeHead() {}, write(chunk) { writes.push({ at: Date.now(), chunk }); if (writes.length === closeAfter) this.destroyed = true; }, end(chunk = '') { writes.push({ at: Date.now(), chunk, end: true }); } };
+    await handle(request, response);
+    return writes;
+  };
+  try {
+    const slow = { ...base(), messages: [{ role: 'user', content: 'EZIL_E2E_SLOW: keep going' }] };
+    const writes = await call(slow);
+    const deltas = writes.filter(w => w.chunk.includes('text_delta')).map(w => ({ at: w.at, text: JSON.parse(w.chunk.split('data: ')[1]).delta.text }));
+    assert.deepEqual(deltas.map(d => d.text), ['EZiL Chat: slow reply.', ' part 1.', ' part 2.', ' part 3.', SLOW_DONE]);
+    assert.ok(deltas.at(-1).at - deltas[0].at >= 4 * 40 - 5, 'parts arrive over time');
+    assert.equal(writes.at(-1).end, true);
+    // A client that went away stops the stream: nothing after the close, and no end.
+    const closed = await call(slow, { closeAfter: 4 });
+    assert.equal(closed.length, 4);
+    // Unstreamed, the same answer arrives whole and carries no test-only field.
+    const whole = JSON.parse((await call({ ...slow, stream: false })).at(-1).chunk);
+    assert.deepEqual(whole.content, [{ type: 'text', text: 'EZiL Chat: slow reply. part 1. part 2. part 3.' + SLOW_DONE }]);
+    // A plain prompt is not slowed.
+    assert.equal((await call(base())).filter(w => w.chunk.includes('text_delta')).length, 1);
   } finally {
     server.close();
     rmSync(captureDir, { recursive: true, force: true });

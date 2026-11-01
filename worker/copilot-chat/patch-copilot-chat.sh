@@ -23,7 +23,7 @@
 #   extensions/copilot/dist/extension.js               copilot-chat extension host bundle
 #   out/nls.messages.js, out/nls.messages.json         workbench English strings (index-addressed array)
 #   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status + chat history
-#   out/vs/code/browser/workbench/workbench.css        welcome disclaimer
+#   out/vs/code/browser/workbench/workbench.css        EZiL notice under the chat input
 #   extensions/copilot/package{,.nls}.json            display strings
 set -euo pipefail
 
@@ -80,11 +80,15 @@ A_EMB_LATEST='async fetchRemoteCacheLatest(){let e=await this.getRemoteCacheLate
 R_EMB_LATEST='async fetchRemoteCacheLatest(){return;let e=await this.getRemoteCacheLatestUpdateURL();try{'
 A_EMB_EXT='async fetchRemoteExtensionCache(n){let o=`${await this.getBaseExtensionCDNURL()}/${n}.json`;try{'
 R_EMB_EXT='async fetchRemoteExtensionCache(n){return{};let o=`${await this.getBaseExtensionCDNURL()}/${n}.json`;try{'
-# Part 2 — the chat welcome hides its disclaimer (our notice) whenever BYOK models exist (workbench.css)
+# Part 2 — the EZiL notice (workbench.css). The welcome that carried it is hidden whenever BYOK
+# models exist (the upstream rule below, nested in `.interactive-session.chat-view-getting-started-disabled{…}`,
+# left as it is) and, with the Sessions list on, an empty chat shows the list instead. The notice
+# becomes one line under the chat view's input, in every chat state: a top-level rule appended to
+# the file (next to the upstream rule it would be nested too, and match nothing).
 CSS="$ROOT/out/vs/code/browser/workbench/workbench.css"
 [ -s "$CSS" ] || { echo "patch-copilot-chat: missing $CSS" >&2; exit 1; }
 A_CSS='.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}'
-R_CSS='.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-tips{display:none}'
+R_CSS_NOTICE='.chat-viewpane .interactive-session>.interactive-input-part::after{content:"AI responses may be inaccurate. Review changes before applying them.";display:block;padding:2px 4px 0;font-size:11px;line-height:16px;color:var(--vscode-descriptionForeground);text-align:center}'
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -158,9 +162,8 @@ P_HISTORY_CAP='var zSn=400,HTt="chat.ChatSessionStore.index"'
 P_HISTORY_READ='return this.readSessionFromLocation(t.flat,t.log,e)})}async readSessionFromLocation(e,t,i){'
 P_HISTORY_LOCATION='getStorageLocation(e){return{flat:ywe(this.storageRoot,e,".json"),log:'
 P_HISTORY_NOTFOUND='ba(r)!==1&&this.reportError("sessionDelete","Error deleting chat session",r)'
-# With chat.viewSessions.enabled:false (kept: it would hide the welcome notice and list every
-# session type in its filter menu) the only way to history is the chat title, and that title
-# rendered only once the current chat had one. Always render it; an empty chat reads "Chat history".
+# The chat title (whose click opens the session picker) rendered only once the current chat had a
+# title. Always render it; an empty chat reads "Chat history".
 A_HISTORY_ENTRY='shouldRender(){return!!this.model?.title}'
 R_HISTORY_ENTRY='shouldRender(){return!0}'
 A_HISTORY_LABEL='static{this.DEFAULT_TITLE=d(12379,null)}'
@@ -176,6 +179,11 @@ A_HISTORY_PICKER='async pickAgentSession(){let o=new A,e=o.add(this.quickInputSe
 R_HISTORY_PICKER='async pickAgentSession(){await this.agentSessionsService.model.resolve(cn.Local).catch(()=>{});let o=new A,e=o.add(this.quickInputService.createQuickPick({useSeparators:!0}))'
 P_HISTORY_LOCAL='r=[{id:cn.Local,label:n(cn.Local)}]'
 P_HISTORY_PICKER_SERVICE='R9e=class{constructor(o,e,t,i,n,r,a){this.anchor=o;this.options=e;this.agentSessionsService=t;'
+# The Sessions list (chat.viewSessions.enabled, Machine settings) offers a filter per session type:
+# Local plus every chatSessions contribution, including the GitHub-hosted agent types the Machine
+# settings and the target-picker patch keep out of EZiL Chat. EZiL runs local sessions only.
+A_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];for(let l of this.chatSessionsService.getAllChatSessionContributions()){let u=l.sessionListGroup??l.type;r.find(p=>p.id===u)||r.push({id:u,label:n(u)})}'
+R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
 
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
@@ -185,7 +193,10 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch embeddings-cache  "$EXT" 1 "$A_EMB_CACHE"  "$R_EMB_CACHE"
   patch embeddings-latest "$EXT" 1 "$A_EMB_LATEST" "$R_EMB_LATEST"
   patch embeddings-ext    "$EXT" 1 "$A_EMB_EXT"    "$R_EMB_EXT"
-  patch welcome-disclaimer "$CSS" 1 "$A_CSS" "$R_CSS"
+  gate chat-notice "$CSS" 1 "$A_CSS"
+  gate chat-notice "$CSS" 0 "$R_CSS_NOTICE"
+  printf '\n%s\n' "$R_CSS_NOTICE" >>"$CSS"
+  echo "patch-copilot-chat: [chat-notice] appended to $(basename "$CSS")"
   patch identity       "$EXT" 13 "$A_IDENT"  "$R_IDENT"
   patch identity-model "$EXT" 2  "$A_IDENT2" "$R_IDENT2"
   for nls in "$NLS_JS" "$NLS_JSON"; do
@@ -211,6 +222,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch history-label  "$WB"  1  "$A_HISTORY_LABEL" "$R_HISTORY_LABEL"
   patch history-empty-title "$WB" 2 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
   patch history-picker "$WB"  1  "$A_HISTORY_PICKER" "$R_HISTORY_PICKER"
+  patch session-filter "$WB" 1  "$A_SESSION_FILTER" "$R_SESSION_FILTER"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -234,7 +246,8 @@ gate identity-model   "$EXT" 0  "$A_IDENT2";       gate identity-model   "$EXT" 
 gate embeddings-cache  "$EXT" 0 "$A_EMB_CACHE";  gate embeddings-cache  "$EXT" 1 "$R_EMB_CACHE"
 gate embeddings-latest "$EXT" 0 "$A_EMB_LATEST"; gate embeddings-latest "$EXT" 1 "$R_EMB_LATEST"
 gate embeddings-ext    "$EXT" 0 "$A_EMB_EXT";    gate embeddings-ext    "$EXT" 1 "$R_EMB_EXT"
-gate welcome-disclaimer "$CSS" 0 "$A_CSS";       gate welcome-disclaimer "$CSS" 1 "$R_CSS"
+gate chat-notice "$CSS" 1 "$A_CSS";             gate chat-notice "$CSS" 1 "$R_CSS_NOTICE"
+node -e 'const fs=require("fs");const [f,r]=process.argv.slice(1);const s=fs.readFileSync(f,"utf8");const i=s.lastIndexOf(r);let d=0;for(const c of s.slice(0,i).replace(/\/\*[\s\S]*?\*\//g,"")){if(c==="{")d++;else if(c==="}")d--}if(d!==0)throw new Error("chat-notice rule is nested (depth "+d+")");console.log("patch-copilot-chat: gate ok [chat-notice] top level")' "$CSS" "$R_CSS_NOTICE"
 gate no-devdeviceid-token "$EXT" 0 'await this.authFromDevDeviceId('
 gate no-known-models-url  "$EXT" 0 'https://main.vscode-cdn.net/extensions/copilotChat.json'
 for nls in "$NLS_JS" "$NLS_JSON"; do
@@ -260,6 +273,7 @@ gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB" 
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
 gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
 gate history-picker   "$WB"  0  "$A_HISTORY_PICKER"; gate history-picker   "$WB"  1  "$R_HISTORY_PICKER"
+gate session-filter   "$WB"  0  "$A_SESSION_FILTER"; gate session-filter   "$WB"  1  "$R_SESSION_FILTER"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"

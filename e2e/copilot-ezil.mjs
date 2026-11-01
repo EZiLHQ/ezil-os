@@ -165,10 +165,15 @@ try {
   // 6 (revision 3). EZiL Chat branding on the boot path.
   await page.waitForTimeout(1500);
   const NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
-  const disclaimer = aux.locator('.chat-welcome-view-disclaimer').first();
-  const disclaimerText = clean(await disclaimer.innerText().catch(() => ''));
-  const disclaimerVisible = await disclaimer.isVisible().catch(() => false);
-  check('chat welcome shows the EZiL notice (no GitHub Terms / Privacy Statement)', disclaimerVisible && disclaimerText.includes(NOTICE) && !/terms|privacy|github|copilot/i.test(disclaimerText), `visible=${disclaimerVisible} text=${JSON.stringify(disclaimerText.slice(0, 120))}`);
+  // The notice is one line under the chat view's input (workbench.css `chat-notice`), in every chat
+  // state; the welcome disclaimer it used to live in stays hidden upstream but must not carry GitHub terms.
+  const notice = await page.evaluate(text => {
+    const part = document.querySelector('.part.auxiliarybar .chat-viewpane .interactive-session > .interactive-input-part');
+    const after = part && getComputedStyle(part, '::after');
+    const box = part?.getBoundingClientRect();
+    return { shown: Boolean(part?.offsetHeight) && after.display !== 'none' && after.content.includes(text) && box.bottom <= innerHeight, disclaimer: document.querySelector('.part.auxiliarybar .chat-welcome-view-disclaimer')?.textContent ?? '' };
+  }, NOTICE);
+  check('chat panel shows the EZiL notice under its input (no GitHub Terms / Privacy Statement anywhere)', notice.shown && !/terms|privacy|github|copilot/i.test(notice.disclaimer), JSON.stringify({ shown: notice.shown, disclaimer: notice.disclaimer.slice(0, 120) }));
   await aux.screenshot({ path: join(OUT, 'welcome.png') }).catch(() => {});
   const brandingBoot = await visibleBranding();
   check('no visible "Copilot" / "GitHub" text anywhere in the workbench after boot', brandingBoot.length === 0, JSON.stringify(brandingBoot.slice(0, 4)));

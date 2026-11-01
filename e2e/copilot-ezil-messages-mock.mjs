@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
+export const SLOW_DONE = ' EZIL_SLOW_DONE';
 const NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const only = (value, keys) => object(value) && Object.keys(value).every(key => keys.includes(key));
@@ -68,7 +69,7 @@ function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
   const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
@@ -76,6 +77,7 @@ function scriptedContent(body, folder) {
     return [{ type: 'tool_use', id, name, input }];
   };
   if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
+  if (userText.includes('EZIL_E2E_SLOW')) return [{ type: 'text', text: 'EZiL Chat: slow reply.', slow: true }];
   if (userText.includes('EZIL_E2E_UNDO')) {
     if (!done('ezil_undo')) return call('ezil_undo', 'replace_string_in_file', { filePath: join(folder, 'existing.txt'), oldString: 'after\n', newString: 'undo candidate\n' });
     return [{ type: 'text', text: 'EZiL Chat: undo candidate ready.' }];
@@ -91,8 +93,10 @@ function scriptedContent(body, folder) {
   return [{ type: 'text', text: body.model === KIMI ? 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' : 'EZiL Chat' }];
 }
 
-export function createMock({ token, folder, captureDir }) {
+// slow: a marked answer streams `parts` numbered parts `ms` apart (the image suite leaves a chat mid-answer).
+export function createMock({ token, folder, captureDir, slow: { parts = 20, ms = 1000 } = {} }) {
   if (!nonempty(token)) throw new Error('a test token is required');
+  const slowParts = () => Array.from({ length: parts }, (_, i) => ` part ${i + 1}.`);
   mkdirSync(captureDir, { recursive: true });
   const captured = [];
   return http.createServer(async (req, res) => {
@@ -113,18 +117,30 @@ export function createMock({ token, folder, captureDir }) {
     if (req.method !== 'POST' || req.url !== '/ai/v1/messages') return error(404, 'not_found', 'unsupported route');
     const invalid = validateBody(body, raw.length);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
-    let content;
-    try { content = scriptedContent(body, folder); } catch (err) { return error(500, 'e2e_missing_tool', err.message); }
+    let scripted;
+    try { scripted = scriptedContent(body, folder); } catch (err) { return error(500, 'e2e_missing_tool', err.message); }
+    // A slow block streams its numbered parts, then SLOW_DONE: long enough to leave a chat while its
+    // answer is still arriving. Unstreamed, it answers at once in full.
+    const content = scripted.map(({ slow, ...block }) => (slow ? { ...block, text: block.text + slowParts().join('') + SLOW_DONE } : block));
     const message = { id: 'msg_e2e_' + n, type: 'message', role: 'assistant', model: body.model, content, stop_reason: content.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn', stop_sequence: null, usage };
     if (body.model === KIMI || body.stream !== true) return json(200, message);
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'x-request-id': 'e2e-' + n });
     const event = (type, value) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
     event('message_start', { message: { ...message, content: [], stop_reason: null } });
-    content.forEach((block, index) => {
+    for (const [index, block] of scripted.entries()) {
       event('content_block_start', { index, content_block: block.type === 'tool_use' ? { ...block, input: {} } : { type: 'text', text: '' } });
-      event('content_block_delta', { index, delta: block.type === 'tool_use' ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } : { type: 'text_delta', text: block.text } });
+      if (block.slow) {
+        event('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } });
+        for (const part of [...slowParts(), SLOW_DONE]) {
+          await new Promise(done => setTimeout(done, ms));
+          if (res.destroyed) return;
+          event('content_block_delta', { index, delta: { type: 'text_delta', text: part } });
+        }
+      } else {
+        event('content_block_delta', { index, delta: block.type === 'tool_use' ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } : { type: 'text_delta', text: block.text } });
+      }
       event('content_block_stop', { index });
-    });
+    }
     event('message_delta', { delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage });
     event('message_stop', {});
     res.end();

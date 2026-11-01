@@ -159,12 +159,14 @@ sws="$root/state-ws"; mkdir -p "$sws/.git/info"; : >"$sws/.git/info/exclude"
 ezil_editor_ignore_state "$sws" "$root/elsewhere"
 [ ! -s "$sws/.git/info/exclude" ] || fail "excluded /.ezil/ for a state dir outside the workspace"
 
-# 8. Copilot's derived session index is off and its old copy is dropped.
+# 8. Copilot's derived session index is off and its old copy is dropped; the chat view lists its
+# sessions (running and past) above an empty chat.
 node - "$cf/Machine/settings.json" <<'JS'
 const assert = require('node:assert/strict');
 const machine = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
 assert.equal(machine['github.copilot.chat.localIndex.enabled'], false);
-assert.equal(machine['chat.viewSessions.enabled'], false);
+assert.equal(machine['chat.viewSessions.enabled'], true);
+assert.equal(machine['chat.viewSessions.orientation'], 'stacked');
 JS
 store="$cf/User/globalStorage/github.copilot-chat"
 mkdir -p "$store"
