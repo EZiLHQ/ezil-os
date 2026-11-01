@@ -3,10 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), retain: vi.fn() }));
+const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => ({ set: stub.set }) }));
 vi.mock('@/server/auth/auth0', async importOriginal => ({ ...await importOriginal<typeof import('@/server/auth/auth0')>(), exchangeCode: stub.exchangeCode, verifyIdToken: stub.verifyIdToken }));
-vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge }));
+vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge, refuseSilentAccountSwitch: stub.refuseSwitch }));
 vi.mock('@/server/auth/retained-identity', () => ({ retainProjectIdentity: stub.retain }));
 
 import { AUTH0_COOKIE, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
@@ -153,6 +153,26 @@ describe('Auth0 callback after a silent (prompt=none) attempt', () => {
         const response = await GET(await silentRequest({ code: 'private-code' }));
         expect(response.headers.get('location')).toBe(`${origin}/app/code?project=p&repo=r`);
         expect(stub.retain).toHaveBeenCalledWith('private-id-token');
+    });
+    it('🔴 a silent success first checks it is the signed-in account, BEFORE the bridge replaces the session (review #3)', async () => {
+        await GET(await silentRequest({ code: 'private-code' }));
+        expect(stub.refuseSwitch).toHaveBeenCalledWith({ sub: 'auth0|one', email: 'private@example.com' });
+        expect(stub.verifyIdToken.mock.invocationCallOrder[0]).toBeLessThan(stub.refuseSwitch.mock.invocationCallOrder[0]);
+        expect(stub.refuseSwitch.mock.invocationCallOrder[0]).toBeLessThan(stub.bridge.mock.invocationCallOrder[0]);
+    });
+    it('🔴 a silent sign-in into another account is account_conflict: no bridge, no retained token, the tab stays signed in as before', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
+        const response = await GET(await silentRequest({ code: 'private-code' }));
+        expect(response.headers.get('location')).toBe(`${origin}/login?error=account_conflict`);
+        expect(stub.bridge).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expectCleared(response);
+    });
+    it('an interactive sign-in is the person choosing an account: no switch check', async () => {
+        await GET(request());
+        expect(stub.refuseSwitch).not.toHaveBeenCalled();
+        expect(stub.bridge).toHaveBeenCalledOnce();
     });
     it('an interactive transaction never takes the silent fallback', async () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});

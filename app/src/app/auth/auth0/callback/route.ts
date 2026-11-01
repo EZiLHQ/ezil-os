@@ -3,7 +3,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import {
     AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, auth0Enabled, exchangeCode, readTransaction, SILENT_LOGIN_FALLBACK_ERRORS, verifyIdToken,
 } from '@/server/auth/auth0';
-import { bridgeAuth0Identity } from '@/server/auth/bridge';
+import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
 import { safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -24,6 +24,9 @@ export async function GET(request: NextRequest) {
             if (params.has('error') || !code) throw new Auth0Error('auth0_failed');
             const token = await exchangeCode(code, { origin: ownedPublicOrigin(request.headers, request.url), codeVerifier: transaction.codeVerifier });
             const identity = await verifyIdToken(token, { nonce: transaction.nonce });
+            // A silent sign-in refreshes the signed-in person's EZiL ID; it never switches the OS account. Before the
+            // bridge, which replaces the session.
+            if (transaction.silent) await refuseSilentAccountSwitch(identity);
             await bridgeAuth0Identity(identity);
             // After the bridge, so the token is bound to the session it just minted. Additive: a failure here never
             // fails the OS sign-in; opening a project then asks for a refresh (IDENTITY_REFRESH_REQUIRED).
