@@ -60,6 +60,7 @@ const MINUTE = 60 * SECOND;
 export const SETUP_MS = 2 * MINUTE;
 export const CLEANUP_SLACK_MS = 30 * SECOND;
 const TERMINAL_MS = 2 * MINUTE;
+const ECHO_MS = MINUTE;
 const CLOSE_MS = 30 * SECOND;
 const PRECHECK_MS = 2 * MINUTE;
 const CREATE_MS = MINUTE;
@@ -251,10 +252,52 @@ export function capText(value, max = 300) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/** Driver errors carry a "Call log" with request headers: keep the first line only. */
-export function describeError(error, { secrets = [], max = 300 } = {}) {
-  const first = String(error?.message ?? error ?? 'Unknown error').split('\n')[0];
-  return capText(redactText(first, { secrets }), max);
+/**
+ * Driver errors carry a "Call log" that can hold request headers and cookies, so
+ * the first line is all that survives, unless `callLog` asks for Playwright's
+ * narration of the action (what it waited for, what it resolved to, why it
+ * retried): only those lines are kept, a matched element is cut down to its tag
+ * and class, and a `cause` supplies the log when the error is a wrapper.
+ */
+export function describeError(error, { secrets = [], max = 300, callLog = false } = {}) {
+  const message = String(error?.message ?? error ?? 'Unknown error');
+  const first = capText(redactText(message.split('\n')[0], { secrets }), max);
+  if (!callLog) return first;
+  const steps = callLogSteps(message.includes('Call log:') ? message : String(error?.cause?.message ?? ''), secrets);
+  return steps ? `${first} [call log: ${steps}]` : first;
+}
+
+const CALL_LOG_STEPS = [
+  /^waiting for (?:locator|selector|element|frameLocator|getBy\w+)\b/, /^attempting \w+ action$/,
+  /^waiting for element to be [a-z, ]+$/, /^element is [a-z, ]+$/, /^retrying \w+ action$/, /^scrolling into view if needed$/,
+];
+const ANSI = /\x1b\[[0-9;]*m/g;
+const CALL_LOG_LINES = 8;
+const CALL_LOG_MAX = 600;
+
+/** `<div class="xterm-screen">` for whatever element preview the text starts with, else null. */
+function elementLabel(text) {
+  const tag = /<([A-Za-z][\w-]*)\b(?:[^>]*?\sclass="([^"]{0,80})")?/.exec(text);
+  return tag ? `<${tag[1]}${tag[2] ? ` class="${tag[2]}"` : ''}>` : null;
+}
+
+function callLogSteps(message, secrets) {
+  const log = /\bCall log:\n([\s\S]*)/.exec(message)?.[1] ?? '';
+  const kept = new Set();
+  for (const raw of log.split('\n')) {
+    // Playwright dims each line, nests the retries, and folds repeats into "6 × ...".
+    const line = raw.replace(ANSI, '').replace(/^\s*(?:-\s+)?(?:\d+ × )?/, '').trim();
+    const label = elementLabel(line);
+    let step = null;
+    if (CALL_LOG_STEPS.some(pattern => pattern.test(line))) step = line;
+    else if (label && /^locator resolved to (?:hidden )?</.test(line)) step = `locator resolved to ${line.includes('to hidden <') ? 'hidden ' : ''}${label}`;
+    else if (label && /^<.*intercepts pointer events$/.test(line)) step = `${label} intercepts pointer events`;
+    if (step) kept.add(capText(redactText(step, { secrets }), 160));
+  }
+  // The first steps say what was targeted, the last ones why it gave up.
+  const steps = [...kept];
+  const shown = steps.length > CALL_LOG_LINES ? [...steps.slice(0, 2), ...steps.slice(2 - CALL_LOG_LINES)] : steps;
+  return capText(shown.join(' | '), CALL_LOG_MAX);
 }
 
 // ── Failure evidence ────────────────────────────────────────────────────────
@@ -496,6 +539,36 @@ export function framePixelVerdict(pixels, width = 64, height = 36) {
 export function echoProbeCommand(nonce) {
   if (typeof nonce !== 'string' || !/^[a-f0-9]{20}$/.test(nonce)) throw new Error('Invalid probe nonce');
   return `printf '%s[%s]\\n' N${nonce} ok`;
+}
+
+/** xterm's root: the screen, the helper textarea and the accessibility tree all live inside it. */
+export const XTERM = '.xterm';
+export const PRIOR_TERMINAL_ATTR = 'data-e2e-prior';
+/**
+ * The terminal this run created. Persisted terminals stay attached but hidden,
+ * and the previous one stays visible while the new one starts, so DOM order
+ * (`.last()`) says nothing: tag what exists before creating (`markPriorTerminals`).
+ */
+export const FRESH_TERMINAL = `${XTERM}:not([${PRIOR_TERMINAL_ATTR}]):visible`;
+
+/** Runs in the page: tag every terminal that is already attached. */
+export function markPriorTerminals({ selector, attr }) {
+  for (const element of document.querySelectorAll(selector)) element.setAttribute(attr, '1');
+}
+
+/**
+ * Form values and Settings' Account pane (the address) are always hidden.
+ * Remote pixels and frames are hidden too, unless `showFrames`.
+ */
+export function screenshotStyle(showFrames = false) {
+  return `${showFrames ? '' : 'iframe, video, canvas, object, embed, '}[data-pane="account"] { visibility: hidden !important; }
+    input, textarea { color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: transparent !important; }`;
+}
+
+/** The page, or with `app` only that app's window: its frame can be shown without showing the rest. */
+export async function takeShot(page, path, { showFrames = false, app = null, mask = [], timeout = 5000 } = {}) {
+  const target = app ? page.locator(`.window[data-app="${app}"]:not([data-closing="1"])`).first() : page;
+  await target.screenshot({ path, timeout, ...(mask.length ? { mask } : {}), style: screenshotStyle(showFrames) });
 }
 
 /** A paid plan (v3 `plan.sku`, v2 `plan.family`). Free, disabled or unreadable is not paid. */
@@ -1109,25 +1182,28 @@ export async function runProdJourneys({
    * Shell text stays readable (the error copy is the point). Form values and
    * Settings' Account pane (the address) are always hidden. Remote pixels and
    * frames are hidden too, except in a `showFrames` shot of an app that is
-   * ready: those exist to show what the user sees, on a dedicated QA account.
+   * ready, or of the window a failed step was driving (`framesApp`): those exist
+   * to show what the user sees, on a dedicated QA account.
    * A mask box is not used: it would hide the failure panel, which overlays
    * the app's own iframe.
    */
-  const screenshot = async (name, { showFrames = false } = {}) => {
+  const screenshot = async (name, { showFrames = false, app = null } = {}) => {
     if (!page || page.isClosed()) return null;
     const file = `${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.png`;
     try {
       // Off the app (an EZiL ID screen shows the address being signed in): mask the address.
       let foreign = true;
       try { foreign = new URL(page.url()).origin !== config.app; } catch { foreign = true; }
-      await page.screenshot({ path: join(config.out, file), timeout: 5000,
-        ...(foreign && config.email ? { mask: [page.locator(`text=${config.email}`)] } : {}),
-        style: `${showFrames ? '' : 'iframe, video, canvas, object, embed, '}[data-pane="account"] { visibility: hidden !important; }
-          input, textarea { color: transparent !important; -webkit-text-fill-color: transparent !important; caret-color: transparent !important; }` });
+      await takeShot(page, join(config.out, file), { showFrames, app,
+        mask: foreign && config.email ? [page.locator(`text=${config.email}`)] : [] });
       return file;
     } catch { return null; }
   };
-  const failureEvidence = async label => {
+  /**
+   * `framesApp`: the failure shot hides frames, so the app that was being driven
+   * also gets a frames-visible shot of its own window, nothing else on the page.
+   */
+  const failureEvidence = async (label, { framesApp = null } = {}) => {
     await bounded(() => Promise.allSettled([...inflight]), 2000).catch(() => {});
     const visible = page && !page.isClosed()
       ? await bounded(() => page.evaluate(readVisibleErrors), 3000).catch(() => []) : [];
@@ -1136,6 +1212,7 @@ export async function runProdJourneys({
     return {
       apiFailures: failures, consoleErrors: [...buffers.consoleErrors], pageErrors: [...buffers.pageErrors],
       visibleError: shapeVisibleErrors(visible, { secrets }), screenshot: await screenshot(label),
+      ...(framesApp ? { appScreenshot: await screenshot(`${label}-${framesApp}-window`, { showFrames: true, app: framesApp }) } : {}),
     };
   };
   const onResponse = response => {
@@ -1166,8 +1243,11 @@ export async function runProdJourneys({
   // ── steps ──
   const emitStep = (journey, record) => say({ journey: journey.name, step: record.name, ok: record.ok, ms: record.ms,
     ...(record.error ? { error: record.error } : {}), ...(record.note ? { note: record.note } : {}) });
-  /** `soft`: a failure is recorded (the journey still fails) but the next step runs; `final`: runs on the reserve after the normal deadline. */
-  async function step(journey, name, timeoutMs, action, { final = false, soft = false } = {}) {
+  /**
+   * `soft`: a failure is recorded (the journey still fails) but the next step runs; `final`: runs on the reserve after the normal deadline;
+   * `framesApp`: a failure also gets a frames-visible shot of that app's window.
+   */
+  async function step(journey, name, timeoutMs, action, { final = false, soft = false, framesApp = null } = {}) {
     const began = performance.now();
     active = { journey: journey.name, step: name, began };
     activeDeadline = final ? finalDeadline : deadline;
@@ -1181,7 +1261,8 @@ export async function runProdJourneys({
       return value;
     } catch (error) {
       const record = stepRecord(name, false, performance.now() - began, {
-        error: describeError(error, { secrets }), evidence: await failureEvidence(`${journey.name}-${name}`),
+        error: describeError(error, { secrets, callLog: true }),
+        evidence: await failureEvidence(`${journey.name}-${name}`, { framesApp }),
       });
       journey.steps.push(record); emitStep(journey, record); save();
       if (soft) return undefined;
@@ -1328,35 +1409,75 @@ export async function runProdJourneys({
     await closeWindows();
   }, 8000).catch(() => {});
   const trpc = (method, path, input) => page.evaluate(trpcInPage, { method, path, input });
-  async function codeCommand(frame, name, id) {
-    for (let attempt = 0; attempt < 5; attempt++) {
+  /**
+   * Run a command from the palette. A click can land and still time out, and
+   * running a toggle or a create twice undoes or doubles it, so a retry first
+   * asks `done` whether the command already took effect, and a failed attempt
+   * dismisses the palette so the next one starts from a fresh list.
+   */
+  async function codeCommand(frame, name, id, { done = null, attempts = 5 } = {}) {
+    let last = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       remaining();
+      if (attempt > 0 && done && await done().catch(() => false)) return;
       try {
         const quick = await openQuickInput(frame, { attempts: 1, timeout: remaining(4000) });
         await quick.fill(`>${name}`, { timeout: remaining(2000) });
         await frame.locator(`.quick-input-list .monaco-list-row:visible [data-quick-input-id="${id}"]`).click({ timeout: remaining(3000) });
+        await quick.waitFor({ state: 'hidden', timeout: remaining(3000) });
         return;
-      } catch { await sleep(remaining(1000)); }
+      } catch (error) {
+        last = error;
+        if (await frame.locator('.quick-input-widget input:visible').count().catch(() => 0)) {
+          await frame.locator('body').press('Escape', { timeout: remaining(2000) }).catch(() => {});
+        }
+        await sleep(remaining(1000));
+      }
     }
-    throw new Error(`Code command unavailable: ${name}`);
+    throw new Error(`Code command unavailable: ${name} (${describeError(last)})`, { cause: last });
   }
   async function terminalEcho(frame) {
     // Screen-reader mode makes the terminal readable through the accessibility tree.
-    if (!await frame.getByText('Screen Reader Optimized', { exact: true }).count()) {
-      await codeCommand(frame, 'Toggle Screen Reader Accessibility Mode', 'editor.action.toggleScreenReaderAccessibilityMode');
-      await sleep(remaining(1000));
+    const screenReader = frame.getByText('Screen Reader Optimized', { exact: true });
+    if (!await screenReader.count()) {
+      await codeCommand(frame, 'Toggle Screen Reader Accessibility Mode', 'editor.action.toggleScreenReaderAccessibilityMode',
+        { done: async () => await screenReader.count() > 0 });
+      await screenReader.first().waitFor({ state: 'attached', timeout: remaining(8000) });
     }
-    await codeCommand(frame, 'Terminal: Create New Terminal', 'workbench.action.terminal.new');
-    await sleep(remaining(4000));   // shell startup; the old terminal can stay visible meanwhile
-    await frame.locator('.xterm-screen').last().click({ timeout: remaining() });
-    const input = frame.locator('.xterm-helper-textarea').last();
+    // The account's earlier terminals stay attached: tag them so only the new one is untagged.
+    await frame.evaluate(markPriorTerminals, { selector: XTERM, attr: PRIOR_TERMINAL_ATTR });
+    const terminal = frame.locator(FRESH_TERMINAL).last();
+    for (let attempt = 1; ; attempt++) {
+      await codeCommand(frame, 'Terminal: Create New Terminal', 'workbench.action.terminal.new',
+        { done: async () => await frame.locator(FRESH_TERMINAL).count() > 0 });
+      const wait = remaining(25_000);
+      try { await terminal.waitFor({ state: 'visible', timeout: wait }); break; } catch (error) {
+        // A command run while the workbench is still starting can be lost: ask once more before giving up.
+        if (attempt < 2) continue;
+        const count = selector => frame.locator(selector).count().catch(() => '?');
+        throw new Error(`No new terminal became visible after Create New Terminal (xterm roots: ${await count(XTERM)} attached, `
+          + `${await count(`${XTERM}:visible`)} visible, ${await count(`${XTERM}:not([${PRIOR_TERMINAL_ATTR}])`)} untagged; `
+          + `terminal panel visible: ${await count('.part.panel:visible')})`, { cause: error });
+      }
+    }
+    await sleep(remaining(4000));   // shell startup
+    // force: shell-integration decorations overlay the screen, and a user's click still focuses it (billing-staging-journey.mjs).
+    await terminal.locator('.xterm-screen').click({ timeout: remaining(), force: true });
+    const input = terminal.locator('.xterm-helper-textarea');
     await input.pressSequentially(echoProbeCommand(nonce), { delay: 1, timeout: remaining() });
     await input.press('Enter', { timeout: remaining() });
+    // Give up before the step does, so the failure says what happened instead of "Deadline exceeded".
+    const giveUpAt = performance.now() + ECHO_MS;
+    let unreadable = null;
     for (;;) {
-      const text = await frame.locator('.xterm-accessibility-tree').last().innerText({ timeout: remaining(2000) }).catch(() => '');
-      if (parseTerminalMarker(text, `N${nonce}`) === 'ok') return;
+      const text = await terminal.locator('.xterm-accessibility-tree').innerText({ timeout: remaining(2000) })
+        .catch(error => { unreadable = error; return ''; });
+      if (parseTerminalMarker(text, `N${nonce}`) === 'ok') break;
+      if (performance.now() > giveUpAt) throw new Error('The typed command never echoed its marker in the new terminal', { cause: unreadable ?? undefined });
       await sleep(remaining(1000));
     }
+    // Best effort: this run's terminal is the active one; do not leave it behind as one more persisted tab.
+    await codeCommand(frame, 'Terminal: Kill the Active Terminal Instance', 'workbench.action.terminal.kill', { attempts: 1 }).catch(() => {});
   }
   async function openSettings(tab) {
     const win = page.locator('.window[data-app="settings"]:not([data-closing="1"])').first();
@@ -1384,7 +1505,7 @@ export async function runProdJourneys({
       await readyShot(journey, 'code', 'code');
       return ready;
     }, { soft: true });
-    if (code) await step(journey, 'terminal-echo', TERMINAL_MS, () => terminalEcho(code.frame), { soft: true });
+    if (code) await step(journey, 'terminal-echo', TERMINAL_MS, () => terminalEcho(code.frame), { soft: true, framesApp: 'code' });
     await step(journey, 'open-browser', config.appTimeoutMs + 15 * SECOND, async () => {
       await clickDock('desktop');
       const ready = await waitForApp('desktop', desktopReady, config.appTimeoutMs);
