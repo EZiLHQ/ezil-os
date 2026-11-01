@@ -103,6 +103,7 @@ rm "$workspace/.ezil/.gitignore"
 #    editor recreates .ezil/chat itself on its next write. Normal files are the controls.
 #    a) A repository at the root: its local exclude keeps .ezil out even before a capture.
 exclude="$workspace/.git/info/exclude"
+[ -f "$exclude" ] || fail "premise: this git's init template has no info/exclude"
 ezil_editor_capture "$cf" "$workspace"
 [ "$(grep -cxF '/.ezil/' "$exclude")" -eq 1 ] || fail "exclude line not added exactly once"
 ezil_editor_prepare "$cf" "$workspace"; ezil_editor_capture "$cf" "$workspace"
