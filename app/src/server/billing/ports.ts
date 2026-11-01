@@ -250,6 +250,12 @@ export interface BillingStore {
     touchInterval(computerId: string, at: Date): Promise<void>;
     closeInterval(computerId: string, at: Date, reason: string): Promise<void>;
     insertStorageSample(userId: string, sample: StorageSample & { source: string }): Promise<void>;
+    /**
+     * The host agent's sample, at most once per (computer, measured_at, source): a retried
+     * POST is `duplicate`, not a second row. Serialised per computer by an advisory lock
+     * (the append-only table has no unique key and this lane adds no migration).
+     */
+    insertStorageSampleOnce?(userId: string, sample: StorageSample & { source: string }): Promise<'recorded' | 'duplicate'>;
     /** Close every open interval last seen before `staleBefore`, ending it at its `last_seen_at`. Returns how many. */
     closeStaleIntervals(staleBefore: Date, reason: string): Promise<number>;
 }

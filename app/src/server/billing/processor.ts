@@ -480,6 +480,12 @@ export async function ingestUsageEvents(events: UsageEvent[], deps: { store: Bil
                     rejected++;
                     continue;
                 }
+                // An AWS computer's storage comes only from its host agent, under that epoch's control key
+                // (POST /api/compute/aws/storage): the deployment-wide usage secret never names one.
+                if (await store.placementProvider?.(event.computerId) === 'aws-ec2') {
+                    rejected++;
+                    continue;
+                }
                 await store.insertStorageSample(userId, {
                     computerId: event.computerId, bytes: BigInt(event.bytes), measuredAt: at, source: 'worker',
                 });

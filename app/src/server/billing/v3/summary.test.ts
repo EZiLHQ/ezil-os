@@ -269,7 +269,7 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
             currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }] };
         expect(buildSummaryV3(args).plan.sku).toBe('legacy');
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: String(2 * 1024 ** 3), state: 'unavailable' });
-        expect(buildSummaryV3(args).computer.disk.usedBytes).toBeNull();
+        expect(buildSummaryV3(args).computer.disk?.usedBytes).toBeNull();
         // Positive controls: a measured zero is ok; 1.8e9 bytes is 83.8% of 2 GiB (low); two computers sum.
         expect(buildSummaryV3({ ...args, storage: [{ computerId: 'c', bytes: BigInt(0), measuredAt: now }] }).storage)
             .toEqual({ usedBytes: '0', capBytes: String(2 * 1024 ** 3), state: 'ok' });
