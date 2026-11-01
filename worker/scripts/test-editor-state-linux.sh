@@ -9,11 +9,13 @@ printf '127.0.0.1 localhost\n' >"$EZIL_HOSTS_FILE"
 workspace="$root/workspace"
 user_data="$root/user"
 mkdir -p "$workspace/.ezil"
-printf '// theme comment\n{"workbench.colorTheme":"Default Dark Modern",}\n' >"$workspace/.ezil/settings.json"
+# Saved settings that already say "task.allowAutomaticTasks": "off" are restored
+# byte for byte (prepare forces that one value; see the end of this script).
+printf '// theme comment\n{"workbench.colorTheme":"Default Dark Modern","task.allowAutomaticTasks":"off",}\n' >"$workspace/.ezil/settings.json"
 printf '// binding comment\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]\n' >"$workspace/.ezil/keybindings.json"
 ezil_editor_prepare "$user_data" "$workspace"
 cmp "$workspace/.ezil/settings.json" "$user_data/User/settings.json"
-printf '// changed immediately\n{"workbench.colorTheme":"Default Dark+",}\n' >"$user_data/User/settings.json"
+printf '// changed immediately\n{"workbench.colorTheme":"Default Dark+","task.allowAutomaticTasks":"off",}\n' >"$user_data/User/settings.json"
 # Prove capture waits for the actual process lock and cannot publish early.
 (
   exec 8>"$user_data/.ezil-state.lock"
@@ -58,13 +60,15 @@ assert.equal(machine['telemetry.telemetryLevel'], 'off');
 assert.equal(machine['github.copilot.chat.tools.viewImage.enabled'], false);
 assert.equal(machine['github.copilot.chat.virtualTools.threshold'], 64);
 assert.deepEqual(machine['terminal.integrated.env.linux'], { EZIL_AI_PROXY_TOKEN: null, EZIL_AI_BASE_URL: null });
+assert.equal(machine['task.allowAutomaticTasks'], 'off');
+assert.equal(JSON.parse(fs.readFileSync(root + '/User/settings.json', 'utf8'))['task.allowAutomaticTasks'], 'off');
 assert(!Object.keys(machine).some(key => /auto.?approve/i.test(key)));
 assert.deepEqual(JSON.parse(fs.readFileSync(root + '/User/chatLanguageModels.json', 'utf8')), [{ name: 'EZiL', vendor: 'ezil' }]);
 JS
 # Hostile pre-existing Machine settings are replaced, even on a ready runtime;
 # User JSONC and other vendors survive byte-for-byte / value-for-value.
 cp "$root/fresh/Machine/settings.json" "$root/expected-machine.json"
-printf '// user JSONC\n{"chat.disableAIFeatures":true,"editor.fontSize":17,}\n' >"$root/fresh/User/settings.json"
+printf '// user JSONC\n{"chat.disableAIFeatures":true,"editor.fontSize":17,"task.allowAutomaticTasks":"off",}\n' >"$root/fresh/User/settings.json"
 cp "$root/fresh/User/settings.json" "$root/expected-user.json"
 printf '{"chat.disableAIFeatures":true,"chat.allowAnonymousAccess":false}\n' >"$root/fresh/Machine/settings.json"
 printf '[{"name":"Other","vendor":"openai","extra":{"keep":true}}, {"name":"custom","vendor":"ezil"}]\n' >"$root/fresh/User/chatLanguageModels.json"
@@ -111,4 +115,13 @@ cmp "$root/expected-user.json" "$root/fresh/User/settings.json"
 grep -qx '127.0.0.1 api.githubcopilot.com' "$EZIL_HOSTS_FILE"
 # /proc/version is genuinely read-only even for root; no boot failure.
 EZIL_HOSTS_FILE=/proc/version seed_blocked_ai_hosts
-printf 'Linux editor restore, checkpoint, locks, failure preservation and chat seeds: passed\n'
+# A project repository's tasks never run on open (build1-review-os.md #1): an
+# "on" (a restored file, or an earlier Allow) is forced back to "off" on a ready
+# runtime, comments and layout intact; a missing key is added last.
+printf '// allowed once\n{"editor.fontSize":17,"task.allowAutomaticTasks":"on",}\n' >"$root/fresh/User/settings.json"
+ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
+[ "$(cat "$root/fresh/User/settings.json")" = "$(printf '// allowed once\n{"editor.fontSize":17,"task.allowAutomaticTasks":"off",}')" ]
+printf '{"editor.fontSize":17}' >"$root/fresh/User/settings.json"
+ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
+[ "$(cat "$root/fresh/User/settings.json")" = "$(printf '{"editor.fontSize":17,\n  "task.allowAutomaticTasks": "off"\n}')" ]
+printf 'Linux editor restore, checkpoint, locks, failure preservation, chat seeds and the task policy: passed\n'
