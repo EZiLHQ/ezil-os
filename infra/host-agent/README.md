@@ -223,6 +223,41 @@ How the outcome is used:
   the boot log. Reporting it to the control plane (for example at enrollment) is an open
   item.
 
+## Storage sampler (`storage.py`)
+
+The agent meters the computer's retained data volume for Billing (docs/billing/CONTRACT.md
+§3.2). This is its one outbound call, and it is best effort: no answer changes a lifecycle
+decision.
+
+- **Meter:** `statvfs(dataMount)` used blocks, `(f_blocks − f_bfree) × f_frsize`. It is O(1)
+  and nothing is traversed, so guest symlinks and hardlinks do not affect it.
+- **What is measured:** the volume only while `dataMount` is a mountpoint AND `runDir/guard-ok`
+  names this lease's epoch. Otherwise there is no sample, never the root disk.
+- **When:**
+  - 60 s after the agent starts (`storageFirstSampleSeconds`), then every 900 s
+    (`storageSampleSeconds`; `0` turns it off), on a daemon thread.
+  - Transport errors, 429 and 5xx retry with 1–30 s backoff inside one interval, and wake on
+    the agent's stop.
+  - Every other answer is final for that sample.
+  - The stop sample runs in `shutdown()` after `sync` and before the stamp is cleared and
+    `dataMount` is unmounted. It gets `storageStopBudgetSeconds` (5 s) of wall-clock time: it
+    runs on its own daemon thread, and `shutdown()` waits for it at most that long, so a slow
+    DNS lookup or a stalled reply cannot hold the unmount. A post still in flight is abandoned
+    (logged `storage_stop_timeout`). It never fails the quiesce.
+- **Wire format:** `POST <app origin>/api/compute/aws/storage`. The origin follows
+  `pool.app_origin`: the lease's `appOrigin` or the baked `enrollUrl`.
+  - The headers are `X-Ezil-Computer-Id`, `X-Ezil-Generation`, `X-Ezil-Lease-Epoch`,
+    `X-Ezil-Timestamp` (unix s) and
+    `X-Ezil-Signature: v1=<hex HMAC-SHA256(control.key, "ezil-storage-sample-v1|ts|computerId|generation|leaseEpoch|sha256hex(body)")>`.
+  - The body is `{"bytes":"<decimal>","measuredAt":"<UTC, whole seconds>","reason":"interval"|"stop"}`.
+    It carries no ids.
+  - The key is the agent's in-memory copy of `stateDir/control.key`, and never enters the
+    container.
+- **Refusal after a control-plane stop:** the app refuses a sample once the control plane has
+  started a stop. DRAINING clears the proof the key is derived from, so the last periodic
+  sample stands.
+- **Release:** this ships with the host AMI, not with an app deploy.
+
 ## Terminal history across stop and cold boot
 
 Bash writes `~/.bash_history` only when a shell exits, and a stop never lets an open

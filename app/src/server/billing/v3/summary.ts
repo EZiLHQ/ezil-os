@@ -1,7 +1,7 @@
 import type { StripeAiPack } from '../stripe/packs';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
-import { storageState } from '../meters';
+import { latestStorageTotal, storageState } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
@@ -218,6 +218,9 @@ export function aiAccountV3(input: { plan: ResolvedPlanV3; receipts: readonly Ai
 
 const GIB = BigInt(1024) ** BigInt(3);
 
+/** A live computer and its provider, as the router's placement read lists it (billing.ts `UserPlacement.computers`). */
+export interface DiskComputer { computerId: string; provider: string | null }
+
 /**
  * Round 5 D3: the disk shown when the computer's volume cannot be read (no AWS placement yet, AWS off,
  * a read error or timeout): the smallest paid new-volume size, so the figure never overclaims.
@@ -252,25 +255,38 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
  * keeps it, so the cap is that volume's REAL size (`volumeGiB`, read by the caller from EC2), never a
  * per-configuration table; unreadable falls back to `DISK_FALLBACK_GIB`. Free/Cloudflare has no
  * provisioned figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
+ *
+ * The legacy meter is the per-user "Saved storage" allowance: every computer's latest sample, deleted
+ * ones included until purged (CONTRACT.md §3.2). A v3 disk is one computer's disk, so it counts only
+ * what can be on it: the samples of the user's LIVE computers (`liveComputers`, the router's placement
+ * read) of the disk's kind, aws-ec2 ones on an AWS volume and the others (Cloudflare, or no placement
+ * row yet) on a Cloudflare disk. A deleted computer's retained volume is on no disk the user can reach,
+ * so it never fills this one. Omitted `liveComputers` (callers that read no placement) counts every sample.
  */
-export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
-    largeStorageEnabled: boolean, volumeGiB?: number | null): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
-    const newest = new Map<string, typeof storage[number]>();
-    for (const sample of storage) {
-        if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
-    }
-    const usedBytes = newest.size ? [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0)) : null;
-    const meter = (cap: bigint) => {
-        const state = storageState(usedBytes ?? BigInt(0), cap);
+export function storageDisk<S extends { computerId: string; bytes: bigint; measuredAt: Date }>(plan: ResolvedPlanV3, size: SizeCode, storage: readonly S[],
+    largeStorageEnabled: boolean, volumeGiB?: number | null, liveComputers?: readonly DiskComputer[]):
+    { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'];
+        /** The samples this meter counted, for any per-sample detail shown beside it (billing.usage `storage.samples`). */
+        counted: readonly S[] } {
+    // Unmeasured is `unavailable` ("not measured yet"), never the `ok` of a zero nobody measured.
+    const meter = (usedBytes: bigint | null, cap: bigint) => {
+        if (usedBytes === null) return 'unavailable' as const;
+        const state = storageState(usedBytes, cap);
         return state === 'over_cap' ? 'exhausted' as const : state;
     };
     if (plan.sku === 'legacy') {
+        const { usedBytes } = latestStorageTotal(storage);
         const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
-        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(cap) };
+        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(usedBytes, cap), counted: storage };
     }
-    const provisionedGiB = SIZES[size].provider === 'aws' ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
+    const aws = SIZES[size].provider === 'aws';
+    const onDisk = liveComputers === undefined ? null : new Set(liveComputers
+        .filter(computer => (computer.provider === 'aws-ec2') === aws).map(computer => computer.computerId.toLowerCase()));
+    const counted = onDisk === null ? storage : storage.filter(sample => onDisk.has(sample.computerId.toLowerCase()));
+    const { usedBytes } = latestStorageTotal(counted);
+    const provisionedGiB = aws ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
-    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(usedBytes, capBytes), counted };
 }
 
 /**
@@ -338,6 +354,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     volumeGiB?: number | null;
     /** Round 6 (R4-02): the metered size of the user's AWS computer as placed; null/omitted = none, unreadable or mixed. */
     awsSize?: SizeCode | null;
+    /** The user's live computers (`storageDisk`): the disk meter counts only their samples; omitted = every sample. */
+    liveComputers?: readonly DiskComputer[];
     /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
     reverseMove?: ReverseMoveSummaryInput;
 }): BillingSummaryV3 {
@@ -385,7 +403,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     )) : null;
-    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
+    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
@@ -416,7 +434,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
                 account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
-        storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
+        // No sample yet: usedBytes null with 'unavailable', never a measured-looking '0'.
+        storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
             upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,

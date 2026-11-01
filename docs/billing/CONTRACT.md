@@ -28,7 +28,7 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 |---|---|---|
 | Price | — | USD 20.00 / month, recurring, before tax |
 | Workspace time | 8 h per calendar month (UTC) | 20 h per Stripe billing period |
-| Saved storage | 2 GB | 20 GB, only once `BILLING_LARGE_STORAGE=1` (gate G-STOR); Free's cap until then |
+| Saved storage | 2 GB (2 GiB = 2,147,483,648 bytes) | 20 GB (20 GiB), only once `BILLING_LARGE_STORAGE=1` (gate G-STOR); Free's cap until then |
 | AI credit (provider cost, no markup) | one-time USD 0.50 trial | USD 3.00 per period |
 
 2.1 The catalog is code, versioned by `CATALOG_VERSION`. A price change is a new SKU, never an edit.
@@ -65,9 +65,40 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 
 ### 3.2 Saved storage
 
-**What counts:** the latest sample per computer, from `ezil_billing_storage_samples`, summed over the user's computers. This includes deleted computers that are not yet purged.
+**What counts:** the latest sample per computer, from `ezil_billing_storage_samples` (`latestStorageTotal`), summed over:
+- **Legacy "Saved storage"** (the per-user v1 allowance): every computer of the user, including deleted computers that are not yet purged.
+- **A v3 computer disk** (`computer.disk` and `storage` in `billing.summary`, `storage.disk` in `billing.usage`): only the user's LIVE computers of that disk's kind, the aws-ec2 ones on an AWS volume and the others on a Cloudflare disk (`storageDisk`, with the live computers from the router's placement read). A deleted computer's retained volume is on no disk the user can reach, so it never fills the new computer's disk. A placement read that lists no computers (failed, or placement reads off) counts none, so the disk reads "not measured yet". `billing.usage`'s `storage.samples` (and its `sampled` state) are exactly the samples its disk counted, because a shell sums them when `disk.usedBytes` is null.
+
+**No sample is not zero:** with no sample at all, every summary (v1, v2, v3) returns `usedBytes: null` with state `unavailable`. The shell shows an unmeasured AWS disk as its size with "Space used isn't measured yet." (the disk figure it showed before the sampler existed) and "Space used isn't measured on this computer." where there is no disk figure (Cloudflare), never "0 used", and shows a bar and Full / Almost full only for a measured figure.
+
+**Units:** bytes are stored as `bigint`. Every figure shown is GiB (1024³ bytes), labelled "GB" like every disk size. The v1 caps were decimal (2,000,000,000 bytes) until 2026-11-01. Making them GiB only ever grants more.
 
 **Cap:** `storageCapBytes(plan, largeStorageEnabled)`.
+
+**Policy (approved 2026-11-01).** The meter counts the logical primary bytes a user owns, each datum once.
+- **AWS computer:** the sample is the used bytes (`statvfs`: `(f_blocks − f_bfree) × f_frsize`) of the computer's retained data volume. That volume holds `/workspace`, HOME, the overlay upper and the profiles, including editor and chat state, so chat is counted once, inside it.
+  - **Who measures:** the HOST agent, outside the guest container (`infra/host-agent/lib/ezil_host/storage.py`), and only while the volume is that lease's guarded mount.
+  - **When:** 60 s after the agent starts, every 15 min, and once on stop. The stop sample runs after the sync and before the unmount, on its own thread that the shutdown waits for at most 5 s of wall-clock time; a post still in flight then is abandoned.
+  - **Endpoint:** it posts to `POST /api/compute/aws/storage` (`app/src/server/billing/http/host-storage.ts`) with `source: 'host-agent'`.
+- **Excluded, as operator cost rather than user quota:** checkpoint generations, S3 noncurrent versions, EBS snapshots and the host root disk.
+- **Credential:**
+  - The host signs each sample with its epoch's control key, the one enrollment already issued and kept host-only. The app re-derives that key from the placement's consumed-nonce proof (`deriveControlKey`). No deployment-wide secret is ever delivered into a guest, where users are root.
+  - The signed headers carry the computer and its epoch, and the key proves them. The owner comes from the placement. The body names no computer or user, and a body that does is refused.
+  - A signature expires after 300 s. A sample measured more than 30 min ago, or more than 5 min ahead, is refused.
+  - A retry of the same `(computer, measured_at)` is answered `recorded: false`. This is enforced by an advisory-locked insert-if-absent, with no new index.
+- **Usage-secret path:** `POST /api/billing/usage` no longer accepts `storage` events for an `aws-ec2` computer.
+
+**Metering gaps that remain:**
+- **Cloudflare computers have no emitter.** Their container is user-reachable, so a sample from inside it would be advisory only. Their storage stays "not measured", and the UI says so.
+- **On Cloudflare/Free, the 512 MiB checkpoint cap binds long before the 2 GB Free figure,** so that allowance cannot be reached there.
+- **No per-user write enforcement exists beyond the volume size.** An AWS disk fills to ENOSPC, and the 80% / 95% states are warnings only.
+- **A deleted computer's last sample counts in legacy "Saved storage" until a purge marker exists.** No purge state is recorded yet, and the 14-day purge is a dry run. The v3 disk never counts it, and no v3 field shows the per-user total yet (the v3 `storage` wire type is pinned).
+- **AWS disks read "Space used isn't measured yet." until the host AMI that carries `storage.py` is rolled out,** and on each computer until its first sample (60 s after its agent starts). That AMI ships separately from the app deploy. Until then the disk shows its size, as before, so the app deploy changes nothing visible for AWS users and needs no rollback flag. The plan's `STORAGE_METER_V2` flag and its `layer_breakdown` / `measurement_kind` columns and unique index were not added (no schema change in this run).
+- **A stop sample is refused once a control-plane stop has begun.** DRAINING clears the key's proof, so the last periodic sample, at most 15 min old, stands. Idle stops, which the agent initiates, are sampled.
+- **Two live AWS computers can read falsely full in the unscoped summary.**
+  - The `billing.summary` and unscoped `billing.usage` compare the sum of the live AWS computers' latest samples with the smallest of their volumes (`readVolumeGiB`).
+  - `billing.usage` with a `computerId` compares one computer with its own volume, which is correct.
+  - Fixing this needs a product decision: a per-user total or a per-disk meter.
 
 **State thresholds:**
 - `over_cap` when used > cap;
@@ -166,7 +197,8 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
   - 503 without a webhook secret;
   - 400 on a bad signature;
   - 200 once the event is in the inbox, duplicates included.
-- `POST /api/billing/usage` (wave 2): the Worker's signed `start`/`stop`/`heartbeat`/`storage` events.
+- `POST /api/billing/usage` (wave 2): the Worker's signed `start`/`stop`/`heartbeat`/`storage` events (storage for an `aws-ec2` computer is refused; see §3.2).
+- `POST /api/compute/aws/storage`: an AWS host agent's storage sample under its epoch control key (§3.2). 401 for every unauthenticated case, 400 for a bad or id-bearing body, 422 for a stale or future measurement, 503 `retryable` for an outage, 200 `{ recorded }`.
   - Signed with `X-EZiL-Timestamp` and `X-EZiL-Signature: v1=<hex HMAC-SHA256(secret, "<ts>.<body>")>`, with a 300 s skew window.
   - A computer is owned only through `ezil_computers`.
 - **`/pricing`:** returns `notFound()` unless `PRICING_PAGE_ENABLED=1`. `/login` shows a plain `<a href="/pricing">Plans</a>` only when it is set.

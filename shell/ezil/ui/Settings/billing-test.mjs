@@ -88,7 +88,7 @@ function v2 (family = 'compute', freeHours = 2) {
         },
         overage: compute ? { available: true, enabled: false, centsPerStdHour: 25, capCents: 2500, defaultCapCents: 2500, maxCapCents: 10000, accruedCents: 0, termsVersion: TERMS, acceptedVersion: null, acceptedAt: null, pausedReason: null } : null,
         estimate: { nextChargeAt: free ? null : END, subscriptionCents: free ? null : compute ? 10000 : 2000, accruedOverageCents: 0, worstCaseOverageCents: 2500, currency: 'usd', taxNote: 'before_tax' },
-        storage: { usedBytes: '1500000000', capBytes: '2000000000', measuredAt: '2026-10-18T11:58:00Z', state: 'ok' },
+        storage: { usedBytes: '1610612736', capBytes: '2147483648', measuredAt: '2026-10-18T11:58:00Z', state: 'ok' }, // 1.5 of 2 GiB
         ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
         actions: { checkout: free, portal: !free, upgrade: family === 'standard', downgrade: compute, cancel: !free, overage: compute, selectSize: compute },
         catalog: {
@@ -669,14 +669,24 @@ try {
     await fixture(); has('[data-role="billing-nudge"]', false);
     contains('[data-meter="storage"]', '1.5 GB'); contains('[data-meter="storage"]', 'of 2.0 GB');
     summary.storage.measuredAt = new Date(now - 120000).toISOString(); await refresh(); contains('[data-meter="storage"]', 'Updated 2 min ago');
-    summary.storage.measuredAt = null; await refresh(); contains('[data-meter="storage"]', 'Not measured yet.');
+    // Unmeasured (no time, or the new server's null): no number, no bar, no Full/Almost full state.
+    summary.storage.measuredAt = null; await refresh(); contains('[data-meter="storage"]', 'Not measured yet');
+    assert.doesNotMatch(q('[data-meter="storage"]').textContent, /1\.5 GB|0\.0 GB/); has('[data-meter="storage"] [role="progressbar"]', false);
+    assert.ok(q('[data-meter="storage"]').classList.contains('is-unavailable')); contains('[data-meter="storage"]', '2.0 GB allowance');
+    Object.assign(summary.storage, { usedBytes: null, state: 'unavailable' }); await refresh(); contains('[data-meter="storage"]', 'Not measured yet');
+    has('[data-meter="storage"] [role="progressbar"]', false); has('[data-role="billing-nudge"]', false);
+    // An older server's synthetic "0" with no measurement time is not a measurement either.
+    Object.assign(summary.storage, { usedBytes: '0', state: 'ok' }); await refresh(); assert.doesNotMatch(q('[data-meter="storage"]').textContent, /0\.0 GB/);
+    // Positive control: a measured zero is shown as measured.
+    summary.storage.measuredAt = new Date(now - 120000).toISOString(); await refresh(); contains('[data-meter="storage"]', '0.0 GB'); contains('[data-meter="storage"]', 'of 2.0 GB');
+    has('[data-meter="storage"] [role="progressbar"]', true);
     contains('[data-meter="ai"]', 'Coming soon'); contains('[data-meter="ai"]', 'AI assistant coming soon');
     assert.doesNotMatch(q('[data-meter="ai"]').textContent, /\$|credit ready|trial ready/i);
     summary.ai = { state: 'ok', trialMicro: '500000', includedMicro: '3000000', purchasedMicro: '10000000', includedExpiresAt: END };
     await refresh(); contains('[data-meter="ai"]', '$13.50 left'); contains('[data-meter="ai"]', 'Included credit expires Nov 1');
     summary.ai.trialMicro = '90071992547409930000'; summary.ai.includedMicro = '70000'; summary.ai.purchasedMicro = '0';
     summary.storage.usedBytes = '900719925474099399999'; await refresh();
-    contains('[data-meter="ai"]', '$90071992547410.00 left'); contains('[data-meter="storage"]', '900719925474.1 GB');
+    contains('[data-meter="ai"]', '$90071992547410.00 left'); contains('[data-meter="storage"]', '838860800000.0 GB');
     assert.equal(q('[data-meter="storage"] [role="progressbar"]').getAttribute('aria-valuenow'), '100');
     summary.ai.state = 'unavailable'; await refresh(); assert.doesNotMatch(q('[data-meter="ai"]').textContent, /\$/);
     for ( const [href, label] of [['/pricing', 'Plans'], ['/refunds', 'Refund policy'], ['mailto:contact@ezil.work', 'Support']] ) assert.equal(pane().querySelector(`a[href="${href}"]`).textContent, label);

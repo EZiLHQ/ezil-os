@@ -387,7 +387,8 @@ export interface BillingSummaryV3 {
         account?: AiAccountV3;
     };
     fairUse: { status: FairUseStatus; resetsAt: string };
-    storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
+    /** `usedBytes` is null (state `unavailable`) until a computer has been measured: never an unmeasured "0". */
+    storage: { usedBytes: string | null; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: {
         checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean;
         /** Round 5 D1 (additive): the EZiL ID sign-in link for the `needs_ezil_id` CTA; null otherwise. */

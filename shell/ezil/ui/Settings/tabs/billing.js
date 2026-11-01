@@ -33,10 +33,15 @@ function actionHtml (action, label, primary = false, sku) {
     return `<button type="button" class="ezil-settings-btn${primary ? ' ezil-settings-btn-primary' : ''}" data-action="${action}"${sku ? ` data-sku="${encode(sku)}"` : ''}>${encode(label)}</button>`;
 }
 
+/** Storage in GiB (1024³), labelled "GB" like every disk size in Billing, to one decimal. */
 function gigabytes (bytes) {
-    const tenths = (BigInt(bytes) + 50_000_000n) / 100_000_000n;
+    const tenths = (BigInt(bytes) * 20n + 1_073_741_824n) / 2_147_483_648n;
     return `${tenths / 10n}.${tenths % 10n} GB`;
 }
+
+/** A v2 storage meter that was measured: digit strings AND a measurement time (an older server sent "0" with none). */
+const measuredStorage = storage => typeof storage?.usedBytes === 'string' && /^\d+$/.test(storage.usedBytes)
+    && typeof storage.capBytes === 'string' && /^\d+$/.test(storage.capBytes) && typeof storage.measuredAt === 'string';
 
 function percent (used, cap) {
     if ( cap <= 0n ) return 0;
@@ -393,13 +398,21 @@ const GIB = 2 ** 30;
 /** Disk bytes in the disk's own unit (GiB, shown as "GB" like the disk size itself). */
 const diskText = bytes => bytes >= GIB ? `${(bytes / GIB).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB`
     : `${Math.floor(bytes / 2 ** 20).toLocaleString('en-US')} MB`;
-/** Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it. */
+/**
+ * Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it.
+ * An AWS disk is measured by its host (every 15 min, once its image carries the sampler): until the
+ * first sample it shows the disk's size and says space used isn't measured yet, never "0 used" and
+ * never a "Measuring…" that may wait for an image rollout; a computer with no disk figure
+ * (Cloudflare) has no measurement at all and says so.
+ */
 function storageMeterV3 ({ computer }) {
     const disk = computer.disk;
     const gb = Number.isFinite(disk?.provisionedGiB) && disk.provisionedGiB > 0 ? disk.provisionedGiB : null;
     const usedBytes = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) : null;
-    if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved', notes: ['Your files are saved between sessions.'] });
-    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`, notes: [`${gb} GB disk for your projects`] });
+    if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved',
+        notes: ['Your files are saved between sessions.', usedBytes === null ? "Space used isn't measured on this computer." : `${diskText(usedBytes)} used`] });
+    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`,
+        notes: [`${gb} GB disk for your projects`, "Space used isn't measured yet."] });
     // ADV-2: the disk is provisionedGiB × 2^30 bytes (the server's cap), so used and left use the same unit.
     const capBytes = gb * GIB;
     const leftBytes = Math.max(0, capBytes - usedBytes);
@@ -603,8 +616,11 @@ function summaryHtml (summary) {
             ${compute.session.activeDeadline ? '<p data-role="session-countdown" aria-live="polite"></p>' : ''}</section>
         ${overageHtml(summary)}${estimateHtml(summary)}
         <div class="ezil-billing-meters">
-            ${meterHtml('storage', 'Saved storage', storage.state, gigabytes(storage.usedBytes), `of ${gigabytes(storage.capBytes)}`,
-                percent(BigInt(storage.usedBytes), BigInt(storage.capBytes)), updated(storage.measuredAt), "Saved project files across your computers — not the computer's working disk.")}
+            ${measuredStorage(storage) ? meterHtml('storage', 'Saved storage', storage.state, gigabytes(storage.usedBytes), `of ${gigabytes(storage.capBytes)}`,
+                percent(BigInt(storage.usedBytes), BigInt(storage.capBytes)), updated(storage.measuredAt), "Saved project files across your computers — not the computer's working disk.")
+                // Unmeasured: no number, no bar and no Full/Almost full state, never "0.0 GB of 2.0 GB".
+                : meterHtml('storage', 'Saved storage', 'unavailable', 'Not measured yet', /^\d+$/.test(storage?.capBytes ?? '') ? `${gigabytes(storage.capBytes)} allowance` : '',
+                    0, 'Space used appears once a computer is measured.', "Saved project files across your computers — not the computer's working disk.")}
             ${meterHtml('ai', 'AI credits', ai.state, unavailable ? 'Coming soon' : `${dollars(balance / 10_000n)} left`, unavailable ? '' : 'Available balance',
                 balance > 0n ? 100 : 0, unavailable ? 'AI assistant coming soon' : ai.includedExpiresAt ? `Included credit expires ${dateLabel(ai.includedExpiresAt)}` : 'No included credit expiry.', '')}
         </div>${nudgeHtml(summary)}

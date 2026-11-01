@@ -394,7 +394,12 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             placement = { provider: null, awsVolumes: [] };
         }
         const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
-        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement };
+        // The disk meter counts only live computers' samples (summary.ts `storageDisk`). A read that lists none
+        // (failed, placement reads off, or a double without `computers`) counts none: "not measured yet", never a
+        // deleted computer's bytes.
+        const liveComputers = (placement.computers ?? []).map(({ computerId: id, provider }) => ({ computerId: id, provider }));
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement,
+            liveComputers };
     };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
@@ -423,7 +428,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
-                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider });
+                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider,
+                liveComputers: placement.liveComputers });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -475,7 +481,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 // `ai.account` (identity-based credits) is read for the authenticated user only, from /v1/me/balance.
                 ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro, heldMicro: ai.heldMicro, gatewayState, openHolds, userId: ctx.user.id },
                 placementProvider: placement.provider,
-                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
+                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, liveComputers: placement.liveComputers,
+                enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.

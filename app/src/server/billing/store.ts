@@ -624,6 +624,21 @@ export function createBillingStore(db: Database): BillingStore {
             await db.insert(billingStorageSamples).values({ userId, ...sample });
         },
 
+        async insertStorageSampleOnce(userId, sample) {
+            return db.transaction(async tx => {
+                // One writer per computer, then a fresh READ COMMITTED snapshot sees any committed twin.
+                await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:storage_sample:${sample.computerId.toLowerCase()}`}, 0))`);
+                const [twin] = await tx.select({ id: billingStorageSamples.id }).from(billingStorageSamples).where(and(
+                    eq(billingStorageSamples.computerId, sample.computerId),
+                    eq(billingStorageSamples.measuredAt, sample.measuredAt),
+                    eq(billingStorageSamples.source, sample.source),
+                )).limit(1);
+                if (twin) return 'duplicate' as const;
+                await tx.insert(billingStorageSamples).values({ userId, ...sample });
+                return 'recorded' as const;
+            });
+        },
+
         async closeStaleIntervals(staleBefore, reason) {
             const closed = await db.update(billingUsageIntervals).set({
                 endedAt: billingUsageIntervals.lastSeenAt,

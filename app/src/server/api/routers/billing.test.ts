@@ -198,9 +198,11 @@ describe('billing router', () => {
         await expect(f.caller.summary()).resolves.toEqual({ enabled: false });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         f.deps.config.tabEnabled = true;
+        // The sample's computer is not among the live computers (placement reads are off here, so none is listed):
+        // the disk counts nothing rather than bytes it cannot place (summary.ts storageDisk).
         await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, version: 3,
             plan: { sku: 'free_v3' }, fairUse: { status: 'ok' },
-            computer: { sessionMaxSeconds: 3600 }, storage: { usedBytes: '123' } });
+            computer: { sessionMaxSeconds: 3600 }, storage: { usedBytes: null, state: 'unavailable' } });
         expect(f.store.subscriptionsFor).toHaveBeenCalledWith(userId);
         expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
         expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
@@ -1423,6 +1425,38 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         });
         return { ...f, placement, volumeGiB, caller: createBillingRouter(() => f.deps, { placement, volumeGiB }).createCaller(f.ctx) };
     };
+
+    it('storage: the disk meters the live AWS computer only, never a deleted computer\'s retained sample (summary and unscoped usage)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const DELETED = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+        const volumes = [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }];
+        const f = withVolumes(volumes, { [VOL_OLD]: 50 });
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: volumes,
+            computers: [{ computerId: C1, provider: 'aws-ec2', placement: null }, { computerId: C2, provider: 'cloudflare', placement: null }] });
+        f.store.latestStorageFor.mockResolvedValue([
+            { computerId: DELETED, bytes: BigInt(30 * GiB), measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: C2, bytes: BigInt(5 * GiB), measuredAt: now },
+            { computerId: C1, bytes: BigInt(25 * GiB), measuredAt: now }]);
+        const live = String(25 * GiB);
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50, usedBytes: live } },
+            storage: { usedBytes: live, capBytes: String(50 * GiB), state: 'ok' } });
+        // The samples beside the disk are only the ones it counted (an older shell sums them when disk.usedBytes is null).
+        const usage = await f.caller.usage();
+        expect(usage).toMatchObject({ storage: { state: 'sampled', capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: live, usedGiB: 25 } } });
+        if (!usage.enabled) throw new Error('usage disabled');
+        expect(usage.storage.samples.map(sample => sample.computerId)).toEqual([C1]);
+        // A live computer not measured yet (scoped): nothing to sum, not the deleted or the Cloudflare computer's bytes.
+        f.store.latestStorageFor.mockResolvedValue([
+            { computerId: DELETED, bytes: BigInt(30 * GiB), measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: C2, bytes: BigInt(5 * GiB), measuredAt: now }]);
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [],
+            disk: { provisionedGiB: 50, usedBytes: null, usedGiB: null } } });
+        // Fail closed: a placement read that lists no computers counts none ("not measured yet"), never the deleted 30 GiB.
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: volumes });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { usedBytes: null } }, storage: { usedBytes: null, state: 'unavailable' } });
+        await expect(f.caller.usage()).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [], disk: { usedBytes: null, usedGiB: null } } });
+        warn.mockRestore();
+    });
 
     it('a Premium computer created today (100 GiB volume) shows 100; an older one (50 GiB) shows 50; summary and usage agree', async () => {
         for (const [volumeId, gib] of [[VOL_TODAY, 100], [VOL_OLD, 50]] as const) {

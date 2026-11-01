@@ -376,15 +376,50 @@ describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () =>
     it.each([['standard_monthly_v3', null], ['premium_monthly_v3', null], ['premium_monthly_v3', 'cmp-8']] as const)('%s (%s) caps at the 50 GiB AWS data volume', (sku, preference) => {
         const args = input(sku); args.sizePreference = preference;
         const summary = buildSummaryV3(args);
-        expect(summary.storage).toEqual({ usedBytes: '0', capBytes: GiB50, state: 'unavailable' });
+        expect(summary.storage).toEqual({ usedBytes: null, capBytes: GiB50, state: 'unavailable' });
         expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null, growsOnSwitch: false });
         args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(1024) ** BigInt(3), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: String(43 * 1024 ** 3), capBytes: GiB50, state: 'low' });
         expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3), growsOnSwitch: false });
     });
+    it('a legacy plan with no sample is unmeasured (null, unavailable), never "0 of 2 GB" ok; measured, it meters against 2 GiB', () => {
+        const args = { ...input(), subs: [{ sku: 'standard_monthly_v2', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }] };
+        expect(buildSummaryV3(args).plan.sku).toBe('legacy');
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: String(2 * 1024 ** 3), state: 'unavailable' });
+        expect(buildSummaryV3(args).computer.disk?.usedBytes).toBeNull();
+        // Positive controls: a measured zero is ok; 1.8e9 bytes is 83.8% of 2 GiB (low); two computers sum.
+        expect(buildSummaryV3({ ...args, storage: [{ computerId: 'c', bytes: BigInt(0), measuredAt: now }] }).storage)
+            .toEqual({ usedBytes: '0', capBytes: String(2 * 1024 ** 3), state: 'ok' });
+        expect(buildSummaryV3({ ...args, storage: [{ computerId: 'c', bytes: BigInt(1_000_000_000), measuredAt: now },
+            { computerId: 'deleted-unpurged', bytes: BigInt(800_000_000), measuredAt: start }] }).storage)
+            .toEqual({ usedBytes: '1800000000', capBytes: String(2 * 1024 ** 3), state: 'low' });
+    });
+    it('a v3 disk counts only live computers on it: a deleted computer\'s retained sample never fills the new computer\'s disk', () => {
+        const GiB = BigInt(1024) ** BigInt(3);
+        const args = { ...input('standard_monthly_v3'), volumeGiB: 50, storage: [
+            { computerId: 'deleted-old', bytes: BigInt(30) * GiB, measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: 'CF-LIVE', bytes: BigInt(5) * GiB, measuredAt: now },
+            { computerId: 'aws-live', bytes: BigInt(25) * GiB, measuredAt: now }] };
+        const live = [{ computerId: 'AWS-LIVE', provider: 'aws-ec2' }, { computerId: 'cf-live', provider: 'cloudflare' }];
+        // The reviewer's case: 25 GiB on the live 50 GiB volume is ok, not 55 GiB "exhausted" (ids compare case-insensitively).
+        expect(buildSummaryV3({ ...args, liveComputers: live })).toMatchObject({
+            storage: { usedBytes: String(BigInt(25) * GiB), capBytes: String(BigInt(50) * GiB), state: 'ok' },
+            computer: { disk: { provisionedGiB: 50, usedBytes: String(BigInt(25) * GiB) } } });
+        // Control: a caller that names no live computers keeps the unscoped sum (60 GiB on 50: exhausted).
+        expect(buildSummaryV3(args).storage).toMatchObject({ usedBytes: String(BigInt(60) * GiB), state: 'exhausted' });
+        // No live computer on the disk: unmeasured, never a deleted computer's bytes.
+        expect(buildSummaryV3({ ...args, liveComputers: [] }).storage).toEqual({ usedBytes: null, capBytes: String(BigInt(50) * GiB), state: 'unavailable' });
+        // Free (Cloudflare disk, no cap): only the live Cloudflare computer's sample; not the AWS volume, not the deleted one.
+        expect(buildSummaryV3({ ...input(), storage: args.storage, liveComputers: live }).computer.disk?.usedBytes).toBe(String(BigInt(5) * GiB));
+        // Legacy "Saved storage" is the per-user allowance: deleted-but-unpurged computers still count there.
+        const legacy = { ...args, subs: [{ sku: 'standard_monthly_v2', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }], liveComputers: live };
+        expect(buildSummaryV3(legacy).storage.usedBytes).toBe(String(BigInt(60) * GiB));
+    });
     it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
         const args = input(); args.config.largeStorageEnabled = true;
-        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: '0', capBytes: '0', state: 'unavailable' });
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: '0', state: 'unavailable' });
         args.storage = [{ computerId: 'c', bytes: BigInt(5), measuredAt: now }];
         expect(buildSummaryV3(args)).toMatchObject({ storage: { usedBytes: '5', capBytes: '0', state: 'unavailable' },
             computer: { disk: { provisionedGiB: null, usedBytes: '5' } } });
@@ -541,7 +576,7 @@ describe('round 5 D3: the shown disk is the computer\'s REAL volume; machine opt
     it.each([null, 'cmp-4', 'cmp-8'] as const)('Premium at %s: a computer created today shows its 100 GiB volume, an older one its 50 GiB volume', preference => {
         const today = { ...input('premium_monthly_v3'), sizePreference: preference, volumeGiB: 100 };
         expect(buildSummaryV3(today).computer.disk).toEqual({ provisionedGiB: 100, usedBytes: null, growsOnSwitch: false });
-        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: '0', capBytes: String(100 * GiB), state: 'unavailable' });
+        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: null, capBytes: String(100 * GiB), state: 'unavailable' });
         const older = { ...today, volumeGiB: 50, storage: [{ computerId: 'c', bytes: BigInt(43) * BigInt(GiB), measuredAt: now }] };
         expect(buildSummaryV3(older).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * GiB), growsOnSwitch: false });
         expect(buildSummaryV3(older).storage).toEqual({ usedBytes: String(43 * GiB), capBytes: String(50 * GiB), state: 'low' });

@@ -1011,6 +1011,20 @@ describe('ingestUsageEvents', () => {
         ]);
     });
 
+    it('refuses a usage-secret storage sample for an AWS computer (its host agent owns it) and keeps Cloudflare samples', async () => {
+        const { store } = fixture();
+        const input: UsageEvent = { type: 'storage', computerId: 'computer_local', at: now.toISOString(), bytes: '7' };
+        store.providers.set('computer_local', 'aws-ec2');
+        expect(await ingestUsageEvents([input], { store })).toEqual({ accepted: 0, rejected: 1 });
+        expect(store.samples).toEqual([]);
+        // Positive controls: the same event for a Cloudflare placement, or none, is recorded as before.
+        store.providers.set('computer_local', 'cloudflare');
+        expect(await ingestUsageEvents([input], { store })).toEqual({ accepted: 1, rejected: 0 });
+        store.providers.delete('computer_local');
+        expect(await ingestUsageEvents([input], { store })).toEqual({ accepted: 1, rejected: 0 });
+        expect(store.samples).toHaveLength(2);
+    });
+
     it('propagates a transient usage store error and accepts the retry', async () => {
         const { store } = fixture();
         const failure = new Error('database unavailable');
