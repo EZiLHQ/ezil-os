@@ -134,6 +134,25 @@ try {
         push(`${label} · identity credits: exact details line`, a.details === 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75', a.details);
         push(`${label} · identity credits: the bar is 83 % (1,246.75 of 1,500) and painted to match`, a.gauge === '83' && Math.abs(a.fill - 83) <= 1, `${a.gauge} / ${a.fill}`);
         push(`${label} · identity credits: details wrap inside the row; no horizontal overflow`, a.fits && a.overflow <= 0 && a.docOverflow <= 0, `pane ${a.overflow} doc ${a.docOverflow}`);
+        // Payment grace (D17) on a nearly spent total: the row warns from the total, and this period's credits wait for the payment.
+        const grace = billingSummary('premium');
+        Object.assign(grace.plan, { status: 'past_due', paymentIssue: 'payment_failed' });
+        Object.assign(grace.ai, { included: { granted: 0, remaining: 0, periodEnd: '2026-11-01T00:00:00Z' }, pendingFromRenewal: { credits: 1000, at: '2026-11-01T00:00:00Z' },
+            account: { ...identity.ai.account, totalMicro: '1000000000', remainingMicro: '64000000', heldMicro: '0', usedMicro: '936000000', grants: [
+                { kind: 'previous', creditsMicro: '1000000000', remainingMicro: '64000000', expiresAt: '2026-11-04T00:00:00Z' }] } });
+        const g = await page.evaluate(html => {
+            document.querySelector('[data-role="billing-body"]').innerHTML = html;
+            const pane = document.querySelector('.ezil-settings-billing'), row = document.querySelector('[data-role="meter-ai"]');
+            const notes = [...row.querySelectorAll('.ezil-billing-note')], note = notes.find(p => /payment goes through/.test(p.textContent));
+            const low = notes.find(p => p.textContent === '! Running low');
+            return { warn: row.classList.contains('is-warn') && !! low && low.getBoundingClientRect().height > 0, text: row.textContent.replace(/\s+/g, ' '),
+                note: note?.textContent ?? null, fits: !! note && note.getBoundingClientRect().right <= row.getBoundingClientRect().right + 0.5,
+                overflow: pane.scrollWidth - pane.clientWidth, docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+        }, await page.evaluate(summary => window.layout.summaryV3Html(summary), grace));
+        push(`${label} · identity grace: 64 of 1,000 left warns on the row ("! Running low" shown)`, g.warn, g.text.slice(0, 80));
+        push(`${label} · identity grace: this period's credits wait for the payment, never "more from"`,
+            g.note === '1,000 credits for this period. Added once your payment goes through.' && ! /more from/.test(g.text), g.note);
+        push(`${label} · identity grace: the note wraps inside the row; no horizontal overflow`, g.fits && g.overflow <= 0 && g.docOverflow <= 0, `pane ${g.overflow} doc ${g.docOverflow}`);
         await page.close();
     }
 
