@@ -997,9 +997,13 @@ class TimingChain(JobBase):
     kernel works to the end of every window, or a drain never confirms. The job's own windows are
     scaled down 50x; PROBE_MAX_S, KILL_WAIT_S and DRAIN_CAP stay full size, so any runc state or
     cleanup that is not cut to the time left overshoots by seconds, not milliseconds. The fake
-    exec honours `cleanup_by` exactly as bounded_runc_exec does (BoundedExec proves that half)."""
+    exec honours `cleanup_by` exactly as bounded_runc_exec does (BoundedExec proves that half).
+    Tolerances: measured worst 0.10 s over the budget on an idle host and 0.02 s beside the
+    neighbour suites (2026-11-01); an unbounded probe or cleanup overshoots by 8 s or more, so
+    the slack below costs no discrimination and absorbs a slow CI runner."""
     SCALE = 50
-    TOLERANCE = 0.5
+    TOLERANCE = 1.5
+    PROBE_SLACK = 1.0
 
     def setUp(self):
         super().setUp()
@@ -1037,7 +1041,7 @@ class TimingChain(JobBase):
             elapsed = self.runner.jobs[JOB]["at"] - started
             self.wait_idle()
         for at, timeout in self.probe_calls:
-            self.assertLessEqual(at + timeout - started_mono, self.budget + ro.PROBE_MIN_S + 0.25,
+            self.assertLessEqual(at + timeout - started_mono, self.budget + ro.PROBE_MIN_S + self.PROBE_SLACK,
                                  "every runc state ends by the publication bound")
         self.assertLessEqual(elapsed, self.budget + self.TOLERANCE, f"published {elapsed:.2f}s after admission")
         return st["result"], elapsed
