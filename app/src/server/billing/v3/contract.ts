@@ -381,7 +381,12 @@ export interface BillingSummaryV3 {
         /** Round 5 D1 (additive): whole credits granted but parked until enrollment; null when none. */
         waiting: { credits: number } | null;
     };
-    fairUse: { status: FairUseStatus; resetsAt: string };
+    /**
+     * Renewal gap (additive): `renewing` = a Stripe renewal whose invoice is not paid yet and has not failed (no receipt
+     * for the new period, no payment issue), up to RENEWAL_PENDING_SECONDS after the period starts. Not used up: the
+     * period's time is added on payment; a failure is grace.
+     */
+    fairUse: { status: FairUseStatus | 'renewing'; resetsAt: string };
     storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: {
         checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean;

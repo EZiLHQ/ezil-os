@@ -161,6 +161,18 @@ check('server fair-use state and reset fallback', () => {
     assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 122400, remainingStandardSeconds: 21600 }), summary), 'compute').dataset.state, 'ok');
     assert.doesNotMatch(meter(rendered(sample, withAI({ balance: 30 })), 'ai').textContent, /Running low/);
 });
+check('renewal gap: a renewal whose invoice is not paid yet is pending, never used up, with no upgrade offer', () => {
+    // The server: no receipt for the new period yet (allowance 0), fair use `renewing`, no upgrade action.
+    const el = rendered(withPeriod({ usedStandardSeconds: 0, allowanceStandardSeconds: 0, remainingStandardSeconds: 0, remainingHoursAtCurrent: 0 }),
+        { ...summary, fairUse: { ...summary.fairUse, status: 'renewing' }, actions: { ...summary.actions, upgrade: false } });
+    assert.equal(meter(el, 'compute').dataset.state, 'pending');
+    assert.match(meter(el, 'compute').querySelector('.usage-value').textContent, /^Pending$/);
+    assert.match(meter(el, 'compute').textContent, /This period's time is added once your payment goes through\./);
+    assert.equal(progress(el, 'compute'), null);
+    assert.equal(el.querySelector('.usage-banner'), null);
+    assert.doesNotMatch(el.textContent, /used up|paused|No computer time/i);
+    assert.equal(el.querySelector('[data-action="usage-upgrade"]'), null);
+});
 check('AI topups, trial grants, zero grants and microcredits', () => {
     const topup = rendered(sample, withAI({ balance: 1200 }));
     // Round 6 (R1-10): above the grant there is no denominator, so no bar (it was full by construction).

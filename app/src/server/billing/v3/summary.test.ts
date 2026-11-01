@@ -3,7 +3,8 @@ import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
 import { operatorGrantedSubscription, planFromSubscriptions } from './catalog';
-import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
+import { buildSummaryV3, fairUseAllowance, renewalPending, RENEWAL_PENDING_SECONDS, usedGiBOf, usedSecondsInWindow } from './summary';
+import { epochSeconds, isoSeconds } from '../v2/time';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
@@ -498,5 +499,40 @@ describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
     });
     it('null, negative or malformed input is null (no invented figure)', () => {
         for (const value of [null, undefined, '', 'abc', '-5', BigInt(-1)]) expect(usedGiBOf(value as never)).toBeNull();
+    });
+});
+
+describe('renewal gap: a renewed Stripe period with no receipt yet reads as renewing, never used up', () => {
+    // Stripe started the new period an hour ago; its invoice is still a draft, so no receipt exists for it.
+    const renewedAt = new Date(now.getTime() - 3600_000), renewedEnd = new Date(renewedAt.getTime() + 30 * 86_400_000);
+    const renewal = (over: Partial<Input['subs'][number]> = {}, sku: SellableSkuV3 = 'standard_monthly_v3'): Input => ({ ...input(sku), grants: [],
+        subs: [{ sku, stripeSubscriptionId: 'sub_renewed', status: 'active', currentPeriodStart: renewedAt, currentPeriodEnd: renewedEnd,
+            cancelAtPeriodEnd: false, ...over }] });
+    const receipt = (amount: number): Input['grants'][number] => ({ ...input('standard_monthly_v3').grants[0]!, subscriptionId: 'sub_renewed',
+        amount: BigInt(amount), periodStart: renewedAt, periodEnd: renewedEnd });
+
+    it('renewing with no upgrade offer and nothing granted; Premium too', () => {
+        const args = renewal();
+        expect(buildSummaryV3(args)).toMatchObject({ fairUse: { status: 'renewing', resetsAt: isoSeconds(epochSeconds(renewedEnd)) },
+            computer: { standing: 'paid' }, plan: { status: 'active', paymentIssue: null }, actions: { upgrade: false, cancel: true, portal: true } });
+        const plan = planFromSubscriptions(args);
+        expect(renewalPending({ plan, standing: 'paid', subs: args.subs, grants: [], now })).toBe(true);
+        expect(fairUseAllowance(plan, [])).toBe(0);
+        expect(buildSummaryV3(renewal({}, 'premium_monthly_v3'))).toMatchObject({ fairUse: { status: 'renewing' }, actions: { upgrade: false, downgrade: true } });
+    });
+    it('a cancel at period end set after the renewal still waits for the renewal invoice (plan_ending)', () => {
+        expect(buildSummaryV3(renewal({ cancelAtPeriodEnd: true }))).toMatchObject({ fairUse: { status: 'renewing' }, computer: { standing: 'plan_ending' } });
+    });
+    it.each<[string, Input, 'ok' | 'paused']>([
+        ['the receipt landed (invoice.paid)', { ...renewal(), grants: [receipt(CATALOG_V3.standard_monthly_v3.fairUseSeconds)] }, 'ok'],
+        ['a refund reversal for the period (a real zero)', { ...renewal(), grants: [receipt(0)] }, 'paused'],
+        ['an operator-granted row (no invoice to wait for)', renewal({ stripeSubscriptionId: 'op_canary_renewed' }), 'paused'],
+        ['a failed payment (grace, D17, keeps its own allowance)', { ...renewal({ status: 'past_due' }), paymentIssues: [{ stripeInvoiceId: 'in_renewal',
+            userId: 'u', subscriptionId: 'sub_renewed', invoiceKind: 'subscription', issue: 'payment_failed', hostedInvoiceUrl: null,
+            stripeEventCreated: now, resolvedAt: null, updatedAt: now }] }, 'ok'],
+        ['a subscription that is not active (trialing)', renewal({ status: 'trialing' }), 'paused'],
+        ['RENEWAL_PENDING_SECONDS after the period start', renewal({ currentPeriodStart: new Date(now.getTime() - RENEWAL_PENDING_SECONDS * 1000) }), 'paused'],
+    ])('not renewing with %s', (_name, args, status) => {
+        expect(buildSummaryV3(args).fairUse.status).toBe(status);
     });
 });

@@ -160,6 +160,9 @@ export function heldClosedText (vcpu) {
     return `Your files are still on your ${Number.isSafeInteger(vcpu) && vcpu > 0 ? `${vcpu} vCPU ` : ''}AWS (India) computer. The Free plan can't open it at that size; upgrade to open it again.`;
 }
 
+/** Renewal gap (summary `fairUse.status: 'renewing'`): the period's invoice is not paid yet, the same words on Billing and Usage. */
+export const RENEWING_COPY = "This period's time is added once your payment goes through.";
+
 /**
  * "About 113 hours left at 8 vCPU" from the usage DTO (round 3 D3); null when the DTO lacks it.
  * Round 6: an equivalent with the current size's vCPU and weight says nothing new, so it is left out

@@ -1,7 +1,7 @@
 import type { StripeAiPack } from '../stripe/packs';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
-import { storageState } from '../meters';
+import { storageState, type SubscriptionRow } from '../meters';
 import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
@@ -43,18 +43,48 @@ export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineA
     })), window, now: iso(now) }).stdSeconds;
 }
 
+/** The compute receipts and reversals of the plan's own subscription and period. */
+function periodComputeGrants(plan: ResolvedPlanV3, grants: readonly GrantRow[]): GrantRow[] {
+    const start = new Date(plan.window.start), end = new Date(plan.window.end);
+    return grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
+        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
+}
+
 /** Paid receipts and reversals keep the same subscription/period isolation as v2. */
 export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
     if (plan.sku === 'legacy') throw new TypeError('Legacy allowances use v2 rating');
     if (plan.sku === 'free_v3') return plan.legacyFree ? plan.offer.legacyFairUseSeconds! : plan.offer.fairUseSeconds;
-    const start = new Date(plan.window.start), end = new Date(plan.window.end);
-    const rows = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
-        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
+    const rows = periodComputeGrants(plan, grants);
     // Round 4 D17: an unpaid renewal has no receipt yet. In grace the paid computer stays usable on the plan's
     // fair use; any receipt or reversal (a refund, D19) for the period still wins.
     if (options.grace && rows.length === 0) return plan.offer.fairUseSeconds;
     const amount = rows.reduce((sum, grant) => sum + grant.amount, BigInt(0));
     return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
+}
+
+/**
+ * Renewal gap (release review 10-31): how long after a Stripe period starts a missing receipt for it reads as renewing,
+ * never as used up. Stripe moves the subscription into its new period at renewal but charges the renewal invoice about
+ * an hour later (up to 72 h while an `invoice.created` delivery fails), retries undelivered webhooks for up to 3 days,
+ * and a US bank debit confirms in up to 4 business days; the receipt is written only on `invoice.paid`. Renewing grants
+ * nothing, so the bound only limits how long the copy waits: 7 days, the same as a failed renewal's grace (D17).
+ */
+export const RENEWAL_PENDING_SECONDS = 7 * 86_400;
+
+/**
+ * Renewal gap: an active Stripe subscription whose current period started less than RENEWAL_PENDING_SECONDS ago and has
+ * no receipt or reversal yet, with no payment issue (a failure is grace, D17). An operator row (not `sub_…`) has no
+ * invoice to wait for. The allowance stays 0: nothing is granted before the payment, as for a first purchase.
+ */
+export function renewalPending(input: { plan: ResolvedPlanV3; standing: ComputeStandingV3; subs: readonly SubscriptionRow[];
+    grants: readonly GrantRow[]; now: Date }): boolean {
+    const { plan } = input;
+    if (plan.sku !== 'standard_monthly_v3' && plan.sku !== 'premium_monthly_v3') return false;
+    if (!paidAccess(input.standing) || input.standing === 'grace' || plan.subscriptionId === null
+        || operatorGrantedSubscription(plan.subscriptionId)) return false;
+    if (input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId)?.status !== 'active') return false;
+    const since = epochSeconds(input.now) - epochSeconds(plan.window.start);
+    return since >= 0 && since < RENEWAL_PENDING_SECONDS && periodComputeGrants(plan, input.grants).length === 0;
 }
 
 /**
@@ -313,6 +343,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     // Promotion review: an operator-granted plan has no Stripe subscription, so no Stripe-backed action applies to it.
     const stripeActions = enabled && !operatorGrantedSubscription(plan.subscriptionId);
+    // Renewal gap: until the renewal invoice is paid or fails the period reads as renewing, with no upgrade offer.
+    const renewing = renewalPending({ plan, standing: standing.standing, subs: input.subs, grants: input.grants, now: input.now });
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
         enabled: true, version: 3,
@@ -339,12 +371,12 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
-        fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
+        fairUse: { status: renewing ? 'renewing' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
-            upgrade: stripeActions && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            upgrade: stripeActions && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue && !renewing,
             downgrade: stripeActions && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: stripeActions && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: stripeActions && input.hasCustomer,
