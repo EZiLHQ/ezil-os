@@ -115,13 +115,13 @@ type ShellCaller = Awaited<ReturnType<typeof shellCaller>>['caller'];
  * mint (`shell/ezil/session.js` DESKTOP_BOOT_TIMEOUT_MS), with room for the answer to get back. Universe and the
  * Worker are both given what is left of it, and the Worker bounds the clone inside the computer by it too.
  */
-export const PROJECT_OPEN_BUDGET_MS = 200_000;
+const PROJECT_OPEN_BUDGET_MS = 200_000;
 /**
  * Less than this left after the Code mint (a cold start can take most of the budget): Universe is not asked for a
  * grant there is no time to use. `repo_open_timeout` is a failed open to the shell, whose one silent retry then
  * finds the computer awake.
  */
-export const PROJECT_OPEN_MIN_LEFT_MS = 40_000;
+const PROJECT_OPEN_MIN_LEFT_MS = 40_000;
 
 const unsupportedProvider = () => shellRefusal(409, 'repo_open_unsupported_provider', 'Projects open on this computer type soon. Your files are safe.');
 const openTimedOut = () => shellRefusal(504, 'repo_open_timeout', "This project's files took too long to open. Try again.");
