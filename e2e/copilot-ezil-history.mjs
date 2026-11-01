@@ -101,13 +101,16 @@ try {
     const row = listed.find(r => r.includes('EZIL_E2E_HISTORY')) ?? listed.find(r => /EZiL Chat/.test(r));
     check('a new browser lists the conversation from before the restart', Boolean(row), JSON.stringify(listed.slice(0, 6)));
     if (row) {
-      await page.locator('.quick-input-widget .monaco-list-row').filter({ hasText: row.slice(0, 30) }).first().click();
+      // Match a stable token, not the row's joined text: the row also carries its group label ("Today") and a
+      // relative time, and the title is the default "EZiL Chat" when no title was generated.
+      const rowText = row.includes('EZIL_E2E_HISTORY') ? 'EZIL_E2E_HISTORY' : /EZiL Chat/;
+      await page.locator('.quick-input-widget .monaco-list-row').filter({ hasText: rowText }).first().click();
       check('choosing it reopens the conversation', await until(async () => (await transcript()).includes(PROMPT), 'reopened transcript', 30_000), (await transcript()).slice(0, 160));
       await page.screenshot({ path: join(OUT, 'history-reopened.png') });
       // Delete from the picker: the row's own delete button, then the file must be gone.
       await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();
       await page.locator('.quick-input-widget').waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
-      const target = page.locator('.quick-input-widget .monaco-list-row').filter({ hasText: row.slice(0, 30) }).first();
+      const target = page.locator('.quick-input-widget .monaco-list-row').filter({ hasText: rowText }).first();
       await target.hover().catch(() => {});
       const del = target.locator('.action-label[aria-label*="Delete" i], .action-label[title*="Delete" i]').first();
       if (await del.count()) {
