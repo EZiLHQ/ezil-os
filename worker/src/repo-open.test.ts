@@ -9,24 +9,33 @@ import {
   branchOf,
   parseRepoOpenOutput,
   parseRepoOpenRequest,
+  repoOpenAuthFor,
+  repoOpenBounds,
   repoOpenCommand,
   repoOpenStatus,
   repoOpenWhenRunning,
   runRepoOpen,
   ownSessionExec,
   REPO_OPEN_ERRORS,
+  REPO_OPEN_EXEC_TIMEOUT_MS,
+  REPO_OPEN_MIN_TIMEOUT_MS,
   REPO_OPEN_TOKEN_ENV,
   type RepoOpenExec,
   type RepoOpenRequest,
 } from './repo-open';
 
 const REPO = '0b6c3c1e-8f0a-4c5e-9a43-2a1f6d0e7b11';
-const TOKEN = `egg_${'ab12'.repeat(16)}`;
+/** An opaque Cloudflare Artifacts repo token: no `egg_` prefix, any visible ASCII. */
+const TOKEN = `art_v1_${'ab12'.repeat(16)}.Zz-9~/+=`;
+const GRANT = `egg_${'ab12'.repeat(16)}`;
+const ACCOUNT = '0123456789abcdef'.repeat(2);
+/** Universe's remote: `https://<32 hex account>.artifacts.cloudflare.net/git/<namespace>/<name>.git`. */
+const ARTIFACTS = `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-${REPO}.git`;
 const HEAD = 'c'.repeat(40);
 const NOW = Date.parse('2026-10-31T12:00:00Z');
 const body = (patch: Record<string, unknown> = {}, git: Record<string, unknown> = {}) => ({
   repositoryId: REPO,
-  canonicalURL: 'https://github.ezil.work/acme/site.git',
+  canonicalURL: ARTIFACTS,
   ref: 'refs/heads/main',
   git: { token: TOKEN, expiresAt: '2026-10-31T12:04:00.000Z', ...git },
   ...patch,
@@ -38,15 +47,31 @@ const parsed = (b: unknown = body()): RepoOpenRequest => {
 };
 
 describe('parseRepoOpenRequest', () => {
-  it('accepts the contract body and derives the branch', () => {
+  it('accepts the contract body, derives the branch, and sends an Artifacts remote Bearer auth', () => {
     expect(parsed()).toEqual({
-      repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main',
-      branch: 'main', token: TOKEN, expiresAt: '2026-10-31T12:04:00.000Z',
+      repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main',
+      branch: 'main', token: TOKEN, expiresAt: '2026-10-31T12:04:00.000Z', auth: 'bearer', timeoutMs: REPO_OPEN_EXEC_TIMEOUT_MS,
     });
   });
 
-  it("accepts Works' git object passed through unchanged (username 'ezil', scope 'read')", () => {
+  it('still accepts an EZiL Git (github.ezil.work) remote, as Basic auth', () => {
+    expect(parsed(body({ canonicalURL: 'https://github.ezil.work/acme/site.git' }, { token: GRANT }))).toMatchObject({
+      canonicalURL: 'https://github.ezil.work/acme/site.git', token: GRANT, auth: 'basic',
+    });
+  });
+
+  it("accepts Universe's git object passed through unchanged (username 'ezil', scope 'read' or 'write')", () => {
     expect(parseRepoOpenRequest(body({}, { username: 'ezil', scope: 'read' }), NOW).ok).toBe(true);
+    expect(parseRepoOpenRequest(body({}, { username: 'ezil', scope: 'write' }), NOW).ok).toBe(true);
+  });
+
+  it("takes the caller's remaining deadline as timeoutMs, within the Worker's own bounds", () => {
+    expect(parsed(body({ timeoutMs: 45_000 })).timeoutMs).toBe(45_000);
+    expect(parsed(body({ timeoutMs: REPO_OPEN_MIN_TIMEOUT_MS })).timeoutMs).toBe(REPO_OPEN_MIN_TIMEOUT_MS);
+    expect(parsed(body({ timeoutMs: REPO_OPEN_EXEC_TIMEOUT_MS })).timeoutMs).toBe(REPO_OPEN_EXEC_TIMEOUT_MS);
+    for (const timeoutMs of [REPO_OPEN_MIN_TIMEOUT_MS - 1, REPO_OPEN_EXEC_TIMEOUT_MS + 1, 30_000.5, '60000', null, -1]) {
+      expect(parseRepoOpenRequest(body({ timeoutMs }), NOW)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    }
   });
 
   const invalid: Array<[string, unknown]> = [
@@ -63,6 +88,23 @@ describe('parseRepoOpenRequest', () => {
     ['a query', body({ canonicalURL: 'https://github.ezil.work/acme/site.git?x=1' })],
     ['a dot-dot name', body({ canonicalURL: 'https://github.ezil.work/acme/a..git' })],
     ['no .git suffix', body({ canonicalURL: 'https://github.ezil.work/acme/site' })],
+    ...([
+      ['a 31-hex account', `https://${ACCOUNT.slice(1)}.artifacts.cloudflare.net/git/universe-staging/site.git`],
+      ['a 33-hex account', `https://${ACCOUNT}0.artifacts.cloudflare.net/git/universe-staging/site.git`],
+      ['an uppercase-hex account', `https://${ACCOUNT.toUpperCase()}.artifacts.cloudflare.net/git/universe-staging/site.git`],
+      ['a lookalike Artifacts host', `https://${ACCOUNT}.artifacts.cloudflare.net.evil.test/git/universe-staging/site.git`],
+      ['userinfo naming the Artifacts host', `https://${ACCOUNT}.artifacts.cloudflare.net@evil.test/git/universe-staging/site.git`],
+      ['userinfo before the Artifacts host', `https://ezil:${GRANT}@${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/site.git`],
+      ['a port', `https://${ACCOUNT}.artifacts.cloudflare.net:8443/git/universe-staging/site.git`],
+      ['an Artifacts query', `${ARTIFACTS}?x=1`],
+      ['an Artifacts fragment', `${ARTIFACTS}#x`],
+      ['plain http to Artifacts', ARTIFACTS.replace('https:', 'http:')],
+      ['no /git/ prefix', `https://${ACCOUNT}.artifacts.cloudflare.net/universe-staging/site.git`],
+      ['a dot-dot Artifacts name', `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/a..b.git`],
+      ['a dot-dot namespace', `https://${ACCOUNT}.artifacts.cloudflare.net/git/../site.git`],
+      ['an extra path segment', `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/x/site.git`],
+      ['an uppercase namespace', `https://${ACCOUNT}.artifacts.cloudflare.net/git/Universe/site.git`],
+    ] as const).map(([name, canonicalURL]): [string, unknown] => [name, body({ canonicalURL })]),
     ['a tag ref', body({ ref: 'refs/tags/v1' })],
     ['a bare branch', body({ ref: 'main' })],
     ['a dot-dot ref', body({ ref: 'refs/heads/a..b' })],
@@ -70,10 +112,15 @@ describe('parseRepoOpenRequest', () => {
     ['a .lock ref', body({ ref: 'refs/heads/main.lock' })],
     ['an unknown git key', body({}, { password: 'x' })],
     ['another username', body({}, { username: 'root' })],
-    ['a write scope', body({}, { scope: 'write' })],
-    ['a token without the egg_ prefix', body({}, { token: 'ab12'.repeat(16) })],
-    ['a token with a newline (credential-line injection)', body({}, { token: `${TOKEN}\nhost=evil.test` })],
-    ['an uppercase-hex token', body({}, { token: TOKEN.toUpperCase().replace('EGG_', 'egg_') })],
+    ['an admin scope', body({}, { scope: 'admin' })],
+    ['an empty token', body({}, { token: '' })],
+    ['a token with a newline (credential-line or header injection)', body({}, { token: `${TOKEN}\nhost=evil.test` })],
+    ['a token with a carriage return', body({}, { token: `${TOKEN}\rX-Evil: 1` })],
+    ['a token with a space', body({}, { token: 'Bearer x' })],
+    ['a token with a tab', body({}, { token: `${TOKEN}\t` })],
+    ['a non-ASCII token', body({}, { token: `${TOKEN}é` })],
+    ['a 4097-character token', body({}, { token: 'a'.repeat(4097) })],
+    ['a numeric token', body({}, { token: 1234 })],
     ['a non-ISO expiry', body({}, { expiresAt: 'tomorrow' })],
     ['an unparseable expiry', body({}, { expiresAt: '2026-13-45T99:99:99Z' })],
   ];
@@ -90,7 +137,18 @@ describe('parseRepoOpenRequest', () => {
     expect(parseRepoOpenRequest(body({}, { expiresAt: '2026-10-31T12:00:10Z' }), NOW).ok).toBe(true);
   });
 
-  it('branchOf keeps nested branch names and refuses what Works refuses', () => {
+  it('accepts a 4096-character token (the cap) and a plain egg_ grant', () => {
+    expect(parseRepoOpenRequest(body({}, { token: 'a'.repeat(4096) }), NOW).ok).toBe(true);
+    expect(parseRepoOpenRequest(body({}, { token: GRANT }), NOW).ok).toBe(true);
+  });
+
+  it('repoOpenAuthFor picks the scheme from the host, and nothing for anything else', () => {
+    expect(repoOpenAuthFor(ARTIFACTS)).toBe('bearer');
+    expect(repoOpenAuthFor('https://github.ezil.work/acme/site.git')).toBe('basic');
+    for (const url of ['https://127.0.0.1/acme/site.git', `${ARTIFACTS}/`, 7, null]) expect(repoOpenAuthFor(url)).toBeNull();
+  });
+
+  it('branchOf keeps nested branch names and refuses what Universe refuses', () => {
     expect(branchOf('refs/heads/feature/x-1')).toBe('feature/x-1');
     for (const ref of ['refs/heads/', 'refs/heads/a//b', 'refs/heads/a/', 'refs/heads/.hidden', 'refs/heads/a.', `refs/heads/${'a'.repeat(250)}`]) {
       expect(branchOf(ref)).toBeNull();
@@ -99,30 +157,56 @@ describe('parseRepoOpenRequest', () => {
 });
 
 describe('repoOpenCommand', () => {
-  const cmd = repoOpenCommand({ root: '/workspace', repositoryId: REPO, url: 'https://github.ezil.work/acme/site.git', branch: 'main', requireHydrated: true });
+  const cmd = repoOpenCommand({ root: '/workspace', repositoryId: REPO, url: ARTIFACTS, branch: 'main', requireHydrated: true,
+    auth: 'bearer', timeoutMs: REPO_OPEN_EXEC_TIMEOUT_MS });
 
   it('is one bash invocation whose arguments are single-quoted, and never takes the token', () => {
     expect(cmd.startsWith("bash -c '")).toBe(true);
-    expect(cmd.endsWith(` ezil-repo-open '/workspace' '${REPO}' 'https://github.ezil.work/acme/site.git' 'main' 1`)).toBe(true);
+    expect(cmd.endsWith(` ezil-repo-open '/workspace' '${REPO}' '${ARTIFACTS}' 'main' 1 bearer 30 90`)).toBe(true);
     expect(cmd).not.toContain('egg_');
+    expect(cmd).not.toContain('art_v1_');
     // `repoOpenCommand` has no token parameter at all: the only route in is the env.
     expect(cmd).toContain(`$${REPO_OPEN_TOKEN_ENV}`);
   });
 
   it('quotes a single quote in an argument so it cannot end the word', () => {
-    const odd = repoOpenCommand({ root: "/w'; rm -rf /; '", repositoryId: REPO, url: 'u', branch: 'b', requireHydrated: false });
+    const odd = repoOpenCommand({ root: "/w'; rm -rf /; '", repositoryId: REPO, url: 'u', branch: 'b', requireHydrated: false,
+      auth: 'basic', timeoutMs: REPO_OPEN_MIN_TIMEOUT_MS });
     expect(odd).toContain(`'/w'\\''; rm -rf /; '\\'''`);
-    expect(odd.endsWith(' 0')).toBe(true);
+    expect(odd.endsWith(' 0 basic 2 8')).toBe(true);
   });
 
-  it('configures git only through the environment, resetting every inherited credential helper first', () => {
+  it('configures git only through the environment, resetting inherited helpers and headers first, never following redirects', () => {
     expect(cmd).toContain('GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=');
+    expect(cmd).toContain('GIT_CONFIG_KEY_1=http.extraHeader GIT_CONFIG_VALUE_1=');
+    expect(cmd).toContain('GIT_CONFIG_KEY_5=http.followRedirects GIT_CONFIG_VALUE_5=false');
     expect(cmd).toContain('GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null');
     expect(cmd).toContain('GIT_ALLOW_PROTOCOL=https');
     expect(cmd).toContain('core.hooksPath');
+    // Bearer is a command-scope header on the network git only, never exported.
+    expect(cmd).toContain('GIT_CONFIG_VALUE_6="Authorization: Bearer $tok" timeout');
+    expect(cmd).not.toMatch(/export[^\n]*Bearer/);
     // `git clone -c` would write the value into the new repository's .git/config.
     expect(cmd).not.toMatch(/git clone[^\n]* -c /);
     expect(cmd).not.toMatch(/git -c /);
+  });
+
+  it('refuses an existing clone with any repository-local url.* or http.* setting', () => {
+    expect(cmd).toContain('--get-regexp ');
+    expect(cmd).toContain(String.raw`^(url|http)\.`);
+  });
+});
+
+describe('repoOpenBounds', () => {
+  it('derives the lock wait and the git limit from one deadline, leaving 10 s for the kill grace and the rest', () => {
+    expect(repoOpenBounds(REPO_OPEN_EXEC_TIMEOUT_MS)).toEqual({ lockWaitS: 30, gitTimeoutS: 90 });
+    expect(repoOpenBounds(REPO_OPEN_MIN_TIMEOUT_MS)).toEqual({ lockWaitS: 2, gitTimeoutS: 8 });
+    for (let t = REPO_OPEN_MIN_TIMEOUT_MS; t <= REPO_OPEN_EXEC_TIMEOUT_MS; t += 777) {
+      const { lockWaitS, gitTimeoutS } = repoOpenBounds(t);
+      expect(lockWaitS).toBeGreaterThanOrEqual(1);
+      expect(gitTimeoutS).toBeGreaterThanOrEqual(1);
+      expect((lockWaitS + gitTimeoutS + 10) * 1000).toBeLessThanOrEqual(t);
+    }
   });
 });
 
@@ -156,9 +240,21 @@ describe('runRepoOpen', () => {
     expect(command).not.toContain(TOKEN);
     expect(options.env).toEqual({ [REPO_OPEN_TOKEN_ENV]: TOKEN });
     expect(options.origin).toBe('internal');
-    // Above the script's worst case: 60 s lock wait + 120 s git + 5 s kill grace.
-    expect(options.timeout).toBeGreaterThan((60 + 120 + 5) * 1000);
+    // The caller's deadline (the default here), above the script's worst case: 30 s lock wait + 90 s git + 5 s kill grace.
+    expect(options.timeout).toBe(REPO_OPEN_EXEC_TIMEOUT_MS);
+    expect(options.timeout).toBeGreaterThan((30 + 90 + 5) * 1000);
+    expect(command.endsWith(' bearer 30 90')).toBe(true);
     expect(JSON.stringify(answer)).not.toContain(TOKEN);
+  });
+
+  it('a shorter deadline shrinks the exec bound and the script bounds with it', async () => {
+    const { exec, calls } = fakeExec(`ezil-repo-open:ok:cloned:${HEAD}\n`);
+    await runRepoOpen(exec, parsed(body({ timeoutMs: 40_000 })), root);
+    const [command, options] = calls[0]!;
+    expect(options.timeout).toBe(40_000);
+    const { lockWaitS, gitTimeoutS } = repoOpenBounds(40_000);
+    expect(command.endsWith(` bearer ${lockWaitS} ${gitTimeoutS}`)).toBe(true);
+    expect((lockWaitS + gitTimeoutS + 5) * 1000).toBeLessThan(40_000);
   });
 
   it('passes the script\'s error code through; stderr (even one holding the token) is never read', async () => {
@@ -207,7 +303,7 @@ describe('ownSessionExec', () => {
   });
 
   it('deletes the session even when the exec throws (an exec timeout), and the open fails closed', async () => {
-    const { sandbox, log } = recorder(async () => { throw new Error('Command timeout after 200000ms'); });
+    const { sandbox, log } = recorder(async () => { throw new Error('Command timeout after 130000ms'); });
     const answer = await runRepoOpen(ownSessionExec(sandbox, () => 'ezil-repo-open-2'), parsed(), { path: '/workspace', requireHydrated: true });
     expect(answer).toEqual({ ok: false, error: 'repo_open_failed' });
     expect(log.at(-1)).toBe('delete ezil-repo-open-2');

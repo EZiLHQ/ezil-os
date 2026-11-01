@@ -36,10 +36,12 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          `sanitizeErrorMessage` before it leaves. Kill switch
  *          `EZIL_NEKO_LOGS=off`. See `handleNekoLogs` / `./neko-logs.ts`)
  *   POST   /sandbox/:name/repo-open → { ok, folder, head, status }
- *          (v2-signed only. Clones, or fetches only, one EZiL Git repository
- *          into `<workspace root>/projects/<repositoryId>` of a RUNNING
- *          computer; the read grant reaches git only through an env-fed
- *          credential helper. See `handleRepoOpen` / `./repo-open.ts`)
+ *          (v2-signed only. Clones, or fetches only, one project repository
+ *          (Cloudflare Artifacts, or EZiL Git) into
+ *          `<workspace root>/projects/<repositoryId>` of a RUNNING computer;
+ *          the Git token reaches git only through its environment, as a
+ *          Bearer header or an env-fed Basic credential helper, within the
+ *          caller's `timeoutMs`. See `handleRepoOpen` / `./repo-open.ts`)
  *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
  *                                     wasRunning, runningAfter, mode }
  *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —
@@ -7813,7 +7815,7 @@ export default {
 
     const repoOpenMatch = path.match(/^\/sandbox\/([^/]+)\/repo-open$/);
     if (method === 'POST' && repoOpenMatch) {
-      // Clone or fetch one EZiL Git repository into a running computer's
+      // Clone or fetch one project repository into a running computer's
       // workspace. v2-signed only; see `handleRepoOpen` / `./repo-open.ts`.
       return handleRepoOpen(request, env, decodeURIComponent(repoOpenMatch[1]));
     }

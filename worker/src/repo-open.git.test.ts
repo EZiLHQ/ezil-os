@@ -1,8 +1,11 @@
 /**
  * `repo-open`'s container script against REAL git and a real smart-HTTP git
  * server: a local HTTPS server (self-signed, trusted through
- * `GIT_SSL_CAINFO`) that demands HTTP Basic `ezil:<token>` and hands every
- * authorized request to `git http-backend`.
+ * `GIT_SSL_CAINFO`) that hands every authorized request to `git
+ * http-backend`. Under `/bearer/` it demands `Authorization: Bearer <token>`,
+ * which is what Cloudflare Artifacts takes (EZiL CLI `apps/git-gateway` sends
+ * exactly that upstream); everywhere else HTTP Basic `ezil:<token>`, which is
+ * what EZiL Git's gateway (github.ezil.work) takes.
  *
  * The script runs through `runRepoOpen` with an exec that does what the
  * Sandbox SDK does with a per-command `env` (the value is in the shell's
@@ -16,12 +19,16 @@
  *     URL the server saw;
  *   - `.git/config` and every other file under the clone are free of it, and
  *     `remote.origin.url` is the canonical URL with no userinfo;
- *   - a `credential.helper=store` in the computer's own `~/.gitconfig` never
- *     runs (`~/.git-credentials` is never written);
+ *   - a `credential.helper=store` in the computer's own `~/.gitconfig`, or in
+ *     the clone's own `.git/config`, never runs (its file is never written),
+ *     in either scheme;
+ *   - Bearer travels only as that header: the server never sees Basic for it,
+ *     and the clone's config holds no `extraHeader`;
  *   - a second open fetches only: an uncommitted edit and HEAD survive, while
  *     the remote-tracking ref moves;
  *   - every refusal (bad grant, missing branch, foreign folder, unhydrated
- *     workspace, a repository-local `insteadOf`) leaves the folder untouched.
+ *     workspace, a repository-local `insteadOf` or `http.*` setting) leaves
+ *     the folder untouched.
  *
  * Runs on the host's git by default. `EZIL_REPO_OPEN_IT_IMAGE=cloudflare/sandbox:0.12.1`
  * runs the same script inside that image instead (git 2.34.1, the computer's
@@ -33,7 +40,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runRepoOpen, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
+import { runRepoOpen, REPO_OPEN_EXEC_TIMEOUT_MS, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
 
 const which = (bin: string) => Bun.spawnSync(['sh', '-c', `command -v ${bin}`]).exitCode === 0;
 /** The real git the shim hands over to: the host's own, or the image's. */
@@ -42,8 +49,11 @@ const REAL_GIT = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() ? '/usr/bin/git'
 const IMAGE = process.env.EZIL_REPO_OPEN_IT_IMAGE?.trim() || '';
 const AVAILABLE = which('git') && which('openssl') && (!IMAGE || which('docker'));
 
-const TOKEN = `egg_${'7e57'.repeat(16)}`;
-const WRONG = `egg_${'0bad'.repeat(16)}`;
+/** Opaque, and full of what a shell or a config parser would trip on: it must arrive byte for byte. */
+const TOKEN = `art_v1_${'7e57'.repeat(16)}$(id)\`x\`"'\\;|&~+/=%s`;
+const WRONG = `art_v1_${'0bad'.repeat(16)}`;
+const BEARER = `Bearer ${TOKEN}`;
+const BASIC = `Basic ${btoa(`ezil:${TOKEN}`)}`;
 const REPO = '3f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
 
 function sh(args: string[], opts: { cwd?: string; env?: Record<string, string> } = {}) {
@@ -78,7 +88,9 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   let argvLog: string;
   let bin: string;
   let server: ReturnType<typeof Bun.serve>;
+  /** Basic (EZiL Git's scheme) at the root, Bearer (Cloudflare Artifacts') under `/bearer/`. */
   let url: string;
+  let bearerUrl: string;
   const seen: Array<{ url: string; auth: string | null }> = [];
   const printed: string[] = [];
 
@@ -104,8 +116,9 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
   };
   const request = (patch: Partial<RepoOpenRequest> = {}): RepoOpenRequest => ({
     repositoryId: REPO, canonicalURL: url, ref: 'refs/heads/main', branch: 'main', token: TOKEN,
-    expiresAt: new Date(Date.now() + 240_000).toISOString(), ...patch,
+    expiresAt: new Date(Date.now() + 240_000).toISOString(), auth: 'basic', timeoutMs: REPO_OPEN_EXEC_TIMEOUT_MS, ...patch,
   });
+  const bearer = (patch: Partial<RepoOpenRequest> = {}): Partial<RepoOpenRequest> => ({ canonicalURL: bearerUrl, auth: 'bearer', ...patch });
   const open = (patch: Partial<RepoOpenRequest> = {}, opts: { requireHydrated?: boolean; root?: string } = {}) =>
     runRepoOpen(exec(patch.token ?? TOKEN), request(patch), { path: opts.root ?? root, requireHydrated: opts.requireHydrated ?? false });
   const git = (cwd: string, ...args: string[]) => sh(['git', ...args], { cwd, env: { HOME: home, GIT_CONFIG_NOSYSTEM: '1' } });
@@ -140,19 +153,19 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     const key = join(dir, 'key.pem');
     sh(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1',
       '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1']);
-    const expected = `Basic ${btoa(`ezil:${TOKEN}`)}`;
     server = Bun.serve({
       hostname: '127.0.0.1', port: 0, tls: { cert: readFileSync(cert, 'utf8'), key: readFileSync(key, 'utf8') },
       async fetch(req) {
         const u = new URL(req.url);
         seen.push({ url: req.url, auth: req.headers.get('authorization') });
-        if (req.headers.get('authorization') !== expected) {
+        const isBearer = u.pathname.startsWith('/bearer/');
+        if (req.headers.get('authorization') !== (isBearer ? BEARER : BASIC)) {
           return new Response('authentication required', { status: 401, headers: { 'www-authenticate': 'Basic realm="ezil-it"' } });
         }
         const proc = Bun.spawn(['git', 'http-backend'], {
           env: {
             PATH: process.env.PATH!, GIT_PROJECT_ROOT: upstream, GIT_HTTP_EXPORT_ALL: '1',
-            REQUEST_METHOD: req.method, PATH_INFO: u.pathname, QUERY_STRING: u.search.slice(1),
+            REQUEST_METHOD: req.method, PATH_INFO: isBearer ? u.pathname.slice('/bearer'.length) : u.pathname, QUERY_STRING: u.search.slice(1),
             CONTENT_TYPE: req.headers.get('content-type') ?? '', REMOTE_ADDR: '127.0.0.1', REMOTE_USER: 'ezil',
             ...(req.headers.get('git-protocol') ? { GIT_PROTOCOL: req.headers.get('git-protocol')! } : {}),
             ...(req.headers.get('content-encoding') ? { HTTP_CONTENT_ENCODING: req.headers.get('content-encoding')! } : {}),
@@ -177,6 +190,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
       },
     });
     url = `https://127.0.0.1:${server.port}/acme/site.git`;
+    bearerUrl = `https://127.0.0.1:${server.port}/bearer/acme/site.git`;
   });
 
   afterAll(() => {
@@ -204,8 +218,8 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(ran).toContain(`git clone --quiet --branch main --origin origin -- ${url}`);
     expect(ran).not.toContain(TOKEN);
     // The server saw the credential only as Basic auth, never in a URL.
-    expect(seen.some((s) => s.auth === `Basic ${btoa(`ezil:${TOKEN}`)}`)).toBe(true);
-    expect(seen.filter((s) => s.url.includes(TOKEN) || s.url.includes('egg_'))).toEqual([]);
+    expect(seen.some((s) => s.auth === BASIC)).toBe(true);
+    expect(seen.filter((s) => s.url.includes(TOKEN) || s.url.includes('art_v1_'))).toEqual([]);
     // The computer's own `credential.helper = store` never ran.
     expect(existsSync(join(home, '.git-credentials'))).toBe(false);
     expect(printed.join('\n')).not.toContain(TOKEN);
@@ -279,6 +293,77 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(await open({ repositoryId: id }, { requireHydrated: true })).toMatchObject({ ok: true, status: 'cloned' });
     expect(await open({}, { root: join(dir, 'no-such-root') })).toEqual({ ok: false, error: 'repo_open_workspace_unavailable' });
   });
+
+  it('🔴 Bearer (Cloudflare Artifacts): clones with the token only in an Authorization header, never Basic, argv, file, URL or output', async () => {
+    const id = 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
+    const before = seen.length;
+    const answer = await open(bearer({ repositoryId: id }));
+    const folder = join(root, 'projects', id);
+    expect(answer).toEqual({ ok: true, folder, head: git(seed, 'rev-parse', 'HEAD'), status: 'cloned' });
+    const mine = seen.slice(before);
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.every((s) => s.auth === BEARER)).toBe(true);
+    expect(mine.filter((s) => s.url.includes(TOKEN) || s.url.includes('art_v1_'))).toEqual([]);
+    expect(git(folder, 'config', '--local', '--get', 'remote.origin.url')).toBe(bearerUrl);
+    const config = readFileSync(join(folder, '.git', 'config'), 'utf8');
+    expect(config).not.toContain(TOKEN);
+    expect(config).not.toMatch(/credential|helper|extraheader|authorization/i);
+    expect(filesContaining(folder, TOKEN)).toEqual([]);
+    expect(readFileSync(trace, 'utf8')).not.toContain(TOKEN);
+    expect(readFileSync(trace, 'utf8')).not.toContain('Bearer');
+    expect(readFileSync(argvLog, 'utf8')).toContain(`git clone --quiet --branch main --origin origin -- ${bearerUrl}`);
+    expect(readFileSync(argvLog, 'utf8')).not.toContain(TOKEN);
+    expect(printed.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('🔴 Bearer: a second open fetches only, and a wrong token is repo_open_auth_failed and creates nothing', async () => {
+    const id = 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
+    const folder = join(root, 'projects', id);
+    const before = git(folder, 'rev-parse', 'HEAD');
+    writeFileSync(join(folder, 'README.md'), '# bearer edit\n');
+    const next = commit('bearer fetch', 'BEARER.md', 'b\n');
+    expect(await open(bearer({ repositoryId: id }))).toEqual({ ok: true, folder, head: before, status: 'fetched' });
+    expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# bearer edit\n');
+    expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(next);
+    const other = 'bf1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
+    expect(await open(bearer({ repositoryId: other, token: WRONG }))).toEqual({ ok: false, error: 'repo_open_auth_failed' });
+    expect(existsSync(join(root, 'projects', other))).toBe(false);
+    // Basic credentials sent to the Bearer path are refused too: the scheme is the server's, not a guess.
+    expect(await open({ repositoryId: other, canonicalURL: bearerUrl, auth: 'basic' })).toEqual({ ok: false, error: 'repo_open_auth_failed' });
+    expect(existsSync(join(root, 'projects', other))).toBe(false);
+  });
+
+  for (const scheme of ['basic', 'bearer'] as const) {
+    it(`🔴 ${scheme}: a credential.helper=store in the clone's own .git/config never runs (review #6)`, async () => {
+      const id = scheme === 'basic' ? REPO : 'af1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
+      const folder = join(root, 'projects', id);
+      const store = join(dir, `local-store-${scheme}`);
+      git(folder, 'config', '--local', 'credential.helper', `store --file=${store}`);
+      try {
+        const answer = await open(scheme === 'basic' ? { repositoryId: id } : bearer({ repositoryId: id }));
+        expect(answer).toMatchObject({ ok: true, status: 'fetched' });
+        // Without the empty credential.helper reset, Basic would have stored the token here.
+        expect(existsSync(store)).toBe(false);
+        expect(filesContaining(dir, TOKEN).filter((p) => !p.startsWith(join(dir, 'upstream')))).toEqual([]);
+      } finally {
+        git(folder, 'config', '--local', '--unset', 'credential.helper');
+      }
+    });
+  }
+
+  for (const [key, value] of [['http.extraHeader', 'X-Leak: 1'], ['http.proxy', 'http://127.0.0.1:9'], ['http.sslVerify', 'false']] as const) {
+    it(`a repository-local ${key} (which could carry or expose the credential) is refused`, async () => {
+      const folder = join(root, 'projects', REPO);
+      git(folder, 'config', '--local', key, value);
+      const before = seen.length;
+      try {
+        expect(await open()).toEqual({ ok: false, error: 'repo_open_folder_conflict' });
+        expect(seen.length).toBe(before);
+      } finally {
+        git(folder, 'config', '--local', '--unset', key);
+      }
+    });
+  }
 
   it('nothing the whole run left behind holds the token (argv log, trace, workspace, home, /tmp staging)', () => {
     expect(readFileSync(argvLog, 'utf8')).not.toContain(TOKEN);

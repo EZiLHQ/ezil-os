@@ -93,7 +93,7 @@ browser — the browser only ever speaks the Guacamole protocol to the web app.
 | `POST /sandbox/preview` | `{ ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }` |
 | `GET /sandbox/:name/status` | `{ ok, sandboxName, guacamoleRunning, mode, desktopRunning, runningModes, modeSource }` |
 | `DELETE /sandbox/:name` | `{ ok, sandboxName, terminated, stopped, outcome, wasRunning, runningAfter, mode }` |
-| `POST /sandbox/:name/repo-open` | `{ ok, folder, head, status }` — clones (or fetches only) one EZiL Git repository into `<workspace root>/projects/<repositoryId>` of a running computer; see `src/repo-open.ts` |
+| `POST /sandbox/:name/repo-open` | `{ ok, folder, head, status }` — clones (or fetches only) one project repository (Cloudflare Artifacts with a Bearer token, or EZiL Git with Basic) into `<workspace root>/projects/<repositoryId>` of a running computer, within the caller's `timeoutMs`; see `src/repo-open.ts` |
 
 `guacamoleUrl` is the exposed container root (`https://<port>-<id>-desktop.<host>/`),
 which serves the auto-connect landing page that redirects into

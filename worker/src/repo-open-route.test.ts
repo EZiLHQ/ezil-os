@@ -23,13 +23,16 @@ const SECRET = 'repo-open-route-secret';
 const SANDBOX = 'guac-user1-comp1';
 const PATH = `/sandbox/${SANDBOX}/repo-open`;
 const REPO = '0b6c3c1e-8f0a-4c5e-9a43-2a1f6d0e7b11';
-const TOKEN = `egg_${'ab12'.repeat(16)}`;
+/** An opaque Cloudflare Artifacts repo token, as Universe passes it through. */
+const TOKEN = `art_v1_${'ab12'.repeat(16)}`;
 const HEAD = 'c'.repeat(40);
+const ARTIFACTS = `https://${'0123456789abcdef'.repeat(2)}.artifacts.cloudflare.net/git/universe-staging/p-${REPO}.git`;
 const BODY = JSON.stringify({
   repositoryId: REPO,
-  canonicalURL: 'https://github.ezil.work/acme/site.git',
+  canonicalURL: ARTIFACTS,
   ref: 'refs/heads/main',
   git: { token: TOKEN, expiresAt: new Date(Date.now() + 4 * 60_000).toISOString() },
+  timeoutMs: 90_000,
 });
 
 const claims = (patch: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims => ({
@@ -79,9 +82,19 @@ describe('POST /sandbox/:name/repo-open on the real route table', () => {
     expect(JSON.parse(text)).toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, head: HEAD, status: 'cloned' });
     expect(text).not.toContain(TOKEN);
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.request).toMatchObject({ repositoryId: REPO, branch: 'main', token: TOKEN });
+    expect(calls[0]!.request).toMatchObject({ repositoryId: REPO, canonicalURL: ARTIFACTS, branch: 'main', token: TOKEN, auth: 'bearer', timeoutMs: 90_000 });
     // R2-backed workspace: the root code-server opens, which must be hydrated in the container.
     expect(calls[0]!.root).toEqual({ path: '/workspace', requireHydrated: true });
+  });
+
+  it('an EZiL Git (github.ezil.work) remote reaches the computer as Basic auth', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const grant = `egg_${'ab12'.repeat(16)}`;
+    const body = JSON.stringify({ ...JSON.parse(BODY), canonicalURL: 'https://github.ezil.work/acme/site.git', git: { token: grant, expiresAt: new Date(Date.now() + 60_000).toISOString() } });
+    const res = await worker.fetch(await signed({ signBody: body }), env(binding));
+    expect(res.status).toBe(200);
+    expect(calls[0]!.request).toMatchObject({ canonicalURL: 'https://github.ezil.work/acme/site.git', auth: 'basic', token: grant });
   });
 
   it('with no workspace store configured, the root is code-server\'s own default and needs no marker', async () => {
