@@ -133,7 +133,17 @@ A_AI_PLAN='"Copilot Free"'; R_AI_PLAN='"EZiL AI"'
 A_AI_QUOTA='"Chat messages"'; R_AI_QUOTA='"Gateway usage"'
 A_AI_LIMIT='"Limited"'; R_AI_LIMIT='"View EZiL AI status"'
 
-# Part 3 — EZiL Chat history (workbench.js). The ChatSessionStore lists history only from
+# Part 3 — EZiL Chat history (workbench.js). Upstream the ChatSessionStore keeps sessions in
+# <user-data>/User/workspaceStorage/<id>/chatSessions, where the id hashes
+# vscode-remote://<browser host><folder> (code-server sets remoteAuthority to location.host),
+# so it changes with the computer's address. For a single-folder window whose folder has
+# .ezil/chat (editor-state.sh creates it in the EZiL workspace), the store uses that folder
+# instead; it is decided as the store's first queued task, before any session file is read
+# or written. Not-found keeps the upstream location; other errors retry, then log loudly.
+A_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){'
+R_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})})),!f.configuration&&f.folders.length===1&&this.storeQueue.queue(()=>this._ezilUseWorkspaceChat(f.folders[0].uri))}async _ezilUseWorkspaceChat(e){let t=Ve(e,".ezil","chat");for(let i=0;;i++)try{let n=await this.fileService.stat(t);n.isDirectory&&(this.storageRoot=t,this.logService.info(`EZiL: chat history in ${t.toString()}`));return}catch(n){if(ba(n)===1)return;if(i>=5){this.logService.error(`EZiL: chat history folder ${t.toString()} unreadable, using ${this.storageRoot.toString()}`,n);return}await new Promise(r=>setTimeout(r,1e3*(i+1)))}}async handleWorkspaceTransition(e,t){'
+P_HISTORY_WORKSPACE='let f=this.workspaceContextService.getWorkspace(),v=!f.configuration&&f.folders.length===0,b=this.workspaceContextService.getWorkspace().id;this.storageRoot=v?Ve(this.userDataProfilesService.defaultProfile.globalStorageHome,"emptyWindowChatSessions"):Ve(this.environmentService.workspaceStorageHome,b,"chatSessions"),'
+# The ChatSessionStore lists history only from
 # its index (storage key chat.ChatSessionStore.index, workspace scope = browser IndexedDB
 # per origin and URL path) and never rebuilds a missing index from the session files.
 # The first index read in a window reconciles it with the chatSessions directory: files
@@ -155,6 +165,9 @@ A_HISTORY_ENTRY='shouldRender(){return!!this.model?.title}'
 R_HISTORY_ENTRY='shouldRender(){return!0}'
 A_HISTORY_LABEL='static{this.DEFAULT_TITLE=d(12379,null)}'
 R_HISTORY_LABEL='static{this.DEFAULT_TITLE="Chat history"}'
+# An empty chat's title is "" (not nullish), so the default label never showed.
+A_HISTORY_EMPTY_TITLE='this.updateTitle(this.title??X2.DEFAULT_TITLE)'
+R_HISTORY_EMPTY_TITLE='this.updateTitle(this.title||X2.DEFAULT_TITLE)'
 
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
@@ -181,12 +194,14 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch accounts-menu  "$WB"  1  "$A_ACCOUNTS" "$R_ACCOUNTS"
   patch target-picker  "$WB"  1  "$A_PICKER"   "$R_PICKER"
-  for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND"; do
+  for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND" "$P_HISTORY_WORKSPACE"; do
     gate history-names "$WB" 1 "$p"
   done
+  patch history-root   "$WB"  1  "$A_HISTORY_ROOT" "$R_HISTORY_ROOT"
   patch history-index  "$WB"  1  "$A_HISTORY_INDEX" "$R_HISTORY_INDEX"
   patch history-entry  "$WB"  1  "$A_HISTORY_ENTRY" "$R_HISTORY_ENTRY"
   patch history-label  "$WB"  1  "$A_HISTORY_LABEL" "$R_HISTORY_LABEL"
+  patch history-empty-title "$WB" 1 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -227,12 +242,14 @@ for nls in "$NLS_JS" "$NLS_JSON"; do
 done
 gate accounts-menu    "$WB"  0  "$A_ACCOUNTS";     gate accounts-menu    "$WB"  1  "$R_ACCOUNTS"
 gate target-picker    "$WB"  0  "$A_PICKER";       gate target-picker    "$WB"  1  "$R_PICKER"
-for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND"; do
+for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND" "$P_HISTORY_WORKSPACE"; do
   gate history-names "$WB" 1 "$p"
 done
+gate history-root     "$WB"  0  "$A_HISTORY_ROOT";  gate history-root     "$WB"  1  "$R_HISTORY_ROOT"
 gate history-index    "$WB"  0  "$A_HISTORY_INDEX"; gate history-index    "$WB"  1  "$R_HISTORY_INDEX"
 gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB"  1  "$R_HISTORY_ENTRY"
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
+gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 1 "$R_HISTORY_EMPTY_TITLE"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"

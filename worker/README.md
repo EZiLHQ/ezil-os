@@ -36,10 +36,10 @@ loopback when `/etc/hosts` is writable; `github.com` and `api.github.com` remain
 available to developer tools. See `seed_blocked_ai_hosts` for the exact list.
 
 EZiL Chat history is one set of files in the workspace, `<workspace>/.ezil/chat/<session>.jsonl`.
-Before each launch `ezil_editor_link_chat` points the editor's
-`User/workspaceStorage/<id>/chatSessions` at that folder (moving any history already in an AWS
-profile there once, never overwriting), so checkpoints, restore, plan moves and Cloudflare
-restarts carry it with the project files. `.ezil/.gitignore` (`*`) keeps it out of user Git.
+Before each launch `ezil_editor_prepare_chat` creates that folder and moves in any history
+already in the editor profile (never overwriting); the `history-root` patch makes the editor
+write there instead of the profile, whose folder name depends on the browser address. So
+checkpoints, restore, plan moves and Cloudflare restarts carry it with the project files. `.ezil/.gitignore` (`*`) keeps it out of user Git.
 The `history-index` patch rebuilds the editor's browser-side list from those files in a new
 browser; the chat title ("Chat history" on an empty chat) opens the list. Deleting a chat there
 deletes its file; export is a copy of `.ezil/chat`. Earlier checkpoints keep their own copy until

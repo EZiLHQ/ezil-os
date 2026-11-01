@@ -156,31 +156,18 @@ embeddings.vscode-cdn.net
 EZIL_BLOCKED_AI_HOSTS
 }
 
-# EZiL Chat history. The editor writes each conversation to
-# <user-data>/User/workspaceStorage/<workspace id>/chatSessions/<session>.jsonl
-# (code-server 4.141.0 ChatSessionStore). That directory becomes a link to
-# <workspace>/.ezil/chat, so the one copy travels with the workspace: checkpoints,
-# restore, reverse move and Cloudflare restarts carry it like any project file.
-# The id is the web workbench's hash of the folder URI vscode-remote://remote<path>
-# (workbench.js QUn/Nr/o0); both bridges drop x-forwarded-port, so the authority is
-# always "remote". Print one id per distinct spelling of the folder path.
-ezil_editor_chat_workspace_ids() {
-  node - "$1" <<'CODESERVER_WORKSPACE_ID_JS'
-const path = require("path");
-const hash = s => { let h = 149417; for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0; return h; };
-// Only paths URI.toString() leaves unencoded; anything else would hash differently.
-for (const p of new Set([process.argv[2], path.resolve(process.argv[2])])) {
-  if (/^\/[A-Za-z0-9._~\/-]*$/.test(p)) console.log(hash("vscode-remote://remote" + p).toString(16));
-}
-CODESERVER_WORKSPACE_ID_JS
-}
-
-# Idempotent; runs before every launch, including warm AWS profiles that already
-# carry .ezil-state-ready. Existing history (AWS profile volume) moves into the
-# workspace once, never overwriting a saved session. Odd entries are moved aside,
-# never followed or deleted.
-ezil_editor_link_chat() (
-  local user_data="$1" workspace="$2" state_dir chat ids id parent link entry name stamp
+# EZiL Chat history lives in the workspace: <workspace>/.ezil/chat/<session>.jsonl, one
+# copy that checkpoints, restore, reverse move and Cloudflare restarts carry like any
+# project file. The patched editor (copilot-chat/PATCHES.md, history-root) writes there
+# whenever that directory exists; upstream it writes to
+# <user-data>/User/workspaceStorage/<id>/chatSessions, with an id that hashes the browser
+# host, so it changes with the computer's address. Idempotent; runs before every launch,
+# including warm AWS profiles that already carry .ezil-state-ready. History already in a
+# profile moves into the workspace, never overwriting a saved session (all such
+# directories: in EZiL the editor opens one folder). Odd entries are moved aside, never
+# followed or deleted.
+ezil_editor_prepare_chat() (
+  local user_data="$1" workspace="$2" state_dir chat dir entry name stamp
   state_dir="${EZIL_EDITOR_STATE_DIR:-$workspace/.ezil}"
   chat="$state_dir/chat"
   stamp="$(date +%s)-$BASHPID-$RANDOM"
@@ -194,32 +181,21 @@ ezil_editor_link_chat() (
     mv -T -- "$chat" "$chat.ezil-quarantine-$stamp" || exit 1
   fi
   mkdir -p "$chat" || exit 1
-  ids="$(ezil_editor_chat_workspace_ids "$workspace")" || exit 1
-  [ -n "$ids" ] || exit 1
-  for id in $ids; do
-    parent="$user_data/User/workspaceStorage/$id"
-    link="$parent/chatSessions"
-    [ "$(readlink "$link" 2>/dev/null)" = "$chat" ] && continue
-    mkdir -p "$parent" || exit 1
-    if [ -d "$link" ] && [ ! -L "$link" ]; then
-      for entry in "$link"/* "$link"/.[!.]* "$link"/..?*; do
-        [ -e "$entry" ] || [ -L "$entry" ] || continue
-        name="${entry##*/}"
-        if [ ! -e "$chat/$name" ] && [ ! -L "$chat/$name" ]; then
-          mv -T -- "$entry" "$chat/$name" || exit 1
-        elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$chat/$name"; then
-          rm -f -- "$entry" || exit 1
-        else
-          mkdir -p "$state_dir/chat-conflicts/$stamp" || exit 1
-          mv -T -- "$entry" "$state_dir/chat-conflicts/$stamp/$name" || exit 1
-        fi
-      done
-      rmdir -- "$link" || exit 1
-    elif [ -e "$link" ] || [ -L "$link" ]; then
-      mv -T -- "$link" "$parent/chatSessions.ezil-quarantine-$stamp" || exit 1
-    fi
-    ln -s -- "$chat" "$parent/.chatSessions.$stamp" || exit 1
-    mv -T -- "$parent/.chatSessions.$stamp" "$link" || { rm -f -- "$parent/.chatSessions.$stamp"; exit 1; }
+  for dir in "$user_data"/User/workspaceStorage/*/chatSessions; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      name="${entry##*/}"
+      if [ ! -e "$chat/$name" ] && [ ! -L "$chat/$name" ]; then
+        mv -T -- "$entry" "$chat/$name" || exit 1
+      elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$chat/$name"; then
+        rm -f -- "$entry" || exit 1
+      else
+        mkdir -p "$state_dir/chat-conflicts/$stamp" || exit 1
+        mv -T -- "$entry" "$state_dir/chat-conflicts/$stamp/$name" || exit 1
+      fi
+    done
+    rmdir -- "$dir" 2>/dev/null || true
   done
 )
 
@@ -246,7 +222,7 @@ ezil_editor_prepare() (
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
     # History must not block the editor: a failed link leaves today's behaviour.
-    ezil_editor_link_chat "$user_data" "$workspace" || echo "editor-state: chat history link failed; conversations stay in the editor profile" >&2
+    ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
     exit 0
   fi
   for file in settings.json keybindings.json; do
@@ -255,7 +231,7 @@ ezil_editor_prepare() (
     fi
   done
   seed_codeserver_user_settings "$user_data" || exit 1
-  ezil_editor_link_chat "$user_data" "$workspace" || echo "editor-state: chat history link failed; conversations stay in the editor profile" >&2
+  ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
   # This marker is published only after every restore succeeded. Failed restores
   # cannot launch defaults or let a later capture replace durable user settings.
   printf '%s\n' "$workspace" >"$user_data/.ezil-state-ready" || exit 1
@@ -298,7 +274,7 @@ ezil_editor_capture() (
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
   [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
-  # A workspace replaced under a running editor keeps the history link usable.
+  # A workspace replaced under a running editor keeps its history folder.
   [ -L "$state_dir/chat" ] || mkdir -p "$state_dir/chat" 2>/dev/null || true
   for file in settings.json keybindings.json; do
     if [ -f "$user_data/User/$file" ]; then

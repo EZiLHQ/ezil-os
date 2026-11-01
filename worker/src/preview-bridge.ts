@@ -725,18 +725,6 @@ export function resolveForwardedHost(url: URL, target: BridgeTarget): string {
   return target === 'code' ? url.host : APP_FORWARDED_HOST;
 }
 
-/**
- * code-server 4.141.0 names the remote authority `remote:<x-forwarded-port>` when
- * that header is present and plain `remote` otherwise. The authority is part of
- * the folder URI the editor hashes into its workspace-storage id, which is where
- * `editor-state.sh` links EZiL Chat history into the workspace. The AWS edge drops
- * every `x-forwarded-*` header; dropping this one here keeps the id identical on
- * both backends whatever a client sends.
- */
-export function dropCodeForwardedPort(headers: Headers, target: BridgeTarget): void {
-  if (target === 'code') headers.delete('x-forwarded-port');
-}
-
 // ── /preview-bootstrap ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
@@ -894,7 +882,6 @@ export async function handlePreviewProxy(
   forwardHeaders.delete('forwarded');
   forwardHeaders.set('x-forwarded-proto', 'https');
   forwardHeaders.set('x-forwarded-host', resolveForwardedHost(url, target));
-  dropCodeForwardedPort(forwardHeaders, target);
 
   const init: RequestInit = {
     method: request.method,
@@ -1070,7 +1057,6 @@ export async function handlePreviewWsProxy(
   forwardHeaders.delete('forwarded');
   forwardHeaders.set('x-forwarded-proto', 'https');
   forwardHeaders.set('x-forwarded-host', resolveForwardedHost(url, target));
-  dropCodeForwardedPort(forwardHeaders, target);
   forwardHeaders.set('upgrade', 'websocket');
   forwardHeaders.set('connection', 'Upgrade');
 

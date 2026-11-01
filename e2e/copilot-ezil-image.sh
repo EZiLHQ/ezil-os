@@ -233,6 +233,9 @@ reset_sink_logs
 ST4="$WORK/history-restart"; mkdir -p "$ST4/home/neko" "$ST4/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST4/etc/ezil/models.e2e.json"
 docker cp "$NAME:/home/neko/project" "$ST4/home/neko/"
+# Another address: code-server keys its workspace storage (and the browser its IndexedDB) to
+# the host, as a Cloudflare <-> AWS move or a new hostname would.
+FORWARD_PORT=$((FORWARD_PORT + 1))
 boot "$ST4"
 start_mock || fail=1
 run_history verify "$OUT/history-verify" || fail=1

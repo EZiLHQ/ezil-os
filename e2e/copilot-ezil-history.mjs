@@ -1,10 +1,11 @@
 /**
  * Lead-run Playwright half of copilot-ezil-image.sh's history pass. Fresh browser per phase.
  *   EZIL_E2E_PHASE=create  send one chat; its session file must land in <folder>/.ezil/chat
- *                          through the editor's chatSessions link.
- *   EZIL_E2E_PHASE=verify  after a restart (new container /tmp, same workspace) and in a new
- *                          browser profile: "Chat history" shows on the empty chat, lists the
- *                          conversation, reopens it, and deleting it removes its file.
+ *                          and nowhere in the editor profile.
+ *   EZIL_E2E_PHASE=verify  after a restart (new container /tmp, same workspace), at a different
+ *                          address (new workspace-storage id) and in a new browser profile:
+ *                          "Chat history" shows on the empty chat, lists the conversation,
+ *                          reopens it, and deleting it removes its file.
  * Exit 2 means not run.
  */
 import { createRequire } from 'node:module';
@@ -35,9 +36,9 @@ const sh = command => execFileSync('docker', ['exec', CONTAINER, 'bash', '-c', c
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const clean = s => s.replace(/\s+/g, ' ').trim();
 const CHAT = join(FOLDER, '.ezil', 'chat');
-// Session files that mention the prompt, and every chatSessions entry in the profile.
+// Session files that mention the prompt: in the workspace, and anywhere in the editor profile.
 const sessionFiles = () => sh(`grep -l -F ${quote(PROMPT)} ${quote(CHAT)}/*.jsonl ${quote(CHAT)}/*.json 2>/dev/null || true`).split('\n').filter(Boolean);
-const profileSessions = () => sh('for p in /tmp/code-server-data/User/workspaceStorage/*/chatSessions; do [ -e "$p" ] || [ -L "$p" ] || continue; if [ -L "$p" ]; then printf "link %s -> %s\\n" "$p" "$(readlink "$p")"; else printf "dir %s\\n" "$p"; fi; done').split('\n').filter(Boolean);
+const profileCopies = () => sh(`grep -rl -F ${quote(PROMPT)} /tmp/code-server-data/User 2>/dev/null || true`).split('\n').filter(Boolean);
 
 const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined });
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -59,9 +60,7 @@ try {
   await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
   await page.locator('.monaco-workbench').waitFor({ state: 'visible', timeout: T });
   await aux.locator('.chat-input-container').first().waitFor({ state: 'visible', timeout: T });
-  const links = profileSessions();
-  check('the editor profile reaches chat history only through the workspace link',
-    links.length > 0 && links.every(l => l.startsWith('link ') && l.endsWith(` -> ${CHAT}`)), JSON.stringify(links));
+  check('the history folder exists before the editor starts', sh(`test -d ${quote(CHAT)} && ! test -L ${quote(CHAT)} && echo yes || echo no`).trim() === 'yes');
 
   if (PHASE === 'create') {
     const editor = aux.locator('.chat-input-container .monaco-editor').first();
@@ -79,11 +78,13 @@ try {
     await until(async () => sessionFiles().length > 0, 'session file in the workspace', 90_000);
     const files = sessionFiles();
     check('the conversation is saved once, in <workspace>/.ezil/chat', files.length === 1, JSON.stringify(files));
-    const copies = sh(`grep -rl -F ${quote(PROMPT)} /tmp/code-server-data 2>/dev/null | grep chatSessions || true`).split('\n').filter(Boolean);
-    info('profile paths that resolve to the same file (through the link)', JSON.stringify(copies));
+    const copies = profileCopies();
+    check('no chat session copy in the editor profile', !copies.some(c => c.includes('/chatSessions/')), JSON.stringify(copies));
+    info('other editor-profile files that contain the prompt (Copilot traces/transcripts; not removed by a delete)', JSON.stringify(copies));
     check('.ezil is ignored by Git', sh(`cd ${quote(FOLDER)} && git init -q 2>/dev/null; git status --porcelain --untracked-files=all | grep -c '^?? .ezil' || true`).trim() === '0');
   } else {
     check('the saved conversation survived the restart', sessionFiles().length === 1, JSON.stringify(sessionFiles()));
+    info('browser address (a different host:port than the create phase means a different workspace-storage id)', new URL(CODE_URL).host);
     const title = aux.locator('.chat-view-title-container.visible .chat-view-title-label').first();
     const shown = await until(async () => (await title.isVisible().catch(() => false)), '"Chat history" title', 30_000);
     const label = shown ? clean(await title.innerText()) : '';

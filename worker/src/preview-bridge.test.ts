@@ -1005,26 +1005,6 @@ describe('handlePreviewProxy', () => {
       expect(body).toBe('<html><head><title>vscode</title></head><body>code-server</body></html>');
     });
 
-    it('drops x-forwarded-port for target: code only, so the editor workspace id never depends on it', async () => {
-      const cookie = await mintPreviewCookie(SECRET, SID);
-      const seen: Record<string, string | null> = {};
-      const sandbox = fakeContainerFetcher((url, init) => {
-        seen[url.includes(`:${CODE_PREVIEW_PORT}/`) ? 'code' : 'app'] = new Headers(init?.headers).get('x-forwarded-port');
-        return new Response('ok');
-      });
-      const headers = { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-forwarded-port': '443' };
-      await handlePreviewProxy(
-        new Request(`https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview/`, { headers }),
-        sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
-      );
-      await handlePreviewProxy(
-        new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/`, { headers }),
-        sandbox, SID, [SECRET], '/',
-      );
-      expect(seen.code).toBeNull();
-      expect(seen.app).toBe('443');
-    });
-
     it('still injects RUNTIME_SHIM for target: app (the default) — no regression', async () => {
       const cookie = await mintPreviewCookie(SECRET, SID);
       const sandbox = fakeContainerFetcher(
@@ -1407,21 +1387,6 @@ describe('handlePreviewWsProxy', () => {
     expect(forwarded.forwarded).toBeUndefined();
     // Left in place it would have chosen the host the origin check compares to.
     expect(() => simulateCodeServerEnsureOrigin(forwarded, `https://${CODE_HOST}`)).not.toThrow();
-  });
-
-  it('drops x-forwarded-port on the code socket; the app socket keeps it', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
-    const code = fakeWsSandbox();
-    await handlePreviewWsProxy(
-      codeUpgradeRequest(cookie, { 'x-forwarded-port': '443' }), code, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
-    );
-    expect(code.calls[0]?.headers['x-forwarded-port']).toBeUndefined();
-    const app = fakeWsSandbox();
-    await handlePreviewWsProxy(
-      new Request(`https://${APP_HOST}/preview-ws/`, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-forwarded-port': '443' } }),
-      app, SID, [SECRET], '/',
-    );
-    expect(app.calls[0]?.headers['x-forwarded-port']).toBe('443');
   });
 
   it('strips the `ezil_preview` cookie before the container ever sees it', async () => {

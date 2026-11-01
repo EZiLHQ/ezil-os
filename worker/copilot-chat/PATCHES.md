@@ -119,26 +119,33 @@ Facts from the pinned 4.141.0 bundle (`workbench.js`, `server-main.js`):
   (`vscode-web-state-db-<workspace id>-<hash of the URL path>`) unless code-server runs with
   `--enable-remote-storage`. A missing index is the empty index; nothing rebuilds it from the files.
   So a new browser, a new origin, or a new user-data dir shows no history even when every file exists.
-- The workspace id is `hash("vscode-remote://remote" + folder).toString(16)` (`QUn`/`Nr`/`o0`).
-  The authority is `remote:<x-forwarded-port>` when that header reaches code-server, so the
-  Cloudflare bridge drops it for the code target (the AWS edge drops every `x-forwarded-*`).
+- The workspace id is `hash("vscode-remote://" + authority + folder).toString(16)` (`QUn`/`Nr`/`o0`),
+  and code-server's embedder sets the authority to `location.host` (`remoteAuthority:location.host`).
+  So the id, and with it the upstream session folder and the browser index, changes with the
+  address the editor is opened at: another computer address, a Cloudflare ↔ AWS move. Measured in
+  the image e2e: `?folder=/home/neko/project` at `127.0.0.1:18493` wrote to `workspaceStorage/31384936`,
+  which is `hash("vscode-remote://127.0.0.1:18493/home/neko/project")`.
 
-`scripts/editor-state.sh` links `chatSessions` for that id to `<workspace>/.ezil/chat` before
-every launch, so the one copy rides on checkpoints, restore and moves (see the script). The
-workbench patches below make the list follow the files.
+`scripts/editor-state.sh` creates `<workspace>/.ezil/chat` (self-ignoring `.ezil/.gitignore`) before
+every launch and moves history already in a profile's `workspaceStorage/*/chatSessions` into it,
+never overwriting. The patches below make the store use that folder and the list follow the files,
+so the one copy rides on checkpoints, restore and moves.
 
 | id | file / anchor | replacement / gate |
 |---|---|---|
+| `history-root` | workbench.js, end of the `ChatSessionStore` constructor: `this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){` | For a window with exactly one folder and no workspace file, queue as the store's first task: `stat(<folder>/.ezil/chat)`; a directory becomes `storageRoot`. Every read of `storageRoot` (`getStorageLocation`, reconcile, migration) runs in a later queued task; the only synchronous accessor, `getChatStorageFolder()`, has no caller. Not-found keeps the upstream location (any other folder); another error retries 5 times (1 s … 5 s), then keeps upstream and logs an error. Anchor 0, replacement 1. |
 | `history-index` | workbench.js `ChatSessionStore.getIndex`: `async getIndex(){return this.storeQueue.queue(async()=>this.internalGetIndex().entries)}` | On the first read in a window, inside the store queue: list the `chatSessions` directory; drop non-external index entries with neither `.json` nor `.jsonl`; read files missing from the index (newest first, never older than the oldest entry of a full 400-entry index) with the store's own `readSessionFromLocation` and `KSn` metadata, titled like `ChatModel.getDefaultTitle` when there is no custom title; then `trimEntries` and `flushIndex`. A listing error other than not-found changes nothing and is retried on the next read; not-found ends it for the window. Anchor 0, replacement 1. |
-| `history-names` | `KSn`, `sC.getDefaultTitle`, `zSn=400`, `readSessionFromLocation`, `getStorageLocation`, `ba(...)!==1` (not-found) | Checked, never patched: each exact definition occurs once, so the replacement's minified names mean the same thing. |
+| `history-names` | `KSn`, `sC.getDefaultTitle`, `zSn=400`, `readSessionFromLocation`, `getStorageLocation`, `ba(...)!==1` (not-found), the constructor's `f` (workspace) and `Ve` (joinPath) | Checked, never patched: each exact definition occurs once, so the replacement's minified names mean the same thing. |
 | `history-entry` | workbench.js `ChatViewTitleControl.shouldRender(){return!!this.model?.title}` | `shouldRender(){return!0}`: the title, whose click opens the session picker (`workbench.action.chat.pickAgentSession`), also shows on an empty chat. Anchor 0, replacement 1. |
 | `history-label` | workbench.js `static{this.DEFAULT_TITLE=d(12379,null)}` | `static{this.DEFAULT_TITLE="Chat history"}`, the label of that title on an empty chat. Anchor 0, replacement 1. |
+| `history-empty-title` | workbench.js `doUpdate`: `this.updateTitle(this.title??X2.DEFAULT_TITLE)` | `this.title||X2.DEFAULT_TITLE`: an empty chat's title is `""`, not nullish, so upstream rendered an empty label. Anchor 0, replacement 1. |
 
 `chat.viewSessions.enabled` stays `false`: turning it on hides the welcome (and the notice) and
 its filter menu lists every session-type contribution, including the agent-host Copilot type the
 `target-picker` patch hides. Deleting a chat in the picker runs the store's `deleteSession`, which
-deletes both `<id>.json` and `<id>.jsonl`; through the link that is the workspace file. Export is
-the files in `.ezil/chat`.
+deletes both `<id>.json` and `<id>.jsonl` in `.ezil/chat`. Export is the files in `.ezil/chat`.
+Moving profile history in takes every profile `chatSessions` folder: conversations from another
+folder opened in the same profile join the EZiL workspace's history (EZiL opens one folder).
 
 Copilot Chat 0.69 also keeps conversation text of its own: `github.copilot.chat.localIndex.enabled`
 (default `true`, tagged `onExp`) writes sessions and turns to
@@ -148,7 +155,7 @@ Copilot Chat 0.69 also keeps conversation text of its own: `github.copilot.chat.
 not remove; the profile keeps it (AWS) or the restart drops it (Cloudflare).
 
 Offline test against the pristine bundle (patches a copy, runs the patched store on real files
-behind the link `editor-state.sh` makes):
+in the folder `editor-state.sh` prepares):
 
 ```sh
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-history-patch.test.cjs
