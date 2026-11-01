@@ -923,6 +923,93 @@ try {
     contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Resets Nov 1, 2026');
     has('[data-role="meter-time"] [role="meter"]', false);
     pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
+
+    // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
+    {
+        const M = credits => { const [whole, fraction = ''] = String(credits).split('.'); return (BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'))).toString(); };
+        const worked = { userId: 'test-user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M('1500'), remainingMicro: M('1246.75'), heldMicro: M('0.5'),
+            usedMicro: M('252.75'), planBaselineMicro: M('1000'), labelled: true, grants: [
+                { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('746.75'), expiresAt: '2026-11-04T00:00:00Z' },
+                { kind: 'added', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-06-01T00:00:00Z' }] };
+        const unreadable = { ...worked, state: 'unavailable', totalMicro: null, remainingMicro: null, heldMicro: null, usedMicro: null, labelled: false, grants: [] };
+        const withAccount = account => { const value = summaryV3('premium'); Object.assign(value.ai, { balance: 1246.75, included: { granted: 1000, remaining: 746.75, periodEnd: END }, account }); return value; };
+        const ai = () => q('[data-role="meter-ai"]');
+        summary = withAccount(worked); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '1,246 credits left of 1,500');
+        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75');
+        assert.equal(ai().querySelector('[role="meter"]').getAttribute('aria-valuenow'), '83');
+        assert.deepEqual(qa('[data-role="ai-details"] span[title]').map(span => span.title), ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
+        contains('[data-role="meter-ai"]', '500 added · expire Jun 1, 2027');
+        assert.doesNotMatch(ai().querySelector('.ezil-billing-meter-value').textContent, /of 1,000|746/);
+        // Gateway down for the same user: the kept balance, as of its own time; never the catalog.
+        summary = withAccount(unreadable); await refresh();
+        contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+        contains('[data-role="meter-ai"]', `Couldn't refresh · as of ${new Date(worked.asOf).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}`);
+        // A summary the server read for another user is refused, and the kept balance with it.
+        summary = withAccount({ ...worked, userId: 'someone-else' }); await refresh();
+        has('[data-role="meter-ai"]', false);
+        assert.doesNotMatch(text(), /1,246|1,500/);
+        contains('[data-role="billing-body"]', "Couldn't load billing");
+        summary = withAccount(unreadable); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '—');
+        contains('[data-role="meter-ai"]', "We couldn't read your credits.");
+        assert.doesNotMatch(ai().textContent, /1,000|1,246|746/);
+        has('[data-role="meter-ai"] [role="meter"]', false);
+        // Positive control: an older server (no `account` key) keeps the legacy meter.
+        summary = withAccount(worked); delete summary.ai.account; summary.ai.included = { granted: 1000, remaining: 812, periodEnd: END }; await refresh();
+        contains('[data-role="meter-ai"]', '812 of 1,000 left');
+        // Window focus reloads a pane older than five minutes, not a fresh one.
+        summary = withAccount(worked); await refresh();
+        const loads = count();
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(count(), loads);
+        // The shell runs in the page's realm: its clock is the page's Date.
+        const realNow = window.Date.now; window.Date.now = () => realNow() + 5 * 60 * 1000 + 1000;
+        try { window.dispatchEvent(new window.Event('focus')); await settle(); } finally { window.Date.now = realNow; }
+        assert.equal(count(), loads + 1);
+        contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+        // The warning is the total's own (at most 10% left), never `ai.state`, which judges the plan bucket alone (the
+        // fixture's is 'low'); Premium's "Add AI credits" primary follows the meter. A large added grant is not low:
+        assert.equal(ai().classList.contains('is-ok'), true);
+        const packs = [{ sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' }];
+        const toned = (account, state) => { const value = withAccount(account); value.ai.state = state; value.actions.topup = true; value.catalog.packs = packs; return value; };
+        const primaries = () => qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent);
+        summary = toned({ ...worked, totalMicro: M('6000'), remainingMicro: M('5050'), heldMicro: '0', usedMicro: M('950'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('50'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] }, 'low'); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '5,050 credits left of 6,000');
+        assert.equal(ai().classList.contains('is-ok'), true);
+        assert.doesNotMatch(ai().textContent, /Running low/);
+        assert.deepEqual(primaries(), []);
+        // ...and a nearly spent total is low while the plan bucket is not (500 of 10,000 left).
+        summary = toned({ ...worked, totalMicro: M('10000'), remainingMicro: M('500'), heldMicro: '0', usedMicro: M('9500'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('500'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('9000'), remainingMicro: '0', expiresAt: '2027-06-01T00:00:00Z' }] }, 'ok'); await refresh();
+        assert.equal(ai().classList.contains('is-warn'), true);
+        contains('[data-role="meter-ai"]', '! Running low');
+        assert.deepEqual(primaries(), ['Add AI credits']);
+        // Billing's own reset: the pane re-activated for another signed-in user (B) drops A's kept balance, even a block
+        // that does not name its user. The same user keeps it (positive control).
+        const userA = payload.user;
+        try {
+            await open();
+            summary = withAccount({ ...worked, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            summary = withAccount({ ...unreadable, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            contains('[data-role="meter-ai"]', "Couldn't refresh · as of");
+            payload.user = { id: 'user-b', name: 'User B' }; await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+            contains('[data-role="meter-ai"]', "We couldn't read your credits.");
+            summary = withAccount({ ...unreadable, userId: 'user-b' }); await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+        } finally { payload.user = userA; }
+        // The shared guard on its own (Usage's lifecycle reaches it; here Billing's reset always runs first): a kept block
+        // named for another user is never used, and the same user's is.
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'user-b' }), null);
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'test-user' })?.left, '1,246');
+        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload, the total\'s own warning, user switch');
+    }
     // Hotfix r5 (ACCEPT #3): the smaller-configuration advice only when the plan allows a size with a
     // smaller time weight than the current one. Standard (2 vCPU only) and Premium on 2 vCPU have none.
     // Review: a computer still on a size its plan no longer offers (Standard on 4 vCPU after a downgrade)
@@ -980,6 +1067,28 @@ try {
         Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
         contains('[data-role="meter-ai"]', '640 of 1,000 left');
         assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/i);
+        // The same grace with identity credits (`ai.account`, which this server always sends): the last period's grant
+        // in its tail is the total, and this period's still waits for the payment. No live grant: no "of 0", no bar.
+        {
+            const M = credits => (BigInt(credits) * 1000000n).toString();
+            const tail = { userId: 'test-user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M(1000), remainingMicro: M(640), heldMicro: '0', usedMicro: M(360),
+                planBaselineMicro: M(1000), labelled: true, grants: [{ kind: 'previous', creditsMicro: M(1000), remainingMicro: M(640), expiresAt: '2026-11-04T00:00:00Z' }] };
+            const none = { ...tail, totalMicro: '0', remainingMicro: '0', usedMicro: '0', grants: [] };
+            const meterAi = () => q('[data-role="meter-ai"]');
+            Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: null, account: tail }); await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '640 credits left of 1,000');
+            contains('[data-role="meter-ai"]', '1,000 credits for this period. Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            summary.ai.account = none; await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '0 credits left');
+            has('[data-role="meter-ai"] [role="meter"]', false);
+            contains('[data-role="meter-ai"]', 'Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            // Positive control: with no payment issue the renewal is a date again.
+            summary.plan.paymentIssue = null; summary.ai.account = tail; await refresh();
+            contains('[data-role="meter-ai"]', '1,000 more from');
+            assert.doesNotMatch(meterAi().textContent, /added once your payment/i);
+        }
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
         Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');

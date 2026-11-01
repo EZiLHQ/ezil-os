@@ -31,8 +31,14 @@ export function parseAiBalanceMicro(body: unknown): string | null {
     return Number(decimal) === credits ? BigInt(decimal.replace('.', '')).toString() : null;
 }
 
-/** One Gateway grant from `/v1/me/balance` `grants[]` (it carries no entitlement id; see `aiCreditBuckets`). */
-export interface AiGatewayGrant { creditsMicro: string; remainingMicro: string; expiresAt: string; live: boolean }
+/**
+ * One Gateway grant from `/v1/me/balance` `grants[]` (it carries no entitlement id; see `aiCreditBuckets`).
+ * `source` 'admin' = an operator grant (never an OS receipt). `revokedAt` 'unknown' = revoked at an unreadable time.
+ */
+export interface AiGatewayGrant {
+    creditsMicro: string; remainingMicro: string; expiresAt: string; live: boolean;
+    source?: 'admin' | 'entitlement' | null; revokedAt?: string | 'unknown' | null;
+}
 
 /** The whole list or null: a partly readable list must not split the balance into wrong buckets. */
 export function parseAiGrants(body: unknown): AiGatewayGrant[] | null {
@@ -44,9 +50,39 @@ export function parseAiGrants(body: unknown): AiGatewayGrant[] | null {
         const creditsMicro = microString(g?.credits_micro), remainingMicro = microString(g?.remaining_micro);
         const expiresAt = isoTimestamp(g?.expires_at);
         if (!g || creditsMicro === null || remainingMicro === null || expiresAt === null || typeof g.live !== 'boolean') return null;
-        grants.push({ creditsMicro, remainingMicro, expiresAt, live: g.live && g.revoked_at == null });
+        grants.push({ creditsMicro, remainingMicro, expiresAt, live: g.live && g.revoked_at == null,
+            source: g.source === 'admin' || g.source === 'entitlement' ? g.source : null,
+            revokedAt: g.revoked_at == null ? null : isoTimestamp(g.revoked_at) ?? 'unknown' });
     }
     return grants;
+}
+
+/** An open (reserved or pending) request on the member's usage page: when it reserved, and its hold. */
+export interface AiOpenHold { at: string; heldMicro: string }
+
+/**
+ * Evidence for `usedMicro` (summary.ts): the open requests on the usage page, or null when the page is
+ * unreadable, an open row's hold is unreadable, or one was platform-absorbed (0021 releases its hold on
+ * the ledger but `balance()` still counts it in `held_micro`).
+ */
+export function parseAiOpenHolds(body: unknown): AiOpenHold[] | null {
+    const data = record(body);
+    if (data?.object !== 'list' || !Array.isArray(data.data)) return null;
+    const open: AiOpenHold[] = [];
+    for (const value of data.data) {
+        const row = record(value);
+        if (row?.status !== 'reserved' && row?.status !== 'pending') continue;
+        const at = isoTimestamp(row.created_at), heldMicro = microString(row.hold_micro);
+        if (at === null || heldMicro === null || (row.billing_resolution !== undefined && row.billing_resolution !== 'user')) return null;
+        open.push({ at, heldMicro });
+    }
+    return open;
+}
+
+/** The Gateway's own balance state (`myBalance`), or null when absent or unknown. */
+export function parseAiGatewayState(body: unknown): 'ok' | 'exhausted' | 'paused_operations' | 'paused_reconciliation' | null {
+    const state = record(body)?.state;
+    return state === 'ok' || state === 'exhausted' || state === 'paused_operations' || state === 'paused_reconciliation' ? state : null;
 }
 
 export function parseAiBalance(body: unknown): number | null {
@@ -84,14 +120,22 @@ function spendingState(balance: unknown, models: unknown, limits: AiLimits | nul
         ? 'available' : 'unavailable';
 }
 
-/** `gatewayGrants` is server-side input for the bucket split; callers strip it before the wire. */
-export async function readAiAccount(input: AiReadInput): Promise<AiAccountView & { gatewayGrants: AiGatewayGrant[] | null }> {
+/** Server-side input for the bucket split and `ai.account`; callers strip these before the wire. */
+export interface AiAccountEvidence {
+    gatewayGrants: AiGatewayGrant[] | null;
+    openHolds: AiOpenHold[] | null;
+    gatewayState: ReturnType<typeof parseAiGatewayState>;
+}
+export async function readAiAccount(input: AiReadInput): Promise<AiAccountView & AiAccountEvidence> {
     const read = createAiReader(input);
+    // The same usage page feeds `recentUsage` and the open-hold evidence (one read).
+    let usageBody: unknown = null;
     const [balanceBody, usage, limitsResult, models] = await Promise.all([
-        read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, read), readAiLimits(input, read), read('/v1/models'),
+        read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, async path => usageBody = await read(path)), readAiLimits(input, read), read('/v1/models'),
     ]);
     const balanceMicro = parseAiBalanceMicro(balanceBody);
     return { gatewayGrants: balanceMicro === null ? null : parseAiGrants(balanceBody),
+        openHolds: usage.state === 'available' ? parseAiOpenHolds(usageBody) : null, gatewayState: parseAiGatewayState(balanceBody),
         balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro), balance: creditNumber(balanceMicro),
         balanceState: aiMicroBalanceState(balanceMicro, 0), spendingState: spendingState(balanceBody, models, limitsResult.limits),
         recentUsage: usage.recentUsage, limits: limitsResult.limits, usageState: usage.state, limitsState: limitsResult.state };

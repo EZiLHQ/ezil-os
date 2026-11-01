@@ -77,6 +77,96 @@ export function creditsLabel (micro, balance = null) {
         ? Math.floor(balance).toLocaleString('en-US') : 'Not reported';
 }
 
+// ── Identity credits (`summary.ai.account`, exact microcredit strings) ─────────
+
+const MICRO = 1000000n;
+
+/** A canonical microcredit string as a BigInt, or null. Numbers are refused: they can't carry every microcredit. */
+export function microOf (value) {
+    return typeof value === 'string' && /^\d{1,100}$/.test(value) ? BigInt(value) : null;
+}
+
+/**
+ * Exact credits floored to `digits` decimals (never rounded up), trailing zeros trimmed:
+ * 1,246.75 · 0.5 · 1,000. `digits` 6 keeps every microcredit (the same text as the
+ * ezil-models extension's `credits()`). null for anything but a microcredit string.
+ */
+export function creditsDecimal (micro, digits = 2) {
+    const n = typeof micro === 'bigint' ? micro : microOf(micro);
+    if ( n === null || n < 0n || ! Number.isInteger(digits) || digits < 0 || digits > 6 ) return null;
+    const fraction = digits === 0 ? '' : String(n % MICRO / 10n ** BigInt(6 - digits)).padStart(digits, '0').replace(/0+$/, '');
+    return (n / MICRO).toLocaleString('en-US') + (fraction ? `.${fraction}` : '');
+}
+
+/** "14:02": the local clock time of an ISO instant (the "as of" of a kept balance). */
+export function clockLabel (iso) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? new Date(time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : null;
+}
+
+const KIND_ORDER = ['plan', 'starter', 'previous', 'purchased', 'added'];
+
+/**
+ * Identity credits for Usage and Billing, from `summary.ai.account` only. The headline is whole
+ * credits (floor, OS-INTEGRATION-CONTRACT §7): "1,246 credits left of 1,500"; the details are
+ * exact to 2 decimals (floored) with every microcredit in `full`. The denominator is the total of
+ * the account's live grants, never the catalog, and only when above 0. `low`: at most 10% of that
+ * total is left. null = no readable balance: say so, show no figure.
+ * `previous` (the last good block for the same user) stands in when this one is unreadable, with
+ * `stale` and its own `asOf`. A block for another user than `userId` is never used.
+ */
+export function accountCredits (account, { previous = null, userId = null, planSku = null } = {}) {
+    const usable = value => value && typeof value === 'object' && microOf(value.remainingMicro) !== null
+        && (typeof value.userId !== 'string' || typeof userId !== 'string' || value.userId === userId) ? value : null;
+    const current = usable(account), shown = current ?? usable(previous);
+    if ( ! shown ) return null;
+    const remaining = microOf(shown.remainingMicro), total = microOf(shown.totalMicro);
+    const held = microOf(shown.heldMicro), used = microOf(shown.usedMicro);
+    const part = (label, micro) => ({ label, text: creditsDecimal(micro), full: creditsDecimal(micro, 6) });
+    const kinds = new Map();
+    const grants = shown.labelled === true && Array.isArray(shown.grants) ? shown.grants : [];
+    for ( const grant of grants ) {
+        const credits = microOf(grant?.creditsMicro);
+        if ( credits !== null && KIND_ORDER.includes(grant.kind) ) kinds.set(grant.kind, (kinds.get(grant.kind) ?? 0n) + credits);
+    }
+    const label = { plan: 'Plan', starter: 'Starter', previous: planSku === 'free_v3' ? 'Previous plan' : 'Earlier period', purchased: 'Purchased', added: 'Added' };
+    const details = [
+        ...KIND_ORDER.filter(kind => kinds.has(kind)).map(kind => part(label[kind], kinds.get(kind))),
+        ...used !== null ? [part('Used', used)] : [],
+        ...held !== null && held > 0n ? [part('Reserved', held)] : [],
+        part('Remaining', remaining),
+    ];
+    // Credits that expire on their own date (not the plan's): the earliest expiry per kind.
+    const expiring = ['previous', 'purchased', 'added'].map(kind => {
+        const live = grants.filter(grant => grant?.kind === kind && (microOf(grant.remainingMicro) ?? 0n) > 0n && Number.isFinite(Date.parse(grant.expiresAt ?? '')));
+        return live.length ? { kind, remaining: creditsLabel(String(live.reduce((sum, grant) => sum + microOf(grant.remainingMicro), 0n))),
+            expiresAt: live.map(grant => grant.expiresAt).sort((a, b) => Date.parse(a) - Date.parse(b))[0] } : null;
+    }).filter(Boolean);
+    // No live grant (every one expired, or the period's not delivered yet): no "of 0", no bar.
+    const known = total !== null && total > 0n ? total : null;
+    return {
+        left: creditsLabel(shown.remainingMicro),
+        total: known !== null ? creditsLabel(shown.totalMicro) : null,
+        percent: known !== null ? Number((remaining > known ? known : remaining) * 100n / known) : null,
+        empty: remaining === 0n,
+        // Warn from this total's own share left (the server's 10% rule), never `ai.state`, which judges one bucket.
+        low: known !== null && remaining * 10n <= known,
+        details, expiring,
+        stale: current === null, asOf: shown.asOf ?? null,
+    };
+}
+
+/** "Couldn't refresh · as of 14:02" for a kept balance (the time is the kept block's own). */
+export function staleCreditsCopy (asOf) {
+    const clock = clockLabel(asOf);
+    return `Couldn't refresh${clock ? ` · as of ${clock}` : ''}`;
+}
+
+/** "Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75" as HTML, each value titled with every microcredit. */
+export function accountDetailsHtml (details, encode) {
+    return details.map(({ label, text, full }) => `${encode(label)} <span title="${encode(`${full} credits`)}">${encode(text)}</span>`).join(' · ');
+}
+
 // ── Round 3 (plan §6.3/§6.4, contract v3 D1/D3/D4) ───────────────────────────
 
 /** The AWS data volume every paid configuration gets today (one 50 GiB EBS volume, round 3 D4). */

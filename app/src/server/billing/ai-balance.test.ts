@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, parseAiGrants, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
+import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, parseAiGatewayState, parseAiGrants, parseAiOpenHolds, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
 import type { OutboxInsert } from './ports';
 
 const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'current-user', headers: new Headers(),
@@ -11,11 +11,29 @@ describe('AI balance', () => {
         const row = { id: 'g', source: 'entitlement', credits_micro: '200000000', remaining_micro: 90_000_000,
             expires_at: '2026-11-04T00:00:00+00:00', revoked_at: null, live: true };
         expect(parseAiGrants({ grants: [row, { ...row, revoked_at: '2026-10-05T00:00:00Z' }] })).toEqual([
-            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: true },
-            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: false }]);
+            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: true, source: 'entitlement', revokedAt: null },
+            { creditsMicro: '200000000', remainingMicro: '90000000', expiresAt: '2026-11-04T00:00:00.000Z', live: false, source: 'entitlement',
+                revokedAt: '2026-10-05T00:00:00.000Z' }]);
+        // Identity credits: the source tells an operator grant from a receipt; an unreadable revocation time stays unknown.
+        expect(parseAiGrants({ grants: [{ ...row, source: 'admin' }, { ...row, source: 'other', revoked_at: 'yesterday' }] })).toMatchObject([
+            { source: 'admin', revokedAt: null, live: true }, { source: null, revokedAt: 'unknown', live: false }]);
         expect(parseAiGrants({ grants: [] })).toEqual([]);
         for (const body of [{}, { grants: null }, { grants: [{ ...row, live: 'yes' }] }, { grants: [{ ...row, remaining_micro: -1 }] },
             { grants: [row, { ...row, expires_at: 'soon' }] }, null]) expect(parseAiGrants(body)).toBeNull();
+    });
+    it('reads open holds from the usage page; an absorbed or unreadable open row voids the evidence', () => {
+        const open = { created_at: '2026-10-20T23:59:00Z', status: 'reserved', hold_micro: 500_000, billing_resolution: 'user' };
+        const settled = { created_at: '2026-10-20T23:00:00Z', status: 'settled', hold_micro: 9_000_000, cost_micro: 1, uncollected_micro: 0 };
+        expect(parseAiOpenHolds({ object: 'list', data: [open, { ...open, status: 'pending', hold_micro: '7' }, settled] }))
+            .toEqual([{ at: '2026-10-20T23:59:00.000Z', heldMicro: '500000' }, { at: '2026-10-20T23:59:00.000Z', heldMicro: '7' }]);
+        // Before 0021 there is no billing_resolution: every open row is the user's.
+        const { billing_resolution: _ignored, ...older } = open;
+        expect(parseAiOpenHolds({ object: 'list', data: [older] })).toEqual([{ at: '2026-10-20T23:59:00.000Z', heldMicro: '500000' }]);
+        expect(parseAiOpenHolds({ object: 'list', data: [settled] })).toEqual([]);
+        for (const body of [null, {}, { object: 'list', data: [{ ...open, billing_resolution: 'platform_absorbed' }] },
+            { object: 'list', data: [{ ...open, hold_micro: -1 }] }, { object: 'list', data: [{ ...open, created_at: 'soon' }] }]) expect(parseAiOpenHolds(body)).toBeNull();
+        expect(['ok', 'exhausted', 'paused_operations', 'paused_reconciliation', 'other', undefined].map(state => parseAiGatewayState({ state })))
+            .toEqual(['ok', 'exhausted', 'paused_operations', 'paused_reconciliation', null, null]);
     });
     it.each([[null, 500, 'unavailable'], [0, 500, 'exhausted'], [1, 500, 'low'], [50, 500, 'low'], [51, 500, 'ok'],
         [20, 200, 'low'], [21, 200, 'ok'], [100, 1000, 'low'], [101, 1000, 'ok'], [1, 0, 'ok']] as const)

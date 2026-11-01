@@ -57,6 +57,38 @@ describe('billing.summary AI wiring', () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         expect(await f.caller.summary()).toMatchObject({ ai: { balance: 90, state: 'low', pendingFromRenewal: null } });
     });
+    it('identity credits: the worked example end to end (plan 1,000 + operator 500, used 252.75, held 0.5) from /v1/me/balance only', async () => {
+        const expiresAt = '2026-11-04T00:00:00.000Z';
+        const balance = { account_public_id: 'acct', micro_per_credit: 1_000_000, state: 'ok', available_micro: 1_246_750_000, held_micro: 500_000, grants: [
+            { id: 'g1', source: 'entitlement', credits_micro: 1_000_000_000, remaining_micro: 746_750_000, expires_at: expiresAt, revoked_at: null, live: true },
+            { id: 'g2', source: 'admin', credits_micro: 500_000_000, remaining_micro: 500_000_000, expires_at: '2027-06-01T00:00:00Z', revoked_at: null, live: true },
+            { id: 'g0', source: 'admin', credits_micro: 900_000_000, remaining_micro: 0, expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-09-01T00:00:00Z', live: false }] };
+        // Rate and budget limits are huge and must never read as a balance or a total.
+        const limits = { policy: { policy: { daily_budget_micro: 9_000_000_000_000, monthly_budget_micro: 8_000_000_000_000 } }, pauses: [],
+            entitlement: { required: false, basis: 'not_required' }, counters: { day_micro: 7_000_000, month_micro: 7_000_000 } };
+        const usage = { object: 'list', data: [{ created_at: '2026-10-20T23:59:00Z', status: 'reserved', hold_micro: 500_000, cost_micro: null, uncollected_micro: null,
+            billing_resolution: 'user' }, { created_at: '2026-10-20T23:00:00Z', status: 'settled', hold_micro: 9_000_000, cost_micro: 2_000_000, uncollected_micro: 0 }] };
+        vi.stubGlobal('fetch', gateway(balance, { '/v1/me/limits': limits, '/v1/me/usage': usage }));
+        const f = fixture('standard_monthly_v3');
+        f.store.subscriptionsFor.mockResolvedValue([{ sku: 'premium_monthly_v3', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: new Date('2026-10-01Z'), currentPeriodEnd: new Date('2026-11-01Z'), cancelAtPeriodEnd: false }]);
+        f.deps.aiCredits = { claim: vi.fn(), accountFor: vi.fn(), pinAccount: vi.fn(), finish: vi.fn(), receiptsFor: vi.fn().mockResolvedValue([
+            { entitlementId: 'ezil-os:v1:premium_monthly_v3:sub:2026-10-01T00:00:00.000Z', credits: 1000, expiresAt, deliveredAt: '2026-10-01T00:05:00.000Z' }]) };
+        const summary = await f.caller.summary() as unknown as { ai: Record<string, unknown> & { account: Record<string, unknown> } };
+        expect(summary.ai.account).toEqual({ userId: 'current-user', state: 'ok', asOf: '2026-10-21T00:00:00Z', totalMicro: '1500000000',
+            remainingMicro: '1246750000', heldMicro: '500000', usedMicro: '252750000', planBaselineMicro: '1000000000', labelled: true, grants: [
+                { kind: 'plan', creditsMicro: '1000000000', remainingMicro: '746750000', expiresAt },
+                { kind: 'added', creditsMicro: '500000000', remainingMicro: '500000000', expiresAt: '2027-06-01T00:00:00.000Z' }] });
+        expect(JSON.stringify(summary.ai.account)).not.toMatch(/9000000000000|8000000000000|7000000/);
+        // Server-side evidence never reaches the wire.
+        for (const key of ['gatewayGrants', 'openHolds', 'gatewayState']) expect(summary).not.toHaveProperty(`ai.${key}`);
+        // Positive control: the limits themselves are still reported, as limits.
+        expect(summary.ai.limits).toMatchObject({ policy: { dailyBudgetMicro: '9000000000000', monthlyBudgetMicro: '8000000000000' } });
+        // Gateway down: the key stays, with no figures (the shell shows "unavailable", never the catalog 1,000).
+        vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => new Response('down', { status: 503 })));
+        const down = await f.caller.summary() as unknown as { ai: { account: Record<string, unknown> } };
+        expect(down.ai.account).toMatchObject({ userId: 'current-user', state: 'unavailable', totalMicro: null, remainingMicro: null, usedMicro: null, grants: [] });
+    });
     it('performs billing reads while balance is stalled and returns unavailable by the timeout', async () => {
         vi.useFakeTimers(); vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(() => new Promise(() => {})));
         const f = fixture(); const pending = f.caller.summary();
