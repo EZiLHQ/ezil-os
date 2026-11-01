@@ -131,6 +131,28 @@ every launch and moves history already in a profile's `workspaceStorage/*/chatSe
 never overwriting. The patches below make the store use that folder and the list follow the files,
 so the one copy rides on checkpoints, restore and moves.
 
+Keeping it out of user Git: the running editor recreates `.ezil/chat` on its next write if
+`.ezil` is removed (`FileService.writeFile` creates missing parents), for example by
+`git clean -x`/`-X` or a workspace replaced under it, and that write would not recreate the
+ignore file. So `ezil_editor_ignore_state` runs before every launch and at every capture (every
+30 s and before each checkpoint): it restores `.ezil/.gitignore` and, when the workspace root has
+a `.git` directory with an `info/exclude` file, adds `/.ezil/` there once. That local file is never
+committed and `git clean` leaves it, so a repository at the root ignores a recreated `.ezil` even
+before the next capture. It never replaces a user's `.gitignore`, follows a link or creates
+`.git/info`. Residual: where the exclude is not written (`.git` is a file or a link, or has no
+`info/exclude`), a chat saved in the up to 30 s between the removal and the next capture is
+untracked but not ignored. Because `.ezil` is ignored, `git clean -x`/`-X` deletes all chat history
+and saved editor settings, as it deletes any ignored file.
+
+Not listed, not deleted: the store's index keeps the 400 most recent conversations (`zSn`), and
+`trimEntries` drops older entries without deleting their files; `history-index` does not re-add
+files older than the oldest entry of a full index. So past 400 conversations the older files stay
+in `.ezil/chat`, unlisted and not deletable from the editor, as upstream leaves them in the profile.
+Copies `editor-state.sh` sets aside in `.ezil/chat-conflicts/<stamp>/` (a profile file whose name
+already exists with other bytes) are not listed either. Both ride every checkpoint and count
+toward its size; they can be removed from a terminal. Deleting trimmed files automatically was
+rejected: it would remove conversations the user never deleted.
+
 | id | file / anchor | replacement / gate |
 |---|---|---|
 | `history-root` | workbench.js, end of the `ChatSessionStore` constructor: `this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){` | For a window with exactly one folder and no workspace file, queue as the store's first task: `stat(<folder>/.ezil/chat)`; a directory becomes `storageRoot`. Every read of `storageRoot` (`getStorageLocation`, reconcile, migration) runs in a later queued task; the only synchronous accessor, `getChatStorageFolder()`, has no caller. Not-found keeps the upstream location (any other folder); another error retries 5 times (1 s … 5 s), then keeps upstream and logs an error. Anchor 0, replacement 1. |

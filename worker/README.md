@@ -39,11 +39,21 @@ EZiL Chat history is one set of files in the workspace, `<workspace>/.ezil/chat/
 Before each launch `ezil_editor_prepare_chat` creates that folder and moves in any history
 already in the editor profile (never overwriting); the `history-root` patch makes the editor
 write there instead of the profile, whose folder name depends on the browser address. So
-checkpoints, restore, plan moves and Cloudflare restarts carry it with the project files. `.ezil/.gitignore` (`*`) keeps it out of user Git.
+checkpoints, restore, plan moves and Cloudflare restarts carry it with the project files.
+Two rules keep `.ezil` out of user Git, both rewritten before each launch and at every capture
+(30 s, and before each checkpoint): `.ezil/.gitignore` (`*`), and `/.ezil/` in the local
+`.git/info/exclude` of a repository at the workspace root. Because `.ezil` is ignored,
+`git clean -x`/`-X` deletes all chat history and saved editor settings, as it deletes any
+ignored file. Where the exclude is not written (`.git` is a file or a link, or has no
+`info/exclude`), a chat saved in the up to 30 s before the next capture can be untracked but
+not ignored.
 The `history-index` patch rebuilds the editor's browser-side list from those files in a new
 browser; the chat title ("Chat history" on an empty chat) opens the list. Deleting a chat there
 deletes its file; export is a copy of `.ezil/chat`. Earlier checkpoints keep their own copy until
-they are replaced or expire. Copilot's separate local session index is off
+they are replaced or expire. The list holds the 400 most recent conversations: older files stay in
+`.ezil/chat`, unlisted, and so do copies set aside in `.ezil/chat-conflicts`; the editor cannot
+delete either, they ride every checkpoint and count toward its size. Remove them from a terminal.
+Copilot's separate local session index is off
 (`github.copilot.chat.localIndex.enabled: false`) and its old database is removed. Details and
 residuals: [PATCHES.md, Part 3](copilot-chat/PATCHES.md#part-3--ezil-chat-history).
 
