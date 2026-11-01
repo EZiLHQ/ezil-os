@@ -28,12 +28,29 @@
  * inside the computer (lock wait, git, the exec itself) is derived from it, so
  * the Worker never keeps cloning after the caller has given up.
  *
- * 🔴 THE TOKEN, sent the way the server behind the URL expects it:
+ * 🔴 THE TOKEN never meets the person's repository. The person (and anything
+ * running on their computer, as root) can write the clone's `.git/config`:
+ * a second `remote.origin.url`, an `include.path` naming a
+ * `url.<x>.insteadOf`, an `http.<url>.proxy`. A git command that carries the
+ * token and reads that config can be sent anywhere, so none does:
+ *   1. the ONE network command fetches into a fresh bare repository under the
+ *      script's private `/tmp` directory (`git init --bare --template=`: no
+ *      hooks, no config but git's own), from the canonical URL given
+ *      explicitly (never a remote name), with system and global config off,
+ *      `HOME` an empty private directory, no prompt and no askpass, every
+ *      inherited credential helper and extra header cleared, redirects not
+ *      followed, https the only protocol, and the credential scoped to that
+ *      remote (`http.<canonicalURL>.extraHeader`, as EZiL Works' runner sends
+ *      it, or `credential.https://<host>.helper`);
+ *   2. the person's folder is then updated (or created) from that private
+ *      repository by a LOCAL fetch or clone whose environment holds no token,
+ *      and the private repository is deleted.
+ * The token is sent the way the server behind the URL expects it:
  *   - Cloudflare Artifacts: `Authorization: Bearer <token>`, exactly what EZiL
  *     Git's own gateway sends upstream (EZiL CLI `apps/git-gateway`). The
  *     computer's git (2.34) cannot take a Bearer token from a credential
- *     helper, so it is an `http.extraHeader` given to the one network git
- *     command through `GIT_CONFIG_VALUE_<n>` in that command's environment;
+ *     helper, so it is an extra header given to the network command through
+ *     `GIT_CONFIG_VALUE_<n>` in that command's environment;
  *   - github.ezil.work (the gateway): HTTP Basic `ezil:<token>`, from a
  *     one-shot credential helper that reads it from the git process's env.
  * Either way:
@@ -44,21 +61,17 @@
  *     hands it back only to the network `git` itself, as an environment prefix
  *     (`NAME=… git …`), never as an argument;
  *   - git is configured through `GIT_CONFIG_COUNT` (command scope, not written
- *     anywhere), after an empty `credential.helper` and an empty
- *     `http.extraHeader` that drop whatever the computer's own config names (a
- *     `store` helper would write the token to a file); system and global
- *     config are not read, redirects are not followed, and an existing clone
- *     with any repository-local `url.*` or `http.*` setting is refused.
- * So it never appears in argv, a URL, `.git/config`, the response, or the
+ *     anywhere), so a `store` helper or a header can never be written to a file.
+ * So it never appears in argv, a URL, any `.git/config`, the response, or the
  * Worker's logs. The clone's `remote.origin.url` is the canonical URL, with no
  * userinfo. `repo-open.git.test.ts` proves each of these against real git, in
- * both schemes.
+ * both schemes, including a clone whose config tries to redirect the fetch.
  *
  * An existing folder with the same origin is fetched only: the working tree,
  * the index and HEAD are not touched, so uncommitted work stays. Any other
- * existing folder is refused, never replaced. A clone lands in a private
- * directory under `/tmp` and is moved into place whole, so a failed clone never
- * leaves a half-folder that a later open would mistake for a repository.
+ * existing folder is refused, never replaced. A clone lands in the private
+ * directory and is moved into place whole, so a failed clone never leaves a
+ * half-folder that a later open would mistake for a repository.
  *
  * Nothing git prints leaves the container: the script classifies git's stderr
  * into one of the codes below and prints a single result line.
@@ -233,6 +246,8 @@ export function parseRepoOpenRequest(
  * The script's bounds for an open that must be over within `timeoutMs`: the
  * lock wait and the git limit (seconds), leaving 5 s for git's kill grace and
  * 5 s for everything else (rev-parse, the move, the exec's own round trip).
+ * The git limit is one deadline shared by every bounded git command (the
+ * network fetch, then the local fetch or clone), not a limit per command.
  */
 export function repoOpenBounds(timeoutMs: number): { lockWaitS: number; gitTimeoutS: number } {
   const total = Math.floor(Math.min(Math.max(timeoutMs, REPO_OPEN_MIN_TIMEOUT_MS), REPO_OPEN_EXEC_TIMEOUT_MS) / 1000) - 10;
@@ -288,34 +303,57 @@ unset EZIL_REPO_OPEN_TOKEN
 case "$auth" in bearer|basic) ;; *) fail repo_open_invalid_request ;; esac
 case "$lockwait" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
 case "$limit" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
+case "$url" in https://?*/*) ;; *) fail repo_open_invalid_request ;; esac
 command -v git >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 || fail repo_open_git_missing
-# The only git configuration in force is this: no system or global config, no
-# inherited command-line config, no hooks, https only, verified TLS, no
-# redirects, and a credential list and an extra-header list both emptied. The
-# last slot carries the credential, and only on the network command (net).
+# Every git below reads no system or global config and no inherited
+# command-line config, runs no hook, no fsmonitor and no askpass, prompts for
+# nothing, uses no credential helper or extra header from anywhere, and speaks
+# only the local "file" protocol: to the private repository, by path. Values in
+# GIT_CONFIG_COUNT outrank a repository's own .git/config. net() alone adds
+# https and the credential.
 unset $(git rev-parse --local-env-vars 2>/dev/null) GIT_CONFIG_PARAMETERS GIT_ASKPASS SSH_ASKPASS \
-  GIT_SSL_NO_VERIFY GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_REDACT GIT_EXEC_PATH GIT_TEMPLATE_DIR
-export GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=https GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-export GIT_CONFIG_COUNT=7
+  GIT_SSL_NO_VERIFY GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_REDACT GIT_EXEC_PATH GIT_TEMPLATE_DIR XDG_CONFIG_HOME
+export GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_COUNT=6
 export GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
 export GIT_CONFIG_KEY_1=http.extraHeader GIT_CONFIG_VALUE_1=
 export GIT_CONFIG_KEY_2=core.hooksPath GIT_CONFIG_VALUE_2=/dev/null
 export GIT_CONFIG_KEY_3=core.fsmonitor GIT_CONFIG_VALUE_3=false
-export GIT_CONFIG_KEY_4=http.sslVerify GIT_CONFIG_VALUE_4=true
-export GIT_CONFIG_KEY_5=http.followRedirects GIT_CONFIG_VALUE_5=false
-if [ "$auth" = basic ]; then
-  export GIT_CONFIG_KEY_6=credential.helper
-  export GIT_CONFIG_VALUE_6='!f() { test "$1" = get || return 0; printf "username=${REPO_OPEN_GIT_USERNAME}\npassword=%s\n" "$EZIL_REPO_OPEN_TOKEN"; }; f'
-else
-  # Empty until net() fills it for one command: an empty value only clears the list again.
-  export GIT_CONFIG_KEY_6=http.extraHeader GIT_CONFIG_VALUE_6=
-fi
+export GIT_CONFIG_KEY_4=core.askPass GIT_CONFIG_VALUE_4=
+export GIT_CONFIG_KEY_5=protocol.allow GIT_CONFIG_VALUE_5=never
+# One deadline for every bounded git command (set once the lock is held).
+bounded() {
+  s=$((deadline - $(date +%s)))
+  [ "$s" -ge 1 ] || return 124
+  timeout -k 5 "$s" "$@"
+}
+# 🔴 The ONLY command that carries the credential: one fetch of every branch
+# and tag of the canonical URL, named explicitly, into the private bare
+# repository ($mirror), run from the private directory with HOME an empty
+# private directory. It never reads the person's repository or its config,
+# so nothing there can send it elsewhere. The credential is scoped to that
+# URL (Bearer) or its host (Basic) and goes only into this command's
+# environment.
 net() {
-  if [ "$auth" = bearer ]; then
-    GIT_CONFIG_VALUE_6="Authorization: Bearer $tok" timeout -k 5 "$limit" git "$@"
-  else
-    EZIL_REPO_OPEN_TOKEN=$tok timeout -k 5 "$limit" git "$@"
-  fi
+  (
+    cd "$work" || exit 1
+    export HOME="$work/home" GIT_ALLOW_PROTOCOL=https GIT_CONFIG_COUNT=10 \
+      GIT_CONFIG_KEY_6=protocol.https.allow GIT_CONFIG_VALUE_6=always \
+      GIT_CONFIG_KEY_7=http.followRedirects GIT_CONFIG_VALUE_7=false \
+      GIT_CONFIG_KEY_8=http.sslVerify GIT_CONFIG_VALUE_8=true
+    s=$((deadline - $(date +%s)))
+    [ "$s" -ge 1 ] || exit 124
+    set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head -- \
+      "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+    if [ "$auth" = bearer ]; then
+      export GIT_CONFIG_KEY_9="http.$url.extraHeader"
+      GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"
+    else
+      export GIT_CONFIG_KEY_9="credential.https://$host.helper"
+      export GIT_CONFIG_VALUE_9='!f() { test "$1" = get || return 0; printf "username=${REPO_OPEN_GIT_USERNAME}\npassword=%s\n" "$EZIL_REPO_OPEN_TOKEN"; }; f'
+      EZIL_REPO_OPEN_TOKEN=$tok timeout -k 5 "$s" "$@"
+    fi
+  )
 }
 classify() {
   case "$1" in 124|137) echo repo_open_timeout; return ;; esac
@@ -340,26 +378,36 @@ if [ -L "$parent" ] || { [ -e "$parent" ] && [ ! -d "$parent" ]; }; then fail re
 mkdir -p "$parent" 2>/dev/null || fail repo_open_workspace_unavailable
 work=$(mktemp -d /tmp/ezil-repo-open.XXXXXX) || fail repo_open_git_failed
 trap 'rm -rf "$work"' EXIT
+mirror=$work/mirror
+host=$(printf '%s' "$url" | cut -d/ -f3)
 exec 9>"/tmp/ezil-repo-open-$id.lock" || fail repo_open_busy
 flock -w "$lockwait" 9 || fail repo_open_busy
+deadline=$(($(date +%s) + limit))
 [ -L "$folder" ] && fail repo_open_folder_conflict
 if [ -d "$folder" ] && [ -z "$(ls -A "$folder" 2>/dev/null)" ]; then rmdir "$folder" 2>/dev/null || fail repo_open_folder_conflict; fi
 if [ -e "$folder" ]; then
-  # Ours from an earlier open, or nothing we will touch. Fetch only: the
-  # working tree, the index and HEAD stay as the person left them.
+  # Ours from an earlier open, or nothing we will touch. These checks are
+  # about identity, not the credential: no command with the credential ever
+  # reads this repository.
   { [ -d "$folder/.git" ] && [ ! -L "$folder/.git" ]; } || fail repo_open_folder_conflict
   [ "$(git -C "$folder" rev-parse --git-dir 2>/dev/null)" = .git ] || fail repo_open_folder_conflict
   [ "$(git -C "$folder" config --local --get remote.origin.url 2>/dev/null)" = "$url" ] || fail repo_open_folder_conflict
-  # A repository-local url.*.insteadOf could send the credential elsewhere, and
-  # an http.* setting (a proxy, a CA, a per-URL header) could expose it on the way.
-  if git -C "$folder" config --local --name-only --get-regexp '^(url|http)\.' >/dev/null 2>&1; then fail repo_open_folder_conflict; fi
-  net -C "$folder" fetch --quiet --no-recurse-submodules origin 2>"$work/err" \
+fi
+{ mkdir "$work/home" && git init --quiet --bare --template= "$mirror" && git --git-dir="$mirror" symbolic-ref HEAD "refs/heads/$branch"; } \
+  >/dev/null 2>&1 || fail repo_open_git_failed
+net 2>"$work/err" || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
+if [ -e "$folder" ]; then
+  # Fetch only, from the private repository and with no credential in the
+  # environment: the working tree, the index and HEAD stay as the person left them.
+  bounded git -C "$folder" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
   head=$(git -C "$folder" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
   emit "ok:fetched:$head"
 fi
-net clone --quiet --branch "$branch" --origin origin -- "$url" "$work/clone" 2>"$work/err" \
+git --git-dir="$mirror" rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null || fail repo_open_ref_not_found
+bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone" 2>"$work/err" \
   || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
+git -C "$work/clone" remote set-url origin "$url" 2>/dev/null || fail repo_open_git_failed
 head=$(git -C "$work/clone" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
 mv -T "$work/clone" "$folder" 2>/dev/null || fail repo_open_git_failed
 emit "ok:cloned:$head"

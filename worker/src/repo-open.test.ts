@@ -17,6 +17,7 @@ import {
   runRepoOpen,
   ownSessionExec,
   REPO_OPEN_ERRORS,
+  REPO_OPEN_SCRIPT,
   REPO_OPEN_EXEC_TIMEOUT_MS,
   REPO_OPEN_MIN_TIMEOUT_MS,
   REPO_OPEN_TOKEN_ENV,
@@ -179,21 +180,42 @@ describe('repoOpenCommand', () => {
   it('configures git only through the environment, resetting inherited helpers and headers first, never following redirects', () => {
     expect(cmd).toContain('GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=');
     expect(cmd).toContain('GIT_CONFIG_KEY_1=http.extraHeader GIT_CONFIG_VALUE_1=');
-    expect(cmd).toContain('GIT_CONFIG_KEY_5=http.followRedirects GIT_CONFIG_VALUE_5=false');
+    expect(cmd).toContain('GIT_CONFIG_KEY_4=core.askPass GIT_CONFIG_VALUE_4=');
+    expect(cmd).toContain('GIT_CONFIG_KEY_5=protocol.allow GIT_CONFIG_VALUE_5=never');
+    expect(cmd).toContain('GIT_CONFIG_KEY_7=http.followRedirects GIT_CONFIG_VALUE_7=false');
     expect(cmd).toContain('GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null');
-    expect(cmd).toContain('GIT_ALLOW_PROTOCOL=https');
     expect(cmd).toContain('core.hooksPath');
-    // Bearer is a command-scope header on the network git only, never exported.
-    expect(cmd).toContain('GIT_CONFIG_VALUE_6="Authorization: Bearer $tok" timeout');
+    // Local commands speak only "file" (the private repository, by path); the network fetch only https.
+    expect(cmd).toContain('GIT_ALLOW_PROTOCOL=file');
+    expect(cmd).toContain('GIT_ALLOW_PROTOCOL=https GIT_CONFIG_COUNT=10');
+    expect(cmd).toContain('GIT_CONFIG_KEY_6=protocol.https.allow GIT_CONFIG_VALUE_6=always');
+    // Bearer is a command-scope header on the network git only, never exported, scoped to the remote's URL.
+    expect(cmd).toContain('export GIT_CONFIG_KEY_9="http.$url.extraHeader"');
+    expect(cmd).toContain('GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout');
     expect(cmd).not.toMatch(/export[^\n]*Bearer/);
+    expect(cmd).toContain('export GIT_CONFIG_KEY_9="credential.https://$host.helper"');
     // `git clone -c` would write the value into the new repository's .git/config.
     expect(cmd).not.toMatch(/git clone[^\n]* -c /);
     expect(cmd).not.toMatch(/git -c /);
   });
 
-  it('refuses an existing clone with any repository-local url.* or http.* setting', () => {
-    expect(cmd).toContain('--get-regexp ');
-    expect(cmd).toContain(String.raw`^(url|http)\.`);
+  it('🔴 the credential goes only to a fetch of the canonical URL into the private repository; the folder is fetched from that, by path', () => {
+    // A fresh bare repository with no template (so no hooks), in the private directory, HOME an empty private directory.
+    expect(cmd).toContain('git init --quiet --bare --template= "$mirror"');
+    expect(cmd).toContain('export HOME="$work/home"');
+    expect(cmd).toContain('set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head -- \\\n      "$url" ');
+    // Besides the presence check, the only lines that use the token are the network fetch's, inside net().
+    const tokenLines = REPO_OPEN_SCRIPT.split('\n').filter((l) => l.includes('$tok'));
+    expect(tokenLines).toEqual([
+      '[ -n "$tok" ] || fail repo_open_invalid_request',
+      '      GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"',
+      '      EZIL_REPO_OPEN_TOKEN=$tok timeout -k 5 "$s" "$@"',
+    ]);
+    // Nothing fetches `origin` (whatever the folder's config says it is), and nothing with the credential runs in the folder.
+    expect(REPO_OPEN_SCRIPT).not.toMatch(/fetch[^\n]* origin/);
+    expect(REPO_OPEN_SCRIPT).toContain(`bounded git -C "$folder" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*'`);
+    expect(REPO_OPEN_SCRIPT).toContain('bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone"');
+    expect(REPO_OPEN_SCRIPT).toContain('git -C "$work/clone" remote set-url origin "$url"');
   });
 });
 
