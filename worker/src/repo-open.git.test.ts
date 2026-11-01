@@ -38,8 +38,11 @@
  *     and the clone's config holds no `extraHeader`;
  *   - a second open fetches only: an uncommitted edit and HEAD survive, while
  *     the remote-tracking ref moves;
- *   - every refusal (bad grant, missing branch, foreign folder, unhydrated
- *     workspace) leaves the folder untouched.
+ *   - a repository with no commits yet, or without the binding's branch yet,
+ *     opens as an empty clone; once the branch is pushed, the next open
+ *     checks it out there, unless that would overwrite one of the person's files;
+ *   - every refusal (bad grant, foreign folder, unhydrated workspace) leaves
+ *     the folder untouched.
  *
  * Runs on the host's git by default. `EZIL_REPO_OPEN_IT_IMAGE=cloudflare/sandbox:0.12.1`
  * runs the same script inside that image instead (git 2.34.1, the computer's
@@ -333,10 +336,70 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(existsSync(join(root, 'projects', id))).toBe(false);
   });
 
-  it('a branch the repository does not have is repo_open_ref_not_found and creates nothing', async () => {
+  it('a branch the repository does not have yet opens as an empty clone on that branch, the others as remote-tracking refs', async () => {
     const id = '5f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b';
-    expect(await open({ repositoryId: id, ref: 'refs/heads/nope', branch: 'nope' })).toEqual({ ok: false, error: 'repo_open_ref_not_found' });
-    expect(existsSync(join(root, 'projects', id))).toBe(false);
+    const folder = join(root, 'projects', id);
+    expect(await open({ repositoryId: id, ref: 'refs/heads/nope', branch: 'nope' })).toEqual({ ok: true, folder, status: 'created' });
+    expect(readdirSync(folder)).toEqual(['.git']);
+    expect(git(folder, 'symbolic-ref', 'HEAD')).toBe('refs/heads/nope');
+    expect(git(folder, 'rev-parse', 'refs/remotes/origin/main')).toBe(git(seed, 'rev-parse', 'HEAD'));
+    expect(git(folder, 'config', '--local', '--get', 'remote.origin.url')).toBe(url);
+  });
+
+  describe('a repository with no commits yet (review F-EMPTY: a new Cloudflare Artifacts repository)', () => {
+    const first = 'c1d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b';
+    const second = 'c2d2c4b0-5a69-4788-9a0b-1c2d3e4f5a6b';
+    let emptyUrl: string;
+    let pusher: string;
+    beforeAll(() => {
+      sh(['git', 'init', '-q', '--bare', join(upstream, 'acme', 'empty.git')]);
+      sh(['git', 'symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: join(upstream, 'acme', 'empty.git') });
+      emptyUrl = `${base}/bearer/acme/empty.git`;
+      pusher = join(dir, 'pusher');
+      sh(['git', 'init', '-q', pusher]);
+      git(pusher, 'remote', 'add', 'origin', join(upstream, 'acme', 'empty.git'));
+    });
+
+    it('🔴 opens as an empty clone: origin the canonical URL, HEAD on the binding\'s branch with its upstream, no head', async () => {
+      const mark = ran().length;
+      for (const id of [first, second]) {
+        const folder = join(root, 'projects', id);
+        expect(await open(bearer({ repositoryId: id, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder, status: 'created' });
+        expect(readdirSync(folder)).toEqual(['.git']);
+        expect(git(folder, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
+        expect(Bun.spawnSync(['git', '-C', folder, 'rev-parse', '--verify', '--quiet', 'HEAD']).exitCode).toBe(1);
+        expect(git(folder, 'config', '--local', '--get', 'remote.origin.url')).toBe(emptyUrl);
+        expect(git(folder, 'config', '--local', '--get', 'remote.origin.fetch')).toBe('+refs/heads/*:refs/remotes/origin/*');
+        expect(git(folder, 'config', '--local', '--get', 'branch.main.remote')).toBe('origin');
+        expect(git(folder, 'config', '--local', '--get', 'branch.main.merge')).toBe('refs/heads/main');
+        expect(filesContaining(folder, TOKEN)).toEqual([]);
+      }
+      expectIsolated(mark, 2, false);
+      // Opened again while still empty: fetched, still no head.
+      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: join(root, 'projects', first), status: 'fetched' });
+    });
+
+    it('once the branch is pushed, the next open checks it out into the empty clone, unless that would overwrite a file', async () => {
+      // The person (in the second clone) has meanwhile written a file the push also brings.
+      writeFileSync(join(root, 'projects', second, 'README.md'), 'mine\n');
+      writeFileSync(join(pusher, 'README.md'), '# empty no more\n');
+      git(pusher, 'add', 'README.md');
+      git(pusher, '-c', 'user.name=t', '-c', 'user.email=t@example.test', 'commit', '-qm', 'first');
+      git(pusher, 'push', '-q', 'origin', 'HEAD:main');
+      const pushed = git(pusher, 'rev-parse', 'HEAD');
+
+      const a = join(root, 'projects', first);
+      expect(await open(bearer({ repositoryId: first, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: a, head: pushed, status: 'fetched' });
+      expect(readFileSync(join(a, 'README.md'), 'utf8')).toBe('# empty no more\n');
+      expect(git(a, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
+      expect(git(a, 'status', '--porcelain')).toBe('');
+
+      const b = join(root, 'projects', second);
+      expect(await open(bearer({ repositoryId: second, canonicalURL: emptyUrl }))).toEqual({ ok: true, folder: b, status: 'fetched' });
+      expect(readFileSync(join(b, 'README.md'), 'utf8')).toBe('mine\n');
+      expect(git(b, 'rev-parse', 'refs/remotes/origin/main')).toBe(pushed);
+      expect(Bun.spawnSync(['git', '-C', b, 'rev-parse', '--verify', '--quiet', 'HEAD']).exitCode).toBe(1);
+    });
   });
 
   it('a folder that is not this repository is refused and left exactly as it was', async () => {

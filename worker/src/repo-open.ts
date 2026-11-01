@@ -17,7 +17,7 @@
  *     ref: "refs/heads/<branch>",
  *     git: { token: <opaque, visible ASCII, ≤ 4096>, expiresAt: <ISO datetime> },
  *     timeoutMs?: <integer, REPO_OPEN_MIN_TIMEOUT_MS..REPO_OPEN_EXEC_TIMEOUT_MS> }
- *   200 { ok: true, folder: "<root>/projects/<repositoryId>", head: <commit>, status: 'cloned' | 'fetched' }
+ *   200 { ok: true, folder: "<root>/projects/<repositoryId>", head?: <commit>, status: 'cloned' | 'fetched' | 'created' }
  *   4xx/5xx { ok: false, error: <one of REPO_OPEN_ERRORS, or an auth code> }
  *
  * The values are Universe's project repository binding and its Git grant,
@@ -68,10 +68,18 @@
  * both schemes, including a clone whose config tries to redirect the fetch.
  *
  * An existing folder with the same origin is fetched only: the working tree,
- * the index and HEAD are not touched, so uncommitted work stays. Any other
- * existing folder is refused, never replaced. A clone lands in the private
- * directory and is moved into place whole, so a failed clone never leaves a
- * half-folder that a later open would mistake for a repository.
+ * the index and HEAD are not touched, so uncommitted work stays. The one
+ * exception is a clone that is still empty (its branch unborn, from an open of
+ * an empty repository): once the branch exists upstream it is checked out,
+ * unless that would overwrite a file. Any other existing folder is refused,
+ * never replaced. A clone lands in the private directory and is moved into
+ * place whole, so a failed clone never leaves a half-folder that a later open
+ * would mistake for a repository.
+ *
+ * A repository with no commits yet (a new Cloudflare Artifacts repository), or
+ * without the binding's branch yet, opens as an empty clone: `origin` the
+ * canonical URL, HEAD on the binding's branch (unborn) with its upstream set,
+ * any other branches as remote-tracking refs, `status: 'created'`, no `head`.
  *
  * Nothing git prints leaves the container: the script classifies git's stderr
  * into one of the codes below and prints a single result line.
@@ -173,8 +181,15 @@ export interface RepoOpenRoot {
   requireHydrated: boolean;
 }
 
+/**
+ * `cloned` and `fetched` name the folder's HEAD; `created` (an empty clone of a
+ * repository with no commits on the binding's branch yet) has none, nor has
+ * `fetched` while that clone is still empty.
+ */
+export type RepoOpenStatus = 'cloned' | 'fetched' | 'created';
+
 export type RepoOpenAnswer =
-  | { ok: true; folder: string; head: string; status: 'cloned' | 'fetched' }
+  | { ok: true; folder: string; head?: string; status: RepoOpenStatus }
   | { ok: false; error: RepoOpenError | 'runtime_not_running' };
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -401,16 +416,38 @@ if [ -e "$folder" ]; then
   # environment: the working tree, the index and HEAD stay as the person left them.
   bounded git -C "$folder" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
     || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
-  head=$(git -C "$folder" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
+  if ! git -C "$folder" rev-parse --verify --quiet HEAD >/dev/null; then
+    # Still the empty clone of an earlier open. Once the branch exists upstream,
+    # check it out; git refuses (and changes nothing) if a file would be overwritten.
+    if [ "$(git -C "$folder" symbolic-ref --quiet HEAD)" = "refs/heads/$branch" ] \
+      && git -C "$folder" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+      bounded git -C "$folder" checkout --quiet -b "$branch" --track "origin/$branch" >/dev/null 2>&1
+    fi
+  fi
+  head=$(git -C "$folder" rev-parse --verify --quiet HEAD) || emit ok:fetched
   emit "ok:fetched:$head"
 fi
-git --git-dir="$mirror" rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null || fail repo_open_ref_not_found
-bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone" 2>"$work/err" \
-  || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
-git -C "$work/clone" remote set-url origin "$url" 2>/dev/null || fail repo_open_git_failed
-head=$(git -C "$work/clone" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
+if git --git-dir="$mirror" rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null; then
+  bounded git clone --quiet --branch "$branch" --origin origin -- "$mirror" "$work/clone" 2>"$work/err" \
+    || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
+  git -C "$work/clone" remote set-url origin "$url" 2>/dev/null || fail repo_open_git_failed
+  head=$(git -C "$work/clone" rev-parse --verify --quiet HEAD) || fail repo_open_ref_not_found
+  status=cloned:$head
+else
+  # The repository has no commits yet (a new Cloudflare Artifacts repository),
+  # or not this branch yet: an empty clone, as "git clone" makes of an empty
+  # repository, with HEAD on the binding's branch and any other branches as
+  # remote-tracking refs.
+  { git init --quiet "$work/clone" && git -C "$work/clone" symbolic-ref HEAD "refs/heads/$branch" \
+    && git -C "$work/clone" remote add origin "$url" \
+    && git -C "$work/clone" config "branch.$branch.remote" origin \
+    && git -C "$work/clone" config "branch.$branch.merge" "refs/heads/$branch"; } >/dev/null 2>&1 || fail repo_open_git_failed
+  bounded git -C "$work/clone" fetch --quiet --no-recurse-submodules "$mirror" '+refs/heads/*:refs/remotes/origin/*' 2>"$work/err" \
+    || { rc=$?; fail "$(classify "$rc" "$work/err")"; }
+  status=created
+fi
 mv -T "$work/clone" "$folder" 2>/dev/null || fail repo_open_git_failed
-emit "ok:cloned:$head"
+emit "ok:$status"
 `;
 
 /**
@@ -436,11 +473,14 @@ export function repoOpenCommand(params: {
 /** The script's result line (the last `ezil-repo-open:` line), or null when there is none or it is malformed. */
 export function parseRepoOpenOutput(
   stdout: string,
-): { ok: true; status: 'cloned' | 'fetched'; head: string } | { ok: false; error: RepoOpenError } | null {
+): { ok: true; status: RepoOpenStatus; head?: string } | { ok: false; error: RepoOpenError } | null {
   const line = stdout.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('ezil-repo-open:')).pop();
   if (!line) return null;
+  if (line === 'ezil-repo-open:ok:created' || line === 'ezil-repo-open:ok:fetched') {
+    return { ok: true, status: line.slice('ezil-repo-open:ok:'.length) as RepoOpenStatus };
+  }
   const ok = /^ezil-repo-open:ok:(cloned|fetched):([0-9a-f]+)$/.exec(line);
-  if (ok) return HEAD.test(ok[2]!) ? { ok: true, status: ok[1] as 'cloned' | 'fetched', head: ok[2]! } : null;
+  if (ok) return HEAD.test(ok[2]!) ? { ok: true, status: ok[1] as RepoOpenStatus, head: ok[2]! } : null;
   const error = /^ezil-repo-open:error:([a-z_]+)$/.exec(line)?.[1];
   return error && (REPO_OPEN_ERRORS as readonly string[]).includes(error) ? { ok: false, error: error as RepoOpenError } : null;
 }
@@ -503,7 +543,7 @@ export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, 
   const parsed = parseRepoOpenOutput(stdout);
   if (!parsed) return { ok: false, error: 'repo_open_failed' };
   if (!parsed.ok) return parsed;
-  return { ok: true, folder: `${root.path}/projects/${request.repositoryId}`, head: parsed.head, status: parsed.status };
+  return { ok: true, folder: `${root.path}/projects/${request.repositoryId}`, ...(parsed.head ? { head: parsed.head } : {}), status: parsed.status };
 }
 
 /**

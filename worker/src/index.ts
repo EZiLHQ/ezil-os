@@ -35,13 +35,15 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          bytes, by lines, and per-line; EVERY line is run through
  *          `sanitizeErrorMessage` before it leaves. Kill switch
  *          `EZIL_NEKO_LOGS=off`. See `handleNekoLogs` / `./neko-logs.ts`)
- *   POST   /sandbox/:name/repo-open → { ok, folder, head, status }
+ *   POST   /sandbox/:name/repo-open → { ok, folder, head?, status }
  *          (v2-signed only. Clones, or fetches only, one project repository
  *          (Cloudflare Artifacts, or EZiL Git) into
  *          `<workspace root>/projects/<repositoryId>` of a RUNNING computer;
  *          the Git token reaches git only through its environment, as a
- *          Bearer header or an env-fed Basic credential helper, within the
- *          caller's `timeoutMs`. See `handleRepoOpen` / `./repo-open.ts`)
+ *          Bearer header or an env-fed Basic credential helper, and only for
+ *          a fetch into a private repository, never the person's, within the
+ *          caller's `timeoutMs`. An empty repository opens as an empty clone
+ *          (`created`, no head). See `handleRepoOpen` / `./repo-open.ts`)
  *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
  *                                     wasRunning, runningAfter, mode }
  *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —

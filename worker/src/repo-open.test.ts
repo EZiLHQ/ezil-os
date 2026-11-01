@@ -238,8 +238,14 @@ describe('parseRepoOpenOutput', () => {
     expect(parseRepoOpenOutput(`ezil-repo-open:ok:fetched:${'d'.repeat(64)}`)).toEqual({ ok: true, status: 'fetched', head: 'd'.repeat(64) });
     expect(parseRepoOpenOutput('ezil-repo-open:error:repo_open_auth_failed')).toEqual({ ok: false, error: 'repo_open_auth_failed' });
   });
+  it('an empty repository: created, or fetched while still empty, with no head', () => {
+    expect(parseRepoOpenOutput('ezil-repo-open:ok:created\n')).toEqual({ ok: true, status: 'created' });
+    expect(parseRepoOpenOutput('ezil-repo-open:ok:fetched')).toEqual({ ok: true, status: 'fetched' });
+  });
   it('refuses a malformed head, an unknown code or no result line', () => {
     expect(parseRepoOpenOutput('ezil-repo-open:ok:cloned:abc')).toBeNull();
+    expect(parseRepoOpenOutput('ezil-repo-open:ok:cloned')).toBeNull();
+    expect(parseRepoOpenOutput(`ezil-repo-open:ok:created:${HEAD}`)).toBeNull();
     expect(parseRepoOpenOutput('ezil-repo-open:error:rm_rf')).toBeNull();
     expect(parseRepoOpenOutput('')).toBeNull();
   });
@@ -277,6 +283,11 @@ describe('runRepoOpen', () => {
     const { lockWaitS, gitTimeoutS } = repoOpenBounds(40_000);
     expect(command.endsWith(` bearer ${lockWaitS} ${gitTimeoutS}`)).toBe(true);
     expect((lockWaitS + gitTimeoutS + 5) * 1000).toBeLessThan(40_000);
+  });
+
+  it('an empty repository is ok with no head (the folder still opens)', async () => {
+    expect(await runRepoOpen(fakeExec('ezil-repo-open:ok:created\n').exec, parsed(), root))
+      .toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'created' });
   });
 
   it('passes the script\'s error code through; stderr (even one holding the token) is never read', async () => {
