@@ -113,11 +113,14 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 // A launch with `ctx.project` (`/app/code?project=<uuid>&repo=<uuid>`, parsed
 // by `../app-link.js`) asks the SAME mint for that repository:
 // `{computerId, intent:'open', project:{projectId, repoId}}`. The server asks
-// Works for a read grant, has the Worker clone or fetch the repository into the
-// computer, and answers a URL whose `folder=` ends `/projects/<repoId>`; a URL
+// Universe 2.0 for a Git token, has the Worker clone or fetch the repository into
+// the computer, and answers a URL whose `folder=` ends `/projects/<repoId>`; a URL
 // without it is refused here rather than shown, because it would open the
 // person's own files as if they were the project. `path` is not sent (deferred).
-// The window's title becomes the repository's name when the answer carries one.
+// The window's title becomes the repository's name when the answer carries one
+// (`repository.name`, `<namespace>/<name>`); the server never sends the
+// Cloudflare Artifacts remote, which names its account, and an Artifacts URL is
+// never shown here even if one arrived.
 // A relaunch naming a DIFFERENT project re-mints; the same project, or none,
 // changes nothing. Refusals get their own copy and are never retried silently
 // (`session.js` TERMINAL_ERROR_CODES): `project_not_authorized`,

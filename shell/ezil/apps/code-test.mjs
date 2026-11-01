@@ -1217,12 +1217,15 @@ await settle(4);
     const spinnerTitle = (w) => w?.querySelector('.ezil-app-spinner .ezil-opening-title')?.textContent ?? '';
     const spinnerKind = (w) => w?.querySelector('.ezil-app-spinner')?.getAttribute('data-kind');
     const frameSrc = (w) => w?.querySelector('.window-app-iframe')?.getAttribute('src');
-    /** A successful project mint: the URL opens `/workspace/projects/<repoId>`, and the answer names the repository. */
+    /**
+     * A successful project mint: the URL opens `/workspace/projects/<repoId>`, and the answer names the repository the
+     * way the server does (`repository: {name: "<namespace>/<name>"}`), never by its remote.
+     */
     let seq = 0;
-    const opened = (name, folderFor = (b) => b?.project?.repoId) => (b) => ({ payload: {
+    const opened = (name, folderFor = (b) => b?.project?.repoId, repository = { name: `acme/${name}` }) => (b) => ({ payload: {
         ok: true, expiresAt: Date.now() + 300_000,
         codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=p${++seq}&folder=/workspace/projects/${folderFor(b)}`,
-        repository: { canonicalURL: `https://github.ezil.work/acme/${name}.git` },
+        repository,
     } });
     const submits = [];
     const realSubmit = window.HTMLFormElement.prototype.submit;
@@ -1282,6 +1285,23 @@ await settle(4);
         JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' })
         && headTitle(codeWin()) === 'Code', JSON.stringify(mints(from)[0]?.body));
     await closeCode();
+
+    // 8d'. The title: a name wins; an EZiL Git URL still gives `<owner>/<name>`; a Cloudflare Artifacts remote (it names
+    //      the account) is never shown, even if a server sent one.
+    const ACCOUNT = '0123456789abcdef'.repeat(2);
+    for ( const [label, repository, title] of [
+        ['a name, over a URL', { name: 'universe-staging/p-1', canonicalURL: 'https://github.ezil.work/acme/x.git' }, 'universe-staging/p-1'],
+        ['an EZiL Git URL alone', { canonicalURL: 'https://github.ezil.work/acme/legacy.git' }, 'acme/legacy'],
+        ['an Artifacts URL alone', { canonicalURL: `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-1.git` }, 'Code'],
+    ] ) {
+        codeMintAnswer = opened('t', undefined, repository);
+        await launch({ project: P1 });
+        await waitFor(() => frameSrc(codeWin())?.includes('/projects/'), 3000);
+        await settle(6);
+        w = codeWin();
+        push(`8d' ${label}: the window is "${title}"`, headTitle(w) === title && ! w.textContent.includes(ACCOUNT), headTitle(w));
+        await closeCode();
+    }
 
     // 8e. A server that ignored the project (no folder for this repository, or a second `folder=` the bridge would
     //     never forward) is refused, never shown.
