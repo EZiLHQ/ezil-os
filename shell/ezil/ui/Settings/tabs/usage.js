@@ -141,7 +141,7 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     const identity = (enrollment ?? 'enrolled') === 'enrolled' && (ai ? 'account' in ai : lastAccount !== null)
         ? accountCredits(ai?.account ?? null, { previous: lastAccount, userId, planSku: plan?.sku }) : undefined;
     if (identity !== undefined) {
-        aiState = identity === null ? 'unavailable' : identity.empty ? 'danger' : !identity.stale && ai?.state === 'low' ? 'warn' : 'ok';
+        aiState = identity === null ? 'unavailable' : identity.empty ? 'danger' : !identity.stale && identity.low ? 'warn' : 'ok';
         aiPercent = identity?.percent ?? null;
         const headline = identity && `${identity.left} credits left${identity.total !== null ? ` of ${identity.total}` : ''}`;
         aiValue = identity === null ? 'Unavailable' : esc(headline);

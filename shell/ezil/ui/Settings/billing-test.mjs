@@ -968,7 +968,27 @@ try {
         try { window.dispatchEvent(new window.Event('focus')); await settle(); } finally { window.Date.now = realNow; }
         assert.equal(count(), loads + 1);
         contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
-        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload');
+        // The warning is the total's own (at most 10% left), never `ai.state`, which judges the plan bucket alone (the
+        // fixture's is 'low'); Premium's "Add AI credits" primary follows the meter. A large added grant is not low:
+        assert.equal(ai().classList.contains('is-ok'), true);
+        const packs = [{ sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' }];
+        const toned = (account, state) => { const value = withAccount(account); value.ai.state = state; value.actions.topup = true; value.catalog.packs = packs; return value; };
+        const primaries = () => qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent);
+        summary = toned({ ...worked, totalMicro: M('6000'), remainingMicro: M('5050'), heldMicro: '0', usedMicro: M('950'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('50'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] }, 'low'); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '5,050 credits left of 6,000');
+        assert.equal(ai().classList.contains('is-ok'), true);
+        assert.doesNotMatch(ai().textContent, /Running low/);
+        assert.deepEqual(primaries(), []);
+        // ...and a nearly spent total is low while the plan bucket is not (500 of 10,000 left).
+        summary = toned({ ...worked, totalMicro: M('10000'), remainingMicro: M('500'), heldMicro: '0', usedMicro: M('9500'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('500'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('9000'), remainingMicro: '0', expiresAt: '2027-06-01T00:00:00Z' }] }, 'ok'); await refresh();
+        assert.equal(ai().classList.contains('is-warn'), true);
+        contains('[data-role="meter-ai"]', '! Running low');
+        assert.deepEqual(primaries(), ['Add AI credits']);
+        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload, the total\'s own warning');
     }
     // Hotfix r5 (ACCEPT #3): the smaller-configuration advice only when the plan allows a size with a
     // smaller time weight than the current one. Standard (2 vCPU only) and Premium on 2 vCPU have none.

@@ -486,6 +486,30 @@ check('identity credits: in the payment grace (D17) the period\'s credits wait f
     assert.doesNotMatch(meter(paid, 'ai').textContent, /added once your payment/i);
     for (const node of [live, empty, paid]) assert.deepEqual(scanCopy(node.textContent), []);
 });
+check('identity credits: the warning is the total\'s own (at most 10% left), never `ai.state`, which judges one bucket', () => {
+    const plenty = { ...worked, totalMicro: M('6000'), remainingMicro: M('5050'), heldMicro: '0', usedMicro: M('950'), grants: [
+        { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('50'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] };
+    const spent = { ...worked, totalMicro: M('10000'), remainingMicro: M('500'), heldMicro: '0', usedMicro: M('9500'), grants: [
+        { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('500'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('9000'), remainingMicro: '0', expiresAt: '2027-06-01T00:00:00Z' }] };
+    const withState = (account, state) => { const value = premiumAI(account); return { ...value, ai: { ...value.ai, state } }; };
+    // The server's 'low' (the plan bucket at 50 of 1,000) beside 5,050 of 6,000 left: no warning.
+    const ok = rendered(sample, withState(plenty, 'low'));
+    assert.equal(aiValue(ok), '5,050 credits left of 6,000');
+    assert.equal(meter(ok, 'ai').dataset.state, 'ok');
+    assert.doesNotMatch(meter(ok, 'ai').textContent, /Running low/);
+    // The server's 'ok' (the plan bucket at half) beside 500 of 10,000 left: running low.
+    const low = rendered(sample, withState(spent, 'ok'));
+    assert.equal(aiValue(low), '500 credits left of 10,000');
+    assert.equal(meter(low, 'ai').dataset.state, 'warn');
+    assert.match(meter(low, 'ai').textContent, /! Running low/);
+    // The line itself: 10% left is low, one microcredit more is not; an unknown or zero total has no share to judge.
+    assert.equal(format.accountCredits({ totalMicro: M('10000'), remainingMicro: M('1000') }).low, true);
+    assert.equal(format.accountCredits({ totalMicro: M('10000'), remainingMicro: '1000000001' }).low, false);
+    assert.equal(format.accountCredits({ totalMicro: null, remainingMicro: M('1') }).low, false);
+    assert.equal(format.accountCredits({ totalMicro: '0', remainingMicro: '0' }).low, false);
+});
 check('round 6 (CR-2): a stale hold session still says when it ends; a far-off paid deadline shows no clock time', () => {
     const el = rendered(heldUsage, heldSummary);
     assert.match(meter(el, 'session').textContent, new RegExp(`Measuring this session… · ends ${clock('2026-10-30T06:42:00Z')}`));

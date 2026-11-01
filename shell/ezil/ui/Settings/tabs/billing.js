@@ -306,7 +306,7 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
     const view = accountCredits(ai.account, { previous: lastAccount, userId, planSku: plan?.sku });
     if ( ! view ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: '—',
         notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
-    const tone = view.empty ? 'danger' : ! view.stale && ai.state === 'low' ? 'warn' : 'ok';
+    const tone = view.empty ? 'danger' : ! view.stale && view.low ? 'warn' : 'ok';
     const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
     // Round 4 D17: in the payment grace this period's plan credits arrive with the payment, never "more from <renewal>".
     const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
@@ -462,7 +462,10 @@ function planPrimaryV3 (summary) {
     const upgrade = upgradeCta(summary, true);
     if ( upgrade ) return upgrade;
     const { plan, ai } = summary;
-    if ( plan.sku === 'premium_monthly_v3' && ['low', 'exhausted'].includes(ai.state) && topupPacks(summary).length ) {
+    // Identity credits: the AI meter's own warning (a large added grant beside a spent plan bucket is not low).
+    const view = 'account' in ai ? accountCredits(ai.account) : undefined;
+    const low = view === undefined ? ['low', 'exhausted'].includes(ai.state) : view !== null && (view.empty || view.low);
+    if ( plan.sku === 'premium_monthly_v3' && low && topupPacks(summary).length ) {
         return '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-topup">Add AI credits</button>';
     }
     return '';
