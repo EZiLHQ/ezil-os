@@ -1,5 +1,6 @@
 import type { ResolvedProvider } from './config';
 import { creditState, type GatewayModels } from './gateway';
+import { credits } from './credits-format';
 
 type Result<T> = { value: T; code?: never; reason?: never } | { value?: never; code: string; reason?: string };
 export type CreditWindow = { seconds: number; budget_micro: string; used_micro: string; remaining_micro: string; started_at: string | null; resets_at: string | null };
@@ -86,12 +87,8 @@ function parseEffectiveLimits(value: unknown): EffectiveLimits | undefined {
     };
 }
 
-export function credits(value: number | string): string {
-    // Format integer microcredits exactly, including window strings beyond Number's safe range.
-    const amount = BigInt(value);
-    const fraction = (amount % 1_000_000n).toString().padStart(6, '0').replace(/0+$/, '');
-    return (amount / 1_000_000n).toLocaleString('en-US') + (fraction ? `.${fraction}` : '');
-}
+// The exact formatter lives in credits-format.ts (shared with gateway.ts); re-exported for existing importers.
+export { credits };
 
 export const localResetTime = (date: string | Date): string => new Date(date).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const windowLength = (seconds: number): string => seconds % 3600 === 0 ? `${seconds / 3600}-hour` : seconds % 60 === 0 ? `${seconds / 60}-minute` : `${seconds}-second`;

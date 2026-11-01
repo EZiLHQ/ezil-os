@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
 import { creditState, describeGatewayError, forgetGatewayModels, gatewayChat, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
+import { credits, creditsFloor2 } from '../src/credits-format';
 import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw } from './fixtures/gateway';
@@ -286,4 +287,28 @@ describe('gateway errors and credits', () => {
         expect(s.calls.map(c => c.url.split('/ai/v1')[1]).sort()).toEqual(['/me/balance', '/models']);
         expect(s.posts()).toHaveLength(0);
     });
+    test('"Show AI credits" prints the exact decimal from integer microcredits, never a float rendering', () => {
+        const ok = (available_micro: number) => creditState(undefined, { available_micro, held_micro: 0, grants: [{ remaining_micro: available_micro, live: true }] }, '');
+        for (const [micro, text] of [[1_246_750_000, '1,246.75'], [996_250_000, '996.25'], [1, '0.000001'], [1_000_000_000, '1,000'],
+            [300_000, '0.3'], [9_007_199_254_740_991, '9,007,199,254.740991']] as const) {
+            expect(ok(micro).text).toBe(`AI credits: ${text} remaining`);
+        }
+        // The float rendering was "1246.75" (no grouping, a Number's shortest text); the `credits` number field is unchanged.
+        expect(ok(1_246_750_000).text).not.toContain('1246.75');
+        expect(ok(300_000).credits).toBe(0.3);
+    });
+    test('an available balance in an error is floored, never rounded up (the hold, a requirement, keeps two places)', () => {
+        const message = (available_micro: number) => describeGatewayError('qwen', 402, null, { code: 'insufficient_credits', available_micro }, null).message;
+        expect(message(999_999)).toContain('Available credits: 0.99.');
+        expect(message(1_234_567_891)).toContain('Available credits: 1,234.56.');
+        expect(message(1_500_000)).toContain('Available credits: 1.50.');
+        for (const odd of [-1, 1.5, Number.NaN]) expect(message(odd)).toContain('Available credits: Not measured.');
+    });
+});
+test('credits-format: the shared vectors (the OS shell pins the same ones for creditsDecimal)', () => {
+    for (const [micro, full, floor2] of [['0', '0', '0.00'], ['1', '0.000001', '0.00'], ['500000', '0.5', '0.50'], ['252750000', '252.75', '252.75'],
+        ['1246759999', '1,246.759999', '1,246.75'], ['1500000000', '1,500', '1,500.00'], ['9007199254740993123456', '9,007,199,254,740,993.123456', '9,007,199,254,740,993.12']] as const) {
+        expect(credits(micro)).toBe(full);
+        expect(creditsFloor2(micro)).toBe(floor2);
+    }
 });

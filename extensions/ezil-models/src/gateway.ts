@@ -12,6 +12,7 @@ import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-resp
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
 import { localResetTime } from './status-data';
+import { credits, creditsFloor2 } from './credits-format';
 import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
@@ -165,7 +166,9 @@ export const CREDIT_STATE_TEXT: Record<CreditState, string> = {
 
 /** Contract §7 "Credit UX states", evaluated top to bottom. Either input may be unknown. */
 export function creditState(models: GatewayModels | undefined, balance: GatewayBalance | undefined, alias: string): { state: CreditState; text: string; credits?: number } {
-    const pick = (state: CreditState, credits?: number) => ({ state, text: state === 'ok' && credits !== undefined ? `AI credits: ${credits} remaining` : CREDIT_STATE_TEXT[state], ...(credits === undefined ? {} : { credits }) });
+    // The text is the exact decimal (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
+    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${credits(micro)} remaining` : CREDIT_STATE_TEXT[state],
+        ...(micro === undefined ? {} : { credits: micro / MICRO_PER_CREDIT }) });
     if (models?.killswitch) return pick(models.pause === 'reconciliation' ? 'paused_reconciliation' : 'paused_operations');
     if (models && models.data.find(entry => entry.id === alias)?.enabled === false) return pick('model_disabled');
     if (!balance) return pick('unknown');
@@ -174,7 +177,7 @@ export function creditState(models: GatewayModels | undefined, balance: GatewayB
         return pick(balance.grants.length ? 'expired' : 'not_included');
     }
     if (balance.available_micro === 0 && balance.held_micro > 0) return pick('held');
-    return pick('ok', balance.available_micro / MICRO_PER_CREDIT);
+    return pick('ok', balance.available_micro);
 }
 
 // ── error mapping (by error.code, never by message; contract §8) ─────────────
@@ -216,7 +219,8 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
             const available = body.available_micro ?? balance?.available_micro;
-            const credits = typeof available === 'number' && Number.isFinite(available) ? (available / MICRO_PER_CREDIT).toFixed(2) : 'Not measured';
+            // Floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
+            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsFloor2(available) : 'Not measured';
             const state = typeof body.hold_micro === 'number' && Number.isFinite(body.hold_micro)
                 && typeof available === 'number' && Number.isFinite(available) && body.hold_micro > available
                 ? `This request needs up to ${(body.hold_micro / MICRO_PER_CREDIT).toFixed(2)} credits, and you have ${credits}.`
