@@ -22,7 +22,7 @@
 # Files patched (all inside <root>):
 #   extensions/copilot/dist/extension.js               copilot-chat extension host bundle
 #   out/nls.messages.js, out/nls.messages.json         workbench English strings (index-addressed array)
-#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status
+#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status + chat history
 #   out/vs/code/browser/workbench/workbench.css        welcome disclaimer
 #   extensions/copilot/package{,.nls}.json            display strings
 set -euo pipefail
@@ -133,6 +133,50 @@ A_AI_PLAN='"Copilot Free"'; R_AI_PLAN='"EZiL AI"'
 A_AI_QUOTA='"Chat messages"'; R_AI_QUOTA='"Gateway usage"'
 A_AI_LIMIT='"Limited"'; R_AI_LIMIT='"View EZiL AI status"'
 
+# Part 3 — EZiL Chat history (workbench.js). Upstream the ChatSessionStore keeps sessions in
+# <user-data>/User/workspaceStorage/<id>/chatSessions, where the id hashes
+# vscode-remote://<browser host><folder> (code-server sets remoteAuthority to location.host),
+# so it changes with the computer's address. For a single-folder window whose folder has
+# .ezil/chat (editor-state.sh creates it in the EZiL workspace), the store uses that folder
+# instead; it is decided as the store's first queued task, before any session file is read
+# or written. Not-found keeps the upstream location; other errors retry, then log loudly.
+A_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){'
+R_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})})),!f.configuration&&f.folders.length===1&&this.storeQueue.queue(()=>this._ezilUseWorkspaceChat(f.folders[0].uri))}async _ezilUseWorkspaceChat(e){let t=Ve(e,".ezil","chat");for(let i=0;;i++)try{let n=await this.fileService.stat(t);n.isDirectory&&(this.storageRoot=t,this.logService.info(`EZiL: chat history in ${t.toString()}`));return}catch(n){if(ba(n)===1)return;if(i>=5){this.logService.error(`EZiL: chat history folder ${t.toString()} unreadable, using ${this.storageRoot.toString()}`,n);return}await new Promise(r=>setTimeout(r,1e3*(i+1)))}}async handleWorkspaceTransition(e,t){'
+P_HISTORY_WORKSPACE='let f=this.workspaceContextService.getWorkspace(),v=!f.configuration&&f.folders.length===0,b=this.workspaceContextService.getWorkspace().id;this.storageRoot=v?Ve(this.userDataProfilesService.defaultProfile.globalStorageHome,"emptyWindowChatSessions"):Ve(this.environmentService.workspaceStorageHome,b,"chatSessions"),'
+# The ChatSessionStore lists history only from
+# its index (storage key chat.ChatSessionStore.index, workspace scope = browser IndexedDB
+# per origin and URL path) and never rebuilds a missing index from the session files.
+# The first index read in a window reconciles it with the chatSessions directory: files
+# missing from the index are added (newest first, within the store's 400-entry cap),
+# local entries whose file is gone are dropped. A failed listing changes nothing.
+A_HISTORY_INDEX='async getIndex(){return this.storeQueue.queue(async()=>this.internalGetIndex().entries)}'
+R_HISTORY_INDEX='async getIndex(){return this.storeQueue.queue(async()=>(this._ezilHistoryReconciled||await this._ezilReconcileHistory(),this.internalGetIndex().entries))}async _ezilReconcileHistory(){let t;try{t=await this.fileService.resolve(this.storageRoot,{resolveMetadata:!0})}catch(f){ba(f)===1&&(this._ezilHistoryReconciled=!0);return}this._ezilHistoryReconciled=!0;try{let i=this.internalGetIndex(),n=new Map,a=0,c=0;for(let f of t.children??[]){let g=!f.isDirectory&&/^(.+)\.jsonl?$/.exec(f.name);g&&n.set(g[1],Math.max(n.get(g[1])??0,f.mtime??0))}for(let[k,v]of Object.entries(i.entries))!v.isExternal&&!n.has(k)&&(delete i.entries[k],c++);let l=Object.values(i.entries).filter(v=>!v.isExternal),u=l.length>=zSn?Math.min(...l.map(v=>v.lastMessageDate)):-1/0;for(let[k]of[...n].filter(([k,g])=>!i.entries[k]&&g>u).sort((p,q)=>q[1]-p[1]).slice(0,zSn))try{let o=this.getStorageLocation(k),s=await this.readSessionFromLocation(o.flat,o.log,k),v=s?.value;if(!v||v.sessionId!==k||!Array.isArray(v.requests))continue;let e=await KSn(v);if(!v.customTitle)try{e.title=sC.getDefaultTitle(v.requests)||e.title}catch{}typeof v.workingDirectory=="string"&&(e.workingDirectory=v.workingDirectory),i.entries[k]=e,a++}catch{}(a||c)&&(await this.trimEntries(),await this.flushIndex(),this.logService.info(`EZiL: chat history index reconciled with ${this.storageRoot.toString()}: +${a} -${c}`))}catch(f){this.logService.error("EZiL: chat history index reconcile failed",f)}}'
+# The names the reconcile uses must mean the same thing in this bundle (checked, never patched).
+P_HISTORY_KSN='async function KSn(s){if(s instanceof sC){let e=klo(s);return e.stats=await p7t(s),e}let o=s.requests.at(-1)?.timestamp??s.creationDate;'
+P_HISTORY_TITLE='get title(){return this._customTitle||sC.getDefaultTitle(this._requests)}'
+P_HISTORY_CAP='var zSn=400,HTt="chat.ChatSessionStore.index"'
+P_HISTORY_READ='return this.readSessionFromLocation(t.flat,t.log,e)})}async readSessionFromLocation(e,t,i){'
+P_HISTORY_LOCATION='getStorageLocation(e){return{flat:ywe(this.storageRoot,e,".json"),log:'
+P_HISTORY_NOTFOUND='ba(r)!==1&&this.reportError("sessionDelete","Error deleting chat session",r)'
+# With chat.viewSessions.enabled:false (kept: it would hide the welcome notice and list every
+# session type in its filter menu) the only way to history is the chat title, and that title
+# rendered only once the current chat had one. Always render it; an empty chat reads "Chat history".
+A_HISTORY_ENTRY='shouldRender(){return!!this.model?.title}'
+R_HISTORY_ENTRY='shouldRender(){return!0}'
+A_HISTORY_LABEL='static{this.DEFAULT_TITLE=d(12379,null)}'
+R_HISTORY_LABEL='static{this.DEFAULT_TITLE="Chat history"}'
+# An empty chat's title is "" (not nullish), so the default label never showed: both the
+# update path and the label created when the toolbar renders (which can come after it).
+A_HISTORY_EMPTY_TITLE='this.title??X2.DEFAULT_TITLE'
+R_HISTORY_EMPTY_TITLE='this.title||X2.DEFAULT_TITLE'
+# The picker lists a snapshot of the agent-sessions model and never refreshes; opened before
+# the local provider first resolved (measured: soon after load) it stayed empty. Resolve the
+# local provider first. cn.Local is the local provider type; R9e holds agentSessionsService.
+A_HISTORY_PICKER='async pickAgentSession(){let o=new A,e=o.add(this.quickInputService.createQuickPick({useSeparators:!0}))'
+R_HISTORY_PICKER='async pickAgentSession(){await this.agentSessionsService.model.resolve(cn.Local).catch(()=>{});let o=new A,e=o.add(this.quickInputService.createQuickPick({useSeparators:!0}))'
+P_HISTORY_LOCAL='r=[{id:cn.Local,label:n(cn.Local)}]'
+P_HISTORY_PICKER_SERVICE='R9e=class{constructor(o,e,t,i,n,r,a){this.anchor=o;this.options=e;this.agentSessionsService=t;'
+
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
@@ -158,6 +202,15 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch accounts-menu  "$WB"  1  "$A_ACCOUNTS" "$R_ACCOUNTS"
   patch target-picker  "$WB"  1  "$A_PICKER"   "$R_PICKER"
+  for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND" "$P_HISTORY_WORKSPACE" "$P_HISTORY_LOCAL" "$P_HISTORY_PICKER_SERVICE"; do
+    gate history-names "$WB" 1 "$p"
+  done
+  patch history-root   "$WB"  1  "$A_HISTORY_ROOT" "$R_HISTORY_ROOT"
+  patch history-index  "$WB"  1  "$A_HISTORY_INDEX" "$R_HISTORY_INDEX"
+  patch history-entry  "$WB"  1  "$A_HISTORY_ENTRY" "$R_HISTORY_ENTRY"
+  patch history-label  "$WB"  1  "$A_HISTORY_LABEL" "$R_HISTORY_LABEL"
+  patch history-empty-title "$WB" 2 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
+  patch history-picker "$WB"  1  "$A_HISTORY_PICKER" "$R_HISTORY_PICKER"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -198,6 +251,15 @@ for nls in "$NLS_JS" "$NLS_JSON"; do
 done
 gate accounts-menu    "$WB"  0  "$A_ACCOUNTS";     gate accounts-menu    "$WB"  1  "$R_ACCOUNTS"
 gate target-picker    "$WB"  0  "$A_PICKER";       gate target-picker    "$WB"  1  "$R_PICKER"
+for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" "$P_HISTORY_LOCATION" "$P_HISTORY_NOTFOUND" "$P_HISTORY_WORKSPACE" "$P_HISTORY_LOCAL" "$P_HISTORY_PICKER_SERVICE"; do
+  gate history-names "$WB" 1 "$p"
+done
+gate history-root     "$WB"  0  "$A_HISTORY_ROOT";  gate history-root     "$WB"  1  "$R_HISTORY_ROOT"
+gate history-index    "$WB"  0  "$A_HISTORY_INDEX"; gate history-index    "$WB"  1  "$R_HISTORY_INDEX"
+gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB"  1  "$R_HISTORY_ENTRY"
+gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
+gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
+gate history-picker   "$WB"  0  "$A_HISTORY_PICKER"; gate history-picker   "$WB"  1  "$R_HISTORY_PICKER"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"

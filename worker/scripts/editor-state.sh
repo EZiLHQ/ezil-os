@@ -53,6 +53,7 @@ seed_codeserver_machine_settings() {
   "github.copilot.chat.backgroundAgent.enabled": false,
   "github.copilot.chat.cloudAgent.enabled": false,
   "chat.viewSessions.enabled": false,
+  "github.copilot.chat.localIndex.enabled": false,
   "workbench.secondarySideBar.defaultVisibility": "visible",
   "telemetry.telemetryLevel": "off",
   "terminal.integrated.env.linux": {
@@ -155,6 +156,76 @@ embeddings.vscode-cdn.net
 EZIL_BLOCKED_AI_HOSTS
 }
 
+# User Git never stages editor state or conversations. Two rules, both written before
+# every launch and at every capture (30 s and each checkpoint), because the running editor
+# recreates .ezil/chat itself after `git clean -x`/`-X` or a replaced workspace removed
+# it: .ezil/.gitignore (`*`), and `/.ezil/` in the local, never-committed
+# .git/info/exclude of a repository at the workspace root, which `git clean` keeps. A
+# user's file is never replaced, a link never followed, and .git/info never created.
+ezil_editor_ignore_state() {
+  local workspace="$1" state_dir="$2" exclude="$1/.git/info/exclude"
+  mkdir -p "$state_dir" || return 1
+  if [ ! -e "$state_dir/.gitignore" ] && [ ! -L "$state_dir/.gitignore" ]; then
+    printf '# EZiL editor state and chat history (managed by EZiL)\n*\n' >"$state_dir/.gitignore" || return 1
+  fi
+  [ "$state_dir" = "$workspace/.ezil" ] || return 0
+  [ -d "$workspace/.git" ] && [ ! -L "$workspace/.git" ] && [ ! -L "$workspace/.git/info" ] || return 0
+  [ -f "$exclude" ] && [ ! -L "$exclude" ] || return 0
+  grep -qxF '/.ezil/' "$exclude" && return 0
+  # Best effort on top of .gitignore. Keep a last line without a newline intact.
+  if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude")" ]; then printf '\n' >>"$exclude" 2>/dev/null || return 0; fi
+  printf '# EZiL editor state and chat history (managed by EZiL)\n/.ezil/\n' >>"$exclude" 2>/dev/null || true
+}
+
+# EZiL Chat history lives in the workspace: <workspace>/.ezil/chat/<session>.jsonl, one
+# copy that checkpoints, restore, reverse move and Cloudflare restarts carry like any
+# project file. The patched editor (copilot-chat/PATCHES.md, history-root) writes there
+# whenever that directory exists; upstream it writes to
+# <user-data>/User/workspaceStorage/<id>/chatSessions, with an id that hashes the browser
+# host, so it changes with the computer's address. Idempotent; runs before every launch,
+# including warm AWS profiles that already carry .ezil-state-ready. History already in a
+# profile moves into the workspace, never overwriting a saved session (all such
+# directories: in EZiL the editor opens one folder). Odd entries are moved aside, never
+# followed or deleted.
+ezil_editor_prepare_chat() (
+  local user_data="$1" workspace="$2" state_dir chat dir entry name stamp
+  state_dir="${EZIL_EDITOR_STATE_DIR:-$workspace/.ezil}"
+  chat="$state_dir/chat"
+  stamp="$(date +%s)-$BASHPID-$RANDOM"
+  ezil_editor_ignore_state "$workspace" "$state_dir" || exit 1
+  # `mv -T` everywhere: a destination is a name, never a directory to move into.
+  if [ -L "$chat" ] || { [ -e "$chat" ] && [ ! -d "$chat" ]; }; then
+    mv -T -- "$chat" "$chat.ezil-quarantine-$stamp" || exit 1
+  fi
+  mkdir -p "$chat" || exit 1
+  for dir in "$user_data"/User/workspaceStorage/*/chatSessions; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      name="${entry##*/}"
+      if [ ! -e "$chat/$name" ] && [ ! -L "$chat/$name" ]; then
+        mv -T -- "$entry" "$chat/$name" || exit 1
+      elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$chat/$name"; then
+        rm -f -- "$entry" || exit 1
+      else
+        mkdir -p "$state_dir/chat-conflicts/$stamp" || exit 1
+        mv -T -- "$entry" "$state_dir/chat-conflicts/$stamp/$name" || exit 1
+      fi
+    done
+    rmdir -- "$dir" 2>/dev/null || true
+  done
+)
+
+# Copilot Chat 0.69's local session index (github.copilot.chat.localIndex.enabled,
+# now off in the Machine seed) keeps a second copy of every turn that deleting a
+# conversation never removes. Drop that derived copy; the workspace keeps the history.
+ezil_editor_drop_copilot_session_index() {
+  rm -f -- "$1/User/globalStorage/github.copilot-chat/session-store.db" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-wal" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-shm" \
+    "$1/User/globalStorage/github.copilot-chat/session-store.db-journal"
+}
+
 ezil_editor_prepare() (
   local user_data="$1" workspace="$2" file
   mkdir -p "$user_data" || exit 1
@@ -163,9 +234,12 @@ ezil_editor_prepare() (
   seed_codeserver_machine_settings "$user_data" || exit 1
   seed_codeserver_chat_models "$user_data" || exit 1
   seed_blocked_ai_hosts || true
+  ezil_editor_drop_copilot_session_index "$user_data" || true
   # Within the same runtime, relaunches preserve the current editor state.
   if [ -f "$user_data/.ezil-state-ready" ]; then
     [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
+    # History must not block the editor: a failed link leaves today's behaviour.
+    ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
     exit 0
   fi
   for file in settings.json keybindings.json; do
@@ -174,6 +248,7 @@ ezil_editor_prepare() (
     fi
   done
   seed_codeserver_user_settings "$user_data" || exit 1
+  ezil_editor_prepare_chat "$user_data" "$workspace" || echo "editor-state: chat history folder not prepared; new conversations stay in the editor profile" >&2
   # This marker is published only after every restore succeeded. Failed restores
   # cannot launch defaults or let a later capture replace durable user settings.
   printf '%s\n' "$workspace" >"$user_data/.ezil-state-ready" || exit 1
@@ -216,6 +291,10 @@ ezil_editor_capture() (
   exec 8>"$user_data/.ezil-state.lock" || exit 1
   flock -w 10 8 || exit 1
   [ "$(cat "$user_data/.ezil-state-ready")" = "$workspace" ] || exit 1
+  # A workspace replaced (or .ezil removed) under a running editor gets its ignore rules
+  # and history folder back. Best effort: a failure here must not fail the checkpoint.
+  ezil_editor_ignore_state "$workspace" "$state_dir" 2>/dev/null || true
+  [ -L "$state_dir/chat" ] || mkdir -p "$state_dir/chat" 2>/dev/null || true
   for file in settings.json keybindings.json; do
     if [ -f "$user_data/User/$file" ]; then
       if ! cmp -s "$user_data/User/$file" "$state_dir/$file"; then
