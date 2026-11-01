@@ -395,6 +395,10 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert '/deployments/os.ezil.work?teamId=' in by_id['previous_app']['run']
     assert by_id['previous_worker']['if'] == by_id['previous_app']['if'] == main
     assert position(by_id['previous_worker']) < position(by_id['previous_app']) < position(worker)
+    # The rollout deploy re-verifies the prepared files against HEAD and the tested receipt.
+    preflight = by_name['Refuse a container rollout that is not the tested build of this commit']
+    assert preflight == {'name': preflight['name'], 'if': image_condition, 'run': 'node .github/scripts/release-state.mjs preflight'}
+    assert position(capture_version) < position(preflight) == position(worker) - 1
     assert '16 * 60' in deploy['run'] and 'timeout --kill-after=10s' in deploy['run']
     assert '16 * 60' in rollout['run'] and 'timeout --kill-after=10s' in rollout['run']
     for step in (identity, check):
@@ -490,7 +494,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert by_name['Fail unverified tag']['run'] == 'exit 1'
     # No deployment, rollback, or migration can execute on a tag.
     for step in steps:
-        if re.search(r'wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
+        if re.search(r'wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|preflight|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
             assert main in step.get('if', ''), step.get('name')
     assert 'exit 1' in fail['run'] and not fail.get('continue-on-error', False)
 

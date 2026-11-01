@@ -611,6 +611,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: node .github/scripts/release-state.mjs container-version
+      - name: Refuse a container rollout that is not the tested build of this commit
+        if: github.ref == 'refs/heads/main' && needs.changes.outputs.image_changed == 'true'
+        run: node .github/scripts/release-state.mjs preflight
       - name: Deploy Worker
         if: github.ref == 'refs/heads/main'
         id: worker
