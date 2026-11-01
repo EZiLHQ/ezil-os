@@ -53,6 +53,15 @@ An expired newest receipt also rebuilds. `preview.yml` keeps the shared `IMAGE_I
 `image-plan.mjs` and every local `worker/Dockerfile` COPY/ADD source. Manual
 dispatch on branches and new branches rebuild images conservatively.
 
+A container rollout (the dispatch's image-changed path, or a manual
+`wrangler deploy --containers-rollout immediate`) runs from a checkout of the
+released commit with that commit's `os-images-<sha>` artifact:
+`EZIL_DEPLOY_SHA=<sha> node .github/scripts/release-state.mjs prepare`, then
+`... release-state.mjs preflight` immediately before the deploy. Preflight
+refuses unless HEAD, `tested-images.json`, `worker/Dockerfile.release` (exact
+tested digest and revision label) and the top-level `[[containers]]` image all
+name the tested build of `<sha>`; never deploy past a failed preflight.
+
 Push a `v*` tag for the deployed production commit to publish its draft release.
 The production job checks <https://os.ezil.work> without redeploying or applying
 migrations. It verifies Worker/app source identities and the deployed container

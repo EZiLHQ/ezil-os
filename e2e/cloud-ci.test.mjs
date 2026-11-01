@@ -333,7 +333,7 @@ test('production requires both production aliases to resolve the exact returned 
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
+const { readState, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest, releaseDockerfile, releasePreflight } = await import('../.github/scripts/release-state.mjs');
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -367,6 +367,67 @@ test('release capture separates provider/container identities and strips configu
   assert.equal(result.cloudflare_container.digest, `sha256:${'d'.repeat(64)}`);
   assert.equal(JSON.stringify(result).includes('do-not-store'), false);
   await assert.rejects(readState(env, async()=>({ok:false,status:403})), /HTTP 403/);
+});
+
+test('container rollout preflight accepts only the prepared tested build of the checked-out release', () => {
+  const other = 'b'.repeat(40), digest = `sha256:${'d'.repeat(64)}`;
+  const images = {source:sha, tested:true, desktop:`ghcr.io/ezilhq/ezil-os-desktop:sha-${sha}`, desktop_digest:digest};
+  const dockerfile = `FROM ghcr.io/ezilhq/ezil-os-desktop@${digest}\nLABEL org.opencontainers.image.revision="${sha}"\n`;
+  assert.equal(releaseDockerfile(images, sha), dockerfile);
+  // The real configuration with prepare's replacement: production first, staging after it.
+  const original = fs.readFileSync('worker/wrangler.toml', 'utf8');
+  const config = original.replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"');
+  const stagingOnly = original.replace(/(\[\[env\.staging\.containers\]\][^[]*?)image = "\.\/Dockerfile"/, '$1image = "./Dockerfile.release"');
+  assert.notEqual(stagingOnly, original);
+  const ready = {sha, head:sha, images, dockerfile, config};
+  releasePreflight(ready);
+  for (const [patch, message] of [
+    [{sha:other}, /another commit/], [{head:other}, /not the release commit/],
+    [{sha:undefined, head:undefined}, /release source SHA/], [{sha:'A'.repeat(40), head:'A'.repeat(40)}, /release source SHA/],
+    [{images:{...images, source:other}}, /another commit/], [{images:{...images, tested:false}}, /not tested/],
+    [{images:{...images, tested:'true'}}, /not tested/], [{images:{...images, desktop_digest:undefined}}, /desktop digest/],
+    [{images:{...images, desktop:`ghcr.io/ezilhq/ezil-os-desktop:sha-${other}`}}, /tag differs/],
+    [{dockerfile:dockerfile.replace(digest, `sha256:${'e'.repeat(64)}`)}, /Dockerfile\.release is not/],
+    [{dockerfile:dockerfile.replace(/^LABEL .*\n/m, '')}, /Dockerfile\.release is not/],
+    [{dockerfile:dockerfile.replace(`"${sha}"`, `"${other}"`)}, /Dockerfile\.release is not/],
+    [{dockerfile:`${dockerfile}RUN true\n`}, /Dockerfile\.release is not/],
+    [{config:original}, /does not build Dockerfile\.release/],
+    [{config:stagingOnly}, /does not build Dockerfile\.release/],
+    [{config:config.replace('[[containers]]', '[[env.other.containers]]')}, /one top-level/],
+    [{config:`${config}\n[[containers]]\nimage = "./Dockerfile.release"\n`}, /one top-level/],
+    [{config:config.replace('image = "./Dockerfile.release"', 'image = "./Dockerfile.release"\nimage = "./Dockerfile"')}, /one \[\[containers\]\] image/],
+  ]) assert.throws(() => releasePreflight({...ready, ...patch}), message);
+});
+
+test('release-state prepare writes what preflight accepts, and preflight refuses a moved or unswitched checkout', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-release-preflight-'));
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  const gitEnv = {PATH:process.env.PATH, HOME:dir, GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null',
+    GIT_AUTHOR_NAME:'ci', GIT_AUTHOR_EMAIL:'ci@example.invalid', GIT_COMMITTER_NAME:'ci', GIT_COMMITTER_EMAIL:'ci@example.invalid'};
+  const created = runWorkflowScript('bash', ['-euo', 'pipefail', '-c', `
+    git -c init.defaultBranch=main init -q "$0" && cd "$0" && mkdir worker && cp "$1" worker/wrangler.toml
+    git add -A && git commit -q -m release && git rev-parse HEAD
+  `, dir, path.resolve('worker/wrangler.toml')], {env:gitEnv});
+  assert.equal(created.status, 0, created.output);
+  const head = created.output.trim();
+  fs.writeFileSync(path.join(dir, 'tested-images.json'), JSON.stringify({source:head, tested:true,
+    desktop:`ghcr.io/ezilhq/ezil-os-desktop:sha-${head}`, desktop_digest:`sha256:${'d'.repeat(64)}`}));
+  const script = path.resolve('.github/scripts/release-state.mjs');
+  const release = (mode, extra = {}) => runWorkflowScript(process.execPath, [script, mode],
+    {cwd:dir, env:{...gitEnv, EZIL_DEPLOY_SHA:head, ...extra}});
+  assert.notEqual(release('preflight').status, 0, 'preflight requires a prepared Dockerfile.release');
+  assert.equal(release('prepare').status, 0);
+  const passed = release('preflight');
+  assert.equal(passed.status, 0, passed.output);
+  assert.match(passed.output, new RegExp(`preflight passed for ${head}`));
+  assert.match(release('preflight', {EZIL_DEPLOY_SHA:'b'.repeat(40)}).output, /another commit/);
+  const toml = path.join(dir, 'worker/wrangler.toml'), prepared = fs.readFileSync(toml, 'utf8');
+  fs.writeFileSync(toml, prepared.replace('image = "./Dockerfile.release"', 'image = "./Dockerfile"'));
+  assert.match(release('preflight').output, /does not build Dockerfile\.release/);
+  fs.writeFileSync(toml, prepared);
+  assert.equal(release('preflight').status, 0);
+  assert.equal(runWorkflowScript('git', ['-C', dir, 'commit', '-q', '--allow-empty', '-m', 'next'], {env:gitEnv}).status, 0);
+  assert.match(release('preflight').output, /not the release commit/);
 });
 
 test('Vercel rollback resolves legacy receipts and promotes the verified ID through the team API', async () => {
@@ -1300,7 +1361,7 @@ test('image change paths cover desktop inputs without rebuilding for app/Worker 
 test('tag verification never deploys or recovers production, and failed live checks cannot publish', () => {
   const job = previewWorkflow.jobs.find(job => job.name === 'production');
   for (const step of job.steps) {
-    if (/wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply/.test(step.text)) {
+    if (/wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|preflight|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply/.test(step.text)) {
       assert.match(step.text, /if: .*github\.ref == 'refs\/heads\/main'/);
     }
     if (/gh release edit|imagetools create|release evidence and wait/.test(step.text)) {
@@ -1314,6 +1375,9 @@ test('tag verification never deploys or recovers production, and failed live che
   const prepare = job.steps.findIndex(step => /release-state.mjs prepare/.test(step.text));
   assert.ok(migration > 0 && migration < prepare, 'migration authorization needs a clean checkout before prepare');
   assert.ok(!job.steps[migration].keys.includes('continue-on-error'));
+  const preflight = job.steps.findIndex(step => /release-state.mjs preflight/.test(step.text));
+  assert.ok(prepare < preflight && preflight === job.steps.findIndex(step => /wrangler deploy\b/.test(step.text)) - 1,
+    'the Worker deploy must directly follow the container rollout preflight');
 });
 
 test('tag receipt accepts a reused tested image but rejects stale production, untested images and different layers', async () => {

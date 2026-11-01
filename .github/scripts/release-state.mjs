@@ -201,6 +201,33 @@ export async function restoreContainer(previous, state, env, fetchImpl = fetch) 
   }
   throw new Error('Container rollback rollout did not complete within five minutes');
 }
+// Wrangler produces a separate Cloudflare registry manifest FROM tested GHCR bytes.
+export function releaseDockerfile(images, sha) {
+  assert.match(sha ?? '', /^[a-f0-9]{40}$/, 'Missing release source SHA');
+  assert.equal(images.source, sha, 'Tested images are from another commit');
+  assert.equal(images.tested, true, 'Images are not tested');
+  assert.match(images.desktop_digest ?? '', /^sha256:[a-f0-9]{64}$/, 'Missing tested desktop digest');
+  assert.equal(images.desktop, `ghcr.io/ezilhq/ezil-os-desktop:sha-${sha}`, 'Tested desktop tag differs');
+  return `FROM ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}\nLABEL org.opencontainers.image.revision="${sha}"\n`;
+}
+// A deploy without --env rolls the top-level [[containers]] table, not [[env.*.containers]].
+function productionContainerImage(config) {
+  const lines = config.split('\n').map(line => line.trim());
+  const start = lines.indexOf('[[containers]]');
+  assert.ok(start >= 0 && lines.indexOf('[[containers]]', start + 1) < 0, 'Expected one top-level [[containers]] table');
+  const end = lines.findIndex((line, i) => i > start && line.startsWith('['));
+  const images = lines.slice(start + 1, end < 0 ? undefined : end).map(line => line.match(/^image\s*=\s*"([^"]*)"/)?.[1]).filter(Boolean);
+  assert.equal(images.length, 1, 'Expected one [[containers]] image');
+  return images[0];
+}
+// Last check before a container rollout: the checkout, tested receipt, Dockerfile.release
+// and production container table must all name the same tested build of the release.
+export function releasePreflight({sha, head, images, dockerfile, config}) {
+  const expected = releaseDockerfile(images, sha);
+  assert.equal(head, sha, 'Checkout is not the release commit');
+  assert.equal(dockerfile, expected, 'Dockerfile.release is not exactly the tested desktop of this release');
+  assert.equal(productionContainerImage(config), './Dockerfile.release', 'Production [[containers]] does not build Dockerfile.release');
+}
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const mode = process.argv[2];
   const env = process.env;
@@ -216,15 +243,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
   } else if (mode === 'prepare') {
     const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
-    assert.equal(images.source, env.EZIL_DEPLOY_SHA);
-    assert.equal(images.tested, true);
-    assert.match(images.desktop_digest, /^sha256:[a-f0-9]{64}$/);
-    assert.equal(images.desktop, `ghcr.io/ezilhq/ezil-os-desktop:sha-${env.EZIL_DEPLOY_SHA}`);
-    // Wrangler produces a separate Cloudflare registry manifest FROM tested GHCR bytes.
-    fs.writeFileSync('worker/Dockerfile.release', `FROM ghcr.io/ezilhq/ezil-os-desktop@${images.desktop_digest}\nLABEL org.opencontainers.image.revision="${env.EZIL_DEPLOY_SHA}"\n`);
+    fs.writeFileSync('worker/Dockerfile.release', releaseDockerfile(images, env.EZIL_DEPLOY_SHA));
     const config = fs.readFileSync('worker/wrangler.toml','utf8');
     assert.ok(config.includes('image = "./Dockerfile"'));
     fs.writeFileSync('worker/wrangler.toml', config.replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'));
+  } else if (mode === 'preflight') {
+    releasePreflight({sha:env.EZIL_DEPLOY_SHA, head:execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(),
+      images:JSON.parse(fs.readFileSync('tested-images.json', 'utf8')),
+      dockerfile:fs.readFileSync('worker/Dockerfile.release', 'utf8'), config:fs.readFileSync('worker/wrangler.toml', 'utf8')});
+    console.log(`Container rollout preflight passed for ${env.EZIL_DEPLOY_SHA}`);
   } else if (mode === 'vercel-rollback') {
     const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
     console.log(JSON.stringify(await restoreVercel(previous, env)));
