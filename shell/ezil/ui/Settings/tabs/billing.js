@@ -6,7 +6,8 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
+    accountCredits, accountDetailsHtml, staleCreditsCopy } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -15,6 +16,7 @@ const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 const STATES = new Set(['ok', 'low', 'exhausted', 'over_cap', 'unavailable']);
 const ATTENTION = new Set(['low', 'exhausted', 'over_cap']);
 const windows = new WeakMap();
+const FOCUS_RELOAD_MS = 5 * 60 * 1000;
 let upgradeSheetOpener = openUpgradeSheet;
 let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet };
 
@@ -294,8 +296,35 @@ export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     ] });
 }
 
-/** AI credits (D1 + founder 2026-10-29): whole numbers, denominator = the plan's grant for the period. */
-function aiMeterV3 (summary) {
+/**
+ * Identity credits (`ai.account`): every live grant in the total, from exact microcredit strings. The headline is
+ * whole credits (floor); the details are exact to 2 decimals with every microcredit in their titles. Neither number
+ * ever comes from the catalog: unreadable shows the last balance read for this user, as of its time, or "—".
+ */
+function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) {
+    const { ai, plan } = summary;
+    const view = accountCredits(ai.account, { previous: lastAccount, userId, planSku: plan?.sku });
+    if ( ! view ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: '—',
+        notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
+    const tone = view.empty ? 'danger' : ! view.stale && ai.state === 'low' ? 'warn' : 'ok';
+    const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+    const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
+    const periodEnd = ai.included && Number.isFinite(Date.parse(ai.included.periodEnd ?? '')) ? ai.included.periodEnd : null;
+    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
+        percent: view.percent, tone, notes: [
+            view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
+            { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
+            ...view.expiring.map(item => `${item.remaining} ${expiry[item.kind]} · expire ${dateLabel(item.expiresAt, true)}`),
+            pending ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
+            // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
+            view.stale ? '' : periodEnd ? dateLabel(periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(periodEnd)}.` : ''
+                : ai.grant?.per === 'period' && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? `Your plan adds ${whole(ai.grant.amount)} credits each month.` : '',
+            'Used by EZiL AI in Code and Chat.',
+        ] });
+}
+
+/** AI credits (D1 + founder 2026-10-29): whole numbers, denominator = the plan's grant for the period (an older server). */
+function aiMeterV3 (summary, options = {}) {
     const { ai, actions, plan } = summary;
     const enrollment = ai.enrollment ?? 'enrolled';
     const waiting = ai.waiting && safeCount(ai.waiting.credits) && ai.waiting.credits > 0 ? ai.waiting.credits : null;
@@ -309,6 +338,7 @@ function aiMeterV3 (summary) {
         return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: 'Setting up your AI credits…',
             notes: [waiting ? `${whole(waiting)} credits are added when this finishes.` : ''] });
     }
+    if ( 'account' in ai ) return aiAccountMeterV3(summary, options);
     const grant = ai.grant && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? ai.grant : null;
     const included = ai.included && safeCount(ai.included.remaining) && safeCount(ai.included.granted) ? ai.included : null;
     const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
@@ -477,10 +507,10 @@ function currentPlanV3 (summary, banner) {
         ${yourComputerV3(summary)}</section>`;
 }
 
-function usageCardV3 (summary, usage) {
+function usageCardV3 (summary, usage, options) {
     return `<section class="ezil-billing-section" data-role="billing-usage" aria-labelledby="billing-usage-heading">
         <div class="ezil-billing-section-head"><h3 id="billing-usage-heading">This period</h3><span class="ezil-billing-note">Resets ${encode(dateLabel(summary.fairUse.resetsAt, true))}</span></div>
-        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${timeV3Html(summary, usage)}${aiMeterV3(summary)}${storageMeterV3(summary)}</div></section>`;
+        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${timeV3Html(summary, usage)}${aiMeterV3(summary, options)}${storageMeterV3(summary)}</div></section>`;
 }
 
 function offerCardV3 (summary, offer) {
@@ -538,14 +568,15 @@ function topupV3 (summary) {
         <div class="ezil-billing-actions">${packs.map(pack => actionHtml('topup', `Add ${whole(pack.aiCredits)} credits — ${dollars(pack.totalCents, { compact: true })}${pack.discountPercent ? ` (save ${pack.discountPercent}%)` : ''}`, false, pack.sku)).join('')}</div></details>`;
 }
 
-export function summaryV3Html (summary, usage = null) {
+/** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
+export function summaryV3Html (summary, usage = null, options = {}) {
     const { plan, actions } = summary;
     const banner = bannerV3(summary);
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan, usage and payments.</p></div>
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
         ${currentPlanV3(summary, banner)}
-        ${usageCardV3(summary, usage)}
+        ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
         ${topupV3(summary)}
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
@@ -634,8 +665,16 @@ async function load ($win, state) {
         if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
             $body.html('<p>Billing isn\'t available yet.</p>');
         } else {
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data) : summaryHtml(result.data));
+            // The server names the user it read: another user's billing (a session changed elsewhere) is never shown.
+            const account = result.data.version === 3 ? result.data.ai?.account : undefined, userId = state.userId;
+            if ( typeof account?.userId === 'string' && typeof userId === 'string' && account.userId !== userId ) {
+                state.lastAccount = null;
+                throw new Error('summary for another user');
+            }
+            if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
+            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
             state.summary = result.data;
+            state.loadedAt = Date.now();
             startCountdown($win, state);
             if ( result.data.version === 3 ) void loadUsage($win, state, request);
         }
@@ -823,8 +862,15 @@ export default {
                 <a href="/refunds" target="_blank" rel="noopener">Refund policy</a><a href="/pricing" target="_blank" rel="noopener">Plans</a></footer></div>`;
     },
     init ($win) {
-        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openSection: null, timer: null, active: false, closed: false };
+        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openSection: null, timer: null, active: false, closed: false,
+            lastAccount: null, loadedAt: undefined, userId: null };
         windows.set($win.get(0), state);
+        // Back from another window or tab (a hosted checkout, a top-up) with a pane older than five minutes: read it again.
+        state.focus = () => {
+            if ( state.active && ! state.closed && ! state.loading && ! state.pending && ! state.sheet
+                && Date.now() - (state.loadedAt ?? 0) > FOCUS_RELOAD_MS ) void load($win, state);
+        };
+        window.addEventListener?.('focus', state.focus);
         const $pane = $win.find('[data-pane="billing"]');
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
@@ -851,6 +897,7 @@ export default {
             if ( ! this.disabled && this.checked ) void act($win, state, 'size', this.value);
         });
         $win.on('remove.billing', () => {
+            window.removeEventListener?.('focus', state.focus);
             state.closed = true;
             state.request++;
             stopCountdown(state);
@@ -863,6 +910,10 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
+            const userId = ctx?.payload?.user?.id ?? bootPayload()?.user?.id ?? null;
+            if ( userId !== state.userId ) state.lastAccount = null;
+            state.userId = userId;
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));
