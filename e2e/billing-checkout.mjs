@@ -76,7 +76,7 @@ function summary(pro) {
             renewsAt: pro ? end.toISOString() : null, cancelsAt: null },
         meters: {
             workspace: { usedSeconds: 0, allowanceSeconds: allowance, remainingSeconds: allowance, resetsAt: end.toISOString(), state: 'ok' },
-            storage: { usedBytes: '0', capBytes: '2000000000', state: 'ok', measuredAt: null },
+            storage: { usedBytes: null, capBytes: '2147483648', state: 'unavailable', measuredAt: null },
             ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
         },
         actions: { checkout: true, portal: pro, topup: false },
