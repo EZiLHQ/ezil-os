@@ -48,13 +48,17 @@ def used_bytes(path, statvfs=os.statvfs):
 
 
 def _guarded(cfg, lease):
-    """True only while runDir/guard-ok names this lease's epoch (as the agent's flush checks)."""
+    """True only while runDir/guard-ok names this lease's epoch. The stamp is the guard's full
+    marker (guard.new_marker: computerId, volumeId, fsUuid, generation, leaseEpoch, ...), so
+    its epoch keys are compared, as guard.committed_digest does, and its computer when named."""
     try:
         with open(os.path.join(cfg.runDir, "guard-ok"), encoding="utf-8") as f:
             stamp = json.load(f)
     except (OSError, ValueError):
         return False
-    return stamp == {"generation": lease.get("generation"), "leaseEpoch": lease.get("leaseEpoch")}
+    if not isinstance(stamp, dict) or any(stamp.get(k) != lease.get(k) or lease.get(k) is None for k in ("generation", "leaseEpoch")):
+        return False
+    return "computerId" not in stamp or str(stamp["computerId"]).lower() == str(lease.get("computerId", "")).lower()
 
 
 def measure(cfg, lease, is_mounted=guard.is_mounted, statvfs=os.statvfs):
@@ -79,7 +83,16 @@ def identity(lease):
 
 
 def endpoint(cfg, lease):
-    """The app origin this host enrolled with (pool.app_origin's rule) + PATH, or None."""
+    """The app origin this host enrolled with (pool.app_origin's rule) + PATH, or None. A
+    pool-claimed computer's lease.json is claim-shaped (no appOrigin): the origin its pool
+    record saved for THIS claim is the one it enrolled with."""
+    try:
+        record = pool.read_record(cfg)
+    except (Refused, OSError):
+        record = None
+    if (isinstance(record, dict) and record.get("appOrigin") and not lease.get("appOrigin")
+            and all(record["claim"].get(k) == lease.get(k) for k in ("computerId", "generation", "leaseEpoch"))):
+        lease = dict(lease, appOrigin=record["appOrigin"])
     try:
         return pool.app_origin(cfg, lease) + PATH
     except Refused:

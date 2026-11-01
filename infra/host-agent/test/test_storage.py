@@ -23,7 +23,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
-from ezil_host import agent as agentmod, config, storage  # noqa: E402
+from ezil_host import agent as agentmod, config, guard, storage  # noqa: E402
 
 CID = "11111111-1111-4111-8111-111111111111"
 LEASE = {"computerId": CID, "generation": 3, "leaseEpoch": 7}
@@ -48,8 +48,10 @@ def scratch(test):
 
 
 def stamp(cfg, lease=LEASE):
+    """What the guard really writes (guard.run_guard): its full marker for this lease."""
+    full = dict(lease, volumeId="vol-0123456789abcdef0", fsUuid="44444444-4444-4444-8444-444444444444")
     with open(os.path.join(cfg.runDir, "guard-ok"), "w") as f:
-        json.dump({"generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"]}, f)
+        json.dump(guard.new_marker(full, "sha256:" + "0" * 64, "i-0123456789abcdef0"), f)
 
 
 def vfs(blocks, bfree, frsize=4096, bavail=None):
@@ -92,11 +94,20 @@ class Meter(unittest.TestCase):
         self.assertEqual(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)), 60 * 4096)
         # Not a mountpoint (the host root disk would answer): nothing.
         self.assertIsNone(storage.measure(self.cfg, LEASE, is_mounted=lambda p: False, statvfs=vfs(100, 40)))
-        # A stamp for another epoch, or none: nothing.
-        stamp(self.cfg, {"generation": 3, "leaseEpoch": 6})
+        # A stamp for another epoch or another computer, a non-object stamp, or none: nothing.
+        stamp(self.cfg, dict(LEASE, leaseEpoch=6))
+        self.assertIsNone(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)))
+        stamp(self.cfg, dict(LEASE, computerId="22222222-2222-4222-8222-222222222222"))
+        self.assertIsNone(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)))
+        with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
+            json.dump([3, 7], f)
         self.assertIsNone(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)))
         os.unlink(os.path.join(self.cfg.runDir, "guard-ok"))
         self.assertIsNone(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)))
+        # The minimal epoch-only stamp older tests write is accepted too (no computer named).
+        with open(os.path.join(self.cfg.runDir, "guard-ok"), "w") as f:
+            json.dump({"generation": 3, "leaseEpoch": 7}, f)
+        self.assertEqual(storage.measure(self.cfg, LEASE, is_mounted=mounted, statvfs=vfs(100, 40)), 60 * 4096)
 
     def test_a_statvfs_failure_is_no_measurement(self):
         stamp(self.cfg)
@@ -140,6 +151,25 @@ class Wire(unittest.TestCase):
         self.assertIsNone(storage.endpoint(cfg, LEASE))
         cfg["enrollUrl"] = "http://app.example.org/api/compute/aws/enroll"   # never plain HTTP
         self.assertIsNone(storage.endpoint(cfg, LEASE))
+
+    def test_a_pool_claimed_computer_is_sampled_at_the_origin_its_claim_enrolled_with(self):
+        _, cfg = scratch(self)
+        # runDir/lease.json after a pool claim: pool.computer_lease's shape, then enrollment's routing.
+        claimed = {"v": 1, "computerId": CID, "generation": 3, "leaseEpoch": 7, "volumeId": "vol-0123456789abcdef0",
+                   "fsUuid": "44444444-4444-4444-8444-444444444444", "provision": False, "nonceConsumed": True,
+                   "sandboxId": "guac-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb", "zone": "ezil.org"}
+        record = {"appOrigin": "https://pool-app.example.org", "claim": {"computerId": CID, "generation": 3, "leaseEpoch": 7}}
+        self.assertEqual(storage.identity(claimed), (CID, 3, 7))
+        with mock.patch.object(storage.pool, "read_record", return_value=record):
+            self.assertEqual(storage.endpoint(cfg, claimed), "https://pool-app.example.org/api/compute/aws/storage")
+            self.assertTrue(storage.Sampler(cfg, claimed, KEY, print).enabled())
+            # Another epoch on the same host (a later cold boot): the baked origin, not the old claim's.
+            self.assertEqual(storage.endpoint(cfg, dict(claimed, leaseEpoch=8)), "https://app.example.org/api/compute/aws/storage")
+        with mock.patch.object(storage.pool, "read_record", side_effect=storage.Refused("pool_epoch_malformed")):
+            self.assertEqual(storage.endpoint(cfg, claimed), "https://app.example.org/api/compute/aws/storage")
+        cfg["enrollUrl"] = None
+        with mock.patch.object(storage.pool, "read_record", return_value=record):
+            self.assertEqual(storage.endpoint(cfg, claimed), "https://pool-app.example.org/api/compute/aws/storage")
 
 
 class Post(unittest.TestCase):
