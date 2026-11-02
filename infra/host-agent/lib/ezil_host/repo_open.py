@@ -41,7 +41,8 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
      ``state`` is never 'existing' and the body adds ``head`` (40 hex, or null for an unborn
      branch), ``clean`` (boolean) and ``remote`` (https://git-qa.ezil.work/<handle>/<name>.git),
      with folder = openFolder = the wrapper /workspace/projects/<repositoryId> and pathNotFound
-     false, vectors errorTable.workerResponses.okOpenAssessment; contract 1.0.3 E1-6),
+     false, vectors errorTable.workerResponses.okOpenAssessment; contract 1.0.3 E1-6; and branch
+     exactly the relay body's defaultBranch, r56),
      ``{status:200, body:{ok:true, state:'refreshed'}}`` (refresh), or
      ``{status, body:{ok:false, error}}`` with status from REPO_OPEN_STATUS (vectors
      errorTable.workerResponses.refusals). Host-originated codes: ``runtime_not_running`` (a
@@ -524,13 +525,15 @@ def kernel_refusal(value):
     return refusal("workspace_failed")
 
 
-def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT, remote=None):
+def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT, remote=None, branch=None):
     """A kernel commit result for op open, validated as strictly as the OS validates the
     Worker's 200 (vectors errorTable.workerResponses.okRule). Class assessment (contract 1.0.3,
     okAssessmentRule): exactly ASSESSMENT_OPEN_KEYS, never `existing`, head None or 40 lowercase
     hex, clean a bool, and head None exactly when empty and when the state is initialized_empty;
     E1-6: `folder` is the wrapper W the caller rebuilt (assessment_folder), openFolder is exactly W,
-    pathNotFound is False, and `remote` is exactly the caller's expected URL (assessment_remote)."""
+    pathNotFound is False, and `remote` is exactly the caller's expected URL (assessment_remote);
+    r56: the answer's branch is exactly `branch`, the defaultBranch of the caller's own body (the
+    kernel checks out exactly defaultBranch for class assessment). Personal ignores `branch`."""
     if value is None:
         return refusal("workspace_failed")
     if value.get("ok") is False:
@@ -548,6 +551,9 @@ def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT, remote=None):
         # E1-6: the editor root is the wrapper itself, never a folder below it, and the remote is this repository's.
         if (not _str(remote) or not _str(value["remote"]) or value["remote"] != remote
                 or value["openFolder"] != folder or value["pathNotFound"] is not False):
+            return refusal("workspace_failed")
+        # r56: exactly the branch this job's own body asked for.
+        if not _str(branch) or value["branch"] != branch:
             return refusal("workspace_failed")
     of = value.get("openFolder")
     if (value["ok"] is not True or value["state"] not in OPEN_STATES
@@ -1249,7 +1255,8 @@ class Flight:
                         # workspace_failed, because a re-open would answer folder_conflict
                         # (workerExec.assessment).
                         answer = self.failure(res, timeout_codes(b)["commit"]) or open_answer(
-                            last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT), self.remote)
+                            last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT), self.remote,
+                            b["defaultBranch"])
         else:
             # Step 10.
             self.step = "refresh"

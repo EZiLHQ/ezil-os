@@ -663,9 +663,11 @@ const redact = (text: unknown) => String(text).replaceAll(TOKEN, '<grant>');
 /** An assessment §8 body: class assessment on its own host, as the assessment route hands it over. */
 const assessmentInput = (patch: Record<string, unknown> = {}, receivedAt = NOW) => input({ class: 'assessment', gitHost: QA, ...patch }, receivedAt);
 /** E1-6: an assessment answers the wrapper W and git-qa's remote of the vectors' repository (okAssessmentContext). */
-const ASSESS_CTX = V.errorTable.workerResponses.okAssessmentContext as { folder: string; remote: string; repositoryId: string };
+const ASSESS_CTX = V.errorTable.workerResponses.okAssessmentContext as { folder: string; remote: string; repositoryId: string; defaultBranch: string };
 const ASSESS_W = ASSESS_CTX.folder;
 const ASSESS_REMOTE = ASSESS_CTX.remote;
+/** r56: an assessment answer names exactly the defaultBranch the request asked for. */
+const ASSESS_BRANCH = ASSESS_CTX.defaultBranch;
 const REPO_ID = V.fixtures.repositoryId as string;
 const OTHER_REPO_ID = V.fixtures.otherRepositoryId as string;
 const OTHER_W = `${AWS_REPO_OPEN_ROOT}/projects/${OTHER_REPO_ID}`;
@@ -720,7 +722,7 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
 
   it('every vectors okAssessmentCases row through an assessment open: a valid result is answered as is, an invalid one is workspace_failed', async () => {
     const cases = V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[];
-    expect(cases.length).toBe(32);
+    expect(cases.length).toBe(33);
     for (const c of cases) {
       const body = materialise(c.body, NOW) as Record<string, unknown>;
       const answer = await runAs(job(() => ok(body)), assessmentInput(), 'assessment');
@@ -736,7 +738,7 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
       carried += 1;
       expect(await run(job(() => ok(materialise(c.body, NOW))), input({ path: 'src' }))).toEqual(refusal('workspace_failed'));
     }
-    expect(carried).toBe(31);
+    expect(carried).toBe(32);
     for (const c of V.errorTable.workerResponses.okCases as { op: string; body: Record<string, unknown>; valid: boolean }[]) {
       if (c.op !== 'open') continue;
       expect(await runAs(job(() => ok(c.body)), assessmentInput(), 'assessment')).toEqual(refusal('workspace_failed'));
@@ -751,8 +753,8 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
   });
 
   it('E1-6 awsJobAnswer for class assessment: the wrapper exactly, no path, the expected remote exactly (pure)', () => {
-    const answer = (body: unknown, folder = ASSESS_W, remote: string | undefined = ASSESS_REMOTE) =>
-      awsJobAnswer({ status: 200, body }, 'open', folder, 'assessment', remote);
+    const answer = (body: unknown, folder = ASSESS_W, remote: string | undefined = ASSESS_REMOTE, branch: string | undefined = ASSESS_BRANCH) =>
+      awsJobAnswer({ status: 200, body }, 'open', folder, 'assessment', remote, branch);
     const clone = `${ASSESS_W}/repository`;
     expect(answer(okAssessment)).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
     for (const [label, bad] of [
@@ -767,6 +769,8 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
       ['a remote with a newline', { ...okAssessment, remote: `${ASSESS_REMOTE}\n` }],
       ['a null remote', { ...okAssessment, remote: null }],
       ['no remote (the 9-key shape)', (({ remote: _r, ...nine }) => nine)(okAssessment)],
+      ['a branch other than the request\'s defaultBranch (r56)', { ...okAssessment, branch: 'trunk' }],
+      ['a branch below the request\'s defaultBranch (r56)', { ...okAssessment, branch: `${ASSESS_BRANCH}/x` }],
     ] as [string, unknown][]) {
       expect([label, answer(bad)]).toEqual([label, refusal('workspace_failed')]);
     }
@@ -774,10 +778,17 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     expect(answer(okAssessment, OTHER_W)).toEqual(refusal('workspace_failed'));
     expect(answer(okAssessment, ASSESS_W, 'https://git-qa.ezil.work/acme/other.git')).toEqual(refusal('workspace_failed'));
     expect(awsJobAnswer({ status: 200, body: okAssessment }, 'open', ASSESS_W, 'assessment')).toEqual(refusal('workspace_failed'));
+    // r56: the expected branch is the caller's too: another one, or none, refuses; a trunk request accepts trunk
+    expect(answer(okAssessment, ASSESS_W, ASSESS_REMOTE, 'trunk')).toEqual(refusal('workspace_failed'));
+    expect(awsJobAnswer({ status: 200, body: okAssessment }, 'open', ASSESS_W, 'assessment', ASSESS_REMOTE)).toEqual(refusal('workspace_failed'));
+    const trunk = { ...okAssessment, branch: 'trunk' };
+    expect(answer(trunk, ASSESS_W, ASSESS_REMOTE, 'trunk')).toEqual({ status: 200, body: trunk } as RepoOpenAnswer);
+    // personal unchanged: any valid branch, and no expected branch is read
+    expect(awsJobAnswer({ status: 200, body: { ...okOpen, branch: 'trunk' } }, 'open', FOLDER)).toEqual({ status: 200, body: { ...okOpen, branch: 'trunk' } } as RepoOpenAnswer);
   });
 
   it('awsJobAnswer for class assessment: head, clean, empty and state agree (pure)', () => {
-    const answer = (body: unknown) => awsJobAnswer({ status: 200, body }, 'open', ASSESS_W, 'assessment', ASSESS_REMOTE);
+    const answer = (body: unknown) => awsJobAnswer({ status: 200, body }, 'open', ASSESS_W, 'assessment', ASSESS_REMOTE, ASSESS_BRANCH);
     const empty = { ...okAssessment, state: 'initialized_empty', empty: true, head: null };
     expect(answer(okAssessment)).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
     expect(answer(empty)).toEqual({ status: 200, body: empty } as RepoOpenAnswer);
@@ -819,9 +830,10 @@ const HANDLE = V.fixtures.handle as string;
 const NAME = V.fixtures.name as string;
 const jobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
   ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'personal', handle: HANDLE, name: NAME, acknowledged: true, ...patch });
-/** E1-6: an assessment job also names its repository (the wrapper its result must answer). */
+/** E1-6: an assessment job also names its repository (the wrapper its result must answer); r56: and its defaultBranch. */
 const assessJobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
-  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'assessment', handle: HANDLE, name: NAME, repositoryId: REPO_ID, acknowledged: true, ...patch });
+  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'assessment', handle: HANDLE, name: NAME, repositoryId: REPO_ID,
+    defaultBranch: ASSESS_BRANCH, acknowledged: true, ...patch });
 const running$ = (job: AwsRepoOpenJob): AwsRepoOpenStep => ({ state: 'running', job });
 const done$ = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
 /** A reply text whose grant is JSON-escaped: a raw scan passes it, JSON.parse decodes it to the grant. */
@@ -866,7 +878,7 @@ describe('E1-5: awsRepoOpenStart sends the start exactly once and answers a toke
   it('E1-6: an assessment job carries its repositoryId (exact keys per class); a personal job keeps its 7 keys', async () => {
     const a = await awsRepoOpenStart(assessmentInput({ repositoryId: OTHER_REPO_ID }), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment');
     expect(a).toEqual(running$(assessJobOf({ repositoryId: OTHER_REPO_ID })));
-    expect(Object.keys((a as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'acknowledged']);
+    expect(Object.keys((a as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'defaultBranch', 'acknowledged']);
     const r = await awsRepoOpenStart(assessmentInput({ op: 'refresh' }), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment');
     expect(r).toEqual(running$(assessJobOf({ op: 'refresh' })));
     const p = await awsRepoOpenStart(input(), SANDBOX, target, deps(edge(() => running()).fetch));
@@ -945,6 +957,25 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
     }
   });
 
+  it('r56: an assessment job carries the defaultBranch it started with, and the poll requires exactly that branch; a personal job and answer are unchanged', async () => {
+    const started = await awsRepoOpenStart(assessmentInput({ defaultBranch: 'trunk' }), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment');
+    expect(started).toEqual(running$(assessJobOf({ defaultBranch: 'trunk' })));
+    const poll = (job: AwsRepoOpenJob, result: Response) => awsRepoOpenPoll(job, target, deps(edge(() => result.clone()).fetch));
+    const trunk = { ...okAssessment, branch: 'trunk' };
+    expect(await poll(assessJobOf(), ok(trunk))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(assessJobOf({ defaultBranch: 'trunk' }), ok(trunk))).toEqual(done$({ status: 200, body: trunk } as RepoOpenAnswer));
+    expect(await poll(assessJobOf({ defaultBranch: 'trunk' }), ok(okAssessment))).toEqual(done$(refusal('workspace_failed')));
+    // a start answered done at once is held to the started body's defaultBranch too
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => ok(trunk)).fetch), 'assessment')).toEqual(done$(refusal('workspace_failed')));
+    // the one-call composition, through the same job
+    expect(await runAs(job(() => ok(trunk)), assessmentInput(), 'assessment')).toEqual(refusal('workspace_failed'));
+    expect(await runAs(job(() => ok(trunk)), assessmentInput({ defaultBranch: 'trunk' }), 'assessment')).toEqual({ status: 200, body: trunk } as RepoOpenAnswer);
+    // personal: the remote HEAD's branch may differ from defaultBranch; the job keeps its 7 keys
+    expect(await poll(jobOf(), ok({ ...okOpen, branch: 'trunk' }))).toEqual(done$({ status: 200, body: { ...okOpen, branch: 'trunk' } } as RepoOpenAnswer));
+    const p = await awsRepoOpenStart(input({ defaultBranch: 'trunk' }), SANDBOX, target, deps(edge(() => running()).fetch));
+    expect(p).toEqual(running$(jobOf()));
+  });
+
   it('E1-6: the poll rebuilds the wrapper and the remote from the job, never from the reply', async () => {
     const poll = (job: AwsRepoOpenJob, result: Response) => awsRepoOpenPoll(job, target, deps(edge(() => result.clone()).fetch));
     // the vectors repository's answer is wrong for a job of another repository, or of another name
@@ -967,6 +998,10 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
     ['a repositoryId that is a path', () => assessJobOf({ repositoryId: '../x' })],
     ['a null repositoryId', () => assessJobOf({ repositoryId: null as unknown as string })],
     ['an extra key on an assessment job', () => ({ ...assessJobOf(), path: 'src' })],
+    ['an assessment job without defaultBranch (r56)', () => (({ defaultBranch: _b, ...rest }) => rest)(assessJobOf())],
+    ['a personal job with a defaultBranch (r56)', () => ({ ...jobOf(), defaultBranch: ASSESS_BRANCH })],
+    ['a defaultBranch BRANCH_RE refuses (r56)', () => assessJobOf({ defaultBranch: 'a..b' })],
+    ['a null defaultBranch (r56)', () => assessJobOf({ defaultBranch: null as unknown as string })],
   ] as [string, () => unknown][])('E1-6: the job is untrusted (%s): invalid_request, no edge call', async (_label, make) => {
     const e = edge(() => ok(okAssessment));
     expect(await awsRepoOpenPoll(make() as AwsRepoOpenJob, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));

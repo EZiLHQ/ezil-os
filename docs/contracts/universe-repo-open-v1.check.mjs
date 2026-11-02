@@ -769,8 +769,10 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
         ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && c.cause.includes(needle) && c.errorCode === code), `classification: class assessment, ${needle} → ${code}`);
     }
     const X = W.okAssessmentContext;
-    eq(Object.keys(X), ['root', 'repositoryId', 'handle', 'name', 'folder', 'remote'], 'okAssessmentContext keys');
-    ok(X.root === C.WORKSPACE_ROOT_DEFAULT && X.repositoryId === V.fixtures.repositoryId && X.handle === V.fixtures.handle && X.name === V.fixtures.name, 'okAssessmentContext is the fixtures repository on the default root');
+    eq(Object.keys(X), ['root', 'repositoryId', 'handle', 'name', 'defaultBranch', 'folder', 'remote'], 'okAssessmentContext keys');
+    ok(X.root === C.WORKSPACE_ROOT_DEFAULT && X.repositoryId === V.fixtures.repositoryId && X.handle === V.fixtures.handle && X.name === V.fixtures.name
+        && X.defaultBranch === V.fixtures.defaultBranch, 'okAssessmentContext is the fixtures repository (and its defaultBranch) on the default root');
+    ok(/equals the defaultBranch of the request/.test(W.okAssessmentRule), 'okAssessmentRule: branch equals the request\'s defaultBranch (r56)');
     eq(X.folder, `${X.root}/${C.ASSESSMENT_DIR_TEMPLATE.replace('<repositoryId>', X.repositoryId)}`, 'okAssessmentContext folder is the wrapper W');
     eq(X.remote, C.ASSESSMENT_REMOTE_TEMPLATE.replace('<handle>', X.handle).replace('<name>', X.name), 'okAssessmentContext remote');
     const HEX40 = /^[0-9a-f]{40}$/;
@@ -781,7 +783,7 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
         if (Object.keys(b).length !== shape.keys.length || !shape.keys.every((k) => Object.hasOwn(b, k))) return false;
         if (b.ok !== true || !shape.states.includes(b.state)) return false;
         return b.folder === ctx.folder && b.openFolder === ctx.folder && b.pathNotFound === false
-            && typeof b.empty === 'boolean' && typeof b.branch === 'string' && R.BRANCH_RE(b.branch)
+            && typeof b.empty === 'boolean' && typeof b.branch === 'string' && R.BRANCH_RE(b.branch) && b.branch === ctx.defaultBranch
             && (b.head === null || (typeof b.head === 'string' && HEX40.test(b.head))) && typeof b.clean === 'boolean'
             && b.empty === (b.head === null) && (b.state === 'initialized_empty') === (b.head === null)
             && b.remote === ctx.remote;
@@ -790,7 +792,7 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     for (const c of assessmentCases) eq(assessmentOkValid(c.body), c.valid, `Worker assessment 200 ${c.why ?? 'valid'} ${JSON.stringify(c.body).slice(0, 60)}`);
     for (const valid of [true, false]) ok(assessmentCases.some((c) => c.valid === valid), `Worker assessment 200 needs a ${valid ? 'valid' : 'invalid'} case`);
     // the E1-6 rows: the clone, the personal folder or another repository's wrapper as folder; a foreign or missing remote
-    for (const why of ['folder is the clone, not the wrapper', 'the personal folder', "another repository's wrapper", 'remote on the personal host', 'remote of another repository', 'remote missing (the 9-key shape before E1-6)']) {
+    for (const why of ['folder is the clone, not the wrapper', 'the personal folder', "another repository's wrapper", 'remote on the personal host', 'remote of another repository', 'remote missing (the 9-key shape before E1-6)', "branch is not the request's defaultBranch (r56)"]) {
         ok(assessmentCases.some((c) => c.why === why && !c.valid), `Worker assessment 200 has the E1-6 row "${why}"`);
     }
     for (const c of assessmentCases) if (c.valid) ok(!workerOkValid('open', c.body), 'an assessment-shaped 200 is invalid for a personal open');

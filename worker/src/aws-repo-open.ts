@@ -87,8 +87,9 @@
  *    awsRepoOpenStart(input, name, target, deps, routeClass) → running + job | done + answer
  *    awsRepoOpenPoll(job, target, deps[, until])               → running + job | done + answer
  *  `job` (AwsRepoOpenJob) carries no grant: a caller persists it between sweeps and passes it back.
- *  For class assessment it also carries repositoryId (E1-6), the wrapper its result must name; its keys
- *  are exact per class (a personal job keeps its 7 keys).
+ *  For class assessment it also carries repositoryId (E1-6), the wrapper its result must name, and
+ *  defaultBranch (r56), the branch its result must name; its keys are exact per class (a personal job
+ *  keeps its 7 keys).
  *  Assessment callers (class assessment, 1.0.3, vectors workerExec.assessment): once the host has
  *  admitted the job, poll the SAME job until done (results stay readable JOB_TTL = 600 s) and never
  *  re-start it. A poll whose own `until` has passed sends nothing and answers running (job unchanged),
@@ -177,10 +178,12 @@ export function awsRepoOpenRelayBody(input: RepoOpenBody, jobId: string): string
  * keys, never `existing`, head null or 40 lowercase hex, clean a boolean, empty === (head === null),
  * and state initialized_empty exactly when head is null; E1-6: `folder` is the wrapper W the caller
  * rebuilt, openFolder is exactly W, pathNotFound is false, and `remote` is exactly the caller's
- * expected URL (no expected remote: refused). Each class's shape is invalid for the other.
+ * expected URL (no expected remote: refused); r56: `branch` is exactly `defaultBranch`, the one the
+ * caller's request asked for (the kernel checks out exactly that branch; none expected: refused).
+ * Personal reads neither. Each class's shape is invalid for the other.
  */
 export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: string,
-  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT, remote?: string): RepoOpenAnswer {
+  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT, remote?: string, defaultBranch?: string): RepoOpenAnswer {
   if (!isRepoOpenClass(cls) || !exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
   const { status, body } = result;
   if (isObject(body) && body.ok === false) {
@@ -222,6 +225,8 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
   if (typeof remote !== 'string' || body.remote !== remote || body.openFolder !== folder || body.pathNotFound !== false) {
     return refusal('workspace_failed');
   }
+  // r56: exactly the branch the request asked for.
+  if (typeof defaultBranch !== 'string' || body.branch !== defaultBranch) return refusal('workspace_failed');
   const { state, branch, empty, clean } = body as unknown as RepoOpenAssessmentOpenResult;
   return { status: 200, body: { ok: true, state, folder, openFolder: folder, pathNotFound: false, branch, empty, head: head as string | null, clean, remote } };
 }
@@ -266,17 +271,20 @@ export interface AwsRepoOpenJob {
   name: string;
   /** Class assessment only (E1-6): names the wrapper W the result must answer; absent for class personal. */
   repositoryId?: string;
+  /** Class assessment only (r56): the defaultBranch the result's branch must equal; absent for class personal. */
+  defaultBranch?: string;
   acknowledged: boolean;
 }
-/** Exact keys per class (E1-6): the personal job is unchanged; an assessment job adds repositoryId. */
+/** Exact keys per class (E1-6, r56): the personal job is unchanged; an assessment job adds repositoryId and defaultBranch. */
 const JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged'];
-const ASSESSMENT_JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'acknowledged'];
+const ASSESSMENT_JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'defaultBranch', 'acknowledged'];
 const validJob = (job: unknown): job is AwsRepoOpenJob =>
   isObject(job) && isRepoOpenClass(job.class) && exactKeys(job, job.class === 'assessment' ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
   && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
   && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh')
   && typeof job.handle === 'string' && HANDLE_RE.test(job.handle) && typeof job.name === 'string' && validName(job.name)
   && (job.class !== 'assessment' || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
+  && (job.class !== 'assessment' || (typeof job.defaultBranch === 'string' && validBranch(job.defaultBranch)))
   && typeof job.acknowledged === 'boolean';
 
 /** One start or poll: the job is still running (as far as that call can tell), or its final §8 answer. */
@@ -286,11 +294,11 @@ export type AwsRepoOpenStep =
 const finished = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
 /**
  * The job's result validated against what the job itself names (never the reply): the repository folder
- * (personal), or the wrapper W and the expected remote (assessment, E1-6).
+ * (personal), or the wrapper W, the expected remote (assessment, E1-6) and the defaultBranch (r56).
  */
 const jobAnswer = (result: unknown, job: AwsRepoOpenJob): RepoOpenAnswer => (job.class === 'assessment'
   ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class,
-    assessmentRemoteUrl(job.handle, job.name))
+    assessmentRemoteUrl(job.handle, job.name), job.defaultBranch)
   : awsJobAnswer(result, job.op, `${AWS_REPO_OPEN_ROOT}/repos/${job.handle}/${job.name}`, job.class));
 
 type EdgeCall = (path: string, until: number, payload?: string, token?: string) => Promise<EdgeReply>;
@@ -382,7 +390,7 @@ export async function awsRepoOpenStart(
     if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return finished(refusal('workspace_failed'));
     const digest = await sha256HexBytes(new TextEncoder().encode(relay));
     const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name,
-      ...(routeClass === 'assessment' ? { repositoryId: body.repositoryId } : {}), acknowledged: false };
+      ...(routeClass === 'assessment' ? { repositoryId: body.repositoryId, defaultBranch: body.defaultBranch } : {}), acknowledged: false };
 
     const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant.token);
     if (started.kind === 'leak') return finished(refusal('workspace_failed'));

@@ -66,6 +66,7 @@ ASSESS = {"class": "assessment", "gitHost": QA_HOST}       # relay overrides of 
 ASSESS_CTX = V["errorTable"]["workerResponses"]["okAssessmentContext"]
 ASSESS_W = ASSESS_CTX["folder"]
 ASSESS_REMOTE = ASSESS_CTX["remote"]
+ASSESS_BRANCH = ASSESS_CTX["defaultBranch"]   # r56: an assessment answer names exactly the body's defaultBranch
 OTHER_REPO_ID = V["fixtures"]["otherRepositoryId"]
 ASSESS_OK = {**OPEN_OK, "folder": ASSESS_W, "openFolder": ASSESS_W, "head": "0123456789abcdef" * 2 + "01234567", "clean": True,
              "remote": ASSESS_REMOTE}
@@ -261,11 +262,11 @@ class Vectors(unittest.TestCase):
         expected folder (W) and remote come from the context (as the job rebuilds them from its own
         body), never from the case body, so a row with another folder or remote cannot pass."""
         cases = V["errorTable"]["workerResponses"]["okAssessmentCases"]
-        self.assertEqual(len(cases), 32)
+        self.assertEqual(len(cases), 33)
         self.assertTrue(any(c["valid"] for c in cases) and any(not c["valid"] for c in cases))
         for case in cases:
             b = expand(case["body"])
-            ans = ro.open_answer(dict(b), ASSESS_W, "assessment", ASSESS_REMOTE)
+            ans = ro.open_answer(dict(b), ASSESS_W, "assessment", ASSESS_REMOTE, ASSESS_BRANCH)
             self.assertEqual(ans["status"] == 200, case["valid"], case.get("why", "valid"))
             if case["valid"]:
                 self.assertEqual(ans["body"], b)
@@ -273,7 +274,7 @@ class Vectors(unittest.TestCase):
                 self.assertNotEqual(ro.open_answer(dict(b), b["folder"])["status"], 200, "an assessment shape for a personal open")
         for case in V["errorTable"]["workerResponses"]["okCases"]:
             if case["op"] == "open" and case["valid"]:
-                self.assertNotEqual(ro.open_answer(dict(case["body"]), case["body"]["folder"], "assessment", ASSESS_REMOTE)["status"],
+                self.assertNotEqual(ro.open_answer(dict(case["body"]), case["body"]["folder"], "assessment", ASSESS_REMOTE, ASSESS_BRANCH)["status"],
                                     200, "a personal shape for an assessment open")
 
 
@@ -352,7 +353,7 @@ class Sanitizer(unittest.TestCase):
         failed = ro.refusal("workspace_failed")
         empty = {**ASSESS_OK, "state": "initialized_empty", "empty": True, "head": None}
         for good in (ASSESS_OK, {**ASSESS_OK, "clean": False}, empty):
-            self.assertEqual(ro.open_answer(dict(good), ASSESS_W, "assessment", ASSESS_REMOTE), {"status": 200, "body": good})
+            self.assertEqual(ro.open_answer(dict(good), ASSESS_W, "assessment", ASSESS_REMOTE, ASSESS_BRANCH), {"status": 200, "body": good})
         clone = ASSESS_W + "/" + ro.ASSESSMENT_CLONE_DIR
         nine = {k: v for k, v in ASSESS_OK.items() if k != "remote"}
         for bad in (OPEN_OK, {**ASSESS_OK, "state": "existing"}, {**ASSESS_OK, "head": None},
@@ -368,14 +369,22 @@ class Sanitizer(unittest.TestCase):
                     {**ASSESS_OK, "folder": FOLDER, "openFolder": FOLDER},
                     {**ASSESS_OK, "remote": "https://git-preview.ezil.work/acme/site.git"},
                     {**ASSESS_OK, "remote": "https://git-qa.ezil.work/acme/other.git"}, {**ASSESS_OK, "remote": ASSESS_REMOTE + "\n"},
-                    {**ASSESS_OK, "remote": None}, {**ASSESS_OK, "remote": 1}):
-            self.assertEqual(ro.open_answer(dict(bad), ASSESS_W, "assessment", ASSESS_REMOTE), failed, str(bad)[-80:])
+                    {**ASSESS_OK, "remote": None}, {**ASSESS_OK, "remote": 1},
+                    # r56: the branch the request asked for, exactly
+                    {**ASSESS_OK, "branch": "trunk"}, {**ASSESS_OK, "branch": ASSESS_BRANCH + "/x"}):
+            self.assertEqual(ro.open_answer(dict(bad), ASSESS_W, "assessment", ASSESS_REMOTE, ASSESS_BRANCH), failed, str(bad)[-80:])
         # the expected values come from the caller: another repository's wrapper, or no expected remote, refuses
-        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ro.assessment_folder(OTHER_REPO_ID), "assessment", ASSESS_REMOTE), failed)
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ro.assessment_folder(OTHER_REPO_ID), "assessment", ASSESS_REMOTE, ASSESS_BRANCH), failed)
         self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment"), failed, "an assessment without an expected remote")
-        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment", ro.assessment_remote("acme", "other")), failed)
-        self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, ASSESS_W, "assessment", ASSESS_REMOTE),
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment", ro.assessment_remote("acme", "other"), ASSESS_BRANCH), failed)
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment", ASSESS_REMOTE), failed, "an assessment without an expected branch")
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment", ASSESS_REMOTE, "trunk"), failed, "another expected branch")
+        trunk = {**ASSESS_OK, "branch": "trunk"}
+        self.assertEqual(ro.open_answer(dict(trunk), ASSESS_W, "assessment", ASSESS_REMOTE, "trunk"), {"status": 200, "body": trunk})
+        self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, ASSESS_W, "assessment", ASSESS_REMOTE, ASSESS_BRANCH),
                          ro.refusal("folder_conflict"))
+        # personal unchanged: any valid branch, whatever the request's defaultBranch
+        self.assertEqual(ro.open_answer({**OPEN_OK, "branch": "trunk"}, FOLDER), {"status": 200, "body": {**OPEN_OK, "branch": "trunk"}})
 
     def test_last_json_line(self):
         self.assertEqual(ro.last_json_line(b"noise\n" + line(OPEN_OK) + b"\n\n"), OPEN_OK)
@@ -1210,6 +1219,21 @@ class AssessmentJob(JobBase):
         self.assertEqual(self.run_job(fake, "9" * 64, repositoryId=OTHER_REPO_ID, **ASSESS), {"status": 200, "body": outs[0]})
         fake = FakeDesktop({"commit": line(outs[4])})
         self.assertEqual(self.run_job(fake, "8" * 64, name="other", **ASSESS), {"status": 200, "body": outs[4]})
+
+    def test_an_assessment_answer_names_the_default_branch_of_its_own_body(self):
+        """r56: the kernel checks out exactly defaultBranch for class assessment, so the job requires the commit
+        answer's branch to be its own body's defaultBranch; a personal open keeps any valid branch."""
+        trunk = {**ASSESS_OK, "branch": "trunk"}
+        fake = FakeDesktop({"commit": line(trunk)})
+        self.assertEqual(self.run_job(fake, "1" * 64, **ASSESS), ro.refusal("workspace_failed"))
+        self.assertEqual(fake.phases(), ["prepare", "commit", "release"])
+        fake = FakeDesktop({"commit": line(trunk)})
+        self.assertEqual(self.run_job(fake, "2" * 64, defaultBranch="trunk", **ASSESS), {"status": 200, "body": trunk})
+        fake = FakeDesktop({"commit": line(ASSESS_OK)})
+        self.assertEqual(self.run_job(fake, "3" * 64, defaultBranch="trunk", **ASSESS), ro.refusal("workspace_failed"))
+        # personal unchanged: the remote HEAD's branch may differ from defaultBranch
+        fake = FakeDesktop({"commit": line({**OPEN_OK, "branch": "trunk"})})
+        self.assertEqual(self.run_job(fake, "4" * 64), {"status": 200, "body": {**OPEN_OK, "branch": "trunk"}})
 
     def test_a_path_on_an_assessment_relay_is_refused_at_the_agent_and_nothing_runs(self):
         """E1-6: an assessment's editor root is always its wrapper; a relay with any path is refused."""
