@@ -31,6 +31,8 @@
  *  = the host's RELAY_MAX_BYTES): the §8 body plus `jobId`, nothing else:
  *    {"jobId":<64 hex>,"v":1,"op","repositoryId","handle","name","gitHost","defaultBranch","path",
  *     "grant":{"username","token","expiresAt","scope"}}
+ *  then (contract 1.0.3) "class" last, only when the route's body carried it; the host re-checks it
+ *  against the same closed class → git-host table and forwards it to the kernel only when present.
  *  `jobId` is 32 random bytes, hex, chosen here. Single use: exactly one start is ever sent with it
  *  (the host refuses a replay with `job_replayed`), and it names the job in every status read.
  *  The host runs the job under its own absolute deadline (HOST_DEADLINE_MS from admission, release
@@ -44,7 +46,8 @@
  *                  404 an edge without the route (an AMI before the Phase-B rollout)
  *  Status replies: 200 {"ok":true,"state":"running"} | 200 {"ok":true,"state":"done","result":R}
  *                  409 {"ok":false,"error":"job_unknown"}; 503 agent_unavailable
- *  R = the §8 answer itself, {"status","body"}: {200, okOpen | okRefresh} or
+ *  R = the §8 answer itself, {"status","body"}: {200, okOpen | okOpenAssessment (class assessment,
+ *      1.0.3: + head, clean) | okRefresh} or
  *      {REPO_OPEN_STATUS[code], {"ok":false,"error":code}}, code ∈ AWS_RESULT_ERROR_CODES (the host's
  *      runtime_not_running, workspace_not_ready, workspace_busy, workspace_failed, plus the kernel's).
  *
@@ -81,8 +84,10 @@ import {
   AWS_GATEWAY_HEADER, awsOriginHostname, decodeControlKey, isComputerId, signGatewayHeader, type AwsTunnelRecord, type FetchLike,
 } from './aws-origin';
 import {
-  BRANCH_RE, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, parseRepoOpenBody, refusal,
-  type RepoOpenAnswer, type RepoOpenBody, type RepoOpenErrorCode, type RepoOpenInput, type RepoOpenOpenResult,
+  ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
+  REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, isRepoOpenClass, parseRepoOpenBody, refusal, validBranch,
+  type RepoOpenAnswer, type RepoOpenAssessmentOpenResult, type RepoOpenBody, type RepoOpenClass, type RepoOpenErrorCode,
+  type RepoOpenInput, type RepoOpenOpenResult,
 } from './repo-open-u2';
 
 // ── protocol constants (AWS_RELAY_POLL_MS is compared with the vectors by the test) ──────────
@@ -109,24 +114,25 @@ export const AWS_RESULT_ERROR_CODES: readonly RepoOpenErrorCode[] = [...new Set(
 /** Anything grant-shaped in an edge reply. */
 const GRANT_SHAPE = /egg_[0-9a-f]{64}/;
 const CONTROL_CHAR = /[\u0000-\u001f\u007f]/;
-const OPEN_KEYS = ['ok', 'state', 'folder', 'openFolder', 'pathNotFound', 'branch', 'empty'];
-const OPEN_STATES = ['cloned', 'initialized_empty', 'existing'];
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 const exactKeys = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
   isObject(value) && Object.keys(value).length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(value, k));
-const validBranch = (s: string) => BRANCH_RE.test(s) && !s.includes('..') && !s.includes('//') && !s.endsWith('/')
-  && !s.endsWith('.lock') && !s.includes('/.') && !s.endsWith('.');
 const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 const byteLength = (text: string) => new TextEncoder().encode(text).byteLength;
 
-/** The §8 fields only, in the vectors' key order (re-validated before anything is relayed). */
+/**
+ * The §8 fields only, in the vectors' key order (re-validated before anything is relayed), then
+ * (1.0.3) `class` only when the input carried it (vectors workerRequest.classRule: the host forwards
+ * it to the kernel only when relayed), so a personal body without class relays byte-identically.
+ */
 function requestBody(input: RepoOpenBody): RepoOpenBody {
   return {
     v: 1, op: input.op, repositoryId: input.repositoryId, handle: input.handle, name: input.name, gitHost: input.gitHost,
     defaultBranch: input.defaultBranch, path: input.path,
     grant: { username: input.grant.username, token: input.grant.token, expiresAt: input.grant.expiresAt, scope: input.grant.scope },
+    ...(input.class !== undefined ? { class: input.class } : {}),
   };
 }
 
@@ -136,11 +142,15 @@ export function awsRepoOpenRelayBody(input: RepoOpenBody, jobId: string): string
 }
 
 /**
- * A finished job's result R = {status, body} for the op that was sent, validated as strictly as the
- * OS validates the Worker's 200; the answer is rebuilt from validated fields and the §8 table.
+ * A finished job's result R = {status, body} for the op and class that were sent, validated as
+ * strictly as the OS validates the Worker's 200; the answer is rebuilt from validated fields and the
+ * §8 table. Class assessment (1.0.3, vectors okOpenAssessment / okAssessmentRule): exactly the 9
+ * keys, never `existing`, head null or 40 lowercase hex, clean a boolean, empty === (head === null),
+ * and state initialized_empty exactly when head is null. Each class's shape is invalid for the other.
  */
-export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: string): RepoOpenAnswer {
-  if (!exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
+export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: string,
+  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT): RepoOpenAnswer {
+  if (!isRepoOpenClass(cls) || !exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
   const { status, body } = result;
   if (isObject(body) && body.ok === false) {
     const code = body.error as RepoOpenErrorCode;
@@ -152,7 +162,10 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     return exactKeys(body, ['ok', 'state']) && body.state === 'refreshed'
       ? { status: 200, body: { ok: true, state: 'refreshed' } } : refusal('workspace_failed');
   }
-  if (!exactKeys(body, OPEN_KEYS) || !OPEN_STATES.includes(body.state as string)
+  const assessment = cls === 'assessment';
+  const keys: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_KEYS : OPEN_RESULT_KEYS;
+  const states: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_STATES : OPEN_RESULT_STATES;
+  if (!exactKeys(body, keys) || !states.includes(body.state as string)
     || body.folder !== folder || typeof body.openFolder !== 'string'
     || !(body.openFolder === folder || body.openFolder.startsWith(`${folder}/`))
     // The OS app's `absolute` rule (worker-client.ts validateWorkerOk): no '.' or '..' segment.
@@ -164,8 +177,18 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     || GRANT_SHAPE.test(body.openFolder) || GRANT_SHAPE.test(body.branch)) {
     return refusal('workspace_failed');
   }
-  const { state, openFolder, pathNotFound, branch, empty } = body as unknown as RepoOpenOpenResult;
-  return { status: 200, body: { ok: true, state, folder, openFolder, pathNotFound, branch, empty } };
+  if (!assessment) {
+    const { state, openFolder, pathNotFound, branch, empty } = body as unknown as RepoOpenOpenResult;
+    return { status: 200, body: { ok: true, state, folder, openFolder, pathNotFound, branch, empty } };
+  }
+  const head: unknown = body.head;
+  const unborn = head === null;
+  if (!(unborn || (typeof head === 'string' && HEAD_RE.test(head))) || typeof body.clean !== 'boolean'
+    || body.empty !== unborn || (body.state === 'initialized_empty') !== unborn) {
+    return refusal('workspace_failed');
+  }
+  const { state, openFolder, pathNotFound, branch, empty, clean } = body as unknown as RepoOpenAssessmentOpenResult;
+  return { status: 200, body: { ok: true, state, folder, openFolder, pathNotFound, branch, empty, head: head as string | null, clean } };
 }
 
 /** A job envelope: exactly {ok:true, state:'running'} or {ok:true, state:'done', result}. */
@@ -194,13 +217,17 @@ type EdgeReply =
 
 /**
  * Steps 2-11 of §8 for an AWS computer: relay, poll, validate. `input` is the route's verified
- * request; `target` is what `awsControlTarget` returned for `sandboxName` (non-null).
+ * request; `target` is what `awsControlTarget` returned for `sandboxName` (non-null); `routeClass`
+ * is the class the CALLING route serves (1.0.3), never read from the body: the body is re-validated
+ * against it (its class must be routeClass and its gitHost routeClass's host), and the answer is
+ * validated against that class's shape.
  */
 export async function handleAwsRepoOpen(
   input: RepoOpenInput,
   sandboxName: string,
   target: AwsRepoOpenTarget | Response,
   deps: AwsRepoOpenDeps,
+  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
 ): Promise<RepoOpenAnswer> {
   // A refusal from awsControlTarget (claims mismatch, origin unavailable or starting): its body is
   // never read or forwarded.
@@ -213,7 +240,7 @@ export async function handleAwsRepoOpen(
 
   // Never relay a field the Worker would refuse, whoever the caller is.
   const body = requestBody(input);
-  if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), now())) return refusal('invalid_request');
+  if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), now(), routeClass)) return refusal('invalid_request');
   const { record, zone } = target;
   const key = decodeControlKey(record.controlKey);
   // The gw1 binding must be signable before anything is sent (awsOriginHostname checks the rest).
@@ -303,7 +330,7 @@ export async function handleAwsRepoOpen(
       state = read.data.state;
       result = read.data.result;
     }
-    return awsJobAnswer(result, body.op, folder);
+    return awsJobAnswer(result, body.op, folder, routeClass);
   } catch {
     return refusal('workspace_failed');
   }

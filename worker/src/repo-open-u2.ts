@@ -1,31 +1,54 @@
 /**
- * The u2 repo-open protocol (contract universe-repo-open-v1, §8 body and answers, §13): ONLY the
- * symbols the AWS relay (A2r) needs, taken unchanged from the u2 Worker module (2ca90211
- * worker/src/repo-open.ts). INERT: no route is mounted here, and nothing but the AWS relay imports it.
+ * The u2 repo-open protocol (contract universe-repo-open-v1 1.0.3, §8 body and answers, §13): ONLY the
+ * symbols the AWS relay (A2r) needs, taken from the u2 Worker module (2ca90211 worker/src/repo-open.ts)
+ * and updated for 1.0.3. INERT: no route is mounted here, and nothing but the AWS relay imports it.
  *
  * Why a separate module: in this tree `./repo-open` is open-project's live module (the assessment
  * routes import it), not the u2 one, so the u2 symbols cannot live under that path. Nothing here is
  * the Cloudflare in-sandbox runner (runFlight, the kernel assets, the DO lock discipline): the AWS host
  * agent runs the kernel (infra/host-agent/lib/ezil_host/repo_open.py).
+ *
+ * 1.0.3 (vectors workerRequest.classRule, okAssessmentRule):
+ *  - The §8 body may carry `class: 'personal'|'assessment'`; absent = personal. Class → git host is a
+ *    closed table (REPO_OPEN_CLASS_GIT_HOSTS). The parser takes the ROUTE's class: the body's
+ *    effective class must equal it, and gitHost must be exactly that class's host. There is no union
+ *    allow-list: a personal route never accepts git-qa, an assessment route never accepts git-preview,
+ *    and an assessment body must carry `class` (so the host and the kernel see it too).
+ *  - An assessment open answers okOpenAssessment: the 7 personal keys plus `head` (40 lowercase hex,
+ *    or null for an unborn branch) and `clean`, never state `existing`.
  */
 
-// ── constants ────────────────────────────────────────────────────────────────
+// ── constants (each compared with the vectors by repo-open-u2.test.ts) ─────────
 
-export const REPO_OPEN_GIT_HOSTS: readonly string[] = ['git-preview.ezil.work'];
 export const WORKER_DEADLINE_MS = 105_000;
 export const WORKER_ACCEPT_EXPIRY_MAX_MS = 960_000;
 export const WORKER_REQUEST_MAX_BYTES = 4_096;
+
+/** vectors constants REPO_OPEN_CLASSES / REPO_OPEN_CLASS_DEFAULT (1.0.3). */
+export const REPO_OPEN_CLASSES = Object.freeze(['personal', 'assessment'] as const);
+export type RepoOpenClass = (typeof REPO_OPEN_CLASSES)[number];
+export const REPO_OPEN_CLASS_DEFAULT: RepoOpenClass = 'personal';
+/** vectors constants REPO_OPEN_CLASS_GIT_HOSTS: the one git host each class may name. */
+export const REPO_OPEN_CLASS_GIT_HOSTS: Readonly<Record<RepoOpenClass, string>> = Object.freeze({
+  personal: 'git-preview.ezil.work',
+  assessment: 'git-qa.ezil.work',
+});
+/** A known class: a member of the closed list, never an inherited property name ('constructor', '__proto__'). */
+export const isRepoOpenClass = (value: unknown): value is RepoOpenClass =>
+  typeof value === 'string' && (REPO_OPEN_CLASSES as readonly string[]).includes(value);
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const HANDLE_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/;
 export const NAME_RE = /^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$/;
 export const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$/;
 export const GRANT_RE = /^egg_[0-9a-f]{64}$/;
+/** okAssessmentRule: a head is 40 lowercase hex. */
+export const HEAD_RE = /^[0-9a-f]{40}$/;
 const PATH_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 
-const validName = (s: string) => NAME_RE.test(s) && !s.includes('..') && !s.endsWith('.git');
-const validBranch = (s: string) => BRANCH_RE.test(s) && !s.includes('..') && !s.includes('//') && !s.endsWith('/')
+export const validName = (s: string) => NAME_RE.test(s) && !s.includes('..') && !s.endsWith('.git');
+export const validBranch = (s: string) => BRANCH_RE.test(s) && !s.includes('..') && !s.includes('//') && !s.endsWith('/')
   && !s.endsWith('.lock') && !s.includes('/.') && !s.endsWith('.');
 
 /** The decoded-path checks of app-link.js `pathProblem` (vectors `link.path`); null when acceptable. */
@@ -59,12 +82,23 @@ export const REPO_OPEN_STATUS: Readonly<Record<RepoOpenErrorCode, number>> = {
   workspace_failed: 500, invalid_signature: 401, invalid_request: 400,
 };
 
+/** vectors errorTable.workerResponses.okOpen (keys in order, states). */
+export const OPEN_RESULT_KEYS = Object.freeze(['ok', 'state', 'folder', 'openFolder', 'pathNotFound', 'branch', 'empty'] as const);
+export const OPEN_RESULT_STATES = Object.freeze(['cloned', 'initialized_empty', 'existing'] as const);
+/** vectors errorTable.workerResponses.okOpenAssessment (1.0.3): never `existing`. */
+export const ASSESSMENT_OPEN_RESULT_KEYS = Object.freeze([...OPEN_RESULT_KEYS, 'head', 'clean'] as const);
+export const ASSESSMENT_OPEN_RESULT_STATES = Object.freeze(['cloned', 'initialized_empty'] as const);
+
 export interface RepoOpenOpenResult {
   ok: true; state: 'cloned' | 'initialized_empty' | 'existing'; folder: string; openFolder: string;
   pathNotFound: boolean; branch: string; empty: boolean;
 }
+/** An assessment open's 200 body (okOpenAssessment): head null exactly when the branch is unborn (empty). */
+export interface RepoOpenAssessmentOpenResult extends Omit<RepoOpenOpenResult, 'state'> {
+  state: 'cloned' | 'initialized_empty'; head: string | null; clean: boolean;
+}
 export type RepoOpenAnswer =
-  | { status: 200; body: RepoOpenOpenResult | { ok: true; state: 'refreshed' } }
+  | { status: 200; body: RepoOpenOpenResult | RepoOpenAssessmentOpenResult | { ok: true; state: 'refreshed' } }
   | { status: number; body: { ok: false; error: RepoOpenErrorCode } };
 
 /** The refusal body is built from the fixed code itself; no upstream text ever reaches it. */
@@ -83,27 +117,41 @@ export interface RepoOpenGrant { username: 'ezil'; token: string; expiresAt: str
 export interface RepoOpenBody {
   v: 1; op: 'open' | 'refresh'; repositoryId: string; handle: string; name: string; gitHost: string;
   defaultBranch: string; path: string | null; grant: RepoOpenGrant;
+  /** 1.0.3 (vectors workerRequest.optionalKeys): absent = personal. */
+  class?: RepoOpenClass;
 }
 export interface RepoOpenInput extends RepoOpenBody { receivedAt: number }
 
 const BODY_KEYS = ['v', 'op', 'repositoryId', 'handle', 'name', 'gitHost', 'defaultBranch', 'path', 'grant'];
+const OPTIONAL_BODY_KEYS = ['class'];
 const GRANT_KEYS = ['username', 'token', 'expiresAt', 'scope'];
-const exactKeys = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
-  !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length
-  && keys.every((k) => Object.prototype.hasOwnProperty.call(value, k));
+const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key);
+const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+/** Every required key, each own, and nothing outside required + optional. */
+const strictKeys = (value: unknown, keys: readonly string[], optional: readonly string[] = []): value is Record<string, unknown> =>
+  isObject(value) && keys.every((k) => hasOwn(value, k))
+  && Object.keys(value).every((k) => keys.includes(k) || optional.includes(k));
 const str = (value: unknown): value is string => typeof value === 'string';
 
-/** Strict §8 body: exact keys, every field re-validated, grant expiry in (now, now + 16 min]. */
-export function parseRepoOpenBody(raw: Uint8Array, now: number): RepoOpenBody | null {
+/**
+ * Strict §8 body for a route that serves `routeClass`: required keys exactly, plus at most the
+ * optional `class`; every field re-validated; grant expiry in (now, now + 16 min]. The body's class
+ * (absent = personal) must BE the route's class, and gitHost must be exactly that class's host
+ * (vectors workerRequest.classRule: a closed table, refused in both directions).
+ */
+export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: RepoOpenClass): RepoOpenBody | null {
+  if (!isRepoOpenClass(routeClass)) return null;
   if (raw.byteLength > WORKER_REQUEST_MAX_BYTES) return null;
   let b: unknown;
   try { b = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(raw)); } catch { return null; }
-  if (!exactKeys(b, BODY_KEYS) || !exactKeys(b.grant, GRANT_KEYS)) return null;
+  if (!strictKeys(b, BODY_KEYS, OPTIONAL_BODY_KEYS) || !strictKeys(b.grant, GRANT_KEYS)) return null;
   const g = b.grant;
+  const bodyClass: unknown = hasOwn(b, 'class') ? b.class : REPO_OPEN_CLASS_DEFAULT;
   const expiresAt = str(g.expiresAt) && ISO_RE.test(g.expiresAt) ? Date.parse(g.expiresAt) : NaN;
   const ok = b.v === 1 && (b.op === 'open' || b.op === 'refresh') && str(b.repositoryId) && UUID_RE.test(b.repositoryId)
     && str(b.handle) && HANDLE_RE.test(b.handle) && str(b.name) && validName(b.name)
-    && str(b.gitHost) && REPO_OPEN_GIT_HOSTS.includes(b.gitHost) && str(b.defaultBranch) && validBranch(b.defaultBranch)
+    && bodyClass === routeClass && str(b.gitHost) && b.gitHost === REPO_OPEN_CLASS_GIT_HOSTS[routeClass]
+    && str(b.defaultBranch) && validBranch(b.defaultBranch)
     && (b.path === null || (b.op === 'open' && str(b.path) && pathProblem(b.path) === null))
     && g.username === 'ezil' && str(g.token) && GRANT_RE.test(g.token) && (g.scope === 'write' || g.scope === 'read')
     && Number.isFinite(expiresAt) && expiresAt > now && expiresAt <= now + WORKER_ACCEPT_EXPIRY_MAX_MS;

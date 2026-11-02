@@ -27,7 +27,7 @@ import {
 } from './aws-repo-open';
 import {
   REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse,
-  type RepoOpenAnswer, type RepoOpenErrorCode, type RepoOpenInput,
+  type RepoOpenAnswer, type RepoOpenClass, type RepoOpenErrorCode, type RepoOpenInput,
 } from './repo-open-u2';
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
@@ -647,5 +647,121 @@ describe('target and module boundaries', () => {
     const importers = readdirSync(here('.')).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && f !== 'aws-repo-open.ts')
       .filter((f) => readFileSync(here(`./${f}`), 'utf8').includes('aws-repo-open'));
     expect(importers).toEqual([]);
+  });
+});
+
+// ── contract 1.0.3: the route class (added on the carried cf27920b suite above) ─────────────
+
+const QA = V.constants.GIT_ASSESSMENT_HOST as string;
+/** An assessment §8 body: class assessment on its own host, as the assessment route hands it over. */
+const assessmentInput = (patch: Record<string, unknown> = {}, receivedAt = NOW) => input({ class: 'assessment', gitHost: QA, ...patch }, receivedAt);
+const okAssessment = { ...okOpen, head: 'a'.repeat(40), clean: true };
+const runAs = (e: ReturnType<typeof edge>, i: RepoOpenInput, routeClass: RepoOpenClass | undefined, extra: Partial<AwsRepoOpenDeps> = {}) =>
+  handleAwsRepoOpen(i, SANDBOX, target, deps(e.fetch, extra), routeClass);
+
+describe('contract 1.0.3: the route class decides the git host and the answer shape', () => {
+  it('an assessment open relays class last, polls, and answers head and clean', async () => {
+    const e = job(() => ok(okAssessment), 2);
+    expect(await runAs(e, assessmentInput(), 'assessment')).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+    const sent = e.calls[0]!.init.body as string;
+    expect(e.calls[0]!.url).toBe(`https://${HOST}${AWS_REPO_OPEN_PATH}${sha256(sent)}`);
+    const relayed = JSON.parse(sent);
+    expect(Object.keys(relayed)).toEqual(['jobId', ...V.workerRequest.keys, ...V.workerRequest.optionalKeys]);
+    expect([relayed.class, relayed.gitHost]).toEqual(['assessment', QA]);
+    const { receivedAt: _r, ...wire } = assessmentInput();
+    expect(relayed).toEqual({ ...wire, jobId: JOB });
+    expect(sent).toBe(JSON.stringify(relayed));
+    expect(e.reads().length).toBe(2);
+  });
+
+  it('a personal body without class relays byte-identically to 1.0.2; an explicit personal class is relayed last', async () => {
+    const e = job(() => ok(okOpen));
+    expect(await runAs(e, input(), 'personal')).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
+    const { receivedAt: _r, ...wire } = input();
+    expect(e.calls[0]!.init.body).toBe(JSON.stringify({ jobId: JOB, ...wire }));
+    expect(JSON.parse(e.calls[0]!.init.body as string)).not.toHaveProperty('class');
+    const explicit = job(() => ok(okOpen));
+    expect(await runAs(explicit, input({ class: 'personal' }), undefined)).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
+    expect(Object.keys(JSON.parse(explicit.calls[0]!.init.body as string)).at(-1)).toBe('class');
+  });
+
+  it.each([
+    ['an assessment body on the default (personal) route', () => assessmentInput(), undefined],
+    ['an assessment body on the personal route', () => assessmentInput(), 'personal'],
+    ['a personal body on the assessment route', () => input(), 'assessment'],
+    ['a class-less body on git-qa on the assessment route (an assessment body must carry class)', () => input({ gitHost: QA }), 'assessment'],
+    ['a class-less body on git-qa on the personal route', () => input({ gitHost: QA }), 'personal'],
+    ['class assessment on git-preview', () => input({ class: 'assessment' }), 'assessment'],
+    ['class personal on git-qa', () => input({ class: 'personal', gitHost: QA }), 'personal'],
+    ['an unknown route class', () => assessmentInput(), 'exam'],
+    ['an inherited property name as the class', () => input({ class: 'constructor', gitHost: QA }), 'constructor'],
+  ] as [string, () => RepoOpenInput, RepoOpenClass | undefined][])('never relays a body outside the route class (%s): invalid_request, no edge call', async (_label, make, routeClass) => {
+    const e = job(() => ok(okAssessment));
+    expect(await runAs(e, make(), routeClass)).toEqual(refusal('invalid_request'));
+    expect(e.calls).toEqual([]);
+  });
+
+  it('every vectors okAssessmentCases row through an assessment open: a valid result is answered as is, an invalid one is workspace_failed', async () => {
+    const cases = V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[];
+    expect(cases.length).toBe(16);
+    for (const c of cases) {
+      const body = materialise(c.body, NOW) as Record<string, unknown>;
+      const answer = await runAs(job(() => ok(body)), assessmentInput({ path: 'src' }), 'assessment');
+      expect([c.why ?? 'valid', answer]).toEqual([c.why ?? 'valid', c.valid ? { status: 200, body } as RepoOpenAnswer : refusal('workspace_failed')]);
+    }
+  });
+
+  it('the two shapes exclude each other: an assessment-shaped result for a personal open, a personal one for an assessment open', async () => {
+    let carried = 0;
+    for (const c of V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown> }[]) {
+      // The one row without head and clean is the 'personal shape' row: valid for personal by construction.
+      if (!('head' in c.body) && !('clean' in c.body)) continue;
+      carried += 1;
+      expect(await run(job(() => ok(materialise(c.body, NOW))), input({ path: 'src' }))).toEqual(refusal('workspace_failed'));
+    }
+    expect(carried).toBe(15);
+    for (const c of V.errorTable.workerResponses.okCases as { op: string; body: Record<string, unknown>; valid: boolean }[]) {
+      if (c.op !== 'open') continue;
+      expect(await runAs(job(() => ok(c.body)), assessmentInput({ path: 'src' }), 'assessment')).toEqual(refusal('workspace_failed'));
+    }
+  });
+
+  it('an assessment refresh answers refreshed; an assessment refusal keeps its code and §8 status', async () => {
+    const e = job(() => ok({ ok: true, state: 'refreshed' }));
+    expect(await runAs(e, assessmentInput({ op: 'refresh' }), 'assessment')).toEqual({ status: 200, body: { ok: true, state: 'refreshed' } });
+    expect(JSON.parse(e.calls[0]!.init.body as string).class).toBe('assessment');
+    for (const code of AWS_RESULT_ERROR_CODES) expect(await runAs(job(() => refused(code)), assessmentInput(), 'assessment')).toEqual(refusal(code));
+  });
+
+  it('awsJobAnswer for class assessment: head, clean, empty and state agree (pure)', () => {
+    const answer = (body: unknown) => awsJobAnswer({ status: 200, body }, 'open', FOLDER, 'assessment');
+    const empty = { ...okAssessment, state: 'initialized_empty', empty: true, head: null };
+    expect(answer(okAssessment)).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+    expect(answer(empty)).toEqual({ status: 200, body: empty } as RepoOpenAnswer);
+    expect(answer({ ...okAssessment, clean: false })).toEqual({ status: 200, body: { ...okAssessment, clean: false } } as RepoOpenAnswer);
+    for (const bad of [
+      { ...okAssessment, state: 'existing' },
+      { ...okAssessment, head: null },
+      { ...empty, head: 'a'.repeat(40) },
+      { ...okAssessment, empty: true },
+      { ...empty, empty: false },
+      { ...empty, state: 'cloned' },
+      { ...okAssessment, head: 'A'.repeat(40) },
+      { ...okAssessment, head: 'a'.repeat(64) },
+      { ...okAssessment, head: 7 },
+      { ...okAssessment, clean: 'true' },
+      { ...okAssessment, clean: null },
+      { ...okAssessment, extra: 1 },
+      okOpen,
+    ]) {
+      expect(answer(bad)).toEqual(refusal('workspace_failed'));
+    }
+    // The personal default is unchanged, and refuses the assessment shape.
+    expect(awsJobAnswer({ status: 200, body: okOpen }, 'open', FOLDER)).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
+    expect(awsJobAnswer({ status: 200, body: okAssessment }, 'open', FOLDER)).toEqual(refusal('workspace_failed'));
+    // A class outside the closed list validates nothing.
+    for (const cls of ['exam', 'constructor']) {
+      expect(awsJobAnswer({ status: 200, body: okOpen }, 'open', FOLDER, cls as RepoOpenClass)).toEqual(refusal('workspace_failed'));
+    }
   });
 });
