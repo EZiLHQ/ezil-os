@@ -313,6 +313,16 @@ COPY ezil-models/models.json /etc/ezil/models.json
 ENV EZIL_MODELS_CONFIG=/etc/ezil/models.json
 RUN node -e "const fs=require('fs'),raw=fs.readFileSync('/etc/ezil/models.json','utf8'),j=JSON.parse(raw);if(!j.providers||!Object.keys(j.providers).length||!Array.isArray(j.models)||!j.models.length)throw new Error('models.json needs providers and models');if(/ANTHROPIC_|OPENAI_|AZURE_|sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/.test(raw))throw new Error('models.json contains a direct-provider reference or literal secret');for(const p of Object.values(j.providers)){if(p.type!=='ezil-gateway'||p.baseUrl!=='{env:EZIL_AI_BASE_URL}'||p.apiKey!=='{env:EZIL_AI_PROXY_TOKEN}'||Object.keys(p).some(k=>!['type','baseUrl','apiKey'].includes(k)))throw new Error('providers must use only the EZiL gateway environment references');}if(j.models.filter(m=>m.default===true).length!==1||j.models.some(m=>!j.providers[m.provider]))throw new Error('models need valid providers and exactly one default');console.log('models.json gateway-only config verified')"
 
+# Per-tab Code folder continuity: the editor tells the EZiL shell (and only an
+# allow-listed shell origin) which folder this document opened, and same-frame
+# Open Folder replaces the iframe's history entry. MIT upstream code; exact
+# anchors with count gates, independent of the copilot-chat patch above (each
+# anchor occurs once in the pristine and the copilot-patched workbench).
+COPY code-folder-bridge/patch-folder-bridge.sh /usr/local/lib/ezil/patch-folder-bridge.sh
+RUN chmod 0755 /usr/local/lib/ezil/patch-folder-bridge.sh \
+  && /usr/local/lib/ezil/patch-folder-bridge.sh /usr/lib/code-server/lib/vscode \
+  && /usr/local/lib/ezil/patch-folder-bridge.sh --verify /usr/lib/code-server/lib/vscode
+
 # ── EZiL OS desktop assets + deterministic validators ────────────────────────
 # Explicit Openbox config (app-switch keybindings + root menu), the mandatory
 # native-browser landing page (deterministic, non-blank content/title), and the
