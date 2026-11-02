@@ -798,6 +798,30 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     for (const c of assessmentCases) if (c.valid) ok(!workerOkValid('open', c.body), 'an assessment-shaped 200 is invalid for a personal open');
     for (const c of W.okCases) if (c.op === 'open' && c.valid) ok(!assessmentOkValid(c.body), 'a personal-shaped 200 is invalid for an assessment open');
     for (const op of ['open', 'refresh']) for (const valid of [true, false]) ok(W.okCases.some((c) => c.op === op && c.valid === valid), `Worker 200 needs a ${valid ? 'valid' : 'invalid'} ${op} case`);
+    // r56 (slot1 D1's consumer rule): the origin of every outcome a consumer can see on the AWS path.
+    const O = E.awsOutcomeOrigin;
+    eq(O.values, ['worker', 'host', 'guest'], 'awsOutcomeOrigin values');
+    eq(Object.keys(O.codes), W.refusals.flatMap((r) => r.error), 'awsOutcomeOrigin codes are exactly the Worker refusal codes, in table order');
+    eq(Object.keys(O.ok), [...new Set([...W.okOpen.states, ...W.okRefresh.states])], 'awsOutcomeOrigin ok states are exactly the okOpen and okRefresh states');
+    const originsOf = (row) => (row && typeof row.origin === 'string' && row.origin !== '' ? row.origin.split('|') : []);
+    for (const [label, rows] of [['code', O.codes], ['ok', O.ok]]) for (const [code, row] of Object.entries(rows)) {
+        const parts = originsOf(row);
+        ok(parts.length > 0 && parts.every((p) => O.values.includes(p)) && new Set(parts).size === parts.length
+            && parts.join('|') === O.values.filter((v) => parts.includes(v)).join('|'), `awsOutcomeOrigin ${label} ${code}: a non-empty origin from ${O.values.join('|')}, in that order`);
+        const pathOrigins = Array.isArray(row && row.paths) ? row.paths.map((p) => String(p).split(':')[0]) : [];
+        ok(pathOrigins.length > 0 && pathOrigins.every((p) => parts.includes(p)) && parts.every((p) => pathOrigins.includes(p)),
+            `awsOutcomeOrigin ${label} ${code}: a path for each origin, and no path for an origin not listed`);
+    }
+    for (const code of V.kernel.errorCodes) ok(originsOf(O.codes[code]).includes('guest'), `awsOutcomeOrigin: kernel code ${code} carries guest`);
+    for (const state of Object.keys(O.ok)) ok(O.ok[state].origin === 'guest', `awsOutcomeOrigin: ok ${state} is the kernel's answer (guest)`);
+    for (const code of ['invalid_request', 'invalid_signature']) ok(O.codes[code] && O.codes[code].origin === 'worker', `awsOutcomeOrigin: ${code} is decided by the Worker before anything is sent`);
+    ok(O.codes.workspace_not_ready && O.codes.workspace_not_ready.origin === 'host', 'awsOutcomeOrigin: workspace_not_ready is the host step-3 epoch check, before any exec');
+    for (const code of ['runtime_not_running', 'workspace_busy', 'workspace_failed']) {
+        ok(originsOf(O.codes[code]).includes('host') && originsOf(O.codes[code]).includes('guest'), `awsOutcomeOrigin: ${code} is answered by the host and inducible by guest root`);
+    }
+    ok(/first grant issuance/.test(O.consumerRule) && /candidate-forgeable/.test(O.consumerRule) && /consuming/.test(O.consumerRule)
+        && /head, clean, remote and branch/.test(O.consumerRule) && /in-guest evidence only/.test(O.consumerRule),
+        'awsOutcomeOrigin consumerRule: after the first grant issuance a guest-origin outcome consumes; success fields are in-guest evidence only');
     for (const ws of [401, 403, 404, 409, 422, 429, '5xx', '3xx', 'other']) ok(E.upstream.some((u) => u.source === 'works' && u.status === ws && u.code === '*'), `works ${ws} has no catch-all`);
     for (const code of ['identity_conflict', 'identity_unverified', 'ezil_id_builders_only', 'account_suspended', 'repository_not_ready']) {
         ok(E.upstream.some((u) => u.source === 'works' && u.code === code), `works code ${code} unmapped`);

@@ -257,6 +257,21 @@ class Vectors(unittest.TestCase):
                       % (t["personal"], t["assessment"]), kernel)
         self.assertIn("const DEFAULT_CLASS = '%s';" % V["constants"]["REPO_OPEN_CLASS_DEFAULT"], kernel)
 
+    def test_the_aws_origin_table_names_every_code_the_host_answers(self):
+        """r56 (vectors errorTable.awsOutcomeOrigin): every code this host can put in a result has an origin;
+        the codes it decides itself carry host (workspace_not_ready only host: step 3, before any exec), the
+        kernel's codes carry guest, and every ok state is the kernel's answer (guest)."""
+        o = V["errorTable"]["awsOutcomeOrigin"]
+        origins = {code: row["origin"].split("|") for code, row in o["codes"].items()}
+        self.assertLessEqual(set(ro.REPO_OPEN_STATUS), set(origins))
+        for code in ("runtime_not_running", "workspace_not_ready", "workspace_busy", "workspace_failed"):
+            self.assertIn("host", origins[code], code)
+        self.assertEqual(origins["workspace_not_ready"], ["host"])
+        for code in ro.KERNEL_ERROR_CODES:
+            self.assertIn("guest", origins[code], code)
+        self.assertEqual({row["origin"] for row in o["ok"].values()}, {"guest"})
+        self.assertLessEqual(set(ro.OPEN_STATES) | {"refreshed"}, set(o["ok"]))
+
     def test_worker_assessment_ok_cases_through_the_host_validator(self):
         """Every okAssessmentCases row, validated for the repository the vectors context names: the
         expected folder (W) and remote come from the context (as the job rebuilds them from its own

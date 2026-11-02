@@ -27,7 +27,7 @@ import {
   type AwsRepoOpenDeps, type AwsRepoOpenJob, type AwsRepoOpenStep, type AwsRepoOpenTarget,
 } from './aws-repo-open';
 import {
-  REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse,
+  OPEN_RESULT_STATES, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse,
   type RepoOpenAnswer, type RepoOpenClass, type RepoOpenErrorCode, type RepoOpenInput,
 } from './repo-open-u2';
 
@@ -785,6 +785,18 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     expect(answer(trunk, ASSESS_W, ASSESS_REMOTE, 'trunk')).toEqual({ status: 200, body: trunk } as RepoOpenAnswer);
     // personal unchanged: any valid branch, and no expected branch is read
     expect(awsJobAnswer({ status: 200, body: { ...okOpen, branch: 'trunk' } }, 'open', FOLDER)).toEqual({ status: 200, body: { ...okOpen, branch: 'trunk' } } as RepoOpenAnswer);
+  });
+
+  it('r56: vectors errorTable.awsOutcomeOrigin names every code this relay can answer; the host\'s result codes carry host, the kernel\'s carry guest, every ok state is guest', () => {
+    const O = V.errorTable.awsOutcomeOrigin as { codes: Record<string, { origin: string }>; ok: Record<string, { origin: string }> };
+    const origins = (code: string) => (O.codes[code]?.origin ?? '').split('|');
+    expect(Object.keys(O.codes).sort()).toEqual(Object.keys(REPO_OPEN_STATUS).sort());
+    for (const code of AWS_HOST_ERROR_CODES) expect([code, origins(code).includes('host')]).toEqual([code, true]);
+    for (const code of AWS_KERNEL_ERROR_CODES) expect([code, origins(code).includes('guest')]).toEqual([code, true]);
+    // what the relay answers before anything is sent is worker-only
+    for (const code of ['invalid_request', 'invalid_signature']) expect([code, O.codes[code]?.origin]).toEqual([code, 'worker']);
+    expect(Object.keys(O.ok)).toEqual([...new Set([...OPEN_RESULT_STATES, 'refreshed'])]);
+    for (const state of Object.keys(O.ok)) expect([state, O.ok[state]!.origin]).toEqual([state, 'guest']);
   });
 
   it('awsJobAnswer for class assessment: head, clean, empty and state agree (pure)', () => {
