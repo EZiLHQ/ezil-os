@@ -32,8 +32,12 @@ const GRANTS_DIR = '/run/ezil/git/grants';
 const INCOMING_DIR = '/run/ezil/git/incoming';
 const REQUESTS_DIR = '/run/ezil/requests';
 const LOCKS_DIR = '/run/ezil/locks';
-// Never created: with GIT_CONFIG_NOSYSTEM this leaves git no system, global or XDG config.
+// Never created by the kernel, and never read by its git (r56 review): guest root can create files here, but
+// GIT_CONFIG_GLOBAL=/dev/null (no ~/.gitconfig), XDG_CONFIG_HOME below (no ~/.config/git/config, ignore or
+// attributes) and GIT_CONFIG_NOSYSTEM=1 (no /etc/gitconfig) leave every kernel git with repo-local config only.
 const GIT_HOME = '/run/ezil/home';
+// A path that cannot exist (below a character device), so git finds none of its XDG files.
+const GIT_XDG_CONFIG_HOME = '/dev/null/ezil-no-xdg';
 const GIT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 export const STAGING_ROOT_NAME = '.ezil-staging';
 const BINDING_FILE = 'ezil-repo.json';
@@ -207,8 +211,12 @@ const requestFileOf = (r) => `${REQUESTS_DIR}/${r.uuid}.json`;
 // the value `false` as a hook command and runs the PATH's `false` (1.0.3).
 const GIT_BASE_CONFIG = ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
   '-c', 'submodule.recurse=false', '-c', 'core.fsmonitor='];
-/** The whole environment of every git child: nothing inherited (§9.4 "Git hygiene"). */
-const gitEnv = () => ({ PATH: GIT_PATH, HOME: GIT_HOME, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' });
+/**
+ * The whole environment of every git child: nothing inherited (§9.4 "Git hygiene", vectors kernel.gitEnv). No system,
+ * global or XDG config is read, so a value guest root plants there (http.proxy, url.<base>.insteadOf,
+ * credential.helper, include.path, core.excludesFile, ...) never reaches ls-remote, fetch, checkout or the reads.
+ */
+export const gitEnv = () => ({ PATH: GIT_PATH, HOME: GIT_HOME, XDG_CONFIG_HOME: GIT_XDG_CONFIG_HOME, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' });
 const seamConfig = (seam) => (seam ? [
   ...(seam.sslCAInfo ? ['-c', `http.sslCAInfo=${seam.sslCAInfo}`] : []),
   ...(seam.proxy ? ['-c', `http.proxy=${seam.proxy}`] : []),
@@ -610,7 +618,9 @@ function indexPaths(gitDir, prefix, { limitBytes, scratch, timeoutMs }) {
       if (copied > limitBytes) return null;
       fs.copyFileSync(`${gitDir}/${n}`, `${tmp}/${n}`, fs.constants.COPYFILE_EXCL);
     }
-    const r = spawnSync(INDEX_GIT, [`--git-dir=${tmp}`, '-c', 'core.fsmonitor=false', 'ls-files', '-z', '--cached', '--sparse'],
+    // core.fsmonitor= (EMPTY, r56 review): git < 2.36 runs the value `false` as a hook command found on PATH; the
+    // listed paths are the same either way.
+    const r = spawnSync(INDEX_GIT, [`--git-dir=${tmp}`, '-c', 'core.fsmonitor=', 'ls-files', '-z', '--cached', '--sparse'],
       { cwd: tmp, env: INDEX_GIT_ENV, stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, maxBuffer: INDEX_PATHS_MAX_BYTES, killSignal: 'SIGKILL' });
     if (r.error || r.status !== 0) return null;
     const text = new TextDecoder('utf-8', { fatal: true }).decode(r.stdout);
@@ -781,8 +791,9 @@ function currentBranch(folder, fallback) {
 }
 
 /**
- * The local git of the assessment reads (1.0.3): on top of the cleared environment and
- * GIT_BASE_CONFIG (no system config, hooks /dev/null, fsmonitor off), no global config either,
+ * The local git of the assessment reads (1.0.3): on top of the cleared environment (no system,
+ * global or XDG config, as for every kernel git since the r56 review; GIT_CONFIG_GLOBAL is
+ * repeated here, vectors hardenedRead.env) and GIT_BASE_CONFIG (hooks /dev/null, fsmonitor off),
  * repository discovery stops at the directory's parent (the directory itself must be the
  * repository), no pager, and no optional lock (a status killed at its timeout never leaves
  * .git/index.lock behind). These flags keep the kernel's own environment from adding anything;

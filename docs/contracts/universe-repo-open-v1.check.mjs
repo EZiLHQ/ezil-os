@@ -739,6 +739,13 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(K.hardenedRead.env.GIT_CONFIG_GLOBAL === '/dev/null' && K.hardenedRead.config.includes('core.hooksPath=/dev/null')
         && K.hardenedRead.config.includes('core.fsmonitor=') && !K.hardenedRead.config.some((c) => /^core\.fsmonitor=./.test(c)), 'hardened read config (fsmonitor off by the empty value)');
     ok(K.hardenedRead.env.GIT_CEILING_DIRECTORIES === `<root>/${C.STAGING_ROOT_NAME}`, 'the hardened reads run in staging, before the rename (ceiling = the staging root)');
+    // r56 review: no kernel git (both classes, every phase) reads a system, global or XDG config or XDG file.
+    const GE = V.kernel.gitEnv;
+    eq(Object.keys(GE.env), ['PATH', 'HOME', 'XDG_CONFIG_HOME', 'GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL'], 'kernel gitEnv keys');
+    ok(GE.env.GIT_CONFIG_NOSYSTEM === '1' && GE.env.GIT_CONFIG_GLOBAL === '/dev/null' && GE.env.XDG_CONFIG_HOME.startsWith('/dev/null/')
+        && GE.env.GIT_TERMINAL_PROMPT === '0', 'kernel gitEnv: no system, global or XDG config (an XDG home that cannot exist), no prompt');
+    ok(/never reaches ls-remote, fetch, checkout or the reads/.test(GE.rule) && /repo-locally/.test(GE.rule), 'kernel gitEnv rule: plants never reach git; nothing relies on a global config');
+    ok(!/ignore or attributes files under the kernel's HOME/.test(K.trust), 'trust no longer lists an XDG ignore or attributes file as a guest capability (git never reads one)');
     ok(Number.isSafeInteger(K.readBudgetMs) && K.readBudgetMs > 0 && K.readBudgetMs < V.timeouts.COMMIT_EXEC_MAX_MS, 'assessment readBudgetMs is inside the commit exec window');
     ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && /defaultBranch/.test(c.cause) && c.errorCode === 'repository_unavailable'), 'an assessment remote without defaultBranch is classified');
     ok(typeof K.trust === 'string' && /evidence, not proof/.test(K.trust), 'assessment head and clean are stated as in-guest evidence');

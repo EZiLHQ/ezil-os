@@ -69,12 +69,19 @@ export function isolate(selfPath) {
     process.exit(1);
   }
   const hostBefore = HOST_MARKERS.filter((m) => fs.existsSync(`/run/ezil/${m}`));
+  // The r56 tests overmount /etc inside the private namespace only; the host's /etc/gitconfig never changes.
+  const etcGitconfig = () => { try { return crypto.createHash('sha256').update(fs.readFileSync('/etc/gitconfig')).digest('hex'); } catch { return 'absent'; } };
+  const etcBefore = etcGitconfig();
   const parent = JSON.stringify({ mnt: fs.readlinkSync('/proc/self/ns/mnt'), net: fs.readlinkSync('/proc/self/ns/net') });
   const result = spawnSync('unshare', ['--mount', '--net', '--propagation', 'private', process.execPath, selfPath, ISOLATED_FLAG, parent],
     { stdio: 'inherit' });
   const hostAfter = HOST_MARKERS.filter((m) => fs.existsSync(`/run/ezil/${m}`));
   if (JSON.stringify(hostBefore) !== JSON.stringify(hostAfter)) {
     console.error(`FAIL: the host /run/ezil changed (${JSON.stringify(hostBefore)} -> ${JSON.stringify(hostAfter)})`);
+    process.exit(1);
+  }
+  if (etcGitconfig() !== etcBefore) {
+    console.error(`FAIL: the host /etc/gitconfig changed (${etcBefore} -> ${etcGitconfig()})`);
     process.exit(1);
   }
   process.exit(result.status ?? 1);
@@ -1762,6 +1769,129 @@ async function main() {
     const a = await openFlow(fx, { root, token, budget, ...ASSESS });
     assert.deepEqual(a.prepared, { ok: false, errorCode: 'repository_too_large' });
     assertNoOpenLeftovers(root, a.uuid, { wrapper: wrapperOf(root) });
+  });
+
+  // ── r56 review (A2h): no global, XDG or system git config; the index read's fsmonitor ────────
+  const KERNEL_HOME = '/run/ezil/home';
+  /**
+   * fn() with an overlay over /etc whose upper directory is on this suite's private /tmp tmpfs: a file written
+   * to /etc here lives in this mount namespace only (isolate() also compares the host's /etc/gitconfig).
+   */
+  async function withPrivateEtc(fn) {
+    const ovl = fs.mkdtempSync('/tmp/etc-overlay-');
+    fs.mkdirSync(`${ovl}/up`); fs.mkdirSync(`${ovl}/work`);
+    execFileSync('mount', ['-t', 'overlay', 'overlay', '-o', `lowerdir=/etc,upperdir=${ovl}/up,workdir=${ovl}/work`, '/etc']);
+    try { return await fn(); } finally { execFileSync('umount', ['/etc']); }
+  }
+  /** A config file a guest root could plant: a proxy and a redirect for `own`, a second remote, an ignore-all excludes file. */
+  const plantedConfig = (own, other, proxyUrl) => [`[http "https://${own}"]`, `\tproxy = ${proxyUrl}`, '[http]', `\tproxy = ${proxyUrl}`,
+    `[url "https://${other}/"]`, `\tinsteadOf = https://${own}/`, '[remote "origin"]', `\turl = https://${other}/acme/site.git`,
+    '[core]', `\texcludesFile = ${KERNEL_HOME}/exclude-all`, ''].join('\n');
+  const PLANT_SITES = [`${KERNEL_HOME}/.gitconfig`, `${KERNEL_HOME}/.config/git/config`, '/etc/gitconfig'];
+  /** Control: a git WITHOUT the kernel's settings (HOME = the kernel's, no XDG_CONFIG_HOME, system config read only for /etc) sees the plant. */
+  const assertPlantLive = (file, own, proxyUrl) => {
+    const env = { PATH: USER_ENV.PATH, HOME: KERNEL_HOME, ...(file === '/etc/gitconfig' ? {} : { GIT_CONFIG_NOSYSTEM: '1' }) };
+    const seen = spawnSync('git', ['config', '--show-origin', '--get-all', `http.https://${own}.proxy`], { cwd: '/', env, encoding: 'utf8' });
+    assert.equal(seen.stdout, `file:${file}\t${proxyUrl}\n`, `control: the plant in ${file} is not live for a plain git`);
+  };
+
+  test('r56 D2: prepare\'s ls-remote and fetch read no global, XDG or system config (GIT_CONFIG_GLOBAL=/dev/null, XDG_CONFIG_HOME that cannot exist, GIT_CONFIG_NOSYSTEM=1): an http.<host>.proxy, http.proxy, url.<other host>.insteadOf and remote.origin.url planted in /run/ezil/home/.gitconfig, /run/ezil/home/.config/git/config or /etc/gitconfig never steer either class (every CONNECT through the seam proxy to the class host, none to the planted proxy); the kernel\'s gitEnv is vectors kernel.gitEnv', async () => {
+    const k = await kernel();
+    const decoy = await startProxy(fx.server.port);   // refuses and counts every CONNECT: git must never use it
+    decoy.state.mode = 'refuse';
+    try {
+      const token = newToken(); fx.server.state.token = token;
+      makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+      await withPrivateEtc(async () => {
+        for (const file of PLANT_SITES) {
+          for (const fields of [{}, ASSESS]) {
+            resetRun();
+            const own = fields.gitHost ?? GIT_HOST;
+            const other = own === GIT_HOST ? QA_HOST : GIT_HOST;
+            const label = `${file} (${fields.cls ?? 'personal'})`;
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.mkdirSync(KERNEL_HOME, { recursive: true });
+            fs.writeFileSync(`${KERNEL_HOME}/exclude-all`, '*\n');
+            fs.writeFileSync(file, plantedConfig(own, other, decoy.url));
+            try {
+              assertPlantLive(file, own, decoy.url);
+              const before = fx.proxy.state.connects.length;
+              const root = newRoot();
+              const { committed, released } = await openFlow(fx, { root, token, ...fields });
+              assert.equal(decoy.state.connects.length, 0, `${label}: git used the planted proxy`);
+              const connects = fx.proxy.state.connects.slice(before);
+              assert.ok(connects.length > 0 && connects.every((c) => c === `${own}:443`), `${label}: CONNECTs ${JSON.stringify(connects)}`);
+              assert.equal(committed && committed.state, 'cloned', `${label}: ${JSON.stringify(committed)}`);
+              if (fields.cls) assert.equal(committed.remote, QA_REMOTE, label);
+              assert.deepEqual(released, { ok: true }, label);
+            } finally {
+              fs.rmSync(file, { force: true });
+            }
+          }
+        }
+      });
+    } finally {
+      decoy.close();
+    }
+    assert.deepEqual(k.gitEnv(), V.kernel.gitEnv.env, 'the kernel git environment is vectors kernel.gitEnv');
+  });
+
+  test('r56 D2: the assessment reads ignore the same plants in all three places at once, and an ignore file under the kernel HOME (/run/ezil/home/.config/git/ignore: only XDG_CONFIG_HOME keeps git from reading it once GIT_CONFIG_GLOBAL is set): a dirty repository reads clean:false, its one remote exactly', async () => {
+    const k = await kernel();
+    const [R, head] = oneCommitRepo('r56-reads');
+    fs.writeFileSync(`${R}/untracked.txt`, 'u');
+    sh('git', ['-C', R, 'config', 'remote.origin.url', QA_REMOTE], { env: USER_ENV });
+    assert.deepEqual(await k.assessmentFacts(R), { head, clean: false }, 'control: the repository is dirty');
+    await withPrivateEtc(async () => {
+      fs.mkdirSync(`${KERNEL_HOME}/.config/git`, { recursive: true });
+      fs.writeFileSync(`${KERNEL_HOME}/exclude-all`, '*\n');
+      fs.writeFileSync(`${KERNEL_HOME}/.config/git/ignore`, '*\n');
+      for (const file of PLANT_SITES) fs.writeFileSync(file, plantedConfig(QA_HOST, GIT_HOST, 'http://127.0.0.1:9'));
+      try {
+        // controls: a git that sets only GIT_CONFIG_GLOBAL still reads the ignore file under HOME (it hides the
+        // untracked file), and a git that reads system and global config sees the three planted remotes beside R's own
+        const status = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all'],
+          { cwd: R, env: { PATH: USER_ENV.PATH, HOME: KERNEL_HOME, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8' });
+        assert.equal(status.stdout, '', 'control: the ignore file under HOME is not live');
+        const remotes = spawnSync('git', ['config', '--get-all', 'remote.origin.url'], { cwd: R, env: { PATH: USER_ENV.PATH, HOME: KERNEL_HOME }, encoding: 'utf8' });
+        assert.equal(remotes.stdout.split('\n').filter(Boolean).length, 4, `control: the planted remotes are not live: ${remotes.stdout}`);
+        assert.deepEqual(await k.assessmentFacts(R), { head, clean: false }, 'a planted ignore or excludes file hid the untracked file');
+        assert.equal(await k.assessmentRemote(R), QA_REMOTE, 'a planted remote.origin.url reached the remote read');
+      } finally {
+        for (const file of [...PLANT_SITES, `${KERNEL_HOME}/.config/git/ignore`, `${KERNEL_HOME}/exclude-all`]) fs.rmSync(file, { force: true });
+      }
+    });
+  });
+
+  test('r56 D6: the index read (codecTracked) runs no PATH `false`: its argv carries core.fsmonitor= (EMPTY); with the same argv and env, the value false runs a planted /usr/bin/false exactly when git < 2.36 (control)', async () => {
+    const k = await kernel();
+    const root = newRoot();
+    indexOnly(root, ['a.txt', 'node_modules/x.js']);
+    const version = k.parseGitVersion(sh('/usr/bin/git', ['--version'], { env: USER_ENV }));
+    const legacy = version.major < 2 || (version.major === 2 && version.minor < 36);
+    const marker = '/tmp/planted-index-false-ran';
+    const planted = '/tmp/planted-index-false';
+    fs.writeFileSync(planted, `#!/bin/sh\necho "$0 $*" >> ${marker}\nexit 1\n`, { mode: 0o755 });
+    const FALSE = '/usr/bin/false';
+    assert.ok(fs.lstatSync(FALSE).isFile(), `${FALSE} is not a regular file`);
+    // A bind mount in this suite's private mount namespace only (isolate()); unmounted below.
+    execFileSync('mount', ['--bind', planted, FALSE]);
+    try {
+      // control: the kernel's index-read argv, env and throwaway git dir, with the value `false`
+      const dir = fs.mkdtempSync('/tmp/r56-index-');
+      fs.mkdirSync(`${dir}/objects`); fs.mkdirSync(`${dir}/refs`);
+      fs.writeFileSync(`${dir}/HEAD`, 'ref: refs/heads/main\n');
+      fs.copyFileSync(`${root}/.git/index`, `${dir}/index`);
+      spawnSync('/usr/bin/git', [`--git-dir=${dir}`, '-c', 'core.fsmonitor=false', 'ls-files', '-z', '--cached', '--sparse'],
+        { cwd: dir, env: { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0' }, stdio: 'ignore' });
+      assert.equal(exists(marker), legacy, `control: git ${version.major}.${version.minor} ${legacy ? 'did not run' : 'ran'} the planted false`);
+      fs.rmSync(marker, { force: true });
+      const tracked = k.codecTracked(root, { limitBytes: DEFAULT_BUDGET.limitBytes, scratch: '/tmp' });
+      assert.ok(tracked === k.TRACKED_ALL || tracked.has('node_modules/x.js'), 'the index read did not run');
+      assert.equal(exists(marker), false, `the index read ran the planted false: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
+    } finally {
+      execFileSync('umount', [FALSE]);
+    }
   });
 
   try {
