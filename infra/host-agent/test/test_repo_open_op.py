@@ -59,6 +59,9 @@ LEASE = {"generation": 1, "leaseEpoch": 2}
 FOLDER = "/workspace/repos/acme/site"
 OPEN_OK = {"ok": True, "state": "cloned", "folder": FOLDER, "openFolder": FOLDER, "pathNotFound": False,
            "branch": "main", "empty": False}
+QA_HOST = "git-qa.ezil.work"
+ASSESS = {"class": "assessment", "gitHost": QA_HOST}       # relay overrides of an assessment open (contract 1.0.3)
+ASSESS_OK = {**OPEN_OK, "head": "0123456789abcdef" * 2 + "01234567", "clean": True}
 
 
 def iso(seconds):
@@ -100,7 +103,7 @@ def line(obj):
 class Vectors(unittest.TestCase):
     def test_host_constants_equal_the_vectors(self):
         c, t = V["constants"], V["timeouts"]
-        self.assertEqual(V["contractVersion"], "1.0.2")
+        self.assertEqual(V["contractVersion"], "1.0.3")
         self.assertEqual(list(ro.RUN_DIRS), c["RUN_DIRS"])
         self.assertEqual(ro.KERNEL_PATH, c["KERNEL_PATH"])
         self.assertEqual(ro.HELPER_MODULE_PATH, c["HELPER_MODULE_PATH"])
@@ -111,6 +114,13 @@ class Vectors(unittest.TestCase):
         self.assertEqual(ro.REPO_BUDGET_FRACTION, c["REPO_BUDGET_FRACTION"])
         self.assertEqual(ro.WORKER_REQUEST_MAX_BYTES, c["BODY_LIMITS_BYTES"]["workerRequest"])
         self.assertEqual(list(ro.REPO_OPEN_GIT_HOSTS), V["workerRequest"]["gitHostAllowList"])
+        self.assertEqual(ro.REPO_OPEN_CLASS_GIT_HOSTS, c["REPO_OPEN_CLASS_GIT_HOSTS"])
+        self.assertEqual(list(ro.REPO_OPEN_CLASS_GIT_HOSTS), c["REPO_OPEN_CLASSES"])
+        self.assertEqual(ro.REPO_OPEN_CLASS_DEFAULT, c["REPO_OPEN_CLASS_DEFAULT"])
+        self.assertEqual(list(ro.OPTIONAL_BODY_KEYS), V["workerRequest"]["optionalKeys"])
+        self.assertEqual(list(ro.OPTIONAL_BODY_KEYS), V["kernel"]["optionalRequestKeys"])
+        self.assertEqual(list(ro.ASSESSMENT_OPEN_KEYS), V["kernel"]["assessment"]["resultOpenKeys"])
+        self.assertEqual(list(ro.ASSESSMENT_OPEN_STATES), V["kernel"]["assessment"]["states"])
         self.assertEqual(list(ro.BODY_KEYS), V["workerRequest"]["keys"])
         self.assertEqual(list(ro.GRANT_KEYS), V["workerRequest"]["grantKeys"])
         for name in ("WORKER_DEADLINE_MS", "PREPARE_WINDOW_MS", "PREPARE_RESERVE_MS", "COMMIT_EXEC_MAX_MS",
@@ -174,7 +184,9 @@ class Vectors(unittest.TestCase):
             raw = {"jobId": JOB, **apply_mutation(base, mutation)}
             job, parsed = ro.parse_relay(raw, int(time.time() * 1000))    # "now" read after the expiry
             self.assertEqual(job, JOB)
-            self.assertEqual(set(parsed), set(ro.BODY_KEYS))
+            self.assertEqual(set(parsed), set(ro.BODY_KEYS) | ({"class"} if "class" in raw else set()))
+            if "class" in raw:
+                self.assertEqual(parsed["class"], raw["class"])
         for mutation in V["workerRequest"]["invalidMutations"]:
             raw = {"jobId": JOB, **apply_mutation(base, mutation)}
             with self.assertRaises(ValueError, msg=mutation["why"]):
@@ -194,12 +206,55 @@ class Vectors(unittest.TestCase):
                 ro.parse_relay(raw, now)
 
     def test_a_worst_case_relay_body_fits_the_edge_limit(self):
-        worst = relayed(handle="h" * 39, name="n" * 100, defaultBranch="b" * 244, path="p" * 255)
-        data = json.dumps(worst, separators=(",", ":")).encode()
-        ro.parse_relay(worst, int(time.time() * 1000))
-        self.assertLessEqual(len(data), ro.WORKER_REQUEST_MAX_BYTES + len(',"jobId":""') + 64)
-        self.assertLess(len(data), edge_mod.MAX_REPO_OPEN_BODY)
+        for over in ({}, {"class": "personal"}, ASSESS):
+            worst = relayed(handle="h" * 39, name="n" * 100, defaultBranch="b" * 244, path="p" * 255, **over)
+            data = json.dumps(worst, separators=(",", ":")).encode()
+            ro.parse_relay(worst, int(time.time() * 1000))
+            self.assertLessEqual(len(data), ro.WORKER_REQUEST_MAX_BYTES + len(',"jobId":""') + 64, over)
+            self.assertLess(len(data), edge_mod.MAX_REPO_OPEN_BODY, over)
         self.assertEqual(edge_mod.MAX_REPO_OPEN_BODY, ro.RELAY_MAX_BYTES)
+
+    def test_the_class_table_is_closed_and_refused_in_both_directions(self):
+        """Contract 1.0.3: gitHost must be REPO_OPEN_CLASS_GIT_HOSTS[class] (class absent = personal);
+        the body keeps `class` only when the relay sent it."""
+        now = int(time.time() * 1000)
+        hosts = sorted(set(ro.REPO_OPEN_CLASS_GIT_HOSTS.values()) | {"github.ezil.work"})
+        for host in hosts:
+            for cls in (None, "personal", "assessment"):
+                raw = relayed(gitHost=host, **({} if cls is None else {"class": cls}))
+                want = ro.REPO_OPEN_CLASS_GIT_HOSTS[cls or "personal"]
+                if host == want:
+                    _, parsed = ro.parse_relay(raw, now)
+                    self.assertEqual(parsed.get("class", "absent"), cls or "absent", (cls, host))
+                else:
+                    with self.assertRaises(ValueError, msg=(cls, host)):
+                        ro.parse_relay(raw, now)
+        for bad in (None, "", "Assessment", "exam", 1, True, [], {}, ["assessment"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                ro.parse_relay(relayed(gitHost=QA_HOST, **{"class": bad}), now)
+
+    def test_the_kernel_asset_carries_the_same_class_table(self):
+        kernel = ro.load_assets()["ezil-repo-open.mjs"].decode()
+        t = V["constants"]["REPO_OPEN_CLASS_GIT_HOSTS"]
+        self.assertIn("export const CLASS_GIT_HOSTS = Object.freeze({ personal: '%s', assessment: '%s' });"
+                      % (t["personal"], t["assessment"]), kernel)
+        self.assertIn("const DEFAULT_CLASS = '%s';" % V["constants"]["REPO_OPEN_CLASS_DEFAULT"], kernel)
+
+    def test_worker_assessment_ok_cases_through_the_host_validator(self):
+        cases = V["errorTable"]["workerResponses"]["okAssessmentCases"]
+        self.assertTrue(any(c["valid"] for c in cases) and any(not c["valid"] for c in cases))
+        for case in cases:
+            b = expand(case["body"])
+            ans = ro.open_answer(dict(b), b["folder"], "assessment")
+            self.assertEqual(ans["status"] == 200, case["valid"], case.get("why", b))
+            if case["valid"]:
+                self.assertEqual(ans["body"], b)
+                self.assertEqual(list(ans["body"]), V["kernel"]["assessment"]["resultOpenKeys"])
+                self.assertNotEqual(ro.open_answer(dict(b), b["folder"])["status"], 200, "an assessment shape for a personal open")
+        for case in V["errorTable"]["workerResponses"]["okCases"]:
+            if case["op"] == "open" and case["valid"]:
+                self.assertNotEqual(ro.open_answer(dict(case["body"]), case["body"]["folder"], "assessment")["status"], 200,
+                                    "a personal shape for an assessment open")
 
 
 # ─────────────────────────────────────────────────────────────────────────── assets
@@ -272,6 +327,19 @@ class Sanitizer(unittest.TestCase):
                     {"ok": False, "errorCode": "runtime_not_running"}, {"ok": False, "errorCode": "x", "detail": 1}, None):
             self.assertEqual(ro.open_answer(bad, FOLDER), failed, str(bad)[:60])
         self.assertEqual(ro.refresh_answer({"ok": True, "state": "refreshed", "x": 1}), failed)
+
+    def test_assessment_answers_reduce_to_the_contract(self):
+        failed = ro.refusal("workspace_failed")
+        empty = {**ASSESS_OK, "state": "initialized_empty", "empty": True, "head": None}
+        for good in (ASSESS_OK, {**ASSESS_OK, "clean": False}, empty):
+            self.assertEqual(ro.open_answer(dict(good), FOLDER, "assessment"), {"status": 200, "body": good})
+        for bad in (OPEN_OK, {**ASSESS_OK, "state": "existing"}, {**ASSESS_OK, "head": None},
+                    {**empty, "head": ASSESS_OK["head"]}, {**ASSESS_OK, "empty": True}, {**ASSESS_OK, "head": "A" * 40},
+                    {**ASSESS_OK, "head": "a" * 64}, {**ASSESS_OK, "head": "a" * 40 + "\n"}, {**ASSESS_OK, "clean": 1},
+                    {**ASSESS_OK, "clean": None}, {**ASSESS_OK, "extra": 1}):
+            self.assertEqual(ro.open_answer(dict(bad), FOLDER, "assessment"), failed, str(bad)[-80:])
+        self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, FOLDER, "assessment"),
+                         ro.refusal("folder_conflict"))
 
     def test_last_json_line(self):
         self.assertEqual(ro.last_json_line(b"noise\n" + line(OPEN_OK) + b"\n\n"), OPEN_OK)
@@ -992,6 +1060,60 @@ class Job(JobBase):
             self.wait_idle()
 
 
+class AssessmentJob(JobBase):
+    """Contract 1.0.3: the relay's class reaches the kernel request only when it was sent, the
+    grant names the class's host, and an assessment commit answer is validated as okOpenAssessment."""
+
+    def requests(self, fake):
+        return [json.loads(d) for a, d in fake.calls if a[:3] == ["/bin/sh", "-c", ro.WRITE_PROGRAM]
+                and a[4].startswith("/run/ezil/requests/")]
+
+    def test_an_assessment_open_forwards_class_and_returns_head_and_clean(self):
+        fake = FakeDesktop({"commit": line(ASSESS_OK)})
+        result = self.run_job(fake, **ASSESS)
+        self.assertEqual(result, {"status": 200, "body": ASSESS_OK})
+        self.assertEqual(list(result["body"]), V["kernel"]["assessment"]["resultOpenKeys"])
+        reqs = self.requests(fake)
+        self.assertEqual([r["phase"] for r in reqs], ["prepare", "commit", "release"])
+        for req in reqs:
+            self.assertEqual(list(req), V["kernel"]["requestKeys"] + V["kernel"]["optionalRequestKeys"])
+            self.assertEqual((req["class"], req["gitHost"]), ("assessment", QA_HOST))
+        grant = json.loads(fake.writes()[[k for k in fake.writes() if k.startswith("/run/ezil/git/incoming/")][0]])
+        self.assertEqual(grant["host"], QA_HOST)
+        self.assert_no_secret_anywhere(fake, result)
+
+    def test_an_explicit_personal_class_is_forwarded_and_an_absent_one_is_not(self):
+        fake = FakeDesktop()
+        self.assertEqual(self.run_job(fake, "c" * 64, **{"class": "personal"}), {"status": 200, "body": OPEN_OK})
+        self.assertEqual({r["class"] for r in self.requests(fake)}, {"personal"})
+        fake = FakeDesktop()
+        self.assertEqual(self.run_job(fake, "d" * 64), {"status": 200, "body": OPEN_OK})
+        self.assertTrue(all(list(r) == V["kernel"]["requestKeys"] for r in self.requests(fake)))
+
+    def test_an_assessment_answer_without_head_and_clean_or_existing_is_workspace_failed(self):
+        for i, out in enumerate((OPEN_OK, {**ASSESS_OK, "state": "existing"}, {**ASSESS_OK, "head": None})):
+            fake = FakeDesktop({"commit": line(out)})
+            self.assertEqual(self.run_job(fake, f"{i:x}" * 64, **ASSESS), ro.refusal("workspace_failed"), out)
+        # and a personal open never accepts the assessment shape
+        fake = FakeDesktop({"commit": line(ASSESS_OK)})
+        self.assertEqual(self.run_job(fake, "e" * 64), ro.refusal("workspace_failed"))
+
+    def test_a_kernel_folder_conflict_passes_through_for_an_assessment(self):
+        fake = FakeDesktop({"prepare": line({"ok": False, "errorCode": "folder_conflict"})})
+        self.assertEqual(self.run_job(fake, **ASSESS), ro.refusal("folder_conflict"))
+        self.assertEqual(fake.phases(), ["prepare", "release"])
+
+    def test_a_class_host_mismatch_is_refused_at_the_agent_and_nothing_runs(self):
+        fake = FakeDesktop()
+        with mock.patch.object(ro, "bounded_runc_exec", fake.exec_):
+            for over in ({"gitHost": QA_HOST}, {"class": "personal", "gitHost": QA_HOST}, {"class": "assessment"},
+                         {"class": "exam", "gitHost": QA_HOST}):
+                self.assertEqual(self.send("repo_open", request=relayed("f" * 64, **over)),
+                                 {"ok": False, "error": "repo_open_invalid"}, over)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(self.runner.busy)
+
+
 class TimingChain(JobBase):
     """The result is published by HOST_DEADLINE + RELEASE_GRACE even when runc state hangs, the
     kernel works to the end of every window, or a drain never confirms. The job's own windows are
@@ -1574,14 +1696,40 @@ class RealKernel(JobBase):
         self.assertEqual(re.sub(r"/run/ezil/[a-z/]+:|/workspace/\.ezil-staging:|acme__site\.json", "", left.stdout).strip(), "")
         self.no_token_in_container_except_grant()
 
+    def test_assessment_through_the_real_kernel_refuses_an_existing_folder_and_needs_git_qa(self):
+        """Contract 1.0.3 through the host's exact argv sequence: an assessment never adopts a folder
+        that is already there (even one bound to this very repository), offline it reaches for
+        git-qa (network_unavailable, nothing left), and a personal request on git-qa never gets that far."""
+        b = body()
+        binding = json.dumps({"v": 1, "repositoryId": b["repositoryId"], "handle": "acme", "name": "staged",
+                              "gitHost": QA_HOST})
+        setup = self.sh("set -e; git init -q -b main /workspace/repos/acme/staged; cd /workspace/repos/acme/staged; "
+                        "git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m staged; "
+                        f"printf '%s\\n' '{binding}' > .git/ezil-repo.json")
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        before = self.sh("cd /workspace/repos/acme/staged && find . -printf '%p %s %T@\\n' | sort").stdout
+        self.assertEqual(self.run_real("4" * 64, name="staged", **ASSESS), ro.refusal("folder_conflict"))
+        self.assertEqual([a[2] for a in self.argvs if a[:2] == ["node", ro.KERNEL_PATH]], ["prepare", "release"])
+        self.assertEqual(self.sh("cd /workspace/repos/acme/staged && find . -printf '%p %s %T@\\n' | sort").stdout, before)
+        left = self.sh("ls -A /run/ezil/git/grants /run/ezil/locks /run/ezil/requests /run/ezil/git/incoming /workspace/.ezil-staging 2>&1")
+        self.assertNotIn("acme__staged", left.stdout, "an assessment refused before any action installs no grant")
+        self.assertNotIn(".json", re.sub(r"acme__site\.json", "", left.stdout))
+        # a fresh folder: the kernel reaches for git-qa.ezil.work, which the container cannot resolve
+        self.assertEqual(self.run_real("5" * 64, name="fresh", **ASSESS), ro.refusal("network_unavailable"))
+        self.assertEqual(self.sh("test -e /workspace/repos/acme/fresh && echo FOLDER; ls -A /run/ezil/locks").stdout.strip(), "")
+        self.no_token_in_container_except_grant(allowed=self.grant_files())
+
+    def grant_files(self):
+        return sorted(f"/run/ezil/git/grants/{n}" for n in self.sh("ls -A /run/ezil/git/grants").stdout.split())
+
     def grep_token(self, script):
         """The token travels on grep's stdin (-f), never in its argv, so grep cannot find itself."""
         return subprocess.run(["docker", "exec", "-i", self.name, "/bin/sh", "-c", script], input=TOKEN + "\n",
                               capture_output=True, text=True, timeout=60).stdout.split()
 
-    def no_token_in_container_except_grant(self):
-        self.assertEqual(self.grep_token("grep -rlF -f /dev/stdin /workspace /etc /root /home /tmp /run/ezil 2>/dev/null; true"),
-                         ["/run/ezil/git/grants/acme__site.json"])
+    def no_token_in_container_except_grant(self, allowed=("/run/ezil/git/grants/acme__site.json",)):
+        self.assertEqual(sorted(self.grep_token("grep -rlF -f /dev/stdin /workspace /etc /root /home /tmp /run/ezil 2>/dev/null; true")),
+                         sorted(allowed))
         self.assertEqual(self.grep_token("grep -lF -f /dev/stdin /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null; true"),
                          [])
 

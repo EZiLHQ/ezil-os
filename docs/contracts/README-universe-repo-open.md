@@ -1,11 +1,11 @@
 # universe-repo-open-v1: pinned vectors
 
-Contract: `docs/contracts/universe-repo-open-v1.md` (contractVersion `1.0.2`).
+Contract: `docs/contracts/universe-repo-open-v1.md` (contractVersion `1.0.3`).
 Canonical vectors: `docs/contracts/universe-repo-open-v1.vectors.json` in EZiL-OS.
 
-Pinned vectors sha256: `b6a786000e42625bab3c1f9e8e07f242ca239bf34696e02c8b33655aaf9db510`
+Pinned vectors sha256: `86fe643c377463367c1a480947d15421e19833e2bf9ccc72fad588ffbc6f4eb3`
 
-Pinned gateway extract sha256: `0de9a1d5d4cc06a2f1505e99100d66b9dfd23c14bfd150b774f3ad29c34ff70a`
+Pinned gateway extract sha256: `4ac1f127eb8b756706d4524f1b4f756c8bb49c07ecce00f929b4dee937a293d1`
 
 ## Check (EZiL-OS)
 

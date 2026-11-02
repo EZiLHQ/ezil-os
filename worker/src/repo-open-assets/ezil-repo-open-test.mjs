@@ -26,11 +26,13 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SOURCE_KERNEL = path.join(HERE, 'ezil-repo-open.mjs');
 export const SOURCE_HELPER = path.join(HERE, 'ezil-git-grant.mjs');
 const VECTORS_PATH = path.join(HERE, '../../../docs/contracts/universe-repo-open-v1.vectors.json');
-export const VECTORS_SHA256 = 'b6a786000e42625bab3c1f9e8e07f242ca239bf34696e02c8b33655aaf9db510';
+export const VECTORS_SHA256 = '86fe643c377463367c1a480947d15421e19833e2bf9ccc72fad588ffbc6f4eb3';
 export const KERNEL_PATH = '/run/ezil/bin/ezil-repo-open.mjs';
 export const HELPER_PATH = '/run/ezil/bin/ezil-git-grant.mjs';
 export const WRAPPER_PATH = '/run/ezil/bin/ezil-git-grant';
 export const GIT_HOST = 'git-preview.ezil.work';
+/** The git host of request class `assessment` (contract 1.0.3, vectors constants GIT_ASSESSMENT_HOST). */
+export const QA_HOST = 'git-qa.ezil.work';
 const ISOLATED_FLAG = '--isolated-namespace';
 
 // ── vectors ─────────────────────────────────────────────────────────────────
@@ -108,7 +110,7 @@ export function makeCa(dir) {
   sh('openssl', ['req', '-x509', ...ec, '-keyout', f('ca.key'), '-out', f('ca.pem'), '-days', '2', '-subj', '/CN=EZiL repo-open test CA',
     '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign']);
   sh('openssl', ['req', ...ec, '-keyout', f('leaf.key'), '-out', f('leaf.csr'), '-subj', `/CN=${GIT_HOST}`]);
-  fs.writeFileSync(f('leaf.ext'), `subjectAltName=DNS:${GIT_HOST}\nextendedKeyUsage=serverAuth\n`);
+  fs.writeFileSync(f('leaf.ext'), `subjectAltName=DNS:${GIT_HOST},DNS:${QA_HOST}\nextendedKeyUsage=serverAuth\n`);
   sh('openssl', ['x509', '-req', '-in', f('leaf.csr'), '-CA', f('ca.pem'), '-CAkey', f('ca.key'), '-CAcreateserial',
     '-out', f('leaf.pem'), '-days', '2', '-extfile', f('leaf.ext')]);
   // A second, unrelated CA: a client trusting only it must fail TLS.
@@ -162,13 +164,13 @@ export function startGitServer({ key, cert, projectRoot }) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ state, port: server.address().port, close: () => server.close() })));
 }
 
-/** Loopback CONNECT proxy: only `git-preview.ezil.work:443` reaches the TLS server; every CONNECT is counted. */
+/** Loopback CONNECT proxy: only `git-preview.ezil.work:443` and `git-qa.ezil.work:443` reach the TLS server; every CONNECT is counted. */
 export function startProxy(tlsPort) {
   const state = { connects: [], mode: 'ok' };
   const server = http.createServer((req, res) => { res.writeHead(405); res.end(); });
   server.on('connect', (req, socket, head) => {
     state.connects.push(req.url);
-    if (state.mode !== 'ok' || req.url !== `${GIT_HOST}:443`) {
+    if (state.mode !== 'ok' || ![`${GIT_HOST}:443`, `${QA_HOST}:443`].includes(req.url)) {
       socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
       return;
     }
@@ -243,17 +245,18 @@ export function newRoot() {
   return root;
 }
 
-export function writeIncoming(uuid, { token, handle = 'acme', name = 'site', expiresAt = new Date(Date.now() + 900000).toISOString(), scope = 'write', extra = {} }) {
+export function writeIncoming(uuid, { token, handle = 'acme', name = 'site', host = GIT_HOST, expiresAt = new Date(Date.now() + 900000).toISOString(), scope = 'write', extra = {} }) {
   const file = `/run/ezil/git/incoming/${uuid}.json`;
-  fs.writeFileSync(file, JSON.stringify({ v: 1, protocol: 'https', host: GIT_HOST, path: `${handle}/${name}.git`, username: 'ezil', password: token, expiresAt, scope, ...extra }), { mode: 0o600 });
+  fs.writeFileSync(file, JSON.stringify({ v: 1, protocol: 'https', host, path: `${handle}/${name}.git`, username: 'ezil', password: token, expiresAt, scope, ...extra }), { mode: 0o600 });
   return file;
 }
 
 export function writeRequest(fields) {
   const { op = 'open', phase, uuid, inflight = [uuid], repositoryId = REPO_ID, handle = 'acme', name = 'site', gitHost = GIT_HOST,
-    defaultBranch = 'main', path: relPath = null, root, deadlineMs = Date.now() + 105000, budget = DEFAULT_BUDGET, extra = {}, omit = [] } = fields;
+    defaultBranch = 'main', path: relPath = null, root, deadlineMs = Date.now() + 105000, budget = DEFAULT_BUDGET, extra = {}, omit = [], cls } = fields;
   const request = { v: 1, op, phase, uuid, inflight, repositoryId, handle, name, gitHost, defaultBranch, path: relPath, root,
-    staging: `${root}/.ezil-staging/${uuid}`, incoming: `/run/ezil/git/incoming/${uuid}.json`, deadlineMs, budget, ...extra };
+    staging: `${root}/.ezil-staging/${uuid}`, incoming: `/run/ezil/git/incoming/${uuid}.json`, deadlineMs, budget,
+    ...(cls === undefined ? {} : { class: cls }), ...extra };
   for (const key of omit) delete request[key];
   const file = `/run/ezil/requests/${uuid}.json`;
   fs.writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
@@ -275,7 +278,7 @@ export function cli(phase, requestPath, env = { PATH: USER_ENV.PATH }) {
 
 /** One Worker-shaped open: prepare (module seam) → commit (CLI) → release (CLI). */
 export async function openFlow(fx, { root, uuid = crypto.randomUUID(), token, inflight, skipCommit = false, ...fields }) {
-  writeIncoming(uuid, { token, handle: fields.handle, name: fields.name });
+  writeIncoming(uuid, { token, handle: fields.handle, name: fields.name, host: fields.gitHost });
   const prepared = await (await kernel()).runKernel('prepare', writeRequest({ ...fields, phase: 'prepare', uuid, inflight: inflight ?? [uuid], root }), fx.seam);
   let committed = null;
   if (prepared.ok && !skipCommit) committed = cli('commit', writeRequest({ ...fields, phase: 'commit', uuid, inflight: inflight ?? [uuid], root })).result;
@@ -1017,6 +1020,253 @@ async function main() {
       if (expand(value) !== expand(raw)) continue; // URL-encoding cases concern the link parser only
       assert.notEqual(k.pathProblem(expand(value)), null, JSON.stringify(value));
     }
+  });
+
+  // ── class assessment (contract 1.0.3) ────────────────────────────────────────
+  const ASSESS = { gitHost: QA_HOST, cls: 'assessment' };
+  const qaConfig = expectedConfig.map((l) => l.split(GIT_HOST).join(QA_HOST));
+  const remoteHeadOf = (bare, branch = 'main') => sh('git', ['-C', bare, 'rev-parse', `refs/heads/${branch}`], { env: USER_ENV }).trim();
+  const kernelCode = async (fn) => { try { return await fn(); } catch (e) { return e && e.code; } };
+
+  test('class assessment (1.0.3): a git-qa.ezil.work clone of a non-empty repository → cloned, head = the remote commit (40 hex), clean; the repo-local config names git-qa; two pushes through the helper', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', 'src/b.txt': 'b' } } });
+    const connects = fx.proxy.state.connects.length;
+    const { prepared, committed, released } = await openFlow(fx, { root, token, ...ASSESS });
+    const F = `${root}/repos/acme/site`;
+    assert.deepEqual(prepared, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false }, 'the prepare answer is unchanged');
+    assert.deepEqual(committed, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare), clean: true });
+    assert.deepEqual(Object.keys(committed), V.kernel.assessment.resultOpenKeys);
+    assert.match(committed.head, /^[0-9a-f]{40}$/);
+    assert.deepEqual(released, { ok: true });
+    const seen = fx.proxy.state.connects.slice(connects);
+    assert.ok(seen.length > 0 && seen.every((c) => c === `${QA_HOST}:443`), `the clone went somewhere else: ${seen}`);
+    assert.ok(gitConfigMatches(localConfig(F), qaConfig), `git config:\n${localConfig(F).join('\n')}`);
+    assert.equal(localConfig(F).some((l) => l.includes(GIT_HOST)), false, 'the assessment folder names git-preview');
+    assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).host, QA_HOST);
+    assert.equal(fs.statSync(grantOf()).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(fs.readFileSync(`${F}/.git/ezil-repo.json`, 'utf8')).gitHost, QA_HOST);
+    for (const n of [1, 2]) {
+      fs.writeFileSync(`${F}/edit-${n}.txt`, `${n}\n`);
+      assert.equal((await userGit(fx, F, ['add', `edit-${n}.txt`])).status, 0);
+      assert.equal((await userGit(fx, F, ['commit', '-q', '-m', `edit ${n}`])).status, 0);
+      const push = await userGit(fx, F, ['push', '-q']);
+      assert.equal(push.status, 0, `push ${n}: ${push.stderr}`);
+      assert.equal(remoteHeadOf(bare), sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim(), `push ${n} landed`);
+    }
+  });
+
+  test('class assessment (1.0.3): an empty git-qa repository → initialized_empty, head null, clean true; the first plain push creates the branch', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx);
+    const { committed } = await openFlow(fx, { root, token, ...ASSESS });
+    const F = `${root}/repos/acme/site`;
+    assert.deepEqual(committed, { ok: true, state: 'initialized_empty', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: true, head: null, clean: true });
+    assert.deepEqual(nonCore(F), [...qaConfig, ...upstreamLines('main')]);
+    fs.writeFileSync(`${F}/README.md`, '# site\n');
+    assert.equal((await userGit(fx, F, ['add', 'README.md'])).status, 0);
+    assert.equal((await userGit(fx, F, ['commit', '-q', '-m', 'first'])).status, 0);
+    const push = await userGit(fx, F, ['push', '-q']);
+    assert.equal(push.status, 0, push.stderr);
+    assert.equal(remoteHeadOf(bare), sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim());
+  });
+
+  test('class → git host is a closed table (1.0.3): absent or personal on git-qa, assessment on git-preview or a foreign host, an unknown, mis-cased, null, empty or non-string class → workspace_failed before any action (CLI and module seam)', async () => {
+    const k = await kernel();
+    assert.deepEqual({ ...k.CLASS_GIT_HOSTS }, V.constants.REPO_OPEN_CLASS_GIT_HOSTS);
+    assert.ok(Object.isFrozen(k.CLASS_GIT_HOSTS));
+    assert.deepEqual(k.OPTIONAL_REQUEST_KEYS, V.kernel.optionalRequestKeys);
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const connects = fx.proxy.state.connects.length;
+    const bad = [
+      ['absent class on git-qa', { gitHost: QA_HOST }],
+      ['personal on git-qa', { gitHost: QA_HOST, cls: 'personal' }],
+      ['assessment on git-preview', { cls: 'assessment' }],
+      ['assessment on a foreign host', { gitHost: 'github.ezil.work', cls: 'assessment' }],
+      ['unknown class', { gitHost: QA_HOST, cls: 'exam' }],
+      ['mis-cased class', { gitHost: QA_HOST, cls: 'Assessment' }],
+      ['an inherited property name', { gitHost: QA_HOST, cls: 'constructor' }],
+      ['null class', { cls: null }],
+      ['empty class', { cls: '' }],
+      ['numeric class', { cls: 1 }],
+      ['array class', { gitHost: QA_HOST, cls: ['assessment'] }],
+    ];
+    for (const [label, fields] of bad) {
+      for (const via of ['cli', 'seam']) {
+        const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: fields.gitHost ?? GIT_HOST });
+        const file = writeRequest({ phase: 'prepare', uuid, root, ...fields });
+        const result = via === 'cli' ? cli('prepare', file).result : await k.runKernel('prepare', file, fx.seam);
+        assert.deepEqual(result, { ok: false, errorCode: 'workspace_failed' }, `${label} (${via})`);
+        assert.equal(exists(`${root}/.ezil-staging`), false, label);
+        assert.equal(exists(lockOf()), false, label);
+        assert.equal(exists(grantOf()), false, label);
+      }
+    }
+    assert.equal(fx.proxy.state.connects.length, connects, 'a refused request reached the network');
+    // both table pairs pass the request check (and clone)
+    for (const fields of [{ cls: 'personal' }, ASSESS]) {
+      resetRun();
+      const r2 = newRoot();
+      assert.equal((await openFlow(fx, { root: r2, token, ...fields })).committed.state, 'cloned', JSON.stringify(fields));
+    }
+  });
+
+  test('class assessment refuses an existing folder at prepare (1.0.3): even the folder an earlier assessment open bound to this very repository and host → folder_conflict before any action (no network, grant, lock or staging; the tree byte-identical)', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    assert.equal((await openFlow(fx, { root, token, ...ASSESS })).committed.state, 'cloned');
+    const F = `${root}/repos/acme/site`;
+    fs.writeFileSync(`${F}/pre-staged.txt`, 'answer written before the attempt');
+    const before = manifest(F);
+    const connects = fx.proxy.state.connects.length, requests = fx.server.state.requests;
+    const token2 = newToken();
+    const { uuid, prepared, committed, released } = await openFlow(fx, { root, token: token2, ...ASSESS });
+    assert.deepEqual(prepared, { ok: false, errorCode: 'folder_conflict' });
+    assert.equal(committed, null);
+    assert.deepEqual(released, { ok: true });
+    assert.deepEqual(manifest(F), before, 'the existing tree changed');
+    assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).password, token, 'the refused open installed its grant');
+    assert.equal(exists(lockOf()), false);
+    assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false);
+    assert.equal(fx.proxy.state.connects.length, connects); assert.equal(fx.server.state.requests, requests);
+    // control: the same folder reopened as personal is still `existing` (personal behaviour unchanged)
+    const root2 = newRoot();
+    await openFlow(fx, { root: root2, token });
+    assert.equal((await openFlow(fx, { root: root2, token })).committed.state, 'existing');
+  });
+
+  test('class assessment refuses at commit a folder that appeared after prepare (1.0.3): a real repository bound to this repository and host, with an incoming grant → folder_conflict; never adopted; lock released; release removes staging', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
+    const F = `${root}/repos/acme/site`;
+    sh('git', ['init', '-q', '-b', 'main', F], { env: USER_ENV });
+    sh('git', ['-C', F, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'planted'], { env: USER_ENV });
+    fs.writeFileSync(`${F}/.git/ezil-repo.json`, `${JSON.stringify({ v: 1, repositoryId: REPO_ID, handle: 'acme', name: 'site', gitHost: QA_HOST })}\n`);
+    writeIncoming(uuid, { token, host: QA_HOST });
+    const before = manifest(F);
+    assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'folder_conflict' });
+    assert.deepEqual(manifest(F), before, 'commit touched the planted folder');
+    assert.equal(exists(lockOf()), false, 'commit kept its lock');
+    assert.equal(exists(`${root}/.ezil-staging/${uuid}/.git`), true, 'staging stays for release');
+    assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+    assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false);
+    assert.deepEqual(manifest(F), before);
+  });
+
+  test('class assessment (1.0.3): clean is false when the staged clone gains an untracked or a modified tracked file before commit (head unchanged); assessmentFacts reads clean after the clone and dirty after an untracked file', async () => {
+    const k = await kernel();
+    for (const [label, tamper] of [['untracked file', (S) => fs.writeFileSync(`${S}/new.txt`, 'n')],
+      ['untracked file in a new directory', (S) => { fs.mkdirSync(`${S}/deep/er`, { recursive: true }); fs.writeFileSync(`${S}/deep/er/x.txt`, 'x'); }],
+      ['modified tracked file', (S) => fs.writeFileSync(`${S}/a.txt`, 'changed')]]) {
+      resetRun();
+      const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+      const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+      const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+      assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).ok, true, label);
+      tamper(`${root}/.ezil-staging/${uuid}`);
+      const F = `${root}/repos/acme/site`;
+      assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result,
+        { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare), clean: false }, label);
+    }
+    resetRun();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', '.gitignore': 'ignored/\n' } } });
+    const { committed } = await openFlow(fx, { root, token, ...ASSESS });
+    const F = committed.folder;
+    assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: true });
+    fs.mkdirSync(`${F}/ignored`); fs.writeFileSync(`${F}/ignored/x`, 'x');
+    assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: true }, 'an ignored file is not listed');
+    fs.writeFileSync(`${F}/untracked.txt`, 'u');
+    assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: false });
+    fs.rmSync(`${F}/untracked.txt`);
+    assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: true });
+  });
+
+  test('assessment reads are hardened (1.0.3): a parent repository is never discovered, a planted fsmonitor or hook never runs, the index is neither rewritten nor locked, and a broken HEAD is workspace_failed (never unborn)', async () => {
+    const k = await kernel();
+    const base = fs.realpathSync(fs.mkdtempSync('/tmp/hardened-'));
+    sh('git', ['init', '-q', '-b', 'main', base], { env: USER_ENV });
+    sh('git', ['-C', base, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'parent'], { env: USER_ENV });
+    const notRepo = `${base}/site`; fs.mkdirSync(notRepo);
+    assert.equal(spawnSync('git', ['-C', notRepo, 'rev-parse', '--verify', '-q', 'HEAD'], { env: USER_ENV }).status, 0, 'control: plain git finds the parent');
+    assert.equal(await kernelCode(() => k.assessmentFacts(notRepo)), 'workspace_failed', 'the parent repository was discovered');
+    const R = `${base}/repo`;
+    sh('git', ['init', '-q', '-b', 'main', R], { env: USER_ENV });
+    fs.writeFileSync(`${R}/a.txt`, 'a');
+    sh('git', ['-C', R, 'add', 'a.txt'], { env: USER_ENV });
+    sh('git', ['-C', R, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '-m', 'one'], { env: USER_ENV });
+    const head = sh('git', ['-C', R, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim();
+    const marker = `${base}/ran`;
+    fs.writeFileSync(`${base}/evil.sh`, `#!/bin/sh\necho "$0 $*" >> ${marker}\nexit 0\n`, { mode: 0o755 });
+    fs.mkdirSync(`${base}/hooks`);
+    for (const hook of ['post-index-change', 'reference-transaction', 'fsmonitor-watchman']) fs.copyFileSync(`${base}/evil.sh`, `${base}/hooks/${hook}`);
+    sh('git', ['-C', R, 'config', 'core.fsmonitor', `${base}/evil.sh`], { env: USER_ENV });
+    sh('git', ['-C', R, 'config', 'core.hooksPath', `${base}/hooks`], { env: USER_ENV });
+    sh('git', ['-C', R, 'config', 'core.pager', `${base}/evil.sh`], { env: USER_ENV });
+    const t = Date.now() / 1000 + 30; fs.utimesSync(`${R}/a.txt`, t, t);   // stale stat: a plain status would rewrite the index
+    const idx = fs.statSync(`${R}/.git/index`);
+    assert.deepEqual(await k.assessmentFacts(R), { head, clean: true });
+    assert.equal(exists(marker), false, `a planted fsmonitor, hook or pager ran: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
+    const idx2 = fs.statSync(`${R}/.git/index`);
+    assert.deepEqual([idx2.ino, idx2.mtimeMs], [idx.ino, idx.mtimeMs], 'the read rewrote the index');
+    assert.equal(exists(`${R}/.git/index.lock`), false);
+    // control: the same status with optional locks rewrites that stale index (the fixture is live)
+    spawnSync('git', ['-C', R, '-c', 'core.fsmonitor=', '-c', 'core.hooksPath=/dev/null', 'status', '--porcelain'], { env: USER_ENV });
+    assert.notDeepEqual((({ ino, mtimeMs }) => [ino, mtimeMs])(fs.statSync(`${R}/.git/index`)), [idx.ino, idx.mtimeMs], 'control: the stale index was not rewritten');
+    // HEAD: detached at a missing commit → workspace_failed; a symbolic ref to an unborn branch → null
+    fs.writeFileSync(`${R}/.git/HEAD`, `${'0'.repeat(40)}\n`);
+    assert.equal(await kernelCode(() => k.assessmentFacts(R)), 'workspace_failed', 'a broken HEAD passed as unborn');
+    fs.writeFileSync(`${R}/.git/HEAD`, 'ref: refs/heads/unborn\n');
+    assert.deepEqual(await k.assessmentFacts(R), { head: null, clean: false }, 'unborn branch, a.txt staged');
+  });
+
+  test('class assessment: no grant in any argv or environ (strace of every execve across prepare, commit and two pushes through the helper), .git/config, the folder or any output', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', 'b/c.txt': 'c' } } });
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    const trace = `/tmp/trace-qa-${uuid}.log`;
+    const strace = ['-f', '-qq', '-v', '-s', '65535', '-e', 'trace=execve', '-o'];
+    const driver = `import { runKernel } from ${JSON.stringify(KERNEL_PATH)}; const [phase, request, ca, proxy] = process.argv.slice(1); process.stdout.write(JSON.stringify(await runKernel(phase, request, { sslCAInfo: ca, proxy })) + '\\n');`;
+    const outputs = [];
+    const run = await spawnAsync('strace', [...strace, trace, process.execPath, '--input-type=module', '-e', driver,
+      'prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.tls.ca, fx.proxy.url], { env: { PATH: USER_ENV.PATH } });
+    outputs.push(run.stdout, run.stderr);
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout.trim()).state, 'cloned');
+    const commitRun = spawnSync('strace', [...strace, `${trace}.commit`, process.execPath, KERNEL_PATH, 'commit',
+      writeRequest({ phase: 'commit', uuid, root, ...ASSESS })], { encoding: 'utf8', env: { PATH: USER_ENV.PATH } });
+    outputs.push(commitRun.stdout, commitRun.stderr);
+    const committed = JSON.parse(commitRun.stdout.trim());
+    assert.deepEqual([committed.state, committed.head, committed.clean], ['cloned', remoteHeadOf(bare), true]);
+    const F = `${root}/repos/acme/site`;
+    for (const n of [1, 2]) {
+      fs.writeFileSync(`${F}/edit-${n}.txt`, `${n}\n`);
+      assert.equal((await userGit(fx, F, ['add', `edit-${n}.txt`])).status, 0);
+      assert.equal((await userGit(fx, F, ['commit', '-q', '-m', `edit ${n}`])).status, 0);
+      const push = await spawnAsync('strace', [...strace, `${trace}.push${n}`, 'git', '-c', `http.sslCAInfo=${fx.tls.ca}`, '-c', `http.proxy=${fx.proxy.url}`, 'push', '-q'],
+        { cwd: F, env: { ...USER_ENV } });
+      outputs.push(push.stdout, push.stderr);
+      assert.equal(push.status, 0, push.stderr);
+      assert.equal(remoteHeadOf(bare), sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim(), `push ${n} landed`);
+    }
+    const logs = ['', '.commit', '.push1', '.push2'].map((s) => fs.readFileSync(`${trace}${s}`, 'utf8'));
+    assert.ok(/execve\("[^"]*git"/.test(logs[0]) && /remote-https/.test(logs[0]) && logs[0].includes('ezil-git-grant'), 'the prepare trace did not cover git, its https remote helper and the credential helper');
+    for (const n of [2, 3]) assert.ok(logs[n].includes(WRAPPER_PATH) && /remote-https/.test(logs[n]), `push ${n - 1} trace did not cover the helper`);
+    for (const log of logs) {
+      assert.equal(log.includes(token), false, 'the grant appeared in a child argv or environ');
+      assert.equal(/egg_[0-9a-f]{64}/.test(log), false, 'a grant-shaped value appeared in a child argv or environ');
+    }
+    for (const out of outputs) assert.equal(out.includes(token) || /egg_[0-9a-f]{64}/.test(out), false, 'a grant-shaped value was printed');
+    const grep = spawnSync('grep', ['-rlF', '--', token, F], { encoding: 'utf8' });
+    assert.equal(grep.status, 1, `token found in: ${grep.stdout}`);
+    const config = fs.readFileSync(`${F}/.git/config`, 'utf8');
+    for (const bad of V.gitConfig.forbiddenSubstrings) assert.equal(config.includes(bad), false, bad);
+    assert.equal(/egg_[0-9a-f]{64}/.test(config), false);
+    assert.equal(sh('git', ['-C', F, 'remote', '-v'], { env: USER_ENV }).includes('@'), false);
   });
 
   try {

@@ -4,7 +4,7 @@ Universe 2.0 builder repository → EZiL OS staging Code → edit and push throu
 
 | Field | Value |
 |---|---|
-| contractVersion | `1.0.2` (changes since 1.0.0: [Changelog](#changelog)) |
+| contractVersion | `1.0.3` (changes since 1.0.0: [Changelog](#changelog)) |
 | Vectors | `docs/contracts/universe-repo-open-v1.vectors.json` (sha256 pinned in `README-universe-repo-open.md`) |
 | Gateway extract | derived by `check.mjs --emit-gateway-extract` for the public EZiL CLI repo; its own sha256 pinned in the README (§18) |
 | Check | `node docs/contracts/universe-repo-open-v1.check.mjs` (also runs under `/root/.bun/bin/bun`) |
@@ -50,6 +50,8 @@ All values live in the vectors (`constants`, `timeouts`, `regex`). The table nam
 | UNIVERSE_STAGING_HOST | `universe-staging.ezil.work` | universe-2.0 9dc58adf deploy/aws/app-host/README.md:393-421 |
 | WORKS_STAGING_ORIGIN | `https://api-preview.ezil.work` [D-NAMES] | new |
 | GIT_STAGING_HOST | `git-preview.ezil.work` [D-NAMES] | new |
+| GIT_ASSESSMENT_HOST | `git-qa.ezil.work`: the git host of request class `assessment` (staging Works issues assessment grants there) [1.0.3] | new |
+| REPO_OPEN_CLASS_GIT_HOSTS | closed table `personal` → GIT_STAGING_HOST, `assessment` → GIT_ASSESSMENT_HOST; a body or request without `class` is `personal` (REPO_OPEN_CLASS_DEFAULT) [1.0.3] | new |
 | PREVIEW_SUPABASE_ORIGIN | `https://13-203-99-168.sslip.io` [D-ISSUER] | a988f28c deploy/aws/os-staging/INFRASTRUCTURE.md:76-79 |
 | PRODUCTION_AUTH0_CLIENTS | `Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx` (CLI), `2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl` (Universe web); the production OS app's client is added by a contract bump before any pin if G-READ finds it unlisted (§16, vectors `productionOs`) | EZiL-Works 7974ab6c apps/api/src/auth/ezil-id.ts:8-12 |
 | OS_STAGING_AUTH0_CLIENT_ID | `"UNPINNED"` until G-READ/G-AUTH0. A code constant in OS `app/src/server/repo-open/targets.ts` and Works `apps/api/src/deployment.ts`; NOT a vectors value | new (a public identifier) |
@@ -410,13 +412,15 @@ A Sandbox exec on a stopped container starts it. The existing code only execs ri
 - Lock (vectors `kernel.lockRule`): the directory `/run/ezil/locks/<handle>__<name>`, taken with `mkdir` by prepare when F is absent, with the request uuid written to `<lock>/owner`. Prepare and commit are separate processes, so the lock is released explicitly: by commit on every outcome (its last act), by `release` (§9.4; the Worker runs it after every outcome, including the busy path after tail acquire), and by prepare itself on failure. A lock is **live** only when its owner uuid is in the request's `inflight` list (the Worker's in-flight map) and it is younger than LOCK_STALE_MS (10 min); otherwise prepare treats it as stale, removes it and takes it. Since the Worker allows one `open` per sandbox (§8 step 5), a lock left by a finished or abandoned request never blocks the next open; LOCK_STALE_MS is only the backstop for a Worker that lost its map (DO eviction) while a kernel process survived.
 
 ### 9.2 Request file
-`{v:1, op, phase, uuid, inflight:[uuid…], repositoryId, handle, name, gitHost, defaultBranch, path|null, root, staging, incoming:'/run/ezil/git/incoming/<uuid>.json', deadlineMs, budget:{limitBytes, maxEntries, fraction}}`. Strict: any other key (including a kernel test option, §9.4) → `workspace_failed` before any action. `phase` is also the kernel's argv[2] (`prepare|commit|refresh|release`).
+`{v:1, op, phase, uuid, inflight:[uuid…], repositoryId, handle, name, gitHost, defaultBranch, path|null, root, staging, incoming:'/run/ezil/git/incoming/<uuid>.json', deadlineMs, budget:{limitBytes, maxEntries, fraction}}`, plus (1.0.3) the one optional key `class: 'personal'|'assessment'` (absent = `personal`). Strict: any other key (including a kernel test option, §9.4), a `class` outside REPO_OPEN_CLASSES, or a `gitHost` other than REPO_OPEN_CLASS_GIT_HOSTS[class] → `workspace_failed` before any action. The relay (Worker, AWS host) writes `class` only when the §8 body carried it (vectors `workerRequest.classRule`). `phase` is also the kernel's argv[2] (`prepare|commit|refresh|release`).
 
 ### 9.3 Grant file
 `/run/ezil/git/grants/<handle>__<name>.json`, mode 0600, directory 0700, uid 0:
 `{v:1, protocol:'https', host:<gitHost>, path:'<handle>/<name>.git', username:'ezil', password:<egg_>, expiresAt, scope}`. `path` has no leading slash (git sends it that way). Installation, by the kernel only: lstat the incoming file (regular file), `rename(2)` into place, `chmod 0600`.
 
 ### 9.4 Kernel `ezil-repo-open.mjs`
+
+**Class `assessment` (1.0.3, vectors `kernel.assessment`).** Same phases on GIT_ASSESSMENT_HOST, with two differences. (1) Fresh folder: prepare refuses with `folder_conflict`, before any action, when F exists, whatever its binding, and commit refuses with `folder_conflict` when F appeared after prepare (lock released; staging left for `release`). There is no `existing` state, so a tree staged in the workspace before the attempt can never satisfy readiness. (2) The commit answer adds `head` and `clean`, read in F after the rename by a hardened local git (`kernel.assessment.hardenedRead`: no system or global config, `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `GIT_CEILING_DIRECTORIES=<R>/repos/<handle>`, `--no-pager`, `--no-optional-locks`): `head` is the 40-hex commit `HEAD^{commit}` resolves to, or null only when HEAD is a symbolic ref to an unborn branch (any other failure is `workspace_failed`); `clean` is true exactly when `git status --porcelain=v1 --untracked-files=all` prints nothing. `refresh` and `release` are unchanged. Class `personal` (or absent) behaves exactly as below.
 
 **prepare, F exists.** Read `F/.git/ezil-repo.json` (read-only). `{repositoryId, handle, name, gitHost}` all equal → `state:'existing'`, no network. Otherwise `folder_conflict`; nothing installed or changed.
 
@@ -447,7 +451,7 @@ A Sandbox exec on a stopped container starts it. The existing code only execs ri
 
 **Post-check:** neither `.git/config` nor `git remote -v` contains userinfo or the token.
 
-**Output:** the last stdout line is `{ok:true,state,folder,openFolder,pathNotFound,branch,empty}` (prepare and commit for `open`), `{ok:true,state:'refreshed'}` (refresh), `{ok:true}` (release) or `{ok:false,errorCode}`.
+**Output:** the last stdout line is `{ok:true,state,folder,openFolder,pathNotFound,branch,empty}` (prepare and commit for `open`; for class `assessment` commit answers `{ok:true,state,folder,openFolder,pathNotFound,branch,empty,head,clean}`, 1.0.3), `{ok:true,state:'refreshed'}` (refresh), `{ok:true}` (release) or `{ok:false,errorCode}`.
 
 ### 9.5 Repo-local `.git/config` (no secret, no node path)
 Vectors `gitConfig.expectLocalList` (as `git config --local --list` prints it):
@@ -531,6 +535,7 @@ Full table, copy and upstream mapping: vectors `errorTable`. `retryable` in the 
 ## 13. Phase B: AWS computers (deferred; inert until activated)
 - **Worker** (`worker/src/aws-repo-open.ts`): relays the §8 body to the host edge at `POST /__ezil/control/repo-open/<sha256hex(relay body)>` with the existing `awsControlTarget` and gw1 control signing; polls `/__ezil/control/repo-open-status/<jobId 64-hex>` every 1.5 s within the Worker deadline. Edge 404 (an AMI before the rollout) → `workspace_unsupported` (cbe83f6a aws-workspace.ts:137-141 mapped it to failed; changed here).
 - **Host** (`infra/host-agent` op `repo_open`): one serial worker per host; a per-job sub-cgroup with a `cgroup.kill` drain; one absolute deadline; refuses while a stop or fence is pending or the desktop is not running; writes the sha-pinned kernel and helper plus request and grant into the desktop's `/run/ezil` through runc exec stdin (`/run` is tmpfs, desktop.py:585); argv-only `runc exec` with root `/workspace` (desktop.py:557,586), never `/workspaces`; output sanitizer rejects GRANT_RE. The prepare/commit split applies (commit under the host's workspace lock).
+- **Class (1.0.3).** The relay body may carry `class`; the host re-validates it with the same closed class → git-host table (`REPO_OPEN_CLASS_GIT_HOSTS`), forwards it into the kernel request only when present, and validates an assessment commit answer against `okOpenAssessment` (`head`, `clean`). The host's kernel sha256 pin moves with every kernel change.
 - **Folder.** `withCodeFolder` sets the AWS `path='/?folder=…'` (§4). Survival through the bootstrap into code-server is INF until E-AWS.
 - **Activation.** A lead commit that removes the Phase-A AWS refusal in `app/src/server/repo-open/service.ts` and switches the Worker dispatch to the relay, made only after the security review, AMI promotion and the canary E2E.
 
@@ -702,6 +707,15 @@ Two checker passes over the draft, each finding verified against the code at the
 | C2: USAGE citation; NUMERIC_REF_RE bound; SANDBOX_NAME_RE case | §6.12, §1, vectors | grants.sql:86; `int64_max` predicate on both sides with overflow cases; strictness note. |
 
 ## Changelog
+
+### 1.0.3 (2026-11-02, PATCH)
+For the AWS candidate assessment on an existing staging computer (analysis `u2-aws-assessment-seam-20261102`). Additive: every 1.0.2 request, body, answer and vector case is unchanged and still valid. Class `personal` (or no class) behaves exactly as in 1.0.2.
+
+1. **Request class.** The §8 body and the §9.2 request may carry `class: 'personal'|'assessment'` (absent = `personal`). Class → git host is a closed table (constants `REPO_OPEN_CLASS_GIT_HOSTS`): `personal` → `git-preview.ezil.work`, `assessment` → `git-qa.ezil.work` (`GIT_ASSESSMENT_HOST`). A body or request whose `gitHost` is not its class's host is refused in both directions. Vectors: constants `GIT_ASSESSMENT_HOST`, `REPO_OPEN_CLASSES`, `REPO_OPEN_CLASS_DEFAULT`, `REPO_OPEN_CLASS_GIT_HOSTS`; `workerRequest.optionalKeys`, `classRule`, four valid and eight invalid class mutations; `kernel.optionalRequestKeys`; `requestKeysRule`. `gitHostAllowList` keeps its meaning (the class-absent list).
+2. **Fresh folder for assessments.** Prepare refuses an existing F with `folder_conflict` before any action, whatever its binding; commit refuses an F that appeared after prepare. No `existing` state for class `assessment`. Vectors: `kernel.assessment.rule`, a `kernel.classification` row.
+3. **Readiness facts.** An assessment commit answer adds `head` (40-hex, or null for an unborn branch) and `clean` (`status --porcelain=v1 --untracked-files=all` empty), read with a hardened git (`kernel.assessment.hardenedRead`). Vectors: `kernel.assessment.resultOpenKeys`, `states`, `headRule`, `cleanRule`; `errorTable.workerResponses.okOpenAssessment`, `okAssessmentRule`, 16 `okAssessmentCases`. Check: a reference validator over every case, and the personal and assessment shapes exclude each other.
+4. **Text:** §1, §9.2, §9.4 (class `assessment`, Output), §13 (class on the AWS relay). The helper (`ezil-git-grant.mjs`) is host-agnostic and unchanged (sha256 5de6b39a…).
+5. **Bump.** `contractVersion` is 1.0.3; both README pins are updated. The gateway extract changes only in `contractVersion` and `sourceVectorsSha256`. The kernel test's vectors pin and the AWS host's kernel sha256 pin are updated in the same change. Re-seeding the copies in EZiL-Works, universe-2.0 and EZiL CLI is a separate lead step (§18) and has not happened at this commit.
 
 ### 1.0.2 (2026-11-01, PATCH)
 The lead's decisions D1-D8 on the final I1 review (16 findings, three reviewers). No OS route, status code, error code, notice copy or request/response shape changes. Two Worker refusals change for the better (a commit exec timeout and a transition in flight after prepare now answer the retryable `workspace_busy`).

@@ -16,8 +16,12 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
    * Relay body: the §8 Worker body, exactly as the Worker validated it, plus ``jobId``
      (64 lowercase hex, 32 random bytes chosen by the Worker); nothing else:
      ``{jobId, v:1, op:'open'|'refresh', repositoryId, handle, name, gitHost, defaultBranch,
-     path:string|null, grant:{username:'ezil', token, expiresAt, scope}}``.
-     Every field is re-validated here with the Worker's rules (parse_relay).
+     path:string|null, grant:{username:'ezil', token, expiresAt, scope}}``, plus (contract 1.0.3)
+     the one optional key ``class: 'personal'|'assessment'`` (absent = personal). gitHost must be
+     REPO_OPEN_CLASS_GIT_HOSTS[class], a closed table (personal -> git-preview.ezil.work,
+     assessment -> git-qa.ezil.work), refused in both directions; ``class`` reaches the kernel
+     request only when the relay carried it. Every field is re-validated here with the Worker's
+     rules (parse_relay).
    * Replies (edge status, JSON body):
      200 ``{ok:true, state:'running'}``;
      409 ``{ok:false, error}`` with error ``workspace_busy`` (the host's one slot is taken, or
@@ -32,7 +36,9 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
      409 ``{ok:false, error:'job_unknown'}`` (never accepted here, or older than JOB_TTL).
    * ``result`` is the §8 answer itself, ``{status, body}``, so the Worker relays it 1:1 after
      its own validation: ``{status:200, body:{ok:true, state:'cloned'|'initialized_empty'|
-     'existing', folder, openFolder, pathNotFound, branch, empty}}`` (open),
+     'existing', folder, openFolder, pathNotFound, branch, empty}}`` (open; for class assessment
+     ``state`` is never 'existing' and the body adds ``head`` (40 hex, or null for an unborn
+     branch) and ``clean`` (boolean), vectors errorTable.workerResponses.okOpenAssessment),
      ``{status:200, body:{ok:true, state:'refreshed'}}`` (refresh), or
      ``{status, body:{ok:false, error}}`` with status from REPO_OPEN_STATUS (vectors
      errorTable.workerResponses.refusals). Host-originated codes: ``runtime_not_running`` (a
@@ -245,7 +251,11 @@ from .lease import strict_json
 
 # ── constants (each compared with the vectors by test_repo_open_op) ─────────────────────────
 WORKSPACE_ROOT = "/workspace"                      # vectors WORKSPACE_ROOT_DEFAULT; desktop.py binds it
-REPO_OPEN_GIT_HOSTS = ("git-preview.ezil.work",)   # vectors workerRequest.gitHostAllowList
+# Request class -> the one git host it may name (contract 1.0.3; vectors constants
+# REPO_OPEN_CLASS_GIT_HOSTS = the kernel's CLASS_GIT_HOSTS). A relay without `class` is personal.
+REPO_OPEN_CLASS_GIT_HOSTS = {"personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work"}
+REPO_OPEN_CLASS_DEFAULT = "personal"
+REPO_OPEN_GIT_HOSTS = (REPO_OPEN_CLASS_GIT_HOSTS[REPO_OPEN_CLASS_DEFAULT],)   # vectors workerRequest.gitHostAllowList
 RUN_DIRS = ("/run/ezil", "/run/ezil/bin", "/run/ezil/git", "/run/ezil/git/grants", "/run/ezil/git/incoming",
             "/run/ezil/requests", "/run/ezil/locks")
 KERNEL_PATH = "/run/ezil/bin/ezil-repo-open.mjs"
@@ -293,7 +303,7 @@ STATUS_MESSAGE_KEYS = frozenset({"op", "leaseEpoch", "ts", "seq", "mac", "jobId"
 # The kernel and helper, sha256-pinned (byte-equal to worker/src/repo-open-assets; tested).
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo_open_assets")
 REPO_OPEN_ASSETS = {
-    "ezil-repo-open.mjs": "d9168d346ef88ecd2dc2c33d55ad5bb85fecfd707bece4a6940781e535a219aa",
+    "ezil-repo-open.mjs": "a744eaa99b45f1857dc1c95092f22d129dfdb5d765a1873d14b628265663f31c",
     "ezil-git-grant.mjs": "5de6b39aeb9ecbdc03cf3334e45047652b7249f0a395227deea92000f61ba55e",
 }
 ASSET_MAX_BYTES = 262144
@@ -308,6 +318,7 @@ GRANT_RE = re.compile(r"\Aegg_[0-9a-f]{64}\Z")
 PATH_SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 ISO_RE = re.compile(r"\A([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,3}))?Z\Z")
 GRANT_SHAPE = re.compile(rb"egg_[0-9a-f]{64}")
+HEAD_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # Constant programs. Request data never appears here: paths arrive as positional parameters.
@@ -325,11 +336,15 @@ KERNEL_ERROR_CODES = ("folder_conflict", "repository_too_large", "git_auth_rejec
                       "network_unavailable", "workspace_busy", "workspace_failed")
 OPEN_STATES = ("cloned", "initialized_empty", "existing")
 OPEN_KEYS = ("ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty")
+ASSESSMENT_OPEN_STATES = ("cloned", "initialized_empty")      # vectors kernel.assessment.states
+ASSESSMENT_OPEN_KEYS = OPEN_KEYS + ("head", "clean")           # vectors kernel.assessment.resultOpenKeys
 START_REFUSALS = frozenset({"workspace_busy", "job_replayed", "repo_open_invalid", "workspace_failed"})
 STATUS_REFUSALS = frozenset({"job_unknown", "repo_open_invalid"})
 BODY_KEYS = ("v", "op", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "grant")
 GRANT_KEYS = ("username", "token", "expiresAt", "scope")
 RELAY_KEYS = frozenset(("jobId",) + BODY_KEYS)
+OPTIONAL_BODY_KEYS = ("class",)                                # vectors workerRequest.optionalKeys
+CLASSED_RELAY_KEYS = RELAY_KEYS | frozenset(OPTIONAL_BODY_KEYS)
 
 
 # ── validation (the Worker's parseRepoOpenBody, field for field) ────────────────────────────
@@ -386,11 +401,25 @@ def valid_job_id(v):
     return _str(v) and bool(JOB_RE.match(v))
 
 
+def relay_class(raw):
+    """The relay's request class (contract 1.0.3): its `class` when present (a string in the
+    table), else the default; None when `class` is present but not a known class."""
+    if "class" not in raw:
+        return REPO_OPEN_CLASS_DEFAULT
+    cls = raw["class"]
+    return cls if isinstance(cls, str) and cls in REPO_OPEN_CLASS_GIT_HOSTS else None
+
+
 def parse_relay(raw, now_ms):
     """The Worker's relay -> (jobId, §8 body). ValueError on anything outside the contract;
     never echoes a value. Same rules as worker/src/repo-open.ts parseRepoOpenBody, stricter
-    only where Python and JSON differ (v must be the integer 1)."""
-    if not isinstance(raw, dict) or set(raw) != RELAY_KEYS or not valid_job_id(raw.get("jobId")):
+    only where Python and JSON differ (v must be the integer 1). gitHost must be the relay
+    class's host (REPO_OPEN_CLASS_GIT_HOSTS); `class` stays in the body only when it was sent."""
+    if (not isinstance(raw, dict) or set(raw) not in (RELAY_KEYS, CLASSED_RELAY_KEYS)
+            or not valid_job_id(raw.get("jobId"))):
+        raise ValueError("repo_open_invalid")
+    cls = relay_class(raw)
+    if cls is None:
         raise ValueError("repo_open_invalid")
     b, g = raw, raw.get("grant")
     if not _exact(g, GRANT_KEYS):
@@ -400,7 +429,7 @@ def parse_relay(raw, now_ms):
     ok = (type(b.get("v")) is int and b["v"] == 1 and b.get("op") in ("open", "refresh")
           and _str(b.get("repositoryId")) and bool(UUID_RE.match(b["repositoryId"]))
           and _str(b.get("handle")) and bool(HANDLE_RE.match(b["handle"])) and valid_name(b.get("name"))
-          and b.get("gitHost") in REPO_OPEN_GIT_HOSTS and valid_branch(b.get("defaultBranch"))
+          and b.get("gitHost") == REPO_OPEN_CLASS_GIT_HOSTS[cls] and valid_branch(b.get("defaultBranch"))
           and (path is None or (b["op"] == "open" and _str(path) and path_problem(path) is None))
           and g.get("username") == "ezil" and _str(g.get("token")) and bool(GRANT_RE.match(g["token"]))
           and g.get("scope") in ("write", "read")
@@ -409,6 +438,8 @@ def parse_relay(raw, now_ms):
         raise ValueError("repo_open_invalid")
     body = {k: b[k] for k in BODY_KEYS if k != "grant"}
     body["grant"] = {k: g[k] for k in GRANT_KEYS}
+    if "class" in raw:
+        body["class"] = cls
     return raw["jobId"], body
 
 
@@ -468,21 +499,33 @@ def kernel_refusal(value):
     return refusal("workspace_failed")
 
 
-def open_answer(value, folder):
+def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT):
     """A kernel commit result for op open, validated as strictly as the OS validates the
-    Worker's 200 (vectors errorTable.workerResponses.okRule)."""
+    Worker's 200 (vectors errorTable.workerResponses.okRule). Class assessment (contract 1.0.3,
+    okAssessmentRule): exactly ASSESSMENT_OPEN_KEYS, never `existing`, head None or 40 lowercase
+    hex, clean a bool, and head None exactly when empty and when the state is initialized_empty."""
     if value is None:
         return refusal("workspace_failed")
     if value.get("ok") is False:
         return kernel_refusal(value)
+    assessment = cls == "assessment"
+    keys = ASSESSMENT_OPEN_KEYS if assessment else OPEN_KEYS
+    if not _exact(value, keys):
+        return refusal("workspace_failed")
+    if assessment:
+        head = value["head"]
+        if (value["state"] not in ASSESSMENT_OPEN_STATES or not (head is None or (_str(head) and HEAD_RE.match(head)))
+                or not isinstance(value["clean"], bool) or value["empty"] is not (head is None)
+                or (value["state"] == "initialized_empty") is not (head is None)):
+            return refusal("workspace_failed")
     of = value.get("openFolder")
-    if (not _exact(value, OPEN_KEYS) or value["ok"] is not True or value["state"] not in OPEN_STATES
+    if (value["ok"] is not True or value["state"] not in OPEN_STATES
             or value["folder"] != folder or not _str(of) or not (of == folder or of.startswith(folder + "/"))
             or len(of.encode("utf-8", "surrogatepass")) > 4096 or CONTROL_CHAR_RE.search(of)
             or not isinstance(value["pathNotFound"], bool) or not isinstance(value["empty"], bool)
             or not valid_branch(value["branch"])):
         return refusal("workspace_failed")
-    return {"status": 200, "body": {k: value[k] for k in OPEN_KEYS}}
+    return {"status": 200, "body": {k: value[k] for k in keys}}
 
 
 def refresh_answer(value):
@@ -975,6 +1018,7 @@ class Flight:
             "incoming": self.incoming, "deadlineMs": self.deadline_ms,
             "budget": {"limitBytes": SNAPSHOT_LIMIT_BYTES, "maxEntries": SNAPSHOT_MAX_ENTRIES,
                        "fraction": REPO_BUDGET_FRACTION},
+            **({"class": b["class"]} if "class" in b else {}),   # contract 1.0.3: only when the relay sent it
         }, separators=(",", ":")).encode()
 
     def grant_file(self):
@@ -1154,7 +1198,8 @@ class Flight:
                         stopped = res is STOPPED
                         # A commit timeout is retryable (vectors workerExec.timeoutErrorByStep): the
                         # rename may have happened, and the next open is idempotent.
-                        answer = self.failure(res, "workspace_busy") or open_answer(last_json_line(res[2]), self.folder)
+                        answer = self.failure(res, "workspace_busy") or open_answer(
+                            last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT))
         else:
             # Step 10.
             self.step = "refresh"

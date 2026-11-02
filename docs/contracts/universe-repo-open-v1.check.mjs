@@ -77,15 +77,25 @@ ok(PROD.length >= 2 && new Set(PROD).size === PROD.length && PROD.every((c) => /
 
 // ── version and constants ────────────────────────────────────────────────────
 ok(V.contract === 'universe-repo-open-v1', 'contract name');
-ok(V.contractVersion === '1.0.2', 'contractVersion is "1.0.2"');
+ok(V.contractVersion === '1.0.3', 'contractVersion is "1.0.3"');
 for (const name of V.requiredConstants) ok(Object.hasOwn(C, name), `constants: ${name} missing`);
 ok(C.CLIENT_ID_UNPINNED === 'UNPINNED', 'CLIENT_ID_UNPINNED');
 for (const key of ['OS_STAGING_ORIGIN', 'WORKS_STAGING_ORIGIN', 'PREVIEW_SUPABASE_ORIGIN']) {
     const u = new URL(C[key]);
     ok(u.protocol === 'https:' && u.origin === C[key], `${key} is a bare https origin`);
 }
-for (const host of [C.GIT_STAGING_HOST, new URL(C.WORKS_STAGING_ORIGIN).host, C.UNIVERSE_STAGING_HOST, new URL(C.OS_STAGING_ORIGIN).host]) {
+for (const host of [C.GIT_STAGING_HOST, C.GIT_ASSESSMENT_HOST, new URL(C.WORKS_STAGING_ORIGIN).host, C.UNIVERSE_STAGING_HOST, new URL(C.OS_STAGING_ORIGIN).host]) {
     ok(!C.STAGING_FORBIDDEN_HOSTS.includes(host), `staging host ${host} is on the forbidden list`);
+}
+// 1.0.3: the request class → git host table is closed, total and injective.
+{
+    const T = C.REPO_OPEN_CLASS_GIT_HOSTS;
+    eq(C.REPO_OPEN_CLASSES, ['personal', 'assessment'], 'REPO_OPEN_CLASSES');
+    eq(Object.keys(T), C.REPO_OPEN_CLASSES, 'REPO_OPEN_CLASS_GIT_HOSTS covers exactly REPO_OPEN_CLASSES');
+    ok(C.REPO_OPEN_CLASS_DEFAULT === 'personal' && T.personal === C.GIT_STAGING_HOST && T.assessment === C.GIT_ASSESSMENT_HOST,
+        'class table: personal (the default) is GIT_STAGING_HOST, assessment is GIT_ASSESSMENT_HOST');
+    ok(new Set(Object.values(T)).size === Object.values(T).length && !Object.values(T).includes(C.GIT_PRODUCTION_HOST),
+        'class table: one distinct host per class, never GIT_PRODUCTION_HOST');
 }
 ok(C.STAGING_FORBIDDEN_HOSTS.includes(C.GIT_PRODUCTION_HOST), 'GIT_PRODUCTION_HOST is forbidden on staging');
 ok(!C.GATEWAY_TAKEN_RL_NAMESPACES.includes(C.GATEWAY_PREVIEW_RL_NAMESPACE), 'preview RL namespace collides');
@@ -390,18 +400,33 @@ for (const b of V.osRoute.request.invalid) ok(!osRouteBodyValid(b), `os route bo
 // ── Worker request body ──────────────────────────────────────────────────────
 function workerBodyValid(b, now) {
     const W = V.workerRequest;
-    if (!b || Object.keys(b).length !== W.keys.length || !W.keys.every((k) => Object.hasOwn(b, k))) return false;
+    if (!b || typeof b !== 'object') return false;
+    // 1.0.3 (workerRequest.classRule): optionalKeys may be present; class absent = the default class.
+    const keys = Object.keys(b).filter((k) => !W.optionalKeys.includes(k));
+    if (keys.length !== W.keys.length || !W.keys.every((k) => Object.hasOwn(b, k))) return false;
+    const cls = Object.hasOwn(b, 'class') ? b.class : C.REPO_OPEN_CLASS_DEFAULT;
+    if (typeof cls !== 'string' || !C.REPO_OPEN_CLASSES.includes(cls) || b.gitHost !== C.REPO_OPEN_CLASS_GIT_HOSTS[cls]) return false;
     if (Buffer.byteLength(JSON.stringify(b)) > C.BODY_LIMITS_BYTES.workerRequest) return false;
     const g = b.grant;
     if (!g || Object.keys(g).length !== W.grantKeys.length || !W.grantKeys.every((k) => Object.hasOwn(g, k))) return false;
     const t = isoMs(g.expiresAt);
     return b.v === 1 && ['open', 'refresh'].includes(b.op) && R.UUID_RE(b.repositoryId) && R.HANDLE_RE(b.handle) && R.NAME_RE(b.name)
-        && W.gitHostAllowList.includes(b.gitHost) && R.BRANCH_RE(b.defaultBranch)
+        && (cls !== C.REPO_OPEN_CLASS_DEFAULT || W.gitHostAllowList.includes(b.gitHost)) && R.BRANCH_RE(b.defaultBranch)
         && (b.path === null || (b.op === 'open' && pathOk(b.path)))
         && g.username === C.GRANT_USERNAME && R.GRANT_RE(g.token) && C.GRANT_SCOPES.includes(g.scope)
         && t > now && t <= now + T.WORKER_ACCEPT_EXPIRY_MAX_MS;
 }
 eq(V.workerRequest.gitHostAllowList, [C.GIT_STAGING_HOST], 'worker gitHost allow-list');
+eq(V.workerRequest.gitHostAllowList, [C.REPO_OPEN_CLASS_GIT_HOSTS[C.REPO_OPEN_CLASS_DEFAULT]], 'worker gitHost allow-list is the class-absent list');
+eq(V.workerRequest.optionalKeys, ['class'], 'worker body optional keys');
+eq(V.kernel.optionalRequestKeys, V.workerRequest.optionalKeys, 'the kernel request carries the same optional key');
+ok(V.kernel.optionalRequestKeys.every((k) => !V.kernel.requestKeys.includes(k) && !V.kernel.testSeamKeys.includes(k)), 'optional request keys are neither request keys nor test-seam keys');
+for (const [cls, host] of Object.entries(C.REPO_OPEN_CLASS_GIT_HOSTS)) {
+    for (const other of Object.values(C.REPO_OPEN_CLASS_GIT_HOSTS)) {
+        const b = { ...materialise(V.workerRequest.base), class: cls, gitHost: other };
+        eq(workerBodyValid(b, NOW), other === host, `worker body class ${cls} on ${other}`);
+    }
+}
 ok(workerBodyValid(materialise(V.workerRequest.base), NOW), 'worker body base valid');
 for (const m of V.workerRequest.validMutations) ok(workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW), `worker body valid ${JSON.stringify(m)}`);
 for (const m of V.workerRequest.invalidMutations) ok(!workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW), `worker body invalid (${m.why})`);
@@ -693,6 +718,32 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
             && typeof b.pathNotFound === 'boolean' && typeof b.empty === 'boolean' && R.BRANCH_RE(b.branch);
     }
     for (const c of W.okCases) eq(workerOkValid(c.op, c.body), c.valid, `Worker 200 ${c.op} ${JSON.stringify(c.body).slice(0, 80)}`);
+    // 1.0.3: the assessment open shape (kernel.assessment, okAssessmentRule).
+    const K = V.kernel.assessment;
+    eq(W.okOpenAssessment.keys, K.resultOpenKeys, 'Worker assessment open 200 keys equal the kernel assessment open keys');
+    eq(K.resultOpenKeys, [...V.kernel.resultOpenKeys, 'head', 'clean'], 'the assessment open keys are the personal ones plus head and clean');
+    eq(W.okOpenAssessment.states, K.states, 'Worker assessment open 200 states');
+    ok(K.states.every((s) => W.okOpen.states.includes(s)) && !K.states.includes('existing'), 'assessment states are open states without existing');
+    eq(K.hardenedRead.globalOptions, ['--no-pager', '--no-optional-locks'], 'hardened read global options');
+    eq(Object.keys(K.hardenedRead.env), ['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CEILING_DIRECTORIES', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT'], 'hardened read env');
+    ok(K.hardenedRead.env.GIT_CONFIG_GLOBAL === '/dev/null' && K.hardenedRead.config.includes('core.hooksPath=/dev/null') && K.hardenedRead.config.includes('core.fsmonitor=false'), 'hardened read config');
+    const HEX40 = /^[0-9a-f]{40}$/;
+    function assessmentOkValid(b) {
+        const shape = W.okOpenAssessment;
+        if (!b || typeof b !== 'object' || Array.isArray(b)) return false;
+        if (Object.keys(b).length !== shape.keys.length || !shape.keys.every((k) => Object.hasOwn(b, k))) return false;
+        if (b.ok !== true || !shape.states.includes(b.state)) return false;
+        const abs = (p) => typeof p === 'string' && p.startsWith('/') && !p.split('/').some((seg) => seg === '..' || seg === '.');
+        return abs(b.folder) && abs(b.openFolder) && (b.openFolder === b.folder || b.openFolder.startsWith(`${b.folder}/`))
+            && typeof b.pathNotFound === 'boolean' && typeof b.empty === 'boolean' && R.BRANCH_RE(b.branch)
+            && (b.head === null || (typeof b.head === 'string' && HEX40.test(b.head))) && typeof b.clean === 'boolean'
+            && b.empty === (b.head === null) && (b.state === 'initialized_empty') === (b.head === null);
+    }
+    const assessmentCases = W.okAssessmentCases.map((c) => ({ ...c, body: Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, expand(v)])) }));
+    for (const c of assessmentCases) eq(assessmentOkValid(c.body), c.valid, `Worker assessment 200 ${c.why ?? 'valid'} ${JSON.stringify(c.body).slice(0, 60)}`);
+    for (const valid of [true, false]) ok(assessmentCases.some((c) => c.valid === valid), `Worker assessment 200 needs a ${valid ? 'valid' : 'invalid'} case`);
+    for (const c of assessmentCases) if (c.valid) ok(!workerOkValid('open', c.body), 'an assessment-shaped 200 is invalid for a personal open');
+    for (const c of W.okCases) if (c.op === 'open' && c.valid) ok(!assessmentOkValid(c.body), 'a personal-shaped 200 is invalid for an assessment open');
     for (const op of ['open', 'refresh']) for (const valid of [true, false]) ok(W.okCases.some((c) => c.op === op && c.valid === valid), `Worker 200 needs a ${valid ? 'valid' : 'invalid'} ${op} case`);
     for (const ws of [401, 403, 404, 409, 422, 429, '5xx', '3xx', 'other']) ok(E.upstream.some((u) => u.source === 'works' && u.status === ws && u.code === '*'), `works ${ws} has no catch-all`);
     for (const code of ['identity_conflict', 'identity_unverified', 'ezil_id_builders_only', 'account_suspended', 'repository_not_ready']) {

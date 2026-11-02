@@ -32,7 +32,11 @@ const GIT_HOME = '/run/ezil/home';
 const GIT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 export const STAGING_ROOT_NAME = '.ezil-staging';
 const BINDING_FILE = 'ezil-repo.json';
-const GIT_HOSTS = ['git-preview.ezil.work'];
+// Request class → the one git host it may name (1.0.3; vectors constants REPO_OPEN_CLASS_GIT_HOSTS).
+// A closed table: a request whose gitHost is not its class's host is refused. A request without
+// `class` is 'personal', so a 1.0.2 request reads exactly as before.
+export const CLASS_GIT_HOSTS = Object.freeze({ personal: 'git-preview.ezil.work', assessment: 'git-qa.ezil.work' });
+const DEFAULT_CLASS = 'personal';
 export const LOCK_STALE_MS = 600000;
 export const KERNEL_GIT_COMMAND_MAX_MS = 80000;
 export const PREPARE_RESERVE_MS = 20000;
@@ -104,6 +108,8 @@ export function pathProblem(value) {
 
 export const REQUEST_KEYS = ['v', 'op', 'phase', 'uuid', 'inflight', 'repositoryId', 'handle', 'name', 'gitHost',
   'defaultBranch', 'path', 'root', 'staging', 'incoming', 'deadlineMs', 'budget'];
+/** The one optional request key (1.0.3, vectors kernel.optionalRequestKeys). */
+export const OPTIONAL_REQUEST_KEYS = ['class'];
 export const PHASES = ['prepare', 'commit', 'refresh', 'release'];
 const PHASE_OPS = { prepare: ['open'], commit: ['open'], refresh: ['refresh'], release: ['open', 'refresh'] };
 const BUDGET_KEYS = ['limitBytes', 'maxEntries', 'fraction'];
@@ -142,17 +148,21 @@ export function readRequest(phase, requestPath) {
   if (!st || !st.isFile() || st.size > MAX_REQUEST_BYTES) refuse('workspace_failed');
   let r;
   try { r = JSON.parse(fs.readFileSync(requestPath, 'utf8')); } catch { refuse('workspace_failed'); }
-  if (!exactKeys(r, REQUEST_KEYS)) refuse('workspace_failed');
+  const classed = exactKeys(r, [...REQUEST_KEYS, ...OPTIONAL_REQUEST_KEYS]);
+  if (!classed && !exactKeys(r, REQUEST_KEYS)) refuse('workspace_failed');
+  const cls = classed ? r.class : DEFAULT_CLASS;
+  if (typeof cls !== 'string' || !Object.hasOwn(CLASS_GIT_HOSTS, cls)) refuse('workspace_failed');
   const ok = r.v === 1 && (r.op === 'open' || r.op === 'refresh') && r.phase === phase && PHASE_OPS[phase].includes(r.op)
     && r.uuid === m[1] && Array.isArray(r.inflight) && r.inflight.length >= 1 && r.inflight.length <= MAX_INFLIGHT
     && r.inflight.every(validUuid) && new Set(r.inflight).size === r.inflight.length && r.inflight.includes(r.uuid)
-    && validUuid(r.repositoryId) && validHandle(r.handle) && validName(r.name) && GIT_HOSTS.includes(r.gitHost)
+    && validUuid(r.repositoryId) && validHandle(r.handle) && validName(r.name) && r.gitHost === CLASS_GIT_HOSTS[cls]
     && validBranch(r.defaultBranch) && (r.path === null || (r.op === 'open' && pathProblem(r.path) === null))
     && validRoot(r.root) && r.staging === `${r.root}/${STAGING_ROOT_NAME}/${r.uuid}`
     && r.incoming === `${INCOMING_DIR}/${r.uuid}.json` && isWholeNumber(r.deadlineMs)
     && exactKeys(r.budget, BUDGET_KEYS) && isWholeNumber(r.budget.limitBytes) && isWholeNumber(r.budget.maxEntries)
     && typeof r.budget.fraction === 'number' && r.budget.fraction > 0 && r.budget.fraction <= 1;
   if (!ok) refuse('workspace_failed');
+  r.class = cls;
   return r;
 }
 
@@ -183,14 +193,17 @@ const seamConfig = (seam) => (seam ? [
 ] : []);
 
 const OUTPUT_CAP = 1 << 20;
-/** One git process (own process group, killed whole on timeout); output captured, never forwarded. */
-export function runGit(args, { cwd, timeoutMs, seam }) {
+/**
+ * One git process (own process group, killed whole on timeout); output captured, never forwarded.
+ * `env` adds fixed variables to the cleared environment (the hardened reads); nothing is inherited.
+ */
+export function runGit(args, { cwd, timeoutMs, seam, env = null }) {
   return new Promise((resolve) => {
     if (!(timeoutMs > 0)) { resolve({ code: null, stdout: '', stderr: '', timedOut: true }); return; }
     let child;
     try {
       child = spawn('git', [...GIT_BASE_CONFIG, ...seamConfig(seam), ...args],
-        { cwd, env: gitEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+        { cwd, env: env ? { ...gitEnv(), ...env } : gitEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch {
       resolve({ code: null, stdout: '', stderr: '', timedOut: false });
       return;
@@ -711,7 +724,55 @@ function currentBranch(folder, fallback) {
   return fallback;
 }
 
+/**
+ * The hardened local git of the assessment reads (1.0.3): on top of the cleared environment and
+ * GIT_BASE_CONFIG (no system config, hooks /dev/null, fsmonitor off), no global config either,
+ * repository discovery stops at F's parent (F itself must be the repository), no pager, and no
+ * optional lock (a status killed at its timeout never leaves .git/index.lock behind). No external
+ * diff can run: status runs no diff driver, and neither the environment nor any config but F's
+ * own (written by this kernel) can name one.
+ */
+const HARDENED_GLOBAL_OPTIONS = ['--no-pager', '--no-optional-locks'];
+const hardenedGit = (folder) => ({ cwd: folder, timeoutMs: LOCAL_GIT_COMMAND_MS, seam: null,
+  env: { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CEILING_DIRECTORIES: path.posix.dirname(folder), GIT_OPTIONAL_LOCKS: '0' } });
+const HEAD_RE = /^[0-9a-f]{40}\n$/;
+const SYMREF_RE = /^refs\/heads\/[^\n]+\n$/;
+
+/**
+ * Assessment readiness facts of F (1.0.3), read in F after the rename:
+ *   head   the 40-hex commit HEAD resolves to; null only when HEAD is a symbolic ref to a branch
+ *          that does not resolve (unborn); any other failure is workspace_failed;
+ *   clean  `git status --porcelain=v1 --untracked-files=all` printed nothing.
+ */
+export async function assessmentFacts(folder) {
+  const opts = hardenedGit(folder);
+  const run = async (args) => {
+    const result = await runGit([...HARDENED_GLOBAL_OPTIONS, ...args], opts);
+    if (result.timedOut) refuse('workspace_busy');
+    return result;
+  };
+  let head = null;
+  const rev = await run(['rev-parse', '--verify', '-q', 'HEAD^{commit}']);
+  if (rev.code === 0) {
+    if (!HEAD_RE.test(rev.stdout)) refuse('workspace_failed');
+    head = rev.stdout.slice(0, 40);
+  } else {
+    const sym = await run(['symbolic-ref', '-q', 'HEAD']);
+    if (sym.code !== 0 || !SYMREF_RE.test(sym.stdout)) refuse('workspace_failed');
+  }
+  const status = await run(['status', '--porcelain=v1', '--untracked-files=all']);
+  if (status.code !== 0) refuse('workspace_failed');
+  return { head, clean: status.stdout === '' };
+}
+
 async function describeFolder(folder, r, state) {
+  if (r.class === 'assessment') {
+    // Never `existing` (prepare and commit refuse a folder that is already there).
+    const { head, clean } = await assessmentFacts(folder);
+    const empty = head === null;
+    return { ok: true, state: empty ? 'initialized_empty' : 'cloned', folder, ...openFolderOf(folder, r.path),
+      branch: currentBranch(folder, r.defaultBranch), empty, head, clean };
+  }
   const head = await runGit(['rev-parse', '--verify', '-q', 'HEAD'], localGit(folder));
   if (head.timedOut) refuse('workspace_busy');
   const empty = head.code !== 0;
@@ -735,6 +796,9 @@ async function prepare(r, seam) {
   const folder = folderOf(r);
   const existing = lstatOrNull(folder);
   if (existing) {
+    // An assessment opens only a folder it clones itself (1.0.3): a tree already there, whatever
+    // its binding, never stands in for the starter clone. Refused before any action.
+    if (r.class === 'assessment') return fail('folder_conflict');
     // Read-only: nothing installed or changed here (commit installs for an existing folder).
     if (!existing.isDirectory() || !bindingMatches(folder, r)) return fail('folder_conflict');
     return { ok: true, state: 'existing', folder, openFolder: folder, pathNotFound: false, branch: r.defaultBranch, empty: false };
@@ -801,6 +865,8 @@ async function commit(r) {
     const folder = folderOf(r);
     const existing = lstatOrNull(folder);
     if (existing) {
+      // A folder that appeared between prepare and commit: an assessment never adopts it (1.0.3).
+      if (r.class === 'assessment') return fail('folder_conflict');
       if (!existing.isDirectory() || !bindingMatches(folder, r)) return fail('folder_conflict');
       const token = readIncomingGrant(r);
       await repairCredentialConfig(folder, r);

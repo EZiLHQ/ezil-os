@@ -1,6 +1,6 @@
 {
   "contract": "universe-repo-open-v1",
-  "contractVersion": "1.0.2",
+  "contractVersion": "1.0.3",
   "about": [
     "Machine-checkable constants and cases for docs/contracts/universe-repo-open-v1.md.",
     "Only the lead changes this file. Any change bumps contractVersion and the pinned sha256 (README-universe-repo-open.md).",
@@ -23,6 +23,10 @@
     "WORKS_STAGING_ORIGIN": "https://api-preview.ezil.work",
     "GIT_STAGING_HOST": "git-preview.ezil.work",
     "GIT_PRODUCTION_HOST": "github.ezil.work",
+    "GIT_ASSESSMENT_HOST": "git-qa.ezil.work",
+    "REPO_OPEN_CLASSES": ["personal", "assessment"],
+    "REPO_OPEN_CLASS_DEFAULT": "personal",
+    "REPO_OPEN_CLASS_GIT_HOSTS": { "personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work" },
     "PREVIEW_SUPABASE_ORIGIN": "https://13-203-99-168.sslip.io",
     "PRODUCTION_AUTH0_CLIENTS": ["Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx", "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"],
     "CLIENT_ID_UNPINNED": "UNPINNED",
@@ -593,6 +597,8 @@
     "keys": ["v", "op", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "grant"],
     "grantKeys": ["username", "token", "expiresAt", "scope"],
     "gitHostAllowList": ["git-preview.ezil.work"],
+    "optionalKeys": ["class"],
+    "classRule": "1.0.3. A body may carry one more key, class: personal or assessment (constants REPO_OPEN_CLASSES); absent means REPO_OPEN_CLASS_DEFAULT (personal), so every 1.0.2 body is valid and unchanged. class must be a string in REPO_OPEN_CLASSES (null, empty and any other value are invalid). gitHost must equal REPO_OPEN_CLASS_GIT_HOSTS[class]: a closed table, refused in both directions (personal or absent on git-qa, assessment on git-preview). gitHostAllowList is the class-absent (personal) list. Whoever relays the body (Worker, AWS host) forwards class into the kernel request (kernel.optionalRequestKeys) only when the body carried it.",
     "base": {
       "v": 1, "op": "open", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "site",
       "gitHost": "git-preview.ezil.work", "defaultBranch": "main", "path": null,
@@ -602,7 +608,11 @@
       { "set": { "op": "refresh" } },
       { "set": { "path": "src/main.ts" } },
       { "setGrant": { "scope": "read" } },
-      { "setGrant": { "expiresAt": { "relativeSeconds": 960 } } }
+      { "setGrant": { "expiresAt": { "relativeSeconds": 960 } } },
+      { "set": { "class": "personal" } },
+      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work" } },
+      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "op": "refresh" } },
+      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "path": "src/main.ts" } }
     ],
     "invalidMutations": [
       { "set": { "v": 2 }, "why": "version" },
@@ -615,7 +625,15 @@
       { "setGrant": { "expiresAt": { "relativeSeconds": 961 } }, "why": "expiry window" },
       { "setGrant": { "expiresAt": { "relativeSeconds": 0 } }, "why": "expired" },
       { "setGrant": { "token": "egg_${repeat:a:63}" }, "why": "token" },
-      { "setGrant": { "username": "root" }, "why": "username" }
+      { "setGrant": { "username": "root" }, "why": "username" },
+      { "set": { "gitHost": "git-qa.ezil.work" }, "why": "class absent (personal) on the assessment host" },
+      { "set": { "class": "personal", "gitHost": "git-qa.ezil.work" }, "why": "personal on the assessment host" },
+      { "set": { "class": "assessment" }, "why": "assessment on the personal host" },
+      { "set": { "class": "assessment", "gitHost": "github.ezil.work" }, "why": "assessment on a foreign host" },
+      { "set": { "class": "exam", "gitHost": "git-qa.ezil.work" }, "why": "unknown class" },
+      { "set": { "class": "Assessment", "gitHost": "git-qa.ezil.work" }, "why": "class is case-sensitive" },
+      { "set": { "class": null }, "why": "null class" },
+      { "set": { "class": "" }, "why": "empty class" }
     ]
   },
   "signature": {
@@ -816,11 +834,25 @@
       "release": "outside the tail; idempotent; removes this request's staging dir, the lock only when its owner file holds this request's uuid, the grant file only when the repository folder is absent, then this request's request and incoming files. Run by the Worker after every open and refresh outcome (section 8 step 11), including the busy path after tail acquire."
     },
     "requestKeys": ["v", "op", "phase", "uuid", "inflight", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "root", "staging", "incoming", "deadlineMs", "budget"],
-    "requestKeysRule": "Strict: a request file with any key outside requestKeys, or a phase outside phases, is refused with workspace_failed before any filesystem or network action. inflight is the Worker in-flight map's uuids for this sandbox at the time the request is written (this request's uuid included).",
+    "optionalRequestKeys": ["class"],
+    "requestKeysRule": "Strict: a request file with any key outside requestKeys plus optionalRequestKeys (1.0.3), any missing requestKeys key, a class outside constants REPO_OPEN_CLASSES, a gitHost other than REPO_OPEN_CLASS_GIT_HOSTS[class] (class absent = personal), or a phase outside phases, is refused with workspace_failed before any filesystem or network action. inflight is the Worker in-flight map's uuids for this sandbox at the time the request is written (this request's uuid included).",
     "lockRule": "prepare (repository folder absent) takes LOCK_TEMPLATE with mkdir and writes this request's uuid to LOCK_OWNER_TEMPLATE. An existing lock is live only when its owner uuid is in the request's inflight list and it is younger than LOCK_STALE_MS; otherwise it is stale and prepare removes it and takes it. Released by commit on every outcome, by release, and by prepare itself on failure.",
-    "testSeam": "The kernel module exports runKernel(phase, requestPath, testOptions). testOptions = { sslCAInfo, proxy } adds -c http.sslCAInfo=<file> -c http.proxy=<loopback CONNECT proxy> to every git command so tests reach a loopback TLS gateway that presents git-preview.ezil.work under a test CA. The CLI entry (node <kernel> <phase> <request>, the only thing the Worker runs) passes no testOptions and has no other input channel: it reads no environment variable, and a request file carrying any test key is refused by requestKeysRule. Hosts, helper checks and allow-lists stay git-preview.ezil.work.",
+    "testSeam": "The kernel module exports runKernel(phase, requestPath, testOptions). testOptions = { sslCAInfo, proxy } adds -c http.sslCAInfo=<file> -c http.proxy=<loopback CONNECT proxy> to every git command so tests reach a loopback TLS gateway that presents git-preview.ezil.work (and, from 1.0.3, git-qa.ezil.work for class assessment) under a test CA. The CLI entry (node <kernel> <phase> <request>, the only thing the Worker runs) passes no testOptions and has no other input channel: it reads no environment variable, and a request file carrying any test key is refused by requestKeysRule. Hosts, helper checks and allow-lists stay the class table's hosts (constants REPO_OPEN_CLASS_GIT_HOSTS).",
     "testSeamKeys": ["sslCAInfo", "proxy"],
     "resultOpenKeys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty"],
+    "assessment": {
+      "rule": "1.0.3. A request with class assessment (git host constants GIT_ASSESSMENT_HOST) differs from personal in two ways only. (1) Fresh folder: prepare refuses with folder_conflict, before any action, when the repository folder already exists, whatever its binding; commit refuses with folder_conflict when the folder appeared after prepare (the lock is released, staging stays for release). There is no existing state, so a tree staged before the attempt can never satisfy readiness. refresh and release are unchanged. (2) The commit answer for open carries resultOpenKeys (exact, in this order) with head and clean, read in the folder after the rename by hardenedRead. Class personal (or absent) is unchanged: its answers carry kernel.resultOpenKeys only. The prepare answer is unchanged for both classes (callers read only ok and errorCode from it).",
+      "resultOpenKeys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty", "head", "clean"],
+      "states": ["cloned", "initialized_empty"],
+      "headRule": "The 40-lowercase-hex commit id HEAD resolves to (git rev-parse --verify -q 'HEAD^{commit}', whose stdout must be exactly 40 hex and a newline). null only when that fails and git symbolic-ref -q HEAD succeeds with a refs/heads/ name (an unborn branch: an empty repository). Any other outcome is workspace_failed; a timeout is workspace_busy. empty === (head === null), and state is initialized_empty exactly when head is null.",
+      "cleanRule": "true exactly when git status --porcelain=v1 --untracked-files=all exits 0 and prints nothing (ignored files are not listed). A non-zero exit is workspace_failed; a timeout is workspace_busy.",
+      "hardenedRead": {
+        "env": { "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CEILING_DIRECTORIES": "<root>/repos/<handle>", "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0" },
+        "globalOptions": ["--no-pager", "--no-optional-locks"],
+        "config": ["core.hooksPath=/dev/null", "core.fsmonitor=false"],
+        "rule": "Every head and clean read runs with the kernel's cleared environment plus env, the kernel's -c list (which includes config) and globalOptions, cwd the repository folder, LOCAL git timeout. No external diff can run: status runs no diff driver and no config but the folder's own, which the kernel wrote, can name one. No optional lock is taken, so a read killed at its timeout never leaves .git/index.lock (which would abort the workspace export capture)."
+      }
+    },
     "resultRefreshKeys": ["ok", "state"],
     "resultErrorKeys": ["ok", "errorCode"],
     "states": ["cloned", "initialized_empty", "existing", "refreshed"],
@@ -833,6 +865,7 @@
       { "cause": "lock live per lockRule (owner uuid in inflight and younger than LOCK_STALE_MS)", "errorCode": "workspace_busy" },
       { "cause": "staged clone over the workspace budget", "errorCode": "repository_too_large" },
       { "cause": "folder exists with a different or missing binding", "errorCode": "folder_conflict" },
+      { "cause": "class assessment and the folder exists (prepare), or appeared before commit, whatever its binding", "errorCode": "folder_conflict" },
       { "cause": "deadline reached", "errorCode": "workspace_busy" },
       { "cause": "anything else", "errorCode": "workspace_failed" }
     ]
@@ -1035,6 +1068,26 @@
         { "op": "refresh", "body": { "ok": true, "state": "cloned" }, "valid": false },
         { "op": "refresh", "body": { "ok": true, "state": "refreshed", "folder": "/workspace/repos/acme/site" }, "valid": false }
       ],
+      "okOpenAssessment": { "status": 200, "keys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty", "head", "clean"], "states": ["cloned", "initialized_empty"] },
+      "okAssessmentRule": "1.0.3. For an open whose body carried class assessment, the caller validates the 200 against okOpenAssessment instead of okOpen: okRule's open checks, plus head null or 40 lowercase hex, clean boolean, empty === (head === null), and state initialized_empty exactly when head is null. A personal-shaped body (no head or clean) is invalid for an assessment open, and an assessment-shaped body is invalid for a personal one.",
+      "okAssessmentCases": [
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}", "clean": true }, "valid": true },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site/src", "pathNotFound": false, "branch": "main", "empty": false, "head": "0123456789abcdef0123456789abcdef01234567", "clean": false }, "valid": true },
+        { "body": { "ok": true, "state": "initialized_empty", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": true, "head": null, "clean": true }, "valid": true },
+        { "body": { "ok": true, "state": "existing", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}", "clean": true }, "valid": false, "why": "existing" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false }, "valid": false, "why": "personal shape" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}" }, "valid": false, "why": "clean missing" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}", "clean": true, "token": "x" }, "valid": false, "why": "extra key" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": null, "clean": true }, "valid": false, "why": "cloned without a head" },
+        { "body": { "ok": true, "state": "initialized_empty", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": true, "head": "${repeat:a:40}", "clean": true }, "valid": false, "why": "empty with a head" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": true, "head": "${repeat:a:40}", "clean": true }, "valid": false, "why": "empty disagrees with head" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:A:40}", "clean": true }, "valid": false, "why": "uppercase head" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:39}", "clean": true }, "valid": false, "why": "short head" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:64}", "clean": true }, "valid": false, "why": "64-hex head" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}\n", "clean": true }, "valid": false, "why": "head with a trailing newline" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/site", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}", "clean": "true" }, "valid": false, "why": "clean not a boolean" },
+        { "body": { "ok": true, "state": "cloned", "folder": "/workspace/repos/acme/site", "openFolder": "/workspace/repos/acme/sitex", "pathNotFound": false, "branch": "main", "empty": false, "head": "${repeat:a:40}", "clean": true }, "valid": false, "why": "openFolder outside folder" }
+      ],
       "refusals": [
         { "status": 409, "error": ["runtime_not_running", "workspace_not_ready", "workspace_busy", "folder_conflict", "workspace_unsupported", "repository_too_large"] },
         { "status": 502, "error": ["network_unavailable", "git_auth_rejected", "repository_unavailable"] },
@@ -1133,6 +1186,7 @@
     "WORKSPACE_ROOT_DEFAULT", "REPO_DIR_TEMPLATE", "STAGING_ROOT_NAME", "STAGING_DIR_TEMPLATE", "HELPER_WRAPPER_PATH", "GRANT_FILE_TEMPLATE",
     "LOCK_TEMPLATE", "LOCK_OWNER_TEMPLATE", "SNAPSHOT_LIMIT_BYTES", "SNAPSHOT_MAX_ENTRIES", "REPO_BUDGET_FRACTION",
     "TAR_BLOCK_BYTES", "TAR_PAX_NAME_BYTES", "TAR_PAX_RECORD_SLACK_BYTES", "TAR_ARCHIVE_TAIL_BYTES", "BODY_LIMITS_BYTES",
-    "OS_PRODUCTION_APP_ORIGIN", "OS_LANDING_ORIGIN", "SNAPSHOT_INTERNAL_NAMES", "SNAPSHOT_CACHE_NAMES", "SNAPSHOT_NESTED_INDEX_MAX"
+    "OS_PRODUCTION_APP_ORIGIN", "OS_LANDING_ORIGIN", "SNAPSHOT_INTERNAL_NAMES", "SNAPSHOT_CACHE_NAMES", "SNAPSHOT_NESTED_INDEX_MAX",
+    "GIT_ASSESSMENT_HOST", "REPO_OPEN_CLASSES", "REPO_OPEN_CLASS_DEFAULT", "REPO_OPEN_CLASS_GIT_HOSTS"
   ]
 }
