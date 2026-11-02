@@ -1045,9 +1045,30 @@ describe('non-stream completion deadline', () => {
         expect(response.status).toBe(504);
         expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_ai_unavailable');
         expect(stalled.attempts()).toBe(1);
+        expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_ai_unavailable', detail: 'headers_timeout' });
       } finally { clock.restore(); }
     });
   }
+  it('a client that leaves a JSON request before the proxy deadline is logged client_disconnected, not a timeout', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    const client = new AbortController();
+    try {
+      const request = new Request(await post('/ai/v1/messages', kimiBody), { signal: client.signal });
+      const result = handleAiProxyRequest(request, d);
+      await stalled.entered;
+      await clock.advance(149_000);
+      client.abort();
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const response = await result;
+      expect(stalled.attempts()).toBe(1);
+      // Status and code are unchanged (nobody receives this response); only the telemetry detail is precise.
+      expect(response.status).toBe(504);
+      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_ai_unavailable', detail: 'client_disconnected' });
+      expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
+    } finally { clock.restore(); }
+  });
   it('Responses JSON uses the same deadline; overrides are injectable', async () => {
     const stalled = stalledGateway();
     const d = await deps({ fetch: stalled.gw.fetch, completionTimeoutMs: 20, headersTimeoutMs: 5_000 });

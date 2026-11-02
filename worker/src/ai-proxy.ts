@@ -656,7 +656,10 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
         `EZiL AI sent no complete reply within ${Math.round(headersMs / 1000)} seconds. It may still be charged if the model finished.`);
     }
     const timedOut = abort.signal.aborted;
-    log({ status: timedOut ? 504 : 502, code: 'os_ai_unavailable', detail: timedOut ? 'headers_timeout' : 'fetch_failed' });
+    // The client going away (for a JSON body usually the extension's own deadline, whose clock starts first) is not
+    // a Gateway timeout: telemetry only, as no one receives this response.
+    const detail = request.signal.aborted && !deadlinePassed ? 'client_disconnected' : timedOut ? 'headers_timeout' : 'fetch_failed';
+    log({ status: timedOut ? 504 : 502, code: 'os_ai_unavailable', detail });
     return proxyError(
       timedOut ? 504 : 502,
       'os_ai_unavailable',
