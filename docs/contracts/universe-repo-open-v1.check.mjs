@@ -726,7 +726,13 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(K.states.every((s) => W.okOpen.states.includes(s)) && !K.states.includes('existing'), 'assessment states are open states without existing');
     eq(K.hardenedRead.globalOptions, ['--no-pager', '--no-optional-locks'], 'hardened read global options');
     eq(Object.keys(K.hardenedRead.env), ['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CEILING_DIRECTORIES', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT'], 'hardened read env');
-    ok(K.hardenedRead.env.GIT_CONFIG_GLOBAL === '/dev/null' && K.hardenedRead.config.includes('core.hooksPath=/dev/null') && K.hardenedRead.config.includes('core.fsmonitor=false'), 'hardened read config');
+    // core.fsmonitor must be EMPTY: git < 2.36 runs the value `false` as a hook command (review fix).
+    ok(K.hardenedRead.env.GIT_CONFIG_GLOBAL === '/dev/null' && K.hardenedRead.config.includes('core.hooksPath=/dev/null')
+        && K.hardenedRead.config.includes('core.fsmonitor=') && !K.hardenedRead.config.some((c) => /^core\.fsmonitor=./.test(c)), 'hardened read config (fsmonitor off by the empty value)');
+    ok(K.hardenedRead.env.GIT_CEILING_DIRECTORIES === `<root>/${C.STAGING_ROOT_NAME}`, 'the hardened reads run in staging, before the rename (ceiling = the staging root)');
+    ok(Number.isSafeInteger(K.readBudgetMs) && K.readBudgetMs > 0 && K.readBudgetMs < V.timeouts.COMMIT_EXEC_MAX_MS, 'assessment readBudgetMs is inside the commit exec window');
+    ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && /defaultBranch/.test(c.cause) && c.errorCode === 'repository_unavailable'), 'an assessment remote without defaultBranch is classified');
+    ok(typeof K.trust === 'string' && /evidence, not proof/.test(K.trust), 'assessment head and clean are stated as in-guest evidence');
     const HEX40 = /^[0-9a-f]{40}$/;
     function assessmentOkValid(b) {
         const shape = W.okOpenAssessment;
@@ -839,6 +845,11 @@ ok(Number.isInteger(T.LOCK_STALE_MS) && T.LOCK_STALE_MS > T.WORKER_DEADLINE_MS, 
         ok(code === 'fallback' ? step === 'release' : V.errorTable.workerResponses.refusals.some((r) => r.error.includes(code)), `workerExec ${step} → ${code}`);
     }
     ok(W.timeoutErrorByStep.prepare === 'workspace_busy' && W.timeoutErrorByStep.commit === 'workspace_busy', 'prepare and commit timeouts are retryable (workspace_busy)');
+    // 1.0.3 (review fix): an assessment commit that may have renamed is never retryable.
+    const A = W.assessment.timeoutErrorByStep;
+    eq(Object.keys(A), Object.keys(W.timeoutErrorByStep), 'workerExec assessment timeoutErrorByStep steps');
+    for (const [step, code] of Object.entries(A)) ok(code === (step === 'commit' ? 'workspace_failed' : W.timeoutErrorByStep[step]), `workerExec assessment ${step} → ${code}`);
+    ok(V.errorTable.codes.workspace_failed.retry === 'none' && V.errorTable.codes.workspace_busy.retry === 'wake_loop', 'an assessment commit timeout is terminal; busy stays retryable');
     eq(W.postPrepareRecheck.stopped.answer, 'runtime_not_running', 'post-prepare stop answer');
     eq(W.postPrepareRecheck.transition.answer, 'workspace_busy', 'post-prepare transition answer');
     for (const k of ['stopped', 'transition']) ok(C.WAKE_RETRY_ERROR_CODES.includes(V.errorTable.upstream.find((u) => u.source === 'worker' && u.code === W.postPrepareRecheck[k].answer)?.errorCode), `post-prepare ${k} answer is retried by the wake loop`);

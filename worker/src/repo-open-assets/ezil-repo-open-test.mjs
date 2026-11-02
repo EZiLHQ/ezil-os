@@ -26,7 +26,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SOURCE_KERNEL = path.join(HERE, 'ezil-repo-open.mjs');
 export const SOURCE_HELPER = path.join(HERE, 'ezil-git-grant.mjs');
 const VECTORS_PATH = path.join(HERE, '../../../docs/contracts/universe-repo-open-v1.vectors.json');
-export const VECTORS_SHA256 = '86fe643c377463367c1a480947d15421e19833e2bf9ccc72fad588ffbc6f4eb3';
+export const VECTORS_SHA256 = '1a9069533b3edd28f43e94cc699a3501d29c57e863caf9b74cae8f81445b935e';
 export const KERNEL_PATH = '/run/ezil/bin/ezil-repo-open.mjs';
 export const HELPER_PATH = '/run/ezil/bin/ezil-git-grant.mjs';
 export const WRAPPER_PATH = '/run/ezil/bin/ezil-git-grant';
@@ -1136,7 +1136,7 @@ async function main() {
     assert.equal((await openFlow(fx, { root: root2, token })).committed.state, 'existing');
   });
 
-  test('class assessment refuses at commit a folder that appeared after prepare (1.0.3): a real repository bound to this repository and host, with an incoming grant → folder_conflict; never adopted; lock released; release removes staging', async () => {
+  test('class assessment refuses at commit a folder that appeared after prepare (1.0.3): a real repository bound to this repository and host, with an incoming grant → folder_conflict; never adopted; lock released; the grant this request installed removed (another request\'s kept); release removes staging', async () => {
     const k = await kernel();
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
@@ -1151,10 +1151,26 @@ async function main() {
     assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'folder_conflict' });
     assert.deepEqual(manifest(F), before, 'commit touched the planted folder');
     assert.equal(exists(lockOf()), false, 'commit kept its lock');
+    assert.equal(exists(grantOf()), false, 'the refused commit left the grant its prepare installed beside a folder it did not place');
     assert.equal(exists(`${root}/.ezil-staging/${uuid}/.git`), true, 'staging stays for release');
     assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
     assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false);
     assert.deepEqual(manifest(F), before);
+    // The lock is no longer this request's (another prepare took it over as stale): the grant in place
+    // is that request's, never this one's to remove.
+    const uuid2 = crypto.randomUUID(); writeIncoming(uuid2, { token, host: QA_HOST });
+    const root2 = newRoot();
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid: uuid2, root: root2, ...ASSESS }), fx.seam)).state, 'cloned');
+    const other = crypto.randomUUID();
+    plantLock(other);
+    fs.writeFileSync(grantOf(), JSON.stringify({ v: 1, protocol: 'https', host: QA_HOST, path: 'acme/site.git', username: 'ezil',
+      password: newToken(), expiresAt: new Date(Date.now() + 900000).toISOString(), scope: 'write' }), { mode: 0o600 });
+    const otherGrant = fs.readFileSync(grantOf());
+    sh('git', ['init', '-q', '-b', 'main', `${root2}/repos/acme/site`], { env: USER_ENV });
+    assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid: uuid2, root: root2, inflight: [uuid2, other], ...ASSESS })).result,
+      { ok: false, errorCode: 'folder_conflict' });
+    assert.equal(exists(grantOf()) && fs.readFileSync(grantOf()).equals(otherGrant), true, 'a commit removed a grant it did not install');
+    assert.equal(fs.readFileSync(`${lockOf()}/owner`, 'utf8'), other, 'the other request\'s lock was released');
   });
 
   test('class assessment (1.0.3): clean is false when the staged clone gains an untracked or a modified tracked file before commit (head unchanged); assessmentFacts reads clean after the clone and dirty after an untracked file', async () => {
@@ -1222,6 +1238,118 @@ async function main() {
     assert.equal(await kernelCode(() => k.assessmentFacts(R)), 'workspace_failed', 'a broken HEAD passed as unborn');
     fs.writeFileSync(`${R}/.git/HEAD`, 'ref: refs/heads/unborn\n');
     assert.deepEqual(await k.assessmentFacts(R), { head: null, clean: false }, 'unborn branch, a.txt staged');
+  });
+
+  // ── 1.0.3 review fixes ───────────────────────────────────────────────────────
+  /** A repository with one commit of a.txt in `${base}/repo`; returns [dir, head]. */
+  const oneCommitRepo = (prefix) => {
+    const base = fs.realpathSync(fs.mkdtempSync(`/tmp/${prefix}-`));
+    const R = `${base}/repo`;
+    sh('git', ['init', '-q', '-b', 'main', R], { env: USER_ENV });
+    fs.writeFileSync(`${R}/a.txt`, 'a');
+    sh('git', ['-C', R, 'add', 'a.txt'], { env: USER_ENV });
+    sh('git', ['-C', R, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '-m', 'one'], { env: USER_ENV });
+    return [R, sh('git', ['-C', R, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim()];
+  };
+
+  test('assessment head (1.0.3): a symbolic HEAD to a missing tag or remote-tracking ref, or a branch that names a tree, is workspace_failed, never unborn', async () => {
+    const k = await kernel();
+    const [R, head] = oneCommitRepo('headrule');
+    const tree = sh('git', ['-C', R, 'rev-parse', 'HEAD^{tree}'], { env: USER_ENV }).trim();
+    fs.writeFileSync(`${R}/.git/refs/heads/treeish`, `${tree}\n`);   // git itself refuses to write a non-commit to a branch
+    for (const [label, text] of [['a symbolic HEAD to a missing tag', 'ref: refs/tags/missing\n'],
+      ['a symbolic HEAD to a missing remote-tracking ref', 'ref: refs/remotes/origin/missing\n'],
+      ['a branch that names a tree', 'ref: refs/heads/treeish\n']]) {
+      fs.writeFileSync(`${R}/.git/HEAD`, text);
+      assert.equal(await kernelCode(() => k.assessmentFacts(R)), 'workspace_failed', `${label} passed as unborn`);
+    }
+    // controls: a symbolic HEAD to an unborn branch is null; back on main it is the commit
+    fs.writeFileSync(`${R}/.git/HEAD`, 'ref: refs/heads/unborn\n');
+    assert.equal((await k.assessmentFacts(R)).head, null);
+    fs.writeFileSync(`${R}/.git/HEAD`, 'ref: refs/heads/main\n');
+    assert.deepEqual(await k.assessmentFacts(R), { head, clean: true });
+  });
+
+  test('assessment reads share one budget (1.0.3): ASSESSMENT_READ_BUDGET_MS equals vectors kernel.assessment.readBudgetMs, below the host commit window; reads whose deadline has passed → workspace_busy', async () => {
+    const k = await kernel();
+    assert.equal(k.ASSESSMENT_READ_BUDGET_MS, V.kernel.assessment.readBudgetMs);
+    assert.ok(k.ASSESSMENT_READ_BUDGET_MS > 0 && k.ASSESSMENT_READ_BUDGET_MS < V.timeouts.COMMIT_EXEC_MAX_MS);
+    const [R, head] = oneCommitRepo('budget');
+    assert.equal(await kernelCode(() => k.assessmentFacts(R, Date.now() - 1)), 'workspace_busy');
+    assert.deepEqual(await k.assessmentFacts(R, Date.now() + k.ASSESSMENT_READ_BUDGET_MS), { head, clean: true });
+  });
+
+  test('class assessment reads head and clean in staging before the rename (1.0.3): a staged HEAD that cannot be read → workspace_failed with no folder placed; release leaves nothing; a re-open succeeds', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
+    fs.writeFileSync(`${root}/.ezil-staging/${uuid}/.git/HEAD`, `${'0'.repeat(40)}\n`);
+    assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'workspace_failed' });
+    assert.equal(exists(`${root}/repos/acme/site`), false, 'the folder was placed although its head could not be read');
+    assert.equal(exists(lockOf()), false, 'commit kept its lock');
+    assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+    assertNoOpenLeftovers(root, uuid);
+    const again = await openFlow(fx, { root, token, ...ASSESS });
+    assert.deepEqual([again.committed.state, again.committed.head, again.committed.clean], ['cloned', remoteHeadOf(bare), true]);
+  });
+
+  test('class assessment checks out exactly defaultBranch (1.0.3): a remote HEAD on another branch is not followed (personal still follows it); a non-empty remote without defaultBranch → repository_unavailable, nothing placed', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { head: 'trunk', branches: { trunk: { 'a.txt': 'a' }, main: { 'm.txt': 'm' } } });
+    const F = `${root}/repos/acme/site`;
+    const { committed } = await openFlow(fx, { root, token, defaultBranch: 'main', ...ASSESS });
+    assert.deepEqual(committed, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare, 'main'), clean: true });
+    assert.equal(sh('git', ['-C', F, 'symbolic-ref', 'HEAD'], { env: USER_ENV }).trim(), 'refs/heads/main');
+    assert.equal(fs.readFileSync(`${F}/m.txt`, 'utf8'), 'm');
+    // control: a personal open of the same remote follows its HEAD
+    assert.equal((await openFlow(fx, { root: newRoot(), token, defaultBranch: 'main' })).committed.branch, 'trunk');
+    const root3 = newRoot();
+    const connects = fx.proxy.state.connects.length;
+    const { uuid, prepared, committed: none, released } = await openFlow(fx, { root: root3, token, defaultBranch: 'release', ...ASSESS });
+    assert.deepEqual(prepared, { ok: false, errorCode: 'repository_unavailable' });
+    assert.equal(none, null);
+    assert.deepEqual(released, { ok: true });
+    assert.ok(fx.proxy.state.connects.length > connects, 'control: the refusal came from the listing');
+    assertNoOpenLeftovers(root3, uuid);
+  });
+
+  test('no kernel git runs a PATH-resolved `false` as an fsmonitor hook (1.0.3; git < 2.36 reads core.fsmonitor=false as a hook command): prepare, commit and release of both classes, and the assessment reads', async () => {
+    // /usr/local/sbin is first on the kernel's git PATH. A tmpfs over it lives in this suite's
+    // private mount namespace only (isolate()), and is unmounted at the end.
+    const SBIN = '/usr/local/sbin';
+    const KERNEL_GIT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    assert.ok(fs.lstatSync(SBIN).isDirectory(), `${SBIN} is not a directory`);
+    const marker = '/tmp/planted-false-ran';
+    fs.rmSync(marker, { force: true });
+    execFileSync('mount', ['-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', SBIN]);
+    try {
+      fs.writeFileSync(`${SBIN}/false`, `#!/bin/sh\necho "$0 $1" >> ${marker}\nexit 1\n`, { mode: 0o755 });
+      const k = await kernel();
+      const version = k.parseGitVersion(sh('git', ['--version'], { env: USER_ENV }));
+      const legacy = version.major < 2 || (version.major === 2 && version.minor < 36);
+      // control: on this git, a bare `-c core.fsmonitor=false status` runs the planted false exactly when git < 2.36
+      const [R] = oneCommitRepo('fsmonitor');
+      spawnSync('git', ['-c', 'core.fsmonitor=false', 'status', '--porcelain'], { cwd: R, env: { PATH: KERNEL_GIT_PATH, HOME: '/tmp/userhome', GIT_CONFIG_NOSYSTEM: '1' } });
+      assert.equal(exists(marker), legacy, `control: git ${version.major}.${version.minor} ${legacy ? 'did not run' : 'ran'} the planted false`);
+      fs.rmSync(marker, { force: true });
+      const token = newToken(); fx.server.state.token = token;
+      makeRemote(fx, { branches: { main: { 'a.txt': 'a', 'b/c.txt': 'c' } } });
+      for (const fields of [{}, ASSESS]) {
+        const root = newRoot();
+        const { committed, released } = await openFlow(fx, { root, token, ...fields });
+        assert.equal(committed.state, 'cloned', JSON.stringify(fields));
+        assert.deepEqual(released, { ok: true });
+        if (fields.cls) {
+          const t = Date.now() / 1000 + 30; fs.utimesSync(`${committed.folder}/a.txt`, t, t);   // stale stat: status consults the index
+          assert.deepEqual(await k.assessmentFacts(committed.folder), { head: committed.head, clean: true });
+        }
+      }
+      assert.equal(exists(marker), false, `the kernel ran the planted false: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
+    } finally {
+      execFileSync('umount', [SBIN]);
+    }
   });
 
   test('class assessment: no grant in any argv or environ (strace of every execve across prepare, commit and two pushes through the helper), .git/config, the folder or any output', async () => {

@@ -59,7 +59,7 @@ const parses = (body: unknown, routeClass: RepoOpenClass) => parseRepoOpenBody(e
 
 describe('u2 protocol constants equal the vectors (1.0.3)', () => {
   it('vectors are the pinned 1.0.3 file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('86fe643c377463367c1a480947d15421e19833e2bf9ccc72fad588ffbc6f4eb3');
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('1a9069533b3edd28f43e94cc699a3501d29c57e863caf9b74cae8f81445b935e');
     expect(V.contractVersion).toBe('1.0.3');
   });
 

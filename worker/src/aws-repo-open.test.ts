@@ -157,7 +157,7 @@ const run = (e: ReturnType<typeof edge>, i: RepoOpenInput = input(), extra: Part
 
 describe('aws relay constants equal the vectors and the contract', () => {
   it('vectors are the pinned file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('86fe643c377463367c1a480947d15421e19833e2bf9ccc72fad588ffbc6f4eb3');
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('1a9069533b3edd28f43e94cc699a3501d29c57e863caf9b74cae8f81445b935e');
   });
   it('the poll interval is the vectors AWS_RELAY_POLL_MS, inside the Worker deadline', () => {
     expect(AWS_RELAY_POLL_MS).toBe(T.AWS_RELAY_POLL_MS);
@@ -711,7 +711,7 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
 
   it('every vectors okAssessmentCases row through an assessment open: a valid result is answered as is, an invalid one is workspace_failed', async () => {
     const cases = V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[];
-    expect(cases.length).toBe(16);
+    expect(cases.length).toBe(18);
     for (const c of cases) {
       const body = materialise(c.body, NOW) as Record<string, unknown>;
       const answer = await runAs(job(() => ok(body)), assessmentInput({ path: 'src' }), 'assessment');
@@ -727,7 +727,7 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
       carried += 1;
       expect(await run(job(() => ok(materialise(c.body, NOW))), input({ path: 'src' }))).toEqual(refusal('workspace_failed'));
     }
-    expect(carried).toBe(15);
+    expect(carried).toBe(17);
     for (const c of V.errorTable.workerResponses.okCases as { op: string; body: Record<string, unknown>; valid: boolean }[]) {
       if (c.op !== 'open') continue;
       expect(await runAs(job(() => ok(c.body)), assessmentInput({ path: 'src' }), 'assessment')).toEqual(refusal('workspace_failed'));
@@ -1069,5 +1069,44 @@ describe('E1-5: across sweeps, and handleAwsRepoOpen as the composition', () => 
     expect(e.starts().length).toBe(1);
     expect(e.reads().length).toBe(4);
     expect(sleeps).toEqual(Array(4).fill(AWS_RELAY_POLL_MS));
+  });
+});
+
+describe('1.0.3 review fix: after an admitted assessment start, nothing answers a retryable workspace_busy', () => {
+  it('an assessment poll whose `until` has passed sends nothing and answers running with the job unchanged (a personal one stays workspace_busy)', async () => {
+    const e = edge(() => ok(okAssessment));
+    const d = deps(e.fetch);
+    for (const acknowledged of [true, false]) {
+      const assessJob = jobOf({ class: 'assessment', acknowledged });
+      expect(await awsRepoOpenPoll(assessJob, target, d, NOW)).toEqual(running$(assessJob));
+      expect(await awsRepoOpenPoll(assessJob, target, d, NOW - 1)).toEqual(running$(assessJob));
+    }
+    expect(e.calls.length).toBe(0);
+    expect(await awsRepoOpenPoll(jobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
+    expect(e.calls.length).toBe(0);
+    // the same job polled later, without a stale `until`, still reads its result
+    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+  });
+
+  it('the one-call composition: an assessment job that never finishes ends at the deadline as workspace_failed (a personal one as workspace_busy), after exactly one start', async () => {
+    const e = edge(() => running());
+    expect(await runAs(e, assessmentInput(), 'assessment')).toEqual(refusal('workspace_failed'));
+    const deadline = NOW + WORKER_DEADLINE_MS;
+    expect(clock).toBeLessThanOrEqual(deadline);
+    expect(e.starts().length).toBe(1);
+    expect(e.calls.every((c) => c.at < deadline)).toBe(true);
+    clock = NOW;
+    const p = edge(() => running());
+    expect(await runAs(p, input(), 'personal')).toEqual(refusal('workspace_busy'));
+    expect(p.starts().length).toBe(1);
+  });
+
+  it('an assessment start refused before anything ran stays workspace_busy (the host slot taken; a deadline already passed): safe to start again', async () => {
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => json({ ok: false, error: 'workspace_busy' }, 409)).fetch), 'assessment'))
+      .toEqual(done$(refusal('workspace_busy')));
+    const e = edge(() => running());
+    expect(await awsRepoOpenStart(assessmentInput({}, NOW - WORKER_DEADLINE_MS), SANDBOX, target, deps(e.fetch), 'assessment'))
+      .toEqual(done$(refusal('workspace_busy')));
+    expect(e.calls.length).toBe(0);
   });
 });

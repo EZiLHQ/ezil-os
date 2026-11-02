@@ -78,8 +78,9 @@ the vectors, and with slow probes, execs and drains). An exec whose cleanup is s
 confirmed by then (CleanupPending) ends the job: the answer already computed is published
 (release only follows it), else the step's timeout code (UNCONFIRMED_ERROR_BY_STEP =
 vectors workerExec.timeoutErrorByStep without release; a commit's outcome is unknown, so
-``workspace_busy``); the slot stays busy until the reaper confirms (backoff up to
-REAP_RETRY_MAX_SECONDS).
+``workspace_busy``; for class assessment UNCONFIRMED_ERROR_BY_STEP_ASSESSMENT = vectors
+workerExec.assessment.timeoutErrorByStep, where that commit is ``workspace_failed``); the slot
+stays busy until the reaper confirms (backoff up to REAP_RETRY_MAX_SECONDS).
 
 The host workspace lock (lead acceptance needed: §13 says "commit under the host's workspace
 lock"). Commit runs inside the runner's single job slot (``busy``), held from admission until
@@ -91,7 +92,11 @@ check KILLS commit instead of waiting for it. Those paths are not changed here (
 other agent op changes). The kernel's commit of a new folder is one rename(2), and the next open
 is idempotent (``existing``, or a re-clone after the step-0 sweep); an ``existing`` commit killed
 mid-way can leave partial credential keys in .git/config until the next open repairs them, as on
-Cloudflare. The residual is a retry, never a half-placed folder.
+Cloudflare. The residual is a retry, never a half-placed folder. Class assessment (contract 1.0.3)
+is NOT idempotent: a re-open after its folder is in place answers ``folder_conflict``. Its kernel
+reads head and clean before the rename, so every kernel ``workspace_busy`` comes before it; a
+commit killed at its timeout (or left unconfirmed) may have renamed, and answers
+``workspace_failed`` (vectors workerExec.assessment).
 
 Host §8.1 (never exec into a desktop that is not running). Before EVERY exec, with nothing in
 between but the cgroup lookup, the host check (Flight.guard) answers a cgroup root or one of:
@@ -303,7 +308,7 @@ STATUS_MESSAGE_KEYS = frozenset({"op", "leaseEpoch", "ts", "seq", "mac", "jobId"
 # The kernel and helper, sha256-pinned (byte-equal to worker/src/repo-open-assets; tested).
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo_open_assets")
 REPO_OPEN_ASSETS = {
-    "ezil-repo-open.mjs": "a744eaa99b45f1857dc1c95092f22d129dfdb5d765a1873d14b628265663f31c",
+    "ezil-repo-open.mjs": "31c178cdeee7bdd2061b024c8662be43b94758951de7ad954e0a55209ba4cc40",
     "ezil-git-grant.mjs": "5de6b39aeb9ecbdc03cf3334e45047652b7249f0a395227deea92000f61ba55e",
 }
 ASSET_MAX_BYTES = 262144
@@ -770,6 +775,14 @@ GUARD_KEYS = ("generation", "leaseEpoch")
 # step (vectors workerExec.timeoutErrorByStep, release excepted: its answer always exists).
 UNCONFIRMED_ERROR_BY_STEP = {"setup": "workspace_failed", "prepare": "workspace_busy", "commit": "workspace_busy",
                              "refresh": "workspace_failed"}
+# Class assessment (contract 1.0.3, vectors workerExec.assessment.timeoutErrorByStep): a commit
+# that may have renamed is terminal, because an assessment re-open would answer folder_conflict.
+UNCONFIRMED_ERROR_BY_STEP_ASSESSMENT = {**UNCONFIRMED_ERROR_BY_STEP, "commit": "workspace_failed"}
+
+
+def timeout_codes(body):
+    """The step -> timeout/unconfirmed code map for the relay body's class."""
+    return UNCONFIRMED_ERROR_BY_STEP_ASSESSMENT if body.get("class") == "assessment" else UNCONFIRMED_ERROR_BY_STEP
 
 
 def refused(res):
@@ -1109,7 +1122,7 @@ class Flight:
             answer = self._steps()
         except CleanupPending as e:
             self.cleanup = e
-            answer = self.answer or refusal(UNCONFIRMED_ERROR_BY_STEP.get(self.step, "workspace_failed"))
+            answer = self.answer or refusal(timeout_codes(self.b).get(self.step, "workspace_failed"))
         return refusal("workspace_failed") if leaked(self.outputs, self.b["grant"]["token"]) else answer
 
     def _steps(self):
@@ -1196,9 +1209,11 @@ class Flight:
                         if self.ok(res):
                             res = self.kernel("commit", commit_deadline)
                         stopped = res is STOPPED
-                        # A commit timeout is retryable (vectors workerExec.timeoutErrorByStep): the
-                        # rename may have happened, and the next open is idempotent.
-                        answer = self.failure(res, "workspace_busy") or open_answer(
+                        # A commit timeout may follow the rename. Personal: workspace_busy, because the
+                        # next open is idempotent (vectors workerExec.timeoutErrorByStep). Assessment:
+                        # workspace_failed, because a re-open would answer folder_conflict
+                        # (workerExec.assessment).
+                        answer = self.failure(res, timeout_codes(b)["commit"]) or open_answer(
                             last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT))
         else:
             # Step 10.

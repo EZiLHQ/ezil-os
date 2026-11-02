@@ -58,9 +58,10 @@
  *    changed by §13). A 404 on a status read after the job was acknowledged → workspace_failed.
  *  - start 409 workspace_busy → workspace_busy. R's refusal codes keep their names, and R's status
  *    must equal the §8 table (the answer is rebuilt here from the code, never copied).
- *  - the deadline passes while the job may still run → 409 workspace_busy (retryable for class
- *    personal, like a §8 prepare or commit timeout: the next open is idempotent and answers
- *    `existing`; NOT for class assessment, see "Start and poll" below).
+ *  - the deadline passes while the job may still run → 409 workspace_busy for class personal
+ *    (retryable, like a §8 prepare or commit timeout: the next open is idempotent and answers
+ *    `existing`); 500 workspace_failed for class assessment in the one-call composition (vectors
+ *    workerExec.assessment: a re-open could only answer folder_conflict). See "Start and poll" below.
  *  - a status read that throws or answers 5xx is transient: the read is repeated within the deadline.
  *    A start that throws or answers 5xx is an unknown outcome, not a refusal: its reply may be lost
  *    after the host admitted the job (A2h's edge answers 503 agent_unavailable when the agent's reply
@@ -83,11 +84,14 @@
  *    awsRepoOpenStart(input, name, target, deps, routeClass) → running + job | done + answer
  *    awsRepoOpenPoll(job, target, deps[, until])               → running + job | done + answer
  *  `job` (AwsRepoOpenJob) carries no grant: a caller persists it between sweeps and passes it back.
- *  Assessment callers (class assessment, 1.0.3): once the host has admitted the job, poll the SAME
- *  job until done (results stay readable JOB_TTL = 600 s) and never re-start it. An assessment folder
- *  must be fresh, so after any admitted attempt (including a result `workspace_busy`, which may follow
- *  a commit whose rename happened) a re-open answers `folder_conflict`: treat it as terminal. Only a
- *  start refused before anything ran (`workspace_busy` from the start itself) is safe to retry.
+ *  Assessment callers (class assessment, 1.0.3, vectors workerExec.assessment): once the host has
+ *  admitted the job, poll the SAME job until done (results stay readable JOB_TTL = 600 s) and never
+ *  re-start it. A poll whose own `until` has passed sends nothing and answers running (job unchanged),
+ *  never workspace_busy. For class assessment a `workspace_busy` answer always means the job placed
+ *  no folder: the kernel reads head and clean before its rename, and the host answers a commit that
+ *  timed out, or whose cleanup is unconfirmed (it may have renamed), with workspace_failed. So a
+ *  `workspace_busy` (from the start or as the job's result) may be retried with a new start, and
+ *  `folder_conflict` after an earlier admitted attempt of the same repository is terminal.
  *
  * ── Activation (lead edit in worker/src/index.ts, sketched here; not made by this lane) ────────
  *    personal (u2's route): open: async (name, input) => {
@@ -387,7 +391,8 @@ export async function awsRepoOpenStart(
  *    refusal: invalid_request (a malformed job or `until`); workspace_failed (a target that cannot be
  *    signed or is bound to another sandbox, job_unknown, any other reply, anything grant-shaped);
  *    workspace_unsupported (an edge 404 before the host ever named the job: an AMI without the route);
- *    workspace_busy (`until` passed: nothing was sent).
+ *    workspace_busy (`until` passed: nothing was sent; class personal only, an assessment job then
+ *    answers running with the job unchanged).
  */
 export async function awsRepoOpenPoll(
   job: AwsRepoOpenJob,
@@ -403,7 +408,10 @@ export async function awsRepoOpenPoll(
     if (!call) return finished(refusal('workspace_failed'));
     const read = await call(`${AWS_REPO_OPEN_STATUS_PATH}${current.jobId}`, until);
     if (read.kind === 'leak') return finished(refusal('workspace_failed'));
-    if (read.kind === 'deadline') return finished(refusal('workspace_busy'));
+    // Nothing was sent. Personal: workspace_busy (a re-open is idempotent). Assessment (1.0.3): the job
+    // may still run and its result stays readable, while a re-open could only answer folder_conflict,
+    // so this read "could not tell": running, the job unchanged.
+    if (read.kind === 'deadline') return current.class === 'assessment' ? { state: 'running', job: current } : finished(refusal('workspace_busy'));
     if (read.kind === 'transport' || read.status >= 500) return { state: 'running', job: current };
     if (read.status === 404) return finished(refusal(current.acknowledged ? 'workspace_failed' : 'workspace_unsupported'));
     if (read.status !== 200 || !envelope(read.data)) return finished(refusal('workspace_failed'));
@@ -416,9 +424,11 @@ export async function awsRepoOpenPoll(
 
 /**
  * Steps 2-11 of §8 for an AWS computer in one call: awsRepoOpenStart, then awsRepoOpenPoll every
- * AWS_RELAY_POLL_MS until the job is done or receivedAt + WORKER_DEADLINE_MS passes (workspace_busy).
- * The same behaviour as cf27920b's single relay for the personal class. `routeClass` is the class the
- * CALLING route serves (1.0.3), never read from the body.
+ * AWS_RELAY_POLL_MS until the job is done or receivedAt + WORKER_DEADLINE_MS passes (workspace_busy;
+ * workspace_failed for class assessment, whose re-open is not idempotent). The same behaviour as
+ * cf27920b's single relay for the personal class. `routeClass` is the class the CALLING route serves
+ * (1.0.3), never read from the body. An assessment caller inside a 40 s sweep uses the start/poll
+ * pair instead (this call can take the whole 105 s).
  */
 export async function handleAwsRepoOpen(
   input: RepoOpenInput,
@@ -435,7 +445,10 @@ export async function handleAwsRepoOpen(
     let job = started.job;
     for (;;) {
       const wait = Math.min(AWS_RELAY_POLL_MS, deadline - deps.now());
-      if (wait <= 0) return refusal('workspace_busy');
+      // The job's outcome is unknown and this caller cannot poll it again. Personal: workspace_busy
+      // (a re-open is idempotent). Assessment (1.0.3, vectors workerExec.assessment): the rename may
+      // have happened and a re-open would answer folder_conflict, so workspace_failed.
+      if (wait <= 0) return refusal(job.class === 'assessment' ? 'workspace_failed' : 'workspace_busy');
       await sleep(wait);
       const polled = await awsRepoOpenPoll(job, target, deps, deadline);
       if (polled.state === 'done') return polled.answer;

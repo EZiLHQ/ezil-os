@@ -336,7 +336,10 @@ class Sanitizer(unittest.TestCase):
         for bad in (OPEN_OK, {**ASSESS_OK, "state": "existing"}, {**ASSESS_OK, "head": None},
                     {**empty, "head": ASSESS_OK["head"]}, {**ASSESS_OK, "empty": True}, {**ASSESS_OK, "head": "A" * 40},
                     {**ASSESS_OK, "head": "a" * 64}, {**ASSESS_OK, "head": "a" * 40 + "\n"}, {**ASSESS_OK, "clean": 1},
-                    {**ASSESS_OK, "clean": None}, {**ASSESS_OK, "extra": 1}):
+                    {**ASSESS_OK, "clean": None}, {**ASSESS_OK, "extra": 1},
+                    # empty and head agree; only the state contradicts them (review fix: these isolate
+                    # "state is initialized_empty exactly when head is null")
+                    {**empty, "state": "cloned"}, {**ASSESS_OK, "state": "initialized_empty"}):
             self.assertEqual(ro.open_answer(dict(bad), FOLDER, "assessment"), failed, str(bad)[-80:])
         self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, FOLDER, "assessment"),
                          ro.refusal("folder_conflict"))
@@ -1002,6 +1005,13 @@ class Job(JobBase):
         by_step = dict(V["workerExec"]["timeoutErrorByStep"])
         self.assertEqual(by_step.pop("release"), "fallback")
         self.assertEqual(ro.UNCONFIRMED_ERROR_BY_STEP, by_step)
+        # class assessment (contract 1.0.3, workerExec.assessment): commit is terminal
+        by_class = dict(V["workerExec"]["assessment"]["timeoutErrorByStep"])
+        self.assertEqual(by_class.pop("release"), "fallback")
+        self.assertEqual(ro.UNCONFIRMED_ERROR_BY_STEP_ASSESSMENT, by_class)
+        self.assertIs(ro.timeout_codes({"class": "assessment"}), ro.UNCONFIRMED_ERROR_BY_STEP_ASSESSMENT)
+        for b in ({}, {"class": "personal"}):
+            self.assertIs(ro.timeout_codes(b), ro.UNCONFIRMED_ERROR_BY_STEP)
 
     def test_unconfirmed_cleanup_after_the_answer_publishes_the_answer(self):
         """A computed answer (a successful commit included) is never discarded because release's
@@ -1097,6 +1107,29 @@ class AssessmentJob(JobBase):
         # and a personal open never accepts the assessment shape
         fake = FakeDesktop({"commit": line(ASSESS_OK)})
         self.assertEqual(self.run_job(fake, "e" * 64), ro.refusal("workspace_failed"))
+
+    def test_an_assessment_commit_that_may_have_renamed_is_failed_never_busy(self):
+        """Contract 1.0.3 (vectors workerExec.assessment): a commit killed at its timeout, or whose
+        cleanup is unconfirmed before its answer, may have renamed, and an assessment re-open would
+        answer folder_conflict, so the answer is terminal. Every busy that comes before the rename
+        (prepare's timeout or unconfirmed cleanup, a kernel busy from commit) stays retryable."""
+        cases = (
+            (FakeDesktop({"commit": ro.ExecLimit(True, b"")}), ro.refusal("workspace_failed"), ["prepare", "commit", "release"]),
+            (FakeDesktop({"commit": ro.CleanupPending()}), ro.refusal("workspace_failed"), ["prepare", "commit"]),
+            (FakeDesktop({"prepare": ro.ExecLimit(True, b"")}), ro.refusal("workspace_busy"), ["prepare", "release"]),
+            (FakeDesktop({"prepare": ro.CleanupPending()}), ro.refusal("workspace_busy"), ["prepare"]),
+            (FakeDesktop({"commit": line({"ok": False, "errorCode": "workspace_busy"})}), ro.refusal("workspace_busy"),
+             ["prepare", "commit", "release"]),
+        )
+        for i, (fake, want, phases) in enumerate(cases):
+            self.setUp()
+            self.assertEqual(self.run_job(fake, f"{i + 1:x}" * 64, **ASSESS), want, (i, phases))
+            self.assertEqual(fake.phases(), phases, i)
+            self.assert_no_secret_anywhere(fake, want)
+        # control: the same commit timeout and unconfirmed commit of a personal open stay retryable
+        for i, fake in enumerate((FakeDesktop({"commit": ro.ExecLimit(True, b"")}), FakeDesktop({"commit": ro.CleanupPending()}))):
+            self.setUp()
+            self.assertEqual(self.run_job(fake, f"{i + 10:x}" * 64), ro.refusal("workspace_busy"), i)
 
     def test_a_kernel_folder_conflict_passes_through_for_an_assessment(self):
         fake = FakeDesktop({"prepare": line({"ok": False, "errorCode": "folder_conflict"})})

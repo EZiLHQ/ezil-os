@@ -183,8 +183,10 @@ const requestFileOf = (r) => `${REQUESTS_DIR}/${r.uuid}.json`;
 
 // ── git ─────────────────────────────────────────────────────────────────────
 
+// `core.fsmonitor=` (empty) turns fsmonitor off on every git: git < 2.36 (the image's 2.34.1) reads
+// the value `false` as a hook command and runs the PATH's `false` (1.0.3).
 const GIT_BASE_CONFIG = ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
-  '-c', 'submodule.recurse=false', '-c', 'core.fsmonitor=false'];
+  '-c', 'submodule.recurse=false', '-c', 'core.fsmonitor='];
 /** The whole environment of every git child: nothing inherited (§9.4 "Git hygiene"). */
 const gitEnv = () => ({ PATH: GIT_PATH, HOME: GIT_HOME, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' });
 const seamConfig = (seam) => (seam ? [
@@ -725,29 +727,36 @@ function currentBranch(folder, fallback) {
 }
 
 /**
- * The hardened local git of the assessment reads (1.0.3): on top of the cleared environment and
+ * The local git of the assessment reads (1.0.3): on top of the cleared environment and
  * GIT_BASE_CONFIG (no system config, hooks /dev/null, fsmonitor off), no global config either,
- * repository discovery stops at F's parent (F itself must be the repository), no pager, and no
- * optional lock (a status killed at its timeout never leaves .git/index.lock behind). No external
- * diff can run: status runs no diff driver, and neither the environment nor any config but F's
- * own (written by this kernel) can name one.
+ * repository discovery stops at the directory's parent (the directory itself must be the
+ * repository), no pager, and no optional lock (a status killed at its timeout never leaves
+ * .git/index.lock behind). These flags keep the kernel's own environment from adding anything;
+ * they do not make the repository's own state trustworthy. Its .git (config filter drivers,
+ * core.worktree, info/exclude, info/attributes, index bits) and the git binary itself are
+ * writable by guest root, so head and clean are in-guest evidence, not proof (vectors
+ * kernel.assessment.trust).
  */
 const HARDENED_GLOBAL_OPTIONS = ['--no-pager', '--no-optional-locks'];
-const hardenedGit = (folder) => ({ cwd: folder, timeoutMs: LOCAL_GIT_COMMAND_MS, seam: null,
-  env: { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CEILING_DIRECTORIES: path.posix.dirname(folder), GIT_OPTIONAL_LOCKS: '0' } });
+/** All reads of one assessment commit share this budget (vectors kernel.assessment.readBudgetMs), well inside the host's commit window. */
+export const ASSESSMENT_READ_BUDGET_MS = 5000;
 const HEAD_RE = /^[0-9a-f]{40}\n$/;
 const SYMREF_RE = /^refs\/heads\/[^\n]+\n$/;
 
 /**
- * Assessment readiness facts of F (1.0.3), read in F after the rename:
- *   head   the 40-hex commit HEAD resolves to; null only when HEAD is a symbolic ref to a branch
- *          that does not resolve (unborn); any other failure is workspace_failed;
+ * Assessment readiness facts of the repository `dir` (1.0.3; commit reads them in staging, before
+ * the rename). Every read ends by `untilMs` (a read with no time left, or killed at it, is
+ * workspace_busy):
+ *   head   the 40-hex commit HEAD resolves to; null only when HEAD resolves to no object at all
+ *          and is a symbolic ref to a refs/heads/ branch (unborn); anything else that is not a
+ *          commit (a branch naming a tree, a symbolic ref outside refs/heads/) is workspace_failed;
  *   clean  `git status --porcelain=v1 --untracked-files=all` printed nothing.
  */
-export async function assessmentFacts(folder) {
-  const opts = hardenedGit(folder);
+export async function assessmentFacts(dir, untilMs = Date.now() + ASSESSMENT_READ_BUDGET_MS) {
+  const env = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CEILING_DIRECTORIES: path.posix.dirname(dir), GIT_OPTIONAL_LOCKS: '0' };
   const run = async (args) => {
-    const result = await runGit([...HARDENED_GLOBAL_OPTIONS, ...args], opts);
+    const result = await runGit([...HARDENED_GLOBAL_OPTIONS, ...args],
+      { cwd: dir, timeoutMs: Math.min(LOCAL_GIT_COMMAND_MS, untilMs - Date.now()), seam: null, env });
     if (result.timedOut) refuse('workspace_busy');
     return result;
   };
@@ -757,6 +766,8 @@ export async function assessmentFacts(folder) {
     if (!HEAD_RE.test(rev.stdout)) refuse('workspace_failed');
     head = rev.stdout.slice(0, 40);
   } else {
+    // HEAD names an object that is not a commit: never unborn.
+    if ((await run(['rev-parse', '--verify', '-q', 'HEAD'])).code === 0) refuse('workspace_failed');
     const sym = await run(['symbolic-ref', '-q', 'HEAD']);
     if (sym.code !== 0 || !SYMREF_RE.test(sym.stdout)) refuse('workspace_failed');
   }
@@ -765,10 +776,12 @@ export async function assessmentFacts(folder) {
   return { head, clean: status.stdout === '' };
 }
 
-async function describeFolder(folder, r, state) {
+async function describeFolder(folder, r, state, facts = null) {
   if (r.class === 'assessment') {
-    // Never `existing` (prepare and commit refuse a folder that is already there).
-    const { head, clean } = await assessmentFacts(folder);
+    // Never `existing` (prepare and commit refuse a folder that is already there). The facts were
+    // read in staging before the rename; no git runs after it.
+    if (!facts) refuse('workspace_failed');
+    const { head, clean } = facts;
     const empty = head === null;
     return { ok: true, state: empty ? 'initialized_empty' : 'cloned', folder, ...openFolderOf(folder, r.path),
       branch: currentBranch(folder, r.defaultBranch), empty, head, clean };
@@ -831,10 +844,15 @@ async function prepare(r, seam) {
       state = 'initialized_empty'; branch = r.defaultBranch; empty = true;
       await writeEmptyUpstream(r.staging, r.defaultBranch);
     } else {
+      // An assessment checks out exactly defaultBranch, never the remote HEAD's branch (1.0.3):
+      // a non-empty remote without it is refused before the fetch.
+      const assessment = r.class === 'assessment';
+      if (assessment && !heads.filter(validBranch).includes(r.defaultBranch)) refuse('repository_unavailable');
       const fetched = await runGit(['fetch', '-q', '--no-tags', 'origin', '+refs/heads/*:refs/remotes/origin/*'], net(r.staging));
       if (fetched.code !== 0) refuse(classifyGitFailure(fetched));
       const usable = heads.filter(validBranch).sort();
-      branch = symref && usable.includes(symref) ? symref : usable.includes(r.defaultBranch) ? r.defaultBranch : usable[0];
+      branch = assessment ? r.defaultBranch
+        : symref && usable.includes(symref) ? symref : usable.includes(r.defaultBranch) ? r.defaultBranch : usable[0];
       if (!branch) refuse('workspace_failed');
       await git(['checkout', '-q', '-b', branch, '--track', `origin/${branch}`], { cwd: r.staging, timeoutMs: remaining(), seam: null });
       state = 'cloned'; empty = false;
@@ -861,12 +879,14 @@ function ensureParent(dir) {
 }
 
 async function commit(r) {
+  const assessment = r.class === 'assessment';
+  let placed = false;
   try {
     const folder = folderOf(r);
     const existing = lstatOrNull(folder);
     if (existing) {
       // A folder that appeared between prepare and commit: an assessment never adopts it (1.0.3).
-      if (r.class === 'assessment') return fail('folder_conflict');
+      if (assessment) return fail('folder_conflict');
       if (!existing.isDirectory() || !bindingMatches(folder, r)) return fail('folder_conflict');
       const token = readIncomingGrant(r);
       await repairCredentialConfig(folder, r);
@@ -879,13 +899,22 @@ async function commit(r) {
     if (!held || held.owner !== r.uuid) return fail('workspace_busy');
     const staged = lstatOrNull(r.staging);
     if (!staged || !staged.isDirectory() || !bindingMatches(r.staging, r)) return fail('workspace_failed');
+    // An assessment reads head and clean in staging, BEFORE the rename (1.0.3): a read that fails or
+    // runs out of time places nothing, so a re-open is still a fresh open.
+    const facts = assessment ? await assessmentFacts(r.staging) : null;
     ensureParent(`${r.root}/repos`);
     ensureParent(`${r.root}/repos/${r.handle}`);
     fs.renameSync(r.staging, folder);
-    return await describeFolder(folder, r, null);
+    placed = true;
+    return await describeFolder(folder, r, null, facts);
   } catch (error) {
     return fail(codeOf(error));
   } finally {
+    // An assessment commit that placed nothing removes the grant its own prepare installed (this
+    // request still owns that prepare's lock), never another request's (1.0.3).
+    if (assessment && !placed) {
+      try { if (readOwner(lockOf(r))?.owner === r.uuid) removeFile(grantOf(r)); } catch { /* release, or the TTL */ }
+    }
     // Last act on every outcome.
     try { releaseOwnLock(r); } catch { /* stale at the next prepare */ }
   }
