@@ -238,9 +238,16 @@ export interface GuacamolePreviewRequest {
      * shell bundle against a NEW server behave exactly as it does today.
      */
     screen?: { width: number; height: number };
+    /**
+     * Code only, own files only: `{v:1, path}`, the shell tab's folder hint (`./compute/code-folder.ts`). OMITTED,
+     * never defaulted. The Worker plans it against the computer's root and walks it there; an older Worker ignores it.
+     */
+    codeFolder?: { v: 1; path: string };
 }
 
 export interface GuacamolePreviewSuccess {
+    /** Per-tab folder continuity: the Worker's outcome code (`restored`, `missing`, …), never a path. */
+    codeFolder?: { v: 1; outcome: string };
     relay?: { runtimeId: string; expiresAt: number };
     ok: true;
     guacamoleUrl: string;

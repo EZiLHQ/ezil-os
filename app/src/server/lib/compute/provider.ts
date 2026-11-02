@@ -46,6 +46,12 @@ export interface EnsureOptions {
     desktopMode: 'neko';
     /** Omitted, never defaulted, when nothing usable was requested. */
     screen?: { width: number; height: number };
+    /**
+     * Code only, own files only: the shell tab's folder hint, already lexically checked (`./code-folder.ts`).
+     * Never trusted as a folder: the Worker plans it against the computer's root and walks it there. Omitted,
+     * never defaulted.
+     */
+    codeFolder?: { v: 1; path: string };
 }
 
 /**

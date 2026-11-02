@@ -84,7 +84,7 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', intent, project } = (body ?? {}) as {
+        const { computerId = '', intent, project, codeFolder } = (body ?? {}) as {
             computerId?: string;
             /**
              * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` on the r9 shell's Code mint. Forwarded
@@ -93,13 +93,19 @@ export async function POST(req: Request) {
             intent?: unknown;
             /** `/app/code?project=&repo=` as `shell/ezil/app-link.js` parsed it. Its `path` is not read (deferred). */
             project?: unknown;
+            /**
+             * Per-tab folder continuity, own files only: `{v:1, path}` the tab's editor last reported. Forwarded
+             * VERBATIM to the procedure (which checks it, `z.unknown()`: never a 400); never with a project, whose
+             * root the server fixes (r32).
+             */
+            codeFolder?: unknown;
         };
 
         if (project !== undefined && project !== null) {
             return await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
         }
 
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent });
+        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}) });
 
         return shellJson(preview);
     } catch (err) {

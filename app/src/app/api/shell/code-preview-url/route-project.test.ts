@@ -43,6 +43,8 @@ const s = vi.hoisted(() => ({
     worker: null as null | ((body: string) => Response),
     requests: [] as { url: URL; init: RequestInit }[],
     cleared: 0,
+    /** What the route handed the Code mint (per-tab folder continuity: never a `codeFolder` with a project). */
+    mintInputs: [] as unknown[],
 }));
 
 vi.mock('@/server/api/trpc', () => ({ createTRPCContext: async () => ({ user: { id: USER }, db: {}, headers: new Headers() }) }));
@@ -52,7 +54,9 @@ vi.mock('@/server/api/root', () => ({ appRouter: { createCaller: () => ({
         if (!s.owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
         return { id };
     } },
-    cloudflareGuacamole: { codePreviewUrl: async () => { s.order.push('codePreviewUrl'); s.skew += s.mintTakes; return s.preview; } },
+    cloudflareGuacamole: { codePreviewUrl: async (input: unknown) => {
+        s.order.push('codePreviewUrl'); s.mintInputs.push(input); s.skew += s.mintTakes; return s.preview;
+    } },
 }) } }));
 vi.mock('@/server/auth/retained-identity', () => ({
     retainedIdentity: async (userId: string) => {
@@ -85,7 +89,7 @@ const grant = (over: Record<string, unknown> = {}) => ({
 
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
-    Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0,
+    Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }) });
@@ -339,6 +343,16 @@ describe('opening a project in Code', () => {
         const response = await open();
         expect(response.status).toBe(409);
         expect((await response.json()).error.code).toBe('repo_open_unsupported_provider');
+    });
+
+    it('per-tab folder continuity: a project mint never carries the own-files `codeFolder` hint (r32: the server fixes the root)', async () => {
+        const response = await post({ computerId: COMPUTER, intent: 'open', project: { projectId: PROJECT, repoId: REPO },
+            codeFolder: { v: 1, path: '/workspace/elsewhere' } });
+        expect(response.status).toBe(200);
+        expect(s.mintInputs).toStrictEqual([{ computerId: COMPUTER, intent: 'open' }]);
+        const url = new URL((await response.json()).url);
+        expect(url.searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}`]);
+        expect(s.requests.map(r => String(r.init.body ?? '')).join('\n')).not.toContain('elsewhere');
     });
 
     it("no project (or null) is exactly today's mint: no ownership pre-read, no identity, no Universe", async () => {
