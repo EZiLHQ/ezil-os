@@ -46,6 +46,7 @@ import time
 from . import agent as agentmod
 from . import desktop
 from . import export
+from . import fsops
 from .fsops import Refused
 
 GW_HEADER = "x-ezil-gw"
@@ -76,6 +77,12 @@ EXPORT_CHUNK_RE = re.compile(r"^/__ezil/control/export/chunk/(.*)$")
 CHUNK_INDEX_RE = re.compile(r"0|[1-9][0-9]{0,2}")   # decimal, no leading zeros, below 512 chunks
 EXPORT_CL_RE = re.compile(r"[0-9]{1,4}")
 MAX_EXPORT_BODY = 1024
+# Per-tab Code folder continuity (worker/src/code-folder.ts; the Worker's walk is code-folder-resolve.ts):
+# is <dataMount>/workspace/<rel> a real directory, no symlink followed? The body {"v":1,"rel":…} is not
+# covered by the path-only gw1 signature, so its sha256 is in the signed path. Answers a code, never rel.
+FOLDER_RE = re.compile(r"^/__ezil/control/folder/([0-9a-f]{64})$")
+FOLDER_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
+MAX_FOLDER_BODY = 4096
 STREAM_BLOCK = 65536
 # The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
 # answer that is not ok, an empty one included, is 503 agent_unavailable.
@@ -381,6 +388,10 @@ class Edge:
         if m:
             self._export_post(client, head, m.group(1), query)
             return
+        m = FOLDER_RE.match(path)
+        if m:
+            self._folder(client, head, m.group(1), query)
+            return
         if path in (EXPORT_STATUS_PATH, EXPORT_HEAD_PATH) or EXPORT_CHUNK_RE.match(path):
             self._export_get(client, head, path, query)
             return
@@ -459,6 +470,40 @@ class Edge:
             _reply(client, 400, {"ok": False, "error": "ice_config_invalid"})
             return
         self._agent(client, "ice", config=config)
+
+    # ------------------------------------------------------------ per-tab Code folder continuity
+    def _folder(self, client, head, digest, query):
+        """POST /__ezil/control/folder/<sha256>: exactly Content-Length bytes (1..4096, no chunking),
+        hashed BEFORE parsing and compared with the signed digest; the body is {"v":1,"rel":…} and
+        nothing else, rel lexically plain (fsops.plain_rel). Walks <dataMount>/workspace/<rel> with
+        fsops.classify_dir_below (lstat + O_DIRECTORY|O_NOFOLLOW per component; nothing created).
+        Answers 200 {"ok": true, "result": ok|missing|not_directory|symlink}; rel is never echoed or
+        logged. Read-only and idempotent: no agent message, no state."""
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if head.method != "POST" or query:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        if te or len(cl) != 1 or not FOLDER_CL_RE.fullmatch(cl[0]) or int(cl[0]) > MAX_FOLDER_BODY:
+            _reply(client, 400, {"ok": False, "error": "folder_body_invalid"})
+            return
+        try:
+            body, _ = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "folder_body_invalid"})
+            return
+        if not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+            _reply(client, 400, {"ok": False, "error": "folder_digest_mismatch"})
+            return
+        try:
+            req = json.loads(body.decode("utf-8", "strict"))
+        except ValueError:
+            req = None
+        if (not isinstance(req, dict) or sorted(req) != ["rel", "v"] or req["v"] != 1 or isinstance(req["v"], bool)
+                or not fsops.plain_rel(req["rel"])):
+            _reply(client, 400, {"ok": False, "error": "folder_body_invalid"})
+            return
+        result = fsops.classify_dir_below(os.path.join(self.cfg.dataMount, "workspace"), req["rel"])
+        _reply(client, 200, {"ok": True, "result": result})
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):
