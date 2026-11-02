@@ -26,6 +26,16 @@ import type { AwsDesktopConfigReadiness, AwsDesktopReadiness } from './aws-ice';
 import { APP_PREVIEW_PORT, CODE_PREVIEW_PORT, portFor } from './desktop-mode';
 import { relayFailureResult, type RelayState } from './relay-refresh';
 import {
+  CODE_FOLDER_MINT_PARAM,
+  codeBootstrapPathProblem,
+  codeFolderAnswer,
+  codeFolderMint,
+  fitsCodeFolderUrl,
+  plainFolderPath,
+  settleCodeFolder,
+  type CodeFolderOutcome,
+} from './code-folder';
+import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
   deriveNekoCredentials,
@@ -221,10 +231,27 @@ export function parseAwsBrowserHost(hostname: string, zoneRoot: string): { port:
   return AWS_EDGE_PORTS.includes(port) ? { port, sandboxId: m[2]! } : null;
 }
 
-export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string, bootstrapToken: string, path = '/'): string {
+/**
+ * The AWS desktop's workspace root as code-server sees it (infra/host-agent desktop.py binds
+ * `<dataMount>/workspace` there and sets EZIL_WORKSPACE_ROOT to it). The ONLY root a restored Code
+ * folder may sit under on AWS (./code-folder.ts).
+ */
+export const AWS_WORKSPACE_ROOT = '/workspace';
+
+/** True for `/workspace` itself or a plain path below it. */
+function underAwsWorkspace(path: string): boolean {
+  return path === AWS_WORKSPACE_ROOT || path.startsWith(`${AWS_WORKSPACE_ROOT}/`);
+}
+
+/**
+ * `folder` is Code's only (port 8443) and only ever a folder the host walked (`handleAwsPreview`); the
+ * bootstrap re-checks it lexically. Every other port ignores it.
+ */
+export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string, bootstrapToken: string, path = '/', folder?: string): string {
   const u = new URL(`https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap`);
   u.searchParams.set('token', bootstrapToken);
   u.searchParams.set('path', path);
+  if (folder && port === CODE_PREVIEW_PORT) u.searchParams.set('folder', folder);
   return u.toString();
 }
 
@@ -328,6 +355,23 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     const raw = url.searchParams.get('path') || '/';
     const dest = new URL(raw.startsWith('/') && !raw.startsWith('//') ? raw : '/', url);
     if (dest.origin !== url.origin) return json({ ok: false, error: 'invalid_redirect' }, 400);
+    if (port === CODE_PREVIEW_PORT) {
+      // Per-tab folder continuity (./code-folder.ts): what a Code document opens may only arrive as THIS
+      // bootstrap's own `folder`, plain-absolute and under /workspace, never hidden in `path`'s query
+      // (`path=/?folder=/etc`), which is forwarded as given. Lexical defense in depth: the Worker composes
+      // `folder` itself, only from a folder the host walked.
+      if (codeBootstrapPathProblem(dest.searchParams)) return json({ ok: false, error: 'invalid_folder' }, 400);
+      const folder = url.searchParams.get('folder');
+      if (folder) {
+        const plain = plainFolderPath(folder);
+        if (!plain || !underAwsWorkspace(plain)) return json({ ok: false, error: 'invalid_folder' }, 400);
+        dest.searchParams.set('folder', plain);
+      }
+      // The shell's per-mint id rides into this mint's FIRST editor document only (an instance binding, not a
+      // credential and not authority); a malformed one is dropped, never an error.
+      const mint = codeFolderMint(url.searchParams.get(CODE_FOLDER_MINT_PARAM));
+      if (mint) dest.searchParams.set(CODE_FOLDER_MINT_PARAM, mint);
+    }
     const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs());
     const attrs = [`${PREVIEW_COOKIE_NAME}=${cookie}`, `Max-Age=${PREVIEW_COOKIE_TTL_S}`, 'HttpOnly', 'Secure', 'SameSite=None', 'Partitioned', 'Path=/'];
     return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; ') } });
@@ -399,6 +443,14 @@ export interface AwsPreviewDeps {
   ensureConfig?: (record: AwsTunnelRecord) => Promise<AwsDesktopConfigReadiness>;
   /** Code: whether code-server answers on the origin (`./aws-ice` `awsCodeServerAnswers`). */
   codeAnswers?: (record: AwsTunnelRecord) => Promise<boolean>;
+  /** Code: the tab's own-files folder hint, as the v2-digested body carried it (`./code-folder.ts`). Never trusted. */
+  codeFolder?: unknown;
+  /**
+   * Code: walk `<dataMount>/workspace/<rel>` on the HOST with no symlink followed (the host edge's folder op).
+   * Written by e1cd418a (`code-folder-resolve.ts`); absent, every resolvable ask is `unverified` and today's
+   * default folder opens.
+   */
+  resolveFolder?: (record: AwsTunnelRecord, rel: string) => Promise<CodeFolderOutcome>;
   nowMs: () => number;
 }
 
@@ -460,9 +512,21 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     if (readiness.state === 'starting') return json({ ok: false, error: 'aws_desktop_starting', reason: readiness.reason }, 503);
     relay = readiness.relay;
   }
+  // Per-tab folder continuity (Code only): strip /workspace, walk on the host, else today's default (no folder).
+  const resolveFolder = deps.resolveFolder;
+  const folder = surface === 'code'
+    ? await settleCodeFolder(deps.codeFolder, AWS_WORKSPACE_ROOT, resolveFolder ? (rel) => resolveFolder(record, rel) : undefined)
+    : {};
   const now = deps.nowMs();
   const token = await mintPreviewBootstrapToken(secrets[0]!, claims.sandboxId, now);
-  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token);
+  let restored = folder.folder;
+  let folderOutcome = folder.outcome;
+  if (restored && !fitsCodeFolderUrl(awsBrowserUrl(CODE_PREVIEW_PORT, claims.sandboxId, deps.zoneRoot, token, '/', restored))) {
+    // The shell's frame confirmation caps the URL; a deep folder opens today's default with a visible notice.
+    restored = undefined;
+    folderOutcome = 'too_long';
+  }
+  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token, '/', port === CODE_PREVIEW_PORT ? restored : undefined);
   return json({
     ok: true,
     provider: 'aws-ec2',
@@ -473,6 +537,8 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     guacamoleUrl: url(AWS_DESKTOP_PORT),
     appPreviewUrl: url(APP_PREVIEW_PORT),
     codePreviewUrl: url(CODE_PREVIEW_PORT),
+    // Codes only, never a path; absent when nothing was asked.
+    ...codeFolderAnswer(folderOutcome),
     expiresAt: now + AWS_PREVIEW_TTL_MS,
     // Like Cloudflare: the relay state the client renews from, and only WHETHER a relay is wired.
     ...(relay ? { relay, turnRelay: true } : {}),
