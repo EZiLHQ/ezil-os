@@ -97,6 +97,14 @@ for (const host of [C.GIT_STAGING_HOST, C.GIT_ASSESSMENT_HOST, new URL(C.WORKS_S
     ok(new Set(Object.values(T)).size === Object.values(T).length && !Object.values(T).includes(C.GIT_PRODUCTION_HOST),
         'class table: one distinct host per class, never GIT_PRODUCTION_HOST');
 }
+// 1.0.3 E1-6: the assessment layout (wrapper projects/<repositoryId>, clone <wrapper>/repository) and its remote.
+{
+    eq(C.ASSESSMENT_DIR_TEMPLATE, 'projects/<repositoryId>', 'ASSESSMENT_DIR_TEMPLATE');
+    eq(C.ASSESSMENT_CLONE_DIR_NAME, 'repository', 'ASSESSMENT_CLONE_DIR_NAME (the OS open-project REPO_OPEN_NESTED_DIR)');
+    eq(C.ASSESSMENT_REMOTE_TEMPLATE, `https://${C.GIT_ASSESSMENT_HOST}/<handle>/<name>.git`, 'ASSESSMENT_REMOTE_TEMPLATE is on GIT_ASSESSMENT_HOST');
+    ok(!C.ASSESSMENT_DIR_TEMPLATE.startsWith(`${C.REPO_DIR_TEMPLATE.split('/')[0]}/`) && C.ASSESSMENT_DIR_TEMPLATE.split('/')[0] !== C.STAGING_ROOT_NAME
+        && !C.SNAPSHOT_INTERNAL_NAMES.includes(C.ASSESSMENT_DIR_TEMPLATE.split('/')[0]), 'the assessment wrappers live apart from repos/, staging and the codec internal names');
+}
 ok(C.STAGING_FORBIDDEN_HOSTS.includes(C.GIT_PRODUCTION_HOST), 'GIT_PRODUCTION_HOST is forbidden on staging');
 ok(!C.GATEWAY_TAKEN_RL_NAMESPACES.includes(C.GATEWAY_PREVIEW_RL_NAMESPACE), 'preview RL namespace collides');
 ok(!C.OS_PRODUCTION_ORIGINS.includes(C.OS_STAGING_ORIGIN), 'staging origin listed as production');
@@ -412,7 +420,8 @@ function workerBodyValid(b, now) {
     const t = isoMs(g.expiresAt);
     return b.v === 1 && ['open', 'refresh'].includes(b.op) && R.UUID_RE(b.repositoryId) && R.HANDLE_RE(b.handle) && R.NAME_RE(b.name)
         && (cls !== C.REPO_OPEN_CLASS_DEFAULT || W.gitHostAllowList.includes(b.gitHost)) && R.BRANCH_RE(b.defaultBranch)
-        && (b.path === null || (b.op === 'open' && pathOk(b.path)))
+        // E1-6: an assessment takes no path (its editor root is always the wrapper).
+        && (b.path === null || (cls !== 'assessment' && b.op === 'open' && pathOk(b.path)))
         && g.username === C.GRANT_USERNAME && R.GRANT_RE(g.token) && C.GRANT_SCOPES.includes(g.scope)
         && t > now && t <= now + T.WORKER_ACCEPT_EXPIRY_MAX_MS;
 }
@@ -721,7 +730,7 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     // 1.0.3: the assessment open shape (kernel.assessment, okAssessmentRule).
     const K = V.kernel.assessment;
     eq(W.okOpenAssessment.keys, K.resultOpenKeys, 'Worker assessment open 200 keys equal the kernel assessment open keys');
-    eq(K.resultOpenKeys, [...V.kernel.resultOpenKeys, 'head', 'clean'], 'the assessment open keys are the personal ones plus head and clean');
+    eq(K.resultOpenKeys, [...V.kernel.resultOpenKeys, 'head', 'clean', 'remote'], 'the assessment open keys are the personal ones plus head, clean and remote');
     eq(W.okOpenAssessment.states, K.states, 'Worker assessment open 200 states');
     ok(K.states.every((s) => W.okOpen.states.includes(s)) && !K.states.includes('existing'), 'assessment states are open states without existing');
     eq(K.hardenedRead.globalOptions, ['--no-pager', '--no-optional-locks'], 'hardened read global options');
@@ -733,21 +742,42 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(Number.isSafeInteger(K.readBudgetMs) && K.readBudgetMs > 0 && K.readBudgetMs < V.timeouts.COMMIT_EXEC_MAX_MS, 'assessment readBudgetMs is inside the commit exec window');
     ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && /defaultBranch/.test(c.cause) && c.errorCode === 'repository_unavailable'), 'an assessment remote without defaultBranch is classified');
     ok(typeof K.trust === 'string' && /evidence, not proof/.test(K.trust), 'assessment head and clean are stated as in-guest evidence');
+    // E1-6: the layout, the remote read and the kernel-enforced editor root.
+    ok(typeof K.layoutRule === 'string' && K.layoutRule.includes('ASSESSMENT_DIR_TEMPLATE') && K.layoutRule.includes('ASSESSMENT_CLONE_DIR_NAME')
+        && /rmdir/.test(K.layoutRule) && /never followed/.test(K.layoutRule), 'assessment layoutRule names the wrapper, the clone, the rollback and the no-follow parent');
+    ok(typeof K.remoteRule === 'string' && K.remoteRule.includes('ASSESSMENT_REMOTE_TEMPLATE') && K.remoteRule.includes('--get-all remote.origin.url')
+        && /without --local/.test(K.remoteRule) && /BEFORE the rename/.test(K.remoteRule), 'assessment remoteRule: one value, read before the rename, includes followed');
+    ok(/kernel-enforced/.test(K.editorRootRule) && !/must first check/.test(K.editorRootRule), 'editorRootRule is kernel-enforced (no consumer precondition left)');
+    ok(/non-null path with class assessment/.test(V.kernel.requestKeysRule), 'requestKeysRule refuses a path on an assessment request');
+    for (const [needle, code] of [['wrapper <root>/projects/<repositoryId> exists in any form', 'folder_conflict'], ['<root>/projects exists but is not a real directory', 'workspace_failed'],
+        ['remote.origin.url read back', 'workspace_failed'], ['rename into the new wrapper failed', 'workspace_failed']]) {
+        ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && c.cause.includes(needle) && c.errorCode === code), `classification: class assessment, ${needle} → ${code}`);
+    }
+    const X = W.okAssessmentContext;
+    eq(Object.keys(X), ['root', 'repositoryId', 'handle', 'name', 'folder', 'remote'], 'okAssessmentContext keys');
+    ok(X.root === C.WORKSPACE_ROOT_DEFAULT && X.repositoryId === V.fixtures.repositoryId && X.handle === V.fixtures.handle && X.name === V.fixtures.name, 'okAssessmentContext is the fixtures repository on the default root');
+    eq(X.folder, `${X.root}/${C.ASSESSMENT_DIR_TEMPLATE.replace('<repositoryId>', X.repositoryId)}`, 'okAssessmentContext folder is the wrapper W');
+    eq(X.remote, C.ASSESSMENT_REMOTE_TEMPLATE.replace('<handle>', X.handle).replace('<name>', X.name), 'okAssessmentContext remote');
     const HEX40 = /^[0-9a-f]{40}$/;
-    function assessmentOkValid(b) {
+    /** okAssessmentRule for the repository `ctx` names: folder and openFolder are its wrapper, its remote exactly. */
+    function assessmentOkValid(b, ctx = X) {
         const shape = W.okOpenAssessment;
         if (!b || typeof b !== 'object' || Array.isArray(b)) return false;
         if (Object.keys(b).length !== shape.keys.length || !shape.keys.every((k) => Object.hasOwn(b, k))) return false;
         if (b.ok !== true || !shape.states.includes(b.state)) return false;
-        const abs = (p) => typeof p === 'string' && p.startsWith('/') && !p.split('/').some((seg) => seg === '..' || seg === '.');
-        return abs(b.folder) && abs(b.openFolder) && (b.openFolder === b.folder || b.openFolder.startsWith(`${b.folder}/`))
-            && typeof b.pathNotFound === 'boolean' && typeof b.empty === 'boolean' && R.BRANCH_RE(b.branch)
+        return b.folder === ctx.folder && b.openFolder === ctx.folder && b.pathNotFound === false
+            && typeof b.empty === 'boolean' && typeof b.branch === 'string' && R.BRANCH_RE(b.branch)
             && (b.head === null || (typeof b.head === 'string' && HEX40.test(b.head))) && typeof b.clean === 'boolean'
-            && b.empty === (b.head === null) && (b.state === 'initialized_empty') === (b.head === null);
+            && b.empty === (b.head === null) && (b.state === 'initialized_empty') === (b.head === null)
+            && b.remote === ctx.remote;
     }
     const assessmentCases = W.okAssessmentCases.map((c) => ({ ...c, body: Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, expand(v)])) }));
     for (const c of assessmentCases) eq(assessmentOkValid(c.body), c.valid, `Worker assessment 200 ${c.why ?? 'valid'} ${JSON.stringify(c.body).slice(0, 60)}`);
     for (const valid of [true, false]) ok(assessmentCases.some((c) => c.valid === valid), `Worker assessment 200 needs a ${valid ? 'valid' : 'invalid'} case`);
+    // the E1-6 rows: the clone, the personal folder or another repository's wrapper as folder; a foreign or missing remote
+    for (const why of ['folder is the clone, not the wrapper', 'the personal folder', "another repository's wrapper", 'remote on the personal host', 'remote of another repository', 'remote missing (the 9-key shape before E1-6)']) {
+        ok(assessmentCases.some((c) => c.why === why && !c.valid), `Worker assessment 200 has the E1-6 row "${why}"`);
+    }
     for (const c of assessmentCases) if (c.valid) ok(!workerOkValid('open', c.body), 'an assessment-shaped 200 is invalid for a personal open');
     for (const c of W.okCases) if (c.op === 'open' && c.valid) ok(!assessmentOkValid(c.body), 'a personal-shaped 200 is invalid for an assessment open');
     for (const op of ['open', 'refresh']) for (const valid of [true, false]) ok(W.okCases.some((c) => c.op === op && c.valid === valid), `Worker 200 needs a ${valid ? 'valid' : 'invalid'} ${op} case`);

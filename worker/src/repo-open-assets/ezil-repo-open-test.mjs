@@ -366,10 +366,11 @@ function plantLock(owner, ageMs = 0, handle, name) {
   fs.writeFileSync(`${lock}/owner`, owner);
   if (ageMs) { const t = (Date.now() - ageMs) / 1000; fs.utimesSync(`${lock}/owner`, t, t); }
 }
-function assertNoOpenLeftovers(root, uuid, { handle = 'acme', name = 'site' } = {}) {
+function assertNoOpenLeftovers(root, uuid, { handle = 'acme', name = 'site', wrapper = null } = {}) {
   assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false, 'staging dir left behind');
   assert.equal(exists(lockOf(handle, name)), false, 'lock left behind');
   assert.equal(exists(`${root}/repos/${handle}/${name}`), false, 'folder created');
+  if (wrapper) assert.equal(exists(wrapper), false, 'assessment wrapper created');
   assert.equal(exists(grantOf(handle, name)), false, 'grant left for an absent folder');
   assert.equal(exists(`/run/ezil/requests/${uuid}.json`), false, 'request file left behind');
   assert.equal(exists(`/run/ezil/git/incoming/${uuid}.json`), false, 'incoming file left behind');
@@ -1024,6 +1025,13 @@ async function main() {
 
   // ── class assessment (contract 1.0.3) ────────────────────────────────────────
   const ASSESS = { gitHost: QA_HOST, cls: 'assessment' };
+  /** E1-6 (vectors kernel.assessment.layoutRule): the wrapper W (the editor root) and the clone F = W/repository. */
+  const wrapperOf = (root, id = REPO_ID) => `${root}/${V.constants.ASSESSMENT_DIR_TEMPLATE.replace('<repositoryId>', id)}`;
+  const cloneOf = (root, id = REPO_ID) => `${wrapperOf(root, id)}/${V.constants.ASSESSMENT_CLONE_DIR_NAME}`;
+  const QA_REMOTE = V.constants.ASSESSMENT_REMOTE_TEMPLATE.replace('<handle>', 'acme').replace('<name>', 'site');
+  /** The assessment commit answer for W under `root` (kernel.assessment.resultOpenKeys), `fields` over a clean clone. */
+  const assessed = (root, fields) => ({ ok: true, state: 'cloned', folder: wrapperOf(root), openFolder: wrapperOf(root), pathNotFound: false,
+    branch: 'main', empty: false, head: null, clean: true, remote: QA_REMOTE, ...fields });
   const qaConfig = expectedConfig.map((l) => l.split(GIT_HOST).join(QA_HOST));
   const remoteHeadOf = (bare, branch = 'main') => sh('git', ['-C', bare, 'rev-parse', `refs/heads/${branch}`], { env: USER_ENV }).trim();
   const kernelCode = async (fn) => { try { return await fn(); } catch (e) { return e && e.code; } };
@@ -1033,9 +1041,9 @@ async function main() {
     const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', 'src/b.txt': 'b' } } });
     const connects = fx.proxy.state.connects.length;
     const { prepared, committed, released } = await openFlow(fx, { root, token, ...ASSESS });
-    const F = `${root}/repos/acme/site`;
-    assert.deepEqual(prepared, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false }, 'the prepare answer is unchanged');
-    assert.deepEqual(committed, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare), clean: true });
+    const W = wrapperOf(root), F = cloneOf(root);
+    assert.deepEqual(prepared, { ok: true, state: 'cloned', folder: W, openFolder: W, pathNotFound: false, branch: 'main', empty: false }, 'the prepare answer keeps its keys (its folder is W)');
+    assert.deepEqual(committed, assessed(root, { head: remoteHeadOf(bare) }));
     assert.deepEqual(Object.keys(committed), V.kernel.assessment.resultOpenKeys);
     assert.match(committed.head, /^[0-9a-f]{40}$/);
     assert.deepEqual(released, { ok: true });
@@ -1060,8 +1068,8 @@ async function main() {
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     const bare = makeRemote(fx);
     const { committed } = await openFlow(fx, { root, token, ...ASSESS });
-    const F = `${root}/repos/acme/site`;
-    assert.deepEqual(committed, { ok: true, state: 'initialized_empty', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: true, head: null, clean: true });
+    const F = cloneOf(root);
+    assert.deepEqual(committed, assessed(root, { state: 'initialized_empty', empty: true, head: null }));
     assert.deepEqual(nonCore(F), [...qaConfig, ...upstreamLines('main')]);
     fs.writeFileSync(`${F}/README.md`, '# site\n');
     assert.equal((await userGit(fx, F, ['add', 'README.md'])).status, 0);
@@ -1112,12 +1120,12 @@ async function main() {
     }
   });
 
-  test('class assessment refuses an existing folder at prepare (1.0.3): even the folder an earlier assessment open bound to this very repository and host → folder_conflict before any action (no network, grant, lock or staging; the tree byte-identical)', async () => {
+  test('class assessment refuses an existing wrapper at prepare (1.0.3, E1-6): even the wrapper an earlier assessment open placed for this very repository and host → folder_conflict before any action (no network, grant, lock or staging; the tree byte-identical)', async () => {
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
     assert.equal((await openFlow(fx, { root, token, ...ASSESS })).committed.state, 'cloned');
-    const F = `${root}/repos/acme/site`;
-    fs.writeFileSync(`${F}/pre-staged.txt`, 'answer written before the attempt');
+    const F = wrapperOf(root);
+    fs.writeFileSync(`${cloneOf(root)}/pre-staged.txt`, 'answer written before the attempt');
     const before = manifest(F);
     const connects = fx.proxy.state.connects.length, requests = fx.server.state.requests;
     const token2 = newToken();
@@ -1136,16 +1144,16 @@ async function main() {
     assert.equal((await openFlow(fx, { root: root2, token })).committed.state, 'existing');
   });
 
-  test('class assessment refuses at commit a folder that appeared after prepare (1.0.3): a real repository bound to this repository and host, with an incoming grant → folder_conflict; never adopted; lock released; the grant this request installed removed (another request\'s kept); release removes staging', async () => {
+  test('class assessment refuses at commit a wrapper that appeared after prepare (1.0.3, E1-6): a real repository at W/repository bound to this repository and host, with an incoming grant → folder_conflict; never adopted; lock released; the grant this request installed removed (another request\'s kept); release removes staging', async () => {
     const k = await kernel();
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
     const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
     assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
-    const F = `${root}/repos/acme/site`;
-    sh('git', ['init', '-q', '-b', 'main', F], { env: USER_ENV });
-    sh('git', ['-C', F, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'planted'], { env: USER_ENV });
-    fs.writeFileSync(`${F}/.git/ezil-repo.json`, `${JSON.stringify({ v: 1, repositoryId: REPO_ID, handle: 'acme', name: 'site', gitHost: QA_HOST })}\n`);
+    const F = wrapperOf(root), planted = cloneOf(root);
+    sh('git', ['init', '-q', '-b', 'main', planted], { env: USER_ENV });
+    sh('git', ['-C', planted, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'planted'], { env: USER_ENV });
+    fs.writeFileSync(`${planted}/.git/ezil-repo.json`, `${JSON.stringify({ v: 1, repositoryId: REPO_ID, handle: 'acme', name: 'site', gitHost: QA_HOST })}\n`);
     writeIncoming(uuid, { token, host: QA_HOST });
     const before = manifest(F);
     assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'folder_conflict' });
@@ -1166,7 +1174,7 @@ async function main() {
     fs.writeFileSync(grantOf(), JSON.stringify({ v: 1, protocol: 'https', host: QA_HOST, path: 'acme/site.git', username: 'ezil',
       password: newToken(), expiresAt: new Date(Date.now() + 900000).toISOString(), scope: 'write' }), { mode: 0o600 });
     const otherGrant = fs.readFileSync(grantOf());
-    sh('git', ['init', '-q', '-b', 'main', `${root2}/repos/acme/site`], { env: USER_ENV });
+    sh('git', ['init', '-q', '-b', 'main', cloneOf(root2)], { env: USER_ENV });
     assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid: uuid2, root: root2, inflight: [uuid2, other], ...ASSESS })).result,
       { ok: false, errorCode: 'folder_conflict' });
     assert.equal(exists(grantOf()) && fs.readFileSync(grantOf()).equals(otherGrant), true, 'a commit removed a grant it did not install');
@@ -1184,15 +1192,15 @@ async function main() {
       const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
       assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).ok, true, label);
       tamper(`${root}/.ezil-staging/${uuid}`);
-      const F = `${root}/repos/acme/site`;
       assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result,
-        { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare), clean: false }, label);
+        assessed(root, { head: remoteHeadOf(bare), clean: false }), label);
     }
     resetRun();
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', '.gitignore': 'ignored/\n' } } });
     const { committed } = await openFlow(fx, { root, token, ...ASSESS });
-    const F = committed.folder;
+    const F = `${committed.folder}/repository`;
+    assert.equal(F, cloneOf(root));
     assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: true });
     fs.mkdirSync(`${F}/ignored`); fs.writeFileSync(`${F}/ignored/x`, 'x');
     assert.deepEqual(await k.assessmentFacts(F), { head: remoteHeadOf(bare), clean: true }, 'an ignored file is not listed');
@@ -1287,10 +1295,10 @@ async function main() {
     assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
     fs.writeFileSync(`${root}/.ezil-staging/${uuid}/.git/HEAD`, `${'0'.repeat(40)}\n`);
     assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'workspace_failed' });
-    assert.equal(exists(`${root}/repos/acme/site`), false, 'the folder was placed although its head could not be read');
+    assert.equal(exists(wrapperOf(root)), false, 'the folder was placed although its head could not be read');
     assert.equal(exists(lockOf()), false, 'commit kept its lock');
     assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
-    assertNoOpenLeftovers(root, uuid);
+    assertNoOpenLeftovers(root, uuid, { wrapper: wrapperOf(root) });
     const again = await openFlow(fx, { root, token, ...ASSESS });
     assert.deepEqual([again.committed.state, again.committed.head, again.committed.clean], ['cloned', remoteHeadOf(bare), true]);
   });
@@ -1298,9 +1306,9 @@ async function main() {
   test('class assessment checks out exactly defaultBranch (1.0.3): a remote HEAD on another branch is not followed (personal still follows it); a non-empty remote without defaultBranch → repository_unavailable, nothing placed', async () => {
     const root = newRoot(); const token = newToken(); fx.server.state.token = token;
     const bare = makeRemote(fx, { head: 'trunk', branches: { trunk: { 'a.txt': 'a' }, main: { 'm.txt': 'm' } } });
-    const F = `${root}/repos/acme/site`;
+    const F = cloneOf(root);
     const { committed } = await openFlow(fx, { root, token, defaultBranch: 'main', ...ASSESS });
-    assert.deepEqual(committed, { ok: true, state: 'cloned', folder: F, openFolder: F, pathNotFound: false, branch: 'main', empty: false, head: remoteHeadOf(bare, 'main'), clean: true });
+    assert.deepEqual(committed, assessed(root, { head: remoteHeadOf(bare, 'main') }));
     assert.equal(sh('git', ['-C', F, 'symbolic-ref', 'HEAD'], { env: USER_ENV }).trim(), 'refs/heads/main');
     assert.equal(fs.readFileSync(`${F}/m.txt`, 'utf8'), 'm');
     // control: a personal open of the same remote follows its HEAD
@@ -1312,7 +1320,7 @@ async function main() {
     assert.equal(none, null);
     assert.deepEqual(released, { ok: true });
     assert.ok(fx.proxy.state.connects.length > connects, 'control: the refusal came from the listing');
-    assertNoOpenLeftovers(root3, uuid);
+    assertNoOpenLeftovers(root3, uuid, { wrapper: wrapperOf(root3) });
   });
 
   test('no kernel git runs a PATH-resolved `false` as an fsmonitor hook (1.0.3; git < 2.36 reads core.fsmonitor=false as a hook command): prepare, commit and release of both classes, and the assessment reads', async () => {
@@ -1342,8 +1350,9 @@ async function main() {
         assert.equal(committed.state, 'cloned', JSON.stringify(fields));
         assert.deepEqual(released, { ok: true });
         if (fields.cls) {
-          const t = Date.now() / 1000 + 30; fs.utimesSync(`${committed.folder}/a.txt`, t, t);   // stale stat: status consults the index
-          assert.deepEqual(await k.assessmentFacts(committed.folder), { head: committed.head, clean: true });
+          const clone = `${committed.folder}/repository`;
+          const t = Date.now() / 1000 + 30; fs.utimesSync(`${clone}/a.txt`, t, t);   // stale stat: status consults the index
+          assert.deepEqual(await k.assessmentFacts(clone), { head: committed.head, clean: true });
         }
       }
       assert.equal(exists(marker), false, `the kernel ran the planted false: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
@@ -1369,8 +1378,8 @@ async function main() {
       writeRequest({ phase: 'commit', uuid, root, ...ASSESS })], { encoding: 'utf8', env: { PATH: USER_ENV.PATH } });
     outputs.push(commitRun.stdout, commitRun.stderr);
     const committed = JSON.parse(commitRun.stdout.trim());
-    assert.deepEqual([committed.state, committed.head, committed.clean], ['cloned', remoteHeadOf(bare), true]);
-    const F = `${root}/repos/acme/site`;
+    assert.deepEqual([committed.state, committed.head, committed.clean, committed.remote], ['cloned', remoteHeadOf(bare), true, QA_REMOTE]);
+    const F = cloneOf(root);
     for (const n of [1, 2]) {
       fs.writeFileSync(`${F}/edit-${n}.txt`, `${n}\n`);
       assert.equal((await userGit(fx, F, ['add', `edit-${n}.txt`])).status, 0);
@@ -1395,6 +1404,315 @@ async function main() {
     for (const bad of V.gitConfig.forbiddenSubstrings) assert.equal(config.includes(bad), false, bad);
     assert.equal(/egg_[0-9a-f]{64}/.test(config), false);
     assert.equal(sh('git', ['-C', F, 'remote', '-v'], { env: USER_ENV }).includes('@'), false);
+  });
+
+  // ── E1-6: the assessment layout, W = <root>/projects/<repositoryId> (the editor root), F = W/repository ──
+  const FORMS = ['empty directory', 'directory with editor config', 'file', 'symlink to a directory', 'dangling symlink'];
+  /** Plant `form` at `p` (its parent is created as a real directory when missing). */
+  const plant = (p, form) => {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    if (form === 'empty directory') fs.mkdirSync(p);
+    else if (form === 'directory with editor config') { fs.mkdirSync(`${p}/.vscode`, { recursive: true }); fs.writeFileSync(`${p}/.vscode/tasks.json`, '{"tasks":[]}'); }
+    else if (form === 'file') fs.writeFileSync(p, 'planted');
+    else if (form === 'symlink to a directory') fs.symlinkSync(fs.realpathSync(fs.mkdtempSync('/tmp/target-')), p);
+    else if (form === 'dangling symlink') fs.symlinkSync(`/tmp/e16-missing-${crypto.randomUUID()}`, p);
+    else throw new Error(form);
+  };
+  /** What is at `p`, never following it, plus whatever a symlink there points at (nothing may be written through it). */
+  const snapshot = (p) => {
+    const st = fs.lstatSync(p);
+    if (!st.isSymbolicLink()) return st.isDirectory() ? `dir\n${manifest(p).join('\n')}` : `file ${fs.readFileSync(p, 'utf8')}`;
+    const target = fs.readlinkSync(p);
+    return `link ${target}\n${exists(target) ? manifest(target).join('\n') : 'dangling'}`;
+  };
+
+  test('E1-6 layout: an assessment clones into F = W/repository under a new wrapper W = <root>/projects/<repositoryId> that holds exactly that entry; projects and W are created like repos and repos/<handle>; folder = openFolder = W, pathNotFound false, remote exact; a personal open of the same repository in the same root still lands in repos/<handle>/<name> with its 7-key answer, is left untouched, and blocks nothing; another repositoryId gets its own wrapper', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a', '.vscode/tasks.json': '{"tasks":[]}' } } });
+    const personal = await openFlow(fx, { root, token });
+    const P = `${root}/repos/acme/site`;
+    assert.deepEqual(personal.committed, { ok: true, state: 'cloned', folder: P, openFolder: P, pathNotFound: false, branch: 'main', empty: false });
+    assert.deepEqual(Object.keys(personal.committed), V.kernel.resultOpenKeys);
+    assert.equal(exists(`${root}/projects`), false, 'a personal open created projects/');
+    const personalBefore = manifest(P);
+    const { prepared, committed, released } = await openFlow(fx, { root, token, ...ASSESS });
+    const W = wrapperOf(root), F = cloneOf(root);
+    assert.deepEqual(prepared, { ok: true, state: 'cloned', folder: W, openFolder: W, pathNotFound: false, branch: 'main', empty: false });
+    assert.deepEqual(committed, assessed(root, { head: remoteHeadOf(bare) }));
+    assert.deepEqual(Object.keys(committed), V.kernel.assessment.resultOpenKeys);
+    assert.deepEqual(released, { ok: true });
+    assert.equal(W, `${root}/projects/${REPO_ID}`);
+    assert.deepEqual(fs.readdirSync(W), ['repository'], 'W holds exactly the clone');
+    for (const [made, like] of [[`${root}/projects`, `${root}/repos`], [W, `${root}/repos/acme`]]) {
+      const a = fs.lstatSync(made), b = fs.lstatSync(like);
+      assert.ok(a.isDirectory() && !a.isSymbolicLink(), made);
+      assert.deepEqual([a.mode & 0o7777, a.uid, a.gid], [b.mode & 0o7777, b.uid, b.gid], `${made} is not created like ${like}`);
+    }
+    assert.equal(fs.readFileSync(`${F}/.vscode/tasks.json`, 'utf8'), '{"tasks":[]}', 'the repository\'s editor config sits in F, below the editor root');
+    assert.equal(exists(`${W}/.vscode`), false);
+    assert.equal(sh('git', ['-C', F, 'config', '--get', 'remote.origin.url'], { env: USER_ENV }).trim(), committed.remote);
+    assert.equal(JSON.parse(fs.readFileSync(`${F}/.git/ezil-repo.json`, 'utf8')).repositoryId, REPO_ID);
+    assert.deepEqual(manifest(P), personalBefore, 'the assessment touched the personal folder');
+    // another repositoryId of the same handle/name: its own wrapper, beside the first
+    const other = await openFlow(fx, { root, token, repositoryId: OTHER_REPO_ID, ...ASSESS });
+    assert.deepEqual([other.committed.folder, other.committed.openFolder], [wrapperOf(root, OTHER_REPO_ID), wrapperOf(root, OTHER_REPO_ID)]);
+    assert.deepEqual(fs.readdirSync(`${root}/projects`).sort(), [OTHER_REPO_ID, REPO_ID].sort());
+    assert.deepEqual(fs.readdirSync(wrapperOf(root, OTHER_REPO_ID)), ['repository']);
+  });
+
+  test('E1-6: anything at W before the attempt (an empty directory, a directory with editor config, a file, a symlink to a directory, a dangling symlink) → folder_conflict at prepare before any action: no network, lock, grant or staging; W and anything it points at untouched; release leaves it', async () => {
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    for (const form of FORMS) {
+      resetRun();
+      const root = newRoot(); const W = wrapperOf(root);
+      plant(W, form);
+      const before = snapshot(W);
+      const connects = fx.proxy.state.connects.length;
+      const { uuid, prepared, committed, released } = await openFlow(fx, { root, token, ...ASSESS });
+      assert.deepEqual([form, prepared], [form, { ok: false, errorCode: 'folder_conflict' }]);
+      assert.equal(committed, null);
+      assert.deepEqual(released, { ok: true });
+      assert.equal(fx.proxy.state.connects.length, connects, `${form}: the refused prepare reached the network`);
+      assert.deepEqual([form, exists(lockOf()), exists(grantOf()), exists(`${root}/.ezil-staging/${uuid}`)], [form, false, false, false]);
+      assert.equal(snapshot(W), before, `${form}: W changed`);
+      assert.deepEqual(fs.readdirSync(`${root}/projects`), [REPO_ID], form);
+    }
+  });
+
+  test('E1-6: W appearing between prepare and commit in any form → folder_conflict at commit; nothing adopted or written into or through it; lock released; the grant this prepare installed removed; staging stays for release, which then leaves only the planted W', async () => {
+    const k = await kernel();
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    for (const form of FORMS) {
+      resetRun();
+      const root = newRoot(); const W = wrapperOf(root);
+      const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+      assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned', form);
+      assert.equal(exists(grantOf()), true, 'control: prepare installed the grant');
+      plant(W, form);
+      const before = snapshot(W);
+      assert.deepEqual([form, cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result], [form, { ok: false, errorCode: 'folder_conflict' }]);
+      assert.equal(snapshot(W), before, `${form}: commit touched W`);
+      assert.deepEqual([form, exists(lockOf()), exists(grantOf())], [form, false, false], `${form}: lock or grant left`);
+      assert.equal(exists(`${root}/.ezil-staging/${uuid}/.git`), true, 'staging stays for release');
+      assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+      assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false);
+      assert.equal(snapshot(W), before);
+    }
+    // The wrapper is checked first, before any read of the staged clone: W planted AND a staged HEAD
+    // that cannot be read is folder_conflict (the precise answer), never workspace_failed.
+    resetRun();
+    const root = newRoot();
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
+    fs.writeFileSync(`${root}/.ezil-staging/${uuid}/.git/HEAD`, `${'0'.repeat(40)}\n`);
+    plant(wrapperOf(root), 'empty directory');
+    assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result, { ok: false, errorCode: 'folder_conflict' },
+      'the wrapper was not checked before the reads');
+    assert.deepEqual([exists(lockOf()), exists(grantOf())], [false, false]);
+  });
+
+  test('E1-6: <root>/projects that is a symlink (to a directory, or dangling) or a file → workspace_failed at prepare before any action, and the same planted after prepare → workspace_failed at commit; nothing is written through it, nothing is placed, lock and grant are gone', async () => {
+    const k = await kernel();
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    for (const when of ['prepare', 'commit']) {
+      for (const form of ['symlink to a directory', 'dangling symlink', 'file']) {
+        resetRun();
+        const root = newRoot(); const projects = `${root}/projects`;
+        const label = `${form} at ${when}`;
+        const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+        let before = null;
+        if (when === 'prepare') { plant(projects, form); before = snapshot(projects); }
+        const connects = fx.proxy.state.connects.length;
+        const prepared = await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam);
+        if (when === 'prepare') {
+          assert.deepEqual([label, prepared], [label, { ok: false, errorCode: 'workspace_failed' }]);
+          assert.equal(fx.proxy.state.connects.length, connects, `${label}: the refused prepare reached the network`);
+          assert.deepEqual([label, exists(lockOf()), exists(grantOf()), exists(`${root}/.ezil-staging/${uuid}`)], [label, false, false, false]);
+        } else {
+          assert.equal(prepared.state, 'cloned', label);
+          plant(projects, form); before = snapshot(projects);
+          assert.deepEqual([label, cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result], [label, { ok: false, errorCode: 'workspace_failed' }]);
+          assert.deepEqual([label, exists(lockOf()), exists(grantOf())], [label, false, false]);
+        }
+        assert.equal(snapshot(projects), before, `${label}: something was written through it`);
+        assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+        assert.equal(snapshot(projects), before, label);
+        assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false, label);
+      }
+    }
+  });
+
+  test('E1-6: a rename into the new wrapper that fails (projects on another filesystem: EXDEV) → workspace_failed, never workspace_busy; commit removes the wrapper it made, so nothing is placed; lock and grant are gone; after release a retry places the clone', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const projects = `${root}/projects`;
+    fs.mkdirSync(projects);
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned');
+    // A tmpfs over projects, in this suite's private mount namespace: mkdir W succeeds on it, and
+    // rename(2) of the staging directory (on the root's filesystem) into it fails with EXDEV.
+    execFileSync('mount', ['-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', projects]);
+    let result, during;
+    try {
+      const probe = fs.mkdtempSync(`${root}/probe-`);
+      assert.throws(() => fs.renameSync(probe, `${projects}/probe`), { code: 'EXDEV' }, 'control: the rename crosses filesystems');
+      fs.rmdirSync(probe);
+      result = cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result;
+      during = fs.readdirSync(projects);
+    } finally {
+      execFileSync('umount', [projects]);
+    }
+    assert.deepEqual(result, { ok: false, errorCode: 'workspace_failed' });
+    assert.deepEqual(during, [], 'the wrapper commit made was left behind');
+    assert.deepEqual(fs.readdirSync(projects), []);
+    assert.deepEqual([exists(lockOf()), exists(grantOf())], [false, false], 'lock or grant left');
+    assert.equal(exists(`${root}/.ezil-staging/${uuid}/.git`), true, 'staging stays for release');
+    assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+    assertNoOpenLeftovers(root, uuid, { wrapper: wrapperOf(root) });
+    const again = await openFlow(fx, { root, token, ...ASSESS });
+    assert.deepEqual(again.committed, assessed(root, { head: remoteHeadOf(bare) }));
+    assert.deepEqual(fs.readdirSync(wrapperOf(root)), ['repository']);
+  });
+
+  test('E1-6: remote is read back from the staged config before the rename, as one value equal to ASSESSMENT_REMOTE_TEMPLATE: another repository, the personal host, userinfo, a second value (added directly or through include.path) or no value → workspace_failed with nothing placed; assessmentRemote honours the read budget', async () => {
+    const k = await kernel();
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const gitIn = (S, ...args) => sh('git', ['-C', S, ...args], { env: USER_ENV });
+    const tampers = [
+      ['another repository', (S) => gitIn(S, 'config', 'remote.origin.url', 'https://git-qa.ezil.work/acme/other.git')],
+      ['the personal host', (S) => gitIn(S, 'config', 'remote.origin.url', 'https://git-preview.ezil.work/acme/site.git')],
+      ['userinfo', (S) => gitIn(S, 'config', 'remote.origin.url', 'https://ezil@git-qa.ezil.work/acme/site.git')],
+      ['a second, equal value', (S) => gitIn(S, 'config', '--add', 'remote.origin.url', QA_REMOTE)],
+      ['a second value through include.path', (S) => {
+        const inc = `/tmp/e16-include-${crypto.randomUUID()}`;
+        fs.writeFileSync(inc, '[remote "origin"]\n\turl = https://evil.example/acme/site.git\n');
+        gitIn(S, 'config', 'include.path', inc);
+      }],
+      ['no value', (S) => gitIn(S, 'config', '--unset-all', 'remote.origin.url')],
+    ];
+    for (const [label, tamper] of tampers) {
+      resetRun();
+      const root = newRoot();
+      const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+      assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned', label);
+      const S = `${root}/.ezil-staging/${uuid}`;
+      assert.equal(await k.assessmentRemote(S), QA_REMOTE, `control (${label}): the staged remote reads back`);
+      tamper(S);
+      assert.deepEqual([label, cli('commit', writeRequest({ phase: 'commit', uuid, root, ...ASSESS })).result], [label, { ok: false, errorCode: 'workspace_failed' }]);
+      assert.equal(exists(wrapperOf(root)), false, `${label}: placed`);
+      assert.deepEqual([label, exists(lockOf()), exists(grantOf())], [label, false, false]);
+      assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...ASSESS })).result, { ok: true });
+      assertNoOpenLeftovers(root, uuid, { wrapper: wrapperOf(root) });
+    }
+    const root = newRoot();
+    const { committed } = await openFlow(fx, { root, token, ...ASSESS });
+    assert.equal(committed.remote, QA_REMOTE);
+    assert.equal(await kernelCode(() => k.assessmentRemote(cloneOf(root), Date.now() - 1)), 'workspace_busy');
+    assert.equal(await k.assessmentRemote(cloneOf(root), Date.now() + k.ASSESSMENT_READ_BUDGET_MS), QA_REMOTE);
+  });
+
+  test('E1-6: an assessment request with a non-null path → workspace_failed before any action in every open phase (CLI and module seam); path null opens W; personal keeps its path', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a', 'src/b.txt': 'b' } } });
+    const connects = fx.proxy.state.connects.length;
+    for (const relPath of ['src', 'src/b.txt', 'repository']) {
+      for (const phase of ['prepare', 'commit', 'release']) {
+        for (const via of ['cli', 'seam']) {
+          const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+          const file = writeRequest({ phase, uuid, root, path: relPath, ...ASSESS });
+          const result = via === 'cli' ? cli(phase, file).result : await k.runKernel(phase, file, fx.seam);
+          assert.deepEqual(result, { ok: false, errorCode: 'workspace_failed' }, `${phase} path ${relPath} (${via})`);
+          assert.equal(exists(`/run/ezil/git/incoming/${uuid}.json`) && exists(file), true, `${phase} path ${relPath} (${via}): the refused request acted`);
+        }
+      }
+    }
+    assert.equal(fx.proxy.state.connects.length, connects, 'a refused request reached the network');
+    assert.deepEqual([exists(lockOf()), exists(grantOf()), exists(`${root}/.ezil-staging`), exists(`${root}/projects`)], [false, false, false, false]);
+    const a = await openFlow(fx, { root, token, ...ASSESS });
+    assert.deepEqual([a.committed.openFolder, a.committed.pathNotFound], [wrapperOf(root), false]);
+    resetRun();
+    const proot = newRoot();
+    const p = await openFlow(fx, { root: proot, token, path: 'src' });
+    assert.deepEqual([p.committed.openFolder, p.committed.pathNotFound], [`${proot}/repos/acme/site/src`, false]);
+  });
+
+  test('E1-6: refresh and release of an assessment locate F under W, through real directories only: refresh installs beside a bound F and refuses folder_conflict for an F bound elsewhere or a W or projects that is a symlink; release keeps the grant while F is under W and removes it once F is gone; a personal folder of the same handle/name plays no part', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    assert.equal((await openFlow(fx, { root, token, ...ASSESS })).committed.state, 'cloned');
+    // a personal folder of the same handle/name bound to ANOTHER repository decides only personal refreshes
+    const P = `${root}/repos/acme/site`;
+    sh('git', ['init', '-q', '-b', 'main', P], { env: USER_ENV });
+    fs.writeFileSync(`${P}/.git/ezil-repo.json`, `${JSON.stringify({ v: 1, repositoryId: OTHER_REPO_ID, handle: 'acme', name: 'site', gitHost: GIT_HOST })}\n`);
+    const refreshAs = (fields) => {
+      const tok = newToken();
+      const uuid = crypto.randomUUID(); writeIncoming(uuid, { token: tok, host: fields.gitHost ?? GIT_HOST });
+      const result = cli('refresh', writeRequest({ op: 'refresh', phase: 'refresh', uuid, root, ...fields })).result;
+      const released = cli('release', writeRequest({ op: 'refresh', phase: 'release', uuid, root, ...fields })).result;
+      assert.deepEqual(released, { ok: true });
+      return { result, tok };
+    };
+    const first = refreshAs(ASSESS);
+    assert.deepEqual(first.result, { ok: true, state: 'refreshed' });
+    assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).password === first.tok, true, 'refresh installed its grant and release kept it (F is under W)');
+    assert.deepEqual(refreshAs({}).result, { ok: false, errorCode: 'folder_conflict' }, 'control: the personal refresh sees its own foreign-bound folder');
+    const binding = `${cloneOf(root)}/.git/ezil-repo.json`;
+    const original = fs.readFileSync(binding);
+    fs.writeFileSync(binding, `${JSON.stringify({ v: 1, repositoryId: OTHER_REPO_ID, handle: 'acme', name: 'site', gitHost: QA_HOST })}\n`);
+    assert.deepEqual(refreshAs(ASSESS).result, { ok: false, errorCode: 'folder_conflict' }, 'F bound to another repository');
+    // the same without the personal folder: only F under W can decide it
+    const movedP = `${root}/moved-personal`;
+    fs.renameSync(P, movedP);
+    assert.deepEqual(refreshAs(ASSESS).result, { ok: false, errorCode: 'folder_conflict' }, 'F bound to another repository, no personal folder');
+    fs.renameSync(movedP, P);
+    fs.writeFileSync(binding, original);
+    const W = wrapperOf(root), movedW = `${root}/moved-wrapper`;
+    fs.renameSync(W, movedW); fs.symlinkSync(movedW, W);
+    assert.deepEqual(refreshAs(ASSESS).result, { ok: false, errorCode: 'folder_conflict' }, 'W is a symlink');
+    fs.unlinkSync(W); fs.renameSync(movedW, W);
+    const projects = `${root}/projects`, movedProjects = `${root}/moved-projects`;
+    fs.renameSync(projects, movedProjects); fs.symlinkSync(movedProjects, projects);
+    assert.deepEqual(refreshAs(ASSESS).result, { ok: false, errorCode: 'folder_conflict' }, 'projects is a symlink');
+    fs.unlinkSync(projects); fs.renameSync(movedProjects, projects);
+    const last = refreshAs(ASSESS);
+    assert.deepEqual(last.result, { ok: true, state: 'refreshed' });
+    assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).password === last.tok, true, 'the grant beside F is kept');
+    fs.rmSync(cloneOf(root), { recursive: true });
+    assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid: crypto.randomUUID(), root, ...ASSESS })).result, { ok: true });
+    assert.equal(exists(grantOf()), false, 'release kept the grant of an assessment F that is gone');
+  });
+
+  test('E1-6: the budget counts an assessment clone under its final names projects/<repositoryId>/repository/… (plus projects and W when absent): with the same remote and budget, a limit between the two measures admits the personal open and refuses the assessment with repository_too_large, nothing left', async () => {
+    const k = await kernel();
+    const token = newToken(); fx.server.state.token = token;
+    // 40 files whose names cross the 100-byte PAX threshold only under the longer assessment prefix
+    const files = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`d/${String(i).padStart(2, '0')}${'x'.repeat(56)}`, 'f']));
+    makeRemote(fx, { branches: { main: files } });
+    const ref = newRoot();
+    assert.equal((await openFlow(fx, { root: ref, token })).committed.state, 'cloned');
+    const empty = newRoot();
+    const huge = { limitBytes: 1 << 30, maxEntries: 1000000, fraction: 1 };
+    const measure = (extra) => k.measureBudget({ root: empty, staging: `${ref}/repos/acme/site`, handle: 'acme', name: 'site', budget: huge, ...extra });
+    const personal = measure({});
+    const assessment = measure({ folder: `projects/${REPO_ID}/repository`, parents: ['projects', `projects/${REPO_ID}`] });
+    assert.equal(assessment.stagedEntries, personal.stagedEntries, 'the same entries, under other names');
+    assert.ok(assessment.stagedTarBytes - personal.stagedTarBytes >= 40 * 1024, `${personal.stagedTarBytes} vs ${assessment.stagedTarBytes}`);
+    const budget = { limitBytes: Math.floor((personal.stagedTarBytes + assessment.stagedTarBytes) / 2) + V.constants.TAR_ARCHIVE_TAIL_BYTES,
+      maxEntries: 1000000, fraction: 1 };
+    resetRun();
+    const p = await openFlow(fx, { root: newRoot(), token, budget });
+    assert.equal(p.committed && p.committed.state, 'cloned', JSON.stringify(p.prepared));
+    resetRun();
+    const root = newRoot();
+    const a = await openFlow(fx, { root, token, budget, ...ASSESS });
+    assert.deepEqual(a.prepared, { ok: false, errorCode: 'repository_too_large' });
+    assertNoOpenLeftovers(root, a.uuid, { wrapper: wrapperOf(root) });
   });
 
   try {
