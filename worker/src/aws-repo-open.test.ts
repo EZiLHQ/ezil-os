@@ -23,7 +23,8 @@ import { awsOriginHostname, decodeControlKey, verifyGatewayHeader, type AwsTunne
 import {
   AWS_EDGE_CALL_MAX_MS, AWS_EDGE_REPLY_MAX_BYTES, AWS_HOST_ERROR_CODES, AWS_JOB_ID_RE, AWS_KERNEL_ERROR_CODES, AWS_RELAY_POLL_MS,
   AWS_REPO_OPEN_PATH, AWS_REPO_OPEN_RELAY_MAX_BYTES, AWS_REPO_OPEN_ROOT, AWS_REPO_OPEN_STATUS_PATH, AWS_RESULT_ERROR_CODES,
-  awsJobAnswer, awsRepoOpenRelayBody, handleAwsRepoOpen, type AwsRepoOpenDeps,
+  awsJobAnswer, awsRepoOpenPoll, awsRepoOpenRelayBody, awsRepoOpenStart, handleAwsRepoOpen,
+  type AwsRepoOpenDeps, type AwsRepoOpenJob, type AwsRepoOpenStep, type AwsRepoOpenTarget,
 } from './aws-repo-open';
 import {
   REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse,
@@ -763,5 +764,302 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     for (const cls of ['exam', 'constructor']) {
       expect(awsJobAnswer({ status: 200, body: okOpen }, 'open', FOLDER, cls as RepoOpenClass)).toEqual(refusal('workspace_failed'));
     }
+  });
+});
+
+// ── E1-5: start and poll (added on the carried cf27920b suite above) ────────────────────────
+
+/** 16f9c25b app/src/server/assessment/worker-client.ts ASSESSMENT_WORKER_TIMEOUTS_MS.repoOpen. */
+const APP_REPO_OPEN_OP_TIMEOUT_MS = 30_000;
+/** 16f9c25b app/src/server/assessment/orchestrator.ts sweepBudgetMs. */
+const ASSESSMENT_SWEEP_BUDGET_MS = 40_000;
+const HANDLE = V.fixtures.handle as string;
+const NAME = V.fixtures.name as string;
+const jobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
+  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'personal', handle: HANDLE, name: NAME, acknowledged: true, ...patch });
+const running$ = (job: AwsRepoOpenJob): AwsRepoOpenStep => ({ state: 'running', job });
+const done$ = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
+/** A reply text whose grant is JSON-escaped: a raw scan passes it, JSON.parse decodes it to the grant. */
+const escapedReply = (value: unknown, status: number) =>
+  new Response(JSON.stringify(value).replaceAll(TOKEN, TOKEN.replace('egg_', 'egg\\u005f')), { status, headers: { 'content-type': 'application/json' } });
+
+describe('E1-5: awsRepoOpenStart sends the start exactly once and answers a token-free job', () => {
+  it('a start the host admits: running + the job (acknowledged), one edge call, no sleep, no status read', async () => {
+    const e = edge(() => running());
+    const r = await awsRepoOpenStart(input(), SANDBOX, target, deps(e.fetch));
+    expect(r).toEqual(running$(jobOf()));
+    expect(e.calls.length).toBe(1);
+    expect(e.starts().length).toBe(1);
+    expect(sleeps).toEqual([]);
+    const { receivedAt: _r, ...wire } = input();
+    expect(e.calls[0]!.init.body).toBe(JSON.stringify({ jobId: JOB, ...wire }));
+    // The job never carries the grant, so a caller may persist it.
+    expect(JSON.stringify(r)).not.toContain('egg_');
+    expect(Object.keys((r as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged']);
+  });
+
+  it.each([
+    ['a lost reply', () => 'throw' as const],
+    ['503 agent_unavailable', () => json({ ok: false, error: 'agent_unavailable' }, 503)],
+    ['a tunnel 502', () => new Response('bad gateway', { status: 502 })],
+    ['an empty 500', () => new Response(null, { status: 500 })],
+    ['a 530', () => new Response('error code: 1033', { status: 530 })],
+  ] as [string, () => Answer][])('a start whose outcome is unknown (%s): running + the job, not acknowledged', async (_label, reply) => {
+    const e = edge(reply);
+    expect(await awsRepoOpenStart(input(), SANDBOX, target, deps(e.fetch))).toEqual(running$(jobOf({ acknowledged: false })));
+    expect(e.calls.length).toBe(1);
+  });
+
+  it('an assessment start records the route class in the job; a refresh records op refresh', async () => {
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment'))
+      .toEqual(running$(jobOf({ class: 'assessment' })));
+    expect(await awsRepoOpenStart(input({ op: 'refresh' }), SANDBOX, target, deps(edge(() => running()).fetch)))
+      .toEqual(running$(jobOf({ op: 'refresh' })));
+  });
+
+  it('a start answered done at once: done + the validated answer, for the route class', async () => {
+    expect(await awsRepoOpenStart(input(), SANDBOX, target, deps(edge(() => ok(okOpen)).fetch))).toEqual(done$({ status: 200, body: okOpen } as RepoOpenAnswer));
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => ok(okAssessment)).fetch), 'assessment'))
+      .toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => ok(okOpen)).fetch), 'assessment'))
+      .toEqual(done$(refusal('workspace_failed')));
+  });
+
+  it.each([
+    ['an awsControlTarget Response', () => edge(() => ok(okOpen)), 'workspace_unsupported', 0, { target: Response.json({}, { status: 503 }) }],
+    ['an edge without the route (404)', () => edge(() => new Response(null, { status: 404 })), 'workspace_unsupported', 1, {}],
+    ['the host\'s one slot taken', () => edge(() => json({ ok: false, error: 'workspace_busy' }, 409)), 'workspace_busy', 1, {}],
+    ['a deadline already passed', () => edge(() => running()), 'workspace_busy', 0, { receivedAt: NOW - WORKER_DEADLINE_MS }],
+    ['job_replayed', () => edge(() => json({ ok: false, error: 'job_replayed' }, 409)), 'workspace_failed', 1, {}],
+    ['a 401', () => edge(() => json({ ok: false, error: 'gw_bad_mac' }, 401)), 'workspace_failed', 1, {}],
+    ['a grant echoed', () => edge(() => json({ ok: false, error: 'workspace_busy', echo: TOKEN }, 409)), 'workspace_failed', 1, {}],
+    ['an assessment body on the personal route', () => edge(() => running()), 'invalid_request', 0, { input: assessmentInput() }],
+  ] as [string, () => ReturnType<typeof edge>, RepoOpenErrorCode, number, { target?: Response; receivedAt?: number; input?: RepoOpenInput }][])(
+    'a start refused (%s): done + the refusal', async (_label, make, code, calls, o) => {
+      const e = make();
+      const i = o.input ?? input({}, o.receivedAt ?? NOW);
+      expect(await awsRepoOpenStart(i, SANDBOX, o.target ?? target, deps(e.fetch))).toEqual(done$(refusal(code)));
+      expect(e.calls.length).toBe(calls);
+    });
+});
+
+describe('E1-5: awsRepoOpenPoll reads the job once', () => {
+  it('one status read of the jobId (signed, no body, no sleep); running → running, now acknowledged', async () => {
+    const e = edge(() => running());
+    expect(await awsRepoOpenPoll(jobOf({ acknowledged: false }), target, deps(e.fetch))).toEqual(running$(jobOf()));
+    expect(e.calls.length).toBe(1);
+    expect(e.starts()).toEqual([]);
+    const c = e.calls[0]!;
+    expect(c.path).toBe(`${AWS_REPO_OPEN_STATUS_PATH}${JOB}`);
+    expect(c.init.body).toBeUndefined();
+    expect(c.init.redirect).toBe('manual');
+    expect(await verifyGatewayHeader(new Headers(c.init.headers).get('x-ezil-gw'), KEY, record, 'POST', c.path, Math.floor(c.at / 1000))).toEqual({ ok: true });
+    expect(sleeps).toEqual([]);
+  });
+
+  it('done → the result re-validated for the job (personal and assessment)', async () => {
+    expect(await awsRepoOpenPoll(jobOf(), target, deps(edge(() => ok(okOpen)).fetch))).toEqual(done$({ status: 200, body: okOpen } as RepoOpenAnswer));
+    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, deps(edge(() => ok(okAssessment)).fetch)))
+      .toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(await awsRepoOpenPoll(jobOf({ op: 'refresh' }), target, deps(edge(() => ok({ ok: true, state: 'refreshed' })).fetch)))
+      .toEqual(done$({ status: 200, body: { ok: true, state: 'refreshed' } }));
+    expect(await awsRepoOpenPoll(jobOf(), target, deps(edge(() => refused('folder_conflict')).fetch))).toEqual(done$(refusal('folder_conflict')));
+  });
+
+  it('the poll re-validates the result against the job\'s class, op and folder', async () => {
+    const poll = (job: AwsRepoOpenJob, result: Response) => awsRepoOpenPoll(job, target, deps(edge(() => result.clone()).fetch));
+    expect(await poll(jobOf(), ok(okAssessment))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf({ class: 'assessment' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf({ class: 'assessment' }), ok({ ...okAssessment, state: 'existing' }))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf({ class: 'assessment' }), ok({ ...okAssessment, head: null }))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf({ name: 'other' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf({ op: 'refresh' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf(), done(201, okOpen))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(jobOf(), done(409, { ok: false, error: 'invalid_request' }))).toEqual(done$(refusal('workspace_failed')));
+    for (const c of V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[]) {
+      const body = materialise(c.body, NOW);
+      expect([c.why ?? 'valid', await poll(jobOf({ class: 'assessment' }), ok(body))])
+        .toEqual([c.why ?? 'valid', done$(c.valid ? { status: 200, body } as RepoOpenAnswer : refusal('workspace_failed'))]);
+    }
+  });
+
+  it('a transport failure or a 5xx is not an answer: running, the job unchanged', async () => {
+    for (const acknowledged of [false, true]) {
+      for (const reply of ['throw', json({ ok: false, error: 'agent_unavailable' }, 503), new Response('bad gateway', { status: 502 })] as Answer[]) {
+        const e = edge(() => (reply instanceof Response ? reply.clone() : reply));
+        expect(await awsRepoOpenPoll(jobOf({ acknowledged }), target, deps(e.fetch))).toEqual(running$(jobOf({ acknowledged })));
+        expect(e.calls.length).toBe(1);
+      }
+    }
+  });
+
+  it('a 404 is workspace_unsupported before the host named the job and workspace_failed after', async () => {
+    const notFound = () => json({ ok: false, error: 'not_found' }, 404);
+    expect(await awsRepoOpenPoll(jobOf({ acknowledged: false }), target, deps(edge(notFound).fetch))).toEqual(done$(refusal('workspace_unsupported')));
+    expect(await awsRepoOpenPoll(jobOf({ acknowledged: true }), target, deps(edge(notFound).fetch))).toEqual(done$(refusal('workspace_failed')));
+  });
+
+  it('job_unknown, any other refusal and any malformed envelope are workspace_failed', async () => {
+    for (const reply of [json({ ok: false, error: 'job_unknown' }, 409), json({ ok: false, error: 'gw_stale' }, 401),
+      json({ ok: true, state: 'queued' }), json({ ok: true, state: 'running', jobId: JOB }), json({ ok: true, state: 'done' }), new Response('{')]) {
+      expect(await awsRepoOpenPoll(jobOf(), target, deps(edge(() => reply.clone()).fetch))).toEqual(done$(refusal('workspace_failed')));
+    }
+  });
+
+  it('the poll holds no grant, yet anything grant-shaped in a status reply, raw or JSON-escaped, is workspace_failed', async () => {
+    const shaped = `egg_${'0123456789abcdef'.repeat(4)}`;
+    for (const reply of [
+      json({ ok: true, state: 'running', note: TOKEN }),
+      json({ ok: true, state: 'running', note: shaped }),
+      escapedReply({ ok: true, state: 'running', note: TOKEN }, 200),
+      escapedReply({ ok: true, state: 'done', result: { status: 200, body: { ...okOpen, branch: TOKEN } } }, 200),
+      escapedReply({ ok: false, error: 'agent_unavailable', echo: TOKEN }, 503),
+      escapedReply({ ok: false, error: 'not_found', echo: TOKEN }, 404),
+    ]) {
+      const answer = await awsRepoOpenPoll(jobOf({ acknowledged: false }), target, deps(edge(() => reply.clone()).fetch));
+      expect(answer).toEqual(done$(refusal('workspace_failed')));
+      expect(JSON.stringify(answer)).not.toContain('egg_');
+    }
+  });
+
+  it.each([
+    ['a short jobId', { jobId: 'ab'.repeat(16) }],
+    ['an uppercase jobId', { jobId: 'AB'.repeat(32) }],
+    ['an unknown op', { op: 'delete' }],
+    ['an unknown class', { class: 'exam' }],
+    ['an inherited name as the class', { class: 'constructor' }],
+    ['a handle HANDLE_RE refuses', { handle: 'h'.repeat(40) }],
+    ['a name ending in .git', { name: 'site.git' }],
+    ['a name with ..', { name: 'a..b' }],
+    ['a non-boolean acknowledged', { acknowledged: 'yes' }],
+    ['a non-string sandbox name', { sandboxName: 7 }],
+    ['an extra key (a grant)', { token: TOKEN }],
+  ] as [string, Record<string, unknown>][])('the job is untrusted (%s): invalid_request, no edge call', async (_label, patch) => {
+    const e = edge(() => ok(okOpen));
+    expect(await awsRepoOpenPoll({ ...jobOf(), ...patch } as AwsRepoOpenJob, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));
+    expect(e.calls).toEqual([]);
+  });
+
+  it('a missing key, a non-object job, or a NaN `until` is invalid_request, no edge call', async () => {
+    const e = edge(() => ok(okOpen));
+    const { acknowledged: _a, ...missing } = jobOf();
+    for (const job of [missing, null, [], 'job'] as unknown as AwsRepoOpenJob[]) {
+      expect(await awsRepoOpenPoll(job, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));
+    }
+    expect(await awsRepoOpenPoll(jobOf(), target, deps(e.fetch), Number.NaN)).toEqual(done$(refusal('invalid_request')));
+    expect(e.calls).toEqual([]);
+  });
+
+  it.each([
+    ['another sandbox\'s job', jobOf({ sandboxName: 'guac-0a1b2c3d4e5f6a7b-0000000000000000' }), target],
+    ['an unverified origin', jobOf(), { ...target, record: { ...record, originVerified: false } }],
+    ['a malformed control key', jobOf(), { ...target, record: { ...record, controlKey: 'short' } }],
+    ['an unroutable zone', jobOf(), { ...target, zone: 'not a zone' }],
+  ] as [string, AwsRepoOpenJob, AwsRepoOpenTarget][])('%s is workspace_failed before any edge call', async (_label, job, t) => {
+    const e = edge(() => ok(okOpen));
+    expect(await awsRepoOpenPoll(job, t, deps(e.fetch))).toEqual(done$(refusal('workspace_failed')));
+    expect(e.calls).toEqual([]);
+  });
+
+  it('an awsControlTarget Response is not an answer: running, the job unchanged, no edge call, its body never read', async () => {
+    const e = edge(() => ok(okOpen));
+    const starting = Response.json({ ok: false, error: 'aws_origin_starting' }, { status: 503 });
+    expect(await awsRepoOpenPoll(jobOf({ acknowledged: false }), starting, deps(e.fetch))).toEqual(running$(jobOf({ acknowledged: false })));
+    expect(starting.bodyUsed).toBe(false);
+    expect(e.calls).toEqual([]);
+  });
+
+  it('without `until`, a poll long after the 105 s Worker deadline still reads the result', async () => {
+    const e = edge(() => ok(okAssessment));
+    const d = deps(e.fetch);
+    clock = NOW + 9 * 60_000;
+    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(e.calls[0]!.timeoutMs).toBe(AWS_EDGE_CALL_MAX_MS);
+  });
+
+  it('`until` bounds the read: passed → workspace_busy with no edge call; near → the call is cut at it', async () => {
+    const e = edge(() => ({ latencyMs: Infinity, reply: running() }));
+    const d = deps(e.fetch);
+    expect(await awsRepoOpenPoll(jobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
+    expect(e.calls).toEqual([]);
+    expect(await awsRepoOpenPoll(jobOf(), target, d, NOW + 2_000)).toEqual(running$(jobOf()));
+    expect(e.calls[0]!.timeoutMs).toBe(2_000);
+    expect(clock).toBe(NOW + 2_000);
+  });
+});
+
+describe('E1-5: each start and each poll is bounded well under the app\'s 30 s op and the 40 s sweep', () => {
+  it('one edge call each, at most AWS_EDGE_CALL_MAX_MS; a start and a poll fit one sweep with room', () => {
+    expect(AWS_EDGE_CALL_MAX_MS).toBe(10_000);
+    expect(AWS_EDGE_CALL_MAX_MS).toBeLessThanOrEqual(APP_REPO_OPEN_OP_TIMEOUT_MS / 3);
+    expect(AWS_EDGE_CALL_MAX_MS * 2).toBeLessThanOrEqual(ASSESSMENT_SWEEP_BUDGET_MS / 2);
+  });
+
+  it('a hung edge: a start answers within AWS_EDGE_CALL_MAX_MS (running, outcome unknown), after one call cut by its own signal', async () => {
+    const e = edge(() => ({ latencyMs: Infinity, reply: running() }));
+    expect(await awsRepoOpenStart(input(), SANDBOX, target, deps(e.fetch))).toEqual(running$(jobOf({ acknowledged: false })));
+    expect(clock - NOW).toBe(AWS_EDGE_CALL_MAX_MS);
+    expect(e.calls.map((c) => c.timeoutMs)).toEqual([AWS_EDGE_CALL_MAX_MS]);
+  });
+
+  it('a hung edge: a poll answers within AWS_EDGE_CALL_MAX_MS (running), after one call cut by its own signal', async () => {
+    const e = edge(() => ({ latencyMs: Infinity, reply: running() }));
+    expect(await awsRepoOpenPoll(jobOf(), target, deps(e.fetch))).toEqual(running$(jobOf()));
+    expect(clock - NOW).toBe(AWS_EDGE_CALL_MAX_MS);
+    expect(e.calls.map((c) => c.timeoutMs)).toEqual([AWS_EDGE_CALL_MAX_MS]);
+  });
+
+  it('the production default: each start and each poll call carries AbortSignal.timeout(AWS_EDGE_CALL_MAX_MS)', async () => {
+    const original = AbortSignal.timeout;
+    const seen: number[] = [];
+    AbortSignal.timeout = (ms: number) => { seen.push(ms); return original.call(AbortSignal, ms); };
+    try {
+      const e = edge(() => running());
+      const d = deps(e.fetch, { timeout: undefined });
+      const s = await awsRepoOpenStart(input(), SANDBOX, target, d);
+      expect(s.state).toBe('running');
+      await awsRepoOpenPoll((s as { job: AwsRepoOpenJob }).job, target, d);
+    } finally {
+      AbortSignal.timeout = original;
+    }
+    faults = []; // the default signals are not the fake's: checked here instead
+    expect(seen).toEqual([AWS_EDGE_CALL_MAX_MS, AWS_EDGE_CALL_MAX_MS]);
+  });
+});
+
+describe('E1-5: across sweeps, and handleAwsRepoOpen as the composition', () => {
+  it('an assessment open across sweeps: start, persist the job (JSON), poll per sweep, answer head and clean', async () => {
+    const e = edge((path, n) => (path.startsWith(AWS_REPO_OPEN_PATH) ? running() : n.reads < 2 ? running() : ok(okAssessment)));
+    const d = deps(e.fetch);
+    const s = await awsRepoOpenStart(assessmentInput(), SANDBOX, target, d, 'assessment');
+    expect(s.state).toBe('running');
+    const persisted = JSON.parse(JSON.stringify((s as { job: AwsRepoOpenJob }).job)) as AwsRepoOpenJob;
+    expect(JSON.stringify(persisted)).not.toContain('egg_');
+    clock += 60_000;
+    const first = await awsRepoOpenPoll(persisted, target, d);
+    expect(first).toEqual(running$(jobOf({ class: 'assessment' })));
+    clock += 60_000;
+    const second = await awsRepoOpenPoll((first as { job: AwsRepoOpenJob }).job, target, d);
+    expect(second).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(e.starts().length).toBe(1);
+    expect(e.reads().map((c) => c.path)).toEqual(Array(2).fill(`${AWS_REPO_OPEN_STATUS_PATH}${JOB}`));
+    expect(sleeps).toEqual([]);
+  });
+
+  it('a lost start, then the poll: the same jobId, never a second start; job_unknown is workspace_failed', async () => {
+    const e = edge((path) => (path.startsWith(AWS_REPO_OPEN_PATH) ? 'throw' : json({ ok: false, error: 'job_unknown' }, 409)));
+    const d = deps(e.fetch);
+    const s = await awsRepoOpenStart(input(), SANDBOX, target, d);
+    expect(s).toEqual(running$(jobOf({ acknowledged: false })));
+    expect(await awsRepoOpenPoll((s as { job: AwsRepoOpenJob }).job, target, d)).toEqual(done$(refusal('workspace_failed')));
+    expect(e.starts().length).toBe(1);
+  });
+
+  it('handleAwsRepoOpen makes exactly the edge calls of a start and its polls, every AWS_RELAY_POLL_MS', async () => {
+    const e = job(() => ok(okAssessment), 4);
+    expect(await runAs(e, assessmentInput(), 'assessment')).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+    expect(e.starts().length).toBe(1);
+    expect(e.reads().length).toBe(4);
+    expect(sleeps).toEqual(Array(4).fill(AWS_RELAY_POLL_MS));
   });
 });

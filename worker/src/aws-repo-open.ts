@@ -1,12 +1,14 @@
 /**
  * Phase B: POST /sandbox/:name/repo-open for an AWS computer (contract universe-repo-open-v1 §13,
- * LANES A2r). INERT: nothing imports this module. The lead's activation commit (after the A2h
- * security review, the AMI promotion and the canary E2E) swaps the route's Phase-A AWS refusal
- * for this relay; this lane does not mount it.
+ * LANES A2r; carried from cf27920b, contract 1.0.3). INERT: nothing imports this module. The lead's
+ * activation commit (after the A2h security review, the AMI promotion and the canary E2E) mounts it;
+ * this lane does not. Its protocol symbols come from ./repo-open-u2 (the u2 module's, 2ca90211):
+ * in this tree ./repo-open is open-project's live module.
  *
- * The route (`handleRepoOpenRoute`, repo-open.ts) has already verified the repo-open signature
- * (own path, 5-minute skew) and the strict §8 body before `awsControlTarget` names an AWS tunnel.
- * This module then relays the same request to that computer's host edge and polls the job:
+ * The calling route (u2's `handleRepoOpenRoute` at 2ca90211, or an assessment route) has already
+ * verified its signature (own path, 5-minute skew) and the strict §8 body FOR ITS CLASS before
+ * `awsControlTarget` names an AWS tunnel; it passes that class as `routeClass` (personal unless
+ * said). This module then relays the same request to that computer's host edge and polls the job:
  *
  *   1. Start: `POST /__ezil/control/repo-open/<sha256hex(relay bytes)>`. The gw1 control signature
  *      covers method and path only, so the digest of the exact body bytes is IN the signed path
@@ -71,21 +73,37 @@
  *  The host serializes jobs, so a second open, or a refresh, while one runs is `workspace_busy` (the
  *  Cloudflare path's in-flight join is a Durable Object map; this relay holds no state).
  *
+ * ── Start and poll (E1-5) ────────────────────────────────────────────────────────────────────
+ *  `handleAwsRepoOpen` (start, then poll until done or the 105 s Worker deadline) cannot fit in one
+ *  call of the OS app's assessment client (30 s per op, 16f9c25b app/src/server/assessment/
+ *  worker-client.ts) inside a 40 s sweep (orchestrator.ts sweepBudgetMs). So it is the composition of
+ *  two calls, each ONE edge call bounded by AWS_EDGE_CALL_MAX_MS (10 s):
+ *    awsRepoOpenStart(input, name, target, deps, routeClass) → running + job | done + answer
+ *    awsRepoOpenPoll(job, target, deps[, until])               → running + job | done + answer
+ *  `job` (AwsRepoOpenJob) carries no grant: a caller persists it between sweeps and passes it back.
+ *  Assessment callers (class assessment, 1.0.3): once the host has admitted the job, poll the SAME
+ *  job until done (results stay readable JOB_TTL = 600 s) and never re-start it. An assessment folder
+ *  must be fresh, so after any admitted attempt (including a result `workspace_busy`, which may follow
+ *  a commit whose rename happened) a re-open answers `folder_conflict`: treat it as terminal. Only a
+ *  start refused before anything ran (`workspace_busy` from the start itself) is safe to retry.
+ *
  * ── Activation (lead edit in worker/src/index.ts, sketched here; not made by this lane) ────────
- *    awsTarget: async () => null,        // the route's Phase-A refusal no longer applies
- *    open: async (name, input) => {
+ *    personal (u2's route): open: async (name, input) => {
  *      const aws = await awsControlTarget(env, request, name, 'repo_open');
  *      return aws === null ? (openSandbox(env, name) as unknown as RepoOpenRpc).repoOpen(input)
  *        : handleAwsRepoOpen(input, name, aws, { fetch: (u, i) => fetch(u, i), now: () => Date.now() });
  *    },
+ *    assessment: awsRepoOpenStart(input, name, aws, deps, 'assessment'), then one
+ *      awsRepoOpenPoll(job, aws, deps) per sweep.
  */
 import { readLimited, sha256HexBytes } from './ai-proxy';
 import {
   AWS_GATEWAY_HEADER, awsOriginHostname, decodeControlKey, isComputerId, signGatewayHeader, type AwsTunnelRecord, type FetchLike,
 } from './aws-origin';
 import {
-  ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
+  ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HANDLE_RE, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
   REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, isRepoOpenClass, parseRepoOpenBody, refusal, validBranch,
+  validName,
   type RepoOpenAnswer, type RepoOpenAssessmentOpenResult, type RepoOpenBody, type RepoOpenClass, type RepoOpenErrorCode,
   type RepoOpenInput, type RepoOpenOpenResult,
 } from './repo-open-u2';
@@ -216,47 +234,59 @@ type EdgeReply =
   | { kind: 'deadline' };
 
 /**
- * Steps 2-11 of §8 for an AWS computer: relay, poll, validate. `input` is the route's verified
- * request; `target` is what `awsControlTarget` returned for `sandboxName` (non-null); `routeClass`
- * is the class the CALLING route serves (1.0.3), never read from the body: the body is re-validated
- * against it (its class must be routeClass and its gitHost routeClass's host), and the answer is
- * validated against that class's shape.
+ * What a status read needs to know about the job it reads. Token-free by construction (the grant never
+ * enters it), so a caller may persist it between sweeps; awsRepoOpenPoll treats it as untrusted and
+ * re-validates every field. `acknowledged`: the host has named this job (a start or status reply said
+ * running), which decides what a later edge 404 means (workspace_failed, not workspace_unsupported).
  */
-export async function handleAwsRepoOpen(
-  input: RepoOpenInput,
-  sandboxName: string,
-  target: AwsRepoOpenTarget | Response,
-  deps: AwsRepoOpenDeps,
-  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
-): Promise<RepoOpenAnswer> {
-  // A refusal from awsControlTarget (claims mismatch, origin unavailable or starting): its body is
-  // never read or forwarded.
-  if (target instanceof Response) return refusal('workspace_unsupported');
-  const now = () => deps.now();
-  const deadline = input.receivedAt + WORKER_DEADLINE_MS;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const random = deps.randomBytes ?? ((n: number) => crypto.getRandomValues(new Uint8Array(n)));
-  const timeout = deps.timeout ?? ((ms: number) => AbortSignal.timeout(ms));
+export interface AwsRepoOpenJob {
+  jobId: string;
+  sandboxName: string;
+  op: 'open' | 'refresh';
+  /** The route class the job was started for (1.0.3); its result is validated against that shape. */
+  class: RepoOpenClass;
+  handle: string;
+  name: string;
+  acknowledged: boolean;
+}
+const JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged'];
+const validJob = (job: unknown): job is AwsRepoOpenJob =>
+  exactKeys(job, JOB_KEYS) && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
+  && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh') && isRepoOpenClass(job.class)
+  && typeof job.handle === 'string' && HANDLE_RE.test(job.handle) && typeof job.name === 'string' && validName(job.name)
+  && typeof job.acknowledged === 'boolean';
 
-  // Never relay a field the Worker would refuse, whoever the caller is.
-  const body = requestBody(input);
-  if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), now(), routeClass)) return refusal('invalid_request');
+/** One start or poll: the job is still running (as far as that call can tell), or its final §8 answer. */
+export type AwsRepoOpenStep =
+  | { state: 'running'; job: AwsRepoOpenJob }
+  | { state: 'done'; answer: RepoOpenAnswer };
+const finished = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
+const repoFolder = (handle: string, name: string) => `${AWS_REPO_OPEN_ROOT}/repos/${handle}/${name}`;
+
+type EdgeCall = (path: string, until: number, payload?: string, token?: string) => Promise<EdgeReply>;
+
+/** The gw1-signed edge of `target`, bound to `sandboxName`; null when that binding cannot be signed. */
+function edgeOf(target: AwsRepoOpenTarget, sandboxName: string, deps: AwsRepoOpenDeps): EdgeCall | null {
   const { record, zone } = target;
   const key = decodeControlKey(record.controlKey);
   // The gw1 binding must be signable before anything is sent (awsOriginHostname checks the rest).
-  if (!key || record.sandboxId !== sandboxName || !record.originVerified || !isComputerId(record.computerId)) return refusal('workspace_failed');
+  if (!key || record.sandboxId !== sandboxName || !record.originVerified || !isComputerId(record.computerId)) return null;
   let host: string;
   try {
     host = awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone);
   } catch {
-    return refusal('workspace_failed');
+    return null;
   }
-  const folder = `${AWS_REPO_OPEN_ROOT}/repos/${body.handle}/${body.name}`;
-  const token = body.grant.token;
-  const carriesGrant = (text: string) => text.includes(token) || GRANT_SHAPE.test(text);
-
-  const call = async (path: string, payload?: string): Promise<EdgeReply> => {
-    const remaining = deadline - now();
+  const now = () => deps.now();
+  const timeout = deps.timeout ?? ((ms: number) => AbortSignal.timeout(ms));
+  /**
+   * One edge call, cut by its own abort signal at min(AWS_EDGE_CALL_MAX_MS, until - now). `token` is
+   * the grant when the caller holds it (a start). A status read does not: GRANT_RE (the parser's)
+   * makes every grant match GRANT_SHAPE, so the shape scan alone already refuses it.
+   */
+  return async (path, until, payload, token) => {
+    const carriesGrant = (text: string) => (token !== undefined && text.includes(token)) || GRANT_SHAPE.test(text);
+    const remaining = until - now();
     if (remaining <= 0) return { kind: 'deadline' };
     let text: string;
     let status: number;
@@ -285,52 +315,130 @@ export async function handleAwsRepoOpen(
     if (data !== null && carriesGrant(JSON.stringify(data))) return { kind: 'leak' };
     return { kind: 'reply', status, data: isObject(data) ? data : null };
   };
+}
 
+/**
+ * Start (E1-5): steps 2-7 of §8 for an AWS computer. Re-validates the route's verified `input`
+ * against `routeClass` (never read from the body), then sends the start exactly once, with a fresh
+ * jobId: ONE edge call, bounded by AWS_EDGE_CALL_MAX_MS and by input.receivedAt + WORKER_DEADLINE_MS.
+ *  - running + job: the host admitted the job (job.acknowledged), or the start's outcome is unknown
+ *    (a transport failure or a 5xx: the host may have admitted it before the reply was lost). Status
+ *    reads of the same jobId settle which; a second start is never sent for it.
+ *  - done + answer: a refusal (invalid_request; workspace_unsupported for an awsControlTarget Response
+ *    or an edge without the route; workspace_busy when the host's one slot is taken or the deadline
+ *    passed, both before anything ran; workspace_failed otherwise), or a start already answered done,
+ *    validated like a status result.
+ */
+export async function awsRepoOpenStart(
+  input: RepoOpenInput,
+  sandboxName: string,
+  target: AwsRepoOpenTarget | Response,
+  deps: AwsRepoOpenDeps,
+  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+): Promise<AwsRepoOpenStep> {
+  // A refusal from awsControlTarget (claims mismatch, origin unavailable or starting): its body is
+  // never read or forwarded.
+  if (target instanceof Response) return finished(refusal('workspace_unsupported'));
   try {
+    // Never relay a field the Worker would refuse, whoever the caller is.
+    const body = requestBody(input);
+    if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), deps.now(), routeClass)) return finished(refusal('invalid_request'));
+    const call = edgeOf(target, sandboxName, deps);
+    if (!call) return finished(refusal('workspace_failed'));
+    const random = deps.randomBytes ?? ((n: number) => crypto.getRandomValues(new Uint8Array(n)));
     const jobId = hex(random(32));
-    if (!AWS_JOB_ID_RE.test(jobId)) return refusal('workspace_failed');
+    if (!AWS_JOB_ID_RE.test(jobId)) return finished(refusal('workspace_failed'));
     const relay = awsRepoOpenRelayBody(body, jobId);
-    if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return refusal('workspace_failed');
+    if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return finished(refusal('workspace_failed'));
     const digest = await sha256HexBytes(new TextEncoder().encode(relay));
+    const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name, acknowledged: false };
 
-    // 1. Start (sent exactly once with this jobId).
-    let acknowledged = false;
-    let state: unknown = 'running';
-    let result: unknown;
-    const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, relay);
-    if (started.kind === 'leak') return refusal('workspace_failed');
-    if (started.kind === 'deadline') return refusal('workspace_busy');
+    const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant.token);
+    if (started.kind === 'leak') return finished(refusal('workspace_failed'));
+    if (started.kind === 'deadline') return finished(refusal('workspace_busy'));
     // A start that throws ('transport') or answers 5xx has an unknown outcome: the host may have
     // admitted the job before the reply was lost (A2h's edge answers 503 agent_unavailable when the
     // agent's reply fails after delivery). The job's status says which; a second start is never sent.
-    if (started.kind === 'reply' && started.status < 500) {
-      if (started.status === 404) return refusal('workspace_unsupported');
-      if (started.status === 409 && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
-        && started.data.error === 'workspace_busy') {
-        return refusal('workspace_busy');
-      }
-      if (started.status !== 200 || !envelope(started.data)) return refusal('workspace_failed');
-      acknowledged = true;
-      state = started.data.state;
-      result = started.data.result;
+    if (started.kind === 'transport' || started.status >= 500) return { state: 'running', job };
+    if (started.status === 404) return finished(refusal('workspace_unsupported'));
+    if (started.status === 409 && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
+      && started.data.error === 'workspace_busy') {
+      return finished(refusal('workspace_busy'));
     }
+    if (started.status !== 200 || !envelope(started.data)) return finished(refusal('workspace_failed'));
+    if (started.data.state === 'running') return { state: 'running', job: { ...job, acknowledged: true } };
+    return finished(awsJobAnswer(started.data.result, job.op, repoFolder(job.handle, job.name), job.class));
+  } catch {
+    return finished(refusal('workspace_failed'));
+  }
+}
 
-    // 2. Status reads until done or the deadline.
-    while (state !== 'done') {
-      const wait = Math.min(AWS_RELAY_POLL_MS, deadline - now());
+/**
+ * Poll (E1-5): ONE status read of `job`, no sleep: one edge call bounded by AWS_EDGE_CALL_MAX_MS and,
+ * when the caller has a deadline, by `until` (the composition passes receivedAt + WORKER_DEADLINE_MS;
+ * a caller polling across sweeps passes none and keeps its own). `job` is untrusted (it may have been
+ * persisted between sweeps): every field is re-validated and the folder is rebuilt from it here.
+ *  - running + job: the host says running (job.acknowledged becomes true), or this read could not
+ *    tell: a transport failure, a 5xx, or an awsControlTarget Response (its body never read). Poll
+ *    again; the host keeps a finished job's result readable for JOB_TTL (600 s, repo_open.py).
+ *  - done + answer: the job's result R re-validated for the job's op and class (awsJobAnswer), or a
+ *    refusal: invalid_request (a malformed job or `until`); workspace_failed (a target that cannot be
+ *    signed or is bound to another sandbox, job_unknown, any other reply, anything grant-shaped);
+ *    workspace_unsupported (an edge 404 before the host ever named the job: an AMI without the route);
+ *    workspace_busy (`until` passed: nothing was sent).
+ */
+export async function awsRepoOpenPoll(
+  job: AwsRepoOpenJob,
+  target: AwsRepoOpenTarget | Response,
+  deps: AwsRepoOpenDeps,
+  until: number = Infinity,
+): Promise<AwsRepoOpenStep> {
+  if (!validJob(job) || typeof until !== 'number' || Number.isNaN(until)) return finished(refusal('invalid_request'));
+  const current: AwsRepoOpenJob = { ...job };
+  if (target instanceof Response) return { state: 'running', job: current };
+  try {
+    const call = edgeOf(target, current.sandboxName, deps);
+    if (!call) return finished(refusal('workspace_failed'));
+    const read = await call(`${AWS_REPO_OPEN_STATUS_PATH}${current.jobId}`, until);
+    if (read.kind === 'leak') return finished(refusal('workspace_failed'));
+    if (read.kind === 'deadline') return finished(refusal('workspace_busy'));
+    if (read.kind === 'transport' || read.status >= 500) return { state: 'running', job: current };
+    if (read.status === 404) return finished(refusal(current.acknowledged ? 'workspace_failed' : 'workspace_unsupported'));
+    if (read.status !== 200 || !envelope(read.data)) return finished(refusal('workspace_failed'));
+    if (read.data.state === 'running') return { state: 'running', job: { ...current, acknowledged: true } };
+    return finished(awsJobAnswer(read.data.result, current.op, repoFolder(current.handle, current.name), current.class));
+  } catch {
+    return finished(refusal('workspace_failed'));
+  }
+}
+
+/**
+ * Steps 2-11 of §8 for an AWS computer in one call: awsRepoOpenStart, then awsRepoOpenPoll every
+ * AWS_RELAY_POLL_MS until the job is done or receivedAt + WORKER_DEADLINE_MS passes (workspace_busy).
+ * The same behaviour as cf27920b's single relay for the personal class. `routeClass` is the class the
+ * CALLING route serves (1.0.3), never read from the body.
+ */
+export async function handleAwsRepoOpen(
+  input: RepoOpenInput,
+  sandboxName: string,
+  target: AwsRepoOpenTarget | Response,
+  deps: AwsRepoOpenDeps,
+  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+): Promise<RepoOpenAnswer> {
+  try {
+    const started = await awsRepoOpenStart(input, sandboxName, target, deps, routeClass);
+    if (started.state === 'done') return started.answer;
+    const deadline = input.receivedAt + WORKER_DEADLINE_MS;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    let job = started.job;
+    for (;;) {
+      const wait = Math.min(AWS_RELAY_POLL_MS, deadline - deps.now());
       if (wait <= 0) return refusal('workspace_busy');
       await sleep(wait);
-      const read = await call(`${AWS_REPO_OPEN_STATUS_PATH}${jobId}`);
-      if (read.kind === 'leak') return refusal('workspace_failed');
-      if (read.kind === 'deadline') return refusal('workspace_busy');
-      if (read.kind === 'transport' || read.status >= 500) continue;
-      if (read.status === 404) return refusal(acknowledged ? 'workspace_failed' : 'workspace_unsupported');
-      if (read.status !== 200 || !envelope(read.data)) return refusal('workspace_failed');
-      acknowledged = true;
-      state = read.data.state;
-      result = read.data.result;
+      const polled = await awsRepoOpenPoll(job, target, deps, deadline);
+      if (polled.state === 'done') return polled.answer;
+      job = polled.job;
     }
-    return awsJobAnswer(result, body.op, folder, routeClass);
   } catch {
     return refusal('workspace_failed');
   }
