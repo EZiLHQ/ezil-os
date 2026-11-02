@@ -654,6 +654,12 @@ describe('target and module boundaries', () => {
 // ── contract 1.0.3: the route class (added on the carried cf27920b suite above) ─────────────
 
 const QA = V.constants.GIT_ASSESSMENT_HOST as string;
+/**
+ * The grant replaced by a marker. The added blocks compare relayed bodies through this, so a failing
+ * assertion never prints the grant (the vectors fixture) into test output; the grant itself is
+ * checked by a boolean.
+ */
+const redact = (text: unknown) => String(text).replaceAll(TOKEN, '<grant>');
 /** An assessment §8 body: class assessment on its own host, as the assessment route hands it over. */
 const assessmentInput = (patch: Record<string, unknown> = {}, receivedAt = NOW) => input({ class: 'assessment', gitHost: QA, ...patch }, receivedAt);
 const okAssessment = { ...okOpen, head: 'a'.repeat(40), clean: true };
@@ -670,8 +676,8 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     expect(Object.keys(relayed)).toEqual(['jobId', ...V.workerRequest.keys, ...V.workerRequest.optionalKeys]);
     expect([relayed.class, relayed.gitHost]).toEqual(['assessment', QA]);
     const { receivedAt: _r, ...wire } = assessmentInput();
-    expect(relayed).toEqual({ ...wire, jobId: JOB });
-    expect(sent).toBe(JSON.stringify(relayed));
+    expect(redact(sent)).toBe(redact(JSON.stringify({ jobId: JOB, ...wire })));
+    expect(relayed.grant.token === TOKEN && sent.split(TOKEN).length === 2).toBe(true);
     expect(e.reads().length).toBe(2);
   });
 
@@ -679,8 +685,9 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     const e = job(() => ok(okOpen));
     expect(await runAs(e, input(), 'personal')).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
     const { receivedAt: _r, ...wire } = input();
-    expect(e.calls[0]!.init.body).toBe(JSON.stringify({ jobId: JOB, ...wire }));
-    expect(JSON.parse(e.calls[0]!.init.body as string)).not.toHaveProperty('class');
+    expect(redact(e.calls[0]!.init.body)).toBe(redact(JSON.stringify({ jobId: JOB, ...wire })));
+    expect(e.calls[0]!.init.body === JSON.stringify({ jobId: JOB, ...wire })).toBe(true);
+    expect('class' in JSON.parse(e.calls[0]!.init.body as string)).toBe(false);
     const explicit = job(() => ok(okOpen));
     expect(await runAs(explicit, input({ class: 'personal' }), undefined)).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
     expect(Object.keys(JSON.parse(explicit.calls[0]!.init.body as string)).at(-1)).toBe('class');
@@ -699,7 +706,7 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
   ] as [string, () => RepoOpenInput, RepoOpenClass | undefined][])('never relays a body outside the route class (%s): invalid_request, no edge call', async (_label, make, routeClass) => {
     const e = job(() => ok(okAssessment));
     expect(await runAs(e, make(), routeClass)).toEqual(refusal('invalid_request'));
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
   });
 
   it('every vectors okAssessmentCases row through an assessment open: a valid result is answered as is, an invalid one is workspace_failed', async () => {
@@ -792,7 +799,8 @@ describe('E1-5: awsRepoOpenStart sends the start exactly once and answers a toke
     expect(e.starts().length).toBe(1);
     expect(sleeps).toEqual([]);
     const { receivedAt: _r, ...wire } = input();
-    expect(e.calls[0]!.init.body).toBe(JSON.stringify({ jobId: JOB, ...wire }));
+    expect(redact(e.calls[0]!.init.body)).toBe(redact(JSON.stringify({ jobId: JOB, ...wire })));
+    expect(e.calls[0]!.init.body === JSON.stringify({ jobId: JOB, ...wire })).toBe(true);
     // The job never carries the grant, so a caller may persist it.
     expect(JSON.stringify(r)).not.toContain('egg_');
     expect(Object.keys((r as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged']);
@@ -937,7 +945,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
   ] as [string, Record<string, unknown>][])('the job is untrusted (%s): invalid_request, no edge call', async (_label, patch) => {
     const e = edge(() => ok(okOpen));
     expect(await awsRepoOpenPoll({ ...jobOf(), ...patch } as AwsRepoOpenJob, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
   });
 
   it('a missing key, a non-object job, or a NaN `until` is invalid_request, no edge call', async () => {
@@ -947,7 +955,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
       expect(await awsRepoOpenPoll(job, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));
     }
     expect(await awsRepoOpenPoll(jobOf(), target, deps(e.fetch), Number.NaN)).toEqual(done$(refusal('invalid_request')));
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
   });
 
   it.each([
@@ -958,7 +966,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
   ] as [string, AwsRepoOpenJob, AwsRepoOpenTarget][])('%s is workspace_failed before any edge call', async (_label, job, t) => {
     const e = edge(() => ok(okOpen));
     expect(await awsRepoOpenPoll(job, t, deps(e.fetch))).toEqual(done$(refusal('workspace_failed')));
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
   });
 
   it('an awsControlTarget Response is not an answer: running, the job unchanged, no edge call, its body never read', async () => {
@@ -966,7 +974,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
     const starting = Response.json({ ok: false, error: 'aws_origin_starting' }, { status: 503 });
     expect(await awsRepoOpenPoll(jobOf({ acknowledged: false }), starting, deps(e.fetch))).toEqual(running$(jobOf({ acknowledged: false })));
     expect(starting.bodyUsed).toBe(false);
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
   });
 
   it('without `until`, a poll long after the 105 s Worker deadline still reads the result', async () => {
@@ -981,7 +989,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
     const e = edge(() => ({ latencyMs: Infinity, reply: running() }));
     const d = deps(e.fetch);
     expect(await awsRepoOpenPoll(jobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
-    expect(e.calls).toEqual([]);
+    expect(e.calls.length).toBe(0);
     expect(await awsRepoOpenPoll(jobOf(), target, d, NOW + 2_000)).toEqual(running$(jobOf()));
     expect(e.calls[0]!.timeoutMs).toBe(2_000);
     expect(clock).toBe(NOW + 2_000);
