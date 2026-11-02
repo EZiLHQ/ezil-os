@@ -78,6 +78,8 @@ import { AwsTunnelRegistry, lookupAwsTunnel, lookupAwsTunnelForBrowser, routeAws
 import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, ensureAwsDesktopConfig, type RelayMint, type ScreenDesktop } from './aws-ice';
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
+// Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
+import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
@@ -732,13 +734,23 @@ const DEFAULT_WORKSPACE_MOUNT_PATH = '/workspace';
  * Guarded by the IDENTICAL `mounted` condition `workspaceRootEnv` already
  * uses: when the bucket isn't mounted, the container's own `WORKSPACE_ROOT`
  * falls back to `start-neko.sh`'s `/home/neko/project` default instead, and
- * `folder` must follow that same fallback (by omitting itself, letting
- * code-server use its own launch-time default) rather than pointing at a
- * path nothing actually populated.
+ * `folder` must follow that same fallback (by omitting itself) rather than
+ * pointing at a path nothing actually populated. Omitting `folder` does NOT
+ * mean "the launch-time default": code-server 4.141.0 (`routes/vscode.js`
+ * GET `/`) then redirects to coder.json's `lastOpened` folder, else to its
+ * CLI positional argument — i.e. whatever this container's code-server last
+ * opened, in any tab.
+ *
+ * `restored` (per-tab folder continuity, `./code-folder.ts`): a folder the
+ * computer itself walked for this tab's ask (`settleCodeFolder` answered
+ * `restored`). It wins over the default; with none, this is today's value
+ * exactly.
  */
 function codePreviewFolderParams(
   workspace: { mounted: boolean; mountPath?: string },
+  restored?: string,
 ): Record<string, string> | undefined {
+  if (restored) return { folder: restored };
   return workspace.mounted && workspace.mountPath ? { folder: workspace.mountPath } : undefined;
 }
 
@@ -4770,6 +4782,13 @@ interface PreviewBody {
    * relay (`awsPreviewSurface`, aws-origin.ts). Covered by the v2 body digest like every other field.
    */
   surface?: unknown;
+  /**
+   * Code, own files only: `{v:1, path}`, the folder this shell tab's editor last reported (`./code-folder.ts`).
+   * A HINT, never a folder: planned against THIS computer's root, walked on the computer with no symlink
+   * followed, else today's default opens. Absent (an older app, a project or assessment mint) is today's
+   * behaviour byte for byte. Covered by the v2 body digest like every other field.
+   */
+  codeFolder?: unknown;
 }
 
 async function handlePreview(
@@ -4917,6 +4936,9 @@ async function handlePreview(
           surface: awsPreviewSurface(body.surface),
           ensureConfig: async (record) => ensureAwsDesktopConfig(await desktop(record)),
           codeAnswers: async (record) => !!zone && awsCodeServerAnswers(record, zone, awsFetch, Date.now),
+          // Per-tab folder continuity (Code only, aws-origin.ts). The host walk (`resolveFolder`) is e1cd418a's
+          // `code-folder-resolve.ts`; until it is wired, a resolvable ask answers `unverified`.
+          codeFolder: body.codeFolder,
           nowMs: Date.now,
         });
         if (answer.status !== 200) {
@@ -5116,7 +5138,19 @@ async function handlePreview(
     const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);
     // See `codePreviewFolderParams`'s doc comment above for the full "empty
     // file tree" mechanism/contract this closes.
-    const codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));
+    // Per-tab folder continuity (`./code-folder.ts`): the tab's hint, stripped of THIS computer's root (the mount,
+    // else the container's own fallback root) and walked on the computer with no symlink followed. The in-container
+    // walk is e1cd418a's `code-folder-resolve.ts` (single writer of Worker path resolution); until it is wired a
+    // resolvable ask answers `unverified` and today's default opens. Only `restored` adds a folder.
+    const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;
+    const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot);
+    let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));
+    if (codeFolder.folder && codePreviewUrl && !fitsCodeFolderUrl(codePreviewUrl)) {
+      // The shell's frame confirmation caps the URL: a deep folder opens today's default with a visible notice.
+      codeFolder.outcome = 'too_long';
+      codeFolder.folder = undefined;
+      codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));
+    }
 
     // Readiness requires confirmation, including any edits made during launch.
     // waitUntil has a bounded lifetime and cannot gate a response on failure.
@@ -5154,6 +5188,8 @@ async function handlePreview(
       codePreviewExpose,
       appPreviewUrl,
       codePreviewUrl,
+      // Per-tab folder continuity: codes only, never a path; absent when nothing was asked.
+      ...codeFolderAnswer(codeFolder.outcome),
     });
     // Spool AFTER the response is built, never awaited by it — see
     // `spoolTelemetry`'s own doc comment for the "no telemetry code path is
