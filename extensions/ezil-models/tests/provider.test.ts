@@ -403,7 +403,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await send('字'.repeat(10000));
             expect(bodies[0]!.byteLength + 1056).toBeLessThanOrEqual(32768);
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and your conversation history is kept. You can switch to another model or start a new chat. (local_input_too_large)');
             expect(bodies).toHaveLength(1); expect(host.models()[0]!.maxInputTokens).toBe(configured);
         });
     }
@@ -421,13 +421,13 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(infos[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192 });
             const send = (text = 'q') => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
-            await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'Conversation too large' : code);
+            await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'EZiL AI: This conversation is too large for qwen.qwen3-coder-next. EZiL AI refused it before the model ran' : code);
             expect(bodies).toHaveLength(1); expect(gets).toBe(1);
             await send(); // Still passes the old VS Code information object.
             expect(bodies.map(body => body.max_tokens)).toEqual([8192, 4096]); expect(gets).toBe(2);
             const refreshed = await provider.provideLanguageModelChatInformation({} as never, token() as never);
             expect(refreshed[0]).toMatchObject({ maxInputTokens: 6176, maxOutputTokens: 4096 });
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('(local_input_too_large)');
             expect(bodies).toHaveLength(2); expect(gets).toBe(2);
         });
     }
@@ -440,7 +440,7 @@ describe('EZiL gateway VS Code bridge', () => {
         await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
             { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('Retry');
         for (let i = 0; i < 10; i++) await Promise.resolve();
-        expect(showRetryError).toHaveBeenCalledWith(expect.stringContaining('could not reach'), 'Retry');
+        expect(showRetryError).toHaveBeenCalledWith(expect.stringContaining('EZiL OS: Could not reach EZiL AI'), 'Retry');
         expect(retryCommand).toHaveBeenCalledWith('workbench.action.chat.retry');
         expect(posts).toBe(1);
     });

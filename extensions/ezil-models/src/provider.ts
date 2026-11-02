@@ -179,7 +179,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
                 controller.signal.throwIfAborted();
                 if (!gatewayModelAvailable(resolved, catalog)) {
-                    throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined);
+                    throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
                 resolved = withGatewayModelLimits(resolved, catalog);
             }

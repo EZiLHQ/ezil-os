@@ -49,8 +49,19 @@ Qwen's response mode. Both models advertise `imageInput: false`.
 
 Token counting measures serialized UTF-8 bytes. Advertised input defaults to
 `131072 - 1056 - 1536 - 24000 = 104480`; `toolReserve` configures the final
-subtraction because Copilot does not count tool schemas. The exact full request
-is also bounded by `body bytes + 1056 <= 131072` before dispatch.
+subtraction because Copilot does not count tool schemas.
+
+The exact request is bounded before dispatch: `body bytes + 1056 <= 131072`, at
+most 1024 messages and 1024 blocks in one message (Responses: the escaped bound
+above, 512 items, 256 KiB). A request over a bound is refused on the computer
+with `local_input_too_large`, `local_too_many_messages` or
+`local_too_many_blocks`: nothing is sent or charged, the conversation history
+is kept, and the message gives the sizes (body bytes including tool-definition
+bytes, and the limit). Copilot's foreground-summarisation and no-summarisation
+renders use the full advertised input without subtracting tools, and tool sets
+dominated by numbers or booleans are under-counted by Copilot itself, so either
+can still reach this refusal. Any other failure before sending is
+`local_build_error` (the exception's class name only).
 
 Calls share a FIFO admission queue per base URL and Bearer auth context, the same
 identity used by the model catalog cache. `GATEWAY_MAX_IN_FLIGHT = 2` is coupled
@@ -72,8 +83,18 @@ admission retry also consumes that allowance. All resends keep identical bytes
 and key: refused concurrency admission creates no Gateway request or credit hold.
 No 401, 5xx, replay, credit-budget refusal, or stream failure is retried.
 
+Errors name where they arose. Chat shows every failure under the provider's
+`EZiL Models:` label; a local refusal (nothing sent) has no second label.
+`EZiL OS:` marks the computer's AI proxy, recognised by `source:
+"ezil-os-proxy"` or an `os_` code (the proxy never relays either from the
+Gateway). `EZiL AI:` marks a Gateway refusal relayed by the proxy, or a deadline
+or interruption on the way; Gateway 413s show the input bound when sent.
+
 Each call writes one redacted JSON telemetry line: request ID, model, stream,
-hold, HTTP status, latency, four usage buckets, stop reason and error code.
+hold, HTTP status, latency, four usage buckets, stop reason, error code and
+error origin (`local`, `os_proxy`, `gateway`, `transport` or `response`). Local
+refusals add their sizes only: body and limit bytes, messages, largest message
+blocks, tools and tool bytes.
 Prompts, bodies and tokens are never logged for the gateway, even when legacy
 request logging is enabled. Cancellation aborts fetch, stops reporting parts,
 and logs `cancelled; may still be charged (request …)`.

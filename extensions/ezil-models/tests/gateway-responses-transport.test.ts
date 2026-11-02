@@ -87,10 +87,10 @@ describe('Responses transport contract', () => {
         expect(model.maxOutputTokens).toBe(8192);
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'responses-request', model: 'reviewed-azure', stream: true, hold: '420000',
-            http_status: 200, latency_ms: 0, usage: { input: 123, output: 17, cache_read: 11, cache_write: 0 }, stop_reason: 'end_turn', error_code: null });
+            http_status: 200, latency_ms: 0, usage: { input: 123, output: 17, cache_read: 11, cache_write: 0 }, stop_reason: 'end_turn', error_code: null, origin: null });
         expect(logs.join()).not.toMatch(/Hello|Visible answer|synthetic-proxy-token|ignored-key|ignored-beta/);
         expect(new Headers(s.reads[0]!.init.headers).get('authorization')).toBe('Bearer synthetic-proxy-token');
-        await expect(run(s.fetch, {}, model, ask([{ role: 'user', parts: [{ type: 'text', value: '字'.repeat(11000) }] }]))).rejects.toThrow('Conversation too large');
+        await expect(run(s.fetch, {}, model, ask([{ role: 'user', parts: [{ type: 'text', value: '字'.repeat(11000) }] }]))).rejects.toThrow('(local_input_too_large)');
         expect(s.posts).toHaveLength(1);
     });
 

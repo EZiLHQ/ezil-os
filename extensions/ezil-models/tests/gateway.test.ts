@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
-import { creditState, describeGatewayError, forgetGatewayModels, gatewayChat, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
+import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
 import { credits, creditsFloor2 } from '../src/credits-format';
 import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
-import { ask, gw } from './fixtures/gateway';
+import { ask, gw, msg, tool, txt } from './fixtures/gateway';
 import { frames, messageJson } from './fixtures/gateway-response';
 import { localResetTime } from '../src/status-data';
 
@@ -41,7 +41,7 @@ describe('gateway transport', () => {
         expect(headers).toEqual({ authorization: 'Bearer synthetic-proxy-token', 'content-type': 'application/json', accept: 'text/event-stream', 'idempotency-key': 'fixed-key' });
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'req-ok', model: gw().id, stream: true, hold: '1000', http_status: 200, latency_ms: 0,
-            usage: { input: 100, output: 8, cache_read: 3, cache_write: 4 }, stop_reason: 'end_turn', error_code: null });
+            usage: { input: 100, output: 8, cache_read: 3, cache_write: 4 }, stop_reason: 'end_turn', error_code: null, origin: null });
         expect(logs.join()).not.toMatch(/Hello|synthetic-proxy-token|never log/);
     });
     test('Kimi always requests JSON and emits only after completion', async () => {
@@ -193,8 +193,8 @@ describe('gateway errors and credits', () => {
     });
     for (const [status, code, text] of [
         [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'no AI credits left'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
-        [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS refused this computer'],
-        [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'Conversation too large — start a new chat'],
+        [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS: This computer’s AI connection was refused'],
+        [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and your conversation history is kept.'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
     ] as const) test(`maps ${code}, always preserving request ID`, () => {
@@ -303,6 +303,71 @@ describe('gateway errors and credits', () => {
         expect(message(1_234_567_891)).toContain('Available credits: 1,234.56.');
         expect(message(1_500_000)).toContain('Available credits: 1.50.');
         for (const odd of [-1, 1.5, Number.NaN]) expect(message(odd)).toContain('Available credits: Not measured.');
+    });
+});
+describe('local refusals and error origin', () => {
+    const SENTINEL = 'PAYLOAD-SENTINEL-7f3a';
+    async function fail(model: ReturnType<typeof gw>, request: ReturnType<typeof ask>, fetch: typeof globalThis.fetch, logs: string[]) {
+        try { for await (const _ of gatewayChat(model, request, { fetch, signal: new AbortController().signal, log: line => logs.push(line), now: () => 0 })) { /* drain */ } }
+        catch (error) { return error as GatewayError; }
+        throw new Error('expected a failure');
+    }
+    test('an over-bound Kimi conversation is refused before any fetch, with sizes, its own code and origin local', async () => {
+        const s = server(() => json(messageJson())); const logs: string[] = [];
+        const error = await fail(gw(KIMI), { ...ask([msg('user', txt(`${SENTINEL} ${'字'.repeat(44_000)}`))]), tools: [tool] }, s.fetch, logs);
+        expect(s.calls).toHaveLength(0);
+        expect(error).toBeInstanceOf(GatewayError);
+        expect([error.code, error.origin, error.status, error.requestId]).toEqual(['local_input_too_large', 'local', undefined, undefined]);
+        const toolBytes = Buffer.byteLength(JSON.stringify([{ name: tool.name, input_schema: tool.inputSchema, description: tool.description }]));
+        const { bodyBytes } = error.counts!;
+        expect(error.counts).toEqual({ bodyBytes, limitBytes: 130_016, messages: 1, maxBlocks: 1, tools: 1, toolBytes });
+        expect(bodyBytes).toBeGreaterThan(130_016);
+        expect(error.message).toBe(`EZiL Models: This conversation is too large to send to ${KIMI}: ${bodyBytes.toLocaleString('en-US')} bytes, including ${toolBytes} bytes of tool definitions; `
+            + 'the limit is 130,016 bytes. Nothing was sent or charged, and your conversation history is kept. You can switch to another model or start a new chat. (local_input_too_large)');
+        // Never promises that /compact works (on Kimi it runs the same failing summary request).
+        expect(error.message).not.toMatch(/compact|invalid/i);
+        expect(logs).toHaveLength(1);
+        expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null, latency_ms: 0,
+            usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
+            body_bytes: bodyBytes, limit_bytes: 130_016, messages: 1, max_blocks: 1, tools: 1, tool_bytes: toolBytes });
+        for (const text of [logs[0]!, error.message]) expect(text).not.toMatch(new RegExp(`${SENTINEL}|字|invalid_request`));
+    });
+    test('any other failure before sending is local_build_error: the class name only, nothing sent', async () => {
+        class SecretBuildFailure extends Error { constructor() { super(SENTINEL); this.name = 'SecretBuildFailure'; } }
+        const broken = { name: 'read_file', description: 'x', get inputSchema(): never { throw new SecretBuildFailure(); } };
+        const s = server(() => ok()); const logs: string[] = [];
+        const error = await fail(gw(), { ...ask(), tools: [broken] }, s.fetch, logs);
+        expect(s.calls).toHaveLength(0);
+        expect([error.code, error.origin]).toEqual(['local_build_error', 'local']);
+        expect(error.message).toBe('EZiL Models: internal error while preparing the request (SecretBuildFailure); nothing was sent or charged. Please report it (local_build_error)');
+        expect(JSON.parse(logs[0]!)).toMatchObject({ error_code: 'local_build_error', origin: 'local', http_status: null });
+        expect(logs.join() + error.message).not.toContain(SENTINEL);
+    });
+    test('OS proxy refusals say EZiL OS; relayed Gateway refusals say EZiL AI and show their numbers', () => {
+        const proxy = describeGatewayError(KIMI, 413, null, parseErrorBody(JSON.stringify({ error: { code: 'body_too_large', message: 'x', source: 'ezil-os-proxy' } })), null);
+        expect([proxy.origin, proxy.code]).toEqual(['os_proxy', 'body_too_large']);
+        expect(proxy.message).toBe('EZiL OS: This request is larger than the 160 KiB EZiL OS forwards. Nothing was sent to EZiL AI or charged, and your conversation history is kept. You can switch to another model or start a new chat');
+        const gateway = describeGatewayError(KIMI, 413, null, { code: 'input_too_large', input_bound_tokens: 140_000, max_input_tokens: 131_072, request_id: 'r1' }, null);
+        expect(gateway.origin).toBe('gateway');
+        expect(gateway.message).toBe(`EZiL AI: This conversation is too large for ${KIMI} (input bound 140000 > 131072 tokens). EZiL AI refused it before the model ran, so it was not charged, `
+            + 'and your conversation history is kept. You can switch to another model or start a new chat (request r1)');
+        expect(describeGatewayError(KIMI, 413, null, { code: 'body_too_large' }, null).message).toStartWith('EZiL AI: This conversation is too large');
+        // Proxy codes are os_-prefixed and never relayed from the Gateway, with or without the source marker.
+        for (const code of ['os_session_missing', 'os_ai_unavailable', 'os_proxy_unauthorized']) {
+            const e = describeGatewayError(KIMI, 504, null, { code }, null);
+            expect([e.origin, e.message.slice(0, 9)]).toEqual(['os_proxy', 'EZiL OS: ']);
+        }
+        // A refusal without a code was written by neither (an edge page on the way).
+        expect(errorOrigin(parseErrorBody('<html>bad gateway</html>'))).toBe('transport');
+        expect(describeGatewayError(KIMI, 413, null, {}, null).message).toStartWith('EZiL AI: This request was refused as too large (HTTP 413) before any model ran');
+        expect(errorOrigin({ code: 'gateway_error' })).toBe('gateway');
+    });
+    test('the log line carries the origin of an HTTP refusal', async () => {
+        const s = server(() => json({ error: { code: 'body_too_large', source: 'ezil-os-proxy' } }, 413)); const logs: string[] = [];
+        const error = await fail(gw(), ask(), s.fetch, logs);
+        expect(error.origin).toBe('os_proxy');
+        expect(JSON.parse(logs[0]!)).toMatchObject({ http_status: 413, error_code: 'body_too_large', origin: 'os_proxy' });
+        expect(JSON.parse(logs[0]!).body_bytes).toBeUndefined();
     });
 });
 test('credits-format: the shared vectors (the OS shell pins the same ones for creditsDecimal)', () => {

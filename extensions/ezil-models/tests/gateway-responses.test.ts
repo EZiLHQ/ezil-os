@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { escapeNonAscii, LocalRequestError } from '../src/gateway-messages';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from '../src/gateway-responses';
 import { sseEvents } from '../src/sse';
 import type { ChatRequest, StreamEvent, Tool } from '../src/types';
@@ -92,8 +93,17 @@ describe('Responses request subset', () => {
     });
 
     test('request allowance accounts for each message and escaped tool schema bytes', () => {
-        expect(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] })).toThrow('Conversation too large');
-        expect(() => build(ask(Array.from({ length: 513 }, () => msg('user', txt('x')))))).toThrow('conversation length');
+        expect(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] })).toThrow(LocalRequestError);
+        const caught = (run: () => unknown) => { try { run(); } catch (error) { return error as LocalRequestError; } throw new Error('did not throw'); };
+        const big = caught(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] }));
+        const escapedTools = Buffer.byteLength(escapeNonAscii(JSON.stringify([{ type: 'function', name: tool.name, parameters: { description: '界'.repeat(150) }, description: tool.description }])));
+        // The counted size is the Gateway bound: body + escaped tool text + 1024 + 32/item + 128/tool.
+        expect(big.code).toBe('local_input_too_large');
+        expect(big.counts).toMatchObject({ limitBytes: 1500, messages: 1, maxBlocks: 1, tools: 1, toolBytes: escapedTools });
+        expect(big.counts.bodyBytes).toBeGreaterThan(1500);
+        const many = caught(() => build(ask(Array.from({ length: 513 }, () => msg('user', txt('x'))))));
+        expect(many.code).toBe('local_too_many_messages'); expect(many.counts.messages).toBe(513);
+        expect(() => build(ask([]))).toThrow('conversation length');
     });
 });
 

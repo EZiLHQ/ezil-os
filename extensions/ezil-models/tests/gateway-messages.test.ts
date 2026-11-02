@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI } from '../src/gateway-messages';
+import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError } from '../src/gateway-messages';
 import { ask, call, fixtureRequests, gw, image, marker, msg, result, thinking, tool, txt } from './fixtures/gateway';
 
 const build = (request = ask()) => buildGatewayBody(gw(), request).body;
@@ -109,7 +109,8 @@ describe('gateway sanitizer', () => {
         expect(gatewayInputTokens({ maxInputTokens: 131072 })).toBe(131072 - 1056 - 1536 - 8000);
     });
     test('actual body bytes plus 1056 are bounded before sending', () => {
-        expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow('Conversation too large');
+        expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow(LocalRequestError);
+        expect(() => build(ask([msg('user', txt('字'.repeat(43000)))]))).not.toThrow();
     });
     for (const [name, fixture] of Object.entries(fixtureRequests())) test(`fixture ${name} is produced by sanitizer`, () => {
         const expected = JSON.parse(readFileSync(`${import.meta.dir}/fixtures/gateway-bodies/${name}.json`, 'utf8'));

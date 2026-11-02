@@ -4,6 +4,8 @@ import { isObject } from './gateway-messages';
 
 const STOP_REASONS = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'refusal']);
 export class GatewayResponseError extends Error {
+    /** A reply arrived (or started to) but was not usable; see GatewayErrorOrigin in gateway.ts. */
+    public readonly origin = 'response' as const;
     constructor(public readonly requestId?: string, public readonly code = 'stream_interrupted') {
         super(`EZiL AI: interrupted (request ${requestId ?? 'unknown'})`);
     }

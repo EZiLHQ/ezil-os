@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject } from './gateway-messages';
+import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError } from './gateway-messages';
 import { GatewayResponseError } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -13,6 +13,7 @@ type FunctionTool = { type: 'function'; name: string; description?: string; para
 export type GatewayResponsesBody = { model: string; input: Input[]; max_output_tokens: number; stream: boolean; store: false;
     tools?: FunctionTool[]; tool_choice?: 'auto'; temperature?: number; top_p?: number };
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_RESPONSES_BODY_BYTES = 256 * 1024;
 const REFERENCES = new Set(['$ref', '$defs', 'definitions', '$dynamicRef', '$recursiveRef', '$anchor']);
 
 /** Refuse lossy JSON and schema references before serialization, including deep or cyclic schemas. */
@@ -81,7 +82,7 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     }
     // Cancelled history has no recorded result. Never invent a successful result for such calls.
     for (const id of pending) input.push({ type: 'function_call_output', call_id: id, output: 'No result was recorded for this tool call.' });
-    if (!input.length || input.length > 512) throw new Error('Invalid conversation length');
+    if (!input.length) throw new Error('Invalid conversation length');
     const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayOutputTokens(model), stream: model.stream !== false, store: false };
     if (tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
@@ -92,9 +93,15 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     const bytes = new TextEncoder().encode(JSON.stringify(body));
     // Conservative mirror of the Gateway's byte bound, counting the whole envelope and escaped schemas.
     const definitions = JSON.stringify(tools);
-    const escaped = definitions.replace(/[\u0080-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    const escaped = escapeNonAscii(definitions);
     const bound = bytes.byteLength + Buffer.byteLength(escaped) - Buffer.byteLength(definitions) + 1024 + 32 * input.length + 128 * tools.length;
-    if (bytes.byteLength > 256 * 1024 || bound > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new Error('Conversation too large — start a new chat');
+    const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+    // Sizes only. The counted size is the raw body for the 256 KiB cap, otherwise the bound above.
+    const raw = bytes.byteLength > MAX_RESPONSES_BODY_BYTES;
+    const counts = () => ({ bodyBytes: raw ? bytes.byteLength : bound, limitBytes: raw ? MAX_RESPONSES_BODY_BYTES : limit,
+        messages: input.length, maxBlocks: 1, tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(escaped) : 0 });
+    if (input.length > 512) throw new LocalRequestError('local_too_many_messages', counts());
+    if (raw || bound > limit) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 

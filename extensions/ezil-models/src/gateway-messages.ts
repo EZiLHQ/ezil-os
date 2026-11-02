@@ -3,6 +3,25 @@
 import type { ResolvedModel } from './config';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
 
+export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
+/** Sizes only, never payload text. `bodyBytes` is the size checked against `limitBytes`. */
+export type LocalRequestCounts = {
+    bodyBytes: number; limitBytes: number; messages: number; maxBlocks: number; tools: number; toolBytes: number;
+};
+
+/** A request this computer refused before sending anything: nothing reached EZiL OS or EZiL AI. */
+export class LocalRequestError extends Error {
+    constructor(public readonly code: LocalRequestCode, public readonly counts: LocalRequestCounts) {
+        super(`EZiL Models: request refused before sending (${code})`);
+        this.name = 'LocalRequestError';
+    }
+}
+
+/** JSON text with every non-ASCII UTF-16 unit written as `\uXXXX`, as the Gateway's Responses bound counts it. */
+export function escapeNonAscii(json: string): string {
+    return json.replace(/[\u0080-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
 export const GATEWAY_INPUT_TOKENS = 131_072;
@@ -159,9 +178,16 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
     }
-    if (body.messages.length > 1024 || body.messages.some(message => message.content.length > 1024)) throw new Error('Conversation too large — start a new chat');
     const bytes = new TextEncoder().encode(JSON.stringify(body));
-    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new Error('Conversation too large — start a new chat');
+    // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
+    const counts = (): LocalRequestCounts => ({
+        bodyBytes: bytes.byteLength, limitBytes: Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING,
+        messages: body.messages.length, maxBlocks: body.messages.reduce((most, message) => Math.max(most, message.content.length), 0),
+        tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0,
+    });
+    if (body.messages.length > 1024) throw new LocalRequestError('local_too_many_messages', counts());
+    if (body.messages.some(message => message.content.length > 1024)) throw new LocalRequestError('local_too_many_blocks', counts());
+    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 

@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
-import { buildGatewayBody } from './gateway-messages';
+import { buildGatewayBody, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -24,7 +24,15 @@ const MODELS_TTL_MS = 5 * 60_000;
 const SIDE_CALL_TIMEOUT_MS = 5_000;
 const MICRO_PER_CREDIT = 1_000_000;
 
-/** A gateway (or OS proxy) refusal, carrying what the UI and the log need. */
+/**
+ * Where a failure arose: `local` (refused or failed on this computer; nothing was sent), `os_proxy` (the EZiL OS
+ * AI proxy answered itself), `gateway` (an EZiL AI refusal relayed by the proxy), `transport` (a deadline or
+ * connection failure on the way, or an HTTP error neither of them wrote) or `response` (a reply that arrived but
+ * was truncated, incomplete or malformed).
+ */
+export type GatewayErrorOrigin = 'local' | 'os_proxy' | 'gateway' | 'transport' | 'response';
+
+/** A gateway (or OS proxy, or local) refusal, carrying what the UI and the log need. */
 export class GatewayError extends Error {
     constructor(
         message: string,
@@ -32,6 +40,9 @@ export class GatewayError extends Error {
         public readonly code: string | undefined,
         public readonly requestId: string | undefined,
         public readonly retryAfterSeconds?: number,
+        public readonly origin: GatewayErrorOrigin = 'gateway',
+        /** Local refusals only: sizes, never payload text. */
+        public readonly counts?: LocalRequestCounts,
     ) {
         super(message);
         this.name = 'GatewayError';
@@ -184,7 +195,19 @@ export function creditState(models: GatewayModels | undefined, balance: GatewayB
 
 type ErrorBody = { code?: string; message?: string; request_id?: string; reason?: string; pause?: string; param?: string;
     no_live_grant?: boolean; available_micro?: number; hold_micro?: number; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
-    input_bound_tokens?: number; max_input_tokens?: number; status?: string };
+    input_bound_tokens?: number; max_input_tokens?: number; status?: string; source?: string };
+
+/**
+ * Who wrote an HTTP refusal. The OS proxy marks its own bodies `source: "ezil-os-proxy"` and uses `os_` codes
+ * (worker/src/ai-proxy.ts proxyError). It relays Gateway refusals rebuilt from an allow-list that never copies
+ * `source` and never admits an `os_` code (safeGatewayError). A body without a code came from neither.
+ */
+export function errorOrigin(body: ErrorBody): GatewayErrorOrigin {
+    if (body.source === 'ezil-os-proxy' || (typeof body.code === 'string' && body.code.startsWith('os_'))) return 'os_proxy';
+    return typeof body.code === 'string' ? 'gateway' : 'transport';
+}
+
+const NOTHING_CHARGED = 'and your conversation history is kept. You can switch to another model or start a new chat';
 
 export function parseErrorBody(text: string): ErrorBody {
     try {
@@ -204,7 +227,15 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
     const requestId = body.request_id ?? headerRequestId ?? undefined;
     const ref = requestId ? ` (request ${requestId})` : '';
     const code = body.code;
-    const make = (message: string) => new GatewayError(`EZiL AI: ${message}${ref}`, status, code, requestId, retryDelay(retryAfter));
+    const origin = errorOrigin(body);
+    const make = (message: string) => new GatewayError(`${origin === 'os_proxy' ? 'EZiL OS' : 'EZiL AI'}: ${message}${ref}`, status, code, requestId, retryDelay(retryAfter), origin);
+    const tooLarge = () => {
+        if (origin === 'os_proxy') return make(`This request is larger than the 160 KiB EZiL OS forwards. Nothing was sent to EZiL AI or charged, ${NOTHING_CHARGED}`);
+        if (origin === 'transport') return make(`This request was refused as too large (HTTP ${status}) before any model ran, so it was not charged, ${NOTHING_CHARGED}`);
+        const bound = Number.isSafeInteger(body.input_bound_tokens) && Number.isSafeInteger(body.max_input_tokens)
+            ? ` (input bound ${body.input_bound_tokens} > ${body.max_input_tokens} tokens)` : '';
+        return make(`This conversation is too large for ${alias}${bound}. EZiL AI refused it before the model ran, so it was not charged, ${NOTHING_CHARGED}`);
+    };
     if (body.reason === 'no_ezil_role' || code === 'no_ezil_role') return make('Your EZiL account has no AI access yet');
     switch (code) {
         case 'window_budget_reached': {
@@ -214,7 +245,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             const seconds = Number.isFinite(reset.getTime()) ? Math.max(0, Math.ceil(delay)) : undefined;
             return new GatewayError(`EZiL AI: This window's EZiL AI credits are used up. ${seconds === undefined
                 ? 'Check EZiL AI status for the reset time.' : `Resets at ${localResetTime(reset)} (local time).`}${ref}`,
-                status, code, requestId, seconds);
+                status, code, requestId, seconds, origin);
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
@@ -233,16 +264,16 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         // session means either no AI access on this account or no delivered sign-in yet: say both.
         case 'os_session_missing': return make('EZiL AI is not available here yet: this account has no EZiL AI access, or this computer has not received your sign-in. Reopen Code to retry');
         case 'os_session_expired': case 'access_token_expired': return make('Your OS sign-in has expired. Reopen Code or sign in again');
-        case 'os_proxy_unauthorized': return make('EZiL OS refused this computer’s AI connection. Restart the computer to reconnect');
+        case 'os_proxy_unauthorized': return make('This computer’s AI connection was refused. Restart the computer to reconnect');
         case 'unauthorized':
             if (body.reason === 'token_expired' || body.reason === 'expired') return make('Your AI sign-in has expired. Reopen Code or sign in again');
             if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
-        case 'os_ai_unavailable': return make('EZiL OS could not reach EZiL AI. Retry the request');
+        case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
         case 'not_a_member': case 'role_mismatch': case 'forbidden': return make('Your EZiL account does not have AI membership');
         case 'account_suspended': case 'suspended': return make('AI access is suspended for your EZiL account');
-        case 'input_too_large': case 'body_too_large': return make('Conversation too large — start a new chat');
+        case 'input_too_large': case 'body_too_large': return tooLarge();
         case 'unsupported_bedrock_converse_request': case 'unsupported_parameter': case 'invalid_request':
         case 'max_output_tokens_invalid': case 'idempotency_conflict': case 'idempotency_key_required':
             return make(`Internal EZiL Models bug (${code}); please report it`);
@@ -257,7 +288,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (status === 401) return make('The AI service refused authentication. Contact your administrator');
             if (status === 402) return make('No AI credits available');
             if (status === 403) return make('Your EZiL account does not have AI access');
-            if (status === 413) return make('Conversation too large — start a new chat');
+            if (status === 413) return tooLarge();
             return make(`AI request failed (${code ?? `HTTP ${status}`})`);
     }
 }
@@ -330,7 +361,7 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
     const started = performance.now();
     const timeout = (code: string, requestId?: string) => new GatewayError(
         `EZiL AI: ${code === 'first_byte_timeout' ? 'did not answer within 30 seconds' : 'the response stopped arriving'}. Retry the request${requestId ? ` (request ${requestId})` : ''}`,
-        undefined, code, requestId);
+        undefined, code, requestId, undefined, 'transport');
     const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), GATEWAY_FIRST_BYTE_TIMEOUT_MS, abort, timeout('first_byte_timeout'));
     if (!response.body) return response;
     const reader = response.body.getReader();
@@ -386,6 +417,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let status: number | undefined;
     let stopReason: string | undefined;
     let errorCode: string | undefined;
+    let errorOrigin: GatewayErrorOrigin | undefined;
+    let localCounts: LocalRequestCounts | undefined;
+    let attempted = false;
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
@@ -398,7 +432,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         if (responses) {
             const catalog = await gatewayModels(provider, doFetch, now(), options.signal);
             options.signal.throwIfAborted();
-            if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined);
+            if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined, undefined, 'local');
             model = withGatewayModelLimits(model, catalog);
         }
         const built = responses ? buildGatewayResponsesBody(model, request, log) : buildGatewayBody(model, request, log);
@@ -429,11 +463,12 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 attemptAbort = new AbortController();
                 let response: Response;
                 try {
+                    attempted = true;
                     response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort);
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
                     if (!retried) { retried = true; continue; }
-                    throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId);
+                    throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId, undefined, 'transport');
                 }
                 status = response.status;
                 hold = response.headers.get('x-ezil-hold-micro');
@@ -462,8 +497,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         if (event.type === 'stop') stopReason = event.reason;
                         yield event;
                     }
-                    if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId);
-                    if (stopReason === 'incomplete' || stopReason === 'failed') throw new GatewayError(`EZiL AI: Response ${stopReason} (request ${requestId ?? 'unknown'})`, status, `response_${stopReason}`, requestId);
+                    if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId, undefined, 'response');
+                    if (stopReason === 'incomplete' || stopReason === 'failed') throw new GatewayError(`EZiL AI: Response ${stopReason} (request ${requestId ?? 'unknown'})`, status, `response_${stopReason}`, requestId, undefined, 'response');
                     return;
                 }
                 // Body read failures happen after headers: never treat them as pre-header transport failures.
@@ -493,22 +528,54 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             }
             await (options.sleep ?? defaultSleep)(waitMs, options.signal);
         }
-    } catch (error) {
+    } catch (caught) {
         if (options.signal.aborted) return;
-        if (attemptAbort.signal.reason instanceof GatewayError) error = attemptAbort.signal.reason;
-        errorCode = error instanceof GatewayError || error instanceof GatewayResponseError ? error.code : status === undefined ? 'invalid_request' : 'stream_interrupted';
-        if (error instanceof GatewayError || error instanceof GatewayResponseError) throw error;
-        if (status !== undefined) throw new GatewayResponseError(requestId);
-        throw new GatewayError('Conversation too large or invalid — start a new chat', undefined, errorCode, requestId);
+        let error: unknown = attemptAbort.signal.reason instanceof GatewayError ? attemptAbort.signal.reason : caught;
+        if (error instanceof LocalRequestError) error = localRefusal(model, error);
+        else if (!(error instanceof GatewayError || error instanceof GatewayResponseError)) {
+            // Only a failure before any send is local; once a request may have left, it is an interrupted response.
+            error = status !== undefined || attempted ? new GatewayResponseError(requestId) : new GatewayError(
+                `EZiL Models: internal error while preparing the request (${errorName(error)}); nothing was sent or charged. Please report it (local_build_error)`,
+                undefined, 'local_build_error', undefined, undefined, 'local');
+        }
+        const failure = error as GatewayError | GatewayResponseError;
+        errorCode = failure.code;
+        errorOrigin = failure.origin;
+        localCounts = failure instanceof GatewayError ? failure.counts : undefined;
+        throw failure;
     } finally {
         options.signal.removeEventListener('abort', cancelAttempt);
         attemptAbort.abort();
         const cancelled = options.signal.aborted;
+        // Metadata only: local refusals add their sizes, never content.
         log(JSON.stringify({ request_id: requestId ?? null, model: model.model, stream, hold, http_status: status ?? null,
             latency_ms: Math.max(0, now() - started), usage: { input: used.inputTokens, output: used.outputTokens, cache_read: used.cacheReadTokens, cache_write: used.cacheWriteTokens },
-            stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null,
+            stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : errorOrigin ?? null,
+            ...(!cancelled && localCounts ? { body_bytes: localCounts.bodyBytes, limit_bytes: localCounts.limitBytes, messages: localCounts.messages,
+                max_blocks: localCounts.maxBlocks, tools: localCounts.tools, tool_bytes: localCounts.toolBytes } : {}),
             ...(cancelled ? { notice: `cancelled; may still be charged (request ${requestId ?? 'unknown'})` } : {}) }));
     }
+}
+
+/** An exception's class name only: its message may quote request content. */
+function errorName(error: unknown): string {
+    const name = error instanceof Error ? error.name : typeof error;
+    return /^[A-Za-z0-9_$]{1,64}$/.test(name) ? name : 'Error';
+}
+
+const bytes = (value: number) => value.toLocaleString('en-US');
+
+/** The user-facing text of a local refusal: what was measured, that nothing left this computer, what to do. */
+function localRefusal(model: ResolvedModel, error: LocalRequestError): GatewayError {
+    const c = error.counts;
+    const kept = 'Nothing was sent or charged, and your conversation history is kept.';
+    const text = error.code === 'local_input_too_large'
+        ? `This conversation is too large to send to ${model.name}: ${bytes(c.bodyBytes)} bytes, including ${bytes(c.toolBytes)} bytes of tool definitions; `
+            + `the limit is ${bytes(c.limitBytes)} bytes. ${kept} You can switch to another model or start a new chat.`
+        : error.code === 'local_too_many_messages'
+            ? `This conversation has ${bytes(c.messages)} messages, more than EZiL AI accepts in one request. ${kept} You can start a new chat.`
+            : `One message in this conversation has ${bytes(c.maxBlocks)} parts, more than EZiL AI accepts in one message. ${kept} You can start a new chat.`;
+    return new GatewayError(`EZiL Models: ${text} (${error.code})`, undefined, error.code, undefined, undefined, 'local', c);
 }
 
 /** For the "Show AI credits" command: models + balance + the §7 state for `alias`. */
