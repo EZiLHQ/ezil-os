@@ -71,26 +71,80 @@ Facts from the pinned 0.69.0 bundle (pristine `extension.js` sha256 `e32a017f…
 | `summarize-scope` | `I`'s definition, then `B`, then `U`'s head, then `U`'s render, all within 4096 characters, and nothing between `I` and the render that may bind another `I` (`let/const/var I`, `I=>`, `(I,`, `,I)`, `,I=`) | — | — | before and after |
 
 Effect: `U` renders the summary and the rounds kept after it in the same budget as the normal
-render, so the request it builds fits with its tools. Its tool-result cap follows `I`, as the
-normal render's already does; this is no new truncation. The summary request is unchanged (full
-endpoint, no tools). With no tools `U` is upstream's. `y` is false for EZiL models: an extension
-model's `apiType` comes only from `capabilities.apiType` (the `Ok` endpoint constructor), the
-extension host passes it on only when the provider declares one, and
-`extensions/ezil-models/src/provider.ts` declares none. Re-check this Part if that changes.
+render, so the request it builds fits with its tools. The summary request is unchanged (full
+endpoint, no tools). With no tools `U` is upstream's. `U`'s tool-result cap follows `I`: it equals
+the normal render's cap, but it is lower than upstream `U`'s (`floor(I × 0.5)` instead of 60,240;
+numbers below). A result over the cap is cut in that one request, which carries the marker
+`[Tool response was too long and was truncated.]`; the stored result is intact.
+
+Why `U` throws instead of pruning (read from the bundle, not executed): `U` spreads the normal
+render's props `T`. `T.enableCacheBreakpoints` is `_ && !D` (`D = apiType === "messages"`), which is
+true for EZiL models. The last cache breakpoint sits on the last tool result, and prompt-tsx's
+pruning discards every candidate before a node that holds a breakpoint, so an over-budget `U` raises
+`BudgetExceeded`. Only `B` sets `enableCacheBreakpoints: false`, so only `B` prunes.
+
+`y` and `D` are false for EZiL models: an extension model's `apiType` comes only from
+`capabilities.apiType` (the `Ok` endpoint constructor), the extension host passes it on only when
+the provider declares one, and `extensions/ezil-models` declares none. Re-check this Part if it ever
+declares any `apiType`:
+
+- `responses` with `chat.advanced.useResponsesApiTruncation` makes `E` unbounded (`y`).
+- `messages` sets `D`. That turns cache breakpoints off for the normal render and `U`, so they
+  prune older rounds out of the request silently instead of throwing and summarizing, and this
+  Part's analysis no longer holds. The tool-call round element's thinking-in-history choice also
+  reads `apiType`.
+
+The offline test fails on any `apiType` in `extensions/ezil-models/src`, whatever its value or form.
 
 When `U` does not fit: a summary larger than its share of `I` (`Summary too large`) or a
 post-summary prompt still over `I` records a failed foreground summarization on the turn and falls
 to `B`; later renders in that turn go straight to `B` ("skipping repeated foreground summarization
-after prior failure"). The summary request has already been sent, and charged, before that check,
-as upstream whenever a summary fails.
+after prior failure"). The summary request has already been sent, and charged, before either
+check, as upstream whenever a summary fails. As upstream, the summarizer writes the summary onto
+the summarized round object before the render that fails, so a later render that honours round
+summaries can still use it (read, not executed). The share can be small: with 64 tools `I` is
+27,304 (below) and the system prompt and other fixed parts take part of it, so a long Kimi summary
+(`maxOutputTokens` 4096) counted in bytes can exceed its share (read, not executed).
 
-**Release order.** `I` is only as large as Copilot's tool count leaves it. With ezil-models as of
-7b95bcd9, `provideTokenCount(string)` counts every tool key and value as a JSON text block (1.65×
-the real bytes), so `I` is 29,003 for 39 tools and 1 for 64. Until that changes, `U` at `I` fails
-where `U` at 120480 succeeds today (post-summary prompts between `I` and about 76 KB) and the turn
-moves to `B`. Ship this Part together with, or after, the ezil-models honest string count (a
-count without the text-block wrapper puts `I` near 59,000 for 39 tools; recompute with the formula
-that ships).
+**Release order and the residual band.** `I` is only as large as Copilot's tool count leaves it.
+For the shipped catalogue (Qwen and Kimi, Messages protocol, `h` = 120480), ezil-models sends a
+request only when its body + 1056 ≤ 131072 bytes and otherwise refuses it locally
+(`local_input_too_large`, `buildGatewayBody`). Copilot counts through ezil-models'
+`provideTokenCount`, in bytes:
+
+| tools (real bytes) | `p` / `I`, ezil-models as of 7b95bcd9 | `p` / `I`, string count of 2048e710 (VSIX 4f1245a2) | prompt that fits with the tools | residual band with the 2048e710 count |
+|---|---|---|---|---|
+| 39 (53,535) | 88,254 / 29,003 | 57,539 / 56,646 | ~76,481 | (56,646, ~76,481] |
+| 64 (83,921) | — / 1 | 90,142 / 27,304 | ~46,095 | (27,304, ~46,095] |
+
+`I = max(1, floor((120480 − p) × 0.9))`; the fitting prompt is 131072 − 1056 − the real tool bytes,
+less the request envelope. `p` for 2048e710 is that commit's measurement over the 39 agent tools
+captured from Copilot Chat 0.67 requests (64 = those plus 25 renamed copies); the numbers move with
+the tool set.
+
+The release order narrows the band; it does not close it. For a post-summary prompt inside the
+band, upstream `U` at 120480 builds it and it fits with the tools. Patched `U` throws
+`BudgetExceeded` after the summary request was sent and charged. The turn records
+`{source: "foreground", outcome: "budgetExceeded"}` and `B` renders the rest of the turn: the
+current turn's rounds unsummarized (earlier turns keep summaries already stored on them), at
+120480, tools not subtracted. `B` succeeds only when that
+prompt fits the model's bound. Usually it does not, because it is larger than the post-summary
+prompt that was already over `I`. ezil-models then refuses it locally: nothing is sent for that
+request, and with the ezil-models error change the refusal is a precise local error. Upstream
+succeeds there.
+
+The gain: `U`'s tool-result cap falls from 60,240 to `floor(I × 0.5)`, which is 28,323 for 39
+tools and 13,652 for 64 with the 2048e710 count (14,501 for 39 with today's count). A single large
+last-round result that upstream `U` kept whole, and ezil-models refused with the tools, now fits. It
+is cut in that request with the marker, and the stored result is intact.
+
+Release gate: ship this Part only in an image that also installs the ezil-models VSIX 4f1245a2 or
+later. `worker/Dockerfile` installs the committed `worker/ezil-models/dist/ezil-models-0.1.0.vsix`,
+so source commit 2048e710 alone changes nothing in the image. With today's VSIX, 64 tools give
+`I` = 1, so every render is over budget: each turn sends a charged summary that cannot fit, then
+goes to `B`. Nothing
+in this script enforces the order. The band above remains with the right VSIX, and shipping this
+Part means accepting it.
 
 **What `B` does after this change.** `B` is not patched; it is upstream "rendering without
 summarization", reached after a failed `U`, after a background summary whose re-render still
@@ -116,9 +170,11 @@ COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/s
 It checks that `U` renders with `I` while the summarizer keeps the full endpoint, that the unpatched
 bundle renders `U` at 120480 (negative control), that `B` renders at the full endpoint after a failed
 `U` and after a prior failure and raises upstream's error when over, that no tools leave `U`
-upstream, that `y` is false for EZiL models, and that the gates reject a restored `U`, a patched `B`,
-a moved `I` and a rebound `I`. Not executed: prompt-tsx's budget enforcement and `vn.create`
-installing `IPromptEndpoint` (read from the bundle as above).
+upstream, that `y` and `D` are false for EZiL models (with a Responses control that makes `E`
+unbounded and a Messages control that turns cache breakpoints off), that no ezil-models source
+mentions `apiType`, and that the gates reject a restored `U`, a patched `B`, a moved `I` and a
+rebound `I`. Not executed: prompt-tsx's budget enforcement and cache-breakpoint pruning rule, and
+`vn.create` installing `IPromptEndpoint` (read from the bundle as above).
 
 ## Part 2 — "EZiL Chat" branding (strings only)
 
