@@ -318,7 +318,7 @@ STATUS_MESSAGE_KEYS = frozenset({"op", "leaseEpoch", "ts", "seq", "mac", "jobId"
 # The kernel and helper, sha256-pinned (byte-equal to worker/src/repo-open-assets; tested).
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo_open_assets")
 REPO_OPEN_ASSETS = {
-    "ezil-repo-open.mjs": "6c0eb42d1721dc203ace1ec74ec82bd18cd49bb699b1e2dbd7617d59725d6f39",
+    "ezil-repo-open.mjs": "865f697485409a338e3ac2c531791e17b5b1d25d2036ba948df9389d87a7e108",
     "ezil-git-grant.mjs": "5de6b39aeb9ecbdc03cf3334e45047652b7249f0a395227deea92000f61ba55e",
 }
 ASSET_MAX_BYTES = 262144
