@@ -12,9 +12,11 @@
 //      (`ezil_mint`) that rides the bootstrap URL into the mint's FIRST
 //      document only (code-server's own redirect keeps it; VS Code's Open
 //      Folder drops it).
-//   4. Shows a visible notice when the server could not reopen the folder,
-//      and keeps the record so the next mint asks again (a transient miss
-//      never erases it; only Close Folder, a new folder or "Forget it" do).
+//   4. Shows a visible notice whenever a mint that asked for a folder did not
+//      open exactly that folder in its first document (another folder, an
+//      empty window, a workspace, a foreign or unreadable folder), and keeps
+//      the record so the next mint asks again (a transient miss never erases
+//      it; only Close Folder, a new folder or "Forget it" do).
 //
 // The editor's report is a HINT. Authority is the next mint's server-side
 // resolution: the Worker strips the computer's own root and walks the rest on
@@ -42,6 +44,16 @@ const OUTCOME_RE = /^[a-z_]{1,32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Server outcomes that opened something other than the asked folder (codes only; never a path). */
 const FALLBACKS = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error']);
+
+/**
+ * The notice code for a mint that asked for a folder and whose first document opened something else. Shell-local
+ * codes, never on the wire: `not_reopened` when the server said `restored` (the editor still opened another thing),
+ * `unsupported_server` when the server answered no code it knows (an older Worker or app ignored the ask).
+ */
+function fallbackCode (outcome) {
+    if ( FALLBACKS.has(outcome) ) return outcome;
+    return outcome === 'restored' ? 'not_reopened' : 'unsupported_server';
+}
 
 const utf8 = (s) => new TextEncoder().encode(s).length;
 
@@ -190,6 +202,8 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  *     person navigated to inside the frame (user-driven);
  *   - anything else (a stale document of an earlier mint, a first document
  *     that has not reported yet): dropped without a word.
+ * A mint-driven report that is not exactly the asked folder shows the notice
+ * once for this binding and leaves the record as it was.
  */
 export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
     bridges.get(iframe)?.detach();
@@ -204,6 +218,7 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
     mints.delete(mintId);
     let nonce = null;
     let firstSeen = false;
+    let fallbackShown = false; // the first document answers each hello (attach, ready, load): one notice per mint
     const live = () => iframe.isConnected && iframe.src === frameUrl;
     const hello = () => {
         if ( ! live() ) { detach(); return; }
@@ -221,15 +236,21 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
         const mintDriven = d.mint === mintId;
         if ( ! mintDriven && ! (d.mint === null && firstSeen) ) return;
         firstSeen = true;
+        if ( mintDriven && mint.asked && ! (d.kind === 'folder' && plainFolderPath(d.path) === mint.asked) ) {
+            // The mint asked for a folder and its first document opened anything else: another folder, an empty
+            // window, a workspace, a folder of another host or one the grammar refuses. The editor's provider fixes
+            // this document's workspace synchronously from its URL at startup, so this is the final answer for the
+            // mint, not a "not hydrated yet". Say so (visible), and keep the record untouched so the next mint asks
+            // again (a missing mount that comes back, an older server that ignored the ask). Never erased here.
+            if ( ! fallbackShown ) {
+                fallbackShown = true;
+                notice?.fallback?.(fallbackCode(mint.outcome), mint.asked);
+            }
+            return;
+        }
         if ( d.kind === 'folder' ) {
             const path = plainFolderPath(d.path);
             if ( ! path ) { putFolderRecord(bind, { kind: 'unsupported', reason: 'path' }); return; }
-            if ( mintDriven && mint.asked && path !== mint.asked ) {
-                // The mint did not reopen the asked folder: say so (visible), and keep the record so the next mint
-                // asks again (a missing mount that comes back, an older server that ignored the ask).
-                notice?.fallback?.(FALLBACKS.has(mint.outcome) ? mint.outcome : 'unsupported_server', mint.asked);
-                return;
-            }
             if ( mintDriven && bind.project ) {
                 // r32: a project reopens at its repository folder; a child opened by hand is not reopened as the
                 // root (the repository's own config stays inert). Say so once, then follow what is on screen.
@@ -258,18 +279,21 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
 
 // ── the notice (visible, recoverable; text only, never markup) ─────────────
 const COPY = {
-    missing: (n) => `Couldn't reopen “${n}”: it isn't on this computer right now. Code opened its usual folder. Nothing was deleted; unsaved changes stay with that folder and come back when you open it again.`,
+    // No copy promises that unsaved changes come back: code-server keeps its hot-exit backups in its user-data
+    // directory, which a Cloudflare container recreates on every start. "Nothing was deleted" is what is known.
+    missing: (n) => `Couldn't reopen “${n}”: it isn't on this computer right now. Code opened its usual folder. Nothing was deleted.`,
     not_directory: (n) => `Couldn't reopen “${n}”: it isn't a folder right now. Code opened its usual folder. Nothing was deleted.`,
     symlink: (n) => `“${n}” is reached through a link. Code reopens real folders inside your workspace only. Open it from File > Open Recent.`,
     outside: (n) => `“${n}” is outside your workspace, so it isn't reopened automatically. Open it from File > Open Recent.`,
     not_allowed: (n) => `“${n}” belongs to a project or to EZiL. Open the project to work there.`,
     too_long: (n) => `“${n}” is too deep to reopen automatically. Open it from File > Open Recent.`,
     unverified: (n) => `Code couldn't check “${n}” on this computer yet, so it opened its usual folder.`,
+    not_reopened: (n) => `Code didn't reopen “${n}” this time, so it opened its usual folder. Nothing was deleted.`,
     unsupported: () => 'Code reopens single folders only; your workspace is still in File > Open Recent.',
-    child: (n) => `This project reopened at its folder. “${n}” isn't reopened automatically, so the repository's own settings stay off. Open it from File > Open Recent; its unsaved changes come back with it.`,
+    child: (n) => `This project reopened at its folder. “${n}” isn't reopened automatically, so the repository's own settings stay off. Open it from File > Open Recent.`,
 };
 COPY.invalid = COPY.unsupported;
-const RETRYABLE = new Set(['missing', 'not_directory', 'unverified', 'error', 'unsupported_server']);
+const RETRYABLE = new Set(['missing', 'not_directory', 'unverified', 'error', 'unsupported_server', 'not_reopened']);
 
 /**
  * The notice band for one Code window: `role=status`, text only. `retry`

@@ -4,7 +4,8 @@
 //   - the instance binding: mint id + per-hello nonce + origin + source + unchanged src,
 //     in BOTH load orderings, and a stale earlier document dropped;
 //   - the record rules (a transient miss never erases; Close Folder clears; multi-root
-//     announced; a project child announced, never asked);
+//     announced; a project child announced, never asked; an ask whose first document
+//     opened anything else is always said, once per mint);
 //   - the notice band (text only, actions wired);
 //   - storage that throws never breaks the window.
 //
@@ -122,12 +123,48 @@ F.load(); report(null, 'empty'); eq(M.folderAskFor(bind), undefined, 'Close Fold
 F.load(); report(null, 'workspace'); eq(M.readFolderRecord(bind).kind, 'unsupported', 'multi-root marked');
 url = mintAndAttach('t6', M.folderAskFor(bind), undefined);
 eq(notices.at(-1), ['unsupported', null], 'multi-root announced'); eq(M.readFolderRecord(bind), null, 'then dropped');
-// 11b a mint-driven empty/workspace never erases the record (the editor may not have hydrated yet)
+// 11b a mint-driven empty after an ask never erases the record, and it is SAID: the bridge reads the workspace
+//     synchronously from the document's URL at startup, so an empty first document is the mint's final answer.
+//     The server said restored, so the shell-local not_reopened (never the "couldn't check" text).
 F.load(); report(mintOf(url), 'folder', '/workspace/keep'); url = mintAndAttach('t6b', M.folderAskFor(bind), { v: 1, outcome: 'restored' });
+before = notices.length;
 F.load(); report(mintOf(url), 'empty'); eq(M.folderAskFor(bind), { v: 1, path: '/workspace/keep' }, 'mint-driven empty keeps the record');
+eq(notices.slice(before), [['not_reopened', '/workspace/keep']], 'restored, but the first document is empty: not_reopened notice');
 // 11c an invalid path from the editor never becomes an ask
 F.load(); report(null, 'folder', '/workspace/../etc'); eq(M.folderAskFor(bind), undefined, 'invalid path stored as unsupported, never asked');
 eq(M.readFolderRecord(bind).kind, 'unsupported', 'unsupported:path');
+// 11d EVERY first document that is not exactly the asked folder shows the notice and leaves the record untouched:
+//     empty, workspace, foreign, a path the grammar refuses, another folder (review-folder blocking finding)
+M.forgetFolder(bind);
+url = mintAndAttach('t9', undefined, undefined); F.load(); report(mintOf(url), 'folder', '/workspace/sub');
+eq(M.folderAskFor(bind), { v: 1, path: '/workspace/sub' }, 'seeded /workspace/sub');
+for ( const [kind, path] of [['empty'], ['workspace'], ['foreign'], ['folder', '/workspace/../etc'], ['folder', '/workspace']] ) {
+    const what = `asked, first document ${kind}${path ? ` ${path}` : ''}`;
+    url = mintAndAttach(`t9-${kind}`, M.folderAskFor(bind), { v: 1, outcome: 'unverified' }); before = notices.length;
+    F.load(); report(mintOf(url), kind, path);
+    eq(notices.slice(before), [['unverified', '/workspace/sub']], `${what}: the notice is shown`);
+    eq(M.readFolderRecord(bind)?.kind, 'folder', `${what}: the record stays a folder`);
+    eq(M.folderAskFor(bind), { v: 1, path: '/workspace/sub' }, `${what}: the next mint asks again`);
+}
+// 11e one notice per mint, even when the first document answers more than one hello (attach, ready, load); a later
+//     Open Folder by hand in that window still records
+url = mintAndAttach('t10', M.folderAskFor(bind), { v: 1, outcome: 'missing' }); before = notices.length;
+F.load(); report(mintOf(url), 'empty'); fire({ type: 'ezil.code.ready', v: 1 }); report(mintOf(url), 'empty');
+eq(notices.slice(before), [['missing', '/workspace/sub']], 'one notice for the mint, not one per hello');
+F.load(); report(null, 'folder', '/workspace/other'); eq(M.folderAskFor(bind), { v: 1, path: '/workspace/other' }, 'then a hand-opened folder records');
+// 11f restored, but a workspace or another folder opened: not_reopened (shell-local), never "couldn't check"
+url = mintAndAttach('t11', M.folderAskFor(bind), { v: 1, outcome: 'restored' }); F.load(); report(mintOf(url), 'workspace');
+eq(notices.at(-1), ['not_reopened', '/workspace/other'], 'restored + workspace: not_reopened');
+url = mintAndAttach('t11b', M.folderAskFor(bind), { v: 1, outcome: 'restored' }); F.load(); report(mintOf(url), 'folder', '/workspace');
+eq(notices.at(-1), ['not_reopened', '/workspace/other'], 'restored + another folder: not_reopened');
+eq(M.folderAskFor(bind), { v: 1, path: '/workspace/other' }, 'and the record is kept');
+// 11g a mint that asked nothing stays silent whatever its first document is, and writes nothing for empty/workspace
+M.forgetFolder(bind);
+for ( const kind of ['empty', 'workspace', 'foreign'] ) {
+    url = mintAndAttach(`t12-${kind}`, M.folderAskFor(bind), undefined); before = notices.length;
+    F.load(); report(mintOf(url), kind);
+    eq(notices.length, before, `no ask, first document ${kind}: no notice`); eq(M.readFolderRecord(bind), null, `no ask, ${kind}: nothing written`);
+}
 // 12 a project tab never asks; a hand-opened child is announced once on the next mint, then follows the screen
 const pb = { userId: 'u1', computerId: 'c1', project: { projectId: '0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b', repoId: '1b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b' } };
 const PF = `/workspace/projects/${pb.project.repoId}`;
@@ -174,6 +211,15 @@ nb.projectChild(`${PF}/repository/web`); eq(body.children.at(-1).children.slice(
 nb.fallback('symlink', '/workspace/link'); eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Forget it', 'Dismiss'], 'symlink: not retryable');
 nb.fallback('unsupported', null); eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Dismiss'], 'unsupported: Dismiss');
 nb.fallback('too_long', `/workspace/${'x'.repeat(300)}`); ok(body.children.at(-1).children[0].textContent.includes('…'), 'a long path is shortened');
+nb.fallback('not_reopened', '/workspace/sub');
+eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Try again', 'Forget it', 'Dismiss'], 'not_reopened: Try again, Forget it, Dismiss');
+ok(/didn't reopen “\/workspace\/sub”/.test(body.children.at(-1).children[0].textContent), 'not_reopened has its own text');
+// No notice promises unsaved changes back (hot-exit backups live in code-server's user-data dir, which a Cloudflare
+// container recreates on start); "Nothing was deleted" is what is known.
+for ( const code of ['missing', 'not_directory', 'unverified', 'not_reopened', 'outside', 'symlink', 'child'] ) {
+    if ( code === 'child' ) nb.projectChild('/workspace/projects/x/repository/web'); else nb.fallback(code, '/workspace/sub');
+    ok(! /unsaved|come back/i.test(body.children.at(-1).children[0].textContent), `${code}: no recovery promise`);
+}
 nb.close(); ok(body.children.at(-1).removed, 'close');
 
 // ── storage that throws never breaks the window ─────────────────────────────
