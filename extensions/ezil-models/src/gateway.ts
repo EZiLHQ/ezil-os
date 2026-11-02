@@ -22,15 +22,15 @@ export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
  * reads the upstream body and settles before sending headers), so a 30 s first-byte deadline would cap every
  * Kimi reply at 30 s. Bounded instead by one completion deadline from the request's first send (only a transport
  * failure within its first 30 s is resent, and the resend shares it; see gatewayChat), the same value as the OS proxy's
- * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts) and strictly below the Gateway's 180 s upstream
- * headers deadline (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS). That clock starts only
- * at the Gateway's upstream fetch, after admission, and on expiry the Gateway answers 504 upstream_timeout with
- * the request pending and its hold kept. Staying below it makes this deadline, with its own code and wording,
- * the one that ends a long wait instead of racing that refusal; the 30 s gap absorbs admission, the body read
- * and settlement after generation, and the two hops (container -> OS proxy -> Gateway). A reply abandoned here
- * may still be charged if the model finished. Streaming deadlines are unchanged.
+ * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts) and below the Gateway's 180 s upstream headers
+ * deadline (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS), which starts only at its
+ * upstream fetch, after admission. When a client leaves, the Gateway keeps the upstream call for a 20 s drain;
+ * a call still unanswered after that becomes upstream_timeout, pending, and disables that model route for
+ * everyone. 165 + 20 >= 180, so abandoning here never pauses a route earlier than the Gateway's own deadline
+ * would (agreed with the Gateway owner, 2 Nov 2026); a shorter deadline would turn 150-180 s replies into route
+ * pauses. A reply abandoned here may still be charged if the model finished. Streaming deadlines are unchanged.
  */
-export const GATEWAY_COMPLETION_TIMEOUT_MS = 150_000;
+export const GATEWAY_COMPLETION_TIMEOUT_MS = 165_000;
 /** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */
 export const GATEWAY_MAX_IN_FLIGHT = 2;
 const CONCURRENCY_WAIT_BUDGET_MS = 60_000;

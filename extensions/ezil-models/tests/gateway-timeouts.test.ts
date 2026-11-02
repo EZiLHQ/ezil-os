@@ -126,7 +126,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
         const proxy = readFileSync(`${import.meta.dir}/../../../worker/src/ai-proxy.ts`, 'utf8');
         const value = /export const AI_PROXY_COMPLETION_TIMEOUT_MS = ([\d_]+);/.exec(proxy)?.[1];
         expect(Number(value?.replaceAll('_', ''))).toBe(GATEWAY_COMPLETION_TIMEOUT_MS);
-        expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBe(150_000);
+        expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBe(165_000);
         expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBeLessThan(180_000);
         expect(GATEWAY_FIRST_BYTE_TIMEOUT_MS).toBe(30_000);
     });
@@ -149,7 +149,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
         await advance(1);
         const error = await result;
         expect([error.code, error.origin]).toEqual(['completion_timeout', 'transport']);
-        expect(error.message).toBe('EZiL AI: no complete reply within 150 seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). '
+        expect(error.message).toBe('EZiL AI: no complete reply within 165 seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). '
             + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
         expect(signal?.aborted).toBe(true); expect(calls).toBe(1);
         expect(JSON.parse(logs[0]!)).toMatchObject({ error_code: 'completion_timeout', origin: 'transport', stream: false });
@@ -209,7 +209,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
             await advance(GATEWAY_FIRST_BYTE_TIMEOUT_MS);
             expect(resent().at(-1)?.type).toBe('stop'); expect(edge.posts).toHaveLength(2);
         }));
-        test('a reject at 10 s is resent once, with the same key and bytes, and the resend gets only what is left of 150 s', async () => fakeClock(async (advance, now) => {
+        test('a reject at 10 s is resent once, with the same key and bytes, and the resend gets only what is left of 165 s', async () => fakeClock(async (advance, now) => {
             let signal: AbortSignal | undefined;
             const s = failingThen(10_000, now, () => new Promise<Response>(() => {}));
             const fetch = (async (url: string, init: RequestInit) => { signal = init.signal ?? undefined; return s.fetch(url, init); }) as unknown as typeof globalThis.fetch;
@@ -225,7 +225,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
             expect([error.code, error.origin, at]).toEqual(['completion_timeout', 'transport', GATEWAY_COMPLETION_TIMEOUT_MS]);
             expect(signal?.aborted).toBe(true); expect(s.posts).toHaveLength(2);
         }));
-        test('a resend whose headers arrive at 145 s must still finish its body by 150 s', async () => fakeClock(async (advance, now) => {
+        test('a resend whose headers arrive at 145 s must still finish its body by 165 s', async () => fakeClock(async (advance, now) => {
             let cancelled = false; let at = -1;
             const s = failingThen(10_000, now, async () => {
                 await new Promise(resolve => setTimeout(resolve, 135_000));
@@ -239,7 +239,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
             expect([error.code, error.requestId, at]).toEqual(['completion_timeout', 'late-body', GATEWAY_COMPLETION_TIMEOUT_MS]);
             expect(cancelled).toBe(true); expect(s.posts).toHaveLength(2);
         }));
-        test('a resend still waiting for an admission slot at 150 s fails there and is never sent', async () => fakeClock(async (advance, now) => {
+        test('a resend still waiting for an admission slot at 165 s fails there and is never sent', async () => fakeClock(async (advance, now) => {
             const s = failingThen(10_000, now, () => new Promise<Response>(() => {}));
             let holderCalls = 0;
             const holderFetch = (async () => { holderCalls++; return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } }); }) as unknown as typeof fetch;
@@ -261,7 +261,7 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
                 expect(s.posts).toHaveLength(1);
             } finally { await Promise.all(holders.map(g => g.return(undefined))); }
         }));
-        test('a 429 refusal of the resend means nothing ran, so the attempt after it gets its own 150 s', async () => fakeClock(async (advance, now) => {
+        test('a 429 refusal of the resend means nothing ran, so the attempt after it gets its own 165 s', async () => fakeClock(async (advance, now) => {
             let at = -1;
             const s = failingThen(10_000, now, async () => s.posts.length === 2
                 ? new Response(JSON.stringify({ error: { code: 'concurrency_limit' } }), { status: 429, headers: { 'retry-after': '1' } })

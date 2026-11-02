@@ -95,7 +95,7 @@ transport failure more than 30 seconds after it was sent is never resent (EZiL A
 may already be running it; a same-key resend could only be refused as a replay).
 It fails with `connection_lost`, which says the request may still be charged.
 An earlier JSON failure is resent within what is left of the request's
-150-second deadline (below). If a resend is answered `idempotency_replay`, the
+165-second deadline (below). If a resend is answered `idempotency_replay`, the
 first send had reached EZiL AI: the message says its reply was lost on the way
 and may still be charged, instead of "already processed".
 No 401, 5xx, replay, credit-budget refusal, or stream failure is retried.
@@ -107,13 +107,15 @@ Errors name where they arose. Chat shows every failure under the provider's
 Gateway). `EZiL AI:` marks a Gateway refusal relayed by the proxy, or a deadline
 or interruption on the way; Gateway 413s show the input bound when sent. Streams must send a first byte within
 30 seconds and then a chunk at least every 30 seconds, per attempt. A
-nonstreaming (JSON) request instead has one 150-second completion deadline,
+nonstreaming (JSON) request instead has one 165-second completion deadline,
 counted from when it was first sent, because the Gateway sends JSON headers
 only after the whole generation. A transport resend of that request shares the
 deadline, including any wait for an admission slot, and nothing is sent after
 it. Only an attempt after a 429 refusal, which EZiL AI answers before anything
-runs, starts a new deadline. The OS proxy uses the same 150 seconds for JSON
-request bodies, below the Gateway's 180-second upstream deadline. A reply
+runs, starts a new deadline. The OS proxy uses the same 165 seconds for JSON
+request bodies. With the Gateway's 20-second drain after a client leaves, that
+never pauses a model route earlier than the Gateway's own 180-second upstream
+deadline would. A reply
 abandoned at that deadline fails with `completion_timeout`
 (`os_completion_timeout` from the proxy) and may still be charged if the model
 finished. Neither deadline adds a retry.

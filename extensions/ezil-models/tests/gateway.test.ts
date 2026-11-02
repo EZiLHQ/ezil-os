@@ -369,7 +369,7 @@ describe('local refusals and error origin', () => {
             expect([e.origin, e.message.slice(0, 9)]).toEqual(['os_proxy', 'EZiL OS: ']);
         }
         const timeout = describeGatewayError(KIMI, 504, null, { code: 'os_completion_timeout', source: 'ezil-os-proxy' }, null);
-        expect(timeout.message).toContain('No complete reply from EZiL AI within 150 seconds');
+        expect(timeout.message).toContain('No complete reply from EZiL AI within 165 seconds');
         expect(timeout.message).toContain('may still be charged if the model finished');
         // A refusal without a code was written by neither (an edge page on the way).
         expect(errorOrigin(parseErrorBody('<html>bad gateway</html>'))).toBe('transport');

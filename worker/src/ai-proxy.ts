@@ -13,14 +13,15 @@ export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
  * Headers deadline for a non-stream (JSON) POST only. The Gateway sends a JSON reply's headers after the whole
  * generation (jsonThrough reads the upstream body and settles first), so the 30 s deadline would cut every
  * reply that takes longer, such as non-streamed Kimi K3. Same value as the extension's
- * GATEWAY_COMPLETION_TIMEOUT_MS, and strictly below the Gateway's own 180 s upstream headers deadline
- * (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS). That clock starts at its upstream fetch,
- * after admission, and on expiry the Gateway answers 504 upstream_timeout with the request pending and its
- * hold kept; staying below it makes this deadline (os_completion_timeout) end a long wait instead of racing
- * that refusal, and the 30 s gap absorbs admission, settlement and the hops. A reply abandoned here may still
- * be charged if the model finished. Streams keep the 30 s headers deadline.
+ * GATEWAY_COMPLETION_TIMEOUT_MS, and below the Gateway's own 180 s upstream headers deadline (EZiL AI
+ * Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS), which starts at its upstream fetch, after
+ * admission. When this proxy aborts, the Gateway keeps the upstream call for a 20 s drain; a call still
+ * unanswered after that becomes upstream_timeout, pending, and disables that model route for everyone.
+ * 165 + 20 >= 180, so an abort here never pauses a route earlier than the Gateway's own deadline would
+ * (agreed with the Gateway owner, 2 Nov 2026). A reply abandoned here may still be charged if the model
+ * finished. Streams keep the 30 s headers deadline.
  */
-export const AI_PROXY_COMPLETION_TIMEOUT_MS = 150_000;
+export const AI_PROXY_COMPLETION_TIMEOUT_MS = 165_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
 export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */

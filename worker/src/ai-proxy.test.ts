@@ -979,7 +979,7 @@ describe('non-stream completion deadline', () => {
   }
 
   it('is one value, paired with the extension, strictly below the Gateway 180 s headers deadline', () => {
-    expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBe(150_000);
+    expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBe(165_000);
     expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBeLessThan(180_000);
     expect(AI_PROXY_HEADERS_TIMEOUT_MS).toBe(30_000);
   });
@@ -1001,7 +1001,7 @@ describe('non-stream completion deadline', () => {
     try {
       const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
       await stalled.entered;
-      expect(clock.timers.map(t => t.ms)).toContain(150_000);
+      expect(clock.timers.map(t => t.ms)).toContain(165_000);
       expect(clock.timers.map(t => t.ms)).not.toContain(30_000);
       await clock.advance(45_000);
       stalled.reply(new Response('{"type":"message"}', { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'kimi-1' } }));
@@ -1019,14 +1019,14 @@ describe('non-stream completion deadline', () => {
     try {
       const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
       await stalled.entered;
-      await clock.advance(149_999);
+      await clock.advance(164_999);
       await clock.advance(1);
       const response = await result;
       expect(response.status).toBe(504);
       expect(await response.json()).toEqual({ error: { code: 'os_completion_timeout', source: 'ezil-os-proxy',
-        message: 'EZiL AI sent no complete reply within 150 seconds. It may still be charged if the model finished.' } });
+        message: 'EZiL AI sent no complete reply within 165 seconds. It may still be charged if the model finished.' } });
       expect(stalled.attempts()).toBe(1);
-      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: 150_000 });
+      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: 165_000 });
       expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
     } finally { clock.restore(); }
   });
@@ -1039,7 +1039,7 @@ describe('non-stream completion deadline', () => {
         const result = handleAiProxyRequest(await post('/ai/v1/messages', body), d);
         await stalled.entered;
         expect(clock.timers.map(t => t.ms)).toContain(30_000);
-        expect(clock.timers.map(t => t.ms)).not.toContain(150_000);
+        expect(clock.timers.map(t => t.ms)).not.toContain(165_000);
         await clock.advance(30_000);
         const response = await result;
         expect(response.status).toBe(504);
