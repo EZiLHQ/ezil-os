@@ -34,7 +34,9 @@ are explicitly failed, and orphan outputs become ordinary text. Tools require
 unique valid names and object schemas; at most 64 are sent. Dropped names are
 logged once per call. Required tool selection becomes auto with a notice.
 
-Kimi is always nonstreaming, even if configured otherwise. JSON text, thinking
+Kimi is always nonstreaming: EZiL AI cannot settle its streams exactly. A
+configured `stream: true` is ignored and reported as a config warning (the model
+is still served; Manage shows it as "Setting ignored"). JSON text, thinking
 (if the proposed API exists), and tools are delivered in their original order.
 Qwen streams text and assembles tool JSON; missing `message_stop`, error events
 and malformed streams fail as interrupted. Final usage comes from

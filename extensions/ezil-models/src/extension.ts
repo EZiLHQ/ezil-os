@@ -17,6 +17,17 @@ export function resolveConfigPath(setting: string | undefined, env: NodeJS.Proce
     return fromSetting ? fromSetting : DEFAULT_CONFIG_PATH;
 }
 
+/** A config warning about a served model's setting (not a skipped provider): its model is still served. */
+function isSettingNotice(warning: string): boolean {
+    return !warning.startsWith('providers.');
+}
+
+/** "2 entries not served, 1 setting ignored", or '' when there is nothing to report. */
+function problemSummary(notServed: number, ignored: number): string {
+    return [notServed ? `${notServed} entr${notServed === 1 ? 'y' : 'ies'} not served` : '',
+        ignored ? `${ignored} setting${ignored === 1 ? '' : 's'} ignored` : ''].filter(Boolean).join(', ');
+}
+
 /**
  * Loads the config file, watches it (atomic replaces included) and keeps the last good result: a half-written
  * or invalid file leaves the previously loaded models in place (with `error()` set) so in-flight and new chats
@@ -39,8 +50,10 @@ export class ConfigStore implements vscode.Disposable {
     secrets(): string[] { return this.current?.secrets ?? []; }
     /** Why the file as a whole could not be loaded (unreadable, not JSON, no providers/models). */
     error(): string | undefined { return this.lastError; }
-    /** Entries of the loaded file that are not served: providers whose secret is not set (warnings) and invalid entries (errors). */
+    /** Warnings and errors of the loaded file: skipped providers, ignored settings of served models, invalid entries. */
     problems(): string[] { return this.current ? [...this.current.warnings, ...this.current.errors] : []; }
+    /** Warnings about a served model's setting that is not applied; everything else in problems() is not served. */
+    notices(): string[] { return this.current ? this.current.warnings.filter(isSettingNotice) : []; }
     onChange(listener: () => void): vscode.Disposable { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; }
 
     setPath(configPath: string): void {
@@ -60,7 +73,8 @@ export class ConfigStore implements vscode.Disposable {
             this.lastText = text;
             this.current = parseModelsConfig(text, { source: this.configPath });
             this.lastError = undefined;
-            this.log(`[config] loaded ${this.configPath}: ${this.current.models.length} model(s)${this.problems().length ? `, ${this.problems().length} entr${this.problems().length === 1 ? 'y' : 'ies'} not served (see below)` : ''}\n${describeConfig(this.current)}`);
+            const summary = problemSummary(this.problems().length - this.notices().length, this.notices().length);
+            this.log(`[config] loaded ${this.configPath}: ${this.current.models.length} model(s)${summary ? `, ${summary} (see below)` : ''}\n${describeConfig(this.current)}`);
             if (!this.watcher && !this.poll) this.watch(); // the directory may not have existed when watching was first attempted
         } catch (error) {
             if (!(error instanceof ConfigError)) this.lastText = undefined;
@@ -236,10 +250,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const reload = () => {
         forgetGatewayModels();
         const ok = store.load();
-        const problems = store.problems().length;
+        const summary = problemSummary(store.problems().length - store.notices().length, store.notices().length);
         void (ok
-            ? problems
-                ? vscode.window.showWarningMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}; ${problems} entr${problems === 1 ? 'y is' : 'ies are'} not served.`, 'Show output').then(choice => { if (choice) output.show(); })
+            ? summary
+                ? vscode.window.showWarningMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}; ${summary}.`, 'Show output').then(choice => { if (choice) output.show(); })
                 : vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`)
             : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
@@ -255,7 +269,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             { label: '$(clippy) Copy settings snippet', description: 'chat.defaultModel / plan / utility for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
         ];
         if (store.error()) items.push({ label: '$(error) Config error', detail: store.error(), action: () => output.show() });
-        for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
+        for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : store.notices().includes(problem) ? 'Setting ignored' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
         if (store.models().length) items.push({ label: 'Models', kind: vscode.QuickPickItemKind.Separator });
         for (const model of store.models()) {
             items.push({
