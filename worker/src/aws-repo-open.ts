@@ -58,8 +58,9 @@
  *    changed by §13). A 404 on a status read after the job was acknowledged → workspace_failed.
  *  - start 409 workspace_busy → workspace_busy. R's refusal codes keep their names, and R's status
  *    must equal the §8 table (the answer is rebuilt here from the code, never copied).
- *  - the deadline passes while the job may still run → 409 workspace_busy (retryable, like a §8
- *    prepare or commit timeout: the next open is idempotent and answers `existing`).
+ *  - the deadline passes while the job may still run → 409 workspace_busy (retryable for class
+ *    personal, like a §8 prepare or commit timeout: the next open is idempotent and answers
+ *    `existing`; NOT for class assessment, see "Start and poll" below).
  *  - a status read that throws or answers 5xx is transient: the read is repeated within the deadline.
  *    A start that throws or answers 5xx is an unknown outcome, not a refusal: its reply may be lost
  *    after the host admitted the job (A2h's edge answers 503 agent_unavailable when the agent's reply
@@ -68,8 +69,9 @@
  *    and a host that never answers ends at the deadline as workspace_busy.
  *  - every other reply (401, 3xx, 400, other 409s, job_unknown, malformed or oversized JSON, an
  *    unexpected envelope) → 500 workspace_failed.
- *  - an awsControlTarget `Response` (503 aws_origin_starting and the like) → workspace_unsupported
- *    with its body never read (vectors errorTable.workerResponses.awsControlTarget).
+ *  - an awsControlTarget `Response` (503 aws_origin_starting and the like) at the start →
+ *    workspace_unsupported with its body never read (vectors errorTable.workerResponses.awsControlTarget);
+ *    at a poll of an already started job it is "could not tell" (running), its body never read either.
  *  The host serializes jobs, so a second open, or a refresh, while one runs is `workspace_busy` (the
  *  Cloudflare path's in-flight join is a Durable Object map; this relay holds no state).
  *
