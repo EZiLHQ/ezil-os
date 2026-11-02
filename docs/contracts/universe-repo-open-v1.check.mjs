@@ -27,6 +27,7 @@ const CONTRACT_PATH = join(HERE, 'universe-repo-open-v1.md');
 
 const EMIT_GATEWAY_EXTRACT = process.argv.includes('--emit-gateway-extract');
 const failures = [];
+const skipped = [];
 let checks = 0;
 function ok(cond, message) {
     checks += 1;
@@ -808,7 +809,11 @@ ok(Number.isInteger(T.LOCK_STALE_MS) && T.LOCK_STALE_MS > T.WORKER_DEADLINE_MS, 
         eq(covering, [], `imageInputs: ${p} is under an image input`);
     }
     ok(I.repoOpenPaths.includes(I.generator), 'imageInputs: the generator is a repo-open path');
-    ok(existsSync(join(REPO_ROOT, I.generator)), `imageInputs: ${I.generator} exists`);
+    // A tree without the u2 Worker half (the AWS assessment carry on the os-staging lineage) has
+    // neither the generator nor the module it generates; the check applies once they land.
+    const generated = 'worker/src/repo-open-assets.generated.ts';
+    if (existsSync(join(REPO_ROOT, generated))) ok(existsSync(join(REPO_ROOT, I.generator)), `imageInputs: ${I.generator} exists`);
+    else skipped.push(`imageInputs: ${I.generator} exists (no ${generated} in this tree)`);
     ok(!existsSync(join(REPO_ROOT, I.retiredGenerator)), `imageInputs: ${I.retiredGenerator} is gone (it sat under the worker/scripts image input)`);
 }
 
@@ -860,6 +865,7 @@ if (failures.length) {
     console.error(`gateway extract sha256 ${gatewayExtractSha256}`);
     process.exit(1);
 }
+for (const s of skipped) status(`SKIP ${s}`);
 status(`universe-repo-open-v1 vectors ${V.contractVersion}: ${checks} checks passed (${runtime})`);
 status(`sha256 ${sha256}`);
 status(`gateway extract sha256 ${gatewayExtractSha256}`);
