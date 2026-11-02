@@ -181,7 +181,8 @@ test('Part 1b: summarization render gets the tool-adjusted budget; fallback B un
       // The extension host passes capabilities.apiType through only when the provider declares it.
       const host = fs.readFileSync(path.join(source, 'out/vs/workbench/api/node/extensionHostProcess.js'), 'utf8');
       once(host, 'apiType:n.metadata.capabilities?.apiType===void 0?void 0:HX[n.metadata.capabilities.apiType]');
-      if (fs.existsSync(provider)) assert.doesNotMatch(fs.readFileSync(provider, 'utf8'), /apiType/, 'ezil-models declares an apiType: re-check y (PATCHES.md Part 1b)');
+      // Only "responses" can make y true (Messages/ChatCompletions leave it false).
+      if (fs.existsSync(provider)) assert.doesNotMatch(fs.readFileSync(provider, 'utf8'), /apiType[^\n,}]*Responses/, 'ezil-models declares a Responses apiType: re-check y (PATCHES.md Part 1b)');
     });
 
     await t.test('rerun: a second patch run fails loudly and leaves the tree verifiable', () => {
