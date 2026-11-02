@@ -124,6 +124,13 @@ let codeMintAnswer = null;
 const confirmScript = [];
 
 const mintedUrls = [];
+/**
+ * Per-tab folder continuity (`apps/code-folder.js`): the Code iframe shows the minted URL plus this mint's
+ * `&ezil_mint=<22 base64url>`, appended as text. `untag` gives back exactly the minted URL; a URL without a
+ * well-formed id stays as it is, so a comparison against `mintedUrls` still fails if the id were missing or wrong.
+ */
+const MINT_TAG = /[?&]ezil_mint=[A-Za-z0-9_-]{22}$/;
+const untag = (u) => (typeof u === 'string' ? u.replace(MINT_TAG, '') : u);
 /** What the cheap status probe (`GET /api/shell/desktop?computerId=`) answers. Section 7k flips it. */
 let guacRunning = true;
 /** `computer.progress` (tRPC) for the transition watch, only while section 7j sets it; otherwise unstubbed (500), as before. */
@@ -283,7 +290,10 @@ push('🔴 it minted from `/api/shell/code-preview-url`, NOT `/api/shell/preview
 
 const iframe = win?.querySelector('.window-app-iframe');
 push('🔴 the iframe is showing the URL THAT call minted',
-    iframe?.getAttribute('src') === mintedUrls[mintedUrls.length - 1],
+    untag(iframe?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1],
+    `${iframe?.getAttribute('src')}`);
+push('🔴 per-tab folder continuity: the frame URL is that minted URL plus one 22-char ezil_mint',
+    MINT_TAG.test(iframe?.getAttribute('src') ?? '') && (iframe?.getAttribute('src') ?? '').startsWith(`${mintedUrls[mintedUrls.length - 1]}&ezil_mint=`),
     `${iframe?.getAttribute('src')}`);
 push('the URL is the CODE bridge (`-code.`), never the app bridge (`-app.`)',
     /-code\.ezil\.org/.test(iframe?.getAttribute('src') ?? '')
@@ -312,7 +322,7 @@ push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     remintCalls.length === 1 && iframe2?.getAttribute('src') !== firstUrl,
     `${remintCalls.length} mint(s); src changed: ${iframe2?.getAttribute('src') !== firstUrl}`);
 push('and the fresh URL is the one the SECOND call returned',
-    iframe2?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]);
+    untag(iframe2?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1]);
 push('r9: the re-open\'s mint says intent \'open\' too',
     JSON.stringify(remintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
     JSON.stringify(remintCalls[0]?.body));
@@ -492,7 +502,7 @@ await settle(4);
         await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
         const w = q('.window[data-app="code"]');
         const frame = w?.querySelector('.window-app-iframe');
-        await waitFor(() => mintedUrls.length > mintsBefore && frame?.getAttribute('src') === mintedUrls.at(-1), 3000);
+        await waitFor(() => mintedUrls.length > mintsBefore && untag(frame?.getAttribute('src')) === mintedUrls.at(-1), 3000);
         let navigations = 0;
         const mo = new window.MutationObserver(records => {
             const n = records.filter(r => r.attributeName === 'src').length;
@@ -616,7 +626,7 @@ await settle(4);
     await settle(20);
     push('🔴 a restart of THIS computer re-mints Code exactly once', mintedUrls.length === before + 1, `${mintedUrls.length - before}`);
     push('the Code frame now shows the freshly minted URL',
-        !! frame() && frame().getAttribute('src') === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
+        !! frame() && untag(frame().getAttribute('src')) === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
     await window.$(q('.window[data-app="code"]')).close();
     await settle(6);
     const closedMints = mintedUrls.length;
@@ -854,9 +864,9 @@ await settle(4);
         `seen=${preparingSeen} asks=${mintAsks - asked} kind=${kind()} "${status()}"`);
     const mintsBefore = mintedUrls.length;
     mintAnswer = null; // the stub's own ok mint
-    await waitFor(() => mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1], 8000);
+    await waitFor(() => mintedUrls.length > mintsBefore && untag(w?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1], 8000);
     push('🔴 C2: the answer at ~222 s opens Code (its frame gets that URL), never "Code isn\'t reachable right now"',
-        mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]
+        mintedUrls.length > mintsBefore && untag(w?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1]
         && ! /isn't reachable/.test(spinner?.textContent ?? ''),
         `${mintedUrls.length - mintsBefore} mint(s) kind=${kind()}`);
     await window.$(w).close();
@@ -1110,7 +1120,7 @@ await settle(4);
         await settle(10);
         push('7j 🔴 when the server settles it, the same Code window re-mints exactly once and the cover goes',
             mintedUrls.length === before + 1 && ! shown(state())
-            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+            && untag(d4.querySelector('.window-app-iframe').getAttribute('src')) === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
         // A watch that never settles (the server keeps reporting the transition
         // in flight) gives up after its poll budget without calling back. The
         // cover must not then stay up forever with nothing to press.
@@ -1175,7 +1185,7 @@ await settle(4);
         await settle(10);
         push('7k 🔴 Start re-mints the same Code window once (the existing mint path) and the cover goes',
             mintedUrls.length === before + 1 && ! shown(state())
-            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+            && untag(d4.querySelector('.window-app-iframe').getAttribute('src')) === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
         const before2 = mintedUrls.length;
         await away(6);
         push('setup: stopped again', shown(state()) && state().dataset.state === 'stopped' && mintedUrls.length === before2);
@@ -1216,7 +1226,7 @@ await settle(4);
     const trayTitle = (w) => w?.querySelector('.dashboard-app-drawer-title')?.textContent;
     const spinnerTitle = (w) => w?.querySelector('.ezil-app-spinner .ezil-opening-title')?.textContent ?? '';
     const spinnerKind = (w) => w?.querySelector('.ezil-app-spinner')?.getAttribute('data-kind');
-    const frameSrc = (w) => w?.querySelector('.window-app-iframe')?.getAttribute('src');
+    const frameSrc = (w) => untag(w?.querySelector('.window-app-iframe')?.getAttribute('src'));
     /**
      * A successful project mint: the URL opens `/workspace/projects/<repoId>`, and the answer names the repository the
      * way the server does (`repository: {name: "<namespace>/<name>"}`), never by its remote.
@@ -1414,6 +1424,45 @@ await settle(4);
         submits.length === before && spinnerTitle(w) === 'Sign in again to open this project', `submits=${submits.length - before} "${spinnerTitle(w)}"`);
     window.Storage.prototype.getItem = realGet;
     await closeCode();
+
+    // 9. Per-tab folder continuity (apps/code-folder.js): an own-files tab with a record asks the mint for that
+    //    folder; a project tab never asks (r32); another user's record is never used; no record is today's body.
+    const FOLDER_KEY = 'ezil-os:code.folder.v1';
+    const record = (userId, path) => ({ [`${userId}\n${COMPUTER.id}\n\n`]: { v: 1, kind: 'folder', path, at: 1 } });
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record(PAYLOAD.user.id, '/workspace/sports/sports-web') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({});
+    await waitFor(() => mints(from).length >= 1 && untag(codeWin()?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls.at(-1), 3000);
+    await settle(6);
+    push('9a 🔴 own files with a record: the body is { computerId, intent:"open", codeFolder:{v:1, path} } and nothing else',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', codeFolder: { v: 1, path: '/workspace/sports/sports-web' } }),
+        JSON.stringify(mints(from)[0]?.body));
+    const tagged = codeWin()?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '';
+    push('9a the frame URL is the minted URL plus one 22-char ezil_mint', MINT_TAG.test(tagged) && untag(tagged) === mintedUrls.at(-1), tagged);
+    push('9a the folder is not on any URL this shell made (a link can never choose a folder)',
+        ! calls.slice(from).some(c => c.url.includes('sports-web')) && ! tagged.includes('sports-web'));
+    await closeCode();
+
+    codeMintAnswer = opened('site');
+    from = calls.length;
+    await launch({ project: P1 });
+    await settle(20);
+    push('9b 🔴 a project tab never asks for a folder, even with an own-files record in this tab (r32)',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', project: P1 }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record('u-2', '/workspace/other-user') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({});
+    await settle(20);
+    push('9c another user\'s record in this tab is never asked; no record is exactly today\'s body',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+    store.removeItem(FOLDER_KEY);
 
     codeMintAnswer = null;
     store.removeItem(GUARD_KEY);

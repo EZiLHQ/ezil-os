@@ -136,6 +136,7 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
+import { attachFolderBridge, createFolderNotice, detachFolderBridge, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
@@ -386,6 +387,9 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
+    // Per-tab folder continuity: an own-files tab asks for the folder its editor last reported (`./code-folder.js`).
+    // A project tab never asks (r32: the server fixes its root), so the project body below is unchanged.
+    const folder_ask = folderAskFor({ userId: session.payload()?.user?.id, computerId, project });
 
     let res;
     try {
@@ -398,7 +402,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
             // Lane O2: the project rides along only when there is one, as its two ids and nothing else.
             body: JSON.stringify(project
                 ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
-                : { computerId, intent: 'open' }),
+                : { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),
             signal: mintSignal(cancel),
         });
     } catch ( err ) {
@@ -466,7 +470,10 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
         });
         return { ok: false, errorCode: 'repo_open_failed' };
     }
-    return { ok: true, url: data.codePreviewUrl, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data) } : {}) };
+    // The iframe gets the minted URL plus `ezil_mint=<id>`: it rides into this mint's FIRST editor document only, which
+    // is how the window tells this mint's editor from one the person navigated to (`./code-folder.js`).
+    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder });
+    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data) } : {}) };
 }
 
 /**
@@ -573,6 +580,8 @@ export async function openCodeWindow (ctx = {}) {
     const reopen_after_retry = () => { if ( ! disposed ) void start_boot(); };
     let stop_monitor = () => {};
     let stop_confirmation = () => {};
+    /** Per-tab folder continuity: this window's notice band (`./code-folder.js`), replaced at each bind. */
+    let folder_notice = null;
     /**
      * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
      * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
@@ -929,6 +938,13 @@ export async function openCodeWindow (ctx = {}) {
                     show_panel();
                     progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }));
                 });
+                // Per-tab folder continuity: bind THIS frame's editor (origin + source + per-hello nonce + mint id).
+                if ( ! nativeSurface ) {
+                    const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
+                    folder_notice?.close();
+                    folder_notice = createFolderNotice(el_body, { retry: () => { void start_boot(); }, forget: () => forgetFolder(bind) });
+                    attachFolderBridge({ iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice });
+                }
                 console.info(`[${PHASE}] code frame confirmed by the server`);
                 // Terminal: a confirmed frame IS the whole verdict for this
                 // window — there is no separate display gate here.
@@ -1266,6 +1282,8 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(transition_guard);
         nativeSurface?.dispose();
         stop_timers();
+        detachFolderBridge(el_iframe);
+        folder_notice?.close();
         stop_runtime_recheck?.();
         if ( heartbeat_timer !== null ) {
             clearInterval(heartbeat_timer);

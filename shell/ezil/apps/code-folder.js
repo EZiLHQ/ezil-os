@@ -1,0 +1,309 @@
+// code-folder.js — EZiL-authored. Per-tab folder continuity for the Code window.
+//
+// What it does, and nothing more:
+//   1. Keeps ONE record per (user, computer, project?, repo?) in THIS TAB's
+//      sessionStorage: the folder the bound editor last reported. Never a URL
+//      key, so no link can choose a folder; never shared with another tab.
+//   2. Gives the mint the record of an own-files tab (`folderAskFor`). A project
+//      tab asks nothing: the server fixes its root to the repository folder
+//      (r32; a project's `path` is reveal-only).
+//   3. Binds the editor in the iframe to THIS mint (`attachFolderBridge`):
+//      origin + source + unchanged frame URL + per-hello nonce + the mint id
+//      (`ezil_mint`) that rides the bootstrap URL into the mint's FIRST
+//      document only (code-server's own redirect keeps it; VS Code's Open
+//      Folder drops it).
+//   4. Shows a visible notice when the server could not reopen the folder,
+//      and keeps the record so the next mint asks again (a transient miss
+//      never erases it; only Close Folder, a new folder or "Forget it" do).
+//
+// The editor's report is a HINT. Authority is the next mint's server-side
+// resolution: the Worker strips the computer's own root and walks the rest on
+// the computer with no symlink followed (worker/src/code-folder.ts). The editor
+// side is a build-time patch (worker/code-folder-bridge/patch-folder-bridge.sh);
+// an editor without it never reports, so this module then does nothing at all.
+//
+// Why sessionStorage and not history.state: Code is single-instance per tab,
+// the folder belongs to the window rather than to a history entry,
+// Back/Forward never re-mints an open window (app-history.js), and a Code
+// window closed and reopened in the same tab should come back to its folder.
+// The store is reached only through readStore/writeStore below.
+//
+// Same path grammar as the app and Worker: docs/contracts/code-folder-v1.vectors.json.
+
+const STORE_KEY = 'ezil-os:code.folder.v1';
+/** The per-mint instance id on the iframe URL. Never an app-link key (app-link.js KEYS), never authority. */
+export const MINT_PARAM = 'ezil_mint';
+const MAX_RECORDS = 32;
+const MAX_PATH_BYTES = 2048;
+const MAX_SEGMENT_BYTES = 255;
+const MAX_SEGMENTS = 64;
+const TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
+const OUTCOME_RE = /^[a-z_]{1,32}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Server outcomes that opened something other than the asked folder (codes only; never a path). */
+const FALLBACKS = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error']);
+
+const utf8 = (s) => new TextEncoder().encode(s).length;
+
+/** No lone surrogate (the same check the app and Worker make). */
+function wellFormed (s) {
+    for ( let i = 0; i < s.length; i += 1 ) {
+        const c = s.charCodeAt(i);
+        if ( c >= 0xd800 && c <= 0xdbff ) {
+            const n = s.charCodeAt(i + 1);
+            if ( ! (n >= 0xdc00 && n <= 0xdfff) ) return false;
+            i += 1;
+        } else if ( c >= 0xdc00 && c <= 0xdfff ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * The plain absolute folder path an editor may report, normalised (one trailing
+ * `/` dropped), or null. Spaces and any well-formed Unicode are kept as they are
+ * (no NFC: a file name is bytes).
+ */
+export function plainFolderPath (value) {
+    if ( typeof value !== 'string' || value.length === 0 || value.length > MAX_PATH_BYTES ) return null;
+    if ( ! wellFormed(value) ) return null;
+    const path = value.length > 1 && value.endsWith('/') ? value.slice(0, -1) : value;
+    if ( ! path.startsWith('/') || utf8(path) > MAX_PATH_BYTES ) return null;
+    for ( let i = 0; i < path.length; i += 1 ) {
+        const c = path.charCodeAt(i);
+        if ( c < 0x20 || c === 0x7f || c === 0x5c ) return null;
+    }
+    if ( path === '/' ) return path;
+    const segments = path.slice(1).split('/');
+    if ( segments.length > MAX_SEGMENTS ) return null;
+    for ( const s of segments ) {
+        if ( s === '' || s === '.' || s === '..' || utf8(s) > MAX_SEGMENT_BYTES ) return null;
+    }
+    return path;
+}
+
+function recordKey ({ userId, computerId, project } = {}) {
+    if ( typeof userId !== 'string' || userId === '' || typeof computerId !== 'string' || computerId === '' ) return null;
+    const p = project && UUID.test(project.projectId ?? '') && UUID.test(project.repoId ?? '') ? project : null;
+    return [userId, computerId, p?.projectId ?? '', p?.repoId ?? ''].join('\n');
+}
+
+function readStore () {
+    try {
+        const parsed = JSON.parse(sessionStorage.getItem(STORE_KEY) ?? '{}');
+        return parsed && typeof parsed === 'object' && parsed.v === 1 && parsed.entries && typeof parsed.entries === 'object'
+            ? parsed : { v: 1, entries: {} };
+    } catch {
+        return { v: 1, entries: {} };
+    }
+}
+
+function writeStore (store) {
+    const keys = Object.keys(store.entries).sort((a, b) => (store.entries[b]?.at ?? 0) - (store.entries[a]?.at ?? 0));
+    for ( const k of keys.slice(MAX_RECORDS) ) delete store.entries[k];
+    try { sessionStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { /* no continuity in this tab, no failure */ }
+}
+
+/** This tab's record for `bind`, or null. A record that no longer parses is ignored, never trusted. */
+export function readFolderRecord (bind) {
+    const key = recordKey(bind);
+    if ( ! key ) return null;
+    const rec = readStore().entries[key];
+    if ( ! rec || rec.v !== 1 ) return null;
+    if ( rec.kind === 'folder' ) return plainFolderPath(rec.path) ? rec : null;
+    return rec.kind === 'unsupported' ? rec : null;
+}
+
+function putFolderRecord (bind, rec) {
+    const key = recordKey(bind);
+    if ( ! key ) return;
+    const store = readStore();
+    if ( rec ) store.entries[key] = { v: 1, ...rec, at: Date.now() }; else delete store.entries[key];
+    writeStore(store);
+}
+
+/** Forget this tab's folder for `bind` (the notice's "Forget it"). */
+export function forgetFolder (bind) { putFolderRecord(bind, null); }
+
+/**
+ * The mint body's `codeFolder`, or undefined. Own-files tabs only. Omitted
+ * entirely, never defaulted, so a tab with no record gets today's per-provider
+ * default byte for byte.
+ */
+export function folderAskFor (bind) {
+    if ( ! bind || bind.project ) return undefined;
+    const rec = readFolderRecord(bind);
+    return rec?.kind === 'folder' ? { v: 1, path: rec.path } : undefined;
+}
+
+function token () {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// mint id -> what was asked and what the server answered (codes only). Read
+// once, by the binding of that mint; bounded.
+const mints = new Map();
+
+/**
+ * Tag a successful mint: the URL to put in the iframe (the minted one plus
+ * `ezil_mint=<id>`), remembering what was asked and answered for it. A server
+ * that answered no outcome to an ask is an older one (`unsupported_server`).
+ */
+export function tagFolderMint (url, { asked, answer } = {}) {
+    const id = token();
+    const outcome = typeof answer?.outcome === 'string' && OUTCOME_RE.test(answer.outcome) ? answer.outcome : null;
+    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome });
+    while ( mints.size > 8 ) mints.delete(mints.keys().next().value);
+    try {
+        const u = new URL(url);
+        // Appended as text, so the minted URL stays byte for byte a prefix of what the iframe gets (a re-serialised
+        // query would re-encode the token and the folder, and grow toward the 2048-character frame-confirm cap).
+        if ( ! u.hash && ! u.searchParams.has(MINT_PARAM) ) {
+            return `${url}${u.search ? '&' : url.endsWith('?') ? '' : '?'}${MINT_PARAM}=${id}`;
+        }
+        u.searchParams.set(MINT_PARAM, id);
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+
+const bridges = new WeakMap();
+
+/** Stop listening for `iframe`'s editor (the window closed). */
+export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
+
+/**
+ * Bind the editor in `iframe` to the mint whose URL is `frameUrl` (the iframe's
+ * `src` PROPERTY, as `settle_frame` reads it). Called from `settle_frame`'s
+ * confirmed branch only, so a local editor never binds.
+ *
+ * A report counts only if `ev.source === iframe.contentWindow`, `ev.origin` is
+ * the minted origin, `iframe.src` is still `frameUrl`, and `nonce` is the one of
+ * the latest hello. Then:
+ *   - `mint === <this mint's id>`: the mint's FIRST document (mint-driven), in
+ *     whichever order load and the server's confirmation came;
+ *   - `mint === null`, after that first document reported: a document the
+ *     person navigated to inside the frame (user-driven);
+ *   - anything else (a stale document of an earlier mint, a first document
+ *     that has not reported yet): dropped without a word.
+ */
+export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
+    bridges.get(iframe)?.detach();
+    let origin, mintId;
+    try {
+        const u = new URL(frameUrl);
+        origin = u.origin;
+        mintId = u.searchParams.get(MINT_PARAM);
+    } catch { return () => {}; }
+    if ( ! TOKEN_RE.test(mintId ?? '') ) return () => {};
+    const mint = mints.get(mintId) ?? { asked: null, outcome: null };
+    mints.delete(mintId);
+    let nonce = null;
+    let firstSeen = false;
+    const live = () => iframe.isConnected && iframe.src === frameUrl;
+    const hello = () => {
+        if ( ! live() ) { detach(); return; }
+        nonce = token();
+        try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce }, origin); } catch { /* gone */ }
+    };
+    const onMessage = (ev) => {
+        if ( ev.source !== iframe.contentWindow || ev.origin !== origin ) return;
+        if ( ! live() ) { detach(); return; }
+        const d = ev.data;
+        if ( ! d || typeof d !== 'object' || d.v !== 1 ) return;
+        if ( d.type === 'ezil.code.ready' ) { hello(); return; }
+        if ( d.type !== 'ezil.code.folder' || ! TOKEN_RE.test(d.nonce ?? '') || d.nonce !== nonce ) return;
+        nonce = null; // one report per hello
+        const mintDriven = d.mint === mintId;
+        if ( ! mintDriven && ! (d.mint === null && firstSeen) ) return;
+        firstSeen = true;
+        if ( d.kind === 'folder' ) {
+            const path = plainFolderPath(d.path);
+            if ( ! path ) { putFolderRecord(bind, { kind: 'unsupported', reason: 'path' }); return; }
+            if ( mintDriven && mint.asked && path !== mint.asked ) {
+                // The mint did not reopen the asked folder: say so (visible), and keep the record so the next mint
+                // asks again (a missing mount that comes back, an older server that ignored the ask).
+                notice?.fallback?.(FALLBACKS.has(mint.outcome) ? mint.outcome : 'unsupported_server', mint.asked);
+                return;
+            }
+            if ( mintDriven && bind.project ) {
+                // r32: a project reopens at its repository folder; a child opened by hand is not reopened as the
+                // root (the repository's own config stays inert). Say so once, then follow what is on screen.
+                const prev = readFolderRecord(bind);
+                if ( prev?.kind === 'folder' && prev.path !== path ) notice?.projectChild?.(prev.path);
+            }
+            putFolderRecord(bind, { kind: 'folder', path });
+        } else if ( d.kind === 'empty' ) {
+            if ( ! mintDriven ) putFolderRecord(bind, null); // Close Folder: the tab has no folder now
+        } else if ( d.kind === 'workspace' || d.kind === 'foreign' ) {
+            if ( ! mintDriven ) putFolderRecord(bind, { kind: 'unsupported', reason: d.kind });
+        }
+    };
+    const detach = () => {
+        iframe.removeEventListener('load', hello);
+        window.removeEventListener('message', onMessage);
+        if ( bridges.get(iframe)?.detach === detach ) bridges.delete(iframe);
+    };
+    iframe.addEventListener('load', hello);
+    window.addEventListener('message', onMessage);
+    bridges.set(iframe, { detach });
+    if ( readFolderRecord(bind)?.kind === 'unsupported' ) { notice?.fallback?.('unsupported', null); forgetFolder(bind); }
+    hello();
+    return detach;
+}
+
+// ── the notice (visible, recoverable; text only, never markup) ─────────────
+const COPY = {
+    missing: (n) => `Couldn't reopen “${n}”: it isn't on this computer right now. Code opened its usual folder. Nothing was deleted; unsaved changes stay with that folder and come back when you open it again.`,
+    not_directory: (n) => `Couldn't reopen “${n}”: it isn't a folder right now. Code opened its usual folder. Nothing was deleted.`,
+    symlink: (n) => `“${n}” is reached through a link. Code reopens real folders inside your workspace only. Open it from File > Open Recent.`,
+    outside: (n) => `“${n}” is outside your workspace, so it isn't reopened automatically. Open it from File > Open Recent.`,
+    not_allowed: (n) => `“${n}” belongs to a project or to EZiL. Open the project to work there.`,
+    too_long: (n) => `“${n}” is too deep to reopen automatically. Open it from File > Open Recent.`,
+    unverified: (n) => `Code couldn't check “${n}” on this computer yet, so it opened its usual folder.`,
+    unsupported: () => 'Code reopens single folders only; your workspace is still in File > Open Recent.',
+    child: (n) => `This project reopened at its folder. “${n}” isn't reopened automatically, so the repository's own settings stay off. Open it from File > Open Recent; its unsaved changes come back with it.`,
+};
+COPY.invalid = COPY.unsupported;
+const RETRYABLE = new Set(['missing', 'not_directory', 'unverified', 'error', 'unsupported_server']);
+
+/**
+ * The notice band for one Code window: `role=status`, text only. `retry`
+ * re-mints (`start_boot`); `forget` drops the tab's record. Styles live in
+ * `ezil-shell.css` (`.ezil-code-folder-notice`), never inline.
+ */
+export function createFolderNotice (el_body, { retry, forget } = {}) {
+    let el = null;
+    const close = () => { el?.remove(); el = null; };
+    const show = (code, path) => {
+        close();
+        const name = path ?? '';
+        const text = (COPY[code] ?? COPY.unverified)(name.length > 120 ? `…${name.slice(-119)}` : name);
+        el = document.createElement('div');
+        el.className = 'ezil-code-folder-notice';
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', 'polite');
+        el.setAttribute('data-outcome', code);
+        const msg = document.createElement('span');
+        msg.className = 'ezil-code-folder-notice-text';
+        msg.textContent = text;
+        el.appendChild(msg);
+        const button = (label, fn) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'ezil-code-folder-notice-action';
+            b.textContent = label;
+            b.addEventListener('click', () => { close(); fn?.(); });
+            el.appendChild(b);
+        };
+        if ( RETRYABLE.has(code) && retry ) button('Try again', retry);
+        if ( path && forget && code !== 'child' ) button('Forget it', forget);
+        button('Dismiss', null);
+        el_body.appendChild(el);
+    };
+    return { fallback: (code, path) => show(code, path), projectChild: (path) => show('child', path), close };
+}
