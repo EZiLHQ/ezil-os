@@ -291,8 +291,14 @@ export function repoOpenAuthFor(url: unknown, remotes: RepoOpenRemotes = {}): Re
   if (typeof url !== 'string') return null;
   if (ARTIFACTS_REPOSITORY_URL.test(url)) return 'bearer';
   if (EZIL_GIT_REPOSITORY_URL.test(url)) return 'basic';
-  if (remotes?.stagingGitQa === true && STAGING_GIT_QA_REPOSITORY_URL.test(url)) return 'basic';
+  if (optedIntoStagingGitQa(remotes) && STAGING_GIT_QA_REPOSITORY_URL.test(url)) return 'basic';
   return null;
+}
+
+/** Own property only: an inherited `stagingGitQa` (a polluted prototype) never opts a caller in. */
+function optedIntoStagingGitQa(remotes: unknown): boolean {
+  return typeof remotes === 'object' && remotes !== null && Object.hasOwn(remotes, 'stagingGitQa')
+    && (remotes as RepoOpenRemotes).stagingGitQa === true;
 }
 
 /**

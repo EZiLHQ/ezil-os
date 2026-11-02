@@ -237,6 +237,22 @@ describe('only the literal true enables it', () => {
       expect(repoOpenAuthFor(GITHUB, remotes)).toBe('basic');
     }
   });
+
+  it('an inherited stagingGitQa (a polluted Object.prototype or a prototype object) never opts in', () => {
+    const inherited = Object.create({ stagingGitQa: true }) as RepoOpenRemotes;
+    expect(repoOpenAuthFor(GIT_QA, inherited)).toBeNull();
+    expect(parseRepoOpenRequest(body(), NOW, inherited)).toEqual(INVALID);
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.stagingGitQa = true;
+    try {
+      expect(repoOpenAuthFor(GIT_QA)).toBeNull();
+      expect(repoOpenAuthFor(GIT_QA, {})).toBeNull();
+      expect(parseRepoOpenRequest(body(), NOW)).toEqual(INVALID);
+    } finally {
+      delete proto.stagingGitQa;
+    }
+    expect(repoOpenAuthFor(GIT_QA, { stagingGitQa: true })).toBe('basic');
+  });
 });
 
 describe('the in-computer flow is host-agnostic (URL + auth kind only)', () => {
