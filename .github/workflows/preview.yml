@@ -20,6 +20,7 @@ env:
     worker/neko
     worker/assets
     worker/bootstrap
+    worker/code-folder-bridge
     worker/copilot-chat
     worker/ezil-models
     worker/guacamole
