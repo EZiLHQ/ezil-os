@@ -17,6 +17,19 @@ import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
 export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
+/**
+ * Non-stream (JSON) requests only: the Gateway answers a JSON request after the whole generation (jsonThrough
+ * reads the upstream body and settles before sending headers), so a 30 s first-byte deadline would cap every
+ * Kimi reply at 30 s. Bounded instead by one completion deadline, the same value as the OS proxy's
+ * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts) and strictly below the Gateway's 180 s upstream
+ * headers deadline (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS). That clock starts only
+ * at the Gateway's upstream fetch, after admission, and on expiry the Gateway answers 504 upstream_timeout with
+ * the request pending and its hold kept. Staying below it makes this deadline, with its own code and wording,
+ * the one that ends a long wait instead of racing that refusal; the 30 s gap absorbs admission, the body read
+ * and settlement after generation, and the two hops (container -> OS proxy -> Gateway). A reply abandoned here
+ * may still be charged if the model finished. Streaming deadlines are unchanged.
+ */
+export const GATEWAY_COMPLETION_TIMEOUT_MS = 150_000;
 /** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */
 export const GATEWAY_MAX_IN_FLIGHT = 2;
 const CONCURRENCY_WAIT_BUDGET_MS = 60_000;
@@ -271,6 +284,8 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
         case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
+        case 'os_completion_timeout': return make(`No complete reply from EZiL AI within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL OS stopped waiting. `
+            + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
         case 'not_a_member': case 'role_mismatch': case 'forbidden': return make('Your EZiL account does not have AI membership');
         case 'account_suspended': case 'suspended': return make('AI access is suspended for your EZiL account');
         case 'input_too_large': case 'body_too_large': return tooLarge();
@@ -357,12 +372,23 @@ async function bounded<T>(work: Promise<T>, ms: number, abort: AbortController, 
     finally { clearTimeout(timer); abort.signal.removeEventListener('abort', onAbort); }
 }
 
-async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController): Promise<Response> {
+type TimeoutCode = 'first_byte_timeout' | 'stream_idle_timeout' | 'completion_timeout';
+const TIMEOUT_TEXT: Record<TimeoutCode, string> = {
+    first_byte_timeout: 'did not answer within 30 seconds. Retry the request',
+    stream_idle_timeout: 'the response stopped arriving. Retry the request',
+    // Mirrors the cancelled notice: a request abandoned here may still be charged if the model finished.
+    completion_timeout: `no complete reply within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). `
+        + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model',
+};
+
+/** Streams: 30 s to the first byte, then 30 s per chunk. Non-stream: the whole reply within the completion deadline. */
+async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean): Promise<Response> {
     const started = performance.now();
-    const timeout = (code: string, requestId?: string) => new GatewayError(
-        `EZiL AI: ${code === 'first_byte_timeout' ? 'did not answer within 30 seconds' : 'the response stopped arriving'}. Retry the request${requestId ? ` (request ${requestId})` : ''}`,
-        undefined, code, requestId, undefined, 'transport');
-    const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), GATEWAY_FIRST_BYTE_TIMEOUT_MS, abort, timeout('first_byte_timeout'));
+    const deadline = stream ? GATEWAY_FIRST_BYTE_TIMEOUT_MS : GATEWAY_COMPLETION_TIMEOUT_MS;
+    const firstCode: TimeoutCode = stream ? 'first_byte_timeout' : 'completion_timeout';
+    const timeout = (code: TimeoutCode, requestId?: string) => new GatewayError(
+        `EZiL AI: ${TIMEOUT_TEXT[code]}${requestId ? ` (request ${requestId})` : ''}`, undefined, code, requestId, undefined, 'transport');
+    const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), deadline, abort, timeout(firstCode));
     if (!response.body) return response;
     const reader = response.body.getReader();
     const requestId = response.headers.get('x-ezil-request-id') ?? undefined;
@@ -370,8 +396,11 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
     const body = new ReadableStream<Uint8Array>({
         async pull(controller) {
             try {
-                const next = await bounded(reader.read(), first ? GATEWAY_FIRST_BYTE_TIMEOUT_MS - (performance.now() - started) : GATEWAY_IDLE_TIMEOUT_MS,
-                    abort, timeout(first ? 'first_byte_timeout' : 'stream_idle_timeout', requestId));
+                const remaining = deadline - (performance.now() - started);
+                // After the first byte a body may idle 30 s per chunk, and a JSON reply must still finish by its deadline.
+                const [ms, code]: [number, TimeoutCode] = first ? [remaining, firstCode]
+                    : stream || remaining > GATEWAY_IDLE_TIMEOUT_MS ? [GATEWAY_IDLE_TIMEOUT_MS, 'stream_idle_timeout'] : [remaining, 'completion_timeout'];
+                const next = await bounded(reader.read(), ms, abort, timeout(code, requestId));
                 first = false;
                 if (next.done) controller.close();
                 else controller.enqueue(next.value);
@@ -464,7 +493,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 let response: Response;
                 try {
                     attempted = true;
-                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort);
+                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream);
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
                     if (!retried) { retried = true; continue; }

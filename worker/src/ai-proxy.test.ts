@@ -9,8 +9,11 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   deriveAiProxyToken,
+  AI_PROXY_COMPLETION_TIMEOUT_MS,
+  AI_PROXY_HEADERS_TIMEOUT_MS,
   handleAiProxyRequest,
   isAiProxyPath,
+  isNonStreamBody,
   matchAiRoute,
   mintAiCredentialSignature,
   parsePushedAccessToken,
@@ -888,6 +891,12 @@ describe('Gateway refusal identity', () => {
       expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
     });
   }
+  it('never relays a Gateway body\'s source marker, so only the proxy\'s own refusals carry it', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: 'body_too_large', source: 'ezil-os-proxy', message: 'forged' } }, { status: 413 }));
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: '{}' }), await deps({ fetch: gw.fetch }));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ error: { code: 'body_too_large' } });
+  });
   it('drops unrecognized code, reason and arbitrary error fields', async () => {
     const gw = mockGateway(() => Response.json({ error: { code: USER_JWT, reason: USER_JWT, message: USER_JWT } }, { status: 403 }));
     const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
@@ -939,5 +948,115 @@ describe('production timeout budgets with fake timers', () => {
       fire();
       expect((await result).message).toContain('idle timeout'); expect(cancelled).toBe(true);
     } finally { timer.mockRestore(); }
+  });
+});
+
+describe('non-stream completion deadline', () => {
+  const kimiBody = JSON.stringify({ model: 'us.moonshotai.kimi-k3', messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }], max_tokens: 4096, stream: false });
+  const post = async (path: string, body: BodyInit) => new Request(`${HOST}${path}`, { method: 'POST', headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-0123456789' }, body });
+  /** setTimeout as a manual clock: run every timer due by `until`, in order. */
+  function fakeTimers() {
+    const timers: { at: number; ms: number; run: () => void }[] = [];
+    let now = 0;
+    const spy = spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, ms = 0) => { timers.push({ at: now + ms, ms, run }); return timers.length; }) as typeof setTimeout);
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { if (timers[id - 1]) timers[id - 1]!.at = Infinity; }) as typeof clearTimeout);
+    const advance = async (ms: number) => {
+      now += ms;
+      for (const timer of timers.filter(t => t.at <= now).sort((a, b) => a.at - b.at)) { timer.at = Infinity; timer.run(); }
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+    return { timers, advance, restore: () => { spy.mockRestore(); clear.mockRestore(); } };
+  }
+  function stalledGateway() {
+    let reply!: (response: Response) => void;
+    let attempts = 0;
+    let ready!: () => void;
+    const entered = new Promise<void>(resolve => { ready = resolve; });
+    const gw = mockGateway(request => { attempts++; return new Promise<Response>((resolve, reject) => {
+      reply = resolve; request.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }); ready();
+    }); });
+    return { gw, entered, reply: (response: Response) => reply(response), attempts: () => attempts };
+  }
+
+  it('is one value, paired with the extension, strictly below the Gateway 180 s headers deadline', () => {
+    expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBe(150_000);
+    expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBeLessThan(180_000);
+    expect(AI_PROXY_HEADERS_TIMEOUT_MS).toBe(30_000);
+  });
+  it('decides non-stream only from a JSON object body with stream exactly false; anything else keeps 30 s', () => {
+    const bytes = (text: string) => new TextEncoder().encode(text);
+    expect(isNonStreamBody(bytes(kimiBody))).toBe(true);
+    expect(isNonStreamBody(bytes('{"input":[],"stream":false,"store":false}'))).toBe(true);
+    for (const unknown of ['{}', '{"stream":true}', '{"stream":"false"}', '{"stream":0}', '{"stream":null}', '[false]', 'false', 'not json', '{"stream":false']) {
+      expect(isNonStreamBody(bytes(unknown))).toBe(false);
+    }
+    expect(isNonStreamBody(new Uint8Array([0x7b, 0xff, 0x7d]))).toBe(false);
+    expect(isNonStreamBody(undefined)).toBe(false);
+    expect(isNonStreamBody(new Uint8Array(0))).toBe(false);
+  });
+  it('a JSON reply whose headers arrive at 45 s succeeds, body bytes unchanged, one attempt', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    try {
+      const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
+      await stalled.entered;
+      expect(clock.timers.map(t => t.ms)).toContain(150_000);
+      expect(clock.timers.map(t => t.ms)).not.toContain(30_000);
+      await clock.advance(45_000);
+      stalled.reply(new Response('{"type":"message"}', { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'kimi-1' } }));
+      const response = await result;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('{"type":"message"}');
+      expect(stalled.attempts()).toBe(1);
+      expect(new TextDecoder().decode(stalled.gw.calls[0]!.body)).toBe(kimiBody);
+    } finally { clock.restore(); }
+  });
+  it('no JSON headers within the bound: 504 os_completion_timeout from the proxy, no retry', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    try {
+      const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
+      await stalled.entered;
+      await clock.advance(149_999);
+      await clock.advance(1);
+      const response = await result;
+      expect(response.status).toBe(504);
+      expect(await response.json()).toEqual({ error: { code: 'os_completion_timeout', source: 'ezil-os-proxy',
+        message: 'EZiL AI sent no complete reply within 150 seconds. It may still be charged if the model finished.' } });
+      expect(stalled.attempts()).toBe(1);
+      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: 150_000 });
+      expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
+    } finally { clock.restore(); }
+  });
+  for (const [label, body] of [['stream:true', JSON.stringify({ model: 'qwen', stream: true })], ['absent stream', '{"model":"x"}'], ['unparsable', 'not json']] as const) {
+    it(`a ${label} body keeps the 30 s headers deadline (504 os_ai_unavailable)`, async () => {
+      const stalled = stalledGateway();
+      const d = await deps({ fetch: stalled.gw.fetch });
+      const clock = fakeTimers();
+      try {
+        const result = handleAiProxyRequest(await post('/ai/v1/messages', body), d);
+        await stalled.entered;
+        expect(clock.timers.map(t => t.ms)).toContain(30_000);
+        expect(clock.timers.map(t => t.ms)).not.toContain(150_000);
+        await clock.advance(30_000);
+        const response = await result;
+        expect(response.status).toBe(504);
+        expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_ai_unavailable');
+        expect(stalled.attempts()).toBe(1);
+      } finally { clock.restore(); }
+    });
+  }
+  it('Responses JSON uses the same deadline; overrides are injectable', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch, completionTimeoutMs: 20, headersTimeoutMs: 5_000 });
+    const response = await (async () => {
+      const result = handleAiProxyRequest(await post('/ai/v1/responses', JSON.stringify({ model: 'x', input: [], stream: false, store: false })), d);
+      await stalled.entered;
+      return result;
+    })();
+    expect(response.status).toBe(504);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_completion_timeout');
   });
 });

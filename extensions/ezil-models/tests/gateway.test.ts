@@ -353,10 +353,13 @@ describe('local refusals and error origin', () => {
             + 'and your conversation history is kept. You can switch to another model or start a new chat (request r1)');
         expect(describeGatewayError(KIMI, 413, null, { code: 'body_too_large' }, null).message).toStartWith('EZiL AI: This conversation is too large');
         // Proxy codes are os_-prefixed and never relayed from the Gateway, with or without the source marker.
-        for (const code of ['os_session_missing', 'os_ai_unavailable', 'os_proxy_unauthorized']) {
+        for (const code of ['os_session_missing', 'os_ai_unavailable', 'os_proxy_unauthorized', 'os_completion_timeout']) {
             const e = describeGatewayError(KIMI, 504, null, { code }, null);
             expect([e.origin, e.message.slice(0, 9)]).toEqual(['os_proxy', 'EZiL OS: ']);
         }
+        const timeout = describeGatewayError(KIMI, 504, null, { code: 'os_completion_timeout', source: 'ezil-os-proxy' }, null);
+        expect(timeout.message).toContain('No complete reply from EZiL AI within 150 seconds');
+        expect(timeout.message).toContain('may still be charged if the model finished');
         // A refusal without a code was written by neither (an edge page on the way).
         expect(errorOrigin(parseErrorBody('<html>bad gateway</html>'))).toBe('transport');
         expect(describeGatewayError(KIMI, 413, null, {}, null).message).toStartWith('EZiL AI: This request was refused as too large (HTTP 413) before any model ran');

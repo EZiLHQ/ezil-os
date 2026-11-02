@@ -95,7 +95,14 @@ Errors name where they arose. Chat shows every failure under the provider's
 `EZiL OS:` marks the computer's AI proxy, recognised by `source:
 "ezil-os-proxy"` or an `os_` code (the proxy never relays either from the
 Gateway). `EZiL AI:` marks a Gateway refusal relayed by the proxy, or a deadline
-or interruption on the way; Gateway 413s show the input bound when sent.
+or interruption on the way; Gateway 413s show the input bound when sent. Streams must send a first byte within
+30 seconds and then a chunk at least every 30 seconds. A nonstreaming (JSON)
+request gets one 150-second completion deadline instead, because the Gateway
+sends JSON headers only after the whole generation; the OS proxy uses the same
+150 seconds for JSON request bodies, below the Gateway's 180-second upstream
+deadline. A reply abandoned at that deadline fails with `completion_timeout`
+(`os_completion_timeout` from the proxy) and may still be charged if the model
+finished. Neither deadline adds a retry.
 
 Each call writes one redacted JSON telemetry line: request ID, model, stream,
 hold, HTTP status, latency, four usage buckets, stop reason, error code and

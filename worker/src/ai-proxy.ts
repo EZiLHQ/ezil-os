@@ -9,6 +9,18 @@ import { hmacSha256Hex, timingSafeEqualHex, TOKEN_MAX_AGE_MS } from './hmac';
 export const DEFAULT_AI_GATEWAY_URL = 'https://ai.ezil.work';
 export const AI_PROXY_HEADERS_TIMEOUT_MS = 30_000;
 export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
+/**
+ * Headers deadline for a non-stream (JSON) POST only. The Gateway sends a JSON reply's headers after the whole
+ * generation (jsonThrough reads the upstream body and settles first), so the 30 s deadline would cut every
+ * reply that takes longer, such as non-streamed Kimi K3. Same value as the extension's
+ * GATEWAY_COMPLETION_TIMEOUT_MS, and strictly below the Gateway's own 180 s upstream headers deadline
+ * (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS). That clock starts at its upstream fetch,
+ * after admission, and on expiry the Gateway answers 504 upstream_timeout with the request pending and its
+ * hold kept; staying below it makes this deadline (os_completion_timeout) end a long wait instead of racing
+ * that refusal, and the 30 s gap absorbs admission, settlement and the hops. A reply abandoned here may still
+ * be charged if the model finished. Streams keep the 30 s headers deadline.
+ */
+export const AI_PROXY_COMPLETION_TIMEOUT_MS = 150_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
 export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */
@@ -261,6 +273,8 @@ export interface AiProxyDeps {
   readonly fetch: (input: Request) => Promise<Response>;
   readonly log?: (fields: Record<string, unknown>) => void;
   readonly headersTimeoutMs?: number;
+  /** Headers deadline for non-stream POST bodies (`isNonStreamBody`). */
+  readonly completionTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
   readonly now?: () => number;
 }
@@ -477,6 +491,23 @@ function passThrough(
   );
 }
 
+/**
+ * True only when a POST body parses as a JSON object whose top-level `stream` is exactly `false`. The Gateway
+ * chooses SSE or JSON from this field (Accept is a client hint it does not act on), so it alone predicts when
+ * response headers arrive. Anything else (true, absent, not a boolean, not JSON, not UTF-8) is treated as a
+ * stream and keeps the short headers deadline; an absent `stream` means JSON to the Gateway, so such clients
+ * keep the old 30 s. The body is only inspected, never changed or logged.
+ */
+export function isNonStreamBody(body: Uint8Array | undefined): boolean {
+  if (body === undefined || body.byteLength === 0) return false;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) && (parsed as { stream?: unknown }).stream === false;
+  } catch {
+    return false;
+  }
+}
+
 export async function readLimited(body: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array | null> {
   if (body === null) return new Uint8Array(0);
   const reader = body.getReader();
@@ -597,7 +628,10 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   }
 
   const abort = new AbortController();
-  const headersTimer = setTimeout(() => abort.abort(), deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS);
+  const completion = route.method === 'POST' && isNonStreamBody(body);
+  const headersMs = completion ? deps.completionTimeoutMs ?? AI_PROXY_COMPLETION_TIMEOUT_MS : deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS;
+  let deadlinePassed = false;
+  const headersTimer = setTimeout(() => { deadlinePassed = true; abort.abort(); }, headersMs);
   const onDisconnect = () => abort.abort();
   request.signal.addEventListener('abort', onDisconnect, { once: true });
   if (request.signal.aborted) abort.abort();
@@ -615,6 +649,12 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     );
   } catch {
     cleanup();
+    if (completion && deadlinePassed) {
+      // Its own code: the upstream may still complete and settle, so the user must not read it as "never ran".
+      log({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: headersMs });
+      return proxyError(504, 'os_completion_timeout',
+        `EZiL AI sent no complete reply within ${Math.round(headersMs / 1000)} seconds. It may still be charged if the model finished.`);
+    }
     const timedOut = abort.signal.aborted;
     log({ status: timedOut ? 504 : 502, code: 'os_ai_unavailable', detail: timedOut ? 'headers_timeout' : 'fetch_failed' });
     return proxyError(

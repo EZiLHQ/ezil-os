@@ -1,7 +1,10 @@
 import { describe, expect, test, spyOn } from 'bun:test';
-import { gatewayChat, GATEWAY_FIRST_BYTE_TIMEOUT_MS, GATEWAY_IDLE_TIMEOUT_MS } from '../src/gateway';
+import { readFileSync } from 'node:fs';
+import { gatewayChat, GATEWAY_COMPLETION_TIMEOUT_MS, GATEWAY_FIRST_BYTE_TIMEOUT_MS, GATEWAY_IDLE_TIMEOUT_MS } from '../src/gateway';
+import { KIMI } from '../src/gateway-messages';
+import type { StreamEvent } from '../src/types';
 import { ask, gw } from './fixtures/gateway';
-import { frames } from './fixtures/gateway-response';
+import { frames, messageJson } from './fixtures/gateway-response';
 
 // Deterministic timers without sleeping or relying on AbortSignal.timeout's native clock.
 async function fakeClock(check: (advance: (ms: number) => Promise<void>, now: () => number) => Promise<void>) {
@@ -109,5 +112,62 @@ describe('bounded gateway waits', () => {
             { headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch, abort.signal);
         await advance(1); abort.abort(); await advance(0);
         await result; expect(cancelled).toBe(true);
+    }));
+});
+
+describe('non-stream completion deadline (paired with the OS proxy)', () => {
+    const kimiJson = () => new Response(JSON.stringify(messageJson()), { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'kimi-json' } });
+    async function collect(model: ReturnType<typeof gw>, fetchImpl: typeof fetch, logs: string[] = []) {
+        const events: StreamEvent[] = [];
+        for await (const event of gatewayChat(model, ask(), { fetch: fetchImpl, signal: new AbortController().signal, log: line => logs.push(line) })) events.push(event);
+        return events;
+    }
+    test('one constant in both places, strictly below the Gateway 180 s upstream headers deadline', () => {
+        const proxy = readFileSync(`${import.meta.dir}/../../../worker/src/ai-proxy.ts`, 'utf8');
+        const value = /export const AI_PROXY_COMPLETION_TIMEOUT_MS = ([\d_]+);/.exec(proxy)?.[1];
+        expect(Number(value?.replaceAll('_', ''))).toBe(GATEWAY_COMPLETION_TIMEOUT_MS);
+        expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBe(150_000);
+        expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBeLessThan(180_000);
+        expect(GATEWAY_FIRST_BYTE_TIMEOUT_MS).toBe(30_000);
+    });
+    test('a Kimi JSON reply arriving at 45 s succeeds, once', async () => fakeClock(async advance => {
+        let reply!: (response: Response) => void; let calls = 0;
+        const result = collect({ ...gw(KIMI), stream: true }, (() => { calls++; return new Promise<Response>(resolve => { reply = resolve; }); }) as unknown as typeof fetch);
+        await advance(45_000);
+        reply(kimiJson());
+        await advance(0);
+        expect((await result).map(event => event.type)).toEqual(['text', 'thinking', 'tool_call', 'text', 'usage', 'stop']);
+        expect(calls).toBe(1);
+    }));
+    test('no complete JSON reply within the bound fails with completion_timeout, aborts and never retries', async () => fakeClock(async advance => {
+        let calls = 0; let signal: AbortSignal | undefined; const logs: string[] = [];
+        const result = collect(gw(KIMI), (async (_url, init) => { calls++; signal = init?.signal ?? undefined; return new Promise<Response>(() => {}); }) as typeof fetch, logs).catch(error => error);
+        await advance(GATEWAY_FIRST_BYTE_TIMEOUT_MS);
+        expect(signal?.aborted).toBe(false);
+        await advance(GATEWAY_COMPLETION_TIMEOUT_MS - GATEWAY_FIRST_BYTE_TIMEOUT_MS - 1);
+        expect(signal?.aborted).toBe(false);
+        await advance(1);
+        const error = await result;
+        expect([error.code, error.origin]).toEqual(['completion_timeout', 'transport']);
+        expect(error.message).toBe('EZiL AI: no complete reply within 150 seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). '
+            + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
+        expect(signal?.aborted).toBe(true); expect(calls).toBe(1);
+        expect(JSON.parse(logs[0]!)).toMatchObject({ error_code: 'completion_timeout', origin: 'transport', stream: false });
+    }));
+    test('a JSON body that starts late must still finish by the same deadline', async () => fakeClock(async advance => {
+        let cancelled = false;
+        const result = collect(gw(KIMI), (async () => { await new Promise(resolve => setTimeout(resolve, 140_000)); return new Response(new ReadableStream({
+            start(c) { c.enqueue(new TextEncoder().encode('{')); }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'application/json' } }); }) as unknown as typeof fetch).catch(error => error);
+        await advance(140_000);
+        await advance(GATEWAY_COMPLETION_TIMEOUT_MS - 140_000);
+        expect((await result).code).toBe('completion_timeout'); expect(cancelled).toBe(true);
+    }));
+    test('streaming still fails at 30 s without a first byte', async () => fakeClock(async advance => {
+        let calls = 0;
+        const result = collect(gw(), (async () => { calls++; return new Promise<Response>(() => {}); }) as unknown as typeof fetch).catch(error => error);
+        await advance(GATEWAY_FIRST_BYTE_TIMEOUT_MS);
+        const error = await result;
+        expect([error.code, error.origin, error.message]).toEqual(['first_byte_timeout', 'transport', 'EZiL AI: did not answer within 30 seconds. Retry the request']);
+        expect(calls).toBe(1);
     }));
 });
