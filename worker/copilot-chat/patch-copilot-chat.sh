@@ -94,6 +94,24 @@ A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
 A_IDENT2='you must state that you are using GitHub Copilot.'
 R_IDENT2='you must state that you are using EZiL Chat.'
+# Part 1b — summarization render budget (extension.js, agent intent buildPrompt). The normal
+# agent render uses I, the endpoint whose budget is cut by the tool definitions the request
+# carries; the foreground-summarization render U used the full advertised budget with every
+# tool still attached, so its prompt could pass Copilot and exceed the model's real input
+# bound. U's renderer (prompt budget + IPromptEndpoint) becomes I; its props keep the full
+# endpoint, which the summarizer uses for the summary request (simple mode sends no tools).
+# The no-summarization fallback B is deliberately NOT patched (PATCHES.md, Part 1b).
+A_SUMMARIZE_RENDER='return await vn.create(this.instantiationService,this.endpoint,this.prompt,{...we,endpoint:this.endpoint,promptContext:we.promptContext,triggerSummarize:!0,forceSimpleSummary:!0}).render(r,o)'
+R_SUMMARIZE_RENDER='return await vn.create(this.instantiationService,I,this.prompt,{...we,endpoint:this.endpoint,promptContext:we.promptContext,triggerSummarize:!0,forceSimpleSummary:!0}).render(r,o)'
+# Checked, never patched: I's definition, U's head and B (which must stay upstream).
+P_SUMMARIZE_BUDGET='x=Math.max(1,Math.floor((h-p)*.9)),E=y?Number.MAX_SAFE_INTEGER:x,I=p>0?this.endpoint.cloneWithTokenOverride(E):this.endpoint;'
+P_SUMMARIZE_U='U=async(oe,we=T)=>{let Ie=n.conversation?.getLatestTurn()?.getMetadata(Kh);'
+P_SUMMARIZE_FALLBACK='let he=vn.create(this.instantiationService,this.endpoint,this.prompt,{...we,endpoint:this.endpoint,enableSummarization:!1,enableCacheBreakpoints:!1});'
+# summarize_scope <render literal>: I's definition, then B, then U's head, then the render, all
+# within 4 KB, and nothing in between binds another I, so the render's I is buildPrompt's.
+summarize_scope() {
+  node -e 'const fs=require("fs");const [f,def,fb,head,render]=process.argv.slice(1);const s=fs.readFileSync(f,"utf8");const at=[def,fb,head,render].map(l=>s.indexOf(l));if(at.some(i=>i<0)||!(at[0]<at[1]&&at[1]<at[2]&&at[2]<at[3]))throw new Error("summarize-scope: I definition, fallback, U and its render are not in that order ("+at.join(",")+")");if(at[3]-at[0]>4096)throw new Error("summarize-scope: U render is "+(at[3]-at[0])+" chars after I, expected the same buildPrompt (<= 4096)");const mid=s.slice(at[0]+def.length,at[3]);const m=/(?:\b(?:let|const|var|function|class)\s+I\b|[(,{]\s*I\s*(?:[,)}=]|=>)|(?:^|[^.\w$])I\s*=>|[,;{(]\s*I\s*=(?!=))/.exec(mid);if(m)throw new Error("summarize-scope: I may be rebound between its definition and the U render ("+m[0]+"), re-derive (PATCHES.md Part 1b)");console.log("patch-copilot-chat: gate ok [summarize-scope] U render "+(at[3]-at[0])+" chars after I, no rebinding")' "$EXT" "$P_SUMMARIZE_BUDGET" "$P_SUMMARIZE_FALLBACK" "$P_SUMMARIZE_U" "$1"
+}
 # Part 2 — workbench strings (nls.messages.js + nls.messages.json; JSON-encoded, quotes included)
 A_TERMS_DOT='"By continuing with {0} Copilot, you agree to {1}'"'"'s [Terms]({2}) and [Privacy Statement]({3})."'
 A_TERMS='"By continuing with {0} Copilot, you agree to {1}'"'"'s [Terms]({2}) and [Privacy Statement]({3})"'
@@ -199,6 +217,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   echo "patch-copilot-chat: [chat-notice] appended to $(basename "$CSS")"
   patch identity       "$EXT" 13 "$A_IDENT"  "$R_IDENT"
   patch identity-model "$EXT" 2  "$A_IDENT2" "$R_IDENT2"
+  for p in "$P_SUMMARIZE_BUDGET" "$P_SUMMARIZE_U" "$P_SUMMARIZE_FALLBACK"; do gate summarize-names "$EXT" 1 "$p"; done
+  summarize_scope "$A_SUMMARIZE_RENDER"
+  patch summarize-budget "$EXT" 1  "$A_SUMMARIZE_RENDER" "$R_SUMMARIZE_RENDER"
   for nls in "$NLS_JS" "$NLS_JSON"; do
     patch ai-plan "$nls" 1 "$A_AI_PLAN" "$R_AI_PLAN"
     patch ai-quota "$nls" 1 "$A_AI_QUOTA" "$R_AI_QUOTA"
@@ -246,6 +267,10 @@ gate identity-model   "$EXT" 0  "$A_IDENT2";       gate identity-model   "$EXT" 
 gate embeddings-cache  "$EXT" 0 "$A_EMB_CACHE";  gate embeddings-cache  "$EXT" 1 "$R_EMB_CACHE"
 gate embeddings-latest "$EXT" 0 "$A_EMB_LATEST"; gate embeddings-latest "$EXT" 1 "$R_EMB_LATEST"
 gate embeddings-ext    "$EXT" 0 "$A_EMB_EXT";    gate embeddings-ext    "$EXT" 1 "$R_EMB_EXT"
+gate summarize-budget  "$EXT" 0 "$A_SUMMARIZE_RENDER"; gate summarize-budget "$EXT" 1 "$R_SUMMARIZE_RENDER"
+for p in "$P_SUMMARIZE_BUDGET" "$P_SUMMARIZE_U"; do gate summarize-names "$EXT" 1 "$p"; done
+gate summarize-fallback-unpatched "$EXT" 1 "$P_SUMMARIZE_FALLBACK"
+summarize_scope "$R_SUMMARIZE_RENDER"
 gate chat-notice "$CSS" 1 "$A_CSS";             gate chat-notice "$CSS" 1 "$R_CSS_NOTICE"
 node -e 'const fs=require("fs");const [f,r]=process.argv.slice(1);const s=fs.readFileSync(f,"utf8");const i=s.lastIndexOf(r);let d=0;for(const c of s.slice(0,i).replace(/\/\*[\s\S]*?\*\//g,"")){if(c==="{")d++;else if(c==="}")d--}if(d!==0)throw new Error("chat-notice rule is nested (depth "+d+")");console.log("patch-copilot-chat: gate ok [chat-notice] top level")' "$CSS" "$R_CSS_NOTICE"
 gate no-devdeviceid-token "$EXT" 0 'await this.authFromDevDeviceId('
