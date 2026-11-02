@@ -1,6 +1,6 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or previous reasoning.
-import type { ResolvedModel } from './config';
+import type { GatewayProtocol, ResolvedModel } from './config';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
 
 export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
@@ -29,8 +29,9 @@ export const INPUT_FRAMING = 1056;
 export const ENVELOPE_RESERVE = 1536;
 // Copilot 0.69 counts its tool definitions (38 tools, 54,221 bytes in Agent mode, image e2e
 // 2026-10-20) against maxInputTokens itself: a 60 KB reserve double-counted them and forced history
-// summarisation on a near-empty conversation. Keep only a margin for counting differences; the
-// byte bound in buildGatewayBody still refuses anything over the gateway limit before sending.
+// summarisation on a near-empty conversation. Keep only a margin for counting differences (Copilot
+// never counts schema numbers, booleans or punctuation); the byte bound in buildGatewayBody still
+// refuses anything over the gateway limit before sending (LocalRequestError, nothing sent).
 export const DEFAULT_TOOL_RESERVE = 8_000;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
@@ -191,9 +192,18 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     return { body, bytes };
 }
 
-/** Copilot does not count tool definitions. Their configurable reserve is subtracted from advertised input. */
-export function gatewayTokenCount(value: string | Message): number {
-    if (typeof value === 'string') return Buffer.byteLength(JSON.stringify(text(value)), 'utf8');
+/**
+ * Copilot 0.69 counts its own tool definitions against maxInputTokens: one countTokens(string) per schema key
+ * and string value (numbers, booleans and falsy entries are not passed), plus 8 per tool, 16, and 10%. Prompt
+ * pruning estimates text chunks through the same call. A string therefore counts as the exact bytes of its JSON
+ * string literal in a Messages body, quotes and escapes included: never fewer than it adds to the request.
+ * The Responses bound escapes non-ASCII tool text and adds 128 bytes per tool and 32 per item, so Responses
+ * strings keep the 23-byte text-block margin and count escaped. Messages count as their serialized wire message.
+ */
+export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
+    if (typeof value === 'string') {
+        return protocol === 'openai-responses' ? escapeNonAscii(JSON.stringify(text(value))).length : Buffer.byteLength(JSON.stringify(value), 'utf8');
+    }
     if (value.role === 'system') {
         const blocks = value.parts.map(partText).filter(Boolean).map(text);
         return blocks.length ? Buffer.byteLength(JSON.stringify(blocks), 'utf8') : 0;

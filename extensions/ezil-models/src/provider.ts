@@ -251,7 +251,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
-        if (this.resolve(_model).provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value));
+        const resolved = this.resolve(_model);
+        if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol);
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));
     }

@@ -47,9 +47,16 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 (or `temperature`/`top_p` in modelOptions) clamp to [0,1]. `stream` configures
 Qwen's response mode. Both models advertise `imageInput: false`.
 
-Token counting measures serialized UTF-8 bytes. Advertised input defaults to
-`131072 - 1056 - 1536 - 24000 = 104480`; `toolReserve` configures the final
-subtraction because Copilot does not count tool schemas.
+Token counting measures serialized UTF-8 bytes; a message counts as its
+serialized wire message. Copilot 0.69 counts its own tool definitions against
+the advertised input, one count per schema key and string value (it never counts
+numbers, booleans or punctuation), so a string counts as the exact bytes of its
+JSON literal, quotes and escapes included (`"你好"` is 8). For `openai-responses`
+models a string counts with non-ASCII escaped as `\uXXXX` plus the 23-byte
+text-block margin, because the Gateway's Responses bound escapes tool text and
+adds 128 bytes per tool and 32 per item. Advertised input defaults to
+`131072 - 1056 - 1536 - 8000 = 120480`; `toolReserve` (default 8000) is only a
+margin for counting differences.
 
 The exact request is bounded before dispatch: `body bytes + 1056 <= 131072`, at
 most 1024 messages and 1024 blocks in one message (Responses: the escaped bound
