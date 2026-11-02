@@ -42,7 +42,8 @@
  *  stops polling.
  *
  *  Start replies:  200 {"ok":true,"state":"running"}
- *                  409 {"ok":false,"error":"workspace_busy"}   the host's one job slot is taken
+ *                  409 {"ok":false,"error":"workspace_busy"}   the host's one job slot is taken, or its result
+ *                      store holds JOBS_MAX unexpired results (r56 D3: none is evicted before JOB_TTL); nothing admitted
  *                  409 job_replayed | repo_open_invalid | workspace_failed; 400 body or digest;
  *                  401 gw1; 503 agent_unavailable
  *                  404 an edge without the route (an AMI before the Phase-B rollout)

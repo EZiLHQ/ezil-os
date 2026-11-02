@@ -995,13 +995,42 @@ class Job(JobBase):
         self.assertEqual(self.runner.jobs, {})
         self.assertEqual(self.send("repo_open_status", jobId="d" * 64), {"ok": False, "error": "job_unknown"})
 
-    def test_finished_results_expire_and_never_block_admission(self):
+    def test_an_unexpired_result_is_never_evicted_and_a_full_store_refuses_the_start(self):
+        """r56 D3: a finished result stays readable for JOB_TTL (an assessment caller polls the same job until
+        done). A store holding JOBS_MAX unexpired results refuses a NEW start with the pre-admission
+        workspace_busy: nothing admitted, the job id not used, nothing evicted. Expired results are reaped."""
         now = time.time()
-        self.runner.jobs = {f"{i:064x}": {"state": "done", "result": {}, "at": now - i} for i in range(ro.JOBS_MAX)}
-        self.run_job(FakeDesktop())
+        held = {f"{i:064x}": {"state": "done", "result": {"status": 200, "body": {"n": i}}, "at": now - i} for i in range(ro.JOBS_MAX)}
+        self.runner.jobs = json.loads(json.dumps(held))
+        fake = FakeDesktop()
+        with mock.patch.object(ro, "bounded_runc_exec", fake.exec_):
+            self.assertEqual(self.send("repo_open", request=relayed()), {"ok": False, "error": "workspace_busy"})
+        self.assertEqual(fake.calls, [], "nothing ran")
+        self.assertNotIn(JOB, self.runner.jobs)
+        self.assertNotIn(JOB, self.runner.used, "a refused start does not use its job id")
+        self.assertFalse(self.runner.busy)
+        for job_id, job in held.items():
+            self.assertEqual(self.send("repo_open_status", jobId=job_id), {"ok": True, "state": "done", "result": job["result"]},
+                             "an unexpired result was evicted")
+        # once one result has expired it is reaped, and the same (unused) job id is admitted
+        oldest = f"{ro.JOBS_MAX - 1:064x}"
+        self.runner.jobs[oldest]["at"] = time.time() - ro.JOB_TTL - 1
+        self.assertEqual(self.run_job(fake), {"status": 200, "body": OPEN_OK})
+        self.assertNotIn(oldest, self.runner.jobs)
+        self.assertEqual(set(self.runner.jobs), (set(held) - {oldest}) | {JOB})
+        # a running job and unexpired results fill the store too: the next start is refused before admission
+        self.runner.jobs = {**json.loads(json.dumps(held)), JOB: {"state": "done", "result": {}, "at": time.time()}}
+        del self.runner.jobs[oldest]
+        self.runner.jobs["b" * 64] = self.runner.jobs.pop(f"{0:064x}")
+        self.runner.jobs["b" * 64]["state"] = "running"
+        self.assertEqual(self.runner.start("d" * 64, body()), {"ok": False, "error": "workspace_busy"})
+        self.assertNotIn("d" * 64, self.runner.used)
         self.assertEqual(len(self.runner.jobs), ro.JOBS_MAX)
+
+    def test_finished_results_expire(self):
         self.runner.jobs = {"c" * 64: {"state": "done", "result": {}, "at": time.time() - ro.JOB_TTL - 1}}
         self.assertEqual(self.send("repo_open_status", jobId="c" * 64), {"ok": False, "error": "job_unknown"})
+        self.assertEqual(self.runner.jobs, {}, "an expired result is reaped")
 
     def test_a_thread_that_cannot_start_leaves_no_reservation(self):
         with mock.patch.object(ro.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):

@@ -24,8 +24,9 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
      (E1-6). Every field is re-validated here with the Worker's rules (parse_relay).
    * Replies (edge status, JSON body):
      200 ``{ok:true, state:'running'}``;
-     409 ``{ok:false, error}`` with error ``workspace_busy`` (the host's one slot is taken, or
-     the replay guard is not ready: retryable), ``job_replayed`` (this jobId was already
+     409 ``{ok:false, error}`` with error ``workspace_busy`` (the host's one slot is taken, the
+     result store already holds JOBS_MAX unexpired results, or the replay guard is not ready:
+     retryable, nothing admitted, the jobId stays unused), ``job_replayed`` (this jobId was already
      accepted: job ids are single use, never joined or re-run; its status stays readable),
      ``repo_open_invalid`` or ``workspace_failed``;
      400 ``repo_open_body_invalid`` | ``repo_open_digest_mismatch``; 404 wrong method or a query;
@@ -186,8 +187,8 @@ Mechanisms:
     positional parameters. The grant is never in argv, env, a log line, a reply, or a file on
     the host other than that unlinked temporary file on tmpfs.
   * Bounds: stdout streamed under STDOUT_MAX, stderr discarded, one absolute deadline (timing
-    chain above), relay body <= RELAY_MAX_BYTES (edge), at most JOBS_MAX results kept JOB_TTL,
-    host memory only.
+    chain above), relay body <= RELAY_MAX_BYTES (edge), at most JOBS_MAX results, each kept JOB_TTL and
+    never evicted earlier (a full store refuses a new start: workspace_busy), host memory only.
   * Process lifetime: each exec runs in its own fresh sub-cgroup of the desktop's cgroup
     (``runc exec --cgroup ezil-repo-open-<tag>-<id>``); afterwards, normal exit included, the
     launcher is killed and reaped first, then ``cgroup.kill``, ``populated 0``, rmdir (repeated
@@ -294,7 +295,7 @@ PRECLEAR_CAP_S = 10.0              # leftovers from an earlier job must be gone 
 # relay and job bookkeeping
 RELAY_MAX_BYTES = 4608             # the Worker's 4 KiB body plus jobId; edge.py enforces it
 STDOUT_MAX = 16 * 1024             # a kernel answer is one short JSON line
-JOBS_MAX = 32                      # retained results; the oldest finished one is evicted first
+JOBS_MAX = 32                      # retained results; none is evicted before JOB_TTL: a full store refuses new starts
 JOB_TTL = 600                      # seconds a finished job's result stays readable
 USED_ID_TTL = 300                  # seconds a job id stays refused (> the gw1 window, 120 s + 5 s)
 USED_IDS_MAX = 512
@@ -886,11 +887,13 @@ class Runner:
                 return {"ok": False, "error": "job_replayed"}
             if self.busy or now < self.quiet_until:
                 return {"ok": False, "error": "workspace_busy"}
+            # r56 D3: a finished result stays readable until JOB_TTL and is never evicted earlier (an assessment
+            # caller polls the same job until done). The prune above reaped the expired ones; a store still full
+            # refuses the start before anything is admitted (the id stays unused; retryable).
+            if len(self.jobs) >= JOBS_MAX:
+                return {"ok": False, "error": "workspace_busy"}
             if not self._remember(job_id, now):
                 return {"ok": False, "error": "workspace_busy"}
-            while len(self.jobs) >= JOBS_MAX:   # only finished jobs remain: one slot per host
-                oldest = min(self.jobs, key=lambda j: self.jobs[j]["at"])
-                del self.jobs[oldest]
             self.busy = True
             self.jobs[job_id] = {"state": "running", "result": None, "at": now}
             admitted = (self.mono(), now)
