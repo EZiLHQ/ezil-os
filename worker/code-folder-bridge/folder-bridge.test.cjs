@@ -56,11 +56,12 @@ const MINT = 'MMMMMMMMMMMMMMMMMMMMMM';
 const fp = (p, authority = 'aws-8443-guac-a-b-aws.ezil.work', scheme = 'vscode-remote') => ({ workspace: { folderUri: { scheme, authority, path: p } } });
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
-function bridgeBehaviour(patched) {
+function bridgeBehaviour(patched, origins = ['https://os-staging.ezil.work']) {
   const bridge = bridgeFrom(patched);
+  const ALLOWED = origins[origins.length - 1];
   // framed folder with spaces + Unicode: `ready` to each allowed origin (no data); a hello is answered once, to its origin
   let t = bridge(fp('/workspace/My Project/日本 ü'));
-  assert.deepEqual(t.posted.map(p => p.o), ['https://os.ezil.work', 'https://os-staging.ezil.work']);
+  assert.deepEqual(t.posted.map(p => p.o), origins);
   assert(t.posted.every(p => p.m.type === 'ezil.code.ready' && Object.keys(p.m).length === 2));
   t.posted.length = 0;
   t.fire({ source: t.parent, origin: 'https://os-staging.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
@@ -69,21 +70,22 @@ function bridgeBehaviour(patched) {
   // a document the person navigated to (Open Folder dropped ezil_mint) reports mint:null; a malformed mint is null
   for (const search of ['?folder=%2Fworkspace%2Fb', '?folder=%2Fw&ezil_mint=bad', `?ezil_mint=${MINT}x`]) {
     const u = bridge(fp('/workspace/b'), { search }); u.posted.length = 0;
-    u.fire({ source: u.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+    u.fire({ source: u.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
     assert.equal(u.posted[0].m.mint, null, search);
   }
   // refusals: another origin, another source, a bad nonce, another version, a string payload
   t.posted.length = 0;
   t.fire({ source: t.parent, origin: 'https://evil.example', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
-  t.fire({ source: t.parent, origin: 'https://os.ezil.work.evil.example', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
-  t.fire({ source: {}, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
-  t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: 'short' } });
-  t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 2, nonce: N } });
-  t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: '{"type":"ezil.code.hello","v":1}' });
-  t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: null });
+  t.fire({ source: t.parent, origin: `${ALLOWED}.evil.example`, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+  if (!origins.includes('https://os.ezil.work')) t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+  t.fire({ source: {}, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+  t.fire({ source: t.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: 'short' } });
+  t.fire({ source: t.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 2, nonce: N } });
+  t.fire({ source: t.parent, origin: ALLOWED, data: '{"type":"ezil.code.hello","v":1}' });
+  t.fire({ source: t.parent, origin: ALLOWED, data: null });
   assert.equal(t.posted.length, 0);
   // kinds: foreign authority or scheme, a workspace file, an empty window, an absurdly long path
-  const kind = (prov) => { const r = bridge(prov); r.posted.length = 0; r.fire({ source: r.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } }); return r.posted[0].m; };
+  const kind = (prov) => { const r = bridge(prov); r.posted.length = 0; r.fire({ source: r.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } }); return r.posted[0].m; };
   assert.equal(kind(fp('/workspace', 'other-host')).kind, 'foreign');
   assert.equal(kind(fp('/workspace', 'aws-8443-guac-a-b-aws.ezil.work', 'file')).kind, 'foreign');
   assert.equal(kind(fp('/workspace', 'other-host')).path, undefined);
@@ -115,6 +117,12 @@ test('synthetic workbench: patch, gates, refusal without a write, origin allowli
     assert(patched.trimEnd().endsWith('MIT License. */'), 'modification notice appended');
     assert(!patched.includes('"*")'), 'never a * target');
     bridgeBehaviour(patched);
+    // The default allowlist is the staging shell only: the production shell origin gets nothing.
+    const st = bridgeFrom(patched)(fp('/workspace'));
+    assert.deepEqual(st.posted.map(p => p.o), ['https://os-staging.ezil.work']);
+    st.posted.length = 0;
+    st.fire({ source: st.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+    assert.equal(st.posted.length, 0);
 
     // B3: a same-frame open REPLACES the entry (no push); B1: the provider goes through the bridge
     const calls = [];
@@ -161,12 +169,13 @@ test('the shell origin allowlist is validated and embedded as given', () => {
   }
   const root = tmpRoot(FIXTURE);
   try {
-    const r = run([root], { EZIL_SHELL_ORIGINS_JSON: '["https://os-staging.ezil.work"]' });
+    // An explicit list (a production image would add its shell origin this way, once approved).
+    const r = run([root], { EZIL_SHELL_ORIGINS_JSON: '["https://os.ezil.work","https://os-staging.ezil.work"]' });
     assert.equal(r.status, 0, r.stderr);
+    bridgeBehaviour(read(root), ['https://os.ezil.work', 'https://os-staging.ezil.work']);
     const t = bridgeFrom(read(root))(fp('/workspace'));
-    assert.deepEqual(t.posted.map(p => p.o), ['https://os-staging.ezil.work']);
     t.posted.length = 0;
-    t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+    t.fire({ source: t.parent, origin: 'https://os-dev.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
     assert.equal(t.posted.length, 0, 'an origin outside the build-time allowlist gets nothing');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
