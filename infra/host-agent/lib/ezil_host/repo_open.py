@@ -20,8 +20,8 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
      the one optional key ``class: 'personal'|'assessment'`` (absent = personal). gitHost must be
      REPO_OPEN_CLASS_GIT_HOSTS[class], a closed table (personal -> git-preview.ezil.work,
      assessment -> git-qa.ezil.work), refused in both directions; ``class`` reaches the kernel
-     request only when the relay carried it. Every field is re-validated here with the Worker's
-     rules (parse_relay).
+     request only when the relay carried it. A class assessment relay carries ``path: null``
+     (E1-6). Every field is re-validated here with the Worker's rules (parse_relay).
    * Replies (edge status, JSON body):
      200 ``{ok:true, state:'running'}``;
      409 ``{ok:false, error}`` with error ``workspace_busy`` (the host's one slot is taken, or
@@ -38,7 +38,9 @@ Both routes are gw1-signed by the Worker with this epoch's control key (edge.py)
      its own validation: ``{status:200, body:{ok:true, state:'cloned'|'initialized_empty'|
      'existing', folder, openFolder, pathNotFound, branch, empty}}`` (open; for class assessment
      ``state`` is never 'existing' and the body adds ``head`` (40 hex, or null for an unborn
-     branch) and ``clean`` (boolean), vectors errorTable.workerResponses.okOpenAssessment),
+     branch), ``clean`` (boolean) and ``remote`` (https://git-qa.ezil.work/<handle>/<name>.git),
+     with folder = openFolder = the wrapper /workspace/projects/<repositoryId> and pathNotFound
+     false, vectors errorTable.workerResponses.okOpenAssessment; contract 1.0.3 E1-6),
      ``{status:200, body:{ok:true, state:'refreshed'}}`` (refresh), or
      ``{status, body:{ok:false, error}}`` with status from REPO_OPEN_STATUS (vectors
      errorTable.workerResponses.refusals). Host-originated codes: ``runtime_not_running`` (a
@@ -261,6 +263,11 @@ WORKSPACE_ROOT = "/workspace"                      # vectors WORKSPACE_ROOT_DEFA
 REPO_OPEN_CLASS_GIT_HOSTS = {"personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work"}
 REPO_OPEN_CLASS_DEFAULT = "personal"
 REPO_OPEN_GIT_HOSTS = (REPO_OPEN_CLASS_GIT_HOSTS[REPO_OPEN_CLASS_DEFAULT],)   # vectors workerRequest.gitHostAllowList
+# Class assessment layout (contract 1.0.3 E1-6, vectors constants ASSESSMENT_DIR_TEMPLATE / ASSESSMENT_CLONE_DIR_NAME /
+# ASSESSMENT_REMOTE_TEMPLATE): the answer's folder is the wrapper W = /workspace/projects/<repositoryId> (the editor
+# root), the clone is W/repository, and the remote is git-qa's URL of <handle>/<name>.
+ASSESSMENT_PROJECTS_DIR = "projects"
+ASSESSMENT_CLONE_DIR = "repository"
 RUN_DIRS = ("/run/ezil", "/run/ezil/bin", "/run/ezil/git", "/run/ezil/git/grants", "/run/ezil/git/incoming",
             "/run/ezil/requests", "/run/ezil/locks")
 KERNEL_PATH = "/run/ezil/bin/ezil-repo-open.mjs"
@@ -342,7 +349,7 @@ KERNEL_ERROR_CODES = ("folder_conflict", "repository_too_large", "git_auth_rejec
 OPEN_STATES = ("cloned", "initialized_empty", "existing")
 OPEN_KEYS = ("ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty")
 ASSESSMENT_OPEN_STATES = ("cloned", "initialized_empty")      # vectors kernel.assessment.states
-ASSESSMENT_OPEN_KEYS = OPEN_KEYS + ("head", "clean")           # vectors kernel.assessment.resultOpenKeys
+ASSESSMENT_OPEN_KEYS = OPEN_KEYS + ("head", "clean", "remote")  # vectors kernel.assessment.resultOpenKeys
 START_REFUSALS = frozenset({"workspace_busy", "job_replayed", "repo_open_invalid", "workspace_failed"})
 STATUS_REFUSALS = frozenset({"job_unknown", "repo_open_invalid"})
 BODY_KEYS = ("v", "op", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "grant")
@@ -406,6 +413,16 @@ def valid_job_id(v):
     return _str(v) and bool(JOB_RE.match(v))
 
 
+def assessment_folder(repository_id):
+    """The wrapper W an assessment answers as its folder and openFolder (E1-6)."""
+    return f"{WORKSPACE_ROOT}/{ASSESSMENT_PROJECTS_DIR}/{repository_id}"
+
+
+def assessment_remote(handle, name):
+    """vectors constants ASSESSMENT_REMOTE_TEMPLATE for <handle>/<name> (E1-6)."""
+    return f"https://{REPO_OPEN_CLASS_GIT_HOSTS['assessment']}/{handle}/{name}.git"
+
+
 def relay_class(raw):
     """The relay's request class (contract 1.0.3): its `class` when present (a string in the
     table), else the default; None when `class` is present but not a known class."""
@@ -419,7 +436,8 @@ def parse_relay(raw, now_ms):
     """The Worker's relay -> (jobId, §8 body). ValueError on anything outside the contract;
     never echoes a value. Same rules as worker/src/repo-open.ts parseRepoOpenBody, stricter
     only where Python and JSON differ (v must be the integer 1). gitHost must be the relay
-    class's host (REPO_OPEN_CLASS_GIT_HOSTS); `class` stays in the body only when it was sent."""
+    class's host (REPO_OPEN_CLASS_GIT_HOSTS); `class` stays in the body only when it was sent. A class
+    assessment relay must carry path null (E1-6: its editor root is always the wrapper)."""
     if (not isinstance(raw, dict) or set(raw) not in (RELAY_KEYS, CLASSED_RELAY_KEYS)
             or not valid_job_id(raw.get("jobId"))):
         raise ValueError("repo_open_invalid")
@@ -435,7 +453,7 @@ def parse_relay(raw, now_ms):
           and _str(b.get("repositoryId")) and bool(UUID_RE.match(b["repositoryId"]))
           and _str(b.get("handle")) and bool(HANDLE_RE.match(b["handle"])) and valid_name(b.get("name"))
           and b.get("gitHost") == REPO_OPEN_CLASS_GIT_HOSTS[cls] and valid_branch(b.get("defaultBranch"))
-          and (path is None or (b["op"] == "open" and _str(path) and path_problem(path) is None))
+          and (path is None or (cls != "assessment" and b["op"] == "open" and _str(path) and path_problem(path) is None))
           and g.get("username") == "ezil" and _str(g.get("token")) and bool(GRANT_RE.match(g["token"]))
           and g.get("scope") in ("write", "read")
           and expires is not None and now_ms < expires <= now_ms + WORKER_ACCEPT_EXPIRY_MAX_MS)
@@ -504,11 +522,13 @@ def kernel_refusal(value):
     return refusal("workspace_failed")
 
 
-def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT):
+def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT, remote=None):
     """A kernel commit result for op open, validated as strictly as the OS validates the
     Worker's 200 (vectors errorTable.workerResponses.okRule). Class assessment (contract 1.0.3,
     okAssessmentRule): exactly ASSESSMENT_OPEN_KEYS, never `existing`, head None or 40 lowercase
-    hex, clean a bool, and head None exactly when empty and when the state is initialized_empty."""
+    hex, clean a bool, and head None exactly when empty and when the state is initialized_empty;
+    E1-6: `folder` is the wrapper W the caller rebuilt (assessment_folder), openFolder is exactly W,
+    pathNotFound is False, and `remote` is exactly the caller's expected URL (assessment_remote)."""
     if value is None:
         return refusal("workspace_failed")
     if value.get("ok") is False:
@@ -522,6 +542,10 @@ def open_answer(value, folder, cls=REPO_OPEN_CLASS_DEFAULT):
         if (value["state"] not in ASSESSMENT_OPEN_STATES or not (head is None or (_str(head) and HEAD_RE.match(head)))
                 or not isinstance(value["clean"], bool) or value["empty"] is not (head is None)
                 or (value["state"] == "initialized_empty") is not (head is None)):
+            return refusal("workspace_failed")
+        # E1-6: the editor root is the wrapper itself, never a folder below it, and the remote is this repository's.
+        if (not _str(remote) or not _str(value["remote"]) or value["remote"] != remote
+                or value["openFolder"] != folder or value["pathNotFound"] is not False):
             return refusal("workspace_failed")
     of = value.get("openFolder")
     if (value["ok"] is not True or value["state"] not in OPEN_STATES
@@ -1013,7 +1037,14 @@ class Flight:
         self.answer = None             # the job's answer once computed (before release)
         self.step = "check"            # the step running, for an unconfirmed cleanup's answer
         self.cleanup = None            # the CleanupPending that ended the flight, if any
-        self.folder = f"{WORKSPACE_ROOT}/repos/{body['handle']}/{body['name']}"
+        # The folder the answer must name, rebuilt from this job's own validated body: the repository folder
+        # (personal), or the wrapper W plus the expected remote (assessment, E1-6).
+        if body.get("class") == "assessment":
+            self.folder = assessment_folder(body["repositoryId"])
+            self.remote = assessment_remote(body["handle"], body["name"])
+        else:
+            self.folder = f"{WORKSPACE_ROOT}/repos/{body['handle']}/{body['name']}"
+            self.remote = None
         self.request_path = f"/run/ezil/requests/{self.uuid}.json"
         self.incoming = f"/run/ezil/git/incoming/{self.uuid}.json"
         self.staging = f"{WORKSPACE_ROOT}/{STAGING_ROOT_NAME}/{self.uuid}"
@@ -1214,7 +1245,7 @@ class Flight:
                         # workspace_failed, because a re-open would answer folder_conflict
                         # (workerExec.assessment).
                         answer = self.failure(res, timeout_codes(b)["commit"]) or open_answer(
-                            last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT))
+                            last_json_line(res[2]), self.folder, b.get("class", REPO_OPEN_CLASS_DEFAULT), self.remote)
         else:
             # Step 10.
             self.step = "refresh"

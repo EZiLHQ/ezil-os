@@ -61,7 +61,14 @@ OPEN_OK = {"ok": True, "state": "cloned", "folder": FOLDER, "openFolder": FOLDER
            "branch": "main", "empty": False}
 QA_HOST = "git-qa.ezil.work"
 ASSESS = {"class": "assessment", "gitHost": QA_HOST}       # relay overrides of an assessment open (contract 1.0.3)
-ASSESS_OK = {**OPEN_OK, "head": "0123456789abcdef" * 2 + "01234567", "clean": True}
+# E1-6: an assessment answers the wrapper W = /workspace/projects/<repositoryId> and git-qa's remote of acme/site
+# (vectors errorTable.workerResponses.okAssessmentContext, for the base body's repository).
+ASSESS_CTX = V["errorTable"]["workerResponses"]["okAssessmentContext"]
+ASSESS_W = ASSESS_CTX["folder"]
+ASSESS_REMOTE = ASSESS_CTX["remote"]
+OTHER_REPO_ID = V["fixtures"]["otherRepositoryId"]
+ASSESS_OK = {**OPEN_OK, "folder": ASSESS_W, "openFolder": ASSESS_W, "head": "0123456789abcdef" * 2 + "01234567", "clean": True,
+             "remote": ASSESS_REMOTE}
 
 
 def iso(seconds):
@@ -121,6 +128,13 @@ class Vectors(unittest.TestCase):
         self.assertEqual(list(ro.OPTIONAL_BODY_KEYS), V["kernel"]["optionalRequestKeys"])
         self.assertEqual(list(ro.ASSESSMENT_OPEN_KEYS), V["kernel"]["assessment"]["resultOpenKeys"])
         self.assertEqual(list(ro.ASSESSMENT_OPEN_STATES), V["kernel"]["assessment"]["states"])
+        # E1-6: the assessment layout and remote, rebuilt the way the vectors context is
+        self.assertEqual(f"{ro.ASSESSMENT_PROJECTS_DIR}/<repositoryId>", c["ASSESSMENT_DIR_TEMPLATE"])
+        self.assertEqual(ro.ASSESSMENT_CLONE_DIR, c["ASSESSMENT_CLONE_DIR_NAME"])
+        self.assertEqual(ro.assessment_folder(ASSESS_CTX["repositoryId"]), ASSESS_CTX["folder"])
+        self.assertEqual(ro.assessment_remote(ASSESS_CTX["handle"], ASSESS_CTX["name"]), ASSESS_CTX["remote"])
+        self.assertEqual(ro.assessment_remote("<handle>", "<name>"), c["ASSESSMENT_REMOTE_TEMPLATE"])
+        self.assertEqual(ASSESS_CTX["root"], ro.WORKSPACE_ROOT)
         self.assertEqual(list(ro.BODY_KEYS), V["workerRequest"]["keys"])
         self.assertEqual(list(ro.GRANT_KEYS), V["workerRequest"]["grantKeys"])
         for name in ("WORKER_DEADLINE_MS", "PREPARE_WINDOW_MS", "PREPARE_RESERVE_MS", "COMMIT_EXEC_MAX_MS",
@@ -207,7 +221,9 @@ class Vectors(unittest.TestCase):
 
     def test_a_worst_case_relay_body_fits_the_edge_limit(self):
         for over in ({}, {"class": "personal"}, ASSESS):
-            worst = relayed(handle="h" * 39, name="n" * 100, defaultBranch="b" * 244, path="p" * 255, **over)
+            # E1-6: an assessment carries no path, so its worst case is smaller
+            path = None if over is ASSESS else "p" * 255
+            worst = relayed(handle="h" * 39, name="n" * 100, defaultBranch="b" * 244, path=path, **over)
             data = json.dumps(worst, separators=(",", ":")).encode()
             ro.parse_relay(worst, int(time.time() * 1000))
             self.assertLessEqual(len(data), ro.WORKER_REQUEST_MAX_BYTES + len(',"jobId":""') + 64, over)
@@ -241,20 +257,24 @@ class Vectors(unittest.TestCase):
         self.assertIn("const DEFAULT_CLASS = '%s';" % V["constants"]["REPO_OPEN_CLASS_DEFAULT"], kernel)
 
     def test_worker_assessment_ok_cases_through_the_host_validator(self):
+        """Every okAssessmentCases row, validated for the repository the vectors context names: the
+        expected folder (W) and remote come from the context (as the job rebuilds them from its own
+        body), never from the case body, so a row with another folder or remote cannot pass."""
         cases = V["errorTable"]["workerResponses"]["okAssessmentCases"]
+        self.assertEqual(len(cases), 32)
         self.assertTrue(any(c["valid"] for c in cases) and any(not c["valid"] for c in cases))
         for case in cases:
             b = expand(case["body"])
-            ans = ro.open_answer(dict(b), b["folder"], "assessment")
-            self.assertEqual(ans["status"] == 200, case["valid"], case.get("why", b))
+            ans = ro.open_answer(dict(b), ASSESS_W, "assessment", ASSESS_REMOTE)
+            self.assertEqual(ans["status"] == 200, case["valid"], case.get("why", "valid"))
             if case["valid"]:
                 self.assertEqual(ans["body"], b)
                 self.assertEqual(list(ans["body"]), V["kernel"]["assessment"]["resultOpenKeys"])
                 self.assertNotEqual(ro.open_answer(dict(b), b["folder"])["status"], 200, "an assessment shape for a personal open")
         for case in V["errorTable"]["workerResponses"]["okCases"]:
             if case["op"] == "open" and case["valid"]:
-                self.assertNotEqual(ro.open_answer(dict(case["body"]), case["body"]["folder"], "assessment")["status"], 200,
-                                    "a personal shape for an assessment open")
+                self.assertNotEqual(ro.open_answer(dict(case["body"]), case["body"]["folder"], "assessment", ASSESS_REMOTE)["status"],
+                                    200, "a personal shape for an assessment open")
 
 
 # ─────────────────────────────────────────────────────────────────────────── assets
@@ -332,16 +352,29 @@ class Sanitizer(unittest.TestCase):
         failed = ro.refusal("workspace_failed")
         empty = {**ASSESS_OK, "state": "initialized_empty", "empty": True, "head": None}
         for good in (ASSESS_OK, {**ASSESS_OK, "clean": False}, empty):
-            self.assertEqual(ro.open_answer(dict(good), FOLDER, "assessment"), {"status": 200, "body": good})
+            self.assertEqual(ro.open_answer(dict(good), ASSESS_W, "assessment", ASSESS_REMOTE), {"status": 200, "body": good})
+        clone = ASSESS_W + "/" + ro.ASSESSMENT_CLONE_DIR
+        nine = {k: v for k, v in ASSESS_OK.items() if k != "remote"}
         for bad in (OPEN_OK, {**ASSESS_OK, "state": "existing"}, {**ASSESS_OK, "head": None},
                     {**empty, "head": ASSESS_OK["head"]}, {**ASSESS_OK, "empty": True}, {**ASSESS_OK, "head": "A" * 40},
                     {**ASSESS_OK, "head": "a" * 64}, {**ASSESS_OK, "head": "a" * 40 + "\n"}, {**ASSESS_OK, "clean": 1},
                     {**ASSESS_OK, "clean": None}, {**ASSESS_OK, "extra": 1},
                     # empty and head agree; only the state contradicts them (review fix: these isolate
                     # "state is initialized_empty exactly when head is null")
-                    {**empty, "state": "cloned"}, {**ASSESS_OK, "state": "initialized_empty"}):
-            self.assertEqual(ro.open_answer(dict(bad), FOLDER, "assessment"), failed, str(bad)[-80:])
-        self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, FOLDER, "assessment"),
+                    {**empty, "state": "cloned"}, {**ASSESS_OK, "state": "initialized_empty"},
+                    # E1-6: the wrapper, exactly; the remote, exactly
+                    nine, {**ASSESS_OK, "folder": clone, "openFolder": clone}, {**ASSESS_OK, "openFolder": clone},
+                    {**ASSESS_OK, "openFolder": ASSESS_W + "/src"}, {**ASSESS_OK, "pathNotFound": True},
+                    {**ASSESS_OK, "folder": FOLDER, "openFolder": FOLDER},
+                    {**ASSESS_OK, "remote": "https://git-preview.ezil.work/acme/site.git"},
+                    {**ASSESS_OK, "remote": "https://git-qa.ezil.work/acme/other.git"}, {**ASSESS_OK, "remote": ASSESS_REMOTE + "\n"},
+                    {**ASSESS_OK, "remote": None}, {**ASSESS_OK, "remote": 1}):
+            self.assertEqual(ro.open_answer(dict(bad), ASSESS_W, "assessment", ASSESS_REMOTE), failed, str(bad)[-80:])
+        # the expected values come from the caller: another repository's wrapper, or no expected remote, refuses
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ro.assessment_folder(OTHER_REPO_ID), "assessment", ASSESS_REMOTE), failed)
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment"), failed, "an assessment without an expected remote")
+        self.assertEqual(ro.open_answer(dict(ASSESS_OK), ASSESS_W, "assessment", ro.assessment_remote("acme", "other")), failed)
+        self.assertEqual(ro.open_answer({"ok": False, "errorCode": "folder_conflict"}, ASSESS_W, "assessment", ASSESS_REMOTE),
                          ro.refusal("folder_conflict"))
 
     def test_last_json_line(self):
@@ -1131,6 +1164,38 @@ class AssessmentJob(JobBase):
             self.setUp()
             self.assertEqual(self.run_job(fake, f"{i + 10:x}" * 64), ro.refusal("workspace_busy"), i)
 
+    def test_an_assessment_answer_names_the_wrapper_and_remote_of_its_own_body(self):
+        """E1-6: the job rebuilds W from its own relay's repositoryId and the remote from its handle and
+        name; a kernel answer naming another wrapper, the clone, or another remote is workspace_failed."""
+        clone = ASSESS_W + "/" + ro.ASSESSMENT_CLONE_DIR
+        other_w = ro.assessment_folder(OTHER_REPO_ID)
+        outs = ({**ASSESS_OK, "folder": other_w, "openFolder": other_w}, {**ASSESS_OK, "folder": clone, "openFolder": clone},
+                {**ASSESS_OK, "openFolder": clone}, {**ASSESS_OK, "pathNotFound": True},
+                {**ASSESS_OK, "remote": ro.assessment_remote("acme", "other")},
+                {k: v for k, v in ASSESS_OK.items() if k != "remote"})
+        for i, out in enumerate(outs):
+            fake = FakeDesktop({"commit": line(out)})
+            self.assertEqual(self.run_job(fake, f"{i + 1:x}" * 64, **ASSESS), ro.refusal("workspace_failed"), i)
+        # the same answers are right for the jobs whose own bodies name that repository
+        fake = FakeDesktop({"commit": line(outs[0])})
+        self.assertEqual(self.run_job(fake, "9" * 64, repositoryId=OTHER_REPO_ID, **ASSESS), {"status": 200, "body": outs[0]})
+        fake = FakeDesktop({"commit": line(outs[4])})
+        self.assertEqual(self.run_job(fake, "8" * 64, name="other", **ASSESS), {"status": 200, "body": outs[4]})
+
+    def test_a_path_on_an_assessment_relay_is_refused_at_the_agent_and_nothing_runs(self):
+        """E1-6: an assessment's editor root is always its wrapper; a relay with any path is refused."""
+        fake = FakeDesktop()
+        with mock.patch.object(ro, "bounded_runc_exec", fake.exec_):
+            for path in ("src", "src/main.ts", "repository", ""):
+                self.assertEqual(self.send("repo_open", request=relayed("f" * 64, path=path, **ASSESS)),
+                                 {"ok": False, "error": "repo_open_invalid"}, path)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(self.runner.busy)
+        # control: a personal relay keeps its path, and an assessment relay with path null parses
+        now = int(time.time() * 1000)
+        self.assertEqual(ro.parse_relay(relayed(path="src"), now)[1]["path"], "src")
+        self.assertIsNone(ro.parse_relay(relayed(**ASSESS), now)[1]["path"])
+
     def test_a_kernel_folder_conflict_passes_through_for_an_assessment(self):
         fake = FakeDesktop({"prepare": line({"ok": False, "errorCode": "folder_conflict"})})
         self.assertEqual(self.run_job(fake, **ASSESS), ro.refusal("folder_conflict"))
@@ -1730,26 +1795,40 @@ class RealKernel(JobBase):
         self.no_token_in_container_except_grant()
 
     def test_assessment_through_the_real_kernel_refuses_an_existing_folder_and_needs_git_qa(self):
-        """Contract 1.0.3 through the host's exact argv sequence: an assessment never adopts a folder
-        that is already there (even one bound to this very repository), offline it reaches for
-        git-qa (network_unavailable, nothing left), and a personal request on git-qa never gets that far."""
+        """Contract 1.0.3 (E1-6 layout) through the host's exact argv sequence: an assessment never
+        adopts a wrapper /workspace/projects/<repositoryId> that is already there (even one holding a
+        clone bound to this very repository), never looks through a /workspace/projects symlink,
+        offline it reaches for git-qa (network_unavailable, nothing left), and a personal folder of the
+        same handle/name does not block it."""
         b = body()
+        wrapper = ro.assessment_folder(b["repositoryId"])
         binding = json.dumps({"v": 1, "repositoryId": b["repositoryId"], "handle": "acme", "name": "staged",
                               "gitHost": QA_HOST})
-        setup = self.sh("set -e; git init -q -b main /workspace/repos/acme/staged; cd /workspace/repos/acme/staged; "
+        setup = self.sh(f"set -e; git init -q -b main {wrapper}/repository; cd {wrapper}/repository; "
                         "git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m staged; "
                         f"printf '%s\\n' '{binding}' > .git/ezil-repo.json")
         self.assertEqual(setup.returncode, 0, setup.stderr)
-        before = self.sh("cd /workspace/repos/acme/staged && find . -printf '%p %s %T@\\n' | sort").stdout
+        before = self.sh(f"cd {wrapper} && find . -printf '%p %s %T@\\n' | sort").stdout
         self.assertEqual(self.run_real("4" * 64, name="staged", **ASSESS), ro.refusal("folder_conflict"))
         self.assertEqual([a[2] for a in self.argvs if a[:2] == ["node", ro.KERNEL_PATH]], ["prepare", "release"])
-        self.assertEqual(self.sh("cd /workspace/repos/acme/staged && find . -printf '%p %s %T@\\n' | sort").stdout, before)
+        self.assertEqual(self.sh(f"cd {wrapper} && find . -printf '%p %s %T@\\n' | sort").stdout, before)
         left = self.sh("ls -A /run/ezil/git/grants /run/ezil/locks /run/ezil/requests /run/ezil/git/incoming /workspace/.ezil-staging 2>&1")
         self.assertNotIn("acme__staged", left.stdout, "an assessment refused before any action installs no grant")
         self.assertNotIn(".json", re.sub(r"acme__site\.json", "", left.stdout))
-        # a fresh folder: the kernel reaches for git-qa.ezil.work, which the container cannot resolve
+        self.assertEqual(self.sh(f"rm -rf {wrapper}").returncode, 0)
+        # a /workspace/projects symlink is never looked through: workspace_failed before any action
+        self.assertEqual(self.sh("set -e; mkdir /tmp/elsewhere; mv /workspace/projects /tmp/moved-projects; "
+                                 "ln -s /tmp/elsewhere /workspace/projects").returncode, 0)
+        self.assertEqual(self.run_real("6" * 64, name="fresh", **ASSESS), ro.refusal("workspace_failed"))
+        self.assertEqual([a[2] for a in self.argvs if a[:2] == ["node", ro.KERNEL_PATH]], ["prepare", "release"])
+        self.assertEqual(self.sh("ls -A /tmp/elsewhere; ls -A /run/ezil/locks").stdout.strip(), "", "something was written through it")
+        self.assertEqual(self.sh("rm /workspace/projects && rmdir /tmp/elsewhere && mv /tmp/moved-projects /workspace/projects").returncode, 0)
+        # a fresh wrapper (a personal folder of the same handle/name is no conflict): the kernel reaches
+        # for git-qa.ezil.work, which the container cannot resolve; nothing is placed
+        self.assertEqual(self.sh("set -e; mkdir -p /workspace/repos/acme/fresh").returncode, 0)
         self.assertEqual(self.run_real("5" * 64, name="fresh", **ASSESS), ro.refusal("network_unavailable"))
-        self.assertEqual(self.sh("test -e /workspace/repos/acme/fresh && echo FOLDER; ls -A /run/ezil/locks").stdout.strip(), "")
+        self.assertEqual(self.sh(f"ls -A /workspace/projects; test -e {wrapper} && echo WRAPPER; ls -A /run/ezil/locks").stdout.strip(), "")
+        self.assertEqual(self.sh("rmdir /workspace/repos/acme/fresh").returncode, 0)
         self.no_token_in_container_except_grant(allowed=self.grant_files())
 
     def grant_files(self):
