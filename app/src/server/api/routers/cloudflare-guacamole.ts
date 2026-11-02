@@ -86,6 +86,7 @@ import {
 import type { PlacementDb } from '@/server/lib/compute/placement';
 import type { ComputeProvider } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
+import { codeFolderAnswer, parseCodeFolderAsk } from '@/server/lib/compute/code-folder';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -765,10 +766,20 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
              * `z.unknown()`, like `previewUrl`'s `screen` and `intent`: never a 400 of the mint.
              */
             intent: z.unknown().optional(),
+            /**
+             * Per-tab folder continuity, own files only (the shell never sends it with a project): `{v:1, path}`, the
+             * folder this tab's editor last reported. A HINT, checked lexically here (`compute/code-folder.ts`) and
+             * resolved by the Worker on the computer itself. `z.unknown()`: never a 400 of the mint; a hint that
+             * fails the check is not forwarded and the answer says `invalid`.
+             */
+            codeFolder: z.unknown().optional(),
         }))
         .query(async ({ ctx, input, signal }) => {
             const startedAt = Date.now();
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            // Only after ownership: nothing about the hint is read for someone else's computer.
+            const folderAsk = input.codeFolder === undefined ? undefined : parseCodeFolderAsk(input.codeFolder);
+            const folderAnswer = (workerAnswer: unknown) => codeFolderAnswer(workerAnswer, input.codeFolder, folderAsk);
 
             const config = resolveCloudflareGuacamoleConfig();
             if (!config.isConfigured) {
@@ -783,7 +794,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const correlationId = newCorrelationId();
 
             const computer = { userId: ctx.user.id, computerId: input.computerId };
-            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
+            // The folder hint rides the Code ask only (Cloudflare: the ensure body; AWS: the `surface: 'code'` preview body,
+            // never pool preparation). Omitted, never defaulted: no hint is today's body byte for byte.
+            const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const, ...(folderAsk ? { codeFolder: folderAsk } : {}) };
             // Phase B (D20, §5.9, r7 fixer, ratified r8): Code is an open of the computer too, so it starts the move as the
             // desktop does ("the next time you open your desktop or Code"). Never within the stop hold: a leftover poll still
             // answers `computer_stopped` below, and no row is created for it.
@@ -827,7 +840,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
-                return awsAnswered(routed.kind, 'code', input.computerId, answer, startedAt, preview);
+                // Per-tab folder continuity: the Worker's code passes through the preview allowlist (aws-preview.ts);
+                // a hint this app refused says `invalid` here. Only on an open, never on a refusal.
+                const folded = answer.ok ? { ...answer, ...folderAnswer((answer as { codeFolder?: unknown }).codeFolder) } : answer;
+                return awsAnswered(routed.kind, 'code', input.computerId, folded, startedAt, preview);
             }
             await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
@@ -913,6 +929,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     ok: true as const,
                     correlationId,
                     codePreviewUrl: verdict.url,
+                    // Per-tab folder continuity: the Worker's outcome code only (never a path); a refused hint says so.
+                    ...folderAnswer(result.codeFolder),
                     expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
                     provider: 'cloudflare-guacamole' as const,
                 };
@@ -953,6 +971,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: true as const,
                 correlationId,
                 codePreviewUrl,
+                // A Worker predating `codePreviewUrl` never resolves a hint: only a refused one is answered (`invalid`).
+                ...folderAnswer(undefined),
                 expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
                 provider: 'cloudflare-guacamole' as const,
             };

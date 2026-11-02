@@ -625,6 +625,37 @@ describe('AWS preview surface (seam B)', () => {
         expect(fetchMock).toHaveBeenCalledOnce();
         expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
     });
+    // Per-tab folder continuity (compute/code-folder.ts): the own-files hint rides Code's signed body only.
+    const codeFolder = { v: 1 as const, path: '/workspace/My Project/日本' };
+    it('code: the folder hint comes last, after the surface, and the v2 token signs that exact body', async () => {
+        fetchMock.mockResolvedValue(Response.json({ ...ready(), codeFolder: { v: 1, outcome: 'restored' } }));
+        const out = await setup().open(config, 'test-secret', { ...options, surface: 'code', codeFolder });
+        expect(out).toMatchObject({ ok: true, codeFolder: { v: 1, outcome: 'restored' } });
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko', surface: 'code', codeFolder }));
+    });
+    it('the app and the desktop never carry the folder hint, whatever the options say', async () => {
+        await setup().open(config, 'test-secret', { ...options, surface: 'app', codeFolder });
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko', surface: 'app' }));
+        fetchMock.mockClear();
+        await setup().open(config, 'test-secret', { ...options, codeFolder });
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
+    });
+    it('pool relay preparation never carries the folder hint', async () => {
+        const pending = row({ state: 'MOUNTING', last_error: 'pool_session_pending', enroll_nonce_hash: null,
+            enroll_consumed_hash: 'a'.repeat(64), instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111',
+            lifecycle_job_id: '11111111-1111-4111-8111-111111111111', lifecycle_digest: 'b'.repeat(64) });
+        const fake = createFakePlacementDb({ placements: [pending] });
+        await prepareAwsPoolSession(fake.db, { userId, computerId }, { ...options, surface: 'code', codeFolder }, config, 'test-secret', 'test');
+        expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
+    });
+    it('the answer allowlist takes an outcome code only: a path, an extra key or another version fails closed', async () => {
+        for (const bad of [{ v: 1, outcome: '/etc' }, { v: 1, outcome: 'restored', path: '/workspace/a' }, { v: 2, outcome: 'restored' }, 'restored']) {
+            fetchMock.mockResolvedValue(Response.json({ ...ready(), codeFolder: bad }));
+            const out = await setup().open(config, 'test-secret', { ...options, surface: 'code', codeFolder });
+            expect(out).toMatchObject({ ok: false });
+            expect(JSON.stringify(out)).not.toContain('/workspace/a');
+        }
+    });
     it('pins the surface key and values to the Worker source', () => {
         const worker = readFileSync(path.resolve(__dirname, '../../../../../worker/src/aws-origin.ts'), 'utf8');
         expect(worker).toContain("return value === 'code' || value === 'app' ? value : 'desktop';");
