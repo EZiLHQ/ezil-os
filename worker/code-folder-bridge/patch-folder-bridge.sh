@@ -18,8 +18,8 @@
 #
 # What the editor tells the shell, and to whom:
 #   - only when framed (window.parent !== window), only to an origin in the
-#     build-time allowlist EZIL_SHELL_ORIGINS_JSON (default: the EZiL OS shell
-#     origins), never with a '*' target;
+#     build-time allowlist EZIL_SHELL_ORIGINS_JSON (default: the staging EZiL OS
+#     shell origin only), never with a '*' target;
 #   - `ezil.code.ready` (no data) once at load, so the shell can say hello;
 #   - `ezil.code.folder` {v:1, nonce, mint, kind, path?} only in answer to a
 #     shell hello whose source is window.parent, whose origin is allowed and
@@ -42,8 +42,10 @@ if [ "${1:-}" = "--verify" ]; then VERIFY_ONLY=1; shift; fi
 ROOT="${1:-/usr/lib/code-server/lib/vscode}"
 WB="$ROOT/out/vs/code/browser/workbench/workbench.js"
 # The EZiL OS shell origins allowed to receive a report. Defense in depth: the
-# shell also checks origin + source + nonce + its own per-mint id.
-SHELL_ORIGINS_JSON="${EZIL_SHELL_ORIGINS_JSON:-[\"https://os.ezil.work\",\"https://os-staging.ezil.work\"]}"
+# shell also checks origin + source + nonce + its own per-mint id. The default is
+# the STAGING shell only (this change is staging-scoped); a production image adds
+# https://os.ezil.work explicitly through EZIL_SHELL_ORIGINS_JSON once approved.
+SHELL_ORIGINS_JSON="${EZIL_SHELL_ORIGINS_JSON:-[\"https://os-staging.ezil.work\"]}"
 NOTICE='/* Modified at build time by EZiL (worker/code-folder-bridge/patch-folder-bridge.sh): the folder this document opened is reported to the EZiL shell; same-frame opens replace history. Original work: Copyright (c) Microsoft Corporation, MIT License. */'
 
 [ -s "$WB" ] || { echo "patch-folder-bridge: missing $WB" >&2; exit 1; }
