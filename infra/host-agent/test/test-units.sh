@@ -112,4 +112,5 @@ check "host units: every long-lived unit restarts after a crash (bounded); edge/
 check "units: the desktop restarts on exit except on a refusal (exit 2); the agent restarts on failure" bash -c "grep -qx 'Restart=always' '$S/ezil-desktop.service' && grep -qx 'RestartPreventExitStatus=2' '$S/ezil-desktop.service' && grep -qx 'StartLimitBurst=5' '$S/ezil-desktop.service' && grep -qx 'Restart=on-failure' '$S/ezil-agent.service'"
 check "desktop step (relay mode): applied or ice_missing, desktop last in the relay boot order, no credential printed" pyunit test_ice.DesktopStep
 check "edge: real edge + real agent socket (ephemeral ports): 401 forwards nothing, strip, no smuggling, framing, WS, presence, control" pyunit test_edge.EdgeE2E
+check "edge folder op (per-tab Code folder continuity): shared walk vectors, no symlink followed (root, middle, leaf, raced), signed digest, framing and body refusals, rel never echoed or logged" pyunit test_folder
 summary "units + pure functions"
