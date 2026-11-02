@@ -1050,6 +1050,20 @@ class Job(JobBase):
         self.assertEqual(self.runner.start("d" * 64, body()), {"ok": False, "error": "workspace_busy"})
         self.assertNotIn("d" * 64, self.runner.used)
         self.assertEqual(len(self.runner.jobs), ro.JOBS_MAX)
+        # The TTL boundary (r56 recheck): with a frozen clock, a result aged exactly JOB_TTL is still unexpired. It
+        # stays readable and counts toward the full store, so the start is refused before admission.
+        frozen = time.time()
+        edge = {f"{i:064x}": {"state": "done", "result": {"status": 200, "body": {"n": i}}, "at": frozen - i}
+                for i in range(ro.JOBS_MAX - 1)}
+        edge["e" * 64] = {"state": "done", "result": {"status": 200, "body": {"aged": ro.JOB_TTL}}, "at": frozen - ro.JOB_TTL}
+        self.runner.jobs = json.loads(json.dumps(edge))
+        with mock.patch.object(ro, "bounded_runc_exec", fake.exec_), mock.patch.object(self.runner, "clock", lambda: frozen):
+            self.assertEqual(self.runner.start("f" * 64, body()), {"ok": False, "error": "workspace_busy"},
+                             "a result aged exactly JOB_TTL was reaped, so the start was admitted")
+            self.assertEqual(self.runner.status("e" * 64), {"ok": True, "state": "done", "result": edge["e" * 64]["result"]},
+                             "a result aged exactly JOB_TTL is no longer readable")
+        self.assertNotIn("f" * 64, self.runner.used)
+        self.assertEqual(set(self.runner.jobs), set(edge))
 
     def test_finished_results_expire(self):
         self.runner.jobs = {"c" * 64: {"state": "done", "result": {}, "at": time.time() - ro.JOB_TTL - 1}}

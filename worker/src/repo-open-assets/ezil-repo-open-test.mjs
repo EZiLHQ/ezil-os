@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
@@ -48,6 +49,12 @@ export const newToken = () => `egg_${crypto.randomBytes(32).toString('hex')}`;
 // ── isolation ───────────────────────────────────────────────────────────────
 
 const HOST_MARKERS = ['bin', 'git', 'requests'];
+/** git's built-in template directory on the Debian/Ubuntu git of the host and of the sandbox image (r56 recheck). */
+export const TEMPLATE_DIR = '/usr/share/git-core/templates';
+/** The passwd home of this uid: libcurl's netrc fallback when HOME is unset (r56 recheck). */
+export const PASSWD_HOME = os.userInfo().homedir;
+const HOST_PLANT_PLACES = ['/etc/gitattributes', `${TEMPLATE_DIR}/config`, `${TEMPLATE_DIR}/info/exclude`, `${TEMPLATE_DIR}/ezil-planted`,
+  `${PASSWD_HOME}/.netrc`];
 /**
  * Re-exec `selfPath` in a private mount + network namespace and exit with its status. Inside
  * (returns true): tmpfs on /run and /tmp, loopback up, and proof that the namespaces differ.
@@ -69,9 +76,12 @@ export function isolate(selfPath) {
     process.exit(1);
   }
   const hostBefore = HOST_MARKERS.filter((m) => fs.existsSync(`/run/ezil/${m}`));
-  // The r56 tests overmount /etc inside the private namespace only; the host's /etc/gitconfig never changes.
+  // The r56 tests overmount /etc, the system template directory and the passwd home inside the private namespace
+  // only; the host's /etc/gitconfig never changes, and neither does any other place they plant (lstat only).
   const etcGitconfig = () => { try { return crypto.createHash('sha256').update(fs.readFileSync('/etc/gitconfig')).digest('hex'); } catch { return 'absent'; } };
+  const plantedPlaces = () => HOST_PLANT_PLACES.map((p) => { try { const s = fs.lstatSync(p); return `${p} ${s.ino} ${s.size} ${s.mtimeMs}`; } catch { return `${p} absent`; } }).join('\n');
   const etcBefore = etcGitconfig();
+  const placesBefore = plantedPlaces();
   const parent = JSON.stringify({ mnt: fs.readlinkSync('/proc/self/ns/mnt'), net: fs.readlinkSync('/proc/self/ns/net') });
   const result = spawnSync('unshare', ['--mount', '--net', '--propagation', 'private', process.execPath, selfPath, ISOLATED_FLAG, parent],
     { stdio: 'inherit' });
@@ -82,6 +92,10 @@ export function isolate(selfPath) {
   }
   if (etcGitconfig() !== etcBefore) {
     console.error(`FAIL: the host /etc/gitconfig changed (${etcBefore} -> ${etcGitconfig()})`);
+    process.exit(1);
+  }
+  if (plantedPlaces() !== placesBefore) {
+    console.error(`FAIL: a host place the r56 tests plant in changed:\n${placesBefore}\n->\n${plantedPlaces()}`);
     process.exit(1);
   }
   process.exit(result.status ?? 1);
@@ -127,9 +141,11 @@ export function makeCa(dir) {
 
 /** HTTPS `git http-backend` (CGI) behind Basic auth `ezil:<state.token>`. mode: ok | 403 | 404 | hang. */
 export function startGitServer({ key, cert, projectRoot }) {
-  const state = { token: null, mode: 'ok', requests: 0 };
+  // watchAuth (r56 recheck): a test-chosen Authorization value (never a grant); watchHits counts the requests carrying it.
+  const state = { token: null, mode: 'ok', requests: 0, watchAuth: null, watchHits: 0 };
   const server = https.createServer({ key, cert }, (req, res) => {
     state.requests += 1;
+    if (state.watchAuth !== null && req.headers.authorization === state.watchAuth) state.watchHits += 1;
     if (state.mode === 'hang') return;
     const url = new URL(req.url, `https://${GIT_HOST}`);
     if (state.mode === '404') { res.writeHead(404); res.end('not found\n'); return; }
@@ -1772,17 +1788,21 @@ async function main() {
   });
 
   // ── r56 review (A2h): no global, XDG or system git config; the index read's fsmonitor ────────
+  // The kernel's HOME before the r56 recheck (guest root can write it). Since the recheck gitEnv's HOME is below
+  // /dev/null, so a config or ignore file planted here is kept out twice: by GIT_CONFIG_GLOBAL or XDG_CONFIG_HOME, and
+  // by HOME. Each of the two is mutation-proven together with HOME put back here (.lane-tmp/r56 specs3).
   const KERNEL_HOME = '/run/ezil/home';
   /**
-   * fn() with an overlay over /etc whose upper directory is on this suite's private /tmp tmpfs: a file written
-   * to /etc here lives in this mount namespace only (isolate() also compares the host's /etc/gitconfig).
+   * fn() with an overlay over `dir` whose upper directory is on this suite's private /tmp tmpfs: a file written
+   * under `dir` here lives in this mount namespace only (isolate() also checks the host's places are unchanged).
    */
-  async function withPrivateEtc(fn) {
-    const ovl = fs.mkdtempSync('/tmp/etc-overlay-');
+  async function withPrivateDir(dir, fn) {
+    const ovl = fs.mkdtempSync('/tmp/dir-overlay-');
     fs.mkdirSync(`${ovl}/up`); fs.mkdirSync(`${ovl}/work`);
-    execFileSync('mount', ['-t', 'overlay', 'overlay', '-o', `lowerdir=/etc,upperdir=${ovl}/up,workdir=${ovl}/work`, '/etc']);
-    try { return await fn(); } finally { execFileSync('umount', ['/etc']); }
+    execFileSync('mount', ['-t', 'overlay', 'overlay', '-o', `lowerdir=${dir},upperdir=${ovl}/up,workdir=${ovl}/work`, dir]);
+    try { return await fn(); } finally { execFileSync('umount', [dir]); }
   }
+  const withPrivateEtc = (fn) => withPrivateDir('/etc', fn);
   /** A config file a guest root could plant: a proxy and a redirect for `own`, a second remote, an ignore-all excludes file. */
   const plantedConfig = (own, other, proxyUrl) => [`[http "https://${own}"]`, `\tproxy = ${proxyUrl}`, '[http]', `\tproxy = ${proxyUrl}`,
     `[url "https://${other}/"]`, `\tinsteadOf = https://${own}/`, '[remote "origin"]', `\turl = https://${other}/acme/site.git`,
@@ -1891,6 +1911,138 @@ async function main() {
       assert.equal(exists(marker), false, `the index read ran the planted false: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
     } finally {
       execFileSync('umount', [FALSE]);
+    }
+  });
+
+  // ── r56 recheck (A2h): no template directory, no system attributes, no file under HOME ─────────
+  /** The placed repository folder F: repos/<handle>/<name> (personal), W/repository (assessment). */
+  const placedOf = (root, fields) => (fields.cls ? cloneOf(root) : `${root}/repos/acme/site`);
+  /** Control: a plain git init (no GIT_TEMPLATE_DIR) copies the planted template config, info/exclude and marker. */
+  const assertTemplateLive = (key, value) => {
+    const dir = fs.mkdtempSync('/tmp/r56-template-control-');
+    sh('git', ['init', '-q', dir], { env: USER_ENV });
+    assert.equal(sh('git', ['config', '--file', `${dir}/.git/config`, '--get', key], { env: USER_ENV }), `${value}\n`, `control: the template's ${key} is not live`);
+    assert.equal(fs.readFileSync(`${dir}/.git/info/exclude`, 'utf8'), '*\n', 'control: the template info/exclude is not live');
+    assert.equal(exists(`${dir}/.git/ezil-planted`), true, 'control: the template marker is not copied');
+  };
+
+  test('r56 recheck D2: no template directory (gitEnv GIT_TEMPLATE_DIR empty): a config (http.<host>.proxy, url.<other>.insteadOf or core.excludesFile), an info/exclude and a marker planted in the system template directory reach no kernel git of either class: no CONNECT to the planted proxy or the redirect, nothing of the template in the placed .git (its config is exactly vectors gitConfig, no info/exclude, no marker), and an untracked file in staging reads clean:false; control: a plain git init copies all of it', async () => {
+    const k = await kernel();
+    const decoy = await startProxy(fx.server.port);   // refuses and counts every CONNECT: git must never use it
+    decoy.state.mode = 'refuse';
+    const excludeAll = '/tmp/r56-template-exclude-all';
+    fs.writeFileSync(excludeAll, '*\n');
+    try {
+      const token = newToken(); fx.server.state.token = token;
+      // Before the plant: the fixtures' own git init would copy it.
+      const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+      assert.ok(fs.lstatSync(TEMPLATE_DIR).isDirectory(), `${TEMPLATE_DIR} is not a directory here`);
+      await withPrivateDir(TEMPLATE_DIR, async () => {
+        fs.mkdirSync(`${TEMPLATE_DIR}/info`, { recursive: true });
+        fs.writeFileSync(`${TEMPLATE_DIR}/info/exclude`, '*\n');
+        fs.writeFileSync(`${TEMPLATE_DIR}/ezil-planted`, 'planted\n');
+        const plants = [
+          ['http.<own>.proxy', (own) => [`http.https://${own}.proxy`, decoy.url]],
+          ['url.<other>.insteadOf', (own) => ['url.https://decoy.invalid/.insteadOf', `https://${own}/`]],
+          ['core.excludesFile', () => ['core.excludesFile', excludeAll]],
+        ];
+        for (const fields of [{}, ASSESS]) {
+          for (const [label, plant] of plants) {
+            resetRun();
+            const own = fields.gitHost ?? GIT_HOST;
+            const [key, value] = plant(own);
+            const tag = `${label} (${fields.cls ?? 'personal'})`;
+            fs.rmSync(`${TEMPLATE_DIR}/config`, { force: true });
+            sh('git', ['config', '--file', `${TEMPLATE_DIR}/config`, key, value], { env: USER_ENV });
+            assertTemplateLive(key, value);
+            const root = newRoot();
+            const uuid = crypto.randomUUID();
+            writeIncoming(uuid, { token, host: own });
+            const before = fx.proxy.state.connects.length;
+            const prepared = await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...fields }), fx.seam);
+            assert.equal(prepared.ok, true, `${tag}: ${JSON.stringify(prepared)}`);
+            assert.equal(decoy.state.connects.length, 0, `${tag}: git used the planted proxy`);
+            const connects = fx.proxy.state.connects.slice(before);
+            assert.ok(connects.length > 0 && connects.every((c) => c === `${own}:443`), `${tag}: CONNECTs ${JSON.stringify(connects)}`);
+            fs.writeFileSync(`${root}/.ezil-staging/${uuid}/untracked.txt`, 'u');
+            const committed = cli('commit', writeRequest({ phase: 'commit', uuid, root, ...fields })).result;
+            if (fields.cls) assert.deepEqual(committed, assessed(root, { head: remoteHeadOf(bare), clean: false }), `${tag}: ${JSON.stringify(committed)}`);
+            else assert.equal(committed && committed.state, 'cloned', `${tag}: ${JSON.stringify(committed)}`);
+            const F = placedOf(root, fields);
+            const config = localConfig(F);
+            assert.ok(gitConfigMatches(config, fields.cls ? qaConfig : expectedConfig), `${tag}: git config:\n${config.join('\n')}`);
+            assert.equal(config.some((l) => l.toLowerCase().startsWith(`${key.toLowerCase()}=`)), false, `${tag}: the template's ${key} reached .git/config`);
+            for (const name of ['info/exclude', 'ezil-planted']) assert.equal(exists(`${F}/.git/${name}`), false, `${tag}: the template's ${name} was copied`);
+            assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...fields })).result, { ok: true }, tag);
+          }
+        }
+      });
+    } finally {
+      decoy.close();
+    }
+  });
+
+  test('r56 recheck D2: no system attributes (gitEnv GIT_ATTR_NOSYSTEM=1): /etc/gitattributes "*.txt text eol=crlf" never reaches the checkout of either class: the placed a.txt keeps the remote\'s LF bytes (assessment: clean:true); control: a plain git clone of the same repository writes CRLF', async () => {
+    const token = newToken(); fx.server.state.token = token;
+    const body = 'l1\nl2\n';
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': body } } });
+    await withPrivateEtc(async () => {
+      fs.writeFileSync('/etc/gitattributes', '*.txt text eol=crlf\n');
+      try {
+        const control = fs.mkdtempSync('/tmp/r56-attributes-control-');
+        sh('git', ['clone', '-q', bare, `${control}/c`], { env: USER_ENV });
+        assert.equal(fs.readFileSync(`${control}/c/a.txt`, 'utf8'), 'l1\r\nl2\r\n', 'control: the planted /etc/gitattributes is not live');
+        for (const fields of [{}, ASSESS]) {
+          resetRun();
+          const tag = fields.cls ?? 'personal';
+          const root = newRoot();
+          const { committed, released } = await openFlow(fx, { root, token, ...fields });
+          if (fields.cls) assert.deepEqual(committed, assessed(root, { head: remoteHeadOf(bare) }), `${tag}: ${JSON.stringify(committed)}`);
+          else assert.equal(committed && committed.state, 'cloned', `${tag}: ${JSON.stringify(committed)}`);
+          assert.equal(fs.readFileSync(`${placedOf(root, fields)}/a.txt`, 'utf8'), body, `${tag}: the system attributes converted the checkout`);
+          assert.deepEqual(released, { ok: true }, tag);
+        }
+      } finally {
+        fs.rmSync('/etc/gitattributes', { force: true });
+      }
+    });
+  });
+
+  test('r56 recheck D2: HOME is a path that cannot exist (gitEnv): a netrc planted at the old kernel HOME (/run/ezil/home/.netrc) or in the passwd home (where libcurl looks when HOME is unset) never reaches the git host from prepare of either class; controls: a plain git with HOME=/run/ezil/home, and one without HOME, each send the planted credential', async () => {
+    // A test credential (never a grant): the server only counts requests that carry it.
+    const NETRC_USER = 'netrcuser', NETRC_PASSWORD = 'netrcpass';
+    const netrc = [GIT_HOST, QA_HOST].map((h) => `machine ${h} login ${NETRC_USER} password ${NETRC_PASSWORD}\n`).join('');
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    assert.ok(fs.lstatSync(PASSWD_HOME).isDirectory() && PASSWD_HOME !== KERNEL_HOME, `passwd home ${PASSWD_HOME}`);
+    fx.server.state.watchAuth = `Basic ${Buffer.from(`${NETRC_USER}:${NETRC_PASSWORD}`).toString('base64')}`;
+    fx.server.state.watchHits = 0;
+    try {
+      await withPrivateDir(PASSWD_HOME, async () => {
+        const plant = () => {
+          fs.mkdirSync(KERNEL_HOME, { recursive: true });
+          for (const file of [`${KERNEL_HOME}/.netrc`, `${PASSWD_HOME}/.netrc`]) fs.writeFileSync(file, netrc, { mode: 0o600 });
+        };
+        plant();
+        for (const [label, home] of [['HOME=/run/ezil/home', { HOME: KERNEL_HOME }], ['HOME unset', {}]]) {
+          const before = fx.server.state.watchHits;
+          await spawnAsync('git', ['-c', `http.sslCAInfo=${fx.tls.ca}`, '-c', `http.proxy=${fx.proxy.url}`, 'ls-remote', `https://${GIT_HOST}/acme/site.git`],
+            { cwd: '/tmp', env: { PATH: USER_ENV.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', ...home } });
+          assert.ok(fx.server.state.watchHits > before, `control (${label}): the planted netrc is not live`);
+        }
+        for (const fields of [{}, ASSESS]) {
+          resetRun();
+          plant();
+          const tag = fields.cls ?? 'personal';
+          const before = fx.server.state.watchHits;
+          const { committed, released } = await openFlow(fx, { root: newRoot(), token, ...fields });
+          assert.equal(fx.server.state.watchHits, before, `${tag}: a kernel git sent the planted netrc credential`);
+          assert.equal(committed && committed.state, 'cloned', `${tag}: ${JSON.stringify(committed)}`);
+          assert.deepEqual(released, { ok: true }, tag);
+        }
+      });
+    } finally {
+      fx.server.state.watchAuth = null;
     }
   });
 

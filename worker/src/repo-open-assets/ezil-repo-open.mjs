@@ -32,11 +32,10 @@ const GRANTS_DIR = '/run/ezil/git/grants';
 const INCOMING_DIR = '/run/ezil/git/incoming';
 const REQUESTS_DIR = '/run/ezil/requests';
 const LOCKS_DIR = '/run/ezil/locks';
-// Never created by the kernel, and never read by its git (r56 review): guest root can create files here, but
-// GIT_CONFIG_GLOBAL=/dev/null (no ~/.gitconfig), XDG_CONFIG_HOME below (no ~/.config/git/config, ignore or
-// attributes) and GIT_CONFIG_NOSYSTEM=1 (no /etc/gitconfig) leave every kernel git with repo-local config only.
-const GIT_HOME = '/run/ezil/home';
-// A path that cannot exist (below a character device), so git finds none of its XDG files.
+// gitEnv's HOME and XDG_CONFIG_HOME (r56 review and recheck): paths that cannot exist (below a character device), so
+// git finds no $HOME/.gitconfig and none of its XDG files, and libcurl (inside git) no $HOME/.netrc. HOME is set,
+// never unset: without HOME, libcurl reads the .netrc of the passwd home instead.
+const GIT_HOME = '/dev/null/ezil-no-home';
 const GIT_XDG_CONFIG_HOME = '/dev/null/ezil-no-xdg';
 const GIT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 export const STAGING_ROOT_NAME = '.ezil-staging';
@@ -212,11 +211,16 @@ const requestFileOf = (r) => `${REQUESTS_DIR}/${r.uuid}.json`;
 const GIT_BASE_CONFIG = ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
   '-c', 'submodule.recurse=false', '-c', 'core.fsmonitor='];
 /**
- * The whole environment of every git child: nothing inherited (§9.4 "Git hygiene", vectors kernel.gitEnv). No system,
- * global or XDG config is read, so a value guest root plants there (http.proxy, url.<base>.insteadOf,
- * credential.helper, include.path, core.excludesFile, ...) never reaches ls-remote, fetch, checkout or the reads.
+ * The whole environment of every runGit child: nothing inherited (§9.4 "Git hygiene", vectors kernel.gitEnv). git's own
+ * configuration sources are closed: no system, global or XDG config (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL,
+ * XDG_CONFIG_HOME), no system attributes file (GIT_ATTR_NOSYSTEM), no template directory (GIT_TEMPLATE_DIR empty: git
+ * init copies nothing into .git) and no file under HOME (libcurl's .netrc). A value guest root plants in any of them
+ * (http.proxy, url.<base>.insteadOf, credential.helper, include.path, core.excludesFile, an eol attribute, a netrc
+ * login, ...) never reaches ls-remote, fetch, checkout or the reads. The programs, libraries and other system files git
+ * and libcurl use (PATH, the CA store, the resolver) stay writable by guest root (vectors kernel.assessment.trust).
+ * The index read is no runGit child: it runs the codec's own binary and environment (INDEX_GIT_ENV) in a throwaway git dir.
  */
-export const gitEnv = () => ({ PATH: GIT_PATH, HOME: GIT_HOME, XDG_CONFIG_HOME: GIT_XDG_CONFIG_HOME, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' });
+export const gitEnv = () => ({ PATH: GIT_PATH, HOME: GIT_HOME, XDG_CONFIG_HOME: GIT_XDG_CONFIG_HOME, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ATTR_NOSYSTEM: '1', GIT_TEMPLATE_DIR: '' });
 const seamConfig = (seam) => (seam ? [
   ...(seam.sslCAInfo ? ['-c', `http.sslCAInfo=${seam.sslCAInfo}`] : []),
   ...(seam.proxy ? ['-c', `http.proxy=${seam.proxy}`] : []),
@@ -271,7 +275,10 @@ export function parseGitVersion(text) {
   const m = /git version (\d+)\.(\d+)/.exec(String(text));
   return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
 }
-/** `git init` argument lists for `dir` (§9.4 step 2): `-b` from git 2.28, else a symbolic-ref fallback. */
+/**
+ * `git init` argument lists for `dir` (§9.4 step 2): `-b` from git 2.28, else a symbolic-ref fallback. Both run with
+ * gitEnv, whose empty GIT_TEMPLATE_DIR keeps any template directory out of .git (r56 recheck).
+ */
 export function gitInitCommands(branch, version) {
   const modern = !!version && (version.major > 2 || (version.major === 2 && version.minor >= 28));
   return modern ? [['init', '-q', '-b', branch]] : [['init', '-q'], ['symbolic-ref', 'HEAD', `refs/heads/${branch}`]];
@@ -791,8 +798,8 @@ function currentBranch(folder, fallback) {
 }
 
 /**
- * The local git of the assessment reads (1.0.3): on top of the cleared environment (no system,
- * global or XDG config, as for every kernel git since the r56 review; GIT_CONFIG_GLOBAL is
+ * The local git of the assessment reads (1.0.3): on top of the cleared environment (gitEnv: git's
+ * own configuration sources closed since the r56 review; GIT_CONFIG_GLOBAL is
  * repeated here, vectors hardenedRead.env) and GIT_BASE_CONFIG (hooks /dev/null, fsmonitor off),
  * repository discovery stops at the directory's parent (the directory itself must be the
  * repository), no pager, and no optional lock (a status killed at its timeout never leaves

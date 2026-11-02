@@ -739,13 +739,20 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(K.hardenedRead.env.GIT_CONFIG_GLOBAL === '/dev/null' && K.hardenedRead.config.includes('core.hooksPath=/dev/null')
         && K.hardenedRead.config.includes('core.fsmonitor=') && !K.hardenedRead.config.some((c) => /^core\.fsmonitor=./.test(c)), 'hardened read config (fsmonitor off by the empty value)');
     ok(K.hardenedRead.env.GIT_CEILING_DIRECTORIES === `<root>/${C.STAGING_ROOT_NAME}`, 'the hardened reads run in staging, before the rename (ceiling = the staging root)');
-    // r56 review: no kernel git (both classes, every phase) reads a system, global or XDG config or XDG file.
+    // r56 review and recheck: git's own configuration sources are closed for every runGit child (both classes, every phase).
     const GE = V.kernel.gitEnv;
-    eq(Object.keys(GE.env), ['PATH', 'HOME', 'XDG_CONFIG_HOME', 'GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL'], 'kernel gitEnv keys');
+    eq(Object.keys(GE.env), ['PATH', 'HOME', 'XDG_CONFIG_HOME', 'GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_ATTR_NOSYSTEM', 'GIT_TEMPLATE_DIR'], 'kernel gitEnv keys');
     ok(GE.env.GIT_CONFIG_NOSYSTEM === '1' && GE.env.GIT_CONFIG_GLOBAL === '/dev/null' && GE.env.XDG_CONFIG_HOME.startsWith('/dev/null/')
         && GE.env.GIT_TERMINAL_PROMPT === '0', 'kernel gitEnv: no system, global or XDG config (an XDG home that cannot exist), no prompt');
     ok(/never reaches ls-remote, fetch, checkout or the reads/.test(GE.rule) && /repo-locally/.test(GE.rule), 'kernel gitEnv rule: plants never reach git; nothing relies on a global config');
     ok(!/ignore or attributes files under the kernel's HOME/.test(K.trust), 'trust no longer lists an XDG ignore or attributes file as a guest capability (git never reads one)');
+    // r56 recheck: no system attributes file, no template directory, and a HOME that cannot exist (libcurl reads $HOME/.netrc).
+    ok(GE.env.GIT_ATTR_NOSYSTEM === '1' && GE.env.GIT_TEMPLATE_DIR === '' && GE.env.HOME.startsWith('/dev/null/'),
+        'kernel gitEnv: no system attributes, no template directory, a HOME that cannot exist (r56 recheck)');
+    ok(/GIT_ATTR_NOSYSTEM=1/.test(GE.rule) && /GIT_TEMPLATE_DIR is empty/.test(GE.rule) && /\.netrc/.test(GE.rule) && /never unset/.test(GE.rule)
+        && /Not closed/.test(GE.rule) && /CA store/.test(GE.rule), 'kernel gitEnv rule: system attributes, templates and HOME files closed; what is not closed is named');
+    ok(/template directory/.test(K.trust) && /\.netrc/.test(K.trust) && /CA store/.test(K.trust) && !/no longer reads at all/.test(K.trust),
+        "trust: git's own sources are closed (templates, system attributes, HOME files); the programs, libraries and system files git uses are not");
     ok(Number.isSafeInteger(K.readBudgetMs) && K.readBudgetMs > 0 && K.readBudgetMs < V.timeouts.COMMIT_EXEC_MAX_MS, 'assessment readBudgetMs is inside the commit exec window');
     ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && /defaultBranch/.test(c.cause) && c.errorCode === 'repository_unavailable'), 'an assessment remote without defaultBranch is classified');
     ok(typeof K.trust === 'string' && /evidence, not proof/.test(K.trust), 'assessment head and clean are stated as in-guest evidence');
@@ -822,6 +829,13 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(/first grant issuance/.test(O.consumerRule) && /candidate-forgeable/.test(O.consumerRule) && /consuming/.test(O.consumerRule)
         && /head, clean, remote and branch/.test(O.consumerRule) && /in-guest evidence only/.test(O.consumerRule),
         'awsOutcomeOrigin consumerRule: after the first grant issuance a guest-origin outcome consumes; success fields are in-guest evidence only');
+    // r56 recheck: under identity A the owner can cause worker- and host-origin outcomes after the grant (a stop, a restart, an idle stop).
+    ok(!/not candidate-forgeable/.test(O.consumerRule) && /whatever the origin/.test(O.consumerRule) && /identity A/.test(O.consumerRule),
+        'awsOutcomeOrigin consumerRule: the clock starts at the first grant issuance whatever the origin of a later outcome; no outcome is called unforgeable by origin');
+    ok(!/can only delay/.test(O.rule) && /may never become final/.test(O.rule), 'awsOutcomeOrigin rule: running may never become final (an owner stop), not only be delayed');
+    for (const code of ['workspace_unsupported', 'runtime_not_running', 'workspace_not_ready']) {
+        ok(O.codes[code] && O.codes[code].paths.some((p) => /owner/.test(p)), `awsOutcomeOrigin: ${code} carries the owner note (identity A)`);
+    }
     for (const ws of [401, 403, 404, 409, 422, 429, '5xx', '3xx', 'other']) ok(E.upstream.some((u) => u.source === 'works' && u.status === ws && u.code === '*'), `works ${ws} has no catch-all`);
     for (const code of ['identity_conflict', 'identity_unverified', 'ezil_id_builders_only', 'account_suspended', 'repository_not_ready']) {
         ok(E.upstream.some((u) => u.source === 'works' && u.code === code), `works code ${code} unmapped`);
