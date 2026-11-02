@@ -37,6 +37,89 @@ Not patched, by measurement: model metadata (`api.githubcopilot.com/models`) and
 
 Handled outside the script: code-server's own release check (`GET api.github.com/repos/coder/code-server/releases/latest`) → `--disable-update-check` in both launchers; applicationinsights Statsbeat (`POST westus-0.in.applicationinsights.azure.com/v2.1/track`, SDK-internal, not gated by the telemetry level, and the SDK reads `APPLICATION_INSIGHTS_NO_STATSBEAT` at module load — before the bundle's own `process.env` assignment) → `ENV APPLICATION_INSIGHTS_NO_STATSBEAT=true` in the Dockerfile; belt and braces: `seed_blocked_ai_hosts` maps the Copilot/telemetry-only hosts to 127.0.0.1 in `/etc/hosts` at boot (never `github.com`/`api.github.com` — developer tooling needs them).
 
+## Part 1b — Summarization render budget (extension host bundle)
+
+File: `extensions/copilot/dist/extension.js`, the agent intent's `buildPrompt`
+(`extension/intents/node/agentIntent.ts`). Not a string patch: one argument of one render call
+changes. Kept next to Part 1 so the `extension.js` sections stay together and Part 2 stays whole.
+
+Facts from the pinned 0.69.0 bundle (pristine `extension.js` sha256 `e32a017f…`):
+
+- `buildPrompt` counts the request's tools (`p = countToolTokens(availableTools)`), takes `h`, the
+  model's advertised `maxInputTokens` (ezil-models advertises 120480 for Qwen and Kimi), and renders
+  the normal agent prompt with `I = this.endpoint.cloneWithTokenOverride(E)`,
+  `E = max(1, floor((h - p) × 0.9))`. With no tools `I` is `this.endpoint`. `E` is unbounded only when
+  `y` holds: `apiType === "responses"` and `chat.advanced.useResponsesApiTruncation`.
+- When that render throws `BudgetExceededError` and no background summary can be applied, `U`
+  re-renders with `triggerSummarize`/`forceSimpleSummary`: it asks the model for a summary of the
+  older rounds, then renders the prompt with it. Upstream `U` renders with `this.endpoint`, the full
+  advertised budget, although the same request still carries every tool. Its prompt can pass Copilot
+  and still exceed what the model accepts with the tools: ezil-models then refuses it locally
+  (`gateway-messages.ts`, body + 1056 > 131072 bytes); with 39 agent tools (53.5 KB) that is any `U`
+  render over about 76 KB of messages.
+- `vn.create(instantiationService, endpoint, …)` uses its endpoint argument as the prompt-tsx
+  budget and installs it as `IPromptEndpoint`; the agent prompt caps tool results at
+  `IPromptEndpoint.modelMaxPromptTokens × 0.5` (`Oro`). The props' `endpoint` is the summarizer's:
+  `getSummary` renders the summary prompt and sends the summary request through `props.endpoint`,
+  and in simple mode (`forceSimpleSummary`) sends no tools.
+
+| id | anchor (exact) | replacement | count | gate |
+|---|---|---|---|---|
+| `summarize-budget` | `return await vn.create(this.instantiationService,this.endpoint,this.prompt,{...we,endpoint:this.endpoint,promptContext:we.promptContext,triggerSummarize:!0,forceSimpleSummary:!0}).render(r,o)` | the same with the renderer's endpoint `this.endpoint` replaced by `I`; the props keep `endpoint:this.endpoint` | 1 | anchor 0, replacement 1 |
+| `summarize-names` | checked, never patched: `x=Math.max(1,Math.floor((h-p)*.9)),E=y?Number.MAX_SAFE_INTEGER:x,I=p>0?this.endpoint.cloneWithTokenOverride(E):this.endpoint;` and the head of `U`, `U=async(oe,we=T)=>{let Ie=n.conversation?.getLatestTurn()?.getMetadata(Kh);` | — | 1 each | before and after |
+| `summarize-fallback-unpatched` | `B`, checked, never patched: `let he=vn.create(this.instantiationService,this.endpoint,this.prompt,{...we,endpoint:this.endpoint,enableSummarization:!1,enableCacheBreakpoints:!1});` | — | 1 | before (with `summarize-names`) and after; a patched `B` fails `--verify` |
+| `summarize-scope` | `I`'s definition, then `B`, then `U`'s head, then `U`'s render, all within 4096 characters, and nothing between `I` and the render that may bind another `I` (`let/const/var I`, `I=>`, `(I,`, `,I)`, `,I=`) | — | — | before and after |
+
+Effect: `U` renders the summary and the rounds kept after it in the same budget as the normal
+render, so the request it builds fits with its tools. Its tool-result cap follows `I`, as the
+normal render's already does; this is no new truncation. The summary request is unchanged (full
+endpoint, no tools). With no tools `U` is upstream's. `y` is false for EZiL models: an extension
+model's `apiType` comes only from `capabilities.apiType` (the `Ok` endpoint constructor), the
+extension host passes it on only when the provider declares one, and
+`extensions/ezil-models/src/provider.ts` declares none. Re-check this Part if that changes.
+
+When `U` does not fit: a summary larger than its share of `I` (`Summary too large`) or a
+post-summary prompt still over `I` records a failed foreground summarization on the turn and falls
+to `B`; later renders in that turn go straight to `B` ("skipping repeated foreground summarization
+after prior failure"). The summary request has already been sent, and charged, before that check,
+as upstream whenever a summary fails.
+
+**Release order.** `I` is only as large as Copilot's tool count leaves it. With ezil-models as of
+7b95bcd9, `provideTokenCount(string)` counts every tool key and value as a JSON text block (1.65×
+the real bytes), so `I` is 29,003 for 39 tools and 1 for 64. Until that changes, `U` at `I` fails
+where `U` at 120480 succeeds today (post-summary prompts between `I` and about 76 KB) and the turn
+moves to `B`. Ship this Part together with, or after, the ezil-models honest string count (a
+count without the text-block wrapper puts `I` near 59,000 for 39 tools; recompute with the formula
+that ships).
+
+**What `B` does after this change.** `B` is not patched; it is upstream "rendering without
+summarization", reached after a failed `U`, after a background summary whose re-render still
+exceeds `I`, and for the rest of a turn after a foreground failure. It renders at `this.endpoint`
+(the advertised budget, tools not subtracted), and as upstream, prompt-tsx may leave older rounds
+out of that one request to fit; the stored conversation (Part 3 files and index) is not touched.
+A prompt that cannot fit even that budget fails with upstream's
+`Unable to build prompt, modelMaxPromptTokens = 120480 (…)`. A prompt that fits Copilot's budget
+but, with the tools, exceeds the model's input bound is refused by ezil-models before anything is
+sent; with the ezil-models error change that refusal is a precise local error (nothing was sent or
+charged; the history is kept) instead of "Conversation too large or invalid — start a new chat".
+Patching `B` to `I` was rejected: `B` would then succeed by leaving out more of the conversation
+without telling the user.
+
+Offline test against the pristine bundle (patches a copy, then runs the real `buildPrompt` span from
+the patched bundle with Copilot's own endpoint, tokenizer and helper code; the renderer factory,
+prompt-tsx's error class and the services are stubbed and record the endpoint each render gets):
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/summarize-budget-patch.test.cjs
+```
+
+It checks that `U` renders with `I` while the summarizer keeps the full endpoint, that the unpatched
+bundle renders `U` at 120480 (negative control), that `B` renders at the full endpoint after a failed
+`U` and after a prior failure and raises upstream's error when over, that no tools leave `U`
+upstream, that `y` is false for EZiL models, and that the gates reject a restored `U`, a patched `B`,
+a moved `I` and a rebound `I`. Not executed: prompt-tsx's budget enforcement and `vn.create`
+installing `IPromptEndpoint` (read from the bundle as above).
+
 ## Part 2 — "EZiL Chat" branding (strings only)
 
 ### System prompt identity — `extensions/copilot/dist/extension.js`
