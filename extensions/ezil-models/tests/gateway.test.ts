@@ -99,8 +99,19 @@ describe('gateway transport', () => {
     test('two pre-header failures stop; committed retry can return replay', async () => {
         const failed = server(() => { throw new Error('transport'); });
         await expect(run(failed.fetch)).rejects.toThrow('cannot reach'); expect(failed.posts()).toHaveLength(2);
-        const replay = server((_, i) => { if (i === 0) throw new Error('transport'); return error(409, 'idempotency_replay', { request_id: 'original' }); });
-        await expect(run(replay.fetch)).rejects.toThrow('already processed (request original)'); sameAttempt(replay.posts());
+        for (const model of [gw(), gw(KIMI)]) {
+            const replay = server((_, i) => { if (i === 0) throw new Error('transport'); return error(409, 'idempotency_replay', { request_id: 'original' }); });
+            const failure = await run(replay.fetch, { model }).then(() => undefined, (e: GatewayError) => e);
+            sameAttempt(replay.posts());
+            // The first send had reached EZiL AI: its reply was lost, not refused, and that is said with the charge notice.
+            expect([failure?.code, failure?.origin, failure?.status, failure?.requestId]).toEqual(['idempotency_replay', 'gateway', 409, 'original']);
+            expect(failure?.message).toBe('EZiL AI: the connection failed after this request had reached EZiL AI, so EZiL AI did not run it again and its reply was lost on the way. '
+                + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry (request original)');
+        }
+    });
+    test('a replay with no resend of this call keeps the plain wording', async () => {
+        const s = server(() => error(409, 'idempotency_replay', { request_id: 'original' }));
+        await expect(run(s.fetch)).rejects.toThrow('EZiL AI: already processed (request original)'); expect(s.posts()).toHaveLength(1);
     });
     for (const status of [401, 403]) for (const code of ['unauthorized', 'os_session_missing', 'os_proxy_unauthorized', 'no_ezil_role']) {
         test(`${status} ${code} fails immediately without polling or retry`, async () => {

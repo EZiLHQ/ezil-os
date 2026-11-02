@@ -20,7 +20,8 @@ export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
 /**
  * Non-stream (JSON) requests only: the Gateway answers a JSON request after the whole generation (jsonThrough
  * reads the upstream body and settles before sending headers), so a 30 s first-byte deadline would cap every
- * Kimi reply at 30 s. Bounded instead by one completion deadline, the same value as the OS proxy's
+ * Kimi reply at 30 s. Bounded instead by one completion deadline from the request's first send (only a transport
+ * failure within its first 30 s is resent, and the resend shares it; see gatewayChat), the same value as the OS proxy's
  * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts) and strictly below the Gateway's 180 s upstream
  * headers deadline (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS). That clock starts only
  * at the Gateway's upstream fetch, after admission, and on expiry the Gateway answers 504 upstream_timeout with
@@ -372,23 +373,33 @@ async function bounded<T>(work: Promise<T>, ms: number, abort: AbortController, 
     finally { clearTimeout(timer); abort.signal.removeEventListener('abort', onAbort); }
 }
 
-type TimeoutCode = 'first_byte_timeout' | 'stream_idle_timeout' | 'completion_timeout';
-const TIMEOUT_TEXT: Record<TimeoutCode, string> = {
+type TransportCode = 'first_byte_timeout' | 'stream_idle_timeout' | 'completion_timeout' | 'connection_lost';
+// Mirrors the cancelled notice: a JSON request abandoned or cut off here may still be charged if the model finished.
+const MAY_BE_CHARGED = 'The request may still be charged if the model finished, never more than EZiL AI settles for it.';
+const TRANSPORT_TEXT: Record<TransportCode, string> = {
     first_byte_timeout: 'did not answer within 30 seconds. Retry the request',
     stream_idle_timeout: 'the response stopped arriving. Retry the request',
-    // Mirrors the cancelled notice: a request abandoned here may still be charged if the model finished.
     completion_timeout: `no complete reply within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). `
-        + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model',
+        + `${MAY_BE_CHARGED} You can retry or switch to a streaming model`,
+    // Not on the provider's Retry list, like completion_timeout: a retry is a new request and may be charged again.
+    connection_lost: 'the connection was lost while waiting for the complete reply (this model sends its reply only when it is complete), '
+        + `and EZiL AI may already have been running the request, so EZiL Models did not send it again. ${MAY_BE_CHARGED} You can retry or switch to a streaming model`,
 };
+const transportError = (code: TransportCode, requestId?: string) => new GatewayError(
+    `EZiL AI: ${TRANSPORT_TEXT[code]}${requestId ? ` (request ${requestId})` : ''}`, undefined, code, requestId, undefined, 'transport');
 
-/** Streams: 30 s to the first byte, then 30 s per chunk. Non-stream: the whole reply within the completion deadline. */
-async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean): Promise<Response> {
-    const started = performance.now();
+/**
+ * Streams: 30 s to the first byte, then 30 s per chunk, per attempt. Non-stream: the whole reply by the completion
+ * deadline counted from `sentAt`, when this request was first sent, so a transport resend gets only what is left.
+ * With nothing left it fails with `completion_timeout` (`abort` carries it) and sends nothing.
+ */
+async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean, sentAt: number): Promise<Response> {
+    const started = stream ? performance.now() : sentAt;
     const deadline = stream ? GATEWAY_FIRST_BYTE_TIMEOUT_MS : GATEWAY_COMPLETION_TIMEOUT_MS;
-    const firstCode: TimeoutCode = stream ? 'first_byte_timeout' : 'completion_timeout';
-    const timeout = (code: TimeoutCode, requestId?: string) => new GatewayError(
-        `EZiL AI: ${TIMEOUT_TEXT[code]}${requestId ? ` (request ${requestId})` : ''}`, undefined, code, requestId, undefined, 'transport');
-    const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), deadline, abort, timeout(firstCode));
+    const firstCode: TransportCode = stream ? 'first_byte_timeout' : 'completion_timeout';
+    const left = deadline - (performance.now() - started);
+    if (left <= 0) { const expired = transportError(firstCode); abort.abort(expired); throw expired; }
+    const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), left, abort, transportError(firstCode));
     if (!response.body) return response;
     const reader = response.body.getReader();
     const requestId = response.headers.get('x-ezil-request-id') ?? undefined;
@@ -398,9 +409,9 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
             try {
                 const remaining = deadline - (performance.now() - started);
                 // After the first byte a body may idle 30 s per chunk, and a JSON reply must still finish by its deadline.
-                const [ms, code]: [number, TimeoutCode] = first ? [remaining, firstCode]
+                const [ms, code]: [number, TransportCode] = first ? [remaining, firstCode]
                     : stream || remaining > GATEWAY_IDLE_TIMEOUT_MS ? [GATEWAY_IDLE_TIMEOUT_MS, 'stream_idle_timeout'] : [remaining, 'completion_timeout'];
-                const next = await bounded(reader.read(), ms, abort, timeout(code, requestId));
+                const next = await bounded(reader.read(), ms, abort, transportError(code, requestId));
                 first = false;
                 if (next.done) controller.close();
                 else controller.enqueue(next.value);
@@ -446,7 +457,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let status: number | undefined;
     let stopReason: string | undefined;
     let errorCode: string | undefined;
-    let errorOrigin: GatewayErrorOrigin | undefined;
+    let failureOrigin: GatewayErrorOrigin | undefined;
     let localCounts: LocalRequestCounts | undefined;
     let attempted = false;
     const responses = model.gatewayProtocol === 'openai-responses';
@@ -474,6 +485,12 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
         const identity = providerIdentity(provider);
         let retried = false;
+        // Set once a transport failure was resent with the same key: a later idempotency_replay means the first send arrived.
+        let resent = false;
+        // Non-stream only, on the performance.now() clock: when the request a transport resend repeats was first sent.
+        // EZiL AI may already be running it, so the resend shares its completion deadline (and its admission wait
+        // counts against it). A 429 refusal answers before anything runs, so the attempt after one starts afresh.
+        let resendOf: number | undefined;
         let concurrencyStarted: number | undefined;
         let concurrencyWaited = 0;
         let concurrencyRetries = 0;
@@ -484,21 +501,27 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         for (;;) {
             options.signal.throwIfAborted();
             const release = await acquireGatewaySlot(identity, options.signal,
-                concurrencyError ? { ms: remainingWait(), error: concurrencyError } : undefined);
+                concurrencyError ? { ms: remainingWait(), error: concurrencyError }
+                    : resendOf !== undefined ? { ms: resendOf + GATEWAY_COMPLETION_TIMEOUT_MS - performance.now(), error: transportError('completion_timeout') } : undefined);
             let waitMs: number;
             try {
                 options.signal.throwIfAborted();
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
                 attemptAbort = new AbortController();
+                const sentAt = resendOf ?? performance.now();
                 let response: Response;
                 try {
                     attempted = true;
-                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream);
+                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream, sentAt);
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
-                    if (!retried) { retried = true; continue; }
+                    // A JSON reply has no headers until it is complete, so a failure this late may have cut off a request
+                    // EZiL AI is already running: a same-key resend could only be answered idempotency_replay.
+                    if (!stream && performance.now() - sentAt > GATEWAY_FIRST_BYTE_TIMEOUT_MS) throw transportError('connection_lost', requestId);
+                    if (!retried) { retried = true; resent = true; resendOf = stream ? undefined : sentAt; continue; }
                     throw new GatewayError('EZiL AI: cannot reach EZiL AI. Retry the request', undefined, 'os_unreachable', requestId, undefined, 'transport');
                 }
+                resendOf = undefined;
                 status = response.status;
                 hold = response.headers.get('x-ezil-hold-micro');
                 requestId = response.headers.get('x-ezil-request-id') ?? undefined;
@@ -549,7 +572,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     waitMs = retryDelay(retryAfter, 60, now()) * 1000;
                 } else {
                     if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
-                    throw describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
+                    const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
+                    throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
                 }
             } finally {
                 attemptAbort.abort();
@@ -569,7 +593,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         }
         const failure = error as GatewayError | GatewayResponseError;
         errorCode = failure.code;
-        errorOrigin = failure.origin;
+        failureOrigin = failure.origin;
         localCounts = failure instanceof GatewayError ? failure.counts : undefined;
         throw failure;
     } finally {
@@ -579,11 +603,21 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         // Metadata only: local refusals add their sizes, never content.
         log(JSON.stringify({ request_id: requestId ?? null, model: model.model, stream, hold, http_status: status ?? null,
             latency_ms: Math.max(0, now() - started), usage: { input: used.inputTokens, output: used.outputTokens, cache_read: used.cacheReadTokens, cache_write: used.cacheWriteTokens },
-            stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : errorOrigin ?? null,
+            stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : failureOrigin ?? null,
             ...(!cancelled && localCounts ? { body_bytes: localCounts.bodyBytes, limit_bytes: localCounts.limitBytes, messages: localCounts.messages,
                 max_blocks: localCounts.maxBlocks, tools: localCounts.tools, tool_bytes: localCounts.toolBytes } : {}),
             ...(cancelled ? { notice: `cancelled; may still be charged (request ${requestId ?? 'unknown'})` } : {}) }));
     }
+}
+
+/**
+ * The Gateway's idempotency_replay after this call's own same-key transport resend: the first send had reached EZiL AI,
+ * which never runs a key twice, so the reply was lost on the way rather than refused. Code, status and origin are kept.
+ */
+function replayAfterResend(error: GatewayError): GatewayError {
+    const ref = error.requestId ? ` (request ${error.requestId})` : '';
+    return new GatewayError(`EZiL AI: the connection failed after this request had reached EZiL AI, so EZiL AI did not run it again and its reply was lost on the way. ${MAY_BE_CHARGED} You can retry${ref}`,
+        error.status, error.code, error.requestId, error.retryAfterSeconds, error.origin);
 }
 
 /** An exception's class name only: its message may quote request content. */

@@ -34,9 +34,11 @@ are explicitly failed, and orphan outputs become ordinary text. Tools require
 unique valid names and object schemas; at most 64 are sent. Dropped names are
 logged once per call. Required tool selection becomes auto with a notice.
 
-Kimi is always nonstreaming: EZiL AI cannot settle its streams exactly. A
-configured `stream: true` is ignored and reported as a config warning (the model
-is still served; Manage shows it as "Setting ignored"). JSON text, thinking
+Kimi on the Messages protocol (the shipped configuration) is always
+nonstreaming: EZiL AI cannot settle its streams exactly. A configured
+`stream: true` is ignored and reported as a config warning (the model is still
+served; Manage shows it as "Setting ignored"). A Kimi model configured on
+`openai-responses` follows its own `stream` setting. JSON text, thinking
 (if the proposed API exists), and tools are delivered in their original order.
 Qwen streams text and assembles tool JSON; missing `message_stop`, error events
 and malformed streams fail as interrupted. Final usage comes from
@@ -88,6 +90,14 @@ Pre-header transport failures and `rate_limited` keep their shared single-resend
 allowance (rate-limit Retry-After capped at 60 seconds, default 60). Taking an
 admission retry also consumes that allowance. All resends keep identical bytes
 and key: refused concurrency admission creates no Gateway request or credit hold.
+A nonstreaming (JSON) request has no headers until its reply is complete, so a
+transport failure more than 30 seconds after it was sent is never resent (EZiL AI
+may already be running it; a same-key resend could only be refused as a replay).
+It fails with `connection_lost`, which says the request may still be charged.
+An earlier JSON failure is resent within what is left of the request's
+150-second deadline (below). If a resend is answered `idempotency_replay`, the
+first send had reached EZiL AI: the message says its reply was lost on the way
+and may still be charged, instead of "already processed".
 No 401, 5xx, replay, credit-budget refusal, or stream failure is retried.
 
 Errors name where they arose. Chat shows every failure under the provider's
@@ -96,11 +106,15 @@ Errors name where they arose. Chat shows every failure under the provider's
 "ezil-os-proxy"` or an `os_` code (the proxy never relays either from the
 Gateway). `EZiL AI:` marks a Gateway refusal relayed by the proxy, or a deadline
 or interruption on the way; Gateway 413s show the input bound when sent. Streams must send a first byte within
-30 seconds and then a chunk at least every 30 seconds. A nonstreaming (JSON)
-request gets one 150-second completion deadline instead, because the Gateway
-sends JSON headers only after the whole generation; the OS proxy uses the same
-150 seconds for JSON request bodies, below the Gateway's 180-second upstream
-deadline. A reply abandoned at that deadline fails with `completion_timeout`
+30 seconds and then a chunk at least every 30 seconds, per attempt. A
+nonstreaming (JSON) request instead has one 150-second completion deadline,
+counted from when it was first sent, because the Gateway sends JSON headers
+only after the whole generation. A transport resend of that request shares the
+deadline, including any wait for an admission slot, and nothing is sent after
+it. Only an attempt after a 429 refusal, which EZiL AI answers before anything
+runs, starts a new deadline. The OS proxy uses the same 150 seconds for JSON
+request bodies, below the Gateway's 180-second upstream deadline. A reply
+abandoned at that deadline fails with `completion_timeout`
 (`os_completion_timeout` from the proxy) and may still be charged if the model
 finished. Neither deadline adds a retry.
 
