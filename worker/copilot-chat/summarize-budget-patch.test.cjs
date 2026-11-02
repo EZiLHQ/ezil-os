@@ -14,7 +14,8 @@ const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const source = process.env.COPILOT_TEST_ROOT;
 const script = path.join(__dirname, 'patch-copilot-chat.sh');
-const provider = path.join(__dirname, '..', '..', 'extensions', 'ezil-models', 'src', 'provider.ts');
+const providerSrc = path.join(__dirname, '..', '..', 'extensions', 'ezil-models', 'src');
+const provider = path.join(providerSrc, 'provider.ts');
 const ext = 'extensions/copilot/dist/extension.js';
 const files = [ext, 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', 'out/vs/code/browser/workbench/workbench.js', 'out/vs/code/browser/workbench/workbench.css'];
 const run = (...args) => spawnSync('bash', [script, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
@@ -173,16 +174,31 @@ test('Part 1b: summarization render gets the tool-adjusted budget; fallback B un
       }
     });
 
-    await t.test('y: apiType comes only from capabilities.apiType; ezil models declare none', async () => {
+    await t.test('y and D: apiType comes only from capabilities.apiType; ezil models declare none', async () => {
       assert.equal(after.endpoint().apiType, undefined);
+      // No apiType: D is false, so the normal render and U keep cache breakpoints (prompt-tsx cannot
+      // prune content before the last one, so an over-budget render throws instead of dropping rounds).
+      const e = await after.pass({ tools: agentTools, script: [after.throwBudget, after.ok(1)] });
+      assert.equal(e.out.y, false);
+      assert.equal(e.calls[0].props.enableCacheBreakpoints, true); assert.equal(e.calls[1].props.enableCacheBreakpoints, true);
       // Control: a Responses endpoint with useResponsesApiTruncation would make E unbounded.
       const r = await after.pass({ tools: agentTools, apiType: 2, truncation: true, script: [after.throwBudget, after.ok(1)] });
       assert.equal(r.out.y, true); assert.equal(r.calls[1].endpoint.modelMaxPromptTokens, Number.MAX_SAFE_INTEGER);
+      // Control: a Messages endpoint sets D, which turns cache breakpoints off for the normal render
+      // and U: they would then prune older rounds silently instead of throwing (Part 1b would not hold).
+      const m = await after.pass({ tools: agentTools, apiType: 3, script: [after.throwBudget, after.ok(1)] });
+      assert.equal(m.self.endpoint.apiType, 'messages'); assert.equal(m.out.y, false);
+      assert.equal(m.calls[0].props.enableCacheBreakpoints, false); assert.equal(m.calls[1].props.enableCacheBreakpoints, false);
       // The extension host passes capabilities.apiType through only when the provider declares it.
       const host = fs.readFileSync(path.join(source, 'out/vs/workbench/api/node/extensionHostProcess.js'), 'utf8');
       once(host, 'apiType:n.metadata.capabilities?.apiType===void 0?void 0:HX[n.metadata.capabilities.apiType]');
-      // Only "responses" can make y true (Messages/ChatCompletions leave it false).
-      if (fs.existsSync(provider)) assert.doesNotMatch(fs.readFileSync(provider, 'utf8'), /apiType[^\n,}]*Responses/, 'ezil-models declares a Responses apiType: re-check y (PATCHES.md Part 1b)');
+      // Any apiType in ezil-models trips this, whatever its value or form: Responses can make y true,
+      // Messages makes D true, and Ok compares enum values, so a word match would miss `apiType: 2` or a
+      // constant. A false positive fails loudly, which is the safe direction.
+      assert(fs.existsSync(provider), `missing ${provider}`);
+      const sources = fs.readdirSync(providerSrc, { recursive: true }).filter(f => /\.[cm]?[jt]s$/.test(f)).map(f => path.join(providerSrc, f));
+      assert(sources.includes(provider));
+      for (const f of sources) assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /apiType/i, `${path.relative(providerSrc, f)} mentions apiType: re-check y and D (PATCHES.md Part 1b)`);
     });
 
     await t.test('rerun: a second patch run fails loudly and leaves the tree verifiable', () => {
