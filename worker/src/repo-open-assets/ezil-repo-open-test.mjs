@@ -26,7 +26,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SOURCE_KERNEL = path.join(HERE, 'ezil-repo-open.mjs');
 export const SOURCE_HELPER = path.join(HERE, 'ezil-git-grant.mjs');
 const VECTORS_PATH = path.join(HERE, '../../../docs/contracts/universe-repo-open-v1.vectors.json');
-export const VECTORS_SHA256 = '551238e1d4908be2c0c463a3bb82d1307b1b0e4e6ff42fd0636d2bff99400ce3';
+export const VECTORS_SHA256 = '8c9e5e9856693ea8cf511fd581a28e74f737d5633c7848570019739485f9bde4';
 export const KERNEL_PATH = '/run/ezil/bin/ezil-repo-open.mjs';
 export const HELPER_PATH = '/run/ezil/bin/ezil-git-grant.mjs';
 export const WRAPPER_PATH = '/run/ezil/bin/ezil-git-grant';
@@ -1576,6 +1576,55 @@ async function main() {
     const again = await openFlow(fx, { root, token, ...ASSESS });
     assert.deepEqual(again.committed, assessed(root, { head: remoteHeadOf(bare) }));
     assert.deepEqual(fs.readdirSync(wrapperOf(root)), ['repository']);
+  });
+
+  test('E1-6 placement re-check: guest root acting while strace holds the commit\'s rename (at its entry or its exit) — W gains an entry, or the root, projects, W or F becomes a symlink to the same tree moved aside → workspace_failed; lock and grant gone; a re-open is refused; the held rename alone still answers ok with W = [repository]', async () => {
+    const k = await kernel();
+    const token = newToken(); fx.server.state.token = token;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+    const TASKS = JSON.stringify({ version: '2.0.0', tasks: [{ label: 'x', type: 'shell', command: 'true', runOptions: { runOn: 'folderOpen' } }] });
+    // The real CLI commit; strace (main thread only, so no git child is touched) holds every rename 2 s at its entry or exit.
+    const heldCommit = (requestPath, at) => spawnAsync('strace', ['-o', '/dev/null', '-e', 'trace=rename,renameat,renameat2',
+      '-e', `inject=rename,renameat,renameat2:delay_${at}=2000000`, process.execPath, KERNEL_PATH, 'commit', requestPath], { env: { PATH: USER_ENV.PATH } });
+    /** Move `p` aside (same filesystem, content kept) and leave a symlink to it at `p`: only the lstat of `p` can tell. */
+    const moveAside = (p) => { const to = `${fs.realpathSync(fs.mkdtempSync('/tmp/aside-'))}/moved`; fs.renameSync(p, to); fs.symlinkSync(to, p); };
+    const addEditorConfig = (root, W) => { fs.mkdirSync(`${W}/.vscode`); fs.writeFileSync(`${W}/.vscode/tasks.json`, TASKS); };
+    // [label, rename end held, act(root, W, F), the re-open's prepare answer]
+    const scenarios = [
+      ['control: the rename is held and nobody acts', 'exit', null, 'folder_conflict'],
+      ['W gains .vscode before the rename', 'enter', addEditorConfig, 'folder_conflict'],
+      ['W gains .vscode after the rename', 'exit', addEditorConfig, 'folder_conflict'],
+      ['the root becomes a symlink', 'exit', (root) => moveAside(root), 'workspace_failed'],
+      ['projects becomes a symlink', 'exit', (root) => moveAside(`${root}/projects`), 'workspace_failed'],
+      ['W becomes a symlink', 'exit', (root, W) => moveAside(W), 'folder_conflict'],
+      ['F becomes a symlink', 'exit', (root, W, F) => moveAside(F), 'folder_conflict'],
+    ];
+    for (const [label, at, act, reopen] of scenarios) {
+      resetRun();
+      const root = newRoot(); const W = wrapperOf(root), F = cloneOf(root);
+      const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+      assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...ASSESS }), fx.seam)).state, 'cloned', label);
+      const running = heldCommit(writeRequest({ phase: 'commit', uuid, root, ...ASSESS }), at);
+      const seen = at === 'enter' ? W : F;   // mkdir(W) done and the rename held; or the rename done and its return held
+      for (const until = Date.now() + 10000; !exists(seen) && Date.now() < until;) await sleep(5);
+      assert.equal(exists(seen), true, `${label}: the held rename never came`);
+      if (act) act(root, W, F);
+      const run = await running;
+      assert.equal(run.stdout.includes(token) || run.stderr.includes(token), false);
+      const result = JSON.parse(run.stdout.trim().split('\n').at(-1));
+      if (!act) {
+        assert.deepEqual(result, assessed(root, { head: remoteHeadOf(bare) }), label);
+        assert.deepEqual(fs.readdirSync(W), ['repository']);
+        assert.equal(exists(grantOf()), true, `${label}: an ok commit keeps its grant`);
+      } else {
+        assert.deepEqual([label, result], [label, { ok: false, errorCode: 'workspace_failed' }]);
+        assert.equal(exists(grantOf()), false, `${label}: the grant of a refused placement was kept`);
+      }
+      assert.equal(exists(lockOf()), false, `${label}: lock left`);
+      const again = await openFlow(fx, { root, token, ...ASSESS });
+      assert.deepEqual([label, again.prepared], [label, { ok: false, errorCode: reopen }]);
+    }
   });
 
   test('E1-6: remote is read back from the staged config before the rename, as one value equal to ASSESSMENT_REMOTE_TEMPLATE: another repository, the personal host, userinfo, a second value (added directly or through include.path) or no value → workspace_failed with nothing placed; assessmentRemote honours the read budget', async () => {

@@ -17,7 +17,8 @@
 //
 // Class assessment (1.0.3, §9.4): git-qa.ezil.work; the clone goes to <root>/projects/<repositoryId>/repository
 // inside a wrapper the commit creates fresh (the editor root); head, clean and remote are read in staging
-// before the rename. Class personal keeps <root>/repos/<handle>/<name>.
+// before the rename, and the placement is re-checked right after it. All of it is in-guest evidence: guest
+// root (identity A) can change W at any time. Class personal keeps <root>/repos/<handle>/<name>.
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -950,6 +951,24 @@ function ensureParent(dir) {
   fs.mkdirSync(dir, { mode: 0o755 });
 }
 
+const realDir = (p) => { const st = lstatOrNull(p); return !!st && st.isDirectory(); };
+/**
+ * An assessment placement re-checked after its rename (vectors kernel.assessment.layoutRule): the root is
+ * still canonical, <root>/projects, W and F are real directories (lstat, never followed), and W holds
+ * exactly F. In-guest evidence at that moment (kernel.assessment.trust), not a lasting guarantee.
+ */
+function placementHolds(r, wrapper, folder) {
+  try {
+    return validRoot(r.root)
+      && realDir(projectsOf(r))
+      && realDir(wrapper)
+      && fs.readdirSync(wrapper).join('/') === ASSESSMENT_CLONE_DIR
+      && realDir(folder);
+  } catch {
+    return false;
+  }
+}
+
 async function commit(r) {
   const assessment = r.class === 'assessment';
   let placed = false;
@@ -1006,6 +1025,10 @@ async function commit(r) {
       try { fs.rmdirSync(wrapper); } catch { /* not empty: something else is in it, never removed here */ }
       refuse('workspace_failed');
     }
+    // The placement as the kernel sees it right after the rename (E1-6 review): anything else means guest
+    // root acted in the window, so workspace_failed; the clone stays where the rename put it (a re-open is
+    // refused, as after a commit timeout) and the grant goes below, as for every assessment commit not ok.
+    if (!placementHolds(r, wrapper, folder)) refuse('workspace_failed');
     placed = true;
     const empty = head === null;
     return { ok: true, state: empty ? 'initialized_empty' : 'cloned', folder: wrapper, openFolder: wrapper, pathNotFound: false,
@@ -1013,8 +1036,9 @@ async function commit(r) {
   } catch (error) {
     return fail(codeOf(error));
   } finally {
-    // An assessment commit that placed nothing removes the grant its own prepare installed (this
-    // request still owns that prepare's lock), never another request's (1.0.3).
+    // An assessment commit that does not answer ok (it placed nothing, or its placement re-check failed)
+    // removes the grant its own prepare installed (this request still owns that prepare's lock), never
+    // another request's (1.0.3).
     if (assessment && !placed) {
       try { if (readOwner(lockOf(r))?.owner === r.uuid) removeFile(grantOf(r)); } catch { /* release, or the TTL */ }
     }

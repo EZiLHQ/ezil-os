@@ -749,8 +749,16 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
         && /without --local/.test(K.remoteRule) && /BEFORE the rename/.test(K.remoteRule), 'assessment remoteRule: one value, read before the rename, includes followed');
     ok(/kernel-enforced/.test(K.editorRootRule) && !/must first check/.test(K.editorRootRule), 'editorRootRule is kernel-enforced (no consumer precondition left)');
     ok(/non-null path with class assessment/.test(V.kernel.requestKeysRule), 'requestKeysRule refuses a path on an assessment request');
+    // E1-6 review: the wrapper rules are the kernel's in-guest observations; guest root under identity A can defeat them.
+    ok(/\bremote\b/.test(K.trust) && /\bW\b/.test(K.trust) && K.trust.includes('<root>/projects') && /pushurl/.test(K.trust),
+        'trust names remote, W and <root>/projects (and a pushurl redirect) as in-guest evidence');
+    ok(/re-checks the placement/.test(K.layoutRule) && /do not hold against guest root/.test(K.layoutRule),
+        'layoutRule: the placement re-check after the rename, scoped to what the kernel observes');
+    ok(/in-guest evidence/.test(K.editorRootRule) && /open-project/.test(K.editorRootRule),
+        'editorRootRule: in-guest evidence against guest root, and the open-project path collision');
+    ok(/not the effective fetch or push target/.test(K.remoteRule), 'remoteRule: the configured url, not the effective fetch or push target');
     for (const [needle, code] of [['wrapper <root>/projects/<repositoryId> exists in any form', 'folder_conflict'], ['<root>/projects exists but is not a real directory', 'workspace_failed'],
-        ['remote.origin.url read back', 'workspace_failed'], ['rename into the new wrapper failed', 'workspace_failed']]) {
+        ['remote.origin.url read back', 'workspace_failed'], ['rename into the new wrapper failed', 'workspace_failed'], ['placement re-check after the rename failed', 'workspace_failed']]) {
         ok(V.kernel.classification.some((c) => /class assessment/.test(c.cause) && c.cause.includes(needle) && c.errorCode === code), `classification: class assessment, ${needle} → ${code}`);
     }
     const X = W.okAssessmentContext;
