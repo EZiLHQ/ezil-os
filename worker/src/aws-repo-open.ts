@@ -49,7 +49,9 @@
  *  Status replies: 200 {"ok":true,"state":"running"} | 200 {"ok":true,"state":"done","result":R}
  *                  409 {"ok":false,"error":"job_unknown"}; 503 agent_unavailable
  *  R = the §8 answer itself, {"status","body"}: {200, okOpen | okOpenAssessment (class assessment,
- *      1.0.3: + head, clean) | okRefresh} or
+ *      1.0.3: + head, clean, remote; E1-6: folder = openFolder = the wrapper /workspace/projects/
+ *      <repositoryId>, pathNotFound false, remote https://git-qa.ezil.work/<handle>/<name>.git, both
+ *      rebuilt here from the job, never read from R) | okRefresh} or
  *      {REPO_OPEN_STATUS[code], {"ok":false,"error":code}}, code ∈ AWS_RESULT_ERROR_CODES (the host's
  *      runtime_not_running, workspace_not_ready, workspace_busy, workspace_failed, plus the kernel's).
  *
@@ -84,6 +86,8 @@
  *    awsRepoOpenStart(input, name, target, deps, routeClass) → running + job | done + answer
  *    awsRepoOpenPoll(job, target, deps[, until])               → running + job | done + answer
  *  `job` (AwsRepoOpenJob) carries no grant: a caller persists it between sweeps and passes it back.
+ *  For class assessment it also carries repositoryId (E1-6), the wrapper its result must name; its keys
+ *  are exact per class (a personal job keeps its 7 keys).
  *  Assessment callers (class assessment, 1.0.3, vectors workerExec.assessment): once the host has
  *  admitted the job, poll the SAME job until done (results stay readable JOB_TTL = 600 s) and never
  *  re-start it. A poll whose own `until` has passed sends nothing and answers running (job unchanged),
@@ -108,8 +112,8 @@ import {
 } from './aws-origin';
 import {
   ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HANDLE_RE, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
-  REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, isRepoOpenClass, parseRepoOpenBody, refusal, validBranch,
-  validName,
+  REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, UUID_RE, WORKER_DEADLINE_MS, assessmentEditorRoot, assessmentRemoteUrl,
+  isRepoOpenClass, parseRepoOpenBody, refusal, validBranch, validName,
   type RepoOpenAnswer, type RepoOpenAssessmentOpenResult, type RepoOpenBody, type RepoOpenClass, type RepoOpenErrorCode,
   type RepoOpenInput, type RepoOpenOpenResult,
 } from './repo-open-u2';
@@ -168,12 +172,14 @@ export function awsRepoOpenRelayBody(input: RepoOpenBody, jobId: string): string
 /**
  * A finished job's result R = {status, body} for the op and class that were sent, validated as
  * strictly as the OS validates the Worker's 200; the answer is rebuilt from validated fields and the
- * §8 table. Class assessment (1.0.3, vectors okOpenAssessment / okAssessmentRule): exactly the 9
+ * §8 table. Class assessment (1.0.3, vectors okOpenAssessment / okAssessmentRule): exactly the 10
  * keys, never `existing`, head null or 40 lowercase hex, clean a boolean, empty === (head === null),
- * and state initialized_empty exactly when head is null. Each class's shape is invalid for the other.
+ * and state initialized_empty exactly when head is null; E1-6: `folder` is the wrapper W the caller
+ * rebuilt, openFolder is exactly W, pathNotFound is false, and `remote` is exactly the caller's
+ * expected URL (no expected remote: refused). Each class's shape is invalid for the other.
  */
 export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: string,
-  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT): RepoOpenAnswer {
+  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT, remote?: string): RepoOpenAnswer {
   if (!isRepoOpenClass(cls) || !exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
   const { status, body } = result;
   if (isObject(body) && body.ok === false) {
@@ -211,8 +217,12 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     || body.empty !== unborn || (body.state === 'initialized_empty') !== unborn) {
     return refusal('workspace_failed');
   }
-  const { state, openFolder, pathNotFound, branch, empty, clean } = body as unknown as RepoOpenAssessmentOpenResult;
-  return { status: 200, body: { ok: true, state, folder, openFolder, pathNotFound, branch, empty, head: head as string | null, clean } };
+  // E1-6: the editor root is the wrapper itself (never the clone or a folder below it), and the remote is this repository's.
+  if (typeof remote !== 'string' || body.remote !== remote || body.openFolder !== folder || body.pathNotFound !== false) {
+    return refusal('workspace_failed');
+  }
+  const { state, branch, empty, clean } = body as unknown as RepoOpenAssessmentOpenResult;
+  return { status: 200, body: { ok: true, state, folder, openFolder: folder, pathNotFound: false, branch, empty, head: head as string | null, clean, remote } };
 }
 
 /** A job envelope: exactly {ok:true, state:'running'} or {ok:true, state:'done', result}. */
@@ -253,13 +263,19 @@ export interface AwsRepoOpenJob {
   class: RepoOpenClass;
   handle: string;
   name: string;
+  /** Class assessment only (E1-6): names the wrapper W the result must answer; absent for class personal. */
+  repositoryId?: string;
   acknowledged: boolean;
 }
+/** Exact keys per class (E1-6): the personal job is unchanged; an assessment job adds repositoryId. */
 const JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged'];
+const ASSESSMENT_JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'acknowledged'];
 const validJob = (job: unknown): job is AwsRepoOpenJob =>
-  exactKeys(job, JOB_KEYS) && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
-  && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh') && isRepoOpenClass(job.class)
+  isObject(job) && isRepoOpenClass(job.class) && exactKeys(job, job.class === 'assessment' ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
+  && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
+  && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh')
   && typeof job.handle === 'string' && HANDLE_RE.test(job.handle) && typeof job.name === 'string' && validName(job.name)
+  && (job.class !== 'assessment' || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
   && typeof job.acknowledged === 'boolean';
 
 /** One start or poll: the job is still running (as far as that call can tell), or its final §8 answer. */
@@ -267,7 +283,14 @@ export type AwsRepoOpenStep =
   | { state: 'running'; job: AwsRepoOpenJob }
   | { state: 'done'; answer: RepoOpenAnswer };
 const finished = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
-const repoFolder = (handle: string, name: string) => `${AWS_REPO_OPEN_ROOT}/repos/${handle}/${name}`;
+/**
+ * The job's result validated against what the job itself names (never the reply): the repository folder
+ * (personal), or the wrapper W and the expected remote (assessment, E1-6).
+ */
+const jobAnswer = (result: unknown, job: AwsRepoOpenJob): RepoOpenAnswer => (job.class === 'assessment'
+  ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class,
+    assessmentRemoteUrl(job.handle, job.name))
+  : awsJobAnswer(result, job.op, `${AWS_REPO_OPEN_ROOT}/repos/${job.handle}/${job.name}`, job.class));
 
 type EdgeCall = (path: string, until: number, payload?: string, token?: string) => Promise<EdgeReply>;
 
@@ -357,7 +380,8 @@ export async function awsRepoOpenStart(
     const relay = awsRepoOpenRelayBody(body, jobId);
     if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return finished(refusal('workspace_failed'));
     const digest = await sha256HexBytes(new TextEncoder().encode(relay));
-    const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name, acknowledged: false };
+    const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name,
+      ...(routeClass === 'assessment' ? { repositoryId: body.repositoryId } : {}), acknowledged: false };
 
     const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant.token);
     if (started.kind === 'leak') return finished(refusal('workspace_failed'));
@@ -373,7 +397,7 @@ export async function awsRepoOpenStart(
     }
     if (started.status !== 200 || !envelope(started.data)) return finished(refusal('workspace_failed'));
     if (started.data.state === 'running') return { state: 'running', job: { ...job, acknowledged: true } };
-    return finished(awsJobAnswer(started.data.result, job.op, repoFolder(job.handle, job.name), job.class));
+    return finished(jobAnswer(started.data.result, job));
   } catch {
     return finished(refusal('workspace_failed'));
   }
@@ -416,7 +440,7 @@ export async function awsRepoOpenPoll(
     if (read.status === 404) return finished(refusal(current.acknowledged ? 'workspace_failed' : 'workspace_unsupported'));
     if (read.status !== 200 || !envelope(read.data)) return finished(refusal('workspace_failed'));
     if (read.data.state === 'running') return { state: 'running', job: { ...current, acknowledged: true } };
-    return finished(awsJobAnswer(read.data.result, current.op, repoFolder(current.handle, current.name), current.class));
+    return finished(jobAnswer(read.data.result, current));
   } catch {
     return finished(refusal('workspace_failed'));
   }

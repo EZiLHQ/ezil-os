@@ -662,7 +662,14 @@ const QA = V.constants.GIT_ASSESSMENT_HOST as string;
 const redact = (text: unknown) => String(text).replaceAll(TOKEN, '<grant>');
 /** An assessment §8 body: class assessment on its own host, as the assessment route hands it over. */
 const assessmentInput = (patch: Record<string, unknown> = {}, receivedAt = NOW) => input({ class: 'assessment', gitHost: QA, ...patch }, receivedAt);
-const okAssessment = { ...okOpen, head: 'a'.repeat(40), clean: true };
+/** E1-6: an assessment answers the wrapper W and git-qa's remote of the vectors' repository (okAssessmentContext). */
+const ASSESS_CTX = V.errorTable.workerResponses.okAssessmentContext as { folder: string; remote: string; repositoryId: string };
+const ASSESS_W = ASSESS_CTX.folder;
+const ASSESS_REMOTE = ASSESS_CTX.remote;
+const REPO_ID = V.fixtures.repositoryId as string;
+const OTHER_REPO_ID = V.fixtures.otherRepositoryId as string;
+const OTHER_W = `${AWS_REPO_OPEN_ROOT}/projects/${OTHER_REPO_ID}`;
+const okAssessment = { ...okOpen, folder: ASSESS_W, openFolder: ASSESS_W, head: 'a'.repeat(40), clean: true, remote: ASSESS_REMOTE };
 const runAs = (e: ReturnType<typeof edge>, i: RepoOpenInput, routeClass: RepoOpenClass | undefined, extra: Partial<AwsRepoOpenDeps> = {}) =>
   handleAwsRepoOpen(i, SANDBOX, target, deps(e.fetch, extra), routeClass);
 
@@ -703,6 +710,8 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     ['class personal on git-qa', () => input({ class: 'personal', gitHost: QA }), 'personal'],
     ['an unknown route class', () => assessmentInput(), 'exam'],
     ['an inherited property name as the class', () => input({ class: 'constructor', gitHost: QA }), 'constructor'],
+    ['an assessment body with a path (E1-6: its editor root is always the wrapper)', () => assessmentInput({ path: 'src' }), 'assessment'],
+    ['an assessment body whose repositoryId is not a lowercase UUID (E1-6)', () => assessmentInput({ repositoryId: REPO_ID.toUpperCase() }), 'assessment'],
   ] as [string, () => RepoOpenInput, RepoOpenClass | undefined][])('never relays a body outside the route class (%s): invalid_request, no edge call', async (_label, make, routeClass) => {
     const e = job(() => ok(okAssessment));
     expect(await runAs(e, make(), routeClass)).toEqual(refusal('invalid_request'));
@@ -711,10 +720,10 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
 
   it('every vectors okAssessmentCases row through an assessment open: a valid result is answered as is, an invalid one is workspace_failed', async () => {
     const cases = V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[];
-    expect(cases.length).toBe(18);
+    expect(cases.length).toBe(32);
     for (const c of cases) {
       const body = materialise(c.body, NOW) as Record<string, unknown>;
-      const answer = await runAs(job(() => ok(body)), assessmentInput({ path: 'src' }), 'assessment');
+      const answer = await runAs(job(() => ok(body)), assessmentInput(), 'assessment');
       expect([c.why ?? 'valid', answer]).toEqual([c.why ?? 'valid', c.valid ? { status: 200, body } as RepoOpenAnswer : refusal('workspace_failed')]);
     }
   });
@@ -727,10 +736,10 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
       carried += 1;
       expect(await run(job(() => ok(materialise(c.body, NOW))), input({ path: 'src' }))).toEqual(refusal('workspace_failed'));
     }
-    expect(carried).toBe(17);
+    expect(carried).toBe(31);
     for (const c of V.errorTable.workerResponses.okCases as { op: string; body: Record<string, unknown>; valid: boolean }[]) {
       if (c.op !== 'open') continue;
-      expect(await runAs(job(() => ok(c.body)), assessmentInput({ path: 'src' }), 'assessment')).toEqual(refusal('workspace_failed'));
+      expect(await runAs(job(() => ok(c.body)), assessmentInput(), 'assessment')).toEqual(refusal('workspace_failed'));
     }
   });
 
@@ -741,8 +750,34 @@ describe('contract 1.0.3: the route class decides the git host and the answer sh
     for (const code of AWS_RESULT_ERROR_CODES) expect(await runAs(job(() => refused(code)), assessmentInput(), 'assessment')).toEqual(refusal(code));
   });
 
+  it('E1-6 awsJobAnswer for class assessment: the wrapper exactly, no path, the expected remote exactly (pure)', () => {
+    const answer = (body: unknown, folder = ASSESS_W, remote: string | undefined = ASSESS_REMOTE) =>
+      awsJobAnswer({ status: 200, body }, 'open', folder, 'assessment', remote);
+    const clone = `${ASSESS_W}/repository`;
+    expect(answer(okAssessment)).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+    for (const [label, bad] of [
+      ['the clone as folder', { ...okAssessment, folder: clone, openFolder: clone }],
+      ['the clone as openFolder', { ...okAssessment, openFolder: clone }],
+      ['a folder below the wrapper', { ...okAssessment, openFolder: `${ASSESS_W}/src` }],
+      ['pathNotFound', { ...okAssessment, pathNotFound: true }],
+      ['the personal folder', { ...okAssessment, folder: FOLDER, openFolder: FOLDER }],
+      ['another repository\'s wrapper', { ...okAssessment, folder: OTHER_W, openFolder: OTHER_W }],
+      ['the personal host\'s remote', { ...okAssessment, remote: 'https://git-preview.ezil.work/acme/site.git' }],
+      ['another repository\'s remote', { ...okAssessment, remote: 'https://git-qa.ezil.work/acme/other.git' }],
+      ['a remote with a newline', { ...okAssessment, remote: `${ASSESS_REMOTE}\n` }],
+      ['a null remote', { ...okAssessment, remote: null }],
+      ['no remote (the 9-key shape)', (({ remote: _r, ...nine }) => nine)(okAssessment)],
+    ] as [string, unknown][]) {
+      expect([label, answer(bad)]).toEqual([label, refusal('workspace_failed')]);
+    }
+    // the expected values are the caller's: another wrapper or remote expected, or none at all, refuses
+    expect(answer(okAssessment, OTHER_W)).toEqual(refusal('workspace_failed'));
+    expect(answer(okAssessment, ASSESS_W, 'https://git-qa.ezil.work/acme/other.git')).toEqual(refusal('workspace_failed'));
+    expect(awsJobAnswer({ status: 200, body: okAssessment }, 'open', ASSESS_W, 'assessment')).toEqual(refusal('workspace_failed'));
+  });
+
   it('awsJobAnswer for class assessment: head, clean, empty and state agree (pure)', () => {
-    const answer = (body: unknown) => awsJobAnswer({ status: 200, body }, 'open', FOLDER, 'assessment');
+    const answer = (body: unknown) => awsJobAnswer({ status: 200, body }, 'open', ASSESS_W, 'assessment', ASSESS_REMOTE);
     const empty = { ...okAssessment, state: 'initialized_empty', empty: true, head: null };
     expect(answer(okAssessment)).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
     expect(answer(empty)).toEqual({ status: 200, body: empty } as RepoOpenAnswer);
@@ -784,6 +819,9 @@ const HANDLE = V.fixtures.handle as string;
 const NAME = V.fixtures.name as string;
 const jobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
   ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'personal', handle: HANDLE, name: NAME, acknowledged: true, ...patch });
+/** E1-6: an assessment job also names its repository (the wrapper its result must answer). */
+const assessJobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
+  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'assessment', handle: HANDLE, name: NAME, repositoryId: REPO_ID, acknowledged: true, ...patch });
 const running$ = (job: AwsRepoOpenJob): AwsRepoOpenStep => ({ state: 'running', job });
 const done$ = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', answer });
 /** A reply text whose grant is JSON-escaped: a raw scan passes it, JSON.parse decodes it to the grant. */
@@ -820,9 +858,25 @@ describe('E1-5: awsRepoOpenStart sends the start exactly once and answers a toke
 
   it('an assessment start records the route class in the job; a refresh records op refresh', async () => {
     expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment'))
-      .toEqual(running$(jobOf({ class: 'assessment' })));
+      .toEqual(running$(assessJobOf()));
     expect(await awsRepoOpenStart(input({ op: 'refresh' }), SANDBOX, target, deps(edge(() => running()).fetch)))
       .toEqual(running$(jobOf({ op: 'refresh' })));
+  });
+
+  it('E1-6: an assessment job carries its repositoryId (exact keys per class); a personal job keeps its 7 keys', async () => {
+    const a = await awsRepoOpenStart(assessmentInput({ repositoryId: OTHER_REPO_ID }), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment');
+    expect(a).toEqual(running$(assessJobOf({ repositoryId: OTHER_REPO_ID })));
+    expect(Object.keys((a as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'acknowledged']);
+    const r = await awsRepoOpenStart(assessmentInput({ op: 'refresh' }), SANDBOX, target, deps(edge(() => running()).fetch), 'assessment');
+    expect(r).toEqual(running$(assessJobOf({ op: 'refresh' })));
+    const p = await awsRepoOpenStart(input(), SANDBOX, target, deps(edge(() => running()).fetch));
+    expect(Object.keys((p as { job: AwsRepoOpenJob }).job)).toEqual(['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged']);
+    // a start answered done at once is validated against the started repository's wrapper
+    const otherAnswer = { ...okAssessment, folder: OTHER_W, openFolder: OTHER_W };
+    expect(await awsRepoOpenStart(assessmentInput(), SANDBOX, target, deps(edge(() => ok(otherAnswer)).fetch), 'assessment'))
+      .toEqual(done$(refusal('workspace_failed')));
+    expect(await awsRepoOpenStart(assessmentInput({ repositoryId: OTHER_REPO_ID }), SANDBOX, target, deps(edge(() => ok(otherAnswer)).fetch), 'assessment'))
+      .toEqual(done$({ status: 200, body: otherAnswer } as RepoOpenAnswer));
   });
 
   it('a start answered done at once: done + the validated answer, for the route class', async () => {
@@ -867,7 +921,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
 
   it('done → the result re-validated for the job (personal and assessment)', async () => {
     expect(await awsRepoOpenPoll(jobOf(), target, deps(edge(() => ok(okOpen)).fetch))).toEqual(done$({ status: 200, body: okOpen } as RepoOpenAnswer));
-    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, deps(edge(() => ok(okAssessment)).fetch)))
+    expect(await awsRepoOpenPoll(assessJobOf(), target, deps(edge(() => ok(okAssessment)).fetch)))
       .toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
     expect(await awsRepoOpenPoll(jobOf({ op: 'refresh' }), target, deps(edge(() => ok({ ok: true, state: 'refreshed' })).fetch)))
       .toEqual(done$({ status: 200, body: { ok: true, state: 'refreshed' } }));
@@ -877,18 +931,46 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
   it('the poll re-validates the result against the job\'s class, op and folder', async () => {
     const poll = (job: AwsRepoOpenJob, result: Response) => awsRepoOpenPoll(job, target, deps(edge(() => result.clone()).fetch));
     expect(await poll(jobOf(), ok(okAssessment))).toEqual(done$(refusal('workspace_failed')));
-    expect(await poll(jobOf({ class: 'assessment' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
-    expect(await poll(jobOf({ class: 'assessment' }), ok({ ...okAssessment, state: 'existing' }))).toEqual(done$(refusal('workspace_failed')));
-    expect(await poll(jobOf({ class: 'assessment' }), ok({ ...okAssessment, head: null }))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(assessJobOf(), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(assessJobOf(), ok({ ...okAssessment, state: 'existing' }))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(assessJobOf(), ok({ ...okAssessment, head: null }))).toEqual(done$(refusal('workspace_failed')));
     expect(await poll(jobOf({ name: 'other' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
     expect(await poll(jobOf({ op: 'refresh' }), ok(okOpen))).toEqual(done$(refusal('workspace_failed')));
     expect(await poll(jobOf(), done(201, okOpen))).toEqual(done$(refusal('workspace_failed')));
     expect(await poll(jobOf(), done(409, { ok: false, error: 'invalid_request' }))).toEqual(done$(refusal('workspace_failed')));
     for (const c of V.errorTable.workerResponses.okAssessmentCases as { body: Record<string, unknown>; valid: boolean; why?: string }[]) {
       const body = materialise(c.body, NOW);
-      expect([c.why ?? 'valid', await poll(jobOf({ class: 'assessment' }), ok(body))])
+      expect([c.why ?? 'valid', await poll(assessJobOf(), ok(body))])
         .toEqual([c.why ?? 'valid', done$(c.valid ? { status: 200, body } as RepoOpenAnswer : refusal('workspace_failed'))]);
     }
+  });
+
+  it('E1-6: the poll rebuilds the wrapper and the remote from the job, never from the reply', async () => {
+    const poll = (job: AwsRepoOpenJob, result: Response) => awsRepoOpenPoll(job, target, deps(edge(() => result.clone()).fetch));
+    // the vectors repository's answer is wrong for a job of another repository, or of another name
+    expect(await poll(assessJobOf({ repositoryId: OTHER_REPO_ID }), ok(okAssessment))).toEqual(done$(refusal('workspace_failed')));
+    expect(await poll(assessJobOf({ name: 'other' }), ok(okAssessment))).toEqual(done$(refusal('workspace_failed')));
+    // and each job's own answer passes
+    const other = { ...okAssessment, folder: OTHER_W, openFolder: OTHER_W };
+    expect(await poll(assessJobOf({ repositoryId: OTHER_REPO_ID }), ok(other))).toEqual(done$({ status: 200, body: other } as RepoOpenAnswer));
+    const named = { ...okAssessment, remote: 'https://git-qa.ezil.work/acme/other.git' };
+    expect(await poll(assessJobOf({ name: 'other' }), ok(named))).toEqual(done$({ status: 200, body: named } as RepoOpenAnswer));
+    // a personal job of the same handle/name still answers its own folder only
+    expect(await poll(jobOf(), ok(okOpen))).toEqual(done$({ status: 200, body: okOpen } as RepoOpenAnswer));
+    expect(await poll(jobOf(), ok({ ...okOpen, folder: ASSESS_W, openFolder: ASSESS_W }))).toEqual(done$(refusal('workspace_failed')));
+  });
+
+  it.each([
+    ['an assessment job without repositoryId', () => (({ repositoryId: _r, ...rest }) => rest)(assessJobOf())],
+    ['a personal job with a repositoryId', () => ({ ...jobOf(), repositoryId: REPO_ID })],
+    ['an uppercase repositoryId', () => assessJobOf({ repositoryId: REPO_ID.toUpperCase() })],
+    ['a repositoryId that is a path', () => assessJobOf({ repositoryId: '../x' })],
+    ['a null repositoryId', () => assessJobOf({ repositoryId: null as unknown as string })],
+    ['an extra key on an assessment job', () => ({ ...assessJobOf(), path: 'src' })],
+  ] as [string, () => unknown][])('E1-6: the job is untrusted (%s): invalid_request, no edge call', async (_label, make) => {
+    const e = edge(() => ok(okAssessment));
+    expect(await awsRepoOpenPoll(make() as AwsRepoOpenJob, target, deps(e.fetch))).toEqual(done$(refusal('invalid_request')));
+    expect(e.calls.length).toBe(0);
   });
 
   it('a transport failure or a 5xx is not an answer: running, the job unchanged', async () => {
@@ -981,7 +1063,7 @@ describe('E1-5: awsRepoOpenPoll reads the job once', () => {
     const e = edge(() => ok(okAssessment));
     const d = deps(e.fetch);
     clock = NOW + 9 * 60_000;
-    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(await awsRepoOpenPoll(assessJobOf(), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
     expect(e.calls[0]!.timeoutMs).toBe(AWS_EDGE_CALL_MAX_MS);
   });
 
@@ -1045,7 +1127,7 @@ describe('E1-5: across sweeps, and handleAwsRepoOpen as the composition', () => 
     expect(JSON.stringify(persisted)).not.toContain('egg_');
     clock += 60_000;
     const first = await awsRepoOpenPoll(persisted, target, d);
-    expect(first).toEqual(running$(jobOf({ class: 'assessment' })));
+    expect(first).toEqual(running$(assessJobOf()));
     clock += 60_000;
     const second = await awsRepoOpenPoll((first as { job: AwsRepoOpenJob }).job, target, d);
     expect(second).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
@@ -1077,7 +1159,7 @@ describe('1.0.3 review fix: after an admitted assessment start, nothing answers 
     const e = edge(() => ok(okAssessment));
     const d = deps(e.fetch);
     for (const acknowledged of [true, false]) {
-      const assessJob = jobOf({ class: 'assessment', acknowledged });
+      const assessJob = assessJobOf({ acknowledged });
       expect(await awsRepoOpenPoll(assessJob, target, d, NOW)).toEqual(running$(assessJob));
       expect(await awsRepoOpenPoll(assessJob, target, d, NOW - 1)).toEqual(running$(assessJob));
     }
@@ -1085,7 +1167,7 @@ describe('1.0.3 review fix: after an admitted assessment start, nothing answers 
     expect(await awsRepoOpenPoll(jobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
     expect(e.calls.length).toBe(0);
     // the same job polled later, without a stale `until`, still reads its result
-    expect(await awsRepoOpenPoll(jobOf({ class: 'assessment' }), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
+    expect(await awsRepoOpenPoll(assessJobOf(), target, d)).toEqual(done$({ status: 200, body: okAssessment } as RepoOpenAnswer));
   });
 
   it('the one-call composition: an assessment job that never finishes ends at the deadline as workspace_failed (a personal one as workspace_busy), after exactly one start', async () => {

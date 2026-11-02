@@ -15,7 +15,12 @@
  *    allow-list: a personal route never accepts git-qa, an assessment route never accepts git-preview,
  *    and an assessment body must carry `class` (so the host and the kernel see it too).
  *  - An assessment open answers okOpenAssessment: the 7 personal keys plus `head` (40 lowercase hex,
- *    or null for an unborn branch) and `clean`, never state `existing`.
+ *    or null for an unborn branch), `clean` and (E1-6) `remote`, never state `existing`.
+ *  - E1-6 (vectors kernel.assessment.layoutRule): an assessment's editor root is the wrapper
+ *    W = <root>/projects/<repositoryId> (the clone is W/repository, the OS open-project layout), so its
+ *    body carries path null, and its answer names W as folder and openFolder with pathNotFound false and
+ *    remote = https://git-qa.ezil.work/<handle>/<name>.git. The caller rebuilds W and the remote from
+ *    what it sent (assessmentEditorRoot, assessmentRemoteUrl), never from the answer.
  */
 
 // ── constants (each compared with the vectors by repo-open-u2.test.ts) ─────────
@@ -36,6 +41,14 @@ export const REPO_OPEN_CLASS_GIT_HOSTS: Readonly<Record<RepoOpenClass, string>> 
 /** A known class: a member of the closed list, never an inherited property name ('constructor', '__proto__'). */
 export const isRepoOpenClass = (value: unknown): value is RepoOpenClass =>
   typeof value === 'string' && (REPO_OPEN_CLASSES as readonly string[]).includes(value);
+
+/** vectors constants ASSESSMENT_DIR_TEMPLATE (projects/<repositoryId>) and ASSESSMENT_CLONE_DIR_NAME (E1-6). */
+export const ASSESSMENT_PROJECTS_DIR = 'projects';
+export const ASSESSMENT_CLONE_DIR = 'repository';
+/** The wrapper W an assessment answers as its folder and openFolder: `<root>/projects/<repositoryId>`. */
+export const assessmentEditorRoot = (root: string, repositoryId: string) => `${root}/${ASSESSMENT_PROJECTS_DIR}/${repositoryId}`;
+/** vectors constants ASSESSMENT_REMOTE_TEMPLATE for `<handle>/<name>`. */
+export const assessmentRemoteUrl = (handle: string, name: string) => `https://${REPO_OPEN_CLASS_GIT_HOSTS.assessment}/${handle}/${name}.git`;
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const HANDLE_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/;
@@ -85,17 +98,20 @@ export const REPO_OPEN_STATUS: Readonly<Record<RepoOpenErrorCode, number>> = {
 /** vectors errorTable.workerResponses.okOpen (keys in order, states). */
 export const OPEN_RESULT_KEYS = Object.freeze(['ok', 'state', 'folder', 'openFolder', 'pathNotFound', 'branch', 'empty'] as const);
 export const OPEN_RESULT_STATES = Object.freeze(['cloned', 'initialized_empty', 'existing'] as const);
-/** vectors errorTable.workerResponses.okOpenAssessment (1.0.3): never `existing`. */
-export const ASSESSMENT_OPEN_RESULT_KEYS = Object.freeze([...OPEN_RESULT_KEYS, 'head', 'clean'] as const);
+/** vectors errorTable.workerResponses.okOpenAssessment (1.0.3, E1-6 `remote`): never `existing`. */
+export const ASSESSMENT_OPEN_RESULT_KEYS = Object.freeze([...OPEN_RESULT_KEYS, 'head', 'clean', 'remote'] as const);
 export const ASSESSMENT_OPEN_RESULT_STATES = Object.freeze(['cloned', 'initialized_empty'] as const);
 
 export interface RepoOpenOpenResult {
   ok: true; state: 'cloned' | 'initialized_empty' | 'existing'; folder: string; openFolder: string;
   pathNotFound: boolean; branch: string; empty: boolean;
 }
-/** An assessment open's 200 body (okOpenAssessment): head null exactly when the branch is unborn (empty). */
+/**
+ * An assessment open's 200 body (okOpenAssessment): head null exactly when the branch is unborn (empty);
+ * folder = openFolder = the wrapper W, pathNotFound false, remote git-qa's URL of the repository (E1-6).
+ */
 export interface RepoOpenAssessmentOpenResult extends Omit<RepoOpenOpenResult, 'state'> {
-  state: 'cloned' | 'initialized_empty'; head: string | null; clean: boolean;
+  state: 'cloned' | 'initialized_empty'; head: string | null; clean: boolean; remote: string;
 }
 export type RepoOpenAnswer =
   | { status: 200; body: RepoOpenOpenResult | RepoOpenAssessmentOpenResult | { ok: true; state: 'refreshed' } }
@@ -137,7 +153,8 @@ const str = (value: unknown): value is string => typeof value === 'string';
  * Strict §8 body for a route that serves `routeClass`: required keys exactly, plus at most the
  * optional `class`; every field re-validated; grant expiry in (now, now + 16 min]. The body's class
  * (absent = personal) must BE the route's class, and gitHost must be exactly that class's host
- * (vectors workerRequest.classRule: a closed table, refused in both directions).
+ * (vectors workerRequest.classRule: a closed table, refused in both directions). An assessment body
+ * carries path null (E1-6: its editor root is always the wrapper).
  */
 export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: RepoOpenClass): RepoOpenBody | null {
   if (!isRepoOpenClass(routeClass)) return null;
@@ -152,7 +169,7 @@ export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: Repo
     && str(b.handle) && HANDLE_RE.test(b.handle) && str(b.name) && validName(b.name)
     && bodyClass === routeClass && str(b.gitHost) && b.gitHost === REPO_OPEN_CLASS_GIT_HOSTS[routeClass]
     && str(b.defaultBranch) && validBranch(b.defaultBranch)
-    && (b.path === null || (b.op === 'open' && str(b.path) && pathProblem(b.path) === null))
+    && (b.path === null || (routeClass !== 'assessment' && b.op === 'open' && str(b.path) && pathProblem(b.path) === null))
     && g.username === 'ezil' && str(g.token) && GRANT_RE.test(g.token) && (g.scope === 'write' || g.scope === 'read')
     && Number.isFinite(expiresAt) && expiresAt > now && expiresAt <= now + WORKER_ACCEPT_EXPIRY_MAX_MS;
   return ok ? (b as unknown as RepoOpenBody) : null;

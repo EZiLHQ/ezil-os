@@ -12,10 +12,11 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-  ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, BRANCH_RE, GRANT_RE, HANDLE_RE, HEAD_RE, NAME_RE,
-  OPEN_RESULT_KEYS, OPEN_RESULT_STATES, REPO_OPEN_CLASSES, REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_CLASS_GIT_HOSTS, REPO_OPEN_STATUS,
-  UUID_RE, WORKER_ACCEPT_EXPIRY_MAX_MS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, isRepoOpenClass, parseRepoOpenBody,
-  refusal, repoOpenResponse, validBranch, validName, type RepoOpenClass, type RepoOpenErrorCode,
+  ASSESSMENT_CLONE_DIR, ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, ASSESSMENT_PROJECTS_DIR, BRANCH_RE, GRANT_RE,
+  HANDLE_RE, HEAD_RE, NAME_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES, REPO_OPEN_CLASSES, REPO_OPEN_CLASS_DEFAULT,
+  REPO_OPEN_CLASS_GIT_HOSTS, REPO_OPEN_STATUS, UUID_RE, WORKER_ACCEPT_EXPIRY_MAX_MS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES,
+  assessmentEditorRoot, assessmentRemoteUrl, isRepoOpenClass, parseRepoOpenBody, refusal, repoOpenResponse, validBranch, validName,
+  type RepoOpenClass, type RepoOpenErrorCode,
 } from './repo-open-u2';
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
@@ -226,6 +227,38 @@ describe('strict §8 body for a route class (vectors workerRequest, classRule)',
     expect([validName('site'), validName('a..b'), validName('site.git'), validName('.site')]).toEqual([true, false, false, false]);
     for (const ok of ['main', 'feature/x', 'v1.2']) expect(validBranch(ok)).toBe(true);
     for (const bad of ['a..b', 'a//b', 'a/', 'x.lock', 'a/.b', 'a.', '-x']) expect(validBranch(bad)).toBe(false);
+  });
+});
+
+// ── E1-6: the assessment layout ─────────────────────────────────────────────
+
+const X_ID = V.fixtures.repositoryId as string;
+
+describe('E1-6: an assessment opens the wrapper projects/<repositoryId> (vectors kernel.assessment.layoutRule)', () => {
+  it('the layout helpers equal the vectors constants and the okAssessmentContext', () => {
+    const X = W.okAssessmentContext;
+    expect(`${ASSESSMENT_PROJECTS_DIR}/<repositoryId>`).toBe(C.ASSESSMENT_DIR_TEMPLATE);
+    expect(ASSESSMENT_CLONE_DIR).toBe(C.ASSESSMENT_CLONE_DIR_NAME);
+    expect(assessmentEditorRoot(X.root, X.repositoryId)).toBe(X.folder);
+    expect(assessmentRemoteUrl(X.handle, X.name)).toBe(X.remote);
+    expect(assessmentRemoteUrl('<handle>', '<name>')).toBe(C.ASSESSMENT_REMOTE_TEMPLATE);
+  });
+
+  it('the clone directory is the live open-project module\'s REPO_OPEN_NESTED_DIR (read as text, never imported)', () => {
+    const live = readFileSync(here('./repo-open.ts'), 'utf8');
+    expect(/^export const REPO_OPEN_NESTED_DIR = '([^']+)';$/m.exec(live)?.[1]).toBe(ASSESSMENT_CLONE_DIR);
+  });
+
+  it('an assessment body takes no path (refused on the assessment route), a personal one still does', () => {
+    const assess = (patch: Record<string, unknown> = {}) => baseBody(NOW, { class: 'assessment', gitHost: QA, ...patch });
+    expect(parses(assess(), 'assessment')).toBe(true);
+    for (const path of ['src', 'src/main.ts', 'repository', '']) expect([path, parses(assess({ path }), 'assessment')]).toEqual([path, false]);
+    for (const v of V.link.path.valid) expect(parses(assess({ path: expand(v) }), 'assessment')).toBe(false);
+    expect(parses(baseBody(NOW, { path: 'src' }), 'personal')).toBe(true);
+    // repositoryId names the wrapper: only a lowercase UUID
+    for (const repositoryId of [X_ID.toUpperCase(), X_ID.replaceAll('-', ''), '../x', `${X_ID}/..`, '', null]) {
+      expect([repositoryId, parses(assess({ repositoryId }), 'assessment')]).toEqual([repositoryId, false]);
+    }
   });
 });
 
