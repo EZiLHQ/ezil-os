@@ -1331,6 +1331,36 @@ class TimingChain(JobBase):
         self.assertEqual(result, {"status": 200, "body": OPEN_OK})
         self.assertIn("repo_open op=open outcome=ok cleanup=pending", self.logs)
 
+    def commit_drain_never_confirms(self, over, want):
+        """r56 D5: the commit phase's two execs (the commit request write and the kernel commit) bound their
+        cleanup by the job deadline D, the bound of every exec but release (timing chain), never by the release
+        cap D + RELEASE_GRACE. A kernel commit whose drain never confirms answers the class's unconfirmed-commit
+        code by D, and release does not run."""
+        fake = FakeDesktop({"commit": line(ASSESS_OK if over else OPEN_OK)})
+        result, elapsed = self.timed(self.slow_exec(fake, hang_drain=("commit",)), **over)
+        self.assertEqual(result, ro.refusal(want))
+        self.assertEqual(fake.phases(), ["prepare", "commit"], "an unconfirmed cleanup ends the job")
+        self.assertLessEqual(elapsed, ro.HOST_DEADLINE_MS / 1000 + self.TOLERANCE)
+        by = {}
+        for (argv, data), cleanup_by in zip(fake.calls, fake.cleanups):
+            if argv[:3] == ["node", ro.KERNEL_PATH, "commit"]:
+                by["kernel commit"] = cleanup_by
+            elif (argv[:3] == ["/bin/sh", "-c", ro.WRITE_PROGRAM] and argv[4].startswith("/run/ezil/requests/")
+                  and json.loads(data)["phase"] == "commit"):
+                by["commit request write"] = cleanup_by
+            else:
+                by.setdefault("every other exec", set()).add(cleanup_by)
+        self.assertEqual(len(by["every other exec"]), 1, "setup and prepare share the job deadline D as their cleanup bound")
+        deadline = next(iter(by["every other exec"]))
+        self.assertEqual((by["commit request write"], by["kernel commit"]), (deadline, deadline),
+                         "the commit phase's cleanup is bounded by the job deadline D")
+
+    def test_a_drain_that_never_confirms_after_a_personal_commit_answers_busy_by_the_deadline(self):
+        self.commit_drain_never_confirms({}, "workspace_busy")
+
+    def test_a_drain_that_never_confirms_after_an_assessment_commit_answers_failed_by_the_deadline(self):
+        self.commit_drain_never_confirms(ASSESS, "workspace_failed")
+
     def test_a_drain_that_never_confirms_after_prepare_answers_busy_by_the_deadline(self):
         fake = FakeDesktop()
         result, elapsed = self.timed(self.slow_exec(fake, hang_drain=("prepare",)))

@@ -71,7 +71,8 @@ Host steps mirror §8 steps 3-11 (worker/src/repo-open.ts runFlight):
     paths; both go through the host check like every exec.
 
 Timing chain. One absolute deadline (HOST_DEADLINE_MS from admission) bounds every exec but
-release INCLUDING its cleanup, and release and the fallback, cleanup included, end within
+release INCLUDING its cleanup (the commit request write and the kernel commit included: r56 D5
+checked, tested), and release and the fallback, cleanup included, end within
 RELEASE_GRACE_MS beyond it: each exec's launcher kill-wait and cgroup drain are cut to the time
 left before that bound (``cleanup_by``), and every runc state probe is bounded by the time left
 before the exec it guards (``probe_timeout``, floor PROBE_MIN_S). So the result is published by
