@@ -806,9 +806,10 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         // code-test.mjs drives the built bundle's mint and checks the same body on the wire.
         const code = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/apps/code.js'), 'utf8');
         // Lane O2 made the body conditional on a project; without one it is still exactly { computerId, intent: 'open' }
-        // (code-test.mjs 8d checks that on the wire).
+        // (code-test.mjs 8d checks that on the wire), plus the per-tab folder hint `codeFolder` only when this tab has a
+        // record (code-test.mjs 9a/9c; the procedure never 400s on it).
         expect(code).toContain("body: JSON.stringify(project\n");
-        expect(code).toContain(": { computerId, intent: 'open' }),");
+        expect(code).toContain(": { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),");
         const w = world([held({ instance_type: 'm6i.large' })]);
         const seen = shellRoutes(w.db);
         await post('/api/shell/code-preview-url', { computerId: C, intent: 'open' });
