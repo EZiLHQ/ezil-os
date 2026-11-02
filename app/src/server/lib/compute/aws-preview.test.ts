@@ -648,12 +648,15 @@ describe('AWS preview surface (seam B)', () => {
         await prepareAwsPoolSession(fake.db, { userId, computerId }, { ...options, surface: 'code', codeFolder }, config, 'test-secret', 'test');
         expect(signedBody()).toBe(JSON.stringify({ sessionId: 'session', userId, projectId: computerId, desktopMode: 'neko' }));
     });
-    it('the answer allowlist takes an outcome code only: a path, an extra key or another version fails closed', async () => {
-        for (const bad of [{ v: 1, outcome: '/etc' }, { v: 1, outcome: 'restored', path: '/workspace/a' }, { v: 2, outcome: 'restored' }, 'restored']) {
+    it('the answer allowlist takes an outcome code only: a path, an extra key or another version is dropped, and the open still succeeds', async () => {
+        for (const bad of [{ v: 1, outcome: '/etc' }, { v: 1, outcome: 'restored', path: '/workspace/a' }, { v: 2, outcome: 'restored' }, 'restored', null, [], { v: 1 }]) {
             fetchMock.mockResolvedValue(Response.json({ ...ready(), codeFolder: bad }));
             const out = await setup().open(config, 'test-secret', { ...options, surface: 'code', codeFolder });
-            expect(out).toMatchObject({ ok: false });
+            expect(out).toMatchObject({ ok: true, codePreviewUrl: ready().codePreviewUrl });
+            expect(out).not.toHaveProperty('codeFolder');
             expect(JSON.stringify(out)).not.toContain('/workspace/a');
+            expect(JSON.stringify(out)).not.toContain('/etc');
+            expect(JSON.stringify(out)).not.toContain('codeFolder');
         }
     });
     it('pins the surface key and values to the Worker source', () => {

@@ -6,7 +6,7 @@
  * - Cloudflare: a valid hint rides the ensure body (`compute/cloudflare.ts`, explicit fields), and the Worker's
  *   `{v:1, outcome}` passes back; never a path.
  * - AWS: a valid hint rides the v2-signed `surface: 'code'` preview body; the answer allowlist passes the outcome
- *   code only and fails closed on anything else.
+ *   code only and drops anything else (never a path, and never a failed Code open over an optional hint).
  * - Another person's computer is NOT_FOUND before anything about the hint is read or sent.
  * Harness: the same mocks as compute-dispatch.test.ts.
  */
@@ -196,13 +196,15 @@ describe('codePreviewUrl, AWS: the hint rides the signed Code preview body; the 
         for (const b of previewBodies()) expect(b).not.toHaveProperty('codeFolder');
     });
 
-    it('a Worker answer whose codeFolder carries anything but a code fails the preview closed', async () => {
+    it('a Worker answer whose codeFolder carries anything but a code is dropped: no path passes, and Code still opens', async () => {
         vi.spyOn(console, 'error').mockImplementation(() => {});
         vi.spyOn(console, 'info').mockImplementation(() => {});
         fetchMock.mockResolvedValue(Response.json(ready({ codeFolder: { v: 1, outcome: 'restored', path: '/workspace/x' } })));
         const { db } = routerDb([awsRow()]);
         const out = await caller(db).codePreviewUrl({ computerId: C1, intent: 'open', codeFolder: ASK });
-        expect(out).toMatchObject({ ok: false });
+        // The shell then has an ask with no answer code and says so itself (`unsupported_server`), record kept.
+        expect(out).toMatchObject({ ok: true, computeProvider: 'aws-ec2' });
+        expect(out).not.toHaveProperty('codeFolder');
         expect(JSON.stringify(out)).not.toContain('/workspace/x');
     });
 });
