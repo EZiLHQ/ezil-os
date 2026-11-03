@@ -1170,7 +1170,7 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
     );
     expect(src).toContain(
       'const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,\n'
-      + '      cloudflareCodeFolderResolver(ownSessionExec(sandbox, () => `ezil-code-folder-${crypto.randomUUID()}`), codeFolderRoot));',
+      + '      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));',
     );
     expect(src).toContain(
       'const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;',
@@ -1188,7 +1188,7 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
   it('answers the per-tab folder outcome as a code only, and forwards the AWS hint unchanged', () => {
     expect(src).toContain('...codeFolderAnswer(codeFolder.outcome),');
     expect(src).toContain('codeFolder: body.codeFolder,');
-    // The walk is e1cd418a's (code-folder-resolve.ts), in a shell session of its own; it answers a code, never a path.
+    // The walk is e1cd418a's (code-folder-resolve.ts): one exec, the whole resolve bounded; it answers a code, never a path.
     expect(src).toContain("import { cloudflareCodeFolderResolver } from './code-folder-resolve';");
   });
 
