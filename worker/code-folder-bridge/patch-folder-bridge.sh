@@ -14,7 +14,8 @@
 # fails the Docker build visibly. Counts were measured on the pinned 4.141.0
 # deb (sha256 f384beb4…77ba, pristine) AND on the shipped
 # ezil-os-worker-staging-sandbox:ad001d55 (copilot patch applied): each anchor
-# occurs exactly once in both, so the two scripts may run in either order.
+# occurs exactly once in both, and the two modification notices carry distinct
+# prefixes (each script gates its own), so the two scripts may run in either order.
 #
 # What the editor tells the shell, and to whom:
 #   - only when framed (window.parent !== window), only to an origin in the
@@ -46,7 +47,9 @@ WB="$ROOT/out/vs/code/browser/workbench/workbench.js"
 # the STAGING shell only (this change is staging-scoped); a production image adds
 # https://os.ezil.work explicitly through EZIL_SHELL_ORIGINS_JSON once approved.
 SHELL_ORIGINS_JSON="${EZIL_SHELL_ORIGINS_JSON:-[\"https://os-staging.ezil.work\"]}"
-NOTICE='/* Modified at build time by EZiL (worker/code-folder-bridge/patch-folder-bridge.sh): the folder this document opened is reported to the EZiL shell; same-frame opens replace history. Original work: Copyright (c) Microsoft Corporation, MIT License. */'
+# Its own prefix: patch-copilot-chat.sh gates its 'Modified at build time by EZiL' notice to exactly one per file,
+# so this notice must never contain that phrase.
+NOTICE='/* EZiL build-time modification (worker/code-folder-bridge/patch-folder-bridge.sh): the folder this document opened is reported to the EZiL shell; same-frame opens replace history. Original work: Copyright (c) Microsoft Corporation, MIT License. */'
 
 [ -s "$WB" ] || { echo "patch-folder-bridge: missing $WB" >&2; exit 1; }
 command -v node >/dev/null || { echo "patch-folder-bridge: node is required" >&2; exit 1; }
@@ -106,7 +109,8 @@ gate B2-iife "$A_B2" 1
 gate B2-origins "const O=${SHELL_ORIGINS_JS};" 1
 gate B3 "$R_B3" 1
 gate B3-old "$A_B3" 0
-gate notice 'worker/code-folder-bridge/patch-folder-bridge.sh' 1
+gate notice "$NOTICE" 1
+gate notice-prefix '/* EZiL build-time modification (' 1
 gate no-wildcard-target 'postMessage({type:"ezil.code.ready",v:1},"*")' 0
 node --check "$WB" || { echo "patch-folder-bridge: GATE FAILED [parse] workbench.js no longer parses" >&2; exit 1; }
 echo "patch-folder-bridge: ok (B1 provider, B2 bridge, B3 replace; origins ${SHELL_ORIGINS_JS})"
