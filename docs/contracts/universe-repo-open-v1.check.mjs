@@ -571,12 +571,20 @@ ok(V.repoBudget.cases.some((c) => c.ok && c.workspaceTarBytes + c.stagedTarBytes
 ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT_NAME.includes('/'), 'staging dir is one top-level reserved name');
 
 // 1.0.2 (D5, D6): the workspace side counts exactly what the codec archives (repoBudget.workspaceRule),
-// and only repo-open folders (repoOpenMarkerRule) have their nested index read.
+// and only repo-open folders (repoOpenMarkerRule; both layouts since the 1.0.3 codec parity) have their nested index read.
 {
     const RB = V.repoBudget;
     eq(C.SNAPSHOT_CACHE_NAMES, ['node_modules', '.next', '.turbo', 'dist'], 'SNAPSHOT_CACHE_NAMES (the codec CACHES set)');
     eq(C.SNAPSHOT_INTERNAL_NAMES, ['.ezil-hydrated.json', '.ezil-flush-manifest.json'], 'SNAPSHOT_INTERNAL_NAMES (the codec INTERNAL set)');
     ok(Number.isInteger(C.SNAPSHOT_NESTED_INDEX_MAX) && C.SNAPSHOT_NESTED_INDEX_MAX > 0, 'SNAPSHOT_NESTED_INDEX_MAX');
+    eq(C.SNAPSHOT_INDEX_PATHS_BYTES, 16 * 1024 * 1024, 'SNAPSHOT_INDEX_PATHS_BYTES (the codec PATHS_LIMIT)');
+    ok(/exit 129 alone/.test(RB.workspaceRule) && /retries once without --sparse/.test(RB.workspaceRule), 'workspaceRule: only exit 129 retries, once, without --sparse');
+    ok(/projects\/<repositoryId>\/repository and repos\/<handle>\/<name>/.test(RB.workspaceRule) && /every projects\/ folder before any repos\/ one/.test(RB.workspaceRule),
+        'workspaceRule: both layouts, projects/ first');
+    ok(/one pool of SNAPSHOT_LIMIT_BYTES the root spends first and the folders then share/.test(RB.workspaceRule)
+        && /SNAPSHOT_INDEX_PATHS_BYTES for the root, then a second SNAPSHOT_INDEX_PATHS_BYTES the folders share/.test(RB.workspaceRule),
+        'workspaceRule: the per-pass index and path pools');
+    ok(/exactly the five keys v, repositoryId, handle, name and gitHost/.test(RB.repoOpenMarkerRule), 'repoOpenMarkerRule: the projects layout binding');
     ok(C.BINDING_FILE === '.git/ezil-repo.json', 'the repo-open marker is the kernel binding file');
     ok(!/caches and skipped names included/.test(RB.rule), 'repoBudget.rule no longer counts caches and skipped names');
     const normalise = (p) => {
@@ -593,10 +601,14 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
         const resolved = normalise(dir ? `${dir}/${target}` : target);
         return resolved !== '..' && !resolved.startsWith('../');
     };
+    const BINDING_KEYS = ['v', 'repositoryId', 'handle', 'name', 'gitHost'];
     const marked = (folder, m) => {
         const parts = folder.split('/');
-        return parts.length === 3 && parts[0] === 'repos' && !!m && typeof m === 'object' && !Array.isArray(m)
-            && m.v === 1 && m.handle === parts[1] && m.name === parts[2];
+        if (parts.length !== 3 || !m || typeof m !== 'object' || Array.isArray(m) || m.v !== 1) return false;
+        if (parts[0] === 'repos') return m.handle === parts[1] && m.name === parts[2];
+        return parts[0] === 'projects' && parts[2] === C.ASSESSMENT_CLONE_DIR_NAME
+            && Object.keys(m).length === BINDING_KEYS.length && BINDING_KEYS.every((key) => Object.hasOwn(m, key))
+            && m.repositoryId === parts[1] && typeof m.handle === 'string' && typeof m.name === 'string';
     };
     function codecArchived(c) {
         const tracked = new Set();
@@ -643,6 +655,10 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     has((c) => c.expectOk && bigUnder(c, 'node_modules') && !Object.keys(c.indexes).length, 'an over-budget untracked node_modules that does not count');
     has((c) => !c.expectOk && Object.keys(c.indexes).some((f) => f !== '' && marked(f, c.markers[f])) && bigUnder(c, 'dist'), 'an over-budget tracked dist in a repo-open folder that counts');
     has((c) => c.expectOk && Object.keys(c.indexes).some((f) => f !== '' && !c.markers[f]) && bigUnder(c, 'dist'), 'a tracked dist in an unmarked nested repository that does not count');
+    has((c) => !c.expectOk && Object.keys(c.indexes).some((f) => f.startsWith('projects/') && marked(f, c.markers[f])) && bigUnder(c, 'dist'),
+        'an over-budget tracked dist in a bound projects/<repositoryId>/repository that counts (1.0.3 codec parity)');
+    has((c) => Object.entries(c.markers).some(([f, m]) => f.startsWith('projects/') && m.v === 1 && m.repositoryId === f.split('/')[1] && !marked(f, m)),
+        'a projects binding without the five keys that marks nothing');
     has((c) => Object.keys(c.indexes).includes(''), 'a root index');
     has((c) => Object.values(c.markers).some((m) => m.v !== 1) && Object.entries(c.markers).some(([f, m]) => m.v === 1 && !marked(f, m)), 'invalid bindings (v and name)');
     has((c) => c.entries.some((e) => e.type === 'fifo') && c.entries.some((e) => e.type === 'symlink' && !linkOk(e.name, e.linkname)), 'skipped FIFOs and escaping links');
