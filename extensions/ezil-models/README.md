@@ -54,15 +54,30 @@ serialized wire message. Copilot 0.69 uses this count for its own tool
 definitions against the advertised input, one count per schema key and string
 value (it never counts numbers, booleans or punctuation), for its tool budget and
 for its text tool-result cap. Its prompt renderer counts message text with its
-own o200k_base tokenizer instead (measured on the image). A string counts as the
-text block it would be sent as, its JSON literal plus 23 bytes, so 38 agent
-tools count about 87,400 against 53,066 bytes on the wire. That is deliberate.
-Copilot starts background compaction (a summary request to the active model)
-when message plus tool tokens reach about 0.8 of the advertised input. Measured
-with a mock on the image, this count compacts every one to three turns and a
-growing chat keeps going. Counting bare literals (57,084) delayed compaction
-until the summary request was itself over the byte bound, and every growing chat
-was refused at its seventh turn. For `openai-responses` models a string also
+own o200k_base tokenizer instead. A string counts as the text block it would be
+sent as, its JSON literal plus 23 bytes. That is deliberate. Copilot starts
+background compaction (a summary request to the active model) when message plus
+tool tokens reach 0.78–0.82 of the advertised input (0.9 without a summarizer).
+A heavy tool count starts it while its summary still fits the byte bound.
+
+This was measured with a mock on the image, with its 38 agent tools (53,066
+bytes on the wire), Qwen, and 10 turns of about 8.5 KB each, where the 39-tool
+test fixture counts 88,254 against 53,535. This count gave about 87,400 tool
+tokens and compacted every one to three turns; all 10 turns completed. Counting
+bare literals (about 57,100) delayed compaction until the summary request was
+itself over the byte bound, and every such chat was refused from its seventh
+turn on.
+
+With Kimi, whose summaries are JSON, summaries that took 45–90 seconds
+completed under the 200-second deadline. The base build abandoned them at 30
+seconds and ended with "Conversation too large or invalid". A chat can still
+outgrow the bound before a slow summary lands, when turns come faster than the
+summary. In the mock this happened with code-like content.
+
+Copilot never counts schema numbers or booleans, so tool sets dominated by
+them are under-counted. A large tool set (64 tools count 139,882, over the
+advertised input) leaves Copilot's history budget at its floor. That case is
+unmeasured. For `openai-responses` models a string also
 counts with non-ASCII escaped as `\uXXXX`, because the Gateway's Responses bound
 escapes tool text and adds 128 bytes per tool and 32 per item. Advertised input defaults to
 `131072 - 1056 - 1536 - 8000 = 120480`; `toolReserve` (default 8000) is only a
@@ -74,10 +89,9 @@ above, 512 items, 256 KiB). A request over a bound is refused on the computer
 with `local_input_too_large`, `local_too_many_messages` or
 `local_too_many_blocks`: nothing is sent or charged, the conversation history
 is kept, and the message gives the sizes (body bytes including tool-definition
-bytes, and the limit). Background compaction normally keeps a chat under the
-bound. A chat can still reach it if compaction does not run or does not finish
-in time, for example with very sparse content or a summary that fails. Any other
-failure before sending is `local_build_error` (the exception's class name only).
+bytes, and the limit). A chat reaches it when compaction does not run or does
+not land in time (above). Any other failure before sending is
+`local_build_error` (the exception's class name only).
 
 Calls share a FIFO admission queue per base URL and Bearer auth context, the same
 identity used by the model catalog cache. `GATEWAY_MAX_IN_FLIGHT = 2` is coupled

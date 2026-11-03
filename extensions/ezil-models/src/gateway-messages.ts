@@ -197,13 +197,14 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
  * countTokens(string) per schema key and string value; numbers, booleans and falsy entries are not passed; plus 8
  * per tool, 16, and 10%), for its tool budget arithmetic and for its text tool-result cap. Its prompt renderer
  * counts message text with its own o200k_base tokenizer, not this call. A string counts as the text block it would be
- * sent as, about 23 bytes over its JSON literal, so 38 agent tools count about 87,400 against 53,066 bytes on the
- * wire. Keep that: Copilot starts background compaction when message plus tool tokens reach about 0.8 of the
- * advertised input, and only this heavier tool count starts it while its summary request still fits the byte bound.
- * Measured on the image (mock A/B, 3 Nov 2026): counting bare literals (57,084) delayed compaction until the summary
- * itself was over the bound, and every growing chat was refused at its 7th turn; this count compacted and continued
- * through 10. The Responses bound also escapes non-ASCII tool text and adds 128 bytes per tool and 32 per item, so
- * Responses strings count escaped. Messages count as their serialized wire message.
+ * sent as, 23 bytes over its JSON literal for ASCII. Keep that: Copilot starts background compaction when message
+ * plus tool tokens reach 0.78-0.82 of the advertised input, and this heavier tool count starts it while its summary
+ * request still fits the byte bound. Measured with a mock on the image (38 agent tools, 53,066 wire bytes; Qwen, 10
+ * turns of about 8.5 KB; 3 Nov 2026): this count (about 87,400) compacted and completed all 10 turns; bare literals
+ * (about 57,100) delayed compaction until the summary itself was over the bound, and every chat was refused from its
+ * 7th turn. 64 tools count over the advertised input (unmeasured). The Responses bound also escapes non-ASCII tool
+ * text and adds 128 bytes per tool and 32 per item, so Responses strings count escaped. Messages count as their
+ * serialized wire message.
  */
 export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
     if (typeof value === 'string') {
