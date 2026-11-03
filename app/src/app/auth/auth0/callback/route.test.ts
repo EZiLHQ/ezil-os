@@ -241,6 +241,21 @@ describe('Auth0 callback failure keeps only a vouched-for destination (auth reco
         const response = await GET(request(query, value));
         expect(new URL(response.headers.get('location')!).searchParams.has('returnUrl')).toBe(false);
     });
+    it('a successful sign-in spends the page a sign-out kept; a failed one keeps it for the retry', async () => {
+        const KEPT = '__Host-ezil-login-return';
+        const withKept = (query: Record<string, string> = {}) => new NextRequest(
+            `${origin}/auth/auth0/callback?${new URLSearchParams({ state, code: 'private-code', ...query })}`,
+            { headers: { cookie: `${AUTH0_COOKIE}=${cookie}; ${KEPT}=L2FwcC9icm93c2Vy` } });
+        const ok = await GET(withKept());
+        expect(ok.headers.get('location')).toBe(`${origin}/os?computer=one`);
+        expect(ok.cookies.get(KEPT)).toMatchObject({ value: '', maxAge: 0, secure: true, httpOnly: true, sameSite: 'lax', path: '/' });
+        stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+        expect((await GET(withKept())).cookies.get(KEPT)).toBeUndefined();
+        expect((await GET(withKept({ error: 'access_denied', code: '' }))).cookies.get(KEPT)).toBeUndefined();
+        stub.verifyIdToken.mockResolvedValue({ sub: 'auth0|one', email: 'private@example.com' });
+        // Nothing to spend: nothing is set.
+        expect((await GET(request())).cookies.get(KEPT)).toBeUndefined();
+    });
     it('a transaction-backed failure ignores a returnUrl in the callback query', async () => {
         stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
         const response = await GET(request({ returnUrl: '/app/settings' }));

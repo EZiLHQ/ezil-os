@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
+import { LOGIN_RETURN_COOKIE, LOGIN_RETURN_COOKIE_OPTIONS } from '@/app/login/return-cookie';
 import {
     AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, auth0Enabled, exchangeCode, readTransaction, SILENT_LOGIN_FALLBACK_ERRORS, verifyIdToken,
 } from '@/server/auth/auth0';
@@ -14,6 +15,7 @@ export async function GET(request: NextRequest) {
     // goes back to the sign-in page still headed for the same page; a failure before it keeps nothing, because then
     // nothing vouches for any destination. Never read from the callback's own query.
     let returnUrl: string | undefined;
+    let signedIn = false;
     try {
         if (!auth0Enabled()) throw new Auth0Error('auth0_disabled');
         const params = request.nextUrl.searchParams;
@@ -37,6 +39,7 @@ export async function GET(request: NextRequest) {
             // fails the OS sign-in; opening a project then asks for a refresh (IDENTITY_REFRESH_REQUIRED).
             try { await retainProjectIdentity(token); } catch { console.warn('[auth0] identity not retained'); }
             destination = returnUrl;
+            signedIn = true;
         }
     } catch (error) {
         const code = error instanceof Auth0Error ? error.code : 'auth0_failed';
@@ -45,6 +48,11 @@ export async function GET(request: NextRequest) {
     }
     const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
+    // Signed in: the page a sign-out kept has been reached. A failed attempt keeps it for the retry (Back and refresh
+    // included); it expires by itself after ten minutes.
+    if (signedIn && request.cookies.has(LOGIN_RETURN_COOKIE)) {
+        response.cookies.set(LOGIN_RETURN_COOKIE, '', { ...LOGIN_RETURN_COOKIE_OPTIONS, maxAge: 0 });
+    }
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');
     return response;

@@ -5,8 +5,8 @@ import 'server-only';
  *
  * That sign-out leaves through id.ezil.work's logout, which comes back to the registered `/login` with nothing else
  * (`post_logout_redirect_uri` is an exact allow-list entry, so no query can ride on it). The destination waits here
- * instead, in a host-only `__Host-` cookie no `*.ezil.org` sibling can plant, for at most ten minutes;
- * `/auth/auth0/login` expires it once a sign-in starts.
+ * instead, in a host-only `__Host-` cookie no `*.ezil.org` sibling can plant, for at most ten minutes. The Auth0
+ * callback expires it once a sign-in succeeds; a failed one keeps it for the retry, Back and refresh included.
  *
  * It is a hint, never trusted: every reader passes it through `safeReturnUrl` like any `?returnUrl=`. base64url keeps
  * `;` and `,` in a query out of the cookie header.

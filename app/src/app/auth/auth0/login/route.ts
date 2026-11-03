@@ -1,6 +1,5 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
-import { LOGIN_RETURN_COOKIE, LOGIN_RETURN_COOKIE_OPTIONS } from '@/app/login/return-cookie';
 import { AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
 import { safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -19,10 +18,6 @@ export async function GET(request: NextRequest) {
         const query = new URLSearchParams({ error: code, ...(returnUrl === null ? {} : { returnUrl: safeReturnUrl(returnUrl) }) });
         response = NextResponse.redirect(new URL(`/login?${query}`, request.url));
         response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
-    }
-    // An interactive sign-in has taken the destination over from the sign-out (`@/app/login/return-cookie`).
-    if (!prompt && request.cookies.has(LOGIN_RETURN_COOKIE)) {
-        response.cookies.set(LOGIN_RETURN_COOKIE, '', { ...LOGIN_RETURN_COOKIE_OPTIONS, maxAge: 0 });
     }
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');
