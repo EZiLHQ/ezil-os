@@ -54,23 +54,28 @@ function os_family () {
 }
 
 /**
- * The app in front, by its address name (`/app/browser` → `browser`): of the
- * open, rendered, not minimised app windows, the one with the highest z-index.
- * Read from `data-app` and checked against `APP_IDS`; never a URL, an iframe
- * `src` or a folder.
+ * The app the report is about, by its address name (`/app/browser` →
+ * `browser`). Settings is where Feedback is opened from, so it is named only
+ * when no other app window is open; otherwise the shown window with the
+ * highest z-index wins, then a minimised one (the Browser someone minimised
+ * before reporting it). Read from `data-app` and checked against `APP_IDS`;
+ * never a URL, an iframe `src` or a folder.
  */
 function front_app () {
-    let front = null;
-    let front_z = -Infinity;
+    let best = null;
     for ( const el of document.querySelectorAll('.window[data-app]:not(.window-alert):not(.window-filedialog)') ) {
         const id = el.getAttribute('data-app');
-        if ( ! APP_IDS.includes(id) || el.getAttribute('data-closing') === '1'
-            || ['true', '1'].includes(el.getAttribute('data-is_minimized')) || ! visible(el) ) continue;
+        if ( ! APP_IDS.includes(id) || el.getAttribute('data-closing') === '1' ) continue;
+        const minimised = ['true', '1'].includes(el.getAttribute('data-is_minimized'));
+        const shown = ! minimised && visible(el);
+        if ( ! minimised && ! shown ) continue;
         const z = Number.parseInt(window.getComputedStyle(el).zIndex, 10);
-        const zz = Number.isFinite(z) ? z : 0;
-        if ( zz >= front_z ) { front = id; front_z = zz; }
+        const rank = [id === 'settings' ? 0 : 1, shown ? 1 : 0, Number.isFinite(z) ? z : 0];
+        // Compared in order; a tie goes to the later window in the document.
+        const differs = best ? rank.findIndex((value, i) => value !== best.rank[i]) : -1;
+        if ( ! best || differs === -1 || rank[differs] > best.rank[differs] ) best = { id, rank };
     }
-    return front === null ? null : routeName(front);
+    return best === null ? null : routeName(best.id);
 }
 
 /**

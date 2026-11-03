@@ -751,7 +751,7 @@ try {
         assert.equal(box.checked, true);
         const help = document.getElementById(box.getAttribute('aria-describedby'));
         assert.match(help.textContent, /Included unless\s+you untick it/);
-        assert.match(help.textContent, /the app in front/);
+        assert.match(help.textContent, /the app you were using/);
         assert.match(help.textContent, /Never your files, what you type in apps, links, cookies or sign-in\./);
         const win = (app, z) => {
             const el = document.createElement('div');
@@ -765,6 +765,17 @@ try {
         windows[1].setAttribute('data-is_minimized', '1');
         setDescription('Default diagnostics..');
         assert.equal(payload().diagnostics.app, 'browser', 'the Browser by its address name, never `desktop` or a URL');
+        // Settings → Feedback (the main entry) puts Settings in front: the report is still about the Browser.
+        const settings = win('settings', 50);
+        setDescription('Default diagnostics,');
+        assert.equal(payload().diagnostics.app, 'browser', 'Settings in front does not name the report');
+        windows[0].setAttribute('data-is_minimized', '1');
+        setDescription('Default diagnostics,,');
+        assert.equal(payload().diagnostics.app, 'code', 'with every app minimised, the minimised one in front, not Settings');
+        windows[1].setAttribute('data-closing', '1'); windows[0].setAttribute('data-closing', '1');
+        setDescription('Default diagnostics,,,');
+        assert.equal(payload().diagnostics.app, 'settings', 'Settings only when it is the only app open');
+        settings.remove();
         for ( const el of windows ) el.remove();
         setDescription('Default diagnostics...');
         assert.equal(payload().diagnostics.app, undefined, 'no app window: no app');
@@ -871,7 +882,7 @@ try {
         document.body.append(el);
         open(); setDescription('Older server');
         assert.equal(form().elements.logs, undefined);
-        assert.doesNotMatch(document.getElementById('ezil-feedback-diagnostics-help').textContent, /app in front/);
+        assert.doesNotMatch(document.getElementById('ezil-feedback-diagnostics-help').textContent, /app you were using/);
         assert.ok(Object.keys(payload().diagnostics).every(key => V1_DIAGNOSTICS.includes(key)), Object.keys(payload().diagnostics).join());
         setDescription(''); close();
         el.remove();
@@ -925,6 +936,26 @@ try {
         assert.equal(JSON.parse(calls.at(-1).body).description, 'Session expired');
         flushing = false;
         assert.equal(stored(outboxKey), null);
+    });
+    await check('v2: every request names the tab\'s own account; a 409 (another account signed in since) is not filed, kept, or retried', async () => {
+        open(); setDescription('Tab booted as the first account');
+        respond = async () => ({ status: 409, json: async () => ({ error: 'account_mismatch' }) });
+        send(); await until(() => /different account/.test(status()));
+        assert.equal(calls.at(-1).headers['X-EZiL-Account'], accountId, 'the account this tab was booted for');
+        assert.doesNotMatch(calls.at(-1).body, new RegExp(accountId), 'the id is a header, never in the previewed body');
+        assert.equal(status(), "You're signed in as a different account now. Reload EZiL OS to send feedback from that account.");
+        assert.equal(stored(outboxKey), null, 'not queued for the second account');
+        assert.equal(stored(draftKey).description, 'Tab booted as the first account', "kept under the first account's draft");
+        const count = calls.length;
+        window.dispatchEvent(new window.Event('online')); await tick();
+        assert.equal(calls.length, count, 'a mismatch is never retried');
+        setDescription(''); close();
+        respond = async () => ({ status: 200, ok: true, json: async () => ({ reports: [] }) });
+        await feedback.list_my_reports();
+        assert.equal(calls.at(-1).headers['X-EZiL-Account'], accountId);
+        respond = async () => ({ status: 204 });
+        await feedback.delete_my_report(reportId);
+        assert.equal(calls.at(-1).headers['X-EZiL-Account'], accountId);
     });
     await check('v2: every option is a labelled native checkbox wired to its description; notes are announced', () => {
         open();

@@ -60,6 +60,13 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
         if (!user) return shellUnauthenticated();
         const features = shellFeaturesFor(user.email, deps.env);
         if (!features.feedback) return shellJson({ error: 'not_found' }, 404);
+        // v2: the shell names the account its tab was booted for. Another account
+        // signed in since (the cookie is shared by every tab) must not receive
+        // that tab's report, diagnostics or log. No header: a v1 shell, as before.
+        const claimed = req.headers.get('x-ezil-account');
+        if (claimed !== null && claimed.trim().toLowerCase() !== user.id.toLowerCase()) {
+            return shellJson({ error: 'account_mismatch' }, 409);
+        }
         if (req.method === 'POST') {
             if (!isJson(req)) return shellJson({ error: 'unsupported_media_type' }, 415);
             let raw: unknown;

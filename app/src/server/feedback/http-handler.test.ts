@@ -184,6 +184,27 @@ describe('feedback HTTP boundary', () => {
         expect(insert.params).not.toContain(foreign);
     });
 
+    it.each(['POST', 'GET', 'DELETE'])('refuses %s with 409 when the tab was booted for another account, before any DB work', async (method) => {
+        // Tab booted as someone else; this browser has since signed in as USER elsewhere.
+        const h = harness({ owned: true, list: true });
+        const headers = { ...JSON_HEADERS, 'x-ezil-account': '660e8400-e29b-41d4-a716-446655440077' };
+        const url = method === 'DELETE' ? `${URL}?id=${ID}` : URL;
+        const response = await handleFeedbackRequest(new Request(url, { method, headers, body: method === 'POST' ? JSON.stringify(VALID) : undefined }), h.deps);
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({ error: 'account_mismatch' });
+        expect(response.headers.get('cache-control')).toContain('no-store');
+        expect(h.statements).toEqual([]);
+    });
+
+    it('accepts the matching account in any letter case, and no account header at all (a v1 shell)', async () => {
+        for (const value of [USER.id, ` ${USER.id.toUpperCase()} `, null]) {
+            const h = harness();
+            const headers: Record<string, string> = { ...JSON_HEADERS };
+            if (value !== null) headers['x-ezil-account'] = value;
+            expect((await handleFeedbackRequest(new Request(URL, { method: 'POST', headers, body: JSON.stringify(VALID) }), h.deps)).status).toBe(201);
+        }
+    });
+
     it('returns 201 only after the report is written', async () => {
         const h = harness(); const response = await handleFeedbackRequest(request(), h.deps);
         expect(response.status).toBe(201); expect(await response.json()).toEqual({ id: expect.any(String), createdAt: NOW.toISOString(), screenshotAccepted: false });

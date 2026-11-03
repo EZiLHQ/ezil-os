@@ -4,7 +4,9 @@
 by default and the form says what they contain; the user can untick them. A
 "Recent activity log" (this tab's console ring and recorded events, redacted, last
 15 minutes, at most 60 lines of 200 characters) can be added by ticking it. The
-report records the app in front by its address name. Both new fields live inside
+report records the app it is about by its address name (Settings only when it is the
+only app open). Every request names the account its tab was booted for, and the server
+refuses a report for another account (409). Both new fields live inside
 the existing `diagnostics` jsonb (no migration), and the shell sends them only when
 the boot payload says the server accepts them (`ui.feedbackLogs`). Sections 1, 2,
 3, 4a and 5 below carry the v2 changes; everything else is unchanged.
@@ -161,7 +163,8 @@ Diagnostics (strict, every field optional):
   fullscreen bool, fullbleed bool, computerStatus ≤32, traceId ≤64, phases string[≤24]≤40,
   recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int},
   // v2, sent only when desktopState.ui.feedbackLogs is true:
-  app ≤32,                      // the front app's address name (`browser`, `code`, `settings`…), from data-app
+  app ≤32,                      // address name (`browser`, `code`…) from data-app: the front non-Settings app window,
+                                // else a minimised one, else `settings`
   logs {t: UTC ISO instant, source 'console'|'event', text ≤200}[≤60] }   // only when ticked
 ```
 Every string, `app` and each log `text` included, is re-redacted on ingest (`redact.ts`
@@ -169,6 +172,11 @@ Every string, `app` and each log `text` included, is re-redacted on ingest (`red
 on the shell's own scrub. A v1 body is accepted unchanged. A v2 body sent to a v1 server is a 400 (the
 schema is strict); the flag above prevents that, and a body queued before a rollback falls back to
 the draft like any other definitive refusal (§4a).
+v2 header on POST, GET and DELETE: `X-EZiL-Account: <__EZIL_BOOT__.user.id>`, the account the tab was
+booted for (a header, never in the body or preview). When it differs from the session's user (another
+account signed in elsewhere in this browser since; the cookie is shared), every method answers
+`409 {error:'account_mismatch'}` before any DB work. The shell treats it as a definitive refusal: kept in
+that first account's local draft, never queued or retried. No header (a v1 shell): unchanged.
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).

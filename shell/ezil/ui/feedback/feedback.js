@@ -62,6 +62,17 @@ function account_id () {
     } catch { return null; }
 }
 
+/**
+ * Headers naming the account this tab was booted for. The session cookie is
+ * shared by every tab: after "Sign out and use another account" elsewhere, this
+ * tab's draft, queued report and diagnostics are still the first account's, so
+ * the server refuses them (409) rather than file them under the second.
+ */
+function account_headers () {
+    const id = account_id();
+    return id ? { 'X-EZiL-Account': id } : {};
+}
+
 function store () {
     try { return window.localStorage ?? null; } catch { return null; }
 }
@@ -133,7 +144,7 @@ async function deliver (clientRequestId, body) {
     try {
         // The exact, visible preview string is also the request body.
         const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body });
+            headers: { 'Content-Type': 'application/json', ...account_headers() }, body });
         status = response.status;
         if ( status === 200 || status === 201 ) {
             data = await response.json();
@@ -150,7 +161,7 @@ async function deliver (clientRequestId, body) {
     } else if ( retryable(status) ) {
         listen_online();
     } else {
-        // A definitive refusal (400/401/404/413/415/429): stop retrying, and
+        // A definitive refusal (400/401/404/409/413/415/429): stop retrying, and
         // put the text back in the draft so it is not lost with the dialog.
         outbox_remove(clientRequestId);
         if ( ! read_draft() ) {
@@ -332,6 +343,7 @@ function error_copy (status, { screenshot = false } = {}) {
     if ( status === 415 ) return 'This page could not send the report. Reload EZiL OS and try again.';
     if ( status === 400 ) return 'This report could not be accepted. Check the description or remove the screenshot and try again.';
     if ( status === 401 ) return 'Your session expired — sign in again to send feedback.';
+    if ( status === 409 ) return "You're signed in as a different account now. Reload EZiL OS to send feedback from that account.";
     if ( status === 404 ) return 'Feedback is not available in this deployment right now.';
     return 'Could not send feedback. Check your connection and try again.';
 }
@@ -371,7 +383,7 @@ export function open_feedback_dialog (_opts) {
                     aria-describedby="ezil-feedback-diagnostics-help"> Include diagnostics (recommended)</label>
                 <p id="ezil-feedback-diagnostics-help" class="ezil-feedback-muted ezil-feedback-help">Included unless
                     you untick it: the EZiL OS version, browser and system type, screen size,
-                    ${extended ? 'the app in front, ' : ''}your computer's status, connection quality and recent error
+                    ${extended ? 'the app you were using, ' : ''}your computer's status, connection quality and recent error
                     codes from this tab. Never your files, what you type in apps, links, cookies or sign-in.
                     <span data-role="diagnostics-note"></span></p>
                 ${extended ? `<label class="ezil-feedback-consent"><input type="checkbox" name="logs"
@@ -689,7 +701,7 @@ export function open_feedback_dialog (_opts) {
 /** @returns {Promise<Array<{id:string,createdAt:string,category:string,descriptionPreview:string,hasScreenshot:boolean,status:string}>>} */
 export async function list_my_reports () {
     if ( ! feedback_enabled() ) return [];
-    const response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin' });
+    const response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin', headers: account_headers() });
     if ( ! response.ok ) throw new Error('Could not load your reports. Try again.');
     const data = await response.json();
     if ( ! Array.isArray(data.reports) ) throw new Error('Could not load your reports. Try again.');
@@ -701,6 +713,6 @@ export async function delete_my_report (_id) {
     if ( ! feedback_enabled() || typeof _id !== 'string' || ! UUID.test(_id) ) return false;
     const route = endpoint();
     const response = await fetch(`${route}${route.includes('?') ? '&' : '?'}id=${encodeURIComponent(_id)}`,
-        { method: 'DELETE', credentials: 'same-origin' });
+        { method: 'DELETE', credentials: 'same-origin', headers: account_headers() });
     return response.status === 204;
 }

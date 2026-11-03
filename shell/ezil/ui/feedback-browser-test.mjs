@@ -111,7 +111,8 @@ try {
             if ( url.pathname === '/api/shell/feedback' ) {
                 if ( request.method() === 'POST' ) {
                     if ( offline ) { offlineAttempts++; return route.abort('internetdisconnected'); }
-                    posts.push({ body: request.postData(), contentType: request.headers()['content-type'] });
+                    posts.push({ body: request.postData(), contentType: request.headers()['content-type'],
+                        account: request.headers()['x-ezil-account'] });
                     const { status, body } = reply();
                     return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body ?? {}) });
                 }
@@ -241,6 +242,10 @@ try {
             await tabTo('logs');
             await page.keyboard.press('Space');
             assert.equal(await page.locator('input[name="logs"]').isChecked(), true);
+            // Optional evidence for review: the form as a keyboard user sees it at this point.
+            if ( process.env.EZIL_FEEDBACK_SHOTS_DIR ) {
+                await dialog.screenshot({ path: path.join(process.env.EZIL_FEEDBACK_SHOTS_DIR, `feedback-v2-${viewport.width}.png`) });
+            }
             const logs = JSON.parse(await preview()).diagnostics.logs ?? [];
             const note = await page.locator('[data-role="logs-note"]').textContent();
             assert.match(note, logs.length ? new RegExp(`^${logs.length} lines? will be included\\.`) : /^Nothing was recorded/);
@@ -252,8 +257,24 @@ try {
             await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
             assert.equal(posts.length, 1);
             assert.equal(posts[0].body, shown, 'what the keyboard user previewed is what was sent');
+            assert.equal(posts[0].account, ACCOUNT, 'the request names the account this tab was booted for (a header, not the body)');
             await closeDialog();
             posts.length = 0;
+        });
+
+        await check(`${tag}: Settings → Feedback over the open Browser reports the Browser, not Settings`, async () => {
+            await launch('settings');
+            const settings = page.locator('.window[data-app="settings"]');
+            await settings.locator('[data-tab="feedback"]').click();
+            await settings.locator('[data-action="send-feedback"]').click();
+            await dialog.waitFor({ state: 'visible' });
+            await description.fill('[synthetic 88e] from Settings');
+            assert.equal(JSON.parse(await preview()).diagnostics.app, 'browser', 'the app the report is about');
+            await description.fill('');
+            await closeDialog();
+            await settings.locator('> .window-head > .window-close-btn').click();
+            await page.waitForSelector('.window[data-app="settings"]', { state: 'detached' });
+            assert.equal(posts.length, 0);
         });
 
         for ( const [code, copy] of [
