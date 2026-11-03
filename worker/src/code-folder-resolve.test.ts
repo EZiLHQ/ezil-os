@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { settleCodeFolder } from './code-folder';
 import {
   CODE_FOLDER_REL_ENV,
+  CODE_FOLDER_RESOLVE_BOUND_MS,
   CODE_FOLDER_RESOLVE_SCRIPT,
   CODE_FOLDER_RESOLVE_TIMEOUT_MS,
   CODE_FOLDER_ROOT_ENV,
@@ -75,6 +76,18 @@ describe('cloudflareCodeFolderResolver: one bounded exec of the constant script'
     const stray: RepoOpenExec = async () => ({ exitCode: 0, stdout: 'hello\n' });
     expect(await cloudflareCodeFolderResolver(stray, '/workspace')('a')).toBe('error');
   });
+  it('settles as error by its bound when the exec never answers (the Code mint is never held longer)', async () => {
+    const hung: RepoOpenExec = () => new Promise(() => undefined);
+    const started = Date.now();
+    expect(await cloudflareCodeFolderResolver(hung, '/workspace', 50)('a')).toBe('error');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(CODE_FOLDER_RESOLVE_BOUND_MS).toBeGreaterThan(CODE_FOLDER_RESOLVE_TIMEOUT_MS);
+    expect(CODE_FOLDER_RESOLVE_BOUND_MS).toBeLessThanOrEqual(CODE_FOLDER_RESOLVE_TIMEOUT_MS + 1_000);
+  });
+  it('a walk that answers in time is not cut by the bound', async () => {
+    const slowish: RepoOpenExec = () => new Promise((r) => setTimeout(() => r({ exitCode: 0, stdout: 'ezil-code-folder:missing\n' }), 20));
+    expect(await cloudflareCodeFolderResolver(slowish, '/workspace', 500)('a')).toBe('missing');
+  });
 });
 
 const which = (bin: string) => Bun.spawnSync(['sh', '-c', `command -v ${bin}`]).exitCode === 0;
@@ -106,8 +119,11 @@ describe('the walk script in real shells', () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
+  // The shell runs IN the walk root (as a session whose cwd is the workspace would), so an unguarded glob
+  // in `set -- $rel` really meets the root's names (`x*` -> `xa`).
   const walk = (shell: string, r: string, rel: string) => {
     const p = Bun.spawnSync([shell, '-c', CODE_FOLDER_RESOLVE_SCRIPT], {
+      cwd: root,
       env: { PATH: process.env.PATH!, [CODE_FOLDER_ROOT_ENV]: r, [CODE_FOLDER_REL_ENV]: rel },
     });
     return codeFolderWalkOutcome(p.exitCode, p.stdout.toString());
@@ -162,7 +178,7 @@ describe('the walk script in real shells', () => {
 
   it('settles end to end: only a walked real directory becomes the folder', async () => {
     const exec: RepoOpenExec = async (command, options) => {
-      const p = Bun.spawnSync(['bash', '-c', command], { env: { PATH: process.env.PATH!, ...options.env } });
+      const p = Bun.spawnSync(['bash', '-c', command], { cwd: root, env: { PATH: process.env.PATH!, ...options.env } });
       return { exitCode: p.exitCode, stdout: p.stdout.toString() };
     };
     const resolve = cloudflareCodeFolderResolver(exec, root);

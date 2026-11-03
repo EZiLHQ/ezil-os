@@ -17,9 +17,10 @@
  *
  * The script is a constant. The root and `rel` reach it only as exec env values (never
  * interpolated into the command), `set -f` keeps `*`, `?` and `[` in names literal, and the
- * split on `/` uses a local IFS. Every tested path is absolute, so a name starting with `-` is
- * never read as an option. The exec is bounded by CODE_FOLDER_RESOLVE_TIMEOUT_MS, because the
- * walk runs inside the Code mint.
+ * split on `/` uses a local IFS (a glob would otherwise match against the shell's working directory,
+ * which may be the root itself). Every tested path is absolute, so a name starting with `-` is
+ * never read as an option. The walk runs inside the Code mint, so the exec is bounded by
+ * CODE_FOLDER_RESOLVE_TIMEOUT_MS and the whole resolve by CODE_FOLDER_RESOLVE_BOUND_MS.
  *
  * Trust: the walk runs in the person's own container and reports to that person's own mint, so a
  * result the container's root could shape changes only which of their own folders opens. A folder
@@ -75,20 +76,36 @@ export function codeFolderWalkOutcome(exitCode: number, stdout: string | undefin
 }
 
 /**
- * The Cloudflare resolver for `settleCodeFolder`: one bounded exec of the constant script with the
- * root and `rel` in its env. Never throws (a refused or failed exec is `error`); stderr is never read.
+ * The whole resolve, whatever the exec does: a container that never answers, or an SDK call that
+ * ignores its own timeout, still settles as `error` by then, so the Code mint is never held longer.
  */
-export function cloudflareCodeFolderResolver(exec: RepoOpenExec, root: string): CodeFolderResolver {
+export const CODE_FOLDER_RESOLVE_BOUND_MS = CODE_FOLDER_RESOLVE_TIMEOUT_MS + 1_000;
+
+/**
+ * The Cloudflare resolver for `settleCodeFolder`: one exec of the constant script with the root and
+ * `rel` in its env, the exec bounded by CODE_FOLDER_RESOLVE_TIMEOUT_MS and the whole call by
+ * `boundMs`. Never throws (a refused, failed or late exec is `error`); stderr is never read.
+ */
+export function cloudflareCodeFolderResolver(exec: RepoOpenExec, root: string, boundMs = CODE_FOLDER_RESOLVE_BOUND_MS): CodeFolderResolver {
   return async (rel) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<CodeFolderOutcome>((resolve) => { timer = setTimeout(() => resolve('error'), boundMs); });
+    const walked = (async (): Promise<CodeFolderOutcome> => {
+      try {
+        const result = await exec(CODE_FOLDER_RESOLVE_SCRIPT, {
+          env: { [CODE_FOLDER_ROOT_ENV]: root, [CODE_FOLDER_REL_ENV]: rel },
+          timeout: CODE_FOLDER_RESOLVE_TIMEOUT_MS,
+          origin: 'internal',
+        });
+        return codeFolderWalkOutcome(result.exitCode, result.stdout);
+      } catch {
+        return 'error';
+      }
+    })();
     try {
-      const result = await exec(CODE_FOLDER_RESOLVE_SCRIPT, {
-        env: { [CODE_FOLDER_ROOT_ENV]: root, [CODE_FOLDER_REL_ENV]: rel },
-        timeout: CODE_FOLDER_RESOLVE_TIMEOUT_MS,
-        origin: 'internal',
-      });
-      return codeFolderWalkOutcome(result.exitCode, result.stdout);
-    } catch {
-      return 'error';
+      return await Promise.race([walked, late]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   };
 }
