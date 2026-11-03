@@ -318,10 +318,14 @@ RUN node -e "const fs=require('fs'),raw=fs.readFileSync('/etc/ezil/models.json',
 # Open Folder replaces the iframe's history entry. MIT upstream code; exact
 # anchors with count gates, independent of the copilot-chat patch above (each
 # anchor occurs once in the pristine and the copilot-patched workbench).
+# EZIL_SHELL_ORIGINS_JSON: the shell origins allowed to receive a report, a JSON
+# array of https origins. Unset or empty keeps the script's default, the staging
+# shell only; the patch and its --verify must see the same value.
+ARG EZIL_SHELL_ORIGINS_JSON=
 COPY code-folder-bridge/patch-folder-bridge.sh /usr/local/lib/ezil/patch-folder-bridge.sh
 RUN chmod 0755 /usr/local/lib/ezil/patch-folder-bridge.sh \
-  && /usr/local/lib/ezil/patch-folder-bridge.sh /usr/lib/code-server/lib/vscode \
-  && /usr/local/lib/ezil/patch-folder-bridge.sh --verify /usr/lib/code-server/lib/vscode
+  && EZIL_SHELL_ORIGINS_JSON="${EZIL_SHELL_ORIGINS_JSON}" /usr/local/lib/ezil/patch-folder-bridge.sh /usr/lib/code-server/lib/vscode \
+  && EZIL_SHELL_ORIGINS_JSON="${EZIL_SHELL_ORIGINS_JSON}" /usr/local/lib/ezil/patch-folder-bridge.sh --verify /usr/lib/code-server/lib/vscode
 
 # ── EZiL OS desktop assets + deterministic validators ────────────────────────
 # Explicit Openbox config (app-switch keybindings + root menu), the mandatory
