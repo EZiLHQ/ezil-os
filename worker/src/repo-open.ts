@@ -232,19 +232,15 @@ export const OS_STAGING_AI_GATEWAY_ORIGIN = 'https://ai-staging.ezil.work';
 
 /**
  * The remotes the personal open-project route accepts in this Worker: on
- * os-staging (`EZIL_AI_GATEWAY_URL` is exactly that origin, at most with a bare
- * `/` path) also `git-qa.ezil.work`; anywhere else, production and a missing or
- * malformed value included, only the default two. Fails closed: a staging
- * Gateway URL change stops staging Builder opens too.
+ * os-staging (`EZIL_AI_GATEWAY_URL` is exactly that origin, or it with a bare
+ * `/`) also `git-qa.ezil.work`; any other value, production's and a missing
+ * one included, only the default two. An exact string comparison, nothing
+ * parsed or trimmed, so it fails closed: a staging Gateway URL change stops
+ * staging Builder opens too.
  */
 export function repoOpenRemotesFor(env: { EZIL_AI_GATEWAY_URL?: unknown }): RepoOpenRemotes {
   const raw = env.EZIL_AI_GATEWAY_URL;
-  if (typeof raw !== 'string') return {};
-  let url: URL;
-  try { url = new URL(raw); } catch { return {}; }
-  const plain = url.origin === OS_STAGING_AI_GATEWAY_ORIGIN && url.pathname === '/' && !url.search && !url.hash
-    && !url.username && !url.password && (raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/`);
-  return plain ? { stagingGitQa: true } : {};
+  return raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/` ? { stagingGitQa: true } : {};
 }
 /** The binding's `ref` pattern; its refinements are applied in `branchOf`. */
 const REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
