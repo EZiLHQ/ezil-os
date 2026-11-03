@@ -1,5 +1,5 @@
 /**
- * The u2 repo-open protocol (contract universe-repo-open-v1 1.0.3, §8 body and answers, §13): ONLY the
+ * The u2 repo-open protocol (contract universe-repo-open-v1 1.0.4, §8 body and answers, §13): ONLY the
  * symbols the AWS relay (A2r) needs, taken from the u2 Worker module (2ca90211 worker/src/repo-open.ts)
  * and updated for 1.0.3. INERT: no route is mounted here, and nothing but the AWS relay imports it.
  *
@@ -21,6 +21,12 @@
  *    body carries path null, and its answer names W as folder and openFolder with pathNotFound false and
  *    remote = https://git-qa.ezil.work/<handle>/<name>.git. The caller rebuilds W and the remote from
  *    what it sent (assessmentEditorRoot, assessmentRemoteUrl), never from the answer.
+ *
+ * 1.0.4 (vectors workerRequest.projectRule, kernel.project): class `project`, an ordinary Builder
+ * project on the Creator's own computer. Its route names the deployment's host (`projectGitHost`, one of
+ * REPO_OPEN_PROJECT_GIT_HOSTS) and the body must name exactly it; path is null; the grant lasts at most
+ * REPO_OPEN_PROJECT_GRANT_MAX_MS. It answers the 7-key okOpen at the wrapper W (states include
+ * `existing`: the kernel reopens a bound and marked W).
  */
 
 // ── constants (each compared with the vectors by repo-open-u2.test.ts) ─────────
@@ -29,15 +35,29 @@ export const WORKER_DEADLINE_MS = 105_000;
 export const WORKER_ACCEPT_EXPIRY_MAX_MS = 960_000;
 export const WORKER_REQUEST_MAX_BYTES = 4_096;
 
-/** vectors constants REPO_OPEN_CLASSES / REPO_OPEN_CLASS_DEFAULT (1.0.3). */
-export const REPO_OPEN_CLASSES = Object.freeze(['personal', 'assessment'] as const);
+/** vectors constants REPO_OPEN_CLASSES / REPO_OPEN_CLASS_DEFAULT (1.0.3; 1.0.4 adds 'project'). */
+export const REPO_OPEN_CLASSES = Object.freeze(['personal', 'assessment', 'project'] as const);
 export type RepoOpenClass = (typeof REPO_OPEN_CLASSES)[number];
 export const REPO_OPEN_CLASS_DEFAULT: RepoOpenClass = 'personal';
-/** vectors constants REPO_OPEN_CLASS_GIT_HOSTS: the one git host each class may name. */
-export const REPO_OPEN_CLASS_GIT_HOSTS: Readonly<Record<RepoOpenClass, string>> = Object.freeze({
+/** vectors constants REPO_OPEN_CLASS_GIT_HOSTS: the one git host each single-host class may name. */
+export const REPO_OPEN_CLASS_GIT_HOSTS: Readonly<Record<'personal' | 'assessment', string>> = Object.freeze({
   personal: 'git-preview.ezil.work',
   assessment: 'git-qa.ezil.work',
 });
+/**
+ * vectors constants REPO_OPEN_PROJECT_GIT_HOSTS (1.0.4): class project, an ordinary Builder-created project's own
+ * repository, names the deployment's EZiL Git host: production github.ezil.work, os-staging git-qa.ezil.work. The
+ * kernel and the host accept either; the ROUTE passes the one its deployment serves (`projectGitHost`), and the body
+ * must name exactly that one.
+ */
+export const REPO_OPEN_PROJECT_GIT_HOSTS = Object.freeze(['github.ezil.work', 'git-qa.ezil.work'] as const);
+/**
+ * vectors workerRequest.projectGrantMaxMs (1.0.4): a class project grant is an OS-scoped grant of at most five
+ * minutes (plus 30 s skew), never Works' 60-minute web-clone grant (Works W2/W3).
+ */
+export const REPO_OPEN_PROJECT_GRANT_MAX_MS = 330_000;
+/** The classes whose repository sits in the wrapper W = <root>/projects/<repositoryId> (E1-6, 1.0.4). */
+export const isWrappedClass = (cls: RepoOpenClass) => cls === 'assessment' || cls === 'project';
 /** A known class: a member of the closed list, never an inherited property name ('constructor', '__proto__'). */
 export const isRepoOpenClass = (value: unknown): value is RepoOpenClass =>
   typeof value === 'string' && (REPO_OPEN_CLASSES as readonly string[]).includes(value);
@@ -156,8 +176,15 @@ const str = (value: unknown): value is string => typeof value === 'string';
  * (vectors workerRequest.classRule: a closed table, refused in both directions). An assessment body
  * carries path null (E1-6: its editor root is always the wrapper).
  */
-export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: RepoOpenClass): RepoOpenBody | null {
+export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: RepoOpenClass,
+  options: { projectGitHost?: string } = {}): RepoOpenBody | null {
   if (!isRepoOpenClass(routeClass)) return null;
+  // Class project (1.0.4): the route names the one host its deployment serves; it must be a project host.
+  const routeHost = routeClass === 'project'
+    ? ((REPO_OPEN_PROJECT_GIT_HOSTS as readonly string[]).includes(options.projectGitHost ?? '') ? options.projectGitHost : undefined)
+    : REPO_OPEN_CLASS_GIT_HOSTS[routeClass];
+  if (routeHost === undefined) return null;
+  const expiryMax = routeClass === 'project' ? REPO_OPEN_PROJECT_GRANT_MAX_MS : WORKER_ACCEPT_EXPIRY_MAX_MS;
   if (raw.byteLength > WORKER_REQUEST_MAX_BYTES) return null;
   let b: unknown;
   try { b = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(raw)); } catch { return null; }
@@ -167,10 +194,11 @@ export function parseRepoOpenBody(raw: Uint8Array, now: number, routeClass: Repo
   const expiresAt = str(g.expiresAt) && ISO_RE.test(g.expiresAt) ? Date.parse(g.expiresAt) : NaN;
   const ok = b.v === 1 && (b.op === 'open' || b.op === 'refresh') && str(b.repositoryId) && UUID_RE.test(b.repositoryId)
     && str(b.handle) && HANDLE_RE.test(b.handle) && str(b.name) && validName(b.name)
-    && bodyClass === routeClass && str(b.gitHost) && b.gitHost === REPO_OPEN_CLASS_GIT_HOSTS[routeClass]
+    && bodyClass === routeClass && str(b.gitHost) && b.gitHost === routeHost
     && str(b.defaultBranch) && validBranch(b.defaultBranch)
-    && (b.path === null || (routeClass !== 'assessment' && b.op === 'open' && str(b.path) && pathProblem(b.path) === null))
+    // A wrapped class's editor root is always its wrapper (E1-6, 1.0.4): path null.
+    && (b.path === null || (routeClass === 'personal' && b.op === 'open' && str(b.path) && pathProblem(b.path) === null))
     && g.username === 'ezil' && str(g.token) && GRANT_RE.test(g.token) && (g.scope === 'write' || g.scope === 'read')
-    && Number.isFinite(expiresAt) && expiresAt > now && expiresAt <= now + WORKER_ACCEPT_EXPIRY_MAX_MS;
+    && Number.isFinite(expiresAt) && expiresAt > now && expiresAt <= now + expiryMax;
   return ok ? (b as unknown as RepoOpenBody) : null;
 }

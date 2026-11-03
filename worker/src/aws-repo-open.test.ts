@@ -157,7 +157,7 @@ const run = (e: ReturnType<typeof edge>, i: RepoOpenInput = input(), extra: Part
 
 describe('aws relay constants equal the vectors and the contract', () => {
   it('vectors are the pinned file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('14fe6eeb0cefe83bc2052f4a456916b9891cc690dbb6f7f2c01c015ec4fab164');
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('092d76d10018156d585424caee993ad6cac3ce56c52f5fee74f56917e60e92ff');
   });
   it('the poll interval is the vectors AWS_RELAY_POLL_MS, inside the Worker deadline', () => {
     expect(AWS_RELAY_POLL_MS).toBe(T.AWS_RELAY_POLL_MS);
@@ -1237,5 +1237,204 @@ describe('1.0.3 review fix: after an admitted assessment start, nothing answers 
     expect(await awsRepoOpenStart(assessmentInput({}, NOW - WORKER_DEADLINE_MS), SANDBOX, target, deps(e.fetch), 'assessment'))
       .toEqual(done$(refusal('workspace_busy')));
     expect(e.calls.length).toBe(0);
+  });
+});
+
+// ── contract 1.0.4: class project (an ordinary Builder project on the Creator's own computer) ─────────────
+
+const GITHUB = 'github.ezil.work';
+const PROJECT_GRANT_MS = 300_000;
+/** A project §8 body: class project on the deployment's host, with an OS-scoped grant of at most five minutes. */
+const projectInput = (patch: Record<string, unknown> = {}, receivedAt = NOW, grantMs = PROJECT_GRANT_MS) =>
+  input({ class: 'project', gitHost: QA, grant: { ...input().grant, expiresAt: new Date(NOW + grantMs).toISOString() }, ...patch }, receivedAt);
+/** The project's wrapper W: folder = openFolder = W, the 7-key answer, exactly defaultBranch. */
+const PROJECT_W = `${AWS_REPO_OPEN_ROOT}/projects/${REPO_ID}`;
+const okProject = { ...okOpen, folder: PROJECT_W, openFolder: PROJECT_W, branch: ASSESS_BRANCH };
+/** Both gates open, each recording the computer it was asked about. */
+let gateCalls: string[] = [];
+const gates = (capable: unknown = true, free: unknown = true): Partial<AwsRepoOpenDeps> => ({
+  projectCapable: async (r) => { gateCalls.push(`capable:${r.computerId}`); return capable as boolean; },
+  computerFree: async (r) => { gateCalls.push(`free:${r.computerId}`); return free as boolean; },
+});
+const runProject = (e: ReturnType<typeof edge>, i: RepoOpenInput = projectInput(), extra: Partial<AwsRepoOpenDeps> = gates(), projectGitHost: string | undefined = QA) => {
+  gateCalls = [];
+  return handleAwsRepoOpen(i, SANDBOX, target, deps(e.fetch, extra), 'project', { projectGitHost });
+};
+const projectJobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
+  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'project', handle: HANDLE, name: NAME, repositoryId: REPO_ID,
+    defaultBranch: ASSESS_BRANCH, acknowledged: true, ...patch });
+
+describe('contract 1.0.4: class project is gated, wrapped and answered exactly', () => {
+  it('both gates open: relays class project last on the deployment host, polls, answers the 7-key wrapper answer', async () => {
+    const e = job(() => ok(okProject), 2);
+    expect(await runProject(e)).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
+    expect(gateCalls).toEqual([`capable:${record.computerId}`, `free:${record.computerId}`]);
+    const sent = e.calls[0]!.init.body as string;
+    expect(e.calls[0]!.url).toBe(`https://${HOST}${AWS_REPO_OPEN_PATH}${sha256(sent)}`);
+    const relayed = JSON.parse(sent);
+    expect(Object.keys(relayed).at(-1)).toBe('class');
+    expect([relayed.class, relayed.gitHost, relayed.path]).toEqual(['project', QA, null]);
+    expect(e.reads().length).toBe(2);
+    // production's host: the route names github.ezil.work and the body carries it
+    const g = job(() => ok(okProject));
+    expect(await runProject(g, projectInput({ gitHost: GITHUB }), gates(), GITHUB)).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
+  });
+
+  it.each([
+    ['no projectCapable', { computerFree: async () => true }],
+    ['no computerFree', { projectCapable: async () => true }],
+    ['neither gate', {}],
+    ['projectCapable false (AMI 1.0.30, no repo-open op)', gates(false, true)],
+    ['computerFree false (an assessment-bound computer)', gates(true, false)],
+    ['projectCapable truthy but not true', gates(1, true)],
+    ['computerFree truthy but not true', gates(true, 'yes')],
+    ['projectCapable throws', { ...gates(), projectCapable: async () => { throw new Error('state unreadable'); } }],
+    ['computerFree throws', { ...gates(), computerFree: async () => { throw new Error('policy unreadable'); } }],
+  ] as [string, Partial<AwsRepoOpenDeps>][])('fails closed when the capability or the fence is not proven (%s): workspace_unsupported, no edge call', async (_label, extra) => {
+    const e = job(() => ok(okProject));
+    expect(await runProject(e, projectInput(), { ...extra })).toEqual(refusal('workspace_unsupported'));
+    expect(e.calls.length).toBe(0);
+  });
+
+  it('the fence is not asked when the capability is absent, and neither gate is asked for personal or assessment', async () => {
+    const e = job(() => ok(okProject));
+    expect(await runProject(e, projectInput(), gates(false, true))).toEqual(refusal('workspace_unsupported'));
+    expect(gateCalls).toEqual([`capable:${record.computerId}`]);
+    gateCalls = [];
+    expect(await run(job(() => ok(okOpen)), input(), gates(false, false))).toEqual({ status: 200, body: okOpen } as RepoOpenAnswer);
+    expect(await runAs(job(() => ok(okAssessment)), assessmentInput(), 'assessment', gates(false, false))).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+    expect(gateCalls).toEqual([]);
+  });
+
+  it('an installed host without the class fails closed: start 404 (no op) and start 409 repo_open_invalid (A2h table without project) are workspace_unsupported', async () => {
+    for (const reply of [() => json({ ok: false, error: 'not_found' }, 404), () => json({ ok: false, error: 'repo_open_invalid' }, 409)]) {
+      const e = edge(reply);
+      expect(await runProject(e)).toEqual(refusal('workspace_unsupported'));
+      expect([e.starts().length, e.reads().length]).toEqual([1, 0]);
+    }
+    // the same 409 for personal and assessment stays workspace_failed (1.0.3 unchanged)
+    expect(await run(edge(() => json({ ok: false, error: 'repo_open_invalid' }, 409)))).toEqual(refusal('workspace_failed'));
+    expect(await runAs(edge(() => json({ ok: false, error: 'repo_open_invalid' }, 409)), assessmentInput(), 'assessment')).toEqual(refusal('workspace_failed'));
+    // a 409 repo_open_invalid with anything extra is not the capability answer
+    expect(await runProject(edge(() => json({ ok: false, error: 'repo_open_invalid', more: 1 }, 409)))).toEqual(refusal('workspace_failed'));
+  });
+
+  it.each([
+    ['a project body on the personal route', () => projectInput(), 'personal', QA],
+    ['a project body on the assessment route', () => projectInput(), 'assessment', QA],
+    ['an assessment body on the project route', () => assessmentInput({ grant: projectInput().grant }), 'project', QA],
+    ['a personal (class-less) body on the project route', () => input({ gitHost: QA, grant: projectInput().grant }), 'project', QA],
+    ['a project body without projectGitHost', () => projectInput(), 'project', undefined],
+    ['a projectGitHost outside the project set (git-preview)', () => projectInput({ gitHost: 'git-preview.ezil.work' }), 'project', 'git-preview.ezil.work'],
+    ['a projectGitHost outside the project set (arbitrary)', () => projectInput({ gitHost: 'evil.example' }), 'project', 'evil.example'],
+    ['a body host other than the route\'s (github vs git-qa)', () => projectInput({ gitHost: GITHUB }), 'project', QA],
+    ['a body host other than the route\'s (git-qa vs github)', () => projectInput(), 'project', GITHUB],
+    ['a project body with a path', () => projectInput({ path: 'src' }), 'project', QA],
+    ['a project body with a traversal path', () => projectInput({ path: '../etc' }), 'project', QA],
+    ['a project repositoryId not a lowercase UUID', () => projectInput({ repositoryId: REPO_ID.toUpperCase() }), 'project', QA],
+    ['a project grant past five minutes (the 60-minute web-clone grant)', () => projectInput({}, NOW, 3_600_000), 'project', QA],
+    ['a project grant one second past 330 s', () => projectInput({}, NOW, 331_000), 'project', QA],
+    ['an expired project grant', () => projectInput({}, NOW, 0), 'project', QA],
+  ] as [string, () => RepoOpenInput, RepoOpenClass, string | undefined][])('never relays a body outside the project route (%s): invalid_request, no gate asked, no edge call', async (_label, make, routeClass, projectGitHost) => {
+    const e = job(() => ok(okProject));
+    gateCalls = [];
+    const d = deps(e.fetch, gates());
+    expect(await handleAwsRepoOpen(make(), SANDBOX, target, d, routeClass, { projectGitHost })).toEqual(refusal('invalid_request'));
+    expect([e.calls.length, gateCalls.length]).toEqual([0, 0]);
+  });
+
+  it('a project grant of exactly 330 s is accepted; a personal or assessment grant keeps the 16-minute ceiling', async () => {
+    expect(await runProject(job(() => ok(okProject)), projectInput({}, NOW, 330_000))).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
+    expect(await runAs(job(() => ok(okAssessment)), assessmentInput(), 'assessment')).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
+  });
+
+  it('awsJobAnswer for class project: the wrapper exactly, no path, exactly defaultBranch, the 7-key shape (pure)', () => {
+    const answer = (body: unknown, folder = PROJECT_W, branch: string | undefined = ASSESS_BRANCH) =>
+      awsJobAnswer({ status: 200, body }, 'open', folder, 'project', undefined, branch);
+    const empty = { ...okProject, state: 'initialized_empty', empty: true };
+    const existing = { ...okProject, state: 'existing' };
+    for (const good of [okProject, empty, existing, { ...okProject, empty: true }]) expect(answer(good)).toEqual({ status: 200, body: good } as RepoOpenAnswer);
+    for (const [label, bad] of [
+      ['the clone as folder', { ...okProject, folder: `${PROJECT_W}/repository`, openFolder: `${PROJECT_W}/repository` }],
+      ['the clone as openFolder', { ...okProject, openFolder: `${PROJECT_W}/repository` }],
+      ['a folder below the wrapper', { ...okProject, openFolder: `${PROJECT_W}/src` }],
+      ['pathNotFound', { ...okProject, pathNotFound: true }],
+      ['the personal folder', { ...okProject, folder: FOLDER, openFolder: FOLDER }],
+      ['another repository\'s wrapper', { ...okProject, folder: OTHER_W, openFolder: OTHER_W }],
+      ['another branch', { ...okProject, branch: 'trunk' }],
+      ['a branch below defaultBranch', { ...okProject, branch: `${ASSESS_BRANCH}/x` }],
+      ['the assessment 10-key shape', okAssessment],
+      ['an extra key', { ...okProject, extra: 1 }],
+      ['an unknown state', { ...okProject, state: 'adopted' }],
+    ] as [string, unknown][]) {
+      expect([label, answer(bad)]).toEqual([label, refusal('workspace_failed')]);
+    }
+    // the expectations are the caller's: another wrapper, another branch, or no branch at all refuses
+    expect(answer(okProject, OTHER_W)).toEqual(refusal('workspace_failed'));
+    expect(answer(okProject, PROJECT_W, 'trunk')).toEqual(refusal('workspace_failed'));
+    expect(awsJobAnswer({ status: 200, body: okProject }, 'open', PROJECT_W, 'project')).toEqual(refusal('workspace_failed'));
+    // a project-shaped answer is refused for personal and assessment
+    expect(awsJobAnswer({ status: 200, body: okProject }, 'open', PROJECT_W, 'assessment', ASSESS_REMOTE, ASSESS_BRANCH)).toEqual(refusal('workspace_failed'));
+  });
+
+  it('idempotent reconnect: a second open of the same project answers existing at the same wrapper; a refresh answers refreshed', async () => {
+    const first = job(() => ok(okProject));
+    expect(await runProject(first)).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
+    const again = job(() => ok({ ...okProject, state: 'existing' }));
+    expect(await runProject(again)).toEqual({ status: 200, body: { ...okProject, state: 'existing' } } as RepoOpenAnswer);
+    const refresh = job(() => ok({ ok: true, state: 'refreshed' }));
+    expect(await runProject(refresh, projectInput({ op: 'refresh' }))).toEqual({ status: 200, body: { ok: true, state: 'refreshed' } });
+    expect(JSON.parse(refresh.calls[0]!.init.body as string)).toMatchObject({ op: 'refresh', class: 'project', path: null });
+    // a refresh is gated too
+    const shut = job(() => ok({ ok: true, state: 'refreshed' }));
+    expect(await runProject(shut, projectInput({ op: 'refresh' }), gates(true, false))).toEqual(refusal('workspace_unsupported'));
+    expect(shut.calls.length).toBe(0);
+  });
+
+  it('the job carries repositoryId and defaultBranch; the poll rebuilds the wrapper from the job and requires that branch', async () => {
+    const e = edge((path, n) => (path.startsWith(AWS_REPO_OPEN_PATH) ? running() : n.reads < 2 ? running() : ok(okProject)));
+    const d = deps(e.fetch, gates());
+    const s = await awsRepoOpenStart(projectInput(), SANDBOX, target, d, 'project', { projectGitHost: QA });
+    expect(s).toEqual(running$(projectJobOf()));
+    const persisted = JSON.parse(JSON.stringify((s as { job: AwsRepoOpenJob }).job)) as AwsRepoOpenJob;
+    expect(JSON.stringify(persisted)).not.toContain('egg_');
+    expect(await awsRepoOpenPoll(persisted, target, d)).toEqual(running$(projectJobOf()));
+    expect(await awsRepoOpenPoll(persisted, target, d)).toEqual(done$({ status: 200, body: okProject } as RepoOpenAnswer));
+    // a job naming another repository or branch rejects the same reply; a job missing either is invalid_request
+    const replay = () => edge(() => ok(okProject));
+    expect(await awsRepoOpenPoll(projectJobOf({ repositoryId: OTHER_REPO_ID }), target, deps(replay().fetch))).toEqual(done$(refusal('workspace_failed')));
+    expect(await awsRepoOpenPoll(projectJobOf({ defaultBranch: 'trunk' }), target, deps(replay().fetch))).toEqual(done$(refusal('workspace_failed')));
+    for (const key of ['repositoryId', 'defaultBranch'] as const) {
+      const { [key]: _drop, ...partial } = projectJobOf();
+      const r = replay();
+      expect(await awsRepoOpenPoll(partial as AwsRepoOpenJob, target, deps(r.fetch))).toEqual(done$(refusal('invalid_request')));
+      expect(r.calls.length).toBe(0);
+    }
+  });
+
+  it('host errors: every result refusal keeps its code and §8 status; a lost start is read by status, never restarted', async () => {
+    for (const code of AWS_RESULT_ERROR_CODES) expect(await runProject(job(() => refused(code)))).toEqual(refusal(code));
+    const lost = edge((path, n) => (path.startsWith(AWS_REPO_OPEN_PATH) ? 'throw' : n.reads < 2 ? running() : ok(okProject)));
+    expect(await runProject(lost)).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
+    expect(lost.starts().length).toBe(1);
+    expect(await runProject(edge(() => json({ ok: false, error: 'workspace_busy' }, 409)))).toEqual(refusal('workspace_busy'));
+    expect(await runProject(edge(() => json({ ok: false, error: 'job_replayed' }, 409)))).toEqual(refusal('workspace_failed'));
+  });
+
+  it('the deadline: a project job that never finishes is workspace_busy (retry-safe: the reopen is idempotent), after exactly one start', async () => {
+    const e = edge(() => running());
+    expect(await runProject(e)).toEqual(refusal('workspace_busy'));
+    expect(e.starts().length).toBe(1);
+    expect(e.calls.every((c) => c.at < NOW + WORKER_DEADLINE_MS)).toBe(true);
+    const d = deps(edge(() => ok(okProject)).fetch);
+    expect(await awsRepoOpenPoll(projectJobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
+  });
+
+  it('an awsControlTarget Response (claims mismatch, origin unavailable) is workspace_unsupported before any gate', async () => {
+    gateCalls = [];
+    const e = edge(() => ok(okProject));
+    const refused$ = new Response('origin unavailable', { status: 503 });
+    expect(await handleAwsRepoOpen(projectInput(), SANDBOX, refused$, deps(e.fetch, gates()), 'project', { projectGitHost: QA })).toEqual(refusal('workspace_unsupported'));
+    expect([e.calls.length, gateCalls.length, refused$.bodyUsed]).toEqual([0, 0, false]);
   });
 });

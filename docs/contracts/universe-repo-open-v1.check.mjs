@@ -77,7 +77,7 @@ ok(PROD.length >= 2 && new Set(PROD).size === PROD.length && PROD.every((c) => /
 
 // ── version and constants ────────────────────────────────────────────────────
 ok(V.contract === 'universe-repo-open-v1', 'contract name');
-ok(V.contractVersion === '1.0.3', 'contractVersion is "1.0.3"');
+ok(V.contractVersion === '1.0.4', 'contractVersion is "1.0.4"');
 for (const name of V.requiredConstants) ok(Object.hasOwn(C, name), `constants: ${name} missing`);
 ok(C.CLIENT_ID_UNPINNED === 'UNPINNED', 'CLIENT_ID_UNPINNED');
 for (const key of ['OS_STAGING_ORIGIN', 'WORKS_STAGING_ORIGIN', 'PREVIEW_SUPABASE_ORIGIN']) {
@@ -90,8 +90,13 @@ for (const host of [C.GIT_STAGING_HOST, C.GIT_ASSESSMENT_HOST, new URL(C.WORKS_S
 // 1.0.3: the request class → git host table is closed, total and injective.
 {
     const T = C.REPO_OPEN_CLASS_GIT_HOSTS;
-    eq(C.REPO_OPEN_CLASSES, ['personal', 'assessment'], 'REPO_OPEN_CLASSES');
-    eq(Object.keys(T), C.REPO_OPEN_CLASSES, 'REPO_OPEN_CLASS_GIT_HOSTS covers exactly REPO_OPEN_CLASSES');
+    eq(C.REPO_OPEN_CLASSES, ['personal', 'assessment', 'project'], 'REPO_OPEN_CLASSES');
+    // 1.0.4: the single-host table covers every class but project, whose host the route's deployment names.
+    eq(Object.keys(T), C.REPO_OPEN_CLASSES.filter((c) => c !== 'project'), 'REPO_OPEN_CLASS_GIT_HOSTS covers exactly the single-host classes');
+    eq(C.REPO_OPEN_PROJECT_GIT_HOSTS, [C.GIT_PRODUCTION_HOST, C.GIT_ASSESSMENT_HOST], 'REPO_OPEN_PROJECT_GIT_HOSTS: production github.ezil.work, os-staging git-qa');
+    ok(!C.REPO_OPEN_PROJECT_GIT_HOSTS.includes(C.GIT_STAGING_HOST), 'class project never names the personal staging host');
+    ok(C.PROJECT_MARKER_FILE === 'ezil-repo-class' && C.PROJECT_MARKER_CONTENT === 'project\n' && !C.SNAPSHOT_INTERNAL_NAMES.includes(C.PROJECT_MARKER_FILE),
+        'the project marker is .git/ezil-repo-class holding "project\\n", archived with .git');
     ok(C.REPO_OPEN_CLASS_DEFAULT === 'personal' && T.personal === C.GIT_STAGING_HOST && T.assessment === C.GIT_ASSESSMENT_HOST,
         'class table: personal (the default) is GIT_STAGING_HOST, assessment is GIT_ASSESSMENT_HOST');
     ok(new Set(Object.values(T)).size === Object.values(T).length && !Object.values(T).includes(C.GIT_PRODUCTION_HOST),
@@ -406,14 +411,17 @@ for (const b of V.osRoute.request.valid) ok(osRouteBodyValid(b), `os route body 
 for (const b of V.osRoute.request.invalid) ok(!osRouteBodyValid(b), `os route body invalid ${JSON.stringify(b)}`);
 
 // ── Worker request body ──────────────────────────────────────────────────────
-function workerBodyValid(b, now) {
+function workerBodyValid(b, now, projectGitHost) {
     const W = V.workerRequest;
     if (!b || typeof b !== 'object') return false;
     // 1.0.3 (workerRequest.classRule): optionalKeys may be present; class absent = the default class.
     const keys = Object.keys(b).filter((k) => !W.optionalKeys.includes(k));
     if (keys.length !== W.keys.length || !W.keys.every((k) => Object.hasOwn(b, k))) return false;
     const cls = Object.hasOwn(b, 'class') ? b.class : C.REPO_OPEN_CLASS_DEFAULT;
-    if (typeof cls !== 'string' || !C.REPO_OPEN_CLASSES.includes(cls) || b.gitHost !== C.REPO_OPEN_CLASS_GIT_HOSTS[cls]) return false;
+    if (typeof cls !== 'string' || !C.REPO_OPEN_CLASSES.includes(cls)) return false;
+    // 1.0.4 (workerRequest.projectRule): a project host is the route's, and one of the project hosts.
+    const routeHost = cls === 'project' ? (C.REPO_OPEN_PROJECT_GIT_HOSTS.includes(projectGitHost) ? projectGitHost : undefined) : C.REPO_OPEN_CLASS_GIT_HOSTS[cls];
+    if (routeHost === undefined || b.gitHost !== routeHost) return false;
     if (Buffer.byteLength(JSON.stringify(b)) > C.BODY_LIMITS_BYTES.workerRequest) return false;
     const g = b.grant;
     if (!g || Object.keys(g).length !== W.grantKeys.length || !W.grantKeys.every((k) => Object.hasOwn(g, k))) return false;
@@ -421,9 +429,9 @@ function workerBodyValid(b, now) {
     return b.v === 1 && ['open', 'refresh'].includes(b.op) && R.UUID_RE(b.repositoryId) && R.HANDLE_RE(b.handle) && R.NAME_RE(b.name)
         && (cls !== C.REPO_OPEN_CLASS_DEFAULT || W.gitHostAllowList.includes(b.gitHost)) && R.BRANCH_RE(b.defaultBranch)
         // E1-6: an assessment takes no path (its editor root is always the wrapper).
-        && (b.path === null || (cls !== 'assessment' && b.op === 'open' && pathOk(b.path)))
+        && (b.path === null || (cls === C.REPO_OPEN_CLASS_DEFAULT && b.op === 'open' && pathOk(b.path)))
         && g.username === C.GRANT_USERNAME && R.GRANT_RE(g.token) && C.GRANT_SCOPES.includes(g.scope)
-        && t > now && t <= now + T.WORKER_ACCEPT_EXPIRY_MAX_MS;
+        && t > now && t <= now + (cls === 'project' ? W.projectGrantMaxMs : T.WORKER_ACCEPT_EXPIRY_MAX_MS);
 }
 eq(V.workerRequest.gitHostAllowList, [C.GIT_STAGING_HOST], 'worker gitHost allow-list');
 eq(V.workerRequest.gitHostAllowList, [C.REPO_OPEN_CLASS_GIT_HOSTS[C.REPO_OPEN_CLASS_DEFAULT]], 'worker gitHost allow-list is the class-absent list');
@@ -437,8 +445,50 @@ for (const [cls, host] of Object.entries(C.REPO_OPEN_CLASS_GIT_HOSTS)) {
     }
 }
 ok(workerBodyValid(materialise(V.workerRequest.base), NOW), 'worker body base valid');
-for (const m of V.workerRequest.validMutations) ok(workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW), `worker body valid ${JSON.stringify(m)}`);
-for (const m of V.workerRequest.invalidMutations) ok(!workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW), `worker body invalid (${m.why})`);
+for (const m of V.workerRequest.validMutations) ok(workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW, m.projectGitHost), `worker body valid ${JSON.stringify(m)}`);
+for (const m of V.workerRequest.invalidMutations) ok(!workerBodyValid(mutate(V.workerRequest.base, m, 'grant'), NOW, m.projectGitHost), `worker body invalid (${m.why})`);
+// 1.0.4: class project, with the route's host in both directions and the five-minute grant window.
+{
+    const W = V.workerRequest;
+    ok(W.projectGrantMaxMs === 330_000 && W.projectGrantMaxMs < T.WORKER_ACCEPT_EXPIRY_MAX_MS, 'projectGrantMaxMs is five minutes plus 30 s skew, under the 16-minute ceiling');
+    ok(/60-minute/.test(W.projectRule) && /W2\/W3/.test(W.projectRule) && /route/.test(W.projectRule), 'projectRule names the refused web-clone grant, Works W2/W3 and the route-named host');
+    const project = (gitHost, grantSeconds, extra = {}) => mutate(W.base, { set: { class: 'project', gitHost, ...extra }, setGrant: { expiresAt: { relativeSeconds: grantSeconds } } }, 'grant');
+    for (const host of C.REPO_OPEN_PROJECT_GIT_HOSTS) {
+        for (const route of [...C.REPO_OPEN_PROJECT_GIT_HOSTS, C.GIT_STAGING_HOST, undefined]) {
+            eq(workerBodyValid(project(host, 300), NOW, route), host === route, `worker body class project on ${host}, route ${route}`);
+        }
+        ok(workerBodyValid(project(host, 330), NOW, host) && !workerBodyValid(project(host, 331), NOW, host), `class project grant window on ${host}`);
+        ok(!workerBodyValid(project(host, 300, { path: 'src' }), NOW, host), `class project path refused on ${host}`);
+    }
+    ok(V.workerRequest.validMutations.some((m) => m.set?.class === 'project') && V.workerRequest.invalidMutations.filter((m) => m.set?.class === 'project').length >= 6,
+        'class project has valid and invalid body mutations');
+    // A Worker-only row is refused only for the route binding: with the route host its body's own host, it is valid.
+    for (const m of W.invalidMutations.filter((x) => x.layer !== undefined)) {
+        eq(m.layer, 'worker', `invalid mutation layer (${m.why})`);
+        ok(m.set?.class === 'project' && workerBodyValid(mutate(W.base, m, 'grant'), NOW, m.set.gitHost), `a layer worker row is only a route-host refusal (${m.why})`);
+    }
+}
+
+// 1.0.4: the kernel's class project and the AWS relay's gates.
+{
+    const K = V.kernel.project;
+    eq(K.resultOpenKeys, V.kernel.resultOpenKeys, 'class project answers the 7-key open shape');
+    eq(K.resultOpenKeys, V.errorTable.workerResponses.okOpen.keys, 'class project keys are the Worker okOpen keys');
+    eq(K.states, V.errorTable.workerResponses.okOpen.states, 'class project states include existing (the idempotent reopen)');
+    ok(/PROJECT_MARKER_FILE/.test(K.rule) && /never adopted/.test(K.rule) && /assessment adopts nothing/.test(K.rule) && /5-key/.test(K.rule), 'kernel.project.rule: marker, no adoption either way, the 5-key binding');
+    ok(/never followed/.test(K.layoutRule) && /ASSESSMENT_DIR_TEMPLATE/.test(K.layoutRule), 'kernel.project.layoutRule: the assessment wrapper, no symlink');
+    ok(/regular file/.test(K.markerRule) && /never a symlink/.test(K.markerRule) && /PROJECT_MARKER_CONTENT/.test(K.markerRule), 'kernel.project.markerRule');
+    ok(/repository_unavailable/.test(K.branchRule) && /defaultBranch/.test(K.branchRule), 'kernel.project.branchRule: exactly defaultBranch');
+    ok(/DIFFERENT token/.test(K.twoPushRule) && /index and HEAD are unchanged/.test(K.twoPushRule) && /no network/.test(K.twoPushRule), 'kernel.project.twoPushRule (T-2PUSH-K)');
+    ok(/class project/.test(V.kernel.requestKeysRule) || /REPO_OPEN_PROJECT_GIT_HOSTS/.test(V.kernel.requestKeysRule), 'requestKeysRule names the project host rule');
+    const A = V.awsProject;
+    eq(A.gates, ['projectCapable', 'computerFree'], 'awsProject gates');
+    for (const k of ['gateAbsent', 'startNotFound', 'startRepoOpenInvalid']) eq(A[k], 'workspace_unsupported', `awsProject ${k} fails closed`);
+    eq(A.deadline, 'workspace_busy', 'awsProject deadline is retry-safe (the reopen is idempotent)');
+    for (const k of ['gateAbsent', 'startNotFound', 'startRepoOpenInvalid', 'deadline']) ok(Object.hasOwn(V.errorTable.workerResponses.refusals.find((r) => r.error.includes(A[k])) ?? {}, 'status'), `awsProject ${k} is a §8 refusal`);
+    ok(/1\.0\.30/.test(A.ami1030) && /404/.test(A.ami1030) && /repo_open_invalid/.test(A.ami1030), 'awsProject names AMI 1.0.30 and both host answers');
+    ok(/never checkout proof/.test(A.rule) && /assessment attempt/.test(A.rule), 'awsProject: EZiL ID is not checkout proof; the assessment fence');
+}
 
 // ── signature ────────────────────────────────────────────────────────────────
 {

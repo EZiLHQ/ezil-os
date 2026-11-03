@@ -27,7 +27,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SOURCE_KERNEL = path.join(HERE, 'ezil-repo-open.mjs');
 export const SOURCE_HELPER = path.join(HERE, 'ezil-git-grant.mjs');
 const VECTORS_PATH = path.join(HERE, '../../../docs/contracts/universe-repo-open-v1.vectors.json');
-export const VECTORS_SHA256 = '14fe6eeb0cefe83bc2052f4a456916b9891cc690dbb6f7f2c01c015ec4fab164';
+export const VECTORS_SHA256 = '092d76d10018156d585424caee993ad6cac3ce56c52f5fee74f56917e60e92ff';
 export const KERNEL_PATH = '/run/ezil/bin/ezil-repo-open.mjs';
 export const HELPER_PATH = '/run/ezil/bin/ezil-git-grant.mjs';
 export const WRAPPER_PATH = '/run/ezil/bin/ezil-git-grant';
@@ -2154,6 +2154,166 @@ async function main() {
     const { gitHost: _host, ...four } = bound;
     assert.equal((await attempt(four)).committed?.state, 'cloned', 'four keys');
     assert.equal((await attempt({ ...bound, repositoryId: REPO_ID })).committed?.state, 'cloned', 'another repositoryId');
+  });
+
+  // ── class project (1.0.4): an ordinary Builder-created project's repository (vectors kernel.project) ─────────
+  const PROJECT = { gitHost: QA_HOST, cls: 'project' };
+  const projected = (root, fields = {}) => ({ ok: true, state: 'cloned', folder: wrapperOf(root), openFolder: wrapperOf(root), pathNotFound: false,
+    branch: 'main', empty: false, ...fields });
+  const indexSha = (dir) => crypto.createHash('sha256').update(fs.readFileSync(`${dir}/.git/index`)).digest('hex');
+  const userCommit = async (dir, file, text) => {
+    fs.writeFileSync(`${dir}/${file}`, text);
+    assert.equal((await userGit(fx, dir, ['add', file])).status, 0);
+    assert.equal((await userGit(fx, dir, ['commit', '-q', '-m', `edit ${file}`])).status, 0);
+  };
+  const refreshWith = (root, token, expiresAt, fields = PROJECT) => {
+    const uuid = crypto.randomUUID();
+    writeIncoming(uuid, { token, host: fields.gitHost, expiresAt });
+    const refreshed = cli('refresh', writeRequest({ ...fields, op: 'refresh', phase: 'refresh', uuid, root })).result;
+    cli('release', writeRequest({ ...fields, op: 'refresh', phase: 'release', uuid, root }));
+    return refreshed;
+  };
+
+  test('class project (1.0.4) T-2PUSH-K: open → W/repository with the binding and the project marker → edit → push #1 → a grant past the helper margin refuses with the fixed hint → the server revokes the old token → refresh with a NEW token → push #2; refresh leaves uncommitted work, the index and HEAD untouched', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token1 = newToken(); fx.server.state.token = token1;
+    const bare = makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const { prepared, committed, released } = await openFlow(fx, { root, token: token1, ...PROJECT });
+    const W = wrapperOf(root), F = cloneOf(root);
+    assert.deepEqual(prepared, projected(root));
+    assert.deepEqual(committed, projected(root));
+    assert.deepEqual(released, { ok: true });
+    assert.equal(fs.readFileSync(`${F}/.git/${k.PROJECT_MARKER_FILE}`, 'utf8'), 'project\n');
+    assert.deepEqual(fs.readdirSync(W), ['repository']);
+    assert.equal(JSON.parse(fs.readFileSync(`${F}/.git/ezil-repo.json`, 'utf8')).gitHost, QA_HOST);
+    assert.ok(gitConfigMatches(localConfig(F), qaConfig), `git config:\n${localConfig(F).join('\n')}`);
+    await userCommit(F, 'one.txt', '1\n');
+    const p1 = await userGit(fx, F, ['push', '-q']);
+    assert.equal(p1.status, 0, `push #1: ${p1.stderr}`);
+    assert.equal(remoteHeadOf(bare), sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim());
+    // Expiry: a grant with less than the helper's 30 s margin left; the push stops at the helper, without a prompt.
+    assert.deepEqual(refreshWith(root, token1, new Date(Date.now() + 20_000).toISOString()), { ok: true, state: 'refreshed' });
+    await userCommit(F, 'two.txt', '2\n');
+    const refused = await userGit(fx, F, ['push', '-q']);
+    assert.notEqual(refused.status, 0);
+    assert.ok(refused.stderr.includes(V.constants.HELPER_HINT_EXPIRED.replace('<handle>/<name>', 'acme/site')), refused.stderr);
+    // The server revokes the old token; the person has uncommitted work.
+    const token2 = newToken(); fx.server.state.token = token2;
+    fs.writeFileSync(`${F}/wip.txt`, 'not committed\n');
+    fs.writeFileSync(`${F}/a.txt`, 'edited, not staged\n');
+    const status = sh('git', ['-C', F, 'status', '--porcelain'], { env: USER_ENV });
+    const head = sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim();
+    const index = indexSha(F);
+    const requests = fx.server.state.requests;
+    assert.deepEqual(refreshWith(root, token2, new Date(Date.now() + 300_000).toISOString()), { ok: true, state: 'refreshed' });
+    assert.equal(fx.server.state.requests, requests, 'refresh contacted the server');
+    assert.equal(sh('git', ['-C', F, 'status', '--porcelain'], { env: USER_ENV }), status);
+    assert.equal(sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim(), head);
+    assert.equal(indexSha(F), index);
+    const p2 = await userGit(fx, F, ['push', '-q']);
+    assert.equal(p2.status, 0, `push #2: ${p2.stderr}`);
+    assert.equal(remoteHeadOf(bare), head);
+    assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).password, token2);
+  });
+
+  test('class project (1.0.4): a re-open is `existing` with no network; the folder, uncommitted work and HEAD are kept; the new grant replaces the old (idempotent reconnect)', async () => {
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    assert.deepEqual((await openFlow(fx, { root, token, ...PROJECT })).committed, projected(root));
+    const F = cloneOf(root);
+    fs.writeFileSync(`${F}/wip.txt`, 'mine\n');
+    const head = sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim();
+    const requests = fx.server.state.requests, connects = fx.proxy.state.connects.length;
+    for (let i = 0; i < 2; i += 1) {
+      resetRun();
+      const again = newToken(); fx.server.state.token = again;
+      const flow = await openFlow(fx, { root, token: again, ...PROJECT });
+      assert.deepEqual(flow.prepared, projected(root, { state: 'existing' }));
+      assert.deepEqual(flow.committed, projected(root, { state: 'existing' }));
+      assert.equal(JSON.parse(fs.readFileSync(grantOf(), 'utf8')).password, again);
+    }
+    assert.equal(fx.server.state.requests, requests); assert.equal(fx.proxy.state.connects.length, connects);
+    assert.equal(fs.readFileSync(`${F}/wip.txt`, 'utf8'), 'mine\n');
+    assert.equal(sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim(), head);
+  });
+
+  test('class project (1.0.4) crossovers: no class adopts a folder another class placed; a folder bound elsewhere, unmarked or marked through a link is folder_conflict; refresh never grants one', async () => {
+    const k = await kernel();
+    // an assessment placement is never re-opened as a project (no marker), nor refreshed as one
+    let root = newRoot(); let token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    assert.equal((await openFlow(fx, { root, token, ...ASSESS })).committed.ok, true);
+    resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token, ...PROJECT })).prepared, { ok: false, errorCode: 'folder_conflict' });
+    resetRun();
+    assert.deepEqual(refreshWith(root, newToken(), new Date(Date.now() + 300_000).toISOString()), { ok: false, errorCode: 'folder_conflict' });
+    // a project placement is never adopted by an assessment (its wrapper must be fresh)
+    root = newRoot(); resetRun();
+    assert.equal((await openFlow(fx, { root, token, ...PROJECT })).committed.ok, true);
+    resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token, ...ASSESS })).prepared, { ok: false, errorCode: 'folder_conflict' });
+    // the marker or the binding tampered with: never re-opened
+    const F = cloneOf(root);
+    const marker = `${F}/.git/${k.PROJECT_MARKER_FILE}`;
+    const variants = [
+      ['marker missing', () => fs.rmSync(marker)],
+      ['marker with other content', () => fs.writeFileSync(marker, 'assessment\n')],
+      ['marker through a link', () => { fs.rmSync(marker); fs.writeFileSync(`${root}/m`, 'project\n'); fs.symlinkSync(`${root}/m`, marker); }],
+      ['binding for another repository', () => {
+        const b = JSON.parse(fs.readFileSync(`${F}/.git/ezil-repo.json`, 'utf8'));
+        fs.writeFileSync(`${F}/.git/ezil-repo.json`, `${JSON.stringify({ ...b, repositoryId: OTHER_REPO_ID })}\n`);
+      }],
+    ];
+    const pristineMarker = fs.readFileSync(marker, 'utf8'), pristineBinding = fs.readFileSync(`${F}/.git/ezil-repo.json`, 'utf8');
+    for (const [label, tamper] of variants) {
+      fs.rmSync(marker, { force: true }); fs.rmSync(`${root}/m`, { force: true });
+      fs.writeFileSync(marker, pristineMarker); fs.writeFileSync(`${F}/.git/ezil-repo.json`, pristineBinding);
+      tamper();
+      resetRun();
+      assert.deepEqual({ label, got: (await openFlow(fx, { root, token, ...PROJECT })).prepared }, { label, got: { ok: false, errorCode: 'folder_conflict' } });
+      resetRun();
+      assert.deepEqual({ label, got: refreshWith(root, newToken(), new Date(Date.now() + 300_000).toISOString()) }, { label, got: { ok: false, errorCode: 'folder_conflict' } });
+    }
+    // a personal open of the same handle/name is unaffected (its own layout)
+    root = newRoot(); resetRun();
+    assert.equal((await openFlow(fx, { root, token })).committed.state, 'cloned');
+  });
+
+  test('class project (1.0.4) request rules: only github.ezil.work or git-qa.ezil.work, path null, a known class; exactly defaultBranch (never a guessed one); symlinked projects, W or F are refused', async () => {
+    const k = await kernel();
+    assert.deepEqual([...k.PROJECT_GIT_HOSTS], ['github.ezil.work', 'git-qa.ezil.work']);
+    assert.deepEqual([...k.KERNEL_CLASSES], ['personal', 'assessment', 'project']);
+    const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const prep = async (fields) => { resetRun(); const u = crypto.randomUUID(); writeIncoming(u, { token, host: fields.gitHost }); return k.runKernel('prepare', writeRequest({ ...fields, phase: 'prepare', uuid: u, root: newRoot() }), fx.seam); };
+    for (const fields of [{ gitHost: GIT_HOST, cls: 'project' }, { gitHost: 'github.ezil.work.evil.com', cls: 'project' }, { gitHost: 'git-staging.ezil.work', cls: 'project' },
+      { ...PROJECT, path: 'src' }, { gitHost: QA_HOST, cls: 'Project' }, { gitHost: QA_HOST, cls: 'projects' }, { gitHost: 'github.ezil.work', cls: 'assessment' },
+      { gitHost: 'github.ezil.work', cls: 'personal' }]) {
+      assert.deepEqual({ fields, got: await prep(fields) }, { fields, got: { ok: false, errorCode: 'workspace_failed' } });
+    }
+    // github.ezil.work is accepted for class project: the request passes, and the seam proxy (which serves only
+    // git-preview and git-qa) then refuses the network, so the answer is network_unavailable, not workspace_failed.
+    assert.deepEqual(await prep({ gitHost: 'github.ezil.work', cls: 'project' }), { ok: false, errorCode: 'network_unavailable' });
+    // never a guessed default: a non-empty remote without defaultBranch is refused, nothing placed
+    let root = newRoot(); resetRun();
+    const missing = await openFlow(fx, { root, token, ...PROJECT, defaultBranch: 'develop' });
+    assert.deepEqual(missing.prepared, { ok: false, errorCode: 'repository_unavailable' });
+    assert.equal(fs.existsSync(wrapperOf(root)), false);
+    // an empty remote: initialized_empty on exactly defaultBranch, marked
+    root = newRoot(); resetRun(); makeRemote(fx);
+    const empty = await openFlow(fx, { root, token, ...PROJECT, defaultBranch: 'trunk' });
+    assert.deepEqual(empty.committed, projected(root, { state: 'initialized_empty', branch: 'trunk', empty: true }));
+    assert.equal(fs.readFileSync(`${cloneOf(root)}/.git/${k.PROJECT_MARKER_FILE}`, 'utf8'), 'project\n');
+    // links: <root>/projects (workspace_failed), W or F (folder_conflict)
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    root = newRoot(); fs.mkdirSync(`${root}/real-projects`); fs.symlinkSync(`${root}/real-projects`, `${root}/projects`); resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token, ...PROJECT })).prepared, { ok: false, errorCode: 'workspace_failed' });
+    root = newRoot(); fs.mkdirSync(`${root}/projects`); fs.mkdirSync(`${root}/elsewhere`); fs.symlinkSync(`${root}/elsewhere`, wrapperOf(root)); resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token, ...PROJECT })).prepared, { ok: false, errorCode: 'folder_conflict' });
+    root = newRoot(); resetRun();
+    assert.equal((await openFlow(fx, { root, token, ...PROJECT })).committed.ok, true);
+    fs.renameSync(cloneOf(root), `${root}/moved`); fs.symlinkSync(`${root}/moved`, cloneOf(root)); resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token, ...PROJECT })).prepared, { ok: false, errorCode: 'folder_conflict' });
   });
 
   // ── r56 recheck (A2h): no template directory, no system attributes, no file under HOME ─────────

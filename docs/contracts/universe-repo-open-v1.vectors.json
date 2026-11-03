@@ -1,6 +1,6 @@
 {
   "contract": "universe-repo-open-v1",
-  "contractVersion": "1.0.3",
+  "contractVersion": "1.0.4",
   "about": [
     "Machine-checkable constants and cases for docs/contracts/universe-repo-open-v1.md.",
     "Only the lead changes this file. Any change bumps contractVersion and the pinned sha256 (README-universe-repo-open.md).",
@@ -24,9 +24,12 @@
     "GIT_STAGING_HOST": "git-preview.ezil.work",
     "GIT_PRODUCTION_HOST": "github.ezil.work",
     "GIT_ASSESSMENT_HOST": "git-qa.ezil.work",
-    "REPO_OPEN_CLASSES": ["personal", "assessment"],
+    "REPO_OPEN_CLASSES": ["personal", "assessment", "project"],
     "REPO_OPEN_CLASS_DEFAULT": "personal",
     "REPO_OPEN_CLASS_GIT_HOSTS": { "personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work" },
+    "REPO_OPEN_PROJECT_GIT_HOSTS": ["github.ezil.work", "git-qa.ezil.work"],
+    "PROJECT_MARKER_FILE": "ezil-repo-class",
+    "PROJECT_MARKER_CONTENT": "project\n",
     "PREVIEW_SUPABASE_ORIGIN": "https://13-203-99-168.sslip.io",
     "PRODUCTION_AUTH0_CLIENTS": ["Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx", "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"],
     "CLIENT_ID_UNPINNED": "UNPINNED",
@@ -602,6 +605,8 @@
     "grantKeys": ["username", "token", "expiresAt", "scope"],
     "gitHostAllowList": ["git-preview.ezil.work"],
     "optionalKeys": ["class"],
+    "projectGrantMaxMs": 330000,
+    "projectRule": "1.0.4. class project: an ordinary Builder-created project's own repository on the Creator's own computer (never a new or assessment computer). It is the third member of REPO_OPEN_CLASSES and has no entry in REPO_OPEN_CLASS_GIT_HOSTS (the single-host table): its gitHost must be one of REPO_OPEN_PROJECT_GIT_HOSTS AND exactly the host the ROUTE's deployment serves (the route passes it: github.ezil.work in production, git-qa.ezil.work on os-staging; GIT_PRODUCTION_HOST stays forbidden on staging), so a body never chooses its host. The AWS host op and the kernel cannot know the deployment and accept either project host; the route binding is the Worker's (invalidMutations rows with layer worker are refused by the Worker only, every other row at every layer). path must be null (its editor root is always the wrapper W, kernel.project.layoutRule). The grant's expiresAt must be in (now, now + projectGrantMaxMs]: an OS-scoped grant of at most five minutes plus 30 s skew, never the 60-minute Works web-clone grant (cli-auth issueGrant webClone; Works W2/W3 add the OS-scoped grant). A project route also requires the deployment's capability and assessment-fence gates (awsProject) before anything is sent. A project body is refused on the personal and assessment routes, and a personal or assessment body on the project route (Worker invalid_request; AWS host repo_open_invalid; kernel workspace_failed).",
     "classRule": "1.0.3. A body may carry one more key, class: personal or assessment (constants REPO_OPEN_CLASSES); absent means REPO_OPEN_CLASS_DEFAULT (personal), so every 1.0.2 body is valid and unchanged. class must be a string in REPO_OPEN_CLASSES (null, empty and any other value are invalid). gitHost must equal REPO_OPEN_CLASS_GIT_HOSTS[class]: a closed table, refused in both directions (personal or absent on git-qa, assessment on git-preview). gitHostAllowList is the class-absent (personal) list. Whoever relays the body (Worker, AWS host) forwards class into the kernel request (kernel.optionalRequestKeys) only when the body carried it. E1-6: a body with class assessment must carry path null (its editor root is always the wrapper, kernel.assessment.layoutRule); a non-null path is refused at every layer (Worker invalid_request, AWS host repo_open_invalid, kernel workspace_failed). repositoryId is the lowercase UUID the wrapper is named after.",
     "base": {
       "v": 1, "op": "open", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "site",
@@ -615,7 +620,9 @@
       { "setGrant": { "expiresAt": { "relativeSeconds": 960 } } },
       { "set": { "class": "personal" } },
       { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work" } },
-      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "op": "refresh" } }
+      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "op": "refresh" } },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-qa.ezil.work" },
+      { "set": { "class": "project", "gitHost": "github.ezil.work", "op": "refresh" }, "setGrant": { "expiresAt": { "relativeSeconds": 330 } }, "projectGitHost": "github.ezil.work" }
     ],
     "invalidMutations": [
       { "set": { "v": 2 }, "why": "version" },
@@ -642,7 +649,16 @@
       { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "repositoryId": "3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C" }, "why": "uppercase repositoryId on an assessment open" },
       { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "repositoryId": "3f2b8c1a9d4e4f6a8b7c1d2e3f4a5b6c" }, "why": "repositoryId without hyphens on an assessment open" },
       { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "repositoryId": "../x" }, "why": "repositoryId as a path on an assessment open" },
-      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "repositoryId": null }, "why": "null repositoryId on an assessment open" }
+      { "set": { "class": "assessment", "gitHost": "git-qa.ezil.work", "repositoryId": null }, "why": "null repositoryId on an assessment open" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work" }, "projectGitHost": "git-qa.ezil.work", "why": "project with the 900 s base grant (past projectGrantMaxMs)" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 331 } }, "projectGitHost": "git-qa.ezil.work", "why": "project grant one second past projectGrantMaxMs" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 3600 } }, "projectGitHost": "git-qa.ezil.work", "why": "project with the 60-minute web-clone grant" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work", "path": "src" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-qa.ezil.work", "why": "path on a project open (the editor root is always the wrapper)" },
+      { "set": { "class": "project", "gitHost": "github.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-qa.ezil.work", "layer": "worker", "why": "project body host other than the route's host" },
+      { "set": { "class": "project", "gitHost": "git-preview.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-preview.ezil.work", "why": "project on the personal host (not a project host, whatever the route says)" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "layer": "worker", "why": "project with no route host" },
+      { "set": { "class": "project", "gitHost": "git-qa.ezil.work", "repositoryId": "../x" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-qa.ezil.work", "why": "repositoryId as a path on a project open" },
+      { "set": { "class": "Project", "gitHost": "git-qa.ezil.work" }, "setGrant": { "expiresAt": { "relativeSeconds": 300 } }, "projectGitHost": "git-qa.ezil.work", "why": "class project is case-sensitive" }
     ]
   },
   "signature": {
@@ -871,7 +887,7 @@
     },
     "requestKeys": ["v", "op", "phase", "uuid", "inflight", "repositoryId", "handle", "name", "gitHost", "defaultBranch", "path", "root", "staging", "incoming", "deadlineMs", "budget"],
     "optionalRequestKeys": ["class"],
-    "requestKeysRule": "Strict: a request file with any key outside requestKeys plus optionalRequestKeys (1.0.3), any missing requestKeys key, a class outside constants REPO_OPEN_CLASSES, a gitHost other than REPO_OPEN_CLASS_GIT_HOSTS[class] (class absent = personal), a non-null path with class assessment (1.0.3 E1-6: its editor root is always the wrapper, assessment.layoutRule), or a phase outside phases, is refused with workspace_failed before any filesystem or network action. inflight is the Worker in-flight map's uuids for this sandbox at the time the request is written (this request's uuid included).",
+    "requestKeysRule": "Strict: a request file with any key outside requestKeys plus optionalRequestKeys (1.0.3), any missing requestKeys key, a class outside constants REPO_OPEN_CLASSES, a gitHost other than REPO_OPEN_CLASS_GIT_HOSTS[class] (class absent = personal; class project: REPO_OPEN_PROJECT_GIT_HOSTS), a non-null path with class assessment (1.0.3 E1-6: its editor root is always the wrapper, assessment.layoutRule), a class project request whose gitHost is outside constants REPO_OPEN_PROJECT_GIT_HOSTS or whose path is non-null (1.0.4, project.rule), or a phase outside phases, is refused with workspace_failed before any filesystem or network action. inflight is the Worker in-flight map's uuids for this sandbox at the time the request is written (this request's uuid included).",
     "lockRule": "prepare (repository folder absent) takes LOCK_TEMPLATE with mkdir and writes this request's uuid to LOCK_OWNER_TEMPLATE. An existing lock is live only when its owner uuid is in the request's inflight list and it is younger than LOCK_STALE_MS; otherwise it is stale and prepare removes it and takes it. Released by commit on every outcome, by release, and by prepare itself on failure.",
     "testSeam": "The kernel module exports runKernel(phase, requestPath, testOptions). testOptions = { sslCAInfo, proxy } adds -c http.sslCAInfo=<file> -c http.proxy=<loopback CONNECT proxy> to every git command so tests reach a loopback TLS gateway that presents git-preview.ezil.work (and, from 1.0.3, git-qa.ezil.work for class assessment) under a test CA. The CLI entry (node <kernel> <phase> <request>, the only thing the Worker runs) passes no testOptions and has no other input channel: it reads no environment variable, and a request file carrying any test key is refused by requestKeysRule. Hosts, helper checks and allow-lists stay the class table's hosts (constants REPO_OPEN_CLASS_GIT_HOSTS).",
     "testSeamKeys": ["sslCAInfo", "proxy"],
@@ -897,6 +913,15 @@
       },
       "trust": "head, clean, remote and the layout (W, <root>/projects and F; layoutRule) are in-guest evidence, not proof. The kernel and git run as uid 0 in the guest, and so do code-server and the terminal on AWS (the desktop's runc process is uid 0). Under identity A (the candidate is the owner of the existing computer) guest root can, between prepare and commit or at any other time: add a filter driver to the staged .git/config with a matching .git/info/attributes entry (it runs during status and can hide a change); set core.worktree, .git/info/exclude, or the index's skip-worktree or assume-unchanged bits so that status prints nothing for a dirty tree; plant programs on the reads' PATH; set remote.origin.pushurl, url.<base>.insteadOf or url.<base>.pushInsteadOf so that fetch and push go elsewhere while remote.origin.url reads back as expected; put files into W (a .vscode/tasks.json that runs on folder open, say), or replace W, F or <root>/projects with a symlink outside <root>, between the kernel's mkdir(W), its rename and its placement re-check, or after placement; or replace git or node. hardenedRead and gitEnv keep out only what the kernel's own environment would add: git's own configuration sources (system, global and XDG config, the XDG ignore and attributes files, the system attributes file, the template directory, and files under HOME such as .netrc; no kernel git reads any of them since the r56 review and its recheck), hooks, fsmonitor, a pager and repository discovery above the directory. They do not cover the programs, libraries and other system files git and libcurl use (PATH, the CA store, the resolver configuration and /etc/hosts): guest root can replace or rewrite those, as it can replace git, and so steer prepare's network phase and the reads. The placement re-check sees only its own moment. A consumer records readiness from head, clean and remote as in-candidate-container evidence, and never treats the editor root's content as platform-controlled; a proof needs a read outside the guest.",
       "editorRootRule": "1.0.3 E1-6: kernel-enforced against the repository's content and against trees staged before the attempt; in-guest evidence against guest root under identity A (trust). It replaces the earlier consumer precondition for those two only: no consumer may treat W's content as platform-controlled. The editor root is the wrapper W (layoutRule), never F, because code-server reads runnable config (.vscode, tasks, MCP and the like) from the root of the folder it opens. The kernel's checks establish that W did not exist in any form when prepare and commit looked (lstat) and that right after the rename it held exactly one entry, ASSESSMENT_CLONE_DIR_NAME, under real directories (layoutRule), so neither the repository's content nor a tree staged before the attempt sits at the editor root. Guest root can still add to W, or redirect W or <root>/projects outside <root>, at any time; what Code then opens is the candidate's own doing, never the platform's; every assessment answer names W as folder and openFolder, and the consumer refuses any other folder. Path collision: the live open-project flow (worker/src/repo-open.ts REPO_OPEN_NESTED_DIR) places its own clones at the same <root>/projects/<repositoryId>/repository. In one workspace an assessment answers folder_conflict for a repositoryId open-project already placed (never adopted); what open-project does with a W an assessment placed is open-project's own rule, not this contract's. A personal folder <root>/repos/<handle>/<name> no longer blocks the assessment of the same <handle>/<name> (the folders differ). Grants and locks stay keyed by handle and name for both classes (GRANT_FILE_TEMPLATE, LOCK_TEMPLATE; the helper is unchanged): a personal and an assessment repository with the same handle and name share one lock and one grant slot, so an install by either replaces the other's grant (the helper then refuses the other's host until its next refresh), and a release whose own F is absent removes the shared grant. That is a liveness limit, never an adoption."
+    },
+    "project": {
+      "rule": "1.0.4. A request with class project differs from class assessment in these ways only. (1) Host: gitHost is one of constants REPO_OPEN_PROJECT_GIT_HOSTS (the route passes the deployment's one; the kernel accepts either). (2) Marker: after writeBinding, prepare writes .git/PROJECT_MARKER_FILE in the staging clone with exactly PROJECT_MARKER_CONTENT (O_EXCL, a regular file); commit refuses a staged folder without it. The binding stays the 5-key BINDING_FILE, so the codec's repoOpenMarkerRule and codecTracked are unchanged, and the snapshot carries the marker with the rest of .git. (3) Reopen: an existing W whose only entry is a real directory F that is bound to this request (binding) AND marked is answered existing, read-only, with no network: folder = openFolder = W, pathNotFound false, branch defaultBranch, empty false; its commit installs the new grant (refresh semantics) and never moves or rewrites F. Anything else at W (absent parent chain aside) is folder_conflict: an assessment-placed W (unmarked) is never adopted, and an assessment request never adopts a project W (assessment adopts nothing). (4) Answer: the 7-key resultOpenKeys, states cloned | initialized_empty | existing; no head, clean or remote. (5) Grant: as assessment, removed only when this request placed nothing and did not reopen.",
+      "layoutRule": "1.0.4. As kernel.assessment.layoutRule: W = <root>/ASSESSMENT_DIR_TEMPLATE, F = W/ASSESSMENT_CLONE_DIR_NAME, no symlink anywhere on <root>/projects/W/F (lstat; never followed), the parent chain refused with workspace_failed, a foreign W with folder_conflict. The editor root is W.",
+      "markerRule": "1.0.4. projectMarked(F) holds exactly when F/.git/PROJECT_MARKER_FILE is lstat'd as a regular file (never a symlink) whose bytes are exactly PROJECT_MARKER_CONTENT. A tampered, symlinked, extended or missing marker makes an existing W folder_conflict for class project; a marker never makes a W adoptable for class assessment.",
+      "branchRule": "1.0.4. Exactly defaultBranch, as assessment (r56): a non-empty remote without defaultBranch is repository_unavailable; an empty remote initializes defaultBranch unborn.",
+      "resultOpenKeys": ["ok", "state", "folder", "openFolder", "pathNotFound", "branch", "empty"],
+      "states": ["cloned", "initialized_empty", "existing"],
+      "twoPushRule": "1.0.4 T-2PUSH-K. After an open, git push succeeds with the installed grant; once the grant's expiresAt is inside the helper's skew it is refused (HELPER_HINT_EXPIRED) without reaching the server; a refresh with a DIFFERENT token installs it (the old token revoked at the server) and the next push succeeds, while the working tree, the index and HEAD are unchanged by the refresh and the refresh makes no network request."
     },
     "resultRefreshKeys": ["ok", "state"],
     "resultErrorKeys": ["ok", "errorCode"],
@@ -1273,6 +1298,15 @@
     "forbiddenHosts": ["api.ezil.work", "api-staging.ezil.work", "api-aws.ezil.work", "github.ezil.work", "git.ezil.work", "git-staging.ezil.work"],
     "regex": ["GRANT_RE", "HANDLE_RE", "NAME_RE"]
   },
+  "awsProject": {
+    "rule": "1.0.4. The AWS relay sends a class project start only after BOTH gates the integrating route supplies answer exactly true for THIS computer: projectCapable (the host's agent and kernel know class project: an AMI after 1.0.30 carrying the A2h repo-open op and this kernel) and computerFree (the computer is the Creator's own and is not bound to an assessment attempt; the assessment policy's answer). A gate that is absent, answers anything but true, or throws is workspace_unsupported with no edge call. Nothing provisions compute; EZiL ID alone is never checkout proof (the grant comes from Works, OS-scoped, W2/W3).",
+    "gates": ["projectCapable", "computerFree"],
+    "gateAbsent": "workspace_unsupported",
+    "startNotFound": "workspace_unsupported",
+    "startRepoOpenInvalid": "workspace_unsupported",
+    "deadline": "workspace_busy",
+    "ami1030": "AMI 1.0.30 (host agent 7b95bcd9) has no repo-open op: start answers 404, so class project there is workspace_unsupported. An A2h host whose class table predates 1.0.4 answers 409 repo_open_invalid: also workspace_unsupported. Neither is retried."
+  },
   "requiredConstants": [
     "OS_STAGING_ORIGIN", "UNIVERSE_STAGING_HOST", "WORKS_STAGING_ORIGIN", "GIT_STAGING_HOST", "GIT_PRODUCTION_HOST",
     "PREVIEW_SUPABASE_ORIGIN", "PRODUCTION_AUTH0_CLIENTS", "CLIENT_ID_UNPINNED", "STAGING_FORBIDDEN_HOSTS",
@@ -1285,6 +1319,7 @@
     "TAR_BLOCK_BYTES", "TAR_PAX_NAME_BYTES", "TAR_PAX_RECORD_SLACK_BYTES", "TAR_ARCHIVE_TAIL_BYTES", "BODY_LIMITS_BYTES",
     "OS_PRODUCTION_APP_ORIGIN", "OS_LANDING_ORIGIN", "SNAPSHOT_INTERNAL_NAMES", "SNAPSHOT_CACHE_NAMES", "SNAPSHOT_NESTED_INDEX_MAX", "SNAPSHOT_INDEX_PATHS_BYTES",
     "GIT_ASSESSMENT_HOST", "REPO_OPEN_CLASSES", "REPO_OPEN_CLASS_DEFAULT", "REPO_OPEN_CLASS_GIT_HOSTS",
-    "ASSESSMENT_DIR_TEMPLATE", "ASSESSMENT_CLONE_DIR_NAME", "ASSESSMENT_REMOTE_TEMPLATE"
+    "ASSESSMENT_DIR_TEMPLATE", "ASSESSMENT_CLONE_DIR_NAME", "ASSESSMENT_REMOTE_TEMPLATE",
+    "REPO_OPEN_PROJECT_GIT_HOSTS", "PROJECT_MARKER_FILE", "PROJECT_MARKER_CONTENT"
   ]
 }

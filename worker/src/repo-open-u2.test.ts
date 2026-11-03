@@ -1,5 +1,5 @@
 /**
- * The u2 repo-open protocol module (worker/src/repo-open-u2.ts), contract universe-repo-open-v1 1.0.3:
+ * The u2 repo-open protocol module (worker/src/repo-open-u2.ts), contract universe-repo-open-v1 1.0.4:
  *
  *  - constants, regexes, the refusal table and both answer shapes against the vectors;
  *  - the strict §8 body for a ROUTE class: every vectors body mutation (valid under its own class and
@@ -14,8 +14,9 @@ import { fileURLToPath } from 'node:url';
 import {
   ASSESSMENT_CLONE_DIR, ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, ASSESSMENT_PROJECTS_DIR, BRANCH_RE, GRANT_RE,
   HANDLE_RE, HEAD_RE, NAME_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES, REPO_OPEN_CLASSES, REPO_OPEN_CLASS_DEFAULT,
-  REPO_OPEN_CLASS_GIT_HOSTS, REPO_OPEN_STATUS, UUID_RE, WORKER_ACCEPT_EXPIRY_MAX_MS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES,
-  assessmentEditorRoot, assessmentRemoteUrl, isRepoOpenClass, parseRepoOpenBody, refusal, repoOpenResponse, validBranch, validName,
+  REPO_OPEN_CLASS_GIT_HOSTS, REPO_OPEN_PROJECT_GIT_HOSTS, REPO_OPEN_PROJECT_GRANT_MAX_MS, REPO_OPEN_STATUS, UUID_RE,
+  WORKER_ACCEPT_EXPIRY_MAX_MS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES,
+  assessmentEditorRoot, assessmentRemoteUrl, isRepoOpenClass, isWrappedClass, parseRepoOpenBody, refusal, repoOpenResponse, validBranch, validName,
   type RepoOpenClass, type RepoOpenErrorCode,
 } from './repo-open-u2';
 
@@ -39,7 +40,8 @@ function materialise(value: unknown, now: number): unknown {
   }
   return typeof value === 'string' ? expand(value) : value;
 }
-type Mutation = { set?: Record<string, unknown>; setGrant?: Record<string, unknown>; why?: string };
+/** 1.0.4: a project row names the route's host (projectGitHost); layer 'worker' rows are refused by the Worker only. */
+type Mutation = { set?: Record<string, unknown>; setGrant?: Record<string, unknown>; projectGitHost?: string; layer?: string; why?: string };
 function mutate(m: Mutation, now: number) {
   const copy = structuredClone(V.workerRequest.base);
   if (m.set) Object.assign(copy, m.set);
@@ -53,15 +55,16 @@ const baseBody = (now: number, patch: Record<string, unknown> = {}, grant: Recor
 };
 /** The class a vectors mutation's body claims (absent = the default). */
 const claimed = (m: Mutation): RepoOpenClass => (m.set && 'class' in m.set ? m.set.class : REPO_OPEN_CLASS_DEFAULT) as RepoOpenClass;
-const other = (c: RepoOpenClass): RepoOpenClass => (c === 'personal' ? 'assessment' : 'personal');
-const parses = (body: unknown, routeClass: RepoOpenClass) => parseRepoOpenBody(enc(body), NOW, routeClass) !== null;
+const others = (c: RepoOpenClass): RepoOpenClass[] => REPO_OPEN_CLASSES.filter((x) => x !== c);
+const parses = (body: unknown, routeClass: RepoOpenClass, projectGitHost?: string) =>
+  parseRepoOpenBody(enc(body), NOW, routeClass, { projectGitHost }) !== null;
 
 // ── constants ───────────────────────────────────────────────────────────────
 
-describe('u2 protocol constants equal the vectors (1.0.3)', () => {
-  it('vectors are the pinned 1.0.3 file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('14fe6eeb0cefe83bc2052f4a456916b9891cc690dbb6f7f2c01c015ec4fab164');
-    expect(V.contractVersion).toBe('1.0.3');
+describe('u2 protocol constants equal the vectors (1.0.4)', () => {
+  it('vectors are the pinned 1.0.4 file', () => {
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('092d76d10018156d585424caee993ad6cac3ce56c52f5fee74f56917e60e92ff');
+    expect(V.contractVersion).toBe('1.0.4');
   });
 
   it('timeouts, limits and regexes', () => {
@@ -75,11 +78,12 @@ describe('u2 protocol constants equal the vectors (1.0.3)', () => {
     expect(REPO_OPEN_CLASS_DEFAULT).toBe(C.REPO_OPEN_CLASS_DEFAULT);
     expect({ ...REPO_OPEN_CLASS_GIT_HOSTS }).toEqual(C.REPO_OPEN_CLASS_GIT_HOSTS);
     expect(REPO_OPEN_CLASS_GIT_HOSTS.assessment).toBe(QA);
-    expect([REPO_OPEN_CLASS_GIT_HOSTS[REPO_OPEN_CLASS_DEFAULT]]).toEqual(V.workerRequest.gitHostAllowList);
+    expect([REPO_OPEN_CLASS_GIT_HOSTS.personal]).toEqual(V.workerRequest.gitHostAllowList);
     expect(V.workerRequest.optionalKeys).toEqual(['class']);
     expect(Object.isFrozen(REPO_OPEN_CLASS_GIT_HOSTS) && Object.isFrozen(REPO_OPEN_CLASSES)).toBe(true);
-    // One host per class, and no host serves two classes.
-    expect(new Set(Object.values(REPO_OPEN_CLASS_GIT_HOSTS)).size).toBe(REPO_OPEN_CLASSES.length);
+    // One host per single-host class, and no host serves two of them; project is the one class without an entry (1.0.4).
+    expect(Object.keys(REPO_OPEN_CLASS_GIT_HOSTS)).toEqual(REPO_OPEN_CLASSES.filter((c) => c !== 'project'));
+    expect(new Set(Object.values(REPO_OPEN_CLASS_GIT_HOSTS)).size).toBe(Object.keys(REPO_OPEN_CLASS_GIT_HOSTS).length);
   });
 
   it('isRepoOpenClass is the closed list: inherited names, case variants and non-strings are not classes', () => {
@@ -137,16 +141,16 @@ describe('strict §8 body for a route class (vectors workerRequest, classRule)',
     for (const m of V.workerRequest.validMutations as Mutation[]) {
       const c = claimed(m);
       claimedClasses.add(c);
-      expect([JSON.stringify(m), parses(mutate(m, NOW), c)]).toEqual([JSON.stringify(m), true]);
-      expect([JSON.stringify(m), parses(mutate(m, NOW), other(c))]).toEqual([JSON.stringify(m), false]);
+      expect([JSON.stringify(m), parses(mutate(m, NOW), c, m.projectGitHost)]).toEqual([JSON.stringify(m), true]);
+      for (const o of others(c)) expect([JSON.stringify(m), o, parses(mutate(m, NOW), o, m.projectGitHost)]).toEqual([JSON.stringify(m), o, false]);
     }
     expect([...claimedClasses].sort()).toEqual([...REPO_OPEN_CLASSES].sort());
   });
 
-  it('every invalid mutation is refused for both route classes', () => {
+  it('every invalid mutation is refused for every route class', () => {
     for (const m of V.workerRequest.invalidMutations as Mutation[]) {
       for (const routeClass of REPO_OPEN_CLASSES) {
-        expect([m.why, routeClass, parses(mutate(m, NOW), routeClass)]).toEqual([m.why, routeClass, false]);
+        expect([m.why, routeClass, parses(mutate(m, NOW), routeClass, m.projectGitHost)]).toEqual([m.why, routeClass, false]);
       }
     }
   });
@@ -158,7 +162,8 @@ describe('strict §8 body for a route class (vectors workerRequest, classRule)',
         for (const gitHost of hosts) {
           const body = baseBody(NOW, { gitHost, ...(bodyClass === undefined ? {} : { class: bodyClass }) });
           const effective = bodyClass ?? REPO_OPEN_CLASS_DEFAULT;
-          const want = effective === routeClass && gitHost === REPO_OPEN_CLASS_GIT_HOSTS[routeClass];
+          // class project has no single-host entry (1.0.4): the project route without projectGitHost refuses every body
+          const want = effective === routeClass && gitHost === (REPO_OPEN_CLASS_GIT_HOSTS as Readonly<Record<string, string>>)[routeClass];
           expect([routeClass, bodyClass ?? null, gitHost, parses(body, routeClass)]).toEqual([routeClass, bodyClass ?? null, gitHost, want]);
         }
       }
@@ -186,6 +191,47 @@ describe('strict §8 body for a route class (vectors workerRequest, classRule)',
         for (const routeClass of REPO_OPEN_CLASSES) expect(parses(baseBody(NOW, { class: value, gitHost }), routeClass)).toBe(false);
       }
     }
+  });
+
+  it('1.0.4 class project: the constants are the vectors\'; only the wrapped classes use the wrapper', () => {
+    expect([...REPO_OPEN_PROJECT_GIT_HOSTS]).toEqual(C.REPO_OPEN_PROJECT_GIT_HOSTS);
+    expect(REPO_OPEN_PROJECT_GRANT_MAX_MS).toBe(V.workerRequest.projectGrantMaxMs);
+    expect(Object.isFrozen(REPO_OPEN_PROJECT_GIT_HOSTS)).toBe(true);
+    expect(REPO_OPEN_CLASSES.map((c) => [c, isWrappedClass(c)])).toEqual([['personal', false], ['assessment', true], ['project', true]]);
+  });
+
+  it('1.0.4 class project: the body names exactly the route\'s host, which must be a project host, in both directions', () => {
+    const grant = { expiresAt: new Date(NOW + 300_000).toISOString() };
+    const hosts = [...REPO_OPEN_PROJECT_GIT_HOSTS, PREVIEW, 'git.ezil.work', 'GIT-QA.EZIL.WORK', ''];
+    for (const route of [...hosts, undefined]) {
+      for (const gitHost of hosts) {
+        const body = baseBody(NOW, { class: 'project', gitHost }, grant);
+        const want = gitHost === route && (REPO_OPEN_PROJECT_GIT_HOSTS as readonly string[]).includes(gitHost);
+        expect([route ?? null, gitHost, parses(body, 'project', route)]).toEqual([route ?? null, gitHost, want]);
+      }
+    }
+    // The project route never takes a personal or assessment body, and they never take a project body.
+    for (const gitHost of REPO_OPEN_PROJECT_GIT_HOSTS) {
+      expect(parses(baseBody(NOW, { gitHost }, grant), 'project', gitHost)).toBe(false);
+      expect(parses(baseBody(NOW, { class: 'assessment', gitHost }, grant), 'project', gitHost)).toBe(false);
+      for (const routeClass of ['personal', 'assessment'] as const) {
+        expect(parses(baseBody(NOW, { class: 'project', gitHost }, grant), routeClass, gitHost)).toBe(false);
+      }
+    }
+    // projectGitHost means nothing to the single-host routes.
+    expect(parses(baseBody(NOW, {}, grant), 'personal', 'github.ezil.work')).toBe(true);
+    expect(parses(baseBody(NOW, { class: 'assessment', gitHost: QA }, grant), 'assessment', 'github.ezil.work')).toBe(true);
+  });
+
+  it('1.0.4 class project: an OS-scoped grant of at most 330 s, path null, open and refresh', () => {
+    const at = (ms: number) => ({ expiresAt: new Date(NOW + ms).toISOString() });
+    const p = (patch: Record<string, unknown>, grantMs: number) => parses(baseBody(NOW, { class: 'project', gitHost: QA, ...patch }, at(grantMs)), 'project', QA);
+    expect([p({}, 1), p({}, 300_000), p({}, REPO_OPEN_PROJECT_GRANT_MAX_MS), p({ op: 'refresh' }, 300_000)]).toEqual([true, true, true, true]);
+    expect([p({}, 0), p({}, -1), p({}, REPO_OPEN_PROJECT_GRANT_MAX_MS + 1), p({}, 3_600_000), p({}, WORKER_ACCEPT_EXPIRY_MAX_MS)]).toEqual([false, false, false, false, false]);
+    for (const path of ['src', 'src/main.ts', '', '../x', '/abs']) expect([path, p({ path }, 300_000)]).toEqual([path, false]);
+    expect(p({ op: 'refresh', path: 'src' }, 300_000)).toBe(false);
+    // the personal ceiling is unchanged
+    expect(parses(baseBody(NOW, {}, at(WORKER_ACCEPT_EXPIRY_MAX_MS)), 'personal')).toBe(true);
   });
 
   it('an own "__proto__" key, or any key outside the body keys and class, is refused', () => {

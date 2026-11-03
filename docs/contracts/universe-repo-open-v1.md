@@ -4,7 +4,7 @@ Universe 2.0 builder repository → EZiL OS staging Code → edit and push throu
 
 | Field | Value |
 |---|---|
-| contractVersion | `1.0.3` (changes since 1.0.0: [Changelog](#changelog)) |
+| contractVersion | `1.0.4` (changes since 1.0.0: [Changelog](#changelog)) |
 | Vectors | `docs/contracts/universe-repo-open-v1.vectors.json` (sha256 pinned in `README-universe-repo-open.md`) |
 | Gateway extract | derived by `check.mjs --emit-gateway-extract` for the public EZiL CLI repo; its own sha256 pinned in the README (§18) |
 | Check | `node docs/contracts/universe-repo-open-v1.check.mjs` (also runs under `/root/.bun/bin/bun`) |
@@ -594,6 +594,11 @@ Full table, copy and upstream mapping: vectors `errorTable`. `retryable` in the 
   3. **AFTER START**, every outcome the candidate can cause is consuming and never extends the deadline: any outcome whose origin includes `guest`, and any worker- or host-origin outcome the candidate can induce (an instance-initiated shutdown, an instance status-check failure, an idle stop from inactivity; a stop or restart where the candidate controls the computer). Only a provider loss proven from the AWS API (r63 CK-2: an EC2 `Server.*` state reason, a failed system status check or an AWS Health event; never the guest or the instance itself) is non-consuming. Restarts are capped, and no restart reopens the clock.
 
   The owner notes in the table (`workspace_unsupported`, `runtime_not_running`, `workspace_not_ready`) assume identity A, where the candidate owns the computer. With placement on Creator or company capacity, an owner's stop is not the candidate's act, and the consumer classifies it. The success fields `head`, `clean`, `remote` and `branch`, and the wrapper rules, are in-guest evidence only (`kernel.assessment.trust`).
+- **Class project (1.0.4; vectors `workerRequest.projectRule`, `kernel.project`, `awsProject`).** An ordinary Builder-created project's own repository, opened on the Creator's own existing computer. Nothing here provisions compute, and EZiL ID alone is never checkout proof: the grant is Works' OS-scoped grant of at most five minutes (`projectGrantMaxMs` 330 s, Works W2/W3), never the 60-minute web-clone grant.
+  - **Route.** The project route passes the one host its deployment serves (`projectGitHost`: `github.ezil.work` in production, `git-qa.ezil.work` on os-staging; `REPO_OPEN_PROJECT_GIT_HOSTS`); the body must name exactly it, with `path` null. A project body is refused on the personal and assessment routes, and theirs on the project route.
+  - **Gates.** The relay sends nothing unless both route-supplied gates answer exactly `true` for this computer: `projectCapable` (its host runs an agent and kernel that know class `project`) and `computerFree` (the computer is not bound to an assessment attempt). Absent, not `true`, or throwing: `workspace_unsupported`. A start 404 (AMI 1.0.30 has no repo-open op) or 409 `repo_open_invalid` (an A2h host whose class table predates 1.0.4) is also `workspace_unsupported`, never retried. The deadline answers `workspace_busy`: the reopen is idempotent.
+  - **Kernel.** W/F as for assessment, plus the marker `.git/ezil-repo-class` (`project\n`). An existing W whose F is bound to this request and marked is reopened (`existing`, read-only, no network, the new grant installed); anything else at W is `folder_conflict`. Assessment still adopts nothing, so neither class adopts the other's folder. The answer is the 7-key `okOpen` with folder = openFolder = W, `pathNotFound` false, `branch` exactly `defaultBranch`.
+  - **Host.** The A2h host op (owner cb1d14e6) needs the class in its closed table and the project answer check before any AMI after 1.0.30 can carry it; until then AWS class project stays `workspace_unsupported`.
 - **Folder.** `withCodeFolder` sets the AWS `path='/?folder=…'` (§4). Survival through the bootstrap into code-server is INF until E-AWS.
 - **Activation.** A lead commit that removes the Phase-A AWS refusal in `app/src/server/repo-open/service.ts` and switches the Worker dispatch to the relay, made only after the security review, AMI promotion and the canary E2E.
 
@@ -765,6 +770,15 @@ Two checker passes over the draft, each finding verified against the code at the
 | C2: USAGE citation; NUMERIC_REF_RE bound; SANDBOX_NAME_RE case | §6.12, §1, vectors | grants.sql:86; `int64_max` predicate on both sides with overflow cases; strictness note. |
 
 ## Changelog
+
+### 1.0.4 (2026-11-03, PATCH)
+Ordinary Builder project open on the Creator's own computer (founder request 9aae, journey `journey-9aae-20261103-repo-aws-local-v1`). Additive: every 1.0.3 request, body, answer and vector case is unchanged and still valid. Classes `personal` and `assessment` behave exactly as in 1.0.3.
+
+1. **Class `project`.** `REPO_OPEN_CLASSES` gains `project`. It has no entry in the single-host table `REPO_OPEN_CLASS_GIT_HOSTS`. Its host is one of `REPO_OPEN_PROJECT_GIT_HOSTS` and exactly the route's (`workerRequest.projectRule`). `path` is null. The grant window is `projectGrantMaxMs` (330 s). Two valid and nine invalid body mutations are added.
+2. **Kernel.** Wrapper layout as for assessment, plus the marker `PROJECT_MARKER_FILE` holding `PROJECT_MARKER_CONTENT`, and an idempotent `existing` reopen of a bound and marked W (`kernel.project`). The binding stays 5 keys, so the codec and `codecTracked` are unchanged; the snapshot archives the marker with `.git`. T-2PUSH-K (`kernel.project.twoPushRule`) is in the kernel suite.
+3. **AWS relay gates.** `awsProject`: `projectCapable` and `computerFree` fail closed. Start 404 and start 409 `repo_open_invalid` map to `workspace_unsupported` for class `project` only. The deadline maps to `workspace_busy`.
+4. **Text:** §13 (class project).
+5. **Bump.** `contractVersion` is 1.0.4; both README pins, the kernel test's vectors pin, the relay and module test pins, and the AWS host's kernel sha256 pin are updated in the same change. Re-seeding the copies in EZiL-Works, universe-2.0 and EZiL CLI is a consumer step (§18); no consumer code changes.
 
 ### 1.0.3 (2026-11-02, PATCH)
 For the AWS candidate assessment on an existing staging computer (analysis `u2-aws-assessment-seam-20261102`). Additive: every 1.0.2 request, body, answer and vector case is unchanged and still valid. Class `personal` (or no class) behaves exactly as in 1.0.2.

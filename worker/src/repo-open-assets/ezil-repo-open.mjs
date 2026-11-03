@@ -19,6 +19,11 @@
 // inside a wrapper the commit creates fresh (the editor root); head, clean and remote are read in staging
 // before the rename, and the placement is re-checked right after it. All of it is in-guest evidence: guest
 // root (identity A) can change W at any time. Class personal keeps <root>/repos/<handle>/<name>.
+//
+// Class project (1.0.4): an ordinary Builder-created project's repository on github.ezil.work or git-qa.ezil.work,
+// in the assessment layout, with exactly defaultBranch; a re-open of a folder this class placed (marked in
+// F/.git/ezil-repo-class) is `existing`, and push access is the same /run/ezil grant and fixed helper, renewed by
+// `refresh`. No class adopts a folder another class placed.
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -47,6 +52,19 @@ const BINDING_KEYS = ['v', 'repositoryId', 'handle', 'name', 'gitHost'];
 // `class` is 'personal', so a 1.0.2 request reads exactly as before.
 export const CLASS_GIT_HOSTS = Object.freeze({ personal: 'git-preview.ezil.work', assessment: 'git-qa.ezil.work' });
 const DEFAULT_CLASS = 'personal';
+// Class project (1.0.4, vectors kernel.project): an ordinary Builder-created project's own repository, on the
+// deployment's EZiL Git host (production github.ezil.work, os-staging git-qa.ezil.work; the Worker sends the one
+// its deployment serves, the kernel takes either and nothing else). Layout as class assessment (W/repository, W the
+// editor root, path null, exactly defaultBranch), but a W this class placed itself, marked in F/.git, re-opens as
+// `existing`; a folder another class placed never does, and class assessment still adopts nothing.
+export const PROJECT_CLASS = 'project';
+export const PROJECT_GIT_HOSTS = Object.freeze(['github.ezil.work', 'git-qa.ezil.work']);
+export const PROJECT_MARKER_FILE = 'ezil-repo-class';
+const PROJECT_MARKER = 'project\n';
+export const KERNEL_CLASSES = Object.freeze(['personal', 'assessment', PROJECT_CLASS]);
+const classAllowsHost = (cls, host) => (cls === PROJECT_CLASS ? PROJECT_GIT_HOSTS.includes(host) : CLASS_GIT_HOSTS[cls] === host);
+/** The classes whose repository sits in a wrapper W = <root>/projects/<repositoryId> (E1-6 layout). */
+const wrapped = (r) => r.class === 'assessment' || r.class === PROJECT_CLASS;
 // Class assessment layout (1.0.3 E1-6, vectors kernel.assessment.layoutRule; constants ASSESSMENT_DIR_TEMPLATE and
 // ASSESSMENT_CLONE_DIR_NAME): the wrapper W = <root>/projects/<repositoryId> is the editor root, and the clone is
 // F = W/repository (the OS open-project layout), so no file of the repository sits at the editor root.
@@ -176,13 +194,13 @@ export function readRequest(phase, requestPath) {
   const classed = exactKeys(r, [...REQUEST_KEYS, ...OPTIONAL_REQUEST_KEYS]);
   if (!classed && !exactKeys(r, REQUEST_KEYS)) refuse('workspace_failed');
   const cls = classed ? r.class : DEFAULT_CLASS;
-  if (typeof cls !== 'string' || !Object.hasOwn(CLASS_GIT_HOSTS, cls)) refuse('workspace_failed');
+  if (typeof cls !== 'string' || !KERNEL_CLASSES.includes(cls)) refuse('workspace_failed');
   const ok = r.v === 1 && (r.op === 'open' || r.op === 'refresh') && r.phase === phase && PHASE_OPS[phase].includes(r.op)
     && r.uuid === m[1] && Array.isArray(r.inflight) && r.inflight.length >= 1 && r.inflight.length <= MAX_INFLIGHT
     && r.inflight.every(validUuid) && new Set(r.inflight).size === r.inflight.length && r.inflight.includes(r.uuid)
-    && validUuid(r.repositoryId) && validHandle(r.handle) && validName(r.name) && r.gitHost === CLASS_GIT_HOSTS[cls]
-    // An assessment's editor root is always its wrapper (E1-6): its path must be null.
-    && validBranch(r.defaultBranch) && (r.path === null || (cls !== 'assessment' && r.op === 'open' && pathProblem(r.path) === null))
+    && validUuid(r.repositoryId) && validHandle(r.handle) && validName(r.name) && typeof r.gitHost === 'string' && classAllowsHost(cls, r.gitHost)
+    // A wrapped class's editor root is always its wrapper (E1-6, 1.0.4): its path must be null.
+    && validBranch(r.defaultBranch) && (r.path === null || (cls === 'personal' && r.op === 'open' && pathProblem(r.path) === null))
     && validRoot(r.root) && r.staging === `${r.root}/${STAGING_ROOT_NAME}/${r.uuid}`
     && r.incoming === `${INCOMING_DIR}/${r.uuid}.json` && isWholeNumber(r.deadlineMs)
     && exactKeys(r.budget, BUDGET_KEYS) && isWholeNumber(r.budget.limitBytes) && isWholeNumber(r.budget.maxEntries)
@@ -205,10 +223,10 @@ function readSeam(testOptions) {
 const projectsOf = (r) => `${r.root}/${ASSESSMENT_PROJECTS_DIR}`;
 /** The editor root of an assessment, W (E1-6). */
 const wrapperOf = (r) => `${projectsOf(r)}/${r.repositoryId}`;
-/** The repository folder F: <root>/repos/<handle>/<name> (personal), W/repository (assessment, E1-6). */
-const folderOf = (r) => (r.class === 'assessment' ? `${wrapperOf(r)}/${ASSESSMENT_CLONE_DIR}` : `${r.root}/repos/${r.handle}/${r.name}`);
-/** What an open answers as its folder: F (personal), W (assessment). */
-const editorRootOf = (r) => (r.class === 'assessment' ? wrapperOf(r) : folderOf(r));
+/** The repository folder F: <root>/repos/<handle>/<name> (personal), W/repository (assessment, project). */
+const folderOf = (r) => (wrapped(r) ? `${wrapperOf(r)}/${ASSESSMENT_CLONE_DIR}` : `${r.root}/repos/${r.handle}/${r.name}`);
+/** What an open answers as its folder: F (personal), W (assessment, project). */
+const editorRootOf = (r) => (wrapped(r) ? wrapperOf(r) : folderOf(r));
 /** The repo-local remote (§9.5); for class assessment, vectors constants ASSESSMENT_REMOTE_TEMPLATE. */
 const remoteUrlOf = (r) => `https://${r.gitHost}/${r.handle}/${r.name}.git`;
 // Grants and locks stay keyed by handle and name for both classes (the helper finds the grant that way).
@@ -451,10 +469,36 @@ function freshWrapperRefusal(r) {
   return state === 'absent' ? null : fail('folder_conflict');
 }
 
-/** lstat of F for refresh and release: an assessment's F only through real directories (null when W is not one). */
+/** lstat of F for refresh and release: a wrapped class's F only through real directories (null when W is not one). */
 function cloneStat(r) {
-  if (r.class !== 'assessment') return lstatOrNull(folderOf(r));
+  if (!wrapped(r)) return lstatOrNull(folderOf(r));
   return wrapperState(r) === 'real' ? lstatOrNull(folderOf(r)) : null;
+}
+
+/** F/.git/PROJECT_MARKER_FILE is a regular file (lstat) holding exactly "project\n": a folder class project placed. */
+function projectMarked(folder) {
+  try {
+    const file = `${folder}/.git/${PROJECT_MARKER_FILE}`;
+    const st = fs.lstatSync(file);
+    return st.isFile() && st.size === PROJECT_MARKER.length && fs.readFileSync(file, 'utf8') === PROJECT_MARKER;
+  } catch { return false; }
+}
+
+/**
+ * Class project (1.0.4): what stands at W. `fresh` when nothing does (the open places a new wrapper, as an
+ * assessment does); `existing` when W and F are real directories and F is bound to this request AND marked as a
+ * project folder (a re-open: nothing fetched, nothing replaced); otherwise the refusal (workspace_failed for a
+ * <root>/projects that is not a real directory, folder_conflict for anything else, an assessment's W included).
+ */
+function projectWrapper(r) {
+  const state = wrapperState(r);
+  if (state === 'bad-parent') return { refusal: fail('workspace_failed') };
+  if (state === 'foreign') return { refusal: fail('folder_conflict') };
+  if (state === 'absent') return { fresh: true };
+  const folder = folderOf(r);
+  const st = lstatOrNull(folder);
+  if (!st || !st.isDirectory() || !bindingMatches(folder, r) || !projectMarked(folder)) return { refusal: fail('folder_conflict') };
+  return { existing: true };
 }
 
 function readOwner(lock) {
@@ -972,6 +1016,14 @@ async function prepare(r, seam) {
     // not a real directory is never looked through. Refused before any action.
     const refused = freshWrapperRefusal(r);
     if (refused) return refused;
+  } else if (r.class === PROJECT_CLASS) {
+    // Read-only, like a personal re-open: an existing project folder is answered, never fetched or changed here.
+    const w = projectWrapper(r);
+    if (w.refusal) return w.refusal;
+    if (w.existing) {
+      const root = editorRootOf(r);
+      return { ok: true, state: 'existing', folder: root, openFolder: root, pathNotFound: false, branch: r.defaultBranch, empty: false };
+    }
   } else {
     const existing = lstatOrNull(folder);
     if (existing) {
@@ -1008,23 +1060,24 @@ async function prepare(r, seam) {
       state = 'initialized_empty'; branch = r.defaultBranch; empty = true;
       await writeEmptyUpstream(r.staging, r.defaultBranch);
     } else {
-      // An assessment checks out exactly defaultBranch, never the remote HEAD's branch (1.0.3):
-      // a non-empty remote without it is refused before the fetch.
-      const assessment = r.class === 'assessment';
-      if (assessment && !heads.filter(validBranch).includes(r.defaultBranch)) refuse('repository_unavailable');
+      // An assessment and a project check out exactly defaultBranch, never the remote HEAD's branch (1.0.3,
+      // 1.0.4: never a guessed default): a non-empty remote without it is refused before the fetch.
+      const exact = wrapped(r);
+      if (exact && !heads.filter(validBranch).includes(r.defaultBranch)) refuse('repository_unavailable');
       const fetched = await runGit(['fetch', '-q', '--no-tags', 'origin', '+refs/heads/*:refs/remotes/origin/*'], net(r.staging));
       if (fetched.code !== 0) refuse(classifyGitFailure(fetched));
       const usable = heads.filter(validBranch).sort();
-      branch = assessment ? r.defaultBranch
+      branch = exact ? r.defaultBranch
         : symref && usable.includes(symref) ? symref : usable.includes(r.defaultBranch) ? r.defaultBranch : usable[0];
       if (!branch) refuse('workspace_failed');
       await git(['checkout', '-q', '-b', branch, '--track', `origin/${branch}`], { cwd: r.staging, timeoutMs: remaining(), seam: null });
       state = 'cloned'; empty = false;
     }
     writeBinding(r.staging, r);
+    if (r.class === PROJECT_CLASS) fs.writeFileSync(`${r.staging}/.git/${PROJECT_MARKER_FILE}`, PROJECT_MARKER, { flag: 'wx' });
     await assertNoCredentials(r.staging, r, token);
     // The staged clone counts under its final names (E1-6: an assessment's under projects/<repositoryId>/repository).
-    const finalNames = r.class === 'assessment'
+    const finalNames = wrapped(r)
       ? { folder: `${ASSESSMENT_PROJECTS_DIR}/${r.repositoryId}/${ASSESSMENT_CLONE_DIR}`, parents: [ASSESSMENT_PROJECTS_DIR, `${ASSESSMENT_PROJECTS_DIR}/${r.repositoryId}`] }
       : {};
     const budget = measureBudget({ root: r.root, staging: r.staging, handle: r.handle, name: r.name, budget: r.budget,
@@ -1067,7 +1120,9 @@ function placementHolds(r, wrapper, folder) {
 
 async function commit(r) {
   const assessment = r.class === 'assessment';
+  const project = r.class === PROJECT_CLASS;
   let placed = false;
+  let reopened = false;
   try {
     const folder = folderOf(r);
     if (assessment) {
@@ -1075,6 +1130,22 @@ async function commit(r) {
       // <root>/projects that became anything but a real directory is never written through (E1-6).
       const refused = freshWrapperRefusal(r);
       if (refused) return refused;
+    } else if (project) {
+      // 1.0.4: a project folder this class placed (bound + marked) is re-opened in place, exactly as a personal
+      // existing folder: credential config repaired, grant and wrapper installed, nothing fetched or replaced.
+      const w = projectWrapper(r);
+      if (w.refusal) return w.refusal;
+      if (w.existing) {
+        reopened = true;
+        const token = readIncomingGrant(r);
+        await repairCredentialConfig(folder, r);
+        await assertNoCredentials(folder, r, token);
+        installGrant(r);
+        writeWrapper();
+        const d = await describeFolder(folder, r, 'existing');
+        const root = editorRootOf(r);
+        return { ok: true, state: d.state, folder: root, openFolder: root, pathNotFound: false, branch: d.branch, empty: d.empty };
+      }
     } else {
       const existing = lstatOrNull(folder);
       if (existing) {
@@ -1091,7 +1162,8 @@ async function commit(r) {
     if (!held || held.owner !== r.uuid) return fail('workspace_busy');
     const staged = lstatOrNull(r.staging);
     if (!staged || !staged.isDirectory() || !bindingMatches(r.staging, r)) return fail('workspace_failed');
-    if (!assessment) {
+    if (project && !projectMarked(r.staging)) return fail('workspace_failed');
+    if (!wrapped(r)) {
       ensureParent(`${r.root}/repos`);
       ensureParent(`${r.root}/repos/${r.handle}`);
       fs.renameSync(r.staging, folder);
@@ -1099,11 +1171,19 @@ async function commit(r) {
     }
     // An assessment reads head, clean and remote in staging, BEFORE the rename, all within one budget
     // (1.0.3): a read that fails, a remote that is not this repository's, or a read out of time places
-    // nothing, so a re-open is still a fresh open. No git runs after the rename.
-    const untilMs = Date.now() + ASSESSMENT_READ_BUDGET_MS;
-    const { head, clean } = await assessmentFacts(r.staging, untilMs);
-    const remote = await assessmentRemote(r.staging, untilMs);
-    if (remote !== remoteUrlOf(r)) refuse('workspace_failed');
+    // nothing, so a re-open is still a fresh open. No git runs after the rename. A project (1.0.4) reads only
+    // whether its HEAD is born, also before the rename.
+    let head = null, clean = null, remote = null;
+    if (assessment) {
+      const untilMs = Date.now() + ASSESSMENT_READ_BUDGET_MS;
+      ({ head, clean } = await assessmentFacts(r.staging, untilMs));
+      remote = await assessmentRemote(r.staging, untilMs);
+      if (remote !== remoteUrlOf(r)) refuse('workspace_failed');
+    } else {
+      const born = await runGit(['rev-parse', '--verify', '-q', 'HEAD'], localGit(r.staging));
+      if (born.timedOut) refuse('workspace_busy');
+      head = born.code === 0 ? 'born' : null;
+    }
     const branch = currentBranch(r.staging, r.defaultBranch);
     // E1-6: a new wrapper W (mkdir: one that appeared meanwhile is folder_conflict), then the clone into
     // W/repository. A failed rename removes the empty W again (rmdir never removes what someone else put
@@ -1127,6 +1207,7 @@ async function commit(r) {
     if (!placementHolds(r, wrapper, folder)) refuse('workspace_failed');
     placed = true;
     const empty = head === null;
+    if (project) return { ok: true, state: empty ? 'initialized_empty' : 'cloned', folder: wrapper, openFolder: wrapper, pathNotFound: false, branch, empty };
     return { ok: true, state: empty ? 'initialized_empty' : 'cloned', folder: wrapper, openFolder: wrapper, pathNotFound: false,
       branch, empty, head, clean, remote };
   } catch (error) {
@@ -1135,7 +1216,7 @@ async function commit(r) {
     // An assessment commit that does not answer ok (it placed nothing, or its placement re-check failed)
     // removes the grant its own prepare installed (this request still owns that prepare's lock), never
     // another request's (1.0.3).
-    if (assessment && !placed) {
+    if ((assessment || (project && !reopened)) && !placed) {
       try { if (readOwner(lockOf(r))?.owner === r.uuid) removeFile(grantOf(r)); } catch { /* release, or the TTL */ }
     }
     // Last act on every outcome.
@@ -1147,10 +1228,12 @@ function refresh(r) {
   const folder = folderOf(r);
   // An assessment's F is found only through real directories (E1-6): a <root>/projects or W that
   // is anything else never gets a grant beside it.
-  if (r.class === 'assessment' && ['bad-parent', 'foreign'].includes(wrapperState(r))) return fail('folder_conflict');
+  if (wrapped(r) && ['bad-parent', 'foreign'].includes(wrapperState(r))) return fail('folder_conflict');
   const existing = cloneStat(r);
-  // Never hand a folder bound to another repository a grant for this route.
-  if (existing && (!existing.isDirectory() || !bindingMatches(folder, r))) return fail('folder_conflict');
+  // Never hand a folder bound to another repository a grant for this route, nor a project grant to a folder
+  // another class placed (1.0.4).
+  if (existing && (!existing.isDirectory() || !bindingMatches(folder, r)
+    || (r.class === PROJECT_CLASS && !projectMarked(folder)))) return fail('folder_conflict');
   installGrant(r);
   writeWrapper();
   return { ok: true, state: 'refreshed' };

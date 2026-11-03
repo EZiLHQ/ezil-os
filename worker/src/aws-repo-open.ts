@@ -115,7 +115,7 @@ import {
 import {
   ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HANDLE_RE, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
   REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, UUID_RE, WORKER_DEADLINE_MS, assessmentEditorRoot, assessmentRemoteUrl,
-  isRepoOpenClass, parseRepoOpenBody, refusal, validBranch, validName,
+  isRepoOpenClass, isWrappedClass, parseRepoOpenBody, refusal, validBranch, validName,
   type RepoOpenAnswer, type RepoOpenAssessmentOpenResult, type RepoOpenBody, type RepoOpenClass, type RepoOpenErrorCode,
   type RepoOpenInput, type RepoOpenOpenResult,
 } from './repo-open-u2';
@@ -197,6 +197,7 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
       ? { status: 200, body: { ok: true, state: 'refreshed' } } : refusal('workspace_failed');
   }
   const assessment = cls === 'assessment';
+  const project = cls === 'project';
   const keys: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_KEYS : OPEN_RESULT_KEYS;
   const states: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_STATES : OPEN_RESULT_STATES;
   if (!exactKeys(body, keys) || !states.includes(body.state as string)
@@ -210,6 +211,14 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     // Never answer anything grant-shaped, whoever decoded the result.
     || GRANT_SHAPE.test(body.openFolder) || GRANT_SHAPE.test(body.branch)) {
     return refusal('workspace_failed');
+  }
+  if (project) {
+    // 1.0.4: the editor root is the wrapper W itself (never a folder below it), no path, exactly defaultBranch.
+    if (body.openFolder !== folder || body.pathNotFound !== false || typeof defaultBranch !== 'string' || body.branch !== defaultBranch) {
+      return refusal('workspace_failed');
+    }
+    const { state, branch, empty } = body as unknown as RepoOpenOpenResult;
+    return { status: 200, body: { ok: true, state, folder, openFolder: folder, pathNotFound: false, branch, empty } };
   }
   if (!assessment) {
     const { state, openFolder, pathNotFound, branch, empty } = body as unknown as RepoOpenOpenResult;
@@ -247,6 +256,18 @@ export interface AwsRepoOpenDeps {
   randomBytes?(n: number): Uint8Array;
   /** The abort signal for one edge call (default `AbortSignal.timeout`). */
   timeout?(ms: number): AbortSignal;
+  /**
+   * Class project (1.0.4) capability gate: whether THIS computer's host runs a repo-open op and kernel that know
+   * class project (an AMI after 1.0.30 carrying the A2h op and kernel b7196b7d's successor). Absent, false or
+   * throwing: the open answers workspace_unsupported and nothing is sent. AMI 1.0.30 has no repo-open op at all.
+   */
+  projectCapable?(record: AwsTunnelRecord): Promise<boolean>;
+  /**
+   * Class project (1.0.4) fence: true only when this computer is NOT bound to an assessment attempt (the
+   * assessment policy's answer, owner f6a67dd0). Absent, false or throwing: workspace_unsupported, nothing sent,
+   * so an ordinary project never reaches an assessment-bound computer.
+   */
+  computerFree?(record: AwsTunnelRecord): Promise<boolean>;
 }
 
 type EdgeReply =
@@ -269,9 +290,9 @@ export interface AwsRepoOpenJob {
   class: RepoOpenClass;
   handle: string;
   name: string;
-  /** Class assessment only (E1-6): names the wrapper W the result must answer; absent for class personal. */
+  /** Wrapped classes only (assessment E1-6, project 1.0.4): names the wrapper W the result must answer. */
   repositoryId?: string;
-  /** Class assessment only (r56): the defaultBranch the result's branch must equal; absent for class personal. */
+  /** Wrapped classes only (assessment r56, project 1.0.4): the defaultBranch the result's branch must equal. */
   defaultBranch?: string;
   acknowledged: boolean;
 }
@@ -279,12 +300,12 @@ export interface AwsRepoOpenJob {
 const JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged'];
 const ASSESSMENT_JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'defaultBranch', 'acknowledged'];
 const validJob = (job: unknown): job is AwsRepoOpenJob =>
-  isObject(job) && isRepoOpenClass(job.class) && exactKeys(job, job.class === 'assessment' ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
+  isObject(job) && isRepoOpenClass(job.class) && exactKeys(job, isWrappedClass(job.class) ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
   && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
   && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh')
   && typeof job.handle === 'string' && HANDLE_RE.test(job.handle) && typeof job.name === 'string' && validName(job.name)
-  && (job.class !== 'assessment' || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
-  && (job.class !== 'assessment' || (typeof job.defaultBranch === 'string' && validBranch(job.defaultBranch)))
+  && (!isWrappedClass(job.class) || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
+  && (!isWrappedClass(job.class) || (typeof job.defaultBranch === 'string' && validBranch(job.defaultBranch)))
   && typeof job.acknowledged === 'boolean';
 
 /** One start or poll: the job is still running (as far as that call can tell), or its final §8 answer. */
@@ -299,7 +320,9 @@ const finished = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', 
 const jobAnswer = (result: unknown, job: AwsRepoOpenJob): RepoOpenAnswer => (job.class === 'assessment'
   ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class,
     assessmentRemoteUrl(job.handle, job.name), job.defaultBranch)
-  : awsJobAnswer(result, job.op, `${AWS_REPO_OPEN_ROOT}/repos/${job.handle}/${job.name}`, job.class));
+  : job.class === 'project'
+    ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class, undefined, job.defaultBranch)
+    : awsJobAnswer(result, job.op, `${AWS_REPO_OPEN_ROOT}/repos/${job.handle}/${job.name}`, job.class));
 
 type EdgeCall = (path: string, until: number, payload?: string, token?: string) => Promise<EdgeReply>;
 
@@ -373,6 +396,7 @@ export async function awsRepoOpenStart(
   target: AwsRepoOpenTarget | Response,
   deps: AwsRepoOpenDeps,
   routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+  options: { projectGitHost?: string } = {},
 ): Promise<AwsRepoOpenStep> {
   // A refusal from awsControlTarget (claims mismatch, origin unavailable or starting): its body is
   // never read or forwarded.
@@ -380,7 +404,14 @@ export async function awsRepoOpenStart(
   try {
     // Never relay a field the Worker would refuse, whoever the caller is.
     const body = requestBody(input);
-    if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), deps.now(), routeClass)) return finished(refusal('invalid_request'));
+    if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), deps.now(), routeClass, options)) return finished(refusal('invalid_request'));
+    // Class project (1.0.4): fail closed unless this computer's host says it knows the class AND the computer is not
+    // bound to an assessment attempt. Nothing is sent otherwise (AMI 1.0.30 has no repo-open op at all).
+    if (routeClass === 'project') {
+      const gate = async () => !!deps.projectCapable && !!deps.computerFree
+        && (await deps.projectCapable(target.record)) === true && (await deps.computerFree(target.record)) === true;
+      if (!(await gate().catch(() => false))) return finished(refusal('workspace_unsupported'));
+    }
     const call = edgeOf(target, sandboxName, deps);
     if (!call) return finished(refusal('workspace_failed'));
     const random = deps.randomBytes ?? ((n: number) => crypto.getRandomValues(new Uint8Array(n)));
@@ -390,7 +421,7 @@ export async function awsRepoOpenStart(
     if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return finished(refusal('workspace_failed'));
     const digest = await sha256HexBytes(new TextEncoder().encode(relay));
     const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name,
-      ...(routeClass === 'assessment' ? { repositoryId: body.repositoryId, defaultBranch: body.defaultBranch } : {}), acknowledged: false };
+      ...(isWrappedClass(routeClass) ? { repositoryId: body.repositoryId, defaultBranch: body.defaultBranch } : {}), acknowledged: false };
 
     const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant.token);
     if (started.kind === 'leak') return finished(refusal('workspace_failed'));
@@ -400,6 +431,12 @@ export async function awsRepoOpenStart(
     // agent's reply fails after delivery). The job's status says which; a second start is never sent.
     if (started.kind === 'transport' || started.status >= 500) return { state: 'running', job };
     if (started.status === 404) return finished(refusal('workspace_unsupported'));
+    // An A2h host whose closed class table predates 1.0.4 refuses class project as repo_open_invalid: the
+    // capability is absent there, never a request to retry.
+    if (routeClass === 'project' && started.status === 409 && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
+      && started.data.error === 'repo_open_invalid') {
+      return finished(refusal('workspace_unsupported'));
+    }
     if (started.status === 409 && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
       && started.data.error === 'workspace_busy') {
       return finished(refusal('workspace_busy'));
@@ -469,9 +506,10 @@ export async function handleAwsRepoOpen(
   target: AwsRepoOpenTarget | Response,
   deps: AwsRepoOpenDeps,
   routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+  options: { projectGitHost?: string } = {},
 ): Promise<RepoOpenAnswer> {
   try {
-    const started = await awsRepoOpenStart(input, sandboxName, target, deps, routeClass);
+    const started = await awsRepoOpenStart(input, sandboxName, target, deps, routeClass, options);
     if (started.state === 'done') return started.answer;
     const deadline = input.receivedAt + WORKER_DEADLINE_MS;
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
