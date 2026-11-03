@@ -15,7 +15,7 @@
 //   4. Shows a visible notice whenever a mint that asked for a folder did not
 //      open exactly that folder in its first document (another folder, an
 //      empty window, a workspace, a foreign or unreadable folder), or did but
-//      the server answered that it did not restore it, and keeps the record so
+//      the server found that folder missing or not a directory, and keeps the record so
 //      the next mint asks again (a transient miss never erases it; only Close
 //      Folder, a new folder or "Forget it" do).
 //
@@ -46,12 +46,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Server outcomes that opened something other than the asked folder (codes only; never a path). */
 const FALLBACKS = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error']);
 /**
- * Server outcomes that definitely did not restore the asked folder: no `folder=` was added, so the editor opened its
- * own last folder, which may be the asked one itself (a missing folder then shows only VS Code's own "does not
- * exist"). Not `restored`, not `unverified` (no check wired: that last folder is the editor's own pick, existence
- * unknown), not the shell-local `unsupported_server` (no answer at all).
+ * Server outcomes that say the asked folder cannot be open: no `folder=` was added, so the editor opened its own last
+ * folder, which may be the asked one itself, and then shows only VS Code's own "does not exist". Every other outcome
+ * with a matching report means that last folder exists and is on screen (`symlink`, `too_long`, a policy refusal,
+ * `unverified`, no answer), so it stays silent like `restored`.
  */
-const NOT_RESTORED = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'too_long', 'error']);
+const NOT_RESTORED = new Set(['missing', 'not_directory']);
 
 /**
  * The notice code for a mint that asked for a folder and whose first document opened something else. Shell-local
@@ -211,7 +211,7 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  *   - anything else (a stale document of an earlier mint, a first document
  *     that has not reported yet): dropped without a word.
  * A mint-driven report that is not exactly the asked folder, or is but the
- * server answered a definite non-restore, shows the notice once for this
+ * server found it missing or not a directory, shows the notice once for this
  * binding and leaves the record as it was.
  */
 export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
@@ -250,10 +250,10 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
             // The mint asked for a folder and its first document opened anything else: another folder, an empty
             // window, a workspace, a folder of another host or one the grammar refuses. The editor's provider fixes
             // this document's workspace synchronously from its URL at startup, so this is the final answer for the
-            // mint, not a "not hydrated yet". Or it opened exactly that folder although the server answered a
-            // definite non-restore: with no `folder=` the editor opened its own last folder, which can be the asked
-            // one even when it is missing (VS Code then shows only its own "does not exist"). `restored`, and
-            // `unverified` or no answer with a matching report (the editor's own pick), stay silent below. Say so
+            // mint, not a "not hydrated yet". Or it reported exactly that folder although the server found it missing
+            // or not a directory: with no `folder=` the editor opened its own last folder, the asked one, and shows
+            // only VS Code's own "does not exist". Any other outcome with a matching report has that folder on
+            // screen (the editor's own pick) and stays silent below. Say so
             // (visible), and keep the record untouched so the next mint asks again (a missing mount that comes back,
             // an older server that ignored the ask). Never erased here.
             if ( ! fallbackShown ) {

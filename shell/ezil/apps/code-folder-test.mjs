@@ -166,14 +166,14 @@ for ( const kind of ['empty', 'workspace', 'foreign'] ) {
     F.load(); report(mintOf(url), kind);
     eq(notices.length, before, `no ask, first document ${kind}: no notice`); eq(M.readFolderRecord(bind), null, `no ask, ${kind}: nothing written`);
 }
-// 11h the first document is EXACTLY the asked folder but the server answered a definite non-restore: no folder= was
-//     added, so the editor opened its own last folder, which can be the asked one even when it is missing (VS Code
-//     then shows only its own "does not exist"). Said, once per mint, and the record untouched (`at` included).
-//     restored, unverified (the editor's own pick, existence unknown) and no answer with a matching report: silent.
+// 11h the first document is EXACTLY the asked folder but the server found it missing or not a directory: no folder=
+//     was added, so the editor opened its own last folder, the asked one, and shows only VS Code's own "does not
+//     exist". Said, once per mint, and the record untouched (`at` included). Every other outcome with a matching
+//     report has that folder on screen (the editor's own pick): silent.
 url = mintAndAttach('t13', undefined, undefined); F.load(); report(mintOf(url), 'folder', '/workspace/sub');
 const seeded = M.readFolderRecord(bind); eq(seeded?.path, '/workspace/sub', 'seeded /workspace/sub');
 const realNow = Date.now; Date.now = () => seeded.at + 60_000; // a write that falls through would move `at`
-for ( const outcome of ['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'too_long', 'error'] ) {
+for ( const outcome of ['missing', 'not_directory'] ) {
     url = mintAndAttach(`t13-${outcome}`, M.folderAskFor(bind), { v: 1, outcome }); before = notices.length;
     F.load(); report(mintOf(url), 'folder', '/workspace/sub');
     eq(notices.slice(before), [[outcome, '/workspace/sub']], `${outcome} + the asked folder on screen: the notice is shown`);
@@ -183,7 +183,8 @@ url = mintAndAttach('t14', M.folderAskFor(bind), { v: 1, outcome: 'missing' }); 
 F.load(); report(mintOf(url), 'folder', '/workspace/sub'); fire({ type: 'ezil.code.ready', v: 1 }); report(mintOf(url), 'folder', '/workspace/sub');
 eq(notices.slice(before), [['missing', '/workspace/sub']], 'missing + the asked folder on screen: one notice for the mint, not one per hello');
 eq(M.readFolderRecord(bind), seeded, 'and the record is still untouched');
-for ( const [i, answer] of [{ v: 1, outcome: 'restored' }, { v: 1, outcome: 'unverified' }, undefined, { v: 1, outcome: 'later_code' }].entries() ) {
+const silent = ['restored', 'unverified', 'symlink', 'outside', 'not_allowed', 'invalid', 'too_long', 'error', 'later_code'];
+for ( const [i, answer] of [...silent.map(outcome => ({ v: 1, outcome })), undefined].entries() ) {
     const what = answer?.outcome ?? 'no answer';
     url = mintAndAttach(`t15-${i}`, M.folderAskFor(bind), answer); before = notices.length;
     F.load(); report(mintOf(url), 'folder', '/workspace/sub');
