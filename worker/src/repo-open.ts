@@ -14,7 +14,8 @@
  *   POST /sandbox/<name>/repo-open        signed v2 (`x-ezil-auth`), no query
  *   { repositoryId: <lowercase uuid>,
  *     canonicalURL: "https://<32 hex>.artifacts.cloudflare.net/git/<namespace>/<name>.git"
- *                 | "https://github.ezil.work/<owner>/<name>.git",
+ *                 | "https://github.ezil.work/<owner>/<name>.git"
+ *                 | "https://git-qa.ezil.work/<owner>/<name>.git"   (opt-in only, see below),
  *     ref: "refs/heads/<branch>",
  *     git: { token: <opaque, visible ASCII, ≤ 4096>, expiresAt: <ISO datetime> },
  *     timeoutMs?: <integer, REPO_OPEN_MIN_TIMEOUT_MS..REPO_OPEN_EXEC_TIMEOUT_MS> }
@@ -26,6 +27,14 @@
  * ref and token rules are enforced here). `git.username` ('ezil') and
  * `git.scope` ('read' | 'write') may ride along unchanged (the layout is the
  * same for both); nothing else may.
+ * The third remote, `git-qa.ezil.work` (EZiL Git's staging gateway, the only
+ * host staging Works issues grants for), is accepted only by a caller that
+ * opts in through `RepoOpenRemotes.stagingGitQa`: the OS staging assessment
+ * seam, which reuses `parseRepoOpenRequest` and `EzilSandboxDO.repoOpen` for
+ * candidate checkouts. This route (`handleRepoOpen`) never opts in, so the
+ * personal open-project flow, and production, refuse it as
+ * `repo_open_invalid_request`. Opting in widens nothing else: the same path,
+ * ref and token rules apply, and it is Basic auth like `github.ezil.work`.
  * `timeoutMs` is what is left of the OS server's own deadline: every bound
  * inside the computer (lock wait, git, the exec itself) is derived from it, so
  * the Worker never keeps cloning after the caller has given up.
@@ -60,8 +69,11 @@
  *     computer's git (2.34) cannot take a Bearer token from a credential
  *     helper, so it is an extra header given to the network command through
  *     `GIT_CONFIG_VALUE_<n>` in that command's environment;
- *   - github.ezil.work (the gateway): HTTP Basic `ezil:<token>`, from a
- *     one-shot credential helper that reads it from the git process's env.
+ *   - github.ezil.work (the gateway) and, opted in, git-qa.ezil.work (its
+ *     staging twin): HTTP Basic `ezil:<token>`, from a one-shot credential
+ *     helper that reads it from the git process's env. The script knows no
+ *     host name: it takes the URL and the auth kind, and scopes the helper to
+ *     the URL's own host.
  * Either way:
  *   - it arrives through the Sandbox SDK's per-command `env` (exported in the
  *     session shell for this command only, then restored — never part of the
@@ -191,6 +203,23 @@ const REPOSITORY_PATH = String.raw`[a-z0-9][a-z0-9-]{0,63}\/(?![a-z0-9._-]*\.\.)
 export const ARTIFACTS_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/[0-9a-f]{32}\.artifacts\.cloudflare\.net\/git\/${REPOSITORY_PATH}$`);
 /** EZiL Git's gateway (`github.ezil.work`): Basic auth with an `egg_` grant. */
 export const EZIL_GIT_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/github\.ezil\.work\/${REPOSITORY_PATH}$`);
+/**
+ * EZiL Git's staging gateway (`git-qa.ezil.work`), where staging Works issues
+ * its grants: Basic auth with an `egg_` grant, like `github.ezil.work`.
+ * Accepted ONLY when the caller opts in (`RepoOpenRemotes.stagingGitQa`).
+ */
+export const STAGING_GIT_QA_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/git-qa\.ezil\.work\/${REPOSITORY_PATH}$`);
+
+/**
+ * Remotes a caller may accept beyond the default two. Only the OS staging
+ * assessment seam opts in; the personal open-project route
+ * (`handleRepoOpen` in `index.ts`) never passes this, so it, and production,
+ * never accept `git-qa.ezil.work`. Only the literal `true` enables an entry.
+ */
+export interface RepoOpenRemotes {
+  /** Also accept `STAGING_GIT_QA_REPOSITORY_URL` (Basic auth). */
+  stagingGitQa?: boolean;
+}
 /** The binding's `ref` pattern; its refinements are applied in `branchOf`. */
 const REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
 /**
@@ -201,7 +230,7 @@ const GIT_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const HEAD = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
-/** How git presents the token: Bearer to Cloudflare Artifacts, Basic `ezil:<token>` to EZiL Git's gateway. */
+/** How git presents the token: Bearer to Cloudflare Artifacts, Basic `ezil:<token>` to EZiL Git's gateway (production or, opted in, staging). */
 export type RepoOpenAuth = 'bearer' | 'basic';
 
 export interface RepoOpenRequest {
@@ -254,22 +283,34 @@ export function branchOf(ref: unknown): string | null {
   return branch;
 }
 
-/** The auth scheme for a canonical URL, or null for any URL that is not one of the two remotes. */
-export function repoOpenAuthFor(url: unknown): RepoOpenAuth | null {
+/**
+ * The auth scheme for a canonical URL, or null for any URL that is not one of
+ * the two default remotes or (opted in through `remotes`) the staging one.
+ */
+export function repoOpenAuthFor(url: unknown, remotes: RepoOpenRemotes = {}): RepoOpenAuth | null {
   if (typeof url !== 'string') return null;
   if (ARTIFACTS_REPOSITORY_URL.test(url)) return 'bearer';
   if (EZIL_GIT_REPOSITORY_URL.test(url)) return 'basic';
+  if (optedIntoStagingGitQa(remotes) && STAGING_GIT_QA_REPOSITORY_URL.test(url)) return 'basic';
   return null;
+}
+
+/** Own property only: an inherited `stagingGitQa` (a polluted prototype) never opts a caller in. */
+function optedIntoStagingGitQa(remotes: unknown): boolean {
+  return typeof remotes === 'object' && remotes !== null && Object.hasOwn(remotes, 'stagingGitQa')
+    && (remotes as RepoOpenRemotes).stagingGitQa === true;
 }
 
 /**
  * Validate the request body. Strict: unknown keys are refused, ids must be
  * lowercase canonical UUIDs, and an expired (or nearly expired) grant is its
- * own answer so the caller can mint a fresh one.
+ * own answer so the caller can mint a fresh one. `remotes` widens only which
+ * remote is accepted (`repoOpenAuthFor`); every other rule is the same.
  */
 export function parseRepoOpenRequest(
   body: unknown,
   now: number = Date.now(),
+  remotes: RepoOpenRemotes = {},
 ): { ok: true; request: RepoOpenRequest } | { ok: false; error: 'repo_open_invalid_request' | 'repo_open_token_expired' } {
   const invalid = { ok: false as const, error: 'repo_open_invalid_request' as const };
   if (!isPlainObject(body)) return invalid;
@@ -277,7 +318,7 @@ export function parseRepoOpenRequest(
   if (keys !== 'canonicalURL,git,ref,repositoryId') return invalid;
   const { repositoryId, canonicalURL, ref, git } = body;
   if (typeof repositoryId !== 'string' || !UUID.test(repositoryId)) return invalid;
-  const auth = repoOpenAuthFor(canonicalURL);
+  const auth = repoOpenAuthFor(canonicalURL, remotes);
   if (auth === null) return invalid;
   const branch = branchOf(ref);
   if (branch === null) return invalid;

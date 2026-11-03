@@ -97,6 +97,17 @@ describe('POST /sandbox/:name/repo-open on the real route table', () => {
     expect(calls[0]!.request).toMatchObject({ canonicalURL: 'https://github.ezil.work/acme/site.git', auth: 'basic', token: grant });
   });
 
+  it('🔴 a staging EZiL Git (git-qa.ezil.work) remote is 400 repo_open_invalid_request here (this route never opts in) and never reaches the computer', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const grant = `egg_${'ab12'.repeat(16)}`;
+    const body = JSON.stringify({ ...JSON.parse(BODY), canonicalURL: 'https://git-qa.ezil.work/acme/site.git', git: { token: grant, expiresAt: new Date(Date.now() + 60_000).toISOString() } });
+    const res = await worker.fetch(await signed({ signBody: body }), env(binding));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(calls).toHaveLength(0);
+  });
+
   it('with no workspace store configured, the root is code-server\'s own default and needs no marker', async () => {
     const worker = await loadWorker();
     const { binding, calls } = fakeNamespace();
