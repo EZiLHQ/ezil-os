@@ -76,6 +76,25 @@
     "projectTab": "The record is the app link's {project, repo} UUIDs only (not secrets; the same as the shell URL). Every restore re-runs the whole project open: computer ownership, Universe authorization with the current EZiL ID, a fresh grant of at most 5 minutes. No grant, token, remote or path is stored or put in a URL. 'path' stays reveal-only and is never an editor root.",
     "wrongUser": "Walks and opens run only on the signed-in person's own computer (the v2 claims bind sandbox and user); a record another person left in the same tab reveals nothing (codes only) and can only open the signed-in person's own folder. Proposal for the shell: key records by (EZiL ID subject digest, computerId) and drop any mismatch."
   },
+  "relativePath": {
+    "owner": "editor f179c8a4 (code.js) + app route; walk by e1cd418a",
+    "rule": "path is a reveal-only hint below <root>/projects/<repositoryId>/repository, in the shared code-folder v1 grammar, walked with no symlink followed (cloudflareCodeFolderResolver with that root); revealed only on 'restored'; never an editor root or authority.",
+    "cases": [
+      { "path": "src/app", "tree": "real directory", "expect": "revealed" },
+      { "path": "src/link", "tree": "symlink to a directory", "expect": "not revealed (symlink)" },
+      { "path": "../other", "tree": "-", "expect": "not revealed (invalid)" },
+      { "path": "/etc", "tree": "-", "expect": "not revealed (outside)" },
+      { "path": "gone", "tree": "missing", "expect": "not revealed (missing)" }
+    ]
+  },
+  "pushGrant": {
+    "status": "GAP on the live open-project path: the grant is used for clone/fetch only; no credential remains, so git push from Code fails. Proposed design reuses the u2 kernel grant machinery (OS 84e4b686).",
+    "files": { "grant": "/run/ezil/git/grants/<handle>__<name>.json", "wrapper": "/run/ezil/bin/ezil-git-grant", "repoConfig": "credential.helper = the fixed wrapper path only" },
+    "refresh": "every <= 4 min while a Code window shows the project, and on reopen/remint; each refresh is an ordinary Universe open; the Worker rewrites /run files only",
+    "expiredHint": "EZiL: Git access for <handle>/<name> expired. Reopen it from EZiL OS (Code renews it while open).",
+    "scope": "Basic-auth hosts only (git-qa.ezil.work on staging, github.ezil.work in production); Cloudflare Artifacts (Bearer) is out of scope on git 2.34.1",
+    "twoPushProof": ["open, edit, push #1 succeeds", "past expiry without refresh: push refused with expiredHint", "refresh, push #2 succeeds", "refresh for another repository or another user refused", "grant never in argv, environ, .git/config, the folder or output (strace)"]
+  },
   "isolation": [
     "OS → Universe: the retained EZiL ID token of THIS session, in the request body only; the computer is checked as the caller's own before Universe hears of the open.",
     "Universe: iss/aud/exp/sub verified; sub → exactly one active users row; owner-only for builder projects; 403 for everything else, existence never revealed.",

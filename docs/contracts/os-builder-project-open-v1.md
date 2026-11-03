@@ -10,7 +10,8 @@ Vectors: `os-builder-project-open-v1.vectors.json` (the exact cases; this text e
 | §3 Works clone-token fields | Works slot5 | ask (W-1..W-3) |
 | §4 OS app accepts git-qa on staging | OS app (open-project; cb1d14e6 integrates) | patch proposal |
 | §5 OS Worker accepts git-qa on os-staging | e1cd418a | implemented on `feat/repo-open-resolver-20261103` |
-| §6 Per-tab restore | editor lead f179c8a4 (shell/app), e1cd418a (Worker walk), cb1d14e6 (AWS host op bake) | Worker walk implemented |
+| §6 Per-tab restore and the reveal path | editor lead f179c8a4 (shell/app), e1cd418a (Worker walk), cb1d14e6 (AWS host op bake) | Worker walk implemented |
+| §7 Renewable push grant (two pushes) | e1cd418a (Worker), OS app/shell owner (refresh loop), Universe (unchanged open), Works (W-3) | **gap**; design below |
 
 Why: Universe REG-1 provisions a Builder-created project's repository in Works (staging host `git-qa.ezil.work`), but the project cannot be opened in OS. `POST /internal/project-repositories/open` resolves only hired projects, so a builder project gets 403. The board's `launchUrl` is always null, and OS refused the staging Git host on the personal route.
 
@@ -56,3 +57,42 @@ The route, the body `{userIdToken, projectId, repositoryId}`, identity verificat
   - Every restore re-runs the full open, with fresh authorization and a fresh grant.
   - `path` stays reveal-only.
 - **Wrong user.** Walks and opens run only on the signed-in person's own computer.
+
+### 6a. Relative path (reveal only)
+`path` in `/app/code?project=&repo=&path=` is a hint, never an editor root and never authority.
+- **Grammar.** The shared code-folder v1 grammar (`plainFolderPath`), relative, below `<root>/projects/<repositoryId>/repository`.
+- **Server walk.** The server walks it there with the same no-follow walk (`cloudflareCodeFolderResolver(exec, '<root>/projects/<repositoryId>/repository')(rel)`), and reveals it only on `restored`.
+- **Refusals.** A symlink at any component, `..`, an absolute path or a missing folder reveals nothing; the project still opens at its folder.
+- **Owners.** Editor f179c8a4 (shell `code.js`) and the app route own the reveal. The walk is e1's and is already reusable with that root.
+
+## 7. Renewable push grant (gap found 2026-11-03)
+**Today.** The live open-project flow uses Universe's grant for the clone or fetch only.
+- The token reaches git through one command's environment, and nothing is left on the computer. That is deliberate: no `.git/config` credential, no helper.
+- So a `git push` from Code after the open has no credential, and the acceptance case "edit, then two pushes" cannot pass on this path.
+
+**Proposed (reuse what already proves two pushes).** The u2 kernel's grant machinery (OS `84e4b686`) does this, with the test "class assessment … two pushes through the helper":
+- a grant file at `/run/ezil/git/grants/<handle>__<name>.json` (root-only `0600`, outside `/workspace`, never checkpointed);
+- the fixed wrapper `/run/ezil/bin/ezil-git-grant`, which serves it only for its own protocol, host and path, and only while it is more than 30 s from expiry;
+- in the clone's `.git/config`, only `credential.helper` naming that fixed wrapper path, never a token;
+- a `refresh` op that rewrites the `/run` files only;
+- once a grant has lapsed, the helper refuses with the fixed hint "EZiL: Git access for `<handle>/<name>` expired. Reopen it from EZiL OS (Code renews it while open)."
+
+For ordinary Builder projects (Basic auth on `git-qa`/`github.ezil.work`):
+
+| Owner | Part |
+|---|---|
+| e1 (Worker `repo-open.ts`) | after a successful open, install the wrapper and grant and set the helper; add a `refresh` exec that installs a fresh grant and touches nothing else |
+| OS app/shell owner | while a Code window shows the project, refresh every ≤ 4 min (the grant lives at most 5 min), and on reopen or remint |
+| Universe | none: each refresh is an ordinary `open` call (rate limit 60/min) |
+| Works | W-3 (route-scoped, ≤ 5 min, `write` for the owner) |
+
+Hired projects on Cloudflare Artifacts are out of this section: git 2.34.1 cannot take a Bearer token from a credential helper.
+
+**Two-push proof (local first).**
+1. Open, edit, push #1.
+2. Advance past the grant's expiry; the push is refused with the hint.
+3. Refresh, push #2 succeeds.
+4. A refresh for another repository or user is refused.
+5. The grant never appears in argv, environ, `.git/config`, the folder or the output (strace, as the u2 kernel tests do).
+
+Then the staging run with the founder's test identities, after release approval.
