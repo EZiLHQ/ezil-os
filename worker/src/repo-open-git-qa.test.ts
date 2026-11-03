@@ -6,6 +6,7 @@
  * `true`), and the opt-in widens nothing else: not the host pattern, not the
  * path, ref or token rules, not the other two remotes.
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'bun:test';
 
 import {
@@ -308,5 +309,33 @@ describe('repoOpenRemotesFor: the personal route opts in on os-staging only (its
     expect(parseRepoOpenRequest(body(GIT_QA_P, { extra: 1 }), Date.now(), remotes)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
     expect(parseRepoOpenRequest(body(GIT_QA_P, { git: { token: GRANT, expiresAt: new Date(Date.now() + 1_000).toISOString() } }), Date.now(), remotes))
       .toEqual({ ok: false, error: 'repo_open_token_expired' });
+  });
+});
+
+describe('docs/contracts/os-builder-project-open-v1.vectors.json osWorker: the code answers every listed case', () => {
+  const C = JSON.parse(readFileSync(new URL('../../docs/contracts/os-builder-project-open-v1.vectors.json', import.meta.url), 'utf8')) as {
+    contract: string;
+    osWorker: { routeGate: { accept: string[]; refuse: Array<string | null> }; remotes: { stagingAccept: string[]; alwaysRefuse: string[] } };
+    negativeCases: Array<{ case: string; where: string; expect: string }>;
+  };
+  it('names its contract and covers every negative case the request lists', () => {
+    expect(C.contract).toBe('ezil.os-builder-project-open.v1');
+    expect(C.negativeCases.map((c) => c.case)).toEqual(['wrong user', 'stale binding (folder exists with another origin)', 'foreign origin remote', 'unknown repo',
+      'deleted or missing folder', 'duplicate / retry', 'unicode', 'nested repository', 'git 2.34.1', 'ordinary non-assignment Builder project']);
+  });
+  it('routeGate: accept opts in, refuse does not', () => {
+    for (const v of C.osWorker.routeGate.accept) expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true });
+    for (const v of C.osWorker.routeGate.refuse) expect({ v, got: repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v ?? undefined }) }).toEqual({ v, got: {} });
+  });
+  it('remotes: staging accepts as Basic only with the gate; the refused list is refused with and without it', () => {
+    const staging = repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: C.osWorker.routeGate.accept[0] });
+    for (const url of C.osWorker.remotes.stagingAccept) {
+      expect(repoOpenAuthFor(url, staging)).toBe('basic');
+      expect(repoOpenAuthFor(url, {})).toBeNull();
+    }
+    for (const url of C.osWorker.remotes.alwaysRefuse) {
+      expect({ url, got: repoOpenAuthFor(url, staging) }).toEqual({ url, got: null });
+      expect(repoOpenAuthFor(url, {})).toBeNull();
+    }
   });
 });
