@@ -692,7 +692,7 @@ export const BOOT_FAILURE_COPY = {
     // after the computer stopped, so a leftover poll cannot restart it. An explicit desktop open is not held.
     computer_stopped: {
         title: 'Your computer was just stopped',
-        body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the desktop from Settings → Computer, or try again in a minute.",
+        body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the Browser from Settings → Computer, or try again in a minute.",
     },
     operations_paused: {
         title: 'Your AWS computer is paused by operations',
