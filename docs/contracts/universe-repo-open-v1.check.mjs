@@ -77,7 +77,7 @@ ok(PROD.length >= 2 && new Set(PROD).size === PROD.length && PROD.every((c) => /
 
 // ── version and constants ────────────────────────────────────────────────────
 ok(V.contract === 'universe-repo-open-v1', 'contract name');
-ok(V.contractVersion === '1.0.4', 'contractVersion is "1.0.4"');
+ok(V.contractVersion === '1.0.5', 'contractVersion is "1.0.5"');
 for (const name of V.requiredConstants) ok(Object.hasOwn(C, name), `constants: ${name} missing`);
 ok(C.CLIENT_ID_UNPINNED === 'UNPINNED', 'CLIENT_ID_UNPINNED');
 for (const key of ['OS_STAGING_ORIGIN', 'WORKS_STAGING_ORIGIN', 'PREVIEW_SUPABASE_ORIGIN']) {
@@ -297,11 +297,16 @@ ok(V.activation.cases.some((c) => c.origin === C.OS_STAGING_ORIGIN && PROD.inclu
 // ── Works deployment and auth ────────────────────────────────────────────────
 function effective(c) { return !c || c === 'UNPINNED' || PROD.includes(c) ? 'UNPINNED' : c; }
 function deploymentFor(apiOrigin, pins) {
-    if (apiOrigin !== C.WORKS_STAGING_ORIGIN) return { name: 'DEFAULT', v1Clients: [...PROD], osClient: null, gitHost: C.GIT_PRODUCTION_HOST };
     const uni = effective(pins.universe);
     let os = effective(pins.os);
     if (os !== 'UNPINNED' && os === uni) os = 'UNPINNED';
-    return { name: 'STAGING', v1Clients: [uni, os].filter((c) => c !== 'UNPINNED'), osClient: os === 'UNPINNED' ? null : os, gitHost: C.GIT_STAGING_HOST };
+    const osClient = os === 'UNPINNED' ? null : os;
+    // 1.0.5: api-staging (the Works behind git-qa) is DEFAULT plus the effective OS pin, for class project only.
+    if (apiOrigin === C.WORKS_QA_ORIGIN) {
+        return { name: 'QA', v1Clients: osClient === null ? [...PROD] : [...PROD, osClient], osClient, gitHost: C.GIT_ASSESSMENT_HOST };
+    }
+    if (apiOrigin !== C.WORKS_STAGING_ORIGIN) return { name: 'DEFAULT', v1Clients: [...PROD], osClient: null, gitHost: C.GIT_PRODUCTION_HOST };
+    return { name: 'STAGING', v1Clients: [uni, os].filter((c) => c !== 'UNPINNED'), osClient, gitHost: C.GIT_STAGING_HOST };
 }
 eq(V.works.deployments.DEFAULT.v1Clients, PROD, 'DEFAULT v1Clients equal the frozen production list');
 ok(V.works.deployments.DEFAULT.osClient === null && V.works.deployments.DEFAULT.gitHost === C.GIT_PRODUCTION_HOST, 'DEFAULT deployment');
@@ -312,6 +317,19 @@ for (const c of V.works.effectivePins) {
     eq({ v1Clients: d.v1Clients.map(sym), osClient: d.osClient === null ? null : sym(d.osClient) }, c.expect, `effectivePins ${JSON.stringify(c.pins)}`);
     ok(d.v1Clients.every((x) => !PROD.includes(x)), 'staging v1Clients ∩ production = ∅');
 }
+// 1.0.5: the QA row keeps DEFAULT's clients and adds only the effective OS pin; no production client is ever its osClient.
+for (const c of V.works.qaEffectivePins) {
+    const d = deploymentFor(C.WORKS_QA_ORIGIN, { os: resolveClient(c.pins.os), universe: resolveClient(c.pins.universe) });
+    eq({ v1Clients: d.v1Clients.map(sym), osClient: d.osClient === null ? null : sym(d.osClient) }, c.expect, `qaEffectivePins ${JSON.stringify(c.pins)}`);
+    ok(d.osClient === null || !PROD.includes(d.osClient), 'QA osClient is never a production client');
+    eq(d.v1Clients.slice(0, PROD.length), PROD, 'QA keeps DEFAULT v1Clients unchanged');
+}
+ok(V.works.deployments.QA.gitHost === C.GIT_ASSESSMENT_HOST && C.REPO_OPEN_PROJECT_GIT_HOSTS.includes(V.works.deployments.QA.gitHost), 'QA gitHost is git-qa, a project host');
+eq(deploymentFor(C.WORKS_QA_ORIGIN, { os: ids.OS_STAGING, universe: ids.UNIVERSE_STAGING }).gitHost, V.works.deployments.QA.gitHost, 'QA row gitHost (reference = vectors)');
+// The OS app never calls the QA origin itself (Universe's builder open does): it stays on the OS's forbidden list.
+ok(new URL(C.WORKS_QA_ORIGIN).origin === C.WORKS_QA_ORIGIN && C.STAGING_FORBIDDEN_HOSTS.includes(new URL(C.WORKS_QA_ORIGIN).host), 'WORKS_QA_ORIGIN is a bare origin the OS never calls');
+eq(Object.keys(C.WORKS_OS_GRANT_CLASSES).sort(), ['QA', 'STAGING'], 'one os-grant class per mounted row');
+ok(C.WORKS_OS_GRANT_CLASSES.STAGING === null && C.WORKS_OS_GRANT_CLASSES.QA === 'project' && C.REPO_OPEN_CLASSES.includes(C.WORKS_OS_GRANT_CLASSES.QA), 'STAGING grants the legacy class, QA class project (existing class vocabulary)');
 const OS_ROUTES = new Set(['os-grant', 'os-revoke']);
 const ROUTES_WITH_REF = new Set(['os-grant', 'clone-token', 'freeze', 'push-tests']);
 // Reads works.authRule in order: 0 mounting, 1 verify, 2 central OS-token
@@ -321,7 +339,7 @@ const ROUTES_WITH_REF = new Set(['os-grant', 'clone-token', 'freeze', 'push-test
 function worksAuth(c) {
     const d = c.deployment === 'DEFAULT'
         ? deploymentFor(null, {})
-        : deploymentFor(C.WORKS_STAGING_ORIGIN, { os: resolveClient(c.pins.os), universe: resolveClient(c.pins.universe) });
+        : deploymentFor(c.deployment === 'QA' ? C.WORKS_QA_ORIGIN : C.WORKS_STAGING_ORIGIN, { os: resolveClient(c.pins.os), universe: resolveClient(c.pins.universe) });
     const ref = c.ref === null ? null : V.works.refs[c.ref];
     const isOs = OS_ROUTES.has(c.route);
     const mounted = !isOs || d.osClient !== null;
@@ -349,10 +367,25 @@ for (const token of ['OS_STAGING', 'UNIVERSE_STAGING']) for (const route of OS_R
         `works auth: needs a DEFAULT ${route} case for a ${token} token (401)`);
 }
 for (const c of V.works.authCases) eq(worksAuth(c), c.expect, `works auth ${c.deployment} ${c.token} ${c.route} ${c.ref}`);
-const osGrantRequestValid = (b) => b && typeof b === 'object' && !Array.isArray(b)
-    && Object.keys(b).length === 1 && R.COMPUTER_LABEL_RE(b.computerLabel) && JSON.stringify(b).length <= C.BODY_LIMITS_BYTES.worksOsGrantRequest;
+// 1.0.5: on QA the OS token reaches os-grant and nothing else; clone-token stays the CLI's and Universe's 60-minute web clone.
+ok(V.works.authCases.some((c) => c.deployment === 'QA' && c.token === 'OS_STAGING' && c.route === 'clone-token' && c.expect.status === 401), 'works auth: needs a QA OS-token clone-token refusal');
+ok(V.works.authCases.some((c) => c.deployment === 'QA' && c.token === 'OS_STAGING' && c.route === 'os-grant' && c.expect.status === 'handler'), 'works auth: needs a QA OS-token os-grant handler case');
+// 1.0.5: the row decides the class (WORKS_OS_GRANT_CLASSES); the body must name exactly that class, or none on STAGING.
+const osGrantRequestValid = (b, row = 'STAGING') => {
+    const cls = C.WORKS_OS_GRANT_CLASSES[row];
+    const keys = cls === null ? ['computerLabel'] : ['computerLabel', 'class'];
+    return Boolean(b) && typeof b === 'object' && !Array.isArray(b)
+        && Object.keys(b).length === keys.length && keys.every((k) => Object.hasOwn(b, k))
+        && R.COMPUTER_LABEL_RE(b.computerLabel) && (cls === null || b.class === cls)
+        && JSON.stringify(b).length <= C.BODY_LIMITS_BYTES.worksOsGrantRequest;
+};
 for (const b of V.works.osGrantRequest.valid) ok(osGrantRequestValid(b), `os-grant request valid ${JSON.stringify(b)}`);
 for (const b of V.works.osGrantRequest.invalid) ok(!osGrantRequestValid(b), `os-grant request invalid ${JSON.stringify(b)}`);
+for (const b of V.works.osGrantRequest.project.valid) ok(osGrantRequestValid(b, 'QA'), `os-grant project request valid ${JSON.stringify(b)}`);
+for (const b of V.works.osGrantRequest.project.invalid) ok(!osGrantRequestValid(b, 'QA'), `os-grant project request invalid ${JSON.stringify(b)}`);
+// Each row refuses the other row's valid body.
+for (const b of V.works.osGrantRequest.valid) ok(!osGrantRequestValid(b, 'QA'), `QA refuses the legacy body ${JSON.stringify(b)}`);
+for (const b of V.works.osGrantRequest.project.valid) ok(!osGrantRequestValid(b, 'STAGING'), `STAGING refuses the project body ${JSON.stringify(b)}`);
 const osRevokeRequestValid = (b) => b && typeof b === 'object' && !Array.isArray(b)
     && Object.keys(b).every((k) => k === 'computerLabel') && (b.computerLabel === undefined || R.COMPUTER_LABEL_RE(b.computerLabel));
 for (const b of V.works.osRevokeRequest.valid) ok(osRevokeRequestValid(b), `revoke request valid ${JSON.stringify(b)}`);
@@ -395,6 +428,35 @@ const ctx = { repoId: V.fixtures.repositoryId, gitHost: C.GIT_STAGING_HOST, now:
 ok(osGrantResponseValid(materialise(V.works.osGrantResponse.base), ctx), 'os-grant response base valid');
 for (const m of V.works.osGrantResponse.validMutations) ok(osGrantResponseValid(mutate(V.works.osGrantResponse.base, m), ctx), `os-grant response valid ${JSON.stringify(m)}`);
 for (const m of V.works.osGrantResponse.invalidMutations) ok(!osGrantResponseValid(mutate(V.works.osGrantResponse.base, m), ctx), `os-grant response invalid (${m.why})`);
+// 1.0.5: the project grant (QA row). Issued for min(300 s, the bearer's exp); accepted up to 300 s + 30 s skew, with the class echoed.
+{
+    const P = V.works.osGrantProjectResponse;
+    const legacy = V.works.osGrantResponse.keys;
+    eq(P.keys, [...legacy, 'class'], 'project answer = the legacy keys + class');
+    function osGrantProjectResponseValid(r, { repoId, projectGitHost, now }) {
+        if (!r || Object.keys(r).length !== P.keys.length || !P.keys.every((k) => Object.hasOwn(r, k))) return false;
+        const t = isoMs(r.expiresAt);
+        return r.class === 'project' && r.username === C.GRANT_USERNAME && R.GRANT_RE(r.token) && r.repositoryId === repoId
+            && R.HANDLE_RE(r.handle) && R.NAME_RE(r.name) && r.routeName === `${r.handle}/${r.name}`
+            && r.cloneUrl === `https://${projectGitHost}/${r.routeName}.git`
+            && t > now && t <= now + T.PROJECT_GRANT_ACCEPT_MAX_MS
+            && C.GRANT_SCOPES.includes(r.scope) && R.BRANCH_RE(r.defaultBranch);
+    }
+    const pctx = { repoId: V.fixtures.repositoryId, projectGitHost: V.works.deployments.QA.gitHost, now: NOW };
+    ok(osGrantProjectResponseValid(materialise(P.base), pctx), 'os-grant project response base valid');
+    for (const m of P.validMutations) ok(osGrantProjectResponseValid(mutate(P.base, m), pctx), `os-grant project response valid ${JSON.stringify(m)}`);
+    for (const m of P.invalidMutations) ok(!osGrantProjectResponseValid(mutate(P.base, m), pctx), `os-grant project response invalid (${m.why})`);
+    // Neither shape passes the other's consumer.
+    ok(!osGrantResponseValid(materialise(P.base), ctx), 'a legacy consumer refuses the project answer');
+    ok(!osGrantProjectResponseValid(materialise(V.works.osGrantResponse.base), pctx), 'a project consumer refuses the legacy answer');
+    const projectExpiry = (issuedAt, bearerExp) => Math.min(issuedAt + T.PROJECT_GRANT_TTL_MS, bearerExp);
+    for (const c of V.works.osGrantProjectExpiry.cases) {
+        eq(projectExpiry(NOW, NOW + c.bearerExpSeconds * 1000), NOW + c.expectSeconds * 1000, `project expiry, bearer exp +${c.bearerExpSeconds}s`);
+        ok(c.expectSeconds * 1000 <= T.PROJECT_GRANT_TTL_MS, `project expiry +${c.expectSeconds}s is never beyond the issue window`);
+    }
+    ok(V.works.osGrantProjectExpiry.cases.some((c) => c.bearerExpSeconds * 1000 < T.PROJECT_GRANT_TTL_MS), 'expiry cases include a bearer expiring first');
+    ok(/min\(issuedAt \+ PROJECT_GRANT_TTL_MS, the bearer's exp\)/.test(V.works.osGrantProjectRule) && /webClone false/.test(V.works.osGrantProjectRule), 'osGrantProjectRule names the expiry and webClone false');
+}
 
 // ── OS route body ────────────────────────────────────────────────────────────
 function osRouteBodyValid(b) {
@@ -451,7 +513,8 @@ for (const m of V.workerRequest.invalidMutations) ok(!workerBodyValid(mutate(V.w
 {
     const W = V.workerRequest;
     ok(W.projectGrantMaxMs === 330_000 && W.projectGrantMaxMs < T.WORKER_ACCEPT_EXPIRY_MAX_MS, 'projectGrantMaxMs is five minutes plus 30 s skew, under the 16-minute ceiling');
-    ok(/60-minute/.test(W.projectRule) && /W2\/W3/.test(W.projectRule) && /route/.test(W.projectRule), 'projectRule names the refused web-clone grant, Works W2/W3 and the route-named host');
+    ok(/60-minute/.test(W.projectRule) && /os-grant with class 'project'/.test(W.projectRule) && /route/.test(W.projectRule), 'projectRule names the refused web-clone grant, its producer (os-grant class project) and the route-named host');
+    ok(W.projectGrantMaxMs === T.PROJECT_GRANT_ACCEPT_MAX_MS, 'projectGrantMaxMs is the project accept ceiling (1.0.5)');
     const project = (gitHost, grantSeconds, extra = {}) => mutate(W.base, { set: { class: 'project', gitHost, ...extra }, setGrant: { expiresAt: { relativeSeconds: grantSeconds } } }, 'grant');
     for (const host of C.REPO_OPEN_PROJECT_GIT_HOSTS) {
         for (const route of [...C.REPO_OPEN_PROJECT_GIT_HOSTS, C.GIT_STAGING_HOST, undefined]) {
@@ -584,6 +647,8 @@ for (const [left, right] of T.equalities) ok(evalT(left) === evalT(right), `time
 for (const [left, right] of T.lessThan) ok(evalT(left) < evalT(right), `timeouts: ${left} < ${right}`);
 ok(T.WAKE_DELAYS_MS.every((d, i, a) => i === 0 || a[i - 1] <= d) && T.WAKE_DELAYS_MS.at(-1) === T.WAKE_REPEAT_DELAY_MS, 'wake delays');
 ok(T.GRANT_TTL_MS === 15 * 60_000, 'grant TTL is the Works GIT_GRANT_MAX_MS (15 min)');
+ok(T.PROJECT_GRANT_TTL_MS === 5 * 60_000 && T.PROJECT_GRANT_SKEW_MS === 30_000, '1.0.5: project grant issued for 5 min, 30 s documented skew');
+ok(T.PROJECT_REFRESH_EVERY_MS === 4 * 60_000, '1.0.5: project grants are re-minted every 4 min (os-builder §7)');
 ok(T.SIGNOUT_BUDGET_MS === 3000, 'signout budget');
 
 // ── repository budget (tar bytes) ────────────────────────────────────────────

@@ -157,7 +157,7 @@ const run = (e: ReturnType<typeof edge>, i: RepoOpenInput = input(), extra: Part
 
 describe('aws relay constants equal the vectors and the contract', () => {
   it('vectors are the pinned file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('4ede80c69322d806c283691456c128d249d7f90105d08e93c4d818a83e98f150');
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('c48c3f182f1ef5d50eac083ec6a3188f51f410e0dcec4aba6a83a57d0af20aea');
   });
   it('the poll interval is the vectors AWS_RELAY_POLL_MS, inside the Worker deadline', () => {
     expect(AWS_RELAY_POLL_MS).toBe(T.AWS_RELAY_POLL_MS);

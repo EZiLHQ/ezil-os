@@ -108,7 +108,7 @@
      def test_host_constants_equal_the_vectors(self):
          c, t = V["constants"], V["timeouts"]
 -        self.assertEqual(V["contractVersion"], "1.0.3")
-+        self.assertEqual(V["contractVersion"], "1.0.4")
++        self.assertEqual(V["contractVersion"], "1.0.5")
          self.assertEqual(list(ro.RUN_DIRS), c["RUN_DIRS"])
          self.assertEqual(ro.KERNEL_PATH, c["KERNEL_PATH"])
          self.assertEqual(ro.HELPER_MODULE_PATH, c["HELPER_MODULE_PATH"])

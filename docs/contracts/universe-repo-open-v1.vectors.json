@@ -1,6 +1,6 @@
 {
   "contract": "universe-repo-open-v1",
-  "contractVersion": "1.0.4",
+  "contractVersion": "1.0.5",
   "about": [
     "Machine-checkable constants and cases for docs/contracts/universe-repo-open-v1.md.",
     "Only the lead changes this file. Any change bumps contractVersion and the pinned sha256 (README-universe-repo-open.md).",
@@ -21,6 +21,7 @@
     "OS_LANDING_ORIGIN": "https://os.ezil.org",
     "UNIVERSE_STAGING_HOST": "universe-staging.ezil.work",
     "WORKS_STAGING_ORIGIN": "https://api-preview.ezil.work",
+    "WORKS_QA_ORIGIN": "https://api-staging.ezil.work",
     "GIT_STAGING_HOST": "git-preview.ezil.work",
     "GIT_PRODUCTION_HOST": "github.ezil.work",
     "GIT_ASSESSMENT_HOST": "git-qa.ezil.work",
@@ -28,6 +29,7 @@
     "REPO_OPEN_CLASS_DEFAULT": "personal",
     "REPO_OPEN_CLASS_GIT_HOSTS": { "personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work" },
     "REPO_OPEN_PROJECT_GIT_HOSTS": ["github.ezil.work", "git-qa.ezil.work"],
+    "WORKS_OS_GRANT_CLASSES": { "STAGING": null, "QA": "project" },
     "PROJECT_MARKER_FILE": "ezil-repo-class",
     "PROJECT_MARKER_CONTENT": "project\n",
     "PREVIEW_SUPABASE_ORIGIN": "https://13-203-99-168.sslip.io",
@@ -119,6 +121,10 @@
     "ROUTE_MAX_DURATION_MS": 150000,
     "AWS_RELAY_POLL_MS": 1500,
     "GRANT_TTL_MS": 900000,
+    "PROJECT_GRANT_TTL_MS": 300000,
+    "PROJECT_GRANT_SKEW_MS": 30000,
+    "PROJECT_GRANT_ACCEPT_MAX_MS": 330000,
+    "PROJECT_REFRESH_EVERY_MS": 240000,
     "OS_ACCEPT_EXPIRY_SLACK_MS": 60000,
     "WORKER_ACCEPT_EXPIRY_MAX_MS": 960000,
     "HELPER_MIN_REMAINING_MS": 30000,
@@ -139,15 +145,18 @@
       ["COMMIT_EXEC_MAX_MS", "COMMIT_MIN_REMAINING_MS", "PREPARE_RESERVE_MS"],
       ["HELPER_MIN_REMAINING_MS", "REFRESH_LEAD_MS", "VISIBILITY_REFRESH_BELOW_MS", "GRANT_TTL_MS", "OS_SESSION_MIN_REMAINING_MS", "OS_SESSION_TTL_MS"],
       ["REMINT_AFTER_MS", "BOOTSTRAP_TTL_MS"],
-      ["AWS_RELAY_POLL_MS", "WORKER_DEADLINE_MS"]
+      ["AWS_RELAY_POLL_MS", "WORKER_DEADLINE_MS"],
+      ["HELPER_MIN_REMAINING_MS", "PROJECT_REFRESH_EVERY_MS", "PROJECT_GRANT_TTL_MS", "PROJECT_GRANT_ACCEPT_MAX_MS", "GRANT_TTL_MS"]
     ],
     "equalities": [
       ["PREPARE_WINDOW_MS", "WORKER_DEADLINE_MS - PREPARE_RESERVE_MS"],
       ["WORKER_ACCEPT_EXPIRY_MAX_MS", "GRANT_TTL_MS + OS_ACCEPT_EXPIRY_SLACK_MS"],
-      ["OS_SESSION_MIN_REMAINING_MS", "GRANT_TTL_MS + OS_ACCEPT_EXPIRY_SLACK_MS"]
+      ["OS_SESSION_MIN_REMAINING_MS", "GRANT_TTL_MS + OS_ACCEPT_EXPIRY_SLACK_MS"],
+      ["PROJECT_GRANT_ACCEPT_MAX_MS", "PROJECT_GRANT_TTL_MS + PROJECT_GRANT_SKEW_MS"]
     ],
     "lessThan": [
-      ["OS_TO_WORKER_FETCH_MS + OS_TO_WORKS_FETCH_MS", "ROUTE_MAX_DURATION_MS"]
+      ["OS_TO_WORKER_FETCH_MS + OS_TO_WORKS_FETCH_MS", "ROUTE_MAX_DURATION_MS"],
+      ["PROJECT_REFRESH_EVERY_MS + HELPER_MIN_REMAINING_MS", "PROJECT_GRANT_TTL_MS"]
     ]
   },
   "predicates": {
@@ -423,15 +432,16 @@
     ]
   },
   "works": {
-    "deploymentRule": "deployment = apiOrigin === WORKS_STAGING_ORIGIN ? STAGING : DEFAULT. A pin is effective only if it is not UNPINNED, not empty and not in PRODUCTION_AUTH0_CLIENTS; at Works only, the OS pin is also ineffective when it equals the Universe pin. createServer mounts the os routes (osPaths) only when deployment.osClient !== null; otherwise their paths are unmatched for every request, including act-as requests.",
+    "deploymentRule": "1.0.5: deployment = apiOrigin === WORKS_STAGING_ORIGIN ? STAGING : apiOrigin === WORKS_QA_ORIGIN ? QA : DEFAULT. QA (api-staging, the Works behind git-qa where Builder repositories live) is DEFAULT plus one thing: its osClient is the effective OS pin (same effective-pin rule), added to v1Clients, and its os-grant issues only class project grants (WORKS_OS_GRANT_CLASSES). Each row has exactly one os-grant class: STAGING the 1.0.3 legacy grant (no class key), QA project, DEFAULT none (os routes unmounted, production unchanged). A pin is effective only if it is not UNPINNED, not empty and not in PRODUCTION_AUTH0_CLIENTS; at Works only, the OS pin is also ineffective when it equals the Universe pin. createServer mounts the os routes (osPaths) only when deployment.osClient !== null; otherwise their paths are unmatched for every request, including act-as requests.",
     "deployments": {
       "DEFAULT": { "v1Clients": ["Mzvm4piCMAKy3ofhywuQDYstJLcYE3mx", "2tVk0vvzQvm964BtGuXzQxpjlo2JCoCl"], "osClient": null, "gitHost": "github.ezil.work" },
-      "STAGING": { "v1Clients": "[universePin, osPin] with ineffective pins removed", "osClient": "osPin if effective, else null", "gitHost": "git-preview.ezil.work" }
+      "STAGING": { "v1Clients": "[universePin, osPin] with ineffective pins removed", "osClient": "osPin if effective, else null", "gitHost": "git-preview.ezil.work" },
+      "QA": { "v1Clients": "DEFAULT v1Clients plus osPin if effective", "osClient": "osPin if effective, else null", "gitHost": "git-qa.ezil.work" }
     },
     "selection": [
       { "apiOrigin": null, "deployment": "DEFAULT" },
       { "apiOrigin": "https://api.ezil.work", "deployment": "DEFAULT" },
-      { "apiOrigin": "https://api-staging.ezil.work", "deployment": "DEFAULT" },
+      { "apiOrigin": "https://api-staging.ezil.work", "deployment": "QA" },
       { "apiOrigin": "https://api-aws.ezil.work", "deployment": "DEFAULT" },
       { "apiOrigin": "https://api-preview.ezil.work", "deployment": "STAGING" }
     ],
@@ -443,6 +453,12 @@
       { "pins": { "os": "PROD_CLI", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING"], "osClient": null } },
       { "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["UNIVERSE_STAGING"], "osClient": null }, "note": "OS and Universe must not share a client" },
       { "pins": { "os": "UNPINNED", "universe": "UNPINNED" }, "expect": { "v1Clients": [], "osClient": null } }
+    ],
+    "qaEffectivePins": [
+      { "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["PROD_CLI", "PROD_UNIVERSE_WEB", "OS_STAGING"], "osClient": "OS_STAGING" } },
+      { "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["PROD_CLI", "PROD_UNIVERSE_WEB"], "osClient": null } },
+      { "pins": { "os": "PROD_UNIVERSE_WEB", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["PROD_CLI", "PROD_UNIVERSE_WEB"], "osClient": null }, "note": "a production client is never an OS pin: os-staging on 2tVk0 mounts nothing" },
+      { "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "expect": { "v1Clients": ["PROD_CLI", "PROD_UNIVERSE_WEB"], "osClient": null }, "note": "OS and Universe must not share a client" }
     ],
     "osPaths": {
       "grant": { "method": "POST", "pathRe": "WORKS_OS_GRANT_PATH_RE" },
@@ -501,14 +517,29 @@
       { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "SUPABASE", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 403, "error": "act_as_operator_required" } },
       { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "actAs": true, "route": "os-grant", "ref": "uuid", "expect": { "status": 403, "error": "ezil_id_delegation_forbidden" } },
       { "deployment": "STAGING", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "actAs": true, "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" }, "note": "the central OS-token refusal precedes account resolution and the act-as check" },
-      { "deployment": "STAGING", "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" }, "note": "OS pin equal to the Universe pin: OS (which cannot see the Universe pin) is active and sends that token; Works has osClient null, so OS maps the 404 to repository_unavailable. X1 P3 refuses equal pins." }
+      { "deployment": "STAGING", "pins": { "os": "UNIVERSE_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" }, "note": "OS pin equal to the Universe pin: OS (which cannot see the Universe pin) is active and sends that token; Works has osClient null, so OS maps the 404 to repository_unavailable. X1 P3 refuses equal pins." },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": "handler" } },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-revoke", "ref": null, "expect": { "status": "handler" } },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "clone-token", "ref": "numeric", "expect": { "status": 401, "error": "identity_token_invalid" }, "note": "1.0.5: the OS token never reaches the 60-minute web clone (os-builder W-2(a) withdrawn)" },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "create", "ref": null, "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "clone-token", "ref": "numeric", "expect": { "status": "handler" }, "note": "unchanged from DEFAULT" },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "PROD_UNIVERSE_WEB", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "UNIVERSE_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "QA", "pins": { "os": "OS_STAGING", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "numeric", "expect": { "status": 404, "error": "not_found" } },
+      { "deployment": "QA", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "OS_STAGING", "route": "os-grant", "ref": "uuid", "expect": { "status": 401, "error": "identity_token_invalid" } },
+      { "deployment": "QA", "pins": { "os": "UNPINNED", "universe": "UNIVERSE_STAGING" }, "token": "PROD_CLI", "route": "os-grant", "ref": "uuid", "expect": { "status": 404, "error": "unmatched_route" } }
     ],
     "refs": { "uuid": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "uppercase_uuid": "3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C", "numeric": "42", "numeric_max": "9223372036854775807", "numeric_overflow": "9223372036854775808" },
     "osGrantRequest": {
       "valid": [{ "computerLabel": "1ee341fade8595ac" }],
-      "invalid": [{}, { "computerLabel": "1EE341FADE8595AC" }, { "computerLabel": "1ee341fade8595a" }, { "computerLabel": "1ee341fade8595ac", "extra": 1 }, { "computerLabel": 7 }],
+      "invalid": [{}, { "computerLabel": "1EE341FADE8595AC" }, { "computerLabel": "1ee341fade8595a" }, { "computerLabel": "1ee341fade8595ac", "extra": 1 }, { "computerLabel": 7 }, { "computerLabel": "1ee341fade8595ac", "class": "project" }],
       "invalidStatus": 422,
-      "invalidError": "invalid_request"
+      "invalidError": "invalid_request",
+      "classRule": "1.0.5. valid/invalid above are the STAGING (legacy, 1.0.3) row and are unchanged except one added invalid case: a class key is refused there, as it always was (strict body). project lists the QA row: the body must be exactly {computerLabel, class: 'project'}; anything else, a missing class included, is 422 invalid_request. The class a row grants is the server's (WORKS_OS_GRANT_CLASSES), never chosen by the caller: the body must name it explicitly and is refused when it does not match. Authentication (works.authRule) runs before the body is read, so a wrong-audience token is 401 whatever the body.",
+      "project": {
+        "valid": [{ "computerLabel": "1ee341fade8595ac", "class": "project" }],
+        "invalid": [{ "computerLabel": "1ee341fade8595ac" }, { "class": "project" }, { "computerLabel": "1ee341fade8595ac", "class": "personal" }, { "computerLabel": "1ee341fade8595ac", "class": "assessment" }, { "computerLabel": "1ee341fade8595ac", "class": "Project" }, { "computerLabel": "1ee341fade8595ac", "class": "project " }, { "computerLabel": "1ee341fade8595ac", "class": "" }, { "computerLabel": "1ee341fade8595ac", "class": null }, { "computerLabel": "1ee341fade8595ac", "class": 1 }, { "computerLabel": "1ee341fade8595ac", "class": ["project"] }, { "computerLabel": "1ee341fade8595ac", "class": "project", "ttl": 300 }, { "computerLabel": "1ee341fade8595ac", "class": "project", "expiresAt": "2026-11-03T00:00:00Z" }, { "computerLabel": "1EE341FADE8595AC", "class": "project" }]
+      }
     },
     "osRevokeRequest": {
       "valid": [{}, { "computerLabel": "1ee341fade8595ac" }],
@@ -564,7 +595,49 @@
         { "set": { "scope": "admin" }, "why": "scope" },
         { "set": { "defaultBranch": "a..b" }, "why": "branch" },
         { "set": { "refreshToken": "x" }, "why": "extra key" },
-        { "delete": "defaultBranch", "why": "missing key" }
+        { "delete": "defaultBranch", "why": "missing key" },
+        { "set": { "class": "project" }, "why": "1.0.5: a class key on a legacy grant" }
+      ]
+    },
+    "osGrantProjectRule": "1.0.5 (Works W2/W3 T3). On the QA row, POST /v1/builder/selfserve-repositories/:repositoryRef/os-grant with body {computerLabel, class: 'project'} issues the project grant: authentication, ref, ownership (ownedByRepositoryId), preconditions (osGrantPreconditions), the session row (osSession: one per account and computerLabel, the same row any class uses) and scope (authority.scope) exactly as the legacy grant; webClone false; routePath exactly <handle>/<name>.git. Only the expiry differs: expiresAt = min(issuedAt + PROJECT_GRANT_TTL_MS, the bearer's exp), never later (osGrantProjectExpiry), which fits git_grants_expiry_chk unchanged (no schema change). The answer is the legacy keys plus class: 'project' (osGrantProjectResponse), cloneUrl on the row's gitHost. os-sessions/revoke revokes the label's session and so every grant of either class (works.osRevokeRequest, gitAuthorize grant_revoked / session_revoked); an expired grant is grant_expired. The gateway does not know the class and needs none: the expiry and the route path carry it. The 60-minute web-clone grant (clone-token, webClone true) is unchanged and is never a project grant: every project consumer refuses expiresAt beyond PROJECT_GRANT_ACCEPT_MAX_MS and a missing or other class.",
+    "osGrantProjectExpiry": {
+      "rule": "expiresAt = min(issuedAt + PROJECT_GRANT_TTL_MS, bearerExp). A bearer that has expired is refused by authentication (401) before this runs.",
+      "cases": [
+        { "bearerExpSeconds": 3600, "expectSeconds": 300 },
+        { "bearerExpSeconds": 301, "expectSeconds": 300 },
+        { "bearerExpSeconds": 300, "expectSeconds": 300 },
+        { "bearerExpSeconds": 120, "expectSeconds": 120 },
+        { "bearerExpSeconds": 1, "expectSeconds": 1 }
+      ]
+    },
+    "osGrantProjectResponse": {
+      "consumerRule": "A project consumer (Universe's builder open, which answers OS; and through it the OS Worker repo-open/repo-grant, the AWS relay, host and kernel) accepts exactly these keys, class === 'project', cloneUrl on the route's project host (on os-staging git-qa.ezil.work), the requested repositoryId, and expiresAt in (now, now + PROJECT_GRANT_ACCEPT_MAX_MS]: PROJECT_GRANT_TTL_MS plus PROJECT_GRANT_SKEW_MS of clock skew. Universe additionally caps it at the userIdToken's exp + 30 s (os-builder-project-open-v1 universeOpen.grant). A legacy consumer refuses a class key (osGrantResponse).",
+      "keys": ["username", "token", "expiresAt", "cloneUrl", "repositoryId", "routeName", "handle", "name", "scope", "defaultBranch", "class"],
+      "base": {
+        "username": "ezil", "token": "egg_${repeat:a:64}", "expiresAt": { "relativeSeconds": 300 },
+        "cloneUrl": "https://git-qa.ezil.work/acme/site.git", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c",
+        "routeName": "acme/site", "handle": "acme", "name": "site", "scope": "write", "defaultBranch": "main", "class": "project"
+      },
+      "validMutations": [
+        { "set": { "expiresAt": { "relativeSeconds": 330 } } },
+        { "set": { "expiresAt": { "relativeSeconds": 1 } } },
+        { "set": { "scope": "read" } },
+        { "set": { "defaultBranch": "release/1.2" } }
+      ],
+      "invalidMutations": [
+        { "set": { "expiresAt": { "relativeSeconds": 331 } }, "why": "beyond 300 s plus 30 s skew" },
+        { "set": { "expiresAt": { "relativeSeconds": 900 } }, "why": "a legacy 15-minute grant" },
+        { "set": { "expiresAt": { "relativeSeconds": 3600 } }, "why": "the 60-minute web-clone grant" },
+        { "set": { "expiresAt": { "relativeSeconds": 0 } }, "why": "already expired" },
+        { "delete": "class", "why": "no class echo (a legacy-shaped answer)" },
+        { "set": { "class": "personal" }, "why": "another class" },
+        { "set": { "class": "Project" }, "why": "class spelling" },
+        { "set": { "cloneUrl": "https://git-preview.ezil.work/acme/site.git" }, "why": "not the route's project host" },
+        { "set": { "cloneUrl": "https://github.ezil.work/acme/site.git" }, "why": "the production host on staging" },
+        { "set": { "repositoryId": "5a6b7c8d-1e2f-4a3b-8c4d-5e6f7a8b9c0d" }, "why": "another repository" },
+        { "set": { "routeName": "acme/other" }, "why": "another route" },
+        { "set": { "scope": "admin" }, "why": "scope" },
+        { "set": { "refreshToken": "x" }, "why": "extra key" }
       ]
     }
   },
@@ -606,7 +679,7 @@
     "gitHostAllowList": ["git-preview.ezil.work"],
     "optionalKeys": ["class"],
     "projectGrantMaxMs": 330000,
-    "projectRule": "1.0.4. class project: an ordinary Builder-created project's own repository on the Creator's own computer (never a new or assessment computer). It is the third member of REPO_OPEN_CLASSES and has no entry in REPO_OPEN_CLASS_GIT_HOSTS (the single-host table): its gitHost must be one of REPO_OPEN_PROJECT_GIT_HOSTS AND exactly the host the ROUTE's deployment serves (the route passes it: github.ezil.work in production, git-qa.ezil.work on os-staging; GIT_PRODUCTION_HOST stays forbidden on staging), so a body never chooses its host. The AWS host op and the kernel cannot know the deployment and accept either project host; the route binding is the Worker's (invalidMutations rows with layer worker are refused by the Worker only, every other row at every layer). path must be null (its editor root is always the wrapper W, kernel.project.layoutRule). The grant's expiresAt must be in (now, now + projectGrantMaxMs]: an OS-scoped grant of at most five minutes plus 30 s skew, never the 60-minute Works web-clone grant (cli-auth issueGrant webClone; Works W2/W3 add the OS-scoped grant). A project route also requires the deployment's capability and assessment-fence gates (awsProject) before anything is sent. A project body is refused on the personal and assessment routes, and a personal or assessment body on the project route (Worker invalid_request; AWS host repo_open_invalid; kernel workspace_failed).",
+    "projectRule": "1.0.4. class project: an ordinary Builder-created project's own repository on the Creator's own computer (never a new or assessment computer). It is the third member of REPO_OPEN_CLASSES and has no entry in REPO_OPEN_CLASS_GIT_HOSTS (the single-host table): its gitHost must be one of REPO_OPEN_PROJECT_GIT_HOSTS AND exactly the host the ROUTE's deployment serves (the route passes it: github.ezil.work in production, git-qa.ezil.work on os-staging; GIT_PRODUCTION_HOST stays forbidden on staging), so a body never chooses its host. The AWS host op and the kernel cannot know the deployment and accept either project host; the route binding is the Worker's (invalidMutations rows with layer worker are refused by the Worker only, every other row at every layer). path must be null (its editor root is always the wrapper W, kernel.project.layoutRule). The grant's expiresAt must be in (now, now + projectGrantMaxMs]: an OS-scoped grant of at most five minutes plus 30 s skew, never the 60-minute Works web-clone grant (cli-auth issueGrant webClone). 1.0.5: that grant is Works os-grant with class 'project' on the QA row (works.osGrantProjectRule), issued for at most PROJECT_GRANT_TTL_MS; projectGrantMaxMs equals PROJECT_GRANT_ACCEPT_MAX_MS. A project route also requires the deployment's capability and assessment-fence gates (awsProject) before anything is sent. A project body is refused on the personal and assessment routes, and a personal or assessment body on the project route (Worker invalid_request; AWS host repo_open_invalid; kernel workspace_failed).",
     "classRule": "1.0.3. A body may carry one more key, class: personal or assessment (constants REPO_OPEN_CLASSES); absent means REPO_OPEN_CLASS_DEFAULT (personal), so every 1.0.2 body is valid and unchanged. class must be a string in REPO_OPEN_CLASSES (null, empty and any other value are invalid). gitHost must equal REPO_OPEN_CLASS_GIT_HOSTS[class]: a closed table, refused in both directions (personal or absent on git-qa, assessment on git-preview). gitHostAllowList is the class-absent (personal) list. Whoever relays the body (Worker, AWS host) forwards class into the kernel request (kernel.optionalRequestKeys) only when the body carried it. E1-6: a body with class assessment must carry path null (its editor root is always the wrapper, kernel.assessment.layoutRule); a non-null path is refused at every layer (Worker invalid_request, AWS host repo_open_invalid, kernel workspace_failed). repositoryId is the lowercase UUID the wrapper is named after.",
     "base": {
       "v": 1, "op": "open", "repositoryId": "3f2b8c1a-9d4e-4f6a-8b7c-1d2e3f4a5b6c", "handle": "acme", "name": "site",
@@ -1320,6 +1393,6 @@
     "OS_PRODUCTION_APP_ORIGIN", "OS_LANDING_ORIGIN", "SNAPSHOT_INTERNAL_NAMES", "SNAPSHOT_CACHE_NAMES", "SNAPSHOT_NESTED_INDEX_MAX", "SNAPSHOT_INDEX_PATHS_BYTES",
     "GIT_ASSESSMENT_HOST", "REPO_OPEN_CLASSES", "REPO_OPEN_CLASS_DEFAULT", "REPO_OPEN_CLASS_GIT_HOSTS",
     "ASSESSMENT_DIR_TEMPLATE", "ASSESSMENT_CLONE_DIR_NAME", "ASSESSMENT_REMOTE_TEMPLATE",
-    "REPO_OPEN_PROJECT_GIT_HOSTS", "PROJECT_MARKER_FILE", "PROJECT_MARKER_CONTENT"
+    "REPO_OPEN_PROJECT_GIT_HOSTS", "PROJECT_MARKER_FILE", "PROJECT_MARKER_CONTENT", "WORKS_QA_ORIGIN", "WORKS_OS_GRANT_CLASSES"
   ]
 }

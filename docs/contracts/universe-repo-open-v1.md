@@ -4,7 +4,7 @@ Universe 2.0 builder repository → EZiL OS staging Code → edit and push throu
 
 | Field | Value |
 |---|---|
-| contractVersion | `1.0.4` (changes since 1.0.0: [Changelog](#changelog)) |
+| contractVersion | `1.0.5` (changes since 1.0.0: [Changelog](#changelog)) |
 | Vectors | `docs/contracts/universe-repo-open-v1.vectors.json` (sha256 pinned in `README-universe-repo-open.md`) |
 | Gateway extract | derived by `check.mjs --emit-gateway-extract` for the public EZiL CLI repo; its own sha256 pinned in the README (§18) |
 | Check | `node docs/contracts/universe-repo-open-v1.check.mjs` (also runs under `/root/.bun/bin/bun`) |
@@ -49,6 +49,10 @@ All values live in the vectors (`constants`, `timeouts`, `regex`). The table nam
 | OS_PRODUCTION_APP_ORIGIN | `https://os.ezil.work` (Vercel project `ezil-os-preview`; `os.ezil.org` = OS_LANDING_ORIGIN, the static landing page) [1.0.2] | .github/scripts/release-state.mjs `canonical` (check.mjs compares) |
 | UNIVERSE_STAGING_HOST | `universe-staging.ezil.work` | universe-2.0 9dc58adf deploy/aws/app-host/README.md:393-421 |
 | WORKS_STAGING_ORIGIN | `https://api-preview.ezil.work` [D-NAMES] | new |
+| WORKS_QA_ORIGIN | `https://api-staging.ezil.work`: the Works behind git-qa.ezil.work, where Builder repositories live. Selects the QA row (§6.2); the OS app never calls it (still on STAGING_FORBIDDEN_HOSTS) | 1.0.5 |
+| WORKS_OS_GRANT_CLASSES | `{STAGING: null, QA: 'project'}`: the one os-grant class each mounted row issues (§6.5) | 1.0.5 |
+| PROJECT_GRANT_TTL_MS / PROJECT_GRANT_SKEW_MS / PROJECT_GRANT_ACCEPT_MAX_MS | 300 000 / 30 000 / 330 000 (= `workerRequest.projectGrantMaxMs`) | 1.0.5 |
+| PROJECT_REFRESH_EVERY_MS | 240 000: a project grant is re-minted at least this often while the project is open | 1.0.5 |
 | GIT_STAGING_HOST | `git-preview.ezil.work` [D-NAMES] | new |
 | GIT_ASSESSMENT_HOST | `git-qa.ezil.work`: the git host of request class `assessment` (staging Works issues assessment grants there) [1.0.3] | new |
 | REPO_OPEN_CLASS_GIT_HOSTS | closed table `personal` → GIT_STAGING_HOST, `assessment` → GIT_ASSESSMENT_HOST; a body or request without `class` is `personal` (REPO_OPEN_CLASS_DEFAULT) [1.0.3] | new |
@@ -250,9 +254,13 @@ Keyed on the existing optional env `EZIL_API_ORIGIN` (7974ab6c apps/api/src/env.
 ```
 apiOrigin === "https://api-preview.ezil.work" → STAGING { v1Clients: [universePin, osPin] minus ineffective pins,
                                                           osClient: osPin if effective else null, gitHost: GIT_STAGING_HOST }
+apiOrigin === "https://api-staging.ezil.work" → QA      { v1Clients: EZIL_ID_V1_CLIENTS + osPin if effective,      (1.0.5)
+                                                          osClient: osPin if effective else null, gitHost: "git-qa.ezil.work" }
 anything else / unset                          → DEFAULT { v1Clients: EZIL_ID_V1_CLIENTS (frozen, unchanged),
                                                           osClient: null, gitHost: "github.ezil.work" }
 ```
+
+- **QA row (1.0.5).** api-staging is the Works git-qa trusts (`API_ORIGIN`), and Builder repositories live there. Under 1.0.4 it selected DEFAULT, so os-grant could never mount where class `project` needs it. QA is DEFAULT plus exactly one thing: the effective OS pin (same rule as STAGING, so never a production client and never the Universe pin) is added to `v1Clients` and is `osClient`. §6.4 step 2 then confines that token to the two os routes, so it never reaches clone-token, create, freeze, push-tests or availability. QA's os-grant issues class `project` only (§6.5). Vectors `works.qaEffectivePins` and the `QA` rows of `works.authCases`. The OS pin VALUE on api-staging is a G-ENV item; DEFAULT, and so production, is unchanged.
 
 - **One deployment object per server, with a test seam (no env):**
   - `deploymentFor(apiOrigin, pins = { os: OS_STAGING_AUTH0_CLIENT_ID, universe: UNIVERSE_STAGING_AUTH0_CLIENT_ID })` is pure and implements the effective-pin rule (§1).
@@ -285,6 +293,15 @@ Declared inside `selfserveRepositoriesV0Routes`, so manifest.ts is unchanged; mo
 - **201:** `{username:'ezil', token, expiresAt, cloneUrl:'https://<deployment.gitHost>/<handle>/<name>.git', repositoryId, routeName, handle, name, scope, defaultBranch}`.
 - Audit: the existing `cli_session.created` and `git_grant.issued` events.
 
+**Class `project` (1.0.5; vectors `works.osGrantRequest.project`, `works.osGrantProjectRule`, `works.osGrantProjectExpiry`, `works.osGrantProjectResponse`).** One route, one class per row: the row decides the class (`WORKS_OS_GRANT_CLASSES`) and the body must name exactly it, so the class is the server's, not a caller's choice.
+- STAGING (above) is 1.0.3 byte for byte: body exactly `{computerLabel}`; a `class` key is 422 as it always was.
+- QA: body exactly `{computerLabel, class:'project'}`, ≤ 256 B. A missing class, any other value (`personal`, `assessment`, case or space variants, `''`, null, a number, an array) and any other key (`ttl`, `expiresAt`, …) is 422 `invalid_request`. Authentication (§6.4) runs first, so a wrong-audience token is 401 whatever the body says.
+- Everything else is the legacy grant's: `ownedByRepositoryId` (cross-user and unknown refs 404), the preconditions, `osRepoSession(account, computerLabel)` (the same row any class uses), `maxScope: authority.scope`, `webClone:false`, `reason:'selfserve_owner'`, `routePath '<handle>/<name>.git'`. Only the expiry differs: `expiresAt = min(now + PROJECT_GRANT_TTL_MS, the bearer's exp)`. That is within `GIT_GRANT_MAX_MS` and `git_grants_expiry_chk`, so no schema change.
+- **201:** the legacy keys plus `class:'project'`, with `cloneUrl` on QA's gitHost (git-qa.ezil.work).
+- **Consumers** accept exactly those keys, `class === 'project'`, the route's project host, the requested repository, and `expiresAt` in (now, now + PROJECT_GRANT_ACCEPT_MAX_MS]: 300 s plus 30 s documented skew. The 60-minute web-clone grant (clone-token) and the 15-minute legacy grant both fail. A legacy consumer refuses a `class` key.
+- **Caller.** Universe's Builder open (os-builder-project-open-v1 §2) forwards the person's own OS-audience EZiL ID token, which it already verifies, never logging or keeping it, with `computerLabel` from the OS's open request. The OS-audience token stays refused on clone-token (§6.4 step 2); that is why the grant is here and not on clone-token.
+- **Lifecycle.** Re-minted at least every PROJECT_REFRESH_EVERY_MS while the project is open (os-builder §7). An expired grant is `grant_expired` at the gateway; os-sessions/revoke (§6.7) revokes the label's session and so every grant of either class (`grant_revoked` / `session_revoked`).
+
 ### 6.6 OS session row (no schema change)
 In ONE transaction, mirroring `webCloneSession` (cli-auth.ts:278-297):
 1. `select id from ezil_works.accounts where id=$1 for update`;
@@ -297,7 +314,7 @@ Never UPDATE `expires_at` (the trigger allows that only for the web-clone shape,
 Body `{computerLabel?}` strict. Gating and authentication as §6.4. Revokes the account's live `ezil-os` sessions (only that label, if given) through `cliAuthRepository.revoke(publicId,'logout', human(account))`, which also stamps `revoked_at` on their live grants in the same transaction (cli-auth.ts:255-269). Answers 200 `{revoked:n}`. Idempotent.
 
 ### 6.8 Unchanged
-`/cli/*`; gateway authorize (routes/cli.ts:240-290); Universe's clone-token route (60-minute web clone); the schema (nothing beyond the existing selfserve forward migration).
+`/cli/*`; gateway authorize (routes/cli.ts:240-290); Universe's clone-token route (60-minute web clone; 1.0.5: never a project grant, and never reached by the OS-audience token); the schema (nothing beyond the existing selfserve forward migration).
 
 ### 6.9 Per-operation authorization at the gateway (unchanged code, corrected expectations)
 Order (cli.ts:258-277; cli-auth.ts:323-338): grant row → grant revoked → session revoked or expired → grant expired → route repository → grant scope → account suspended → live authority. Vectors `gitAuthorize`:
@@ -594,7 +611,7 @@ Full table, copy and upstream mapping: vectors `errorTable`. `retryable` in the 
   3. **AFTER START**, every outcome the candidate can cause is consuming and never extends the deadline: any outcome whose origin includes `guest`, and any worker- or host-origin outcome the candidate can induce (an instance-initiated shutdown, an instance status-check failure, an idle stop from inactivity; a stop or restart where the candidate controls the computer). Only a provider loss proven from the AWS API (r63 CK-2: an EC2 `Server.*` state reason, a failed system status check or an AWS Health event; never the guest or the instance itself) is non-consuming. Restarts are capped, and no restart reopens the clock.
 
   The owner notes in the table (`workspace_unsupported`, `runtime_not_running`, `workspace_not_ready`) assume identity A, where the candidate owns the computer. With placement on Creator or company capacity, an owner's stop is not the candidate's act, and the consumer classifies it. The success fields `head`, `clean`, `remote` and `branch`, and the wrapper rules, are in-guest evidence only (`kernel.assessment.trust`).
-- **Class project (1.0.4; vectors `workerRequest.projectRule`, `kernel.project`, `awsProject`).** An ordinary Builder-created project's own repository, opened on the Creator's own existing computer. Nothing here provisions compute, and EZiL ID alone is never checkout proof: the grant is Works' OS-scoped grant of at most five minutes (`projectGrantMaxMs` 330 s, Works W2/W3), never the 60-minute web-clone grant.
+- **Class project (1.0.4; vectors `workerRequest.projectRule`, `kernel.project`, `awsProject`).** An ordinary Builder-created project's own repository, opened on the Creator's own existing computer. Nothing here provisions compute, and EZiL ID alone is never checkout proof: the grant is Works' OS-scoped grant of at most five minutes, issued by os-grant with class `project` on the QA row (§6.5, 1.0.5) and accepted up to `projectGrantMaxMs` (330 s = 300 s + 30 s skew), never the 60-minute web-clone grant.
   - **Route.** The project route passes the one host its deployment serves (`projectGitHost`: `github.ezil.work` in production, `git-qa.ezil.work` on os-staging; `REPO_OPEN_PROJECT_GIT_HOSTS`); the body must name exactly it, with `path` null. A project body is refused on the personal and assessment routes, and theirs on the project route.
   - **Gates.** The relay sends nothing unless both route-supplied gates answer exactly `true` for this computer: `projectCapable` (its host runs an agent and kernel that know class `project`) and `computerFree` (the computer is not bound to an assessment attempt). Absent, not `true`, or throwing: `workspace_unsupported`. A start 404 (AMI 1.0.30 has no repo-open op) or 409 `repo_open_invalid` (an A2h host whose class table predates 1.0.4) is also `workspace_unsupported`, never retried. The deadline answers `workspace_busy`: the reopen is idempotent.
   - **Kernel.** W/F as for assessment, plus the marker `.git/ezil-repo-class` (`project\n`). An existing W whose F is bound to this request and marked is reopened (`existing`, read-only, no network, the new grant installed); anything else at W is `folder_conflict`. Assessment still adopts nothing, so neither class adopts the other's folder. The answer is the 7-key `okOpen` with folder = openFolder = W and `pathNotFound` false. A fresh placement names exactly `defaultBranch`; an `existing` reopen names the folder's current branch (`defaultBranch` when HEAD is detached), so a Creator's own branch work reconnects.
@@ -770,6 +787,16 @@ Two checker passes over the draft, each finding verified against the code at the
 | C2: USAGE citation; NUMERIC_REF_RE bound; SANDBOX_NAME_RE case | §6.12, §1, vectors | grants.sql:86; `int64_max` predicate on both sides with overflow cases; strictness note. |
 
 ## Changelog
+
+### 1.0.5 (2026-11-03, PATCH)
+Closes the project-grant contradiction (request `88e642df-project-grant-contract-closure-v1`): §6.5 issued 15 minutes and `works.osGrantResponse` pinned 900 s, while §13 and `workerRequest.projectRule` required at most 330 s from an undefined "Works W2/W3 grant". Additive: every 1.0.4 request, body, answer and vector case is unchanged and still valid, except one row of `works.selection` (below). Classes `personal` and `assessment`, and the legacy os-grant on STAGING, behave exactly as in 1.0.4.
+
+1. **Producer.** The existing os-grant route issues class `project` on a new QA row: body `{computerLabel, class:'project'}`, `expiresAt = min(now + 300 s, bearer exp)`, the answer adds `class:'project'` (§6.5). No new route, no schema change.
+2. **Deployment row.** `works.selection` maps api-staging to the new QA row instead of DEFAULT (§6.2): DEFAULT's clients plus the effective OS pin, gitHost git-qa.ezil.work, os-grant class `project` only. Production (DEFAULT) is unchanged.
+3. **Consumers.** Accept ≤ 330 s with the class echoed (`works.osGrantProjectResponse`); legacy consumers refuse a class key. Universe's Builder open calls os-grant instead of clone-token. os-builder-project-open-v1 §3 W-2(a) (the OS-audience token on clone-token) is withdrawn, because §6.4 step 2 refuses it there.
+4. **Timeouts.** `PROJECT_GRANT_TTL_MS` 300 000, `PROJECT_GRANT_SKEW_MS` 30 000, `PROJECT_GRANT_ACCEPT_MAX_MS` 330 000 (= `projectGrantMaxMs`), `PROJECT_REFRESH_EVERY_MS` 240 000, with a new strict chain, an equality and a lessThan (refresh + helper floor < TTL).
+5. **Text:** §1, §6.2, §6.5, §6.8, §13.
+6. **Bump.** `contractVersion` is 1.0.5; both README pins, the kernel test's vectors pin, the relay and module test pins, and the H1 host patch's version line are updated in the same change. Kernel bytes are unchanged (sha256 1362a691…). Re-seeding the copies in EZiL-Works, universe-2.0 and EZiL CLI is a consumer step (§18); the gateway extract changes only in `contractVersion` and `sourceVectorsSha256`.
 
 ### 1.0.4 (2026-11-03, PATCH)
 Ordinary Builder project open on the Creator's own computer (founder request 9aae, journey `journey-9aae-20261103-repo-aws-local-v1`). Additive: every 1.0.3 request, body, answer and vector case is unchanged and still valid. Classes `personal` and `assessment` behave exactly as in 1.0.3.
