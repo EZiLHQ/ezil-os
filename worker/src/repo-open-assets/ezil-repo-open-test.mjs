@@ -321,6 +321,8 @@ export function spawnAsync(cmd, args, { cwd, env, input } = {}) {
     child.stderr.on('data', (d) => err.push(d));
     child.on('error', (e) => resolve({ status: null, stdout: '', stderr: String(e) }));
     child.on('close', (status) => resolve({ status, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
+    // A child that exits before reading its stdin (EPIPE, more likely on a loaded host) is judged by its status and output.
+    child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
   });
 }
@@ -364,6 +366,12 @@ export function indexOnly(dir, paths) {
   sh('git', ['-C', dir, 'init', '-q'], { env: USER_ENV });
   const blob = execFileSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], { env: USER_ENV, input: '' }).toString('utf8').trim();
   for (const p of paths) sh('git', ['-C', dir, 'update-index', '--add', '--cacheinfo', `100644,${blob},${p}`], { env: USER_ENV });
+}
+/** indexOnly for many paths: one `update-index --index-info` instead of one git per path. */
+export function indexInfo(dir, paths) {
+  sh('git', ['-C', dir, 'init', '-q'], { env: USER_ENV });
+  const blob = execFileSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], { env: USER_ENV, input: '' }).toString('utf8').trim();
+  execFileSync('git', ['-C', dir, 'update-index', '--index-info'], { env: USER_ENV, input: paths.map((p) => `100644 ${blob}\t${p}\n`).join(''), stdio: ['pipe', 'ignore', 'pipe'] });
 }
 
 /** vectors repoBudget.workspaceCases: every entry on disk (sparse files), the bindings, and real indexes. */
@@ -787,7 +795,7 @@ async function main() {
       const root = newRoot();
       buildWorkspaceCase(root, c);
       const names = [];
-      k.walkArchived(root, (e) => { names.push(e.name); }, { tracked: () => k.codecTracked(root, { limitBytes: DEFAULT_BUDGET.limitBytes, scratch: '/tmp' }) });
+      k.walkArchived(root, (e) => { names.push(e.name); }, { tracked: () => k.codecTracked(root, { scratch: '/tmp' }) });
       // git adds its own files under each index's .git; inside a .git path nothing is skipped, so they are archived too.
       const gitDirs = Object.keys(c.indexes).map((f) => (f ? `${f}/.git` : '.git'));
       const own = (n) => !gitDirs.some((g) => n.startsWith(`${g}/`));
@@ -1906,12 +1914,246 @@ async function main() {
         { cwd: dir, env: { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0' }, stdio: 'ignore' });
       assert.equal(exists(marker), legacy, `control: git ${version.major}.${version.minor} ${legacy ? 'did not run' : 'ran'} the planted false`);
       fs.rmSync(marker, { force: true });
-      const tracked = k.codecTracked(root, { limitBytes: DEFAULT_BUDGET.limitBytes, scratch: '/tmp' });
+      const tracked = k.codecTracked(root, { scratch: '/tmp' });
       assert.ok(tracked === k.TRACKED_ALL || tracked.has('node_modules/x.js'), 'the index read did not run');
       assert.equal(exists(marker), false, `the index read ran the planted false: ${exists(marker) ? fs.readFileSync(marker, 'utf8') : ''}`);
     } finally {
       execFileSync('umount', [FALSE]);
     }
+  });
+
+  // ── codec parity with the OS codec 463d1543 (nested_candidates, nested_marked, nested_index_paths) ─────────
+  /** A folder with a real index listing `paths` (a copy of `tpl` when given) and, unless undefined, a binding. */
+  const boundFolder = (folder, binding, paths = ['dist/app.js'], tpl = null) => {
+    fs.mkdirSync(folder, { recursive: true });
+    if (tpl) { fs.mkdirSync(`${folder}/.git`); fs.copyFileSync(tpl, `${folder}/.git/index`); } else indexOnly(folder, paths);
+    if (binding !== undefined) {
+      fs.writeFileSync(`${folder}/.git/ezil-repo.json`, typeof binding === 'string' || Buffer.isBuffer(binding) ? binding : `${JSON.stringify(binding)}\n`);
+    }
+  };
+  const fiveKeys = (id, extra = {}) => ({ v: 1, repositoryId: id, handle: 'acme', name: 'site', gitHost: QA_HOST, ...extra });
+  const projectOf = (root, id) => `${root}/projects/${id}/repository`;
+  const trackedOf = (k, root, pools) => k.codecTracked(root, { scratch: '/tmp', ...(pools ? { pools } : {}) });
+
+  test('codec parity, git 2.34.1 (463d1543): the index read retries without --sparse only on git\'s usage exit 129, once, with core.fsmonitor= (EMPTY) on both runs; exit 128, a signal, or 129 twice is final (root → TRACKED_ALL, a bound folder adds nothing); a git that knows --sparse runs once', async () => {
+    const k = await kernel();
+    const GIT = '/usr/bin/git', REAL = '/tmp/real-git', FAKE = '/tmp/fake-git', LOG = '/tmp/fake-git.log', MODE = '/tmp/fake-git.mode';
+    fs.copyFileSync(GIT, REAL); fs.chmodSync(REAL, 0o755);
+    fs.writeFileSync(FAKE, ['#!/bin/sh', `printf '%s\\n' "$*" >> ${LOG}`, `mode=$(cat ${MODE})`, 'sparse=0',
+      'for a in "$@"; do [ "$a" = --sparse ] && sparse=1; done', 'case "$mode" in',
+      '  usage) [ $sparse = 1 ] && exit 129 ;;', '  usage-twice) exit 129 ;;', '  fatal) [ $sparse = 1 ] && exit 128 ;;',
+      '  killed) [ $sparse = 1 ] && kill -9 $$ ;;', 'esac', `exec ${REAL} "$@"`, ''].join('\n'), { mode: 0o755 });
+    const root = newRoot(); // a root repository and a bound folder
+    indexOnly(root, ['a.txt', 'node_modules/x.js']);
+    boundFolder(projectOf(root, REPO_ID), fiveKeys(REPO_ID));
+    const nested = newRoot(); // a bound folder only
+    boundFolder(projectOf(nested, REPO_ID), fiveKeys(REPO_ID));
+    const DIST = `projects/${REPO_ID}/repository/dist/app.js`;
+    // A bind mount in this suite's private mount namespace only (isolate()); unmounted below.
+    execFileSync('mount', ['--bind', FAKE, GIT]);
+    try {
+      const runs = (mode, r) => {
+        fs.writeFileSync(MODE, mode); fs.rmSync(LOG, { force: true });
+        const tracked = trackedOf(k, r);
+        return { tracked, calls: exists(LOG) ? fs.readFileSync(LOG, 'utf8').split('\n').filter(Boolean) : [] };
+      };
+      const usage = runs('usage', root); // git 2.34.1: --sparse is a usage error; the retry lists the same paths
+      assert.ok(usage.tracked !== k.TRACKED_ALL && usage.tracked.has('node_modules/x.js') && usage.tracked.has(DIST), 'read through the retry');
+      assert.equal(usage.calls.length, 4, usage.calls.join('\n'));
+      usage.calls.forEach((c, i) => {
+        assert.match(c, / -c core\.fsmonitor= ls-files -z --cached( --sparse)?$/, c);
+        assert.equal(c.endsWith(' --sparse'), i % 2 === 0, `run ${i} --sparse: ${c}`);
+      });
+      // the real git behind the fake: ≥ 2.35 runs once per index; this image's 2.34.1 retries for real
+      const version = k.parseGitVersion(sh(REAL, ['--version'], { env: USER_ENV }));
+      const sparseKnown = version.major > 2 || (version.major === 2 && version.minor >= 35);
+      const real = runs('none', root);
+      assert.ok(real.tracked.has('node_modules/x.js') && real.tracked.has(DIST));
+      assert.deepEqual(real.calls.map((c) => c.endsWith(' --sparse')), sparseKnown ? [true, true] : [true, false, true, false], `git ${version.major}.${version.minor}`);
+      for (const [mode, calls] of [['fatal', 1], ['killed', 1], ['usage-twice', 2]]) {
+        const rootRun = runs(mode, root);
+        assert.ok(rootRun.tracked === k.TRACKED_ALL, `${mode}: root`);
+        assert.equal(rootRun.calls.length, calls, `${mode}: root runs\n${rootRun.calls.join('\n')}`);
+        const nestedRun = runs(mode, nested);
+        assert.ok(nestedRun.tracked !== k.TRACKED_ALL && !nestedRun.tracked.has(DIST), `${mode}: bound folder adds nothing`);
+        assert.equal(nestedRun.calls.length, calls, `${mode}: bound folder runs`);
+      }
+    } finally {
+      execFileSync('umount', [GIT]);
+    }
+  });
+
+  test('codec parity (463d1543): projects/<repositoryId>/repository is read only with exactly the five binding keys, v 1 (not a boolean or string), its own repositoryId and string handle and name; repos/<handle>/<name> keeps its rule (other keys allowed); both need strict UTF-8 JSON without a BOM and real directories (a symlinked projects or handle is never listed)', async () => {
+    const k = await kernel();
+    const root = newRoot();
+    const marked = [], unmarked = [];
+    const add = (folder, binding, isMarked) => { boundFolder(folder, binding); (isMarked ? marked : unmarked).push(`${folder.slice(root.length + 1)}/dist/app.js`); };
+    add(projectOf(root, REPO_ID), fiveKeys(REPO_ID), true);
+    add(projectOf(root, 'any-name'), fiveKeys('any-name'), true); // the codec does not ask for a UUID directory
+    add(projectOf(root, 'v-float'), '{"v":1.0,"repositoryId":"v-float","handle":"a","name":"b","gitHost":7}', true);
+    add(projectOf(root, 'six'), fiveKeys('six', { extra: 1 }), false);
+    const four = fiveKeys('four'); delete four.gitHost;
+    add(projectOf(root, 'four'), four, false);
+    add(projectOf(root, 'other-id'), fiveKeys(OTHER_REPO_ID), false);
+    add(projectOf(root, 'num-handle'), fiveKeys('num-handle', { handle: 5 }), false);
+    add(projectOf(root, 'v-true'), fiveKeys('v-true', { v: true }), false);
+    add(projectOf(root, 'v-string'), fiveKeys('v-string', { v: '1' }), false);
+    add(projectOf(root, 'bom'), `﻿${JSON.stringify(fiveKeys('bom'))}`, false);
+    add(`${root}/projects/wrong-dir/repo`, fiveKeys('wrong-dir'), false);
+    add(`${root}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site', anything: [1] }, true);
+    add(`${root}/repos/acme/other`, { v: 1, handle: 'acme', name: 'site' }, false);
+    add(`${root}/repos/acme/bad-utf8`, Buffer.concat([Buffer.from('{"v":1,"handle":"acme","name":"bad-utf8","x":"'), Buffer.from([0xc3, 0x28]), Buffer.from('"}')]), false);
+    add(`${root}/repos/acme/bom`, `﻿${JSON.stringify({ v: 1, handle: 'acme', name: 'bom' })}`, false);
+    // a symlinked repository component (the codec opens every component O_NOFOLLOW)
+    boundFolder(`${root}/elsewhere/clone`, fiveKeys('linked'));
+    fs.mkdirSync(`${root}/projects/linked`);
+    fs.symlinkSync('../../elsewhere/clone', `${root}/projects/linked/repository`);
+    unmarked.push('projects/linked/repository/dist/app.js');
+    const tracked = trackedOf(k, root);
+    for (const n of marked) assert.ok(tracked.has(n), `read: ${n}`);
+    for (const n of unmarked) assert.ok(!tracked.has(n), `not read: ${n}`);
+    const linked = newRoot();
+    boundFolder(`${linked}/real/${REPO_ID}/repository`, fiveKeys(REPO_ID));
+    fs.symlinkSync('real', `${linked}/projects`);
+    boundFolder(`${linked}/elsewhere/site`, { v: 1, handle: 'acme', name: 'site' });
+    fs.mkdirSync(`${linked}/repos`); fs.symlinkSync('../elsewhere', `${linked}/repos/acme`);
+    assert.deepEqual([...trackedOf(k, linked)], [], 'nothing through a symlinked projects or handle');
+  });
+
+  test('codec parity (463d1543): one SNAPSHOT_NESTED_INDEX_MAX cap over both layouts in component order, projects/ first and names by code point (not UTF-16 units), counting bound folders only; a folder the codec cannot archive (a backslash in its name) is never read, so it spends no cap and no pool', async () => {
+    const k = await kernel();
+    assert.equal(k.SNAPSHOT_NESTED_INDEX_MAX, V.constants.SNAPSHOT_NESTED_INDEX_MAX);
+    const tplRoot = newRoot(); indexOnly(tplRoot, ['dist/app.js']);
+    const tpl = `${tplRoot}/.git/index`;
+    const root = newRoot();
+    // 300 unbound project folders (a .git, no binding) sort first and never count
+    for (let i = 0; i < 300; i += 1) fs.mkdirSync(`${root}/projects/a${String(i).padStart(3, '0')}/repository/.git`, { recursive: true });
+    for (let i = 0; i < 255; i += 1) { const id = `m${String(i).padStart(3, '0')}`; boundFolder(projectOf(root, id), fiveKeys(id), undefined, tpl); }
+    boundFolder(`${root}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' }, undefined, tpl);
+    boundFolder(`${root}/repos/acme/zzz`, { v: 1, handle: 'acme', name: 'zzz' }, undefined, tpl);
+    let tracked = trackedOf(k, root);
+    assert.ok(tracked.has('projects/m254/repository/dist') && tracked.has('repos/acme/site/dist'), 'the 256th bound folder is read');
+    assert.ok(!tracked.has('repos/acme/zzz/dist'), 'the 257th is past the cap');
+    boundFolder(projectOf(root, 'm255'), fiveKeys('m255'), undefined, tpl);
+    tracked = trackedOf(k, root);
+    assert.ok(tracked.has('projects/m255/repository/dist') && !tracked.has('repos/acme/site/dist'), 'projects/ sorts before repos/');
+    const order = newRoot();
+    for (const n of [...Array.from({ length: 255 }, (_, i) => `n${String(i).padStart(3, '0')}`), '\u{E000}', '\u{1F600}']) {
+      boundFolder(`${order}/repos/h/${n}`, { v: 1, handle: 'h', name: n }, undefined, tpl);
+    }
+    tracked = trackedOf(k, order);
+    assert.ok(tracked.has('repos/h/\u{E000}/dist') && !tracked.has('repos/h/\u{1F600}/dist'), 'U+E000 before U+1F600 (UTF-16 units order them the other way)');
+    const odd = newRoot();
+    boundFolder(projectOf(odd, 'x\\y'), fiveKeys('x\\y'));
+    boundFolder(`${odd}/repos/a\\b/site`, { v: 1, handle: 'a\\b', name: 'site' });
+    boundFolder(`${odd}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' });
+    tracked = trackedOf(k, odd, { indexBytes: fs.statSync(`${odd}/repos/acme/site/.git/index`).size, pathBytes: 1 << 20 });
+    assert.ok(tracked.has('repos/acme/site/dist'), 'the index pool is spent only by folders the codec archives');
+    assert.ok(!tracked.has('projects/x\\y/repository/dist') && !tracked.has('repos/a\\b/site/dist'), 'unrepresentable folders are never read');
+  });
+
+  test('codec parity (463d1543): per-pass pools: index bytes in one pool the root spends first and bound folders share; path bytes in the root\'s own pool, then one pool the folders share; a failed read keeps what it spent; output past the pool spends all of it', async () => {
+    const k = await kernel();
+    assert.deepEqual({ ...k.CODEC_INDEX_POOLS }, { indexBytes: V.constants.SNAPSHOT_LIMIT_BYTES, pathBytes: V.constants.SNAPSHOT_INDEX_PATHS_BYTES });
+    const size = (p) => fs.statSync(p).size;
+    const big = 1 << 30;
+    const r1 = newRoot();
+    indexOnly(r1, ['dist/app.js']);
+    boundFolder(projectOf(r1, REPO_ID), fiveKeys(REPO_ID));
+    boundFolder(`${r1}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' });
+    const R = size(`${r1}/.git/index`), P = size(`${projectOf(r1, REPO_ID)}/.git/index`), S = size(`${r1}/repos/acme/site/.git/index`);
+    let tracked = trackedOf(k, r1, { indexBytes: R + P, pathBytes: big });
+    assert.ok(tracked.has('dist') && tracked.has(`projects/${REPO_ID}/repository/dist`) && !tracked.has('repos/acme/site/dist'), 'root first, then the folders, one pool');
+    assert.ok(trackedOf(k, r1, { indexBytes: R + P + S, pathBytes: big }).has('repos/acme/site/dist'), 'exactly the pool fits');
+    assert.ok(trackedOf(k, r1, { indexBytes: R - 1, pathBytes: big }) === k.TRACKED_ALL, 'a root over the pool');
+    const r2 = newRoot(); // a corrupt 300-byte index spends 300 bytes before git refuses it
+    boundFolder(projectOf(r2, REPO_ID), fiveKeys(REPO_ID));
+    fs.writeFileSync(`${projectOf(r2, REPO_ID)}/.git/index`, Buffer.alloc(300, 1));
+    boundFolder(`${r2}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' });
+    const S2 = size(`${r2}/repos/acme/site/.git/index`);
+    assert.ok(trackedOf(k, r2, { indexBytes: 300 + S2, pathBytes: big }).has('repos/acme/site/dist'));
+    assert.ok(!trackedOf(k, r2, { indexBytes: 300 + S2 - 1, pathBytes: big }).has('repos/acme/site/dist'), 'the failed read kept its spend');
+    // each listing below is 'dist/app.js\0' (12) + 40 characters and '\0' (41) = 53 bytes
+    const r3 = newRoot();
+    indexOnly(r3, ['dist/app.js', 'a'.repeat(40)]);
+    boundFolder(projectOf(r3, REPO_ID), fiveKeys(REPO_ID), ['dist/app.js', 'b'.repeat(40)]);
+    boundFolder(`${r3}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' }, ['dist/app.js', 'c'.repeat(40)]);
+    tracked = trackedOf(k, r3, { indexBytes: big, pathBytes: 53 });
+    assert.ok(tracked.has('dist') && tracked.has(`projects/${REPO_ID}/repository/dist`), 'the root fills its own pool; the folders\' pool starts full');
+    assert.ok(!tracked.has('repos/acme/site/dist'), 'the folders share one pool');
+    assert.ok(trackedOf(k, r3, { indexBytes: big, pathBytes: 106 }).has('repos/acme/site/dist'));
+    assert.ok(trackedOf(k, r3, { indexBytes: big, pathBytes: 52 }) === k.TRACKED_ALL, 'a root listing one byte over its pool');
+    const r4 = newRoot(); // 12 + 50 × 31 bytes, far past a 100-byte pool: the child is cut off and the pool is gone
+    boundFolder(projectOf(r4, REPO_ID), fiveKeys(REPO_ID), ['dist/app.js', ...Array.from({ length: 50 }, (_, i) => `f${String(i).padStart(2, '0')}`.padEnd(30, 'z'))]);
+    boundFolder(`${r4}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' });
+    tracked = trackedOf(k, r4, { indexBytes: big, pathBytes: 100 });
+    assert.ok(!tracked.has(`projects/${REPO_ID}/repository/dist`) && !tracked.has('repos/acme/site/dist'), 'a 12-byte listing after an exhausted pool');
+    fs.rmSync(`${projectOf(r4, REPO_ID)}/.git/ezil-repo.json`);
+    assert.ok(trackedOf(k, r4, { indexBytes: big, pathBytes: 100 }).has('repos/acme/site/dist'), 'control: the same folder alone fits');
+  });
+
+  test('codec parity (463d1543): index files are copied in the directory\'s own order, as os.listdir lists them (not sorted): a sharedindex.* that is not a regular file and is listed before index fails the read with nothing charged', async () => {
+    const k = await kernel();
+    const root = newRoot();
+    boundFolder(projectOf(root, REPO_ID), fiveKeys(REPO_ID));
+    boundFolder(`${root}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' });
+    const git = `${projectOf(root, REPO_ID)}/.git`;
+    const listed = () => {
+      const d = fs.opendirSync(git); const out = [];
+      for (let e = d.readSync(); e !== null; e = d.readSync()) if (e.name === 'index' || e.name === 'sharedindex.0') out.push(e.name);
+      d.closeSync();
+      return out;
+    };
+    fs.mkdirSync(`${git}/sharedindex.0`); // listed first where the newest entry comes first
+    if (listed()[0] === 'index') { fs.renameSync(`${git}/index`, `${root}/index.tmp`); fs.renameSync(`${root}/index.tmp`, `${git}/index`); } // insertion order
+    assert.deepEqual(listed(), ['sharedindex.0', 'index'], 'precondition: the directory lists sharedindex.0 before index');
+    const S = fs.statSync(`${root}/repos/acme/site/.git/index`).size;
+    const tracked = trackedOf(k, root, { indexBytes: S, pathBytes: 1 << 20 });
+    assert.ok(!tracked.has(`projects/${REPO_ID}/repository/dist`) && tracked.has('repos/acme/site/dist'), 'sorted, index would be charged before the directory fails the read');
+  });
+
+  test('codec parity (463d1543): the default path pools at full size: a root listing of exactly 16 MiB is read and one byte more → TRACKED_ALL; a bound folder still reads after a full root; two bound folders of 16 MiB each share one pool', async () => {
+    const k = await kernel();
+    const MiB16 = V.constants.SNAPSHOT_INDEX_PATHS_BYTES;
+    // 65536 paths of 255 bytes: 65536 × (255 + 1) = 16 MiB of `ls-files -z` output
+    const paths = Array.from({ length: 65536 }, (_, i) => `p/${i.toString(16).padStart(8, '0')}`.padEnd(255, 'x'));
+    assert.equal(paths.reduce((n, p) => n + p.length + 1, 0), MiB16);
+    const exact = newRoot(); indexInfo(exact, paths);
+    const over = newRoot(); indexInfo(over, [...paths.slice(1), paths[0].padEnd(256, 'y')]);
+    const first = `projects/${REPO_ID}/repository/${paths[0]}`;
+    boundFolder(projectOf(exact, REPO_ID), fiveKeys(REPO_ID), undefined, `${exact}/.git/index`);
+    let tracked = trackedOf(k, exact);
+    assert.ok(tracked !== k.TRACKED_ALL && tracked.has(paths[0]) && tracked.has(paths.at(-1)), 'a 16 MiB root listing is read');
+    assert.ok(tracked.has(first), 'a bound folder after a full root still reads (its pool is its own)');
+    // identity only: a failing strict-equal on a 65 536-path Set makes node 24 build a diff of many GiB
+    assert.ok(trackedOf(k, over) === k.TRACKED_ALL, 'one byte over');
+    const two = newRoot();
+    boundFolder(projectOf(two, REPO_ID), fiveKeys(REPO_ID), undefined, `${exact}/.git/index`);
+    boundFolder(`${two}/repos/acme/site`, { v: 1, handle: 'acme', name: 'site' }, undefined, `${exact}/.git/index`);
+    tracked = trackedOf(k, two);
+    assert.ok(tracked.has(first) && !tracked.has(`repos/acme/site/${paths[0]}`), 'the second 16 MiB folder is over the shared pool');
+  });
+
+  test('prepare (codec parity, 463d1543): 450 MiB in the tracked dist of a bound projects/<repositoryId>/repository → repository_too_large (the codec archives it); the same folder with a four-key binding, or bound to another repositoryId, is not read and the open succeeds', async () => {
+    const big = 471859200;
+    const attempt = async (binding) => {
+      resetRun();
+      const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+      const folder = projectOf(root, OTHER_REPO_ID);
+      fs.mkdirSync(`${folder}/dist`, { recursive: true });
+      const fd = fs.openSync(`${folder}/dist/app.js`, 'wx'); fs.ftruncateSync(fd, big); fs.closeSync(fd);
+      boundFolder(folder, binding);
+      makeRemote(fx, { branches: { main: { 'README.md': 'hi' } } });
+      const flow = await openFlow(fx, { root, token });
+      if (!flow.prepared.ok) assertNoOpenLeftovers(root, flow.uuid);
+      assert.deepEqual(fs.readdirSync('/run/ezil').filter((n) => n.startsWith('repo-open-index-')), []);
+      return flow;
+    };
+    const bound = fiveKeys(OTHER_REPO_ID, { name: 'blog' });
+    assert.deepEqual((await attempt(bound)).prepared, { ok: false, errorCode: 'repository_too_large' }, 'five-key binding');
+    const { gitHost: _host, ...four } = bound;
+    assert.equal((await attempt(four)).committed?.state, 'cloned', 'four keys');
+    assert.equal((await attempt({ ...bound, repositoryId: REPO_ID })).committed?.state, 'cloned', 'another repositoryId');
   });
 
   // ── r56 recheck (A2h): no template directory, no system attributes, no file under HOME ─────────

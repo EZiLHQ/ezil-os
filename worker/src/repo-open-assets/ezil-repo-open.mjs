@@ -40,6 +40,8 @@ const GIT_XDG_CONFIG_HOME = '/dev/null/ezil-no-xdg';
 const GIT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 export const STAGING_ROOT_NAME = '.ezil-staging';
 const BINDING_FILE = 'ezil-repo.json';
+/** The binding's exact keys (writeBinding, bindingMatches, repoOpenMarked for projects/<repositoryId>/repository). */
+const BINDING_KEYS = ['v', 'repositoryId', 'handle', 'name', 'gitHost'];
 // Request class → the one git host it may name (1.0.3; vectors constants REPO_OPEN_CLASS_GIT_HOSTS).
 // A closed table: a request whose gitHost is not its class's host is refused. A request without
 // `class` is 'personal', so a 1.0.2 request reads exactly as before.
@@ -50,6 +52,8 @@ const DEFAULT_CLASS = 'personal';
 // F = W/repository (the OS open-project layout), so no file of the repository sits at the editor root.
 export const ASSESSMENT_PROJECTS_DIR = 'projects';
 export const ASSESSMENT_CLONE_DIR = 'repository';
+/** The personal layout's top directory, repos/<handle>/<name> (REPO_DIR_TEMPLATE). */
+const NESTED_REPOS_DIR = 'repos';
 export const LOCK_STALE_MS = 600000;
 export const KERNEL_GIT_COMMAND_MAX_MS = 80000;
 export const PREPARE_RESERVE_MS = 20000;
@@ -79,7 +83,15 @@ export const SNAPSHOT_NESTED_INDEX_MAX = 256;
 const INDEX_GIT = '/usr/bin/git';
 const INDEX_GIT_ENV = { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0' };
 const INDEX_GIT_TIMEOUT_MS = 30000;
-const INDEX_PATHS_MAX_BYTES = 16 * 1024 * 1024;
+/** git's usage-error exit: git < 2.35 (the image's 2.34.1) has no `ls-files --sparse` and exits with it before reading the index. */
+const GIT_USAGE_EXIT = 129;
+/**
+ * The codec's budgets for one inventory pass (vectors repoBudget.workspaceRule): index bytes copied, one pool
+ * the root spends first and the bound folders then share (the codec's LIMIT); ls-files output bytes, the root's
+ * own pool, then a second one the bound folders share (PATHS_LIMIT). A failed read keeps what it spent.
+ */
+export const SNAPSHOT_INDEX_BYTES = 512 * 1024 * 1024;
+export const SNAPSHOT_INDEX_PATHS_BYTES = 16 * 1024 * 1024;
 const MARKER_MAX_BYTES = 4096;
 
 export const HELPER_HINT_NOT_CONNECTED = 'EZiL: Git access for this repository is not connected. Reopen it from EZiL OS.';
@@ -519,7 +531,7 @@ function bindingMatches(dir, r) {
     const file = fs.lstatSync(`${dir}/.git/${BINDING_FILE}`);
     if (!git.isDirectory() || !file.isFile() || file.size > 4096) return false;
     const b = JSON.parse(fs.readFileSync(`${dir}/.git/${BINDING_FILE}`, 'utf8'));
-    return exactKeys(b, ['v', 'repositoryId', 'handle', 'name', 'gitHost']) && b.v === 1 && b.repositoryId === r.repositoryId
+    return exactKeys(b, BINDING_KEYS) && b.v === 1 && b.repositoryId === r.repositoryId
       && b.handle === r.handle && b.name === r.name && b.gitHost === r.gitHost;
   } catch { return false; }
 }
@@ -582,54 +594,125 @@ function walk(dir, prefix, visit, overDeadline) {
 // ── what the snapshot codec archives (§9.4 step 5, §9.8; vectors repoBudget.workspaceRule) ──
 
 /**
- * vectors repoBudget.repoOpenMarkerRule: `folder` (= <root>/repos/<handle>/<name>) is a repo-open
- * folder when no component is a symlink and `.git/ezil-repo.json` is a small regular file whose
- * JSON names this folder's own handle and name with v 1. The codec uses the same predicate.
+ * vectors repoBudget.repoOpenMarkerRule, the codec's nested_marked: <layout>/<a>/<b> is a repo-open folder when
+ * <layout>, <a>, <b> and .git are real directories (lstat, never a symlink) and .git/ezil-repo.json is a regular
+ * file of at most 4096 bytes whose strict UTF-8 text (a byte-order mark kept, so refused) parses as an object
+ * with v 1. repos/<handle>/<name>: its own handle and name, other keys allowed. projects/<repositoryId>/repository:
+ * exactly BINDING_KEYS, its own repositoryId and string handle and name. Anything else marks nothing.
  */
-export function repoOpenMarked(root, handle, name) {
+export function repoOpenMarked(root, layout, a, b) {
   try {
-    for (const p of [`${root}/repos`, `${root}/repos/${handle}`, `${root}/repos/${handle}/${name}`, `${root}/repos/${handle}/${name}/.git`]) {
+    const folder = `${root}/${layout}/${a}/${b}`;
+    for (const p of [`${root}/${layout}`, `${root}/${layout}/${a}`, folder, `${folder}/.git`]) {
       if (!fs.lstatSync(p).isDirectory()) return false;
     }
-    const file = `${root}/repos/${handle}/${name}/.git/${BINDING_FILE}`;
+    const file = `${folder}/.git/${BINDING_FILE}`;
     const st = fs.lstatSync(file);
     if (!st.isFile() || st.size > MARKER_MAX_BYTES) return false;
-    const m = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return !!m && typeof m === 'object' && !Array.isArray(m) && m.v === 1 && m.handle === handle && m.name === name;
+    const m = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file)));
+    if (!m || typeof m !== 'object' || Array.isArray(m) || m.v !== 1) return false;
+    if (layout === NESTED_REPOS_DIR) return m.handle === a && m.name === b;
+    return exactKeys(m, BINDING_KEYS) && m.repositoryId === a && typeof m.handle === 'string' && typeof m.name === 'string';
   } catch { return false; }
+}
+
+/** The codec's representable(): a name it archives; anything else it skips, a directory with its whole subtree. */
+const representable = (name) => name !== '' && !name.startsWith('/') && !name.includes('\\')
+  && name.split('/').every((x) => x !== '' && x !== '.' && x !== '..') && !SNAPSHOT_INTERNAL_NAMES.includes(name.split('/')[0]);
+/** Tuples of names in Python's order: component-wise by code point (JS `<` compares UTF-16 units instead). */
+const byComponents = (x, y) => {
+  for (let i = 0; i < x.length; i += 1) {
+    const c = Buffer.compare(Buffer.from(x[i], 'utf8'), Buffer.from(y[i], 'utf8'));
+    if (c !== 0) return c;
+  }
+  return 0;
+};
+/** A real directory's names (lstat first, so a symlink is never listed). */
+const listRealDir = (dir) => {
+  if (!fs.lstatSync(dir).isDirectory()) throw new Error('not a directory');
+  return fs.readdirSync(dir);
+};
+/** A directory's names in its own order (no sort), as the codec's os.listdir returns them. */
+function unsortedNames(dir) {
+  const d = fs.opendirSync(dir);
+  try {
+    const out = [];
+    for (let e = d.readSync(); e !== null; e = d.readSync()) out.push(e.name);
+    return out;
+  } finally { d.closeSync(); }
+}
+
+/**
+ * The codec's nested_candidates: [layout, a, b] for every projects/<repositoryId>/repository and
+ * repos/<handle>/<name>, in byComponents order (so projects/ first). A projects, repos or handle that is
+ * a symlink or cannot be listed contributes nothing.
+ */
+function nestedCandidates(root) {
+  const out = [];
+  let top;
+  try { top = fs.readdirSync(root); } catch { return out; }
+  if (top.includes(ASSESSMENT_PROJECTS_DIR)) {
+    try {
+      for (const id of listRealDir(`${root}/${ASSESSMENT_PROJECTS_DIR}`)) out.push([ASSESSMENT_PROJECTS_DIR, id, ASSESSMENT_CLONE_DIR]);
+    } catch { /* contributes nothing */ }
+  }
+  if (top.includes(NESTED_REPOS_DIR)) {
+    try {
+      for (const handle of listRealDir(`${root}/${NESTED_REPOS_DIR}`)) {
+        try {
+          for (const name of listRealDir(`${root}/${NESTED_REPOS_DIR}/${handle}`)) out.push([NESTED_REPOS_DIR, handle, name]);
+        } catch { continue; }
+      }
+    } catch { /* contributes nothing */ }
+  }
+  return out.sort(byComponents);
 }
 
 /**
  * The paths one index lists, read exactly as the codec reads it: a private copy of `index` and
- * any `sharedindex.*` in a throwaway git dir under `scratch` (never git inside the user's
- * repository, so its config, hooks and fsmonitor never run), the codec's binary, environment,
- * flags and limits. null when the codec could not read it either.
+ * any `sharedindex.*` (in the directory's own order) in a throwaway git dir under `scratch`
+ * (never git inside the user's repository, so its config, hooks and fsmonitor never run), the
+ * codec's binary, environment and flags. `budget` ({index, paths}: what the pass has left) is
+ * spent as the codec spends it: every copied byte, even by a read that then fails; the listed
+ * bytes once git exits 0. null when the codec could not read it either.
  */
-function indexPaths(gitDir, prefix, { limitBytes, scratch, timeoutMs }) {
+function indexPaths(gitDir, prefix, { budget, scratch, timeoutMs }) {
   let tmp = null;
   try {
     if (!fs.lstatSync(gitDir).isDirectory()) return null;
-    const names = fs.readdirSync(gitDir);
+    const names = unsortedNames(gitDir);
     if (!names.includes('index')) return new Set();
-    if (!(timeoutMs > 0)) return null;
+    if (!(timeoutMs() > 0)) return null;
     tmp = fs.mkdtempSync(`${scratch}/repo-open-index-`);
     fs.mkdirSync(`${tmp}/objects`);
     fs.mkdirSync(`${tmp}/refs`);
     fs.writeFileSync(`${tmp}/HEAD`, 'ref: refs/heads/main\n');
-    let copied = 0;
     for (const n of names) {
       if (n !== 'index' && !n.startsWith('sharedindex.')) continue;
       const st = fs.lstatSync(`${gitDir}/${n}`);
       if (!st.isFile()) return null;
-      copied += st.size;
-      if (copied > limitBytes) return null;
+      budget.index -= st.size;
+      if (budget.index < 0) return null;
       fs.copyFileSync(`${gitDir}/${n}`, `${tmp}/${n}`, fs.constants.COPYFILE_EXCL);
     }
-    // core.fsmonitor= (EMPTY, r56 review): git < 2.36 runs the value `false` as a hook command found on PATH; the
-    // listed paths are the same either way.
-    const r = spawnSync(INDEX_GIT, [`--git-dir=${tmp}`, '-c', 'core.fsmonitor=', 'ls-files', '-z', '--cached', '--sparse'],
-      { cwd: tmp, env: INDEX_GIT_ENV, stdio: ['ignore', 'pipe', 'ignore'], timeout: timeoutMs, maxBuffer: INDEX_PATHS_MAX_BYTES, killSignal: 'SIGKILL' });
+    // core.fsmonitor= (EMPTY, r56 review): git < 2.36 runs any other value, `false` included, as a hook command
+    // found on PATH; the listed paths are the same either way. GIT_USAGE_EXIT alone retries, once, without
+    // --sparse (git 2.34.1 exits so before reading the index); every other failure is final. maxBuffer is
+    // at least 1 because 0 would lift the bound.
+    const lsFiles = (extra) => {
+      const ms = timeoutMs();
+      if (!(ms > 0)) return null;
+      return spawnSync(INDEX_GIT, [`--git-dir=${tmp}`, '-c', 'core.fsmonitor=', 'ls-files', '-z', '--cached', ...extra],
+        { cwd: tmp, env: INDEX_GIT_ENV, stdio: ['ignore', 'pipe', 'ignore'], timeout: ms, maxBuffer: Math.max(budget.paths, 0) + 1, killSignal: 'SIGKILL' });
+    };
+    let r = lsFiles(['--sparse']);
+    if (r && !r.error && r.status === GIT_USAGE_EXIT) r = lsFiles([]);
+    if (!r) return null;
+    // More output than the pool holds: git listed it after reading the whole index, so the codec spends it all.
+    if (r.error && r.error.code === 'ENOBUFS') budget.paths = -1;
     if (r.error || r.status !== 0) return null;
+    budget.paths -= r.stdout.length;
+    if (budget.paths < 0) return null;
     const text = new TextDecoder('utf-8', { fatal: true }).decode(r.stdout);
     const out = new Set();
     for (const p of text.split('\0')) {
@@ -647,39 +730,34 @@ function indexPaths(gitDir, prefix, { limitBytes, scratch, timeoutMs }) {
 /** Every cache-named entry counts: the codec could not read the root index (it then fails the whole capture). */
 export const TRACKED_ALL = Symbol('every cache-named entry counts');
 
+/** The codec's pools for one inventory pass (SNAPSHOT_INDEX_BYTES, SNAPSHOT_INDEX_PATHS_BYTES). */
+export const CODEC_INDEX_POOLS = Object.freeze({ indexBytes: SNAPSHOT_INDEX_BYTES, pathBytes: SNAPSHOT_INDEX_PATHS_BYTES });
+
 /**
- * The codec's `tracked`: the root index, then repos/<handle>/<name>/.git/index of each repo-open
- * folder in sorted order, at most SNAPSHOT_NESTED_INDEX_MAX of them. An unreadable nested index
- * adds nothing (as in the codec); an unreadable root index → TRACKED_ALL (conservative).
+ * The codec's `tracked` for one inventory pass (its inventory() and nested_index_paths): the root
+ * index first, then each nestedCandidates folder whose name is representable and that carries the
+ * binding (repoOpenMarked), at most SNAPSHOT_NESTED_INDEX_MAX over both layouts. Index bytes come
+ * from one pool, root first; path bytes from the root's own pool, then one the folders share. An
+ * unreadable nested index, or one past a pool, adds nothing (as in the codec); an unreadable root
+ * index → TRACKED_ALL (the codec fails the whole capture; conservative). `pools` is for tests.
  */
-export function codecTracked(root, { limitBytes, scratch, remainingMs = () => INDEX_GIT_TIMEOUT_MS }) {
+export function codecTracked(root, { scratch, remainingMs = () => INDEX_GIT_TIMEOUT_MS, pools = CODEC_INDEX_POOLS }) {
   const timeoutMs = () => Math.min(INDEX_GIT_TIMEOUT_MS, remainingMs());
   const tracked = new Set();
+  const budget = { index: pools.indexBytes, paths: pools.pathBytes };
   if (lstatOrNull(`${root}/.git`)) {
-    const found = indexPaths(`${root}/.git`, '', { limitBytes, scratch, timeoutMs: timeoutMs() });
+    const found = indexPaths(`${root}/.git`, '', { budget, scratch, timeoutMs });
     if (found === null) return TRACKED_ALL;
     for (const p of found) tracked.add(p);
   }
-  const sorted = (dir) => fs.readdirSync(dir).sort();
-  const candidates = [];
-  try {
-    if (!fs.lstatSync(`${root}/repos`).isDirectory()) return tracked;
-    for (const handle of sorted(`${root}/repos`)) {
-      try {
-        if (!fs.lstatSync(`${root}/repos/${handle}`).isDirectory()) continue;
-        for (const name of sorted(`${root}/repos/${handle}`)) candidates.push([handle, name]);
-      } catch { continue; }
-    }
-  } catch { return tracked; }
+  budget.paths = pools.pathBytes;
   let read = 0;
-  for (const [handle, name] of candidates) {
+  for (const [layout, a, b] of nestedCandidates(root)) {
+    const folder = `${layout}/${a}/${b}`;
+    if (!representable(folder) || !repoOpenMarked(root, layout, a, b)) continue;
     if (read >= SNAPSHOT_NESTED_INDEX_MAX) break;
-    const folder = `${root}/repos/${handle}/${name}`;
-    const st = lstatOrNull(folder);
-    if (!st || !st.isDirectory() || !lstatOrNull(`${folder}/.git`)) continue;
-    if (!repoOpenMarked(root, handle, name)) continue;
     read += 1;
-    const found = indexPaths(`${folder}/.git`, `repos/${handle}/${name}/`, { limitBytes, scratch, timeoutMs: timeoutMs() });
+    const found = indexPaths(`${root}/${folder}/.git`, `${folder}/`, { budget, scratch, timeoutMs });
     if (found) for (const p of found) tracked.add(p);
   }
   return tracked;
@@ -763,7 +841,7 @@ export function measureBudget({ root, staging, handle, name, budget, scratch = '
   const over = () => workspaceTarBytes + stagedTarBytes + TAR_ARCHIVE_TAIL_BYTES > maxBytes || workspaceEntries + stagedEntries > maxEntries;
   if (!over()) {
     walkArchived(root, (e) => { workspaceTarBytes += entryTarBytes(e); workspaceEntries += 1; return !over(); }, {
-      tracked: () => codecTracked(root, { limitBytes: budget.limitBytes, scratch, ...(remainingMs ? { remainingMs } : {}) }),
+      tracked: () => codecTracked(root, { scratch, ...(remainingMs ? { remainingMs } : {}) }),
       overDeadline,
     });
   }
