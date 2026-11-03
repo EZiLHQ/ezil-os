@@ -142,6 +142,18 @@ test('synthetic workbench: patch, gates, refusal without a write, origin allowli
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the notice never carries the copilot-chat patch\'s prefix, which it gates to exactly one per file', () => {
+  const COPILOT = 'Modified at build time by EZiL';
+  const root = tmpRoot(`/* ${COPILOT} (worker/copilot-chat/patch-copilot-chat.sh, see PATCHES.md): fixture. */\n${FIXTURE}`);
+  try {
+    let r = run([root]); assert.equal(r.status, 0, r.stdout + r.stderr);
+    r = run(['--verify', root]); assert.equal(r.status, 0, r.stdout + r.stderr);
+    const patched = read(root);
+    assert.equal(patched.split(COPILOT).length - 1, 1, `'${COPILOT}' still occurs once after the bridge patch`);
+    assert.match(patched.trimEnd().split('\n').pop(), /^\/\* EZiL build-time modification \(worker\/code-folder-bridge\/patch-folder-bridge\.sh\): .* MIT License\. \*\/$/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a moved or duplicated anchor fails the build and leaves the file untouched', () => {
   for (const [label, content, id] of [
     ['B1 moved', FIXTURE.replace('workspaceProvider:KDo.create(e),', 'workspaceProvider:KDo.make(e),'), 'B1'],
