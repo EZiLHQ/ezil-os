@@ -403,7 +403,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await send('字'.repeat(10000));
             expect(bodies[0]!.byteLength + 1056).toBeLessThanOrEqual(32768);
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and your conversation history is kept. You can switch to another model or start a new chat. (local_input_too_large)');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and your conversation history is kept. You can start a new chat. (local_input_too_large)');
             expect(bodies).toHaveLength(1); expect(host.models()[0]!.maxInputTokens).toBe(configured);
         });
     }

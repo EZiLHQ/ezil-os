@@ -221,7 +221,7 @@ export function errorOrigin(body: ErrorBody): GatewayErrorOrigin {
     return typeof body.code === 'string' ? 'gateway' : 'transport';
 }
 
-const NOTHING_CHARGED = 'and your conversation history is kept. You can switch to another model or start a new chat';
+const NOTHING_CHARGED = 'and your conversation history is kept. You can start a new chat';
 
 export function parseErrorBody(text: string): ErrorBody {
     try {
@@ -634,7 +634,7 @@ function localRefusal(model: ResolvedModel, error: LocalRequestError): GatewayEr
     const kept = 'Nothing was sent or charged, and your conversation history is kept.';
     const text = error.code === 'local_input_too_large'
         ? `This conversation is too large to send to ${model.name}: ${bytes(c.bodyBytes)} bytes, including ${bytes(c.toolBytes)} bytes of tool definitions; `
-            + `the limit is ${bytes(c.limitBytes)} bytes. ${kept} You can switch to another model or start a new chat.`
+            + `the limit is ${bytes(c.limitBytes)} bytes. ${kept} You can start a new chat.`
         : error.code === 'local_too_many_messages'
             ? `This conversation has ${bytes(c.messages)} messages, more than EZiL AI accepts in one request. ${kept} You can start a new chat.`
             : `One message in this conversation has ${bytes(c.maxBlocks)} parts, more than EZiL AI accepts in one message. ${kept} You can start a new chat.`;
