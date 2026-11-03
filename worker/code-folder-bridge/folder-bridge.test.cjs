@@ -42,11 +42,11 @@ function bridgeFrom(patched) {
   const end = patched.indexOf(`;${A_B2}`, start);
   assert(start >= 0 && end > start, 'bridge text present right before the bootstrap IIFE');
   const src = patched.slice(start, end + 1);
-  return (provider, { framed = true, host = 'aws-8443-guac-a-b-aws.ezil.work', search = '?folder=%2Fworkspace&ezil_mint=MMMMMMMMMMMMMMMMMMMMMM' } = {}) => {
+  return (provider, { framed = true, host = 'aws-8443-guac-a-b-aws.ezil.work', search = '?folder=%2Fworkspace&ezil_mint=MMMMMMMMMMMMMMMMMMMMMM', pathname = '/' } = {}) => {
     const listeners = []; const posted = []; const parent = { postMessage: (m, o) => posted.push({ m, o }) };
     const win = { addEventListener: (t, f) => t === 'message' && listeners.push(f) };
     win.parent = framed ? parent : win;
-    const ctx = { window: win, location: { host, search }, URLSearchParams, globalThis: null };
+    const ctx = { window: win, location: { host, search, pathname }, URLSearchParams, globalThis: null };
     ctx.globalThis = ctx; vm.createContext(ctx); vm.runInContext(src, ctx);
     const ret = ctx.__ezilFolderBridge(provider);
     return { ret, posted, fire: (ev) => listeners.forEach(f => f(ev)), parent };
@@ -67,7 +67,7 @@ function bridgeBehaviour(patched, origins = ['https://os-staging.ezil.work']) {
   t.posted.length = 0;
   t.fire({ source: t.parent, origin: 'https://os-staging.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
   assert.deepEqual(plain(t.posted), [{ o: 'https://os-staging.ezil.work',
-    m: { type: 'ezil.code.folder', v: 1, nonce: N, mint: MINT, kind: 'folder', path: '/workspace/My Project/日本 ü' } }]);
+    m: { type: 'ezil.code.folder', v: 1, nonce: N, mint: MINT, kind: 'folder', path: '/workspace/My Project/日本 ü', base: '/' } }]);
   // a document the person navigated to (Open Folder dropped ezil_mint) reports mint:null; a malformed mint is null
   for (const search of ['?folder=%2Fworkspace%2Fb', '?folder=%2Fw&ezil_mint=bad', `?ezil_mint=${MINT}x`]) {
     const u = bridge(fp('/workspace/b'), { search }); u.posted.length = 0;
@@ -97,6 +97,13 @@ function bridgeBehaviour(patched, origins = ['https://os-staging.ezil.work']) {
   assert.equal(kind({ workspace: { workspaceUri: {} } }).path, undefined);
   assert.equal(kind({ workspace: undefined }).kind, 'empty');
   assert.equal(kind(fp(`/${'a'.repeat(5000)}`)).kind, 'foreign');
+  // base: the document's own path, for folder and empty only (the shell reloads the editor's own document, F2)
+  const baseOf = (prov, pathname) => { const r = bridge(prov, { pathname }); r.posted.length = 0; r.fire({ source: r.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } }); return r.posted[0].m; };
+  assert.equal(baseOf(fp('/workspace'), '/preview/').base, '/preview/', 'the Cloudflare document path');
+  assert.equal(baseOf({ workspace: undefined }, '/').base, '/', 'empty window: base too');
+  assert.equal(baseOf({ workspace: { workspaceUri: {} } }, '/').base, undefined, 'a workspace document has no base');
+  assert.equal(baseOf(fp('/workspace', 'other-host'), '/').base, undefined, 'a foreign folder has no base');
+  assert.equal(baseOf(fp('/workspace'), `/${'p'.repeat(300)}/`).base, undefined, 'an absurd document path is left out');
   // top level (not framed): nothing posted, no listener needed, the provider returned unchanged
   const prov = fp('/workspace');
   t = bridge(prov, { framed: false });

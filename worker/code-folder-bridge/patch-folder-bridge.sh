@@ -22,12 +22,16 @@
 #     build-time allowlist EZIL_SHELL_ORIGINS_JSON (default: the staging EZiL OS
 #     shell origin only), never with a '*' target;
 #   - `ezil.code.ready` (no data) once at load, so the shell can say hello;
-#   - `ezil.code.folder` {v:1, nonce, mint, kind, path?} only in answer to a
+#   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, base?} only in answer to a
 #     shell hello whose source is window.parent, whose origin is allowed and
 #     whose nonce is 22 base64url characters. `mint` is this document's own
 #     `ezil_mint` URL parameter (the shell's per-mint id; null when absent,
 #     e.g. after an in-editor Open Folder, which drops every other parameter).
 #     `kind` is folder (vscode-remote on this host), foreign, workspace or empty.
+#     `base` (folder and empty only) is this document's own location.pathname
+#     (`/` on AWS, `/preview/` on Cloudflare), so the shell can reload the
+#     editor's own document in a fresh frame after an in-editor Open Folder
+#     (Back/Forward, F2). The shell validates it; it is never authority.
 # It is a HINT: the shell only uses it to ask the next mint, and the server
 # walks it on the computer before anything opens. No new inline script, so the
 # workbench CSP is unchanged; every error is swallowed and the provider is
@@ -80,7 +84,7 @@ A_B1='workspaceProvider:KDo.create(e),'
 R_B1='workspaceProvider:globalThis.__ezilFolderBridge(KDo.create(e)),'
 # B2 — define the bridge before the bootstrap IIFE runs (the IIFE builds the provider through B1).
 A_B2='(function(){dt.document.getElementById("vscode-startup-fallback")?.remove();'
-R_B2="globalThis.__ezilFolderBridge=(p=>{try{const O=${SHELL_ORIGINS_JS};if(window.parent===window)return p;let M=null;try{const m=new URLSearchParams(location.search).get(\"ezil_mint\");M=m&&/^[A-Za-z0-9_-]{22}\$/.test(m)?m:null}catch{}const w=p&&p.workspace;let r={kind:\"empty\"};if(w&&w.folderUri){const u=w.folderUri;r=u.scheme===\"vscode-remote\"&&u.authority===location.host?{kind:\"folder\",path:String(u.path)}:{kind:\"foreign\"}}else if(w&&w.workspaceUri)r={kind:\"workspace\"};if(r.path&&r.path.length>4096)r={kind:\"foreign\"};window.addEventListener(\"message\",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!==\"object\"||d.type!==\"ezil.code.hello\"||d.v!==1||typeof d.nonce!==\"string\"||!/^[A-Za-z0-9_-]{22}\$/.test(d.nonce))return;ev.source.postMessage({type:\"ezil.code.folder\",v:1,nonce:d.nonce,mint:M,...r},ev.origin)}catch{}});for(const o of O){try{window.parent.postMessage({type:\"ezil.code.ready\",v:1},o)}catch{}}}catch{}return p});${A_B2}"
+R_B2="globalThis.__ezilFolderBridge=(p=>{try{const O=${SHELL_ORIGINS_JS};if(window.parent===window)return p;let M=null;try{const m=new URLSearchParams(location.search).get(\"ezil_mint\");M=m&&/^[A-Za-z0-9_-]{22}\$/.test(m)?m:null}catch{}const w=p&&p.workspace;let r={kind:\"empty\"};if(w&&w.folderUri){const u=w.folderUri;r=u.scheme===\"vscode-remote\"&&u.authority===location.host?{kind:\"folder\",path:String(u.path)}:{kind:\"foreign\"}}else if(w&&w.workspaceUri)r={kind:\"workspace\"};if(r.path&&r.path.length>4096)r={kind:\"foreign\"};if(r.kind===\"folder\"||r.kind===\"empty\"){const b=String(location.pathname||\"\");if(b.length<=256)r.base=b}window.addEventListener(\"message\",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!==\"object\"||d.type!==\"ezil.code.hello\"||d.v!==1||typeof d.nonce!==\"string\"||!/^[A-Za-z0-9_-]{22}\$/.test(d.nonce))return;ev.source.postMessage({type:\"ezil.code.folder\",v:1,nonce:d.nonce,mint:M,...r},ev.origin)}catch{}});for(const o of O){try{window.parent.postMessage({type:\"ezil.code.ready\",v:1},o)}catch{}}}catch{}return p});${A_B2}"
 # B3 — Open Folder / Close Folder / Open Workspace in the SAME frame replace the iframe's session-history entry
 # instead of pushing one, so a shell Back leaves /app/code (app-history.js: Back/Forward moves between shell
 # entries and never re-mints) instead of silently reloading the previous folder inside the frame.
