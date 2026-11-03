@@ -9,9 +9,11 @@
 import { describe, expect, it } from 'bun:test';
 
 import {
+  OS_STAGING_AI_GATEWAY_ORIGIN,
   parseRepoOpenRequest,
   repoOpenAuthFor,
   repoOpenCommand,
+  repoOpenRemotesFor,
   REPO_OPEN_EXEC_TIMEOUT_MS,
   REPO_OPEN_SCRIPT,
   STAGING_GIT_QA_REPOSITORY_URL,
@@ -272,5 +274,39 @@ describe('the in-computer flow is host-agnostic (URL + auth kind only)', () => {
     expect(qa).toContain(`'${GIT_QA}'`);
     expect(qa).not.toContain(GRANT);
     expect(qa.replace(GIT_QA, GITHUB)).toBe(gh);
+  });
+});
+
+describe('repoOpenRemotesFor: the personal route opts in on os-staging only (its exact Gateway origin; no env var added)', () => {
+  it('os-staging: exactly the staging Gateway origin, with or without a bare /', () => {
+    expect(OS_STAGING_AI_GATEWAY_ORIGIN).toBe('https://ai-staging.ezil.work');
+    for (const v of ['https://ai-staging.ezil.work', 'https://ai-staging.ezil.work/']) {
+      expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true });
+      expect(repoOpenAuthFor(GIT_QA_P, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBe('basic');
+    }
+  });
+  it('anything else fails closed: production, absent, empty, a path, a query, a fragment, http, userinfo, case, padding, look-alikes, non-strings', () => {
+    for (const v of [undefined, null, '', 'https://ai.ezil.work', 'https://ai.ezil.work/', 'https://ai-staging.ezil.work/v1', 'https://ai-staging.ezil.work//',
+      'https://ai-staging.ezil.work?x', 'https://ai-staging.ezil.work#x', 'http://ai-staging.ezil.work', 'https://a@ai-staging.ezil.work',
+      'https://AI-STAGING.EZIL.WORK', ' https://ai-staging.ezil.work', 'https://ai-staging.ezil.work ', 'https://ai-staging.ezil.work:443',
+      'https://ai-staging.ezil.work.evil.com', 'https://evil.com/https://ai-staging.ezil.work', 'not a url', 42, ['https://ai-staging.ezil.work'],
+      { toString: () => 'https://ai-staging.ezil.work' }]) {
+      expect({ v, got: repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }) }).toEqual({ v, got: {} });
+      expect(repoOpenAuthFor(GIT_QA, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBeNull();
+    }
+    expect(repoOpenRemotesFor({})).toEqual({});
+  });
+  it('on os-staging the parser accepts a Builder project\'s git-qa remote and keeps every other rule', () => {
+    const remotes = repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' });
+    const body = (canonicalURL: string, extra: Record<string, unknown> = {}) => ({
+      repositoryId: REPO, canonicalURL, ref: 'refs/heads/main', git: { token: GRANT, expiresAt: new Date(Date.now() + 60_000).toISOString() }, ...extra,
+    });
+    const ok = parseRepoOpenRequest(body(GIT_QA_P), Date.now(), remotes);
+    expect(ok.ok && ok.request.auth).toBe('basic');
+    expect(parseRepoOpenRequest(body(GIT_QA_P, { repositoryId: REPO.toUpperCase() }), Date.now(), remotes)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(parseRepoOpenRequest(body(GIT_QA_P, { ref: 'refs/heads/../x' }), Date.now(), remotes)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(parseRepoOpenRequest(body(GIT_QA_P, { extra: 1 }), Date.now(), remotes)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(parseRepoOpenRequest(body(GIT_QA_P, { git: { token: GRANT, expiresAt: new Date(Date.now() + 1_000).toISOString() } }), Date.now(), remotes))
+      .toEqual({ ok: false, error: 'repo_open_token_expired' });
   });
 });

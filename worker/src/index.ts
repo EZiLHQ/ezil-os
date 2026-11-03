@@ -617,6 +617,7 @@ import {
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
   parseRepoOpenRequest,
+  repoOpenRemotesFor,
   repoOpenStatus,
   repoOpenWhenRunning,
   ownSessionExec,
@@ -5406,7 +5407,8 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   }
   const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
   if (!read.ok) return read.response;
-  const parsed = parseRepoOpenRequest(read.body);
+  // os-staging also accepts git-qa.ezil.work (ordinary Builder-created projects, repo-open.ts `repoOpenRemotesFor`).
+  const parsed = parseRepoOpenRequest(read.body, Date.now(), repoOpenRemotesFor(env));
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoOpenStatus(parsed.error));
   const root = repoOpenRoot(env);
   if (!root) {

@@ -97,15 +97,41 @@ describe('POST /sandbox/:name/repo-open on the real route table', () => {
     expect(calls[0]!.request).toMatchObject({ canonicalURL: 'https://github.ezil.work/acme/site.git', auth: 'basic', token: grant });
   });
 
-  it('🔴 a staging EZiL Git (git-qa.ezil.work) remote is 400 repo_open_invalid_request here (this route never opts in) and never reaches the computer', async () => {
+  it('🔴 a staging EZiL Git (git-qa.ezil.work) remote is 400 repo_open_invalid_request off os-staging (no Gateway var, production\'s, or any other value) and never reaches the computer', async () => {
     const worker = await loadWorker();
-    const { binding, calls } = fakeNamespace();
     const grant = `egg_${'ab12'.repeat(16)}`;
     const body = JSON.stringify({ ...JSON.parse(BODY), canonicalURL: 'https://git-qa.ezil.work/acme/site.git', git: { token: grant, expiresAt: new Date(Date.now() + 60_000).toISOString() } });
-    const res = await worker.fetch(await signed({ signBody: body }), env(binding));
-    expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ ok: false, error: 'repo_open_invalid_request' });
-    expect(calls).toHaveLength(0);
+    for (const gateway of [undefined, 'https://ai.ezil.work', 'https://ai-staging.ezil.work/v1', 'https://ai-staging.ezil.work?x=1', 'http://ai-staging.ezil.work',
+      ' https://ai-staging.ezil.work', 'https://user@ai-staging.ezil.work', 'https://AI-STAGING.ezil.work', 'https://ai-staging.ezil.work.evil.com']) {
+      const { binding, calls } = fakeNamespace();
+      const res = await worker.fetch(await signed({ signBody: body }), env(binding, gateway === undefined ? {} : { EZIL_AI_GATEWAY_URL: gateway }));
+      expect({ gateway, status: res.status }).toEqual({ gateway, status: 400 });
+      expect(await res.json()).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it('on os-staging (its exact Gateway origin) an ordinary Builder project\'s git-qa.ezil.work remote reaches THIS computer as Basic auth; foreign hosts stay refused', async () => {
+    const worker = await loadWorker();
+    const grant = `egg_${'cd34'.repeat(16)}`;
+    const open = (canonicalURL: string) => JSON.stringify({ ...JSON.parse(BODY), canonicalURL, git: { token: grant, expiresAt: new Date(Date.now() + 60_000).toISOString() } });
+    for (const gateway of ['https://ai-staging.ezil.work', 'https://ai-staging.ezil.work/']) {
+      const { binding, calls } = fakeNamespace();
+      const res = await worker.fetch(await signed({ signBody: open('https://git-qa.ezil.work/acme/site.git') }), env(binding, { EZIL_AI_GATEWAY_URL: gateway }));
+      expect(res.status).toBe(200);
+      expect(await res.text()).not.toContain(grant);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.request).toMatchObject({ repositoryId: REPO, canonicalURL: 'https://git-qa.ezil.work/acme/site.git', auth: 'basic', token: grant, branch: 'main' });
+    }
+    // still refused on staging: the production-backed git-staging gateway, look-alike hosts, a port, userinfo, case, a dotdot or Unicode name
+    for (const foreign of ['https://git-staging.ezil.work/acme/site.git', 'https://git-qa.ezil.work.evil.com/acme/site.git', 'https://evil.com/git-qa.ezil.work/acme/site.git',
+      'https://git-qa.ezil.work:8443/acme/site.git', 'https://ezil:x@git-qa.ezil.work/acme/site.git', 'https://GIT-QA.ezil.work/acme/site.git',
+      'http://git-qa.ezil.work/acme/site.git', 'https://git-qa.ezil.work/acme/si..te.git', 'https://git-qa.ezil.work/acme/sité.git', 'https://git-qa.ezil.work/acme/site']) {
+      const { binding, calls } = fakeNamespace();
+      const res = await worker.fetch(await signed({ signBody: open(foreign) }), env(binding, { EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' }));
+      expect({ foreign, status: res.status }).toEqual({ foreign, status: 400 });
+      expect(calls).toHaveLength(0);
+    }
   });
 
   it('with no workspace store configured, the root is code-server\'s own default and needs no marker', async () => {

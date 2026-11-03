@@ -31,8 +31,10 @@
  * host staging Works issues grants for), is accepted only by a caller that
  * opts in through `RepoOpenRemotes.stagingGitQa`: the OS staging assessment
  * seam, which reuses `parseRepoOpenRequest` and `EzilSandboxDO.repoOpen` for
- * candidate checkouts. This route (`handleRepoOpen`) never opts in, so the
- * personal open-project flow, and production, refuse it as
+ * candidate checkouts, and this route (`handleRepoOpen`) on os-staging only
+ * (`repoOpenRemotesFor`), where staging Works serves the repositories of
+ * ordinary Builder-created projects (docs/contracts/os-builder-project-open-v1).
+ * Production, and any Worker whose Gateway is not os-staging's, refuse it as
  * `repo_open_invalid_request`. Opting in widens nothing else: the same path,
  * ref and token rules apply, and it is Basic auth like `github.ezil.work`.
  * `timeoutMs` is what is left of the OS server's own deadline: every bound
@@ -211,14 +213,38 @@ export const EZIL_GIT_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/github\.
 export const STAGING_GIT_QA_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/git-qa\.ezil\.work\/${REPOSITORY_PATH}$`);
 
 /**
- * Remotes a caller may accept beyond the default two. Only the OS staging
- * assessment seam opts in; the personal open-project route
- * (`handleRepoOpen` in `index.ts`) never passes this, so it, and production,
- * never accept `git-qa.ezil.work`. Only the literal `true` enables an entry.
+ * Remotes a caller may accept beyond the default two: the OS staging
+ * assessment seam, and the personal open-project route (`handleRepoOpen` in
+ * `index.ts`) through `repoOpenRemotesFor`, which opts in on os-staging only.
+ * Only the literal `true` enables an entry.
  */
 export interface RepoOpenRemotes {
   /** Also accept `STAGING_GIT_QA_REPOSITORY_URL` (Basic auth). */
   stagingGitQa?: boolean;
+}
+
+/**
+ * os-staging's own AI Gateway origin. The Worker's existing `EZIL_AI_GATEWAY_URL`
+ * names it on os-staging only (production's is `https://ai.ezil.work`): the
+ * coupling the u2 contract's route gate uses, so no env var is added.
+ */
+export const OS_STAGING_AI_GATEWAY_ORIGIN = 'https://ai-staging.ezil.work';
+
+/**
+ * The remotes the personal open-project route accepts in this Worker: on
+ * os-staging (`EZIL_AI_GATEWAY_URL` is exactly that origin, at most with a bare
+ * `/` path) also `git-qa.ezil.work`; anywhere else, production and a missing or
+ * malformed value included, only the default two. Fails closed: a staging
+ * Gateway URL change stops staging Builder opens too.
+ */
+export function repoOpenRemotesFor(env: { EZIL_AI_GATEWAY_URL?: unknown }): RepoOpenRemotes {
+  const raw = env.EZIL_AI_GATEWAY_URL;
+  if (typeof raw !== 'string') return {};
+  let url: URL;
+  try { url = new URL(raw); } catch { return {}; }
+  const plain = url.origin === OS_STAGING_AI_GATEWAY_ORIGIN && url.pathname === '/' && !url.search && !url.hash
+    && !url.username && !url.password && (raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/`);
+  return plain ? { stagingGitQa: true } : {};
 }
 /** The binding's `ref` pattern; its refinements are applied in `branchOf`. */
 const REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
