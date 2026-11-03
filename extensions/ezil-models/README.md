@@ -50,10 +50,13 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 Qwen's response mode. Both models advertise `imageInput: false`.
 
 Token counting measures serialized UTF-8 bytes; a message counts as its
-serialized wire message. Copilot 0.69 counts its own tool definitions against
-the advertised input, one count per schema key and string value (it never counts
-numbers, booleans or punctuation), so a string counts as the exact bytes of its
-JSON literal, quotes and escapes included (`"你好"` is 8). For `openai-responses`
+serialized wire message. Copilot 0.69 uses this count for its own tool
+definitions against the advertised input, one count per schema key and string
+value (it never counts numbers, booleans or punctuation), for its tool budget and
+for its text tool-result cap. Its prompt renderer counts message text with its
+own o200k_base tokenizer instead (measured on the image). A string counts as the
+exact bytes of its JSON literal, quotes and escapes included (`"你好"` is 8):
+never fewer than a schema string adds to a Messages body. For `openai-responses`
 models a string counts with non-ASCII escaped as `\uXXXX` plus the 23-byte
 text-block margin, because the Gateway's Responses bound escapes tool text and
 adds 128 bytes per tool and 32 per item. Advertised input defaults to
@@ -66,10 +69,11 @@ above, 512 items, 256 KiB). A request over a bound is refused on the computer
 with `local_input_too_large`, `local_too_many_messages` or
 `local_too_many_blocks`: nothing is sent or charged, the conversation history
 is kept, and the message gives the sizes (body bytes including tool-definition
-bytes, and the limit). Copilot's foreground-summarisation and no-summarisation
-renders use the full advertised input without subtracting tools, and tool sets
-dominated by numbers or booleans are under-counted by Copilot itself, so either
-can still reach this refusal. Any other failure before sending is
+bytes, and the limit). Measured on the image with 38 tools, Copilot's renderer
+budget was 57,056 o200k tokens, and typical chat content is about 4-9 bytes per
+o200k token, so a long chat reaches `local_input_too_large` long before Copilot
+would summarize. Summarization was reachable only with unusually dense content
+(about 1-1.4 bytes per token). Any other failure before sending is
 `local_build_error` (the exception's class name only).
 
 Calls share a FIFO admission queue per base URL and Bearer auth context, the same
@@ -113,9 +117,13 @@ only after the whole generation. A transport resend of that request shares the
 deadline, including any wait for an admission slot, and nothing is sent after
 it. Only an attempt after a 429 refusal, which EZiL AI answers before anything
 runs, starts a new deadline. The OS proxy uses the same 165 seconds for JSON
-request bodies. With the Gateway's 20-second drain after a client leaves, that
-never pauses a model route earlier than the Gateway's own 180-second upstream
-deadline would. A reply
+request bodies. The Gateway owner cites a 180-second upstream deadline, started
+at the Gateway's upstream fetch, and a 20-second drain after a client leaves;
+neither is verifiable in this repo. On those figures, abandoning a call pauses a
+model route no earlier than the Gateway's own deadline would only when the call
+reaches the Gateway's upstream fetch within 5 seconds of its first send.
+Admission time or a resend can abandon a reply the Gateway would still have
+answered, and pause its route after the drain. A reply
 abandoned at that deadline fails with `completion_timeout`
 (`os_completion_timeout` from the proxy) and may still be charged if the model
 finished. Neither deadline adds a retry.

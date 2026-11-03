@@ -13,13 +13,16 @@ export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
  * Headers deadline for a non-stream (JSON) POST only. The Gateway sends a JSON reply's headers after the whole
  * generation (jsonThrough reads the upstream body and settles first), so the 30 s deadline would cut every
  * reply that takes longer, such as non-streamed Kimi K3. Same value as the extension's
- * GATEWAY_COMPLETION_TIMEOUT_MS, and below the Gateway's own 180 s upstream headers deadline (EZiL AI
- * Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS), which starts at its upstream fetch, after
- * admission. When this proxy aborts, the Gateway keeps the upstream call for a 20 s drain; a call still
- * unanswered after that becomes upstream_timeout, pending, and disables that model route for everyone.
- * 165 + 20 >= 180, so an abort here never pauses a route earlier than the Gateway's own deadline would
- * (agreed with the Gateway owner, 2 Nov 2026). A reply abandoned here may still be charged if the model
- * finished. Streams keep the 30 s headers deadline.
+ * GATEWAY_COMPLETION_TIMEOUT_MS, counted here from this proxy's fetch. The Gateway figures below are cited
+ * from the Gateway owner, not verifiable in this repo: a 180 s upstream headers deadline (EZiL AI Gateway
+ * src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS) that starts at its upstream fetch, after admission; and,
+ * when this proxy aborts, a 20 s drain, after which a call still unanswered becomes upstream_timeout, pending,
+ * and disables that model route for everyone. An abort here therefore pauses a route no earlier than the
+ * Gateway's own deadline would only when the Gateway reaches its upstream fetch within 5 s of this fetch
+ * (165 + 20 = 180 + 5); admission time moves the Gateway's clock later. The extension's deadline, counted from
+ * its first send, usually aborts first, under the same condition from that send. Changing the value needs the
+ * Gateway owner. A reply abandoned here may still be charged if the model finished. Streams keep the 30 s
+ * headers deadline.
  */
 export const AI_PROXY_COMPLETION_TIMEOUT_MS = 165_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
