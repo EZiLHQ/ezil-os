@@ -11,7 +11,8 @@ Vectors: `os-builder-project-open-v1.vectors.json` (the exact cases; this text e
 | §4 OS app accepts git-qa on staging | OS app (open-project; cb1d14e6 integrates) | patch proposal |
 | §5 OS Worker accepts git-qa on os-staging | e1cd418a | implemented on `feat/repo-open-resolver-20261103` |
 | §6 Per-tab restore and the reveal path | editor lead f179c8a4 (shell/app), e1cd418a (Worker walk), cb1d14e6 (AWS host op bake) | Worker walk implemented |
-| §7 Renewable push grant (two pushes) | e1cd418a (Worker), OS app/shell owner (refresh loop), Universe (unchanged open), Works (W-3) | **gap**; design below |
+| §7 Renewable push grant (two pushes) | e1cd418a (Worker), OS app/shell owner (refresh loop), Universe (unchanged open), Works (W-3) | Worker **implemented** (28339390); app/shell refresh loop pending |
+| §8 AWS ordinary project open | cb1d14e6 (host/AMI), e1cd418a (contract + Worker relay), app owner | **blocked**: no host op on AMI 1.0.30 |
 
 Why: Universe REG-1 provisions a Builder-created project's repository in Works (staging host `git-qa.ezil.work`), but the project cannot be opened in OS. `POST /internal/project-repositories/open` resolves only hired projects, so a builder project gets 403. The board's `launchUrl` is always null, and OS refused the staging Git host on the personal route.
 
@@ -65,34 +66,61 @@ The route, the body `{userIdToken, projectId, repositoryId}`, identity verificat
 - **Refusals.** A symlink at any component, `..`, an absolute path or a missing folder reveals nothing; the project still opens at its folder.
 - **Owners.** Editor f179c8a4 (shell `code.js`) and the app route own the reveal. The walk is e1's and is already reusable with that root.
 
-## 7. Renewable push grant (gap found 2026-11-03)
-**Today.** The live open-project flow uses Universe's grant for the clone or fetch only.
-- The token reaches git through one command's environment, and nothing is left on the computer. That is deliberate: no `.git/config` credential, no helper.
-- So a `git push` from Code after the open has no credential, and the acceptance case "edit, then two pushes" cannot pass on this path.
+## 7. Renewable push grant (implemented in the Worker, 28339390)
+**Before.** The open-project flow used Universe's grant for the clone or fetch only. Nothing was left on the computer, so a `git push` from Code had no credential.
 
-**Proposed (reuse what already proves two pushes).** The u2 kernel's grant machinery (OS `84e4b686`) does this, with the test "class assessment … two pushes through the helper":
-- a grant file at `/run/ezil/git/grants/<handle>__<name>.json` (root-only `0600`, outside `/workspace`, never checkpointed);
-- the fixed wrapper `/run/ezil/bin/ezil-git-grant`, which serves it only for its own protocol, host and path, and only while it is more than 30 s from expiry;
-- in the clone's `.git/config`, only `credential.helper` naming that fixed wrapper path, never a token;
-- a `refresh` op that rewrites the `/run` files only;
-- once a grant has lapsed, the helper refuses with the fixed hint "EZiL: Git access for `<handle>/<name>` expired. Reopen it from EZiL OS (Code renews it while open)."
+**Now** (`worker/src/repo-grant.ts`). After an EZiL Git open (Basic auth), and on every refresh, the Worker runs one op in the computer. It installs the u2 kernel's fixed helper (`84e4b686` `ezil-git-grant.mjs`, sha256 `5de6b39a…`, pinned) and one grant per repository:
+- **The grant.** `/run/ezil/git/grants/<handle>__<name>.json`, uid 0, mode 0600, with the helper's eight keys. It is outside `/workspace`, so it is never checkpointed.
+- **The owner.** `<handle>__<name>.bind` reads `v1 <subject> <repositoryId> <url>`. Another subject, repository or URL is refused with `repo_grant_conflict`.
+- **The repository's config.** It gains `credential.https://<host>.helper` set to `''` plus the fixed wrapper `/run/ezil/bin/ezil-git-grant`, and `credential.https://<host>.usehttppath=true`: a path, never a token.
+- **Finding the repository.** It is located as the open placed it, through real directories only, with the binding's URL as its one origin. Otherwise the answer is `repo_grant_not_open`.
+- **The token.** It arrives on fd 3, as an open's does. Every git in the person's repository runs before it is read and without fd 3; none runs after.
+- **Never touched.** The working tree, the index and HEAD.
+- **Out of scope.** Cloudflare Artifacts (Bearer), because git 2.34.1 cannot take a Bearer token from a credential helper.
 
-For ordinary Builder projects (Basic auth on `git-qa`/`github.ezil.work`):
+**Refresh endpoint (for the app; the app calls it every ≤ 4 min while Code shows the project, and on reopen or remint).** `POST {worker}/sandbox/<sandboxName>/repo-grant`, v2-signed like repo-open, Cloudflare computers only. A stopped computer is refused (`runtime_not_running`), never started.
+- **Request** (exactly these keys; no ref or branch, so a refresh never chooses one): `{ "repositoryId": "<lowercase uuid>", "canonicalURL": "https://github.ezil.work/<h>/<n>.git" | (os-staging) "https://git-qa.ezil.work/<h>/<n>.git", "git": { "token": "egg_<64 hex>", "expiresAt": "<ISO, 60 s..330 s ahead>", "scope": "read"|"write", "username"?: "ezil" } }`. The `git` object is Universe's `open` answer's `git` as it is.
+- **Answers:**
+
+| Status | Body |
+|---|---|
+| 200 | `{ "ok": true, "expiresAt": "<normalised ISO>" }` |
+| 400 | `repo_open_invalid_request` or `repo_grant_unsupported_remote` |
+| 409 | `repo_open_token_expired`, `repo_grant_not_open`, `repo_grant_conflict`, `repo_open_busy` or `runtime_not_running` |
+| 409 | `repo_open_unsupported_provider` (AWS) |
+| 500 | `repo_open_git_missing` |
+| 502 | `repo_grant_failed` |
+| 401 | the v2 errors |
+
+- **Open.** `repo-open` keeps `git.scope` when sent. The app should send Universe's `git.scope` too, so the open installs push access itself. Its answer is unchanged either way.
+
+**Two-push proof (local, real git, the real helper; `worker/src/repo-grant.git.test.ts`, 7/7 on host git 2.43 and in the git 2.34.1 image).**
+1. Edit, then push #1.
+2. A grant with less than the helper's 30 s left is refused with the fixed hint, and no credential reaches the server.
+3. The server rotates its grant; a refresh installs the new one, with uncommitted work, HEAD and the index untouched.
+4. Push #2 succeeds.
+
+The same suite covers:
+- refusals for a wrong subject, repository, host and path;
+- symlinks at the projects, folder, repository, `.git` and `.git/config` levels, plus a linked `/run` grants directory;
+- four concurrent refreshes;
+- a retried refresh and a retried open;
+- the grant appearing in no config, folder file, output or command.
+
+## 8. AWS ordinary project open (blocked; exact missing pieces)
+**Today.** Every layer refuses an AWS computer:
+- the app (`code-preview-url/route.ts` `isAws` → `repo_open_unsupported_provider`);
+- the Worker (`handleRepoOpen` and `handleRepoGrant`: `v2.provider !== 'cloudflare'` → 409);
+- AMI 1.0.30's host agent (= 7b95bcd9), which has no op that can write into the guest.
+
+So no Worker-only change can open a repository on AWS. A Docker run proves nothing about AWS either.
+
+**Minimal path (each part separately reviewed and released):**
 
 | Owner | Part |
 |---|---|
-| e1 (Worker `repo-open.ts`) | after a successful open, install the wrapper and grant and set the helper; add a `refresh` exec that installs a fresh grant and touches nothing else |
-| OS app/shell owner | while a Code window shows the project, refresh every ≤ 4 min (the grant lives at most 5 min), and on reopen or remint |
-| Universe | none: each refresh is an ordinary `open` call (rate limit 60/min) |
-| Works | W-3 (route-scoped, ≤ 5 min, `write` for the owner) |
+| e1 | u2 contract 1.0.4 adds a class `project`: git host = the deployment's paired Works host (github.ezil.work, or git-qa.ezil.work on staging); layout `projects/<repositoryId>/repository` under a fresh wrapper, as for class assessment; `path` reveal-only. Kernel and host class tables updated (both AMI inputs), with a slot1 review. |
+| cb1 | Bake the A2h host op (`POST /__ezil/control/repo-open/<sha256(body)>` and `repo-open-status/<jobId>`, u2 `84e4b686` `repo_open.py`) and kernel `b7196b7d…` into an AMI after 1.0.30. |
+| e1 | Port the Worker relay (`84e4b686` `aws-repo-open.ts`) onto this branch, and route AWS v2 claims of the open-project and repo-grant routes to it (the kernel's own `refresh` op installs the same helper and grant in the guest). |
+| app owner | Lift `isAws` in `code-preview-url/route.ts` once the relay is live. |
 
-Hired projects on Cloudflare Artifacts are out of this section: git 2.34.1 cannot take a Bearer token from a credential helper.
-
-**Two-push proof (local first).**
-1. Open, edit, push #1.
-2. Advance past the grant's expiry; the push is refused with the hint.
-3. Refresh, push #2 succeeds.
-4. A refresh for another repository or user is refused.
-5. The grant never appears in argv, environ, `.git/config`, the folder or the output (strace, as the u2 kernel tests do).
-
-Then the staging run with the founder's test identities, after release approval.

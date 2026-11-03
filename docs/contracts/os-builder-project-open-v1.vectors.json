@@ -88,12 +88,29 @@
     ]
   },
   "pushGrant": {
-    "status": "GAP on the live open-project path: the grant is used for clone/fetch only; no credential remains, so git push from Code fails. Proposed design reuses the u2 kernel grant machinery (OS 84e4b686).",
-    "files": { "grant": "/run/ezil/git/grants/<handle>__<name>.json", "wrapper": "/run/ezil/bin/ezil-git-grant", "repoConfig": "credential.helper = the fixed wrapper path only" },
-    "refresh": "every <= 4 min while a Code window shows the project, and on reopen/remint; each refresh is an ordinary Universe open; the Worker rewrites /run files only",
+    "status": "Worker implemented at OS 28339390 (worker/src/repo-grant.ts). The app/shell refresh loop is pending (editor f179c8a4 + app owner).",
+    "files": { "grant": "/run/ezil/git/grants/<handle>__<name>.json (uid 0, 0600, the u2 helper's 8 keys)", "bind": "/run/ezil/git/grants/<handle>__<name>.bind = 'v1 <subject> <repositoryId> <url>'", "wrapper": "/run/ezil/bin/ezil-git-grant (0500)", "helper": "/run/ezil/bin/ezil-git-grant.mjs (u2 84e4b686, sha256 5de6b39aeb9ecbdc03cf3334e45047652b7249f0a395227deea92000f61ba55e)", "repoConfig": "credential.https://<host>.helper = '' then the fixed wrapper; credential.https://<host>.usehttppath = true" },
+    "subject": "sha256('ezil.repo-grant.subject.v1\\n' + v2 claims userId), hex",
+    "refreshEndpoint": {
+      "route": "POST {worker}/sandbox/<sandboxName>/repo-grant (v2-signed, Cloudflare only, never starts a stopped computer)",
+      "request": { "repositoryId": "<lowercase uuid>", "canonicalURL": "https://github.ezil.work/<h>/<n>.git | (os-staging) https://git-qa.ezil.work/<h>/<n>.git", "git": { "token": "egg_<64 hex>", "expiresAt": "ISO, 60 s to 330 s ahead", "scope": "read | write", "username": "optional, 'ezil'" } },
+      "response": { "200": { "ok": true, "expiresAt": "<normalised ISO>" }, "400": ["repo_open_invalid_request", "repo_grant_unsupported_remote"], "409": ["repo_open_token_expired", "repo_grant_not_open", "repo_grant_conflict", "repo_open_busy", "runtime_not_running", "repo_open_unsupported_provider"], "500": ["repo_open_git_missing"], "502": ["repo_grant_failed"] },
+      "cadence": "every <= 4 min while a Code window shows the project, and on reopen/remint; never a ref or branch"
+    },
+    "openInstall": "repo-open keeps git.scope; an EZiL Git open with a scope and a v2 subject installs the grant with its own token; the open's answer is unchanged",
     "expiredHint": "EZiL: Git access for <handle>/<name> expired. Reopen it from EZiL OS (Code renews it while open).",
-    "scope": "Basic-auth hosts only (git-qa.ezil.work on staging, github.ezil.work in production); Cloudflare Artifacts (Bearer) is out of scope on git 2.34.1",
-    "twoPushProof": ["open, edit, push #1 succeeds", "past expiry without refresh: push refused with expiredHint", "refresh, push #2 succeeds", "refresh for another repository or another user refused", "grant never in argv, environ, .git/config, the folder or output (strace)"]
+    "scope": "Basic-auth hosts only (git-qa.ezil.work on os-staging, github.ezil.work); Cloudflare Artifacts (Bearer) is repo_grant_unsupported_remote",
+    "twoPushProof": ["open, edit, push #1 succeeds", "past expiry without refresh: push refused with expiredHint, no credential sent", "server rotates the grant; refresh installs it; work, HEAD and index untouched", "push #2 succeeds", "refresh for another subject (conflict), repository, host or path (not_open) refused", "symlinks at projects/folder/repository/.git/.git/config and a linked /run grants dir refused", "concurrent refreshes, retried refresh and reopen keep identity and work", "grant never in git config, folder files, output or command"],
+    "evidence": "worker/src/repo-grant.git.test.ts 7/7 on host git 2.43 and in ezil-os-worker-sandbox:5e96dc3f (git 2.34.1, node 22); 18/18 mutants killed"
+  },
+  "aws": {
+    "status": "BLOCKED: no host op on AMI 1.0.30 (host agent = 7b95bcd9) writes into the guest; the app, the Worker repo-open and repo-grant routes refuse AWS (repo_open_unsupported_provider).",
+    "missing": [
+      "e1: u2 contract 1.0.4 class 'project' (paired Works host; projects/<repositoryId>/repository under a fresh wrapper; path reveal-only); kernel + host class tables (AMI inputs); slot1 review",
+      "cb1: bake the A2h host op (POST /__ezil/control/repo-open/<sha256>, repo-open-status/<jobId>; u2 84e4b686 repo_open.py) and kernel b7196b7d into an AMI after 1.0.30",
+      "e1: port the Worker relay (84e4b686 aws-repo-open.ts) and route AWS claims of repo-open and repo-grant to it (the kernel's refresh op installs the same helper/grant in the guest)",
+      "app owner: lift isAws in code-preview-url/route.ts once the relay is live"
+    ]
   },
   "isolation": [
     "OS → Universe: the retained EZiL ID token of THIS session, in the request body only; the computer is checked as the caller's own before Universe hears of the open.",
