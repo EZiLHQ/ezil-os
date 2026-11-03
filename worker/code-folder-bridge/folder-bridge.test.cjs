@@ -179,6 +179,13 @@ test('the shell origin allowlist is validated and embedded as given', () => {
       assert.equal(read(root), FIXTURE, `${bad}: unchanged`);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }
+  // Empty is unset (the Dockerfile's ARG EZIL_SHELL_ORIGINS_JSON defaults to empty): the staging shell only.
+  const empty = tmpRoot(FIXTURE);
+  try {
+    let r = run([empty], { EZIL_SHELL_ORIGINS_JSON: '' }); assert.equal(r.status, 0, r.stderr);
+    r = run(['--verify', empty], { EZIL_SHELL_ORIGINS_JSON: '' }); assert.equal(r.status, 0, r.stderr);
+    assert(read(empty).includes('const O=["https://os-staging.ezil.work"];'));
+  } finally { fs.rmSync(empty, { recursive: true, force: true }); }
   const root = tmpRoot(FIXTURE);
   try {
     // An explicit list (a production image would add its shell origin this way, once approved).
