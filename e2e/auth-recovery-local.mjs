@@ -226,6 +226,26 @@ for (const [hostile, expected] of [
     });
 }
 
+// f179's integration cases (os-share-browser): the canonical Browser link with a query, and a legacy /app/desktop link,
+// each through "Sign out and use another account" and a cancelled retry. Server side the path is kept as sent; the shell
+// rewrites /app/desktop to /app/browser in place after load (f179's suite).
+for (const destination of ['/app/browser?x=1', '/app/desktop?computer=11111111-1111-1111-1111-111111111111&x=%41#top']) {
+    await check(`sign-out round trip keeps ${destination} through logout and a cancelled retry`, async () => {
+        const { context, hops } = await contextWith();
+        const page = await context.newPage();
+        await page.goto(loginFor(destination));
+        const expected = `/auth/auth0/login?${new URLSearchParams({ returnUrl: destination })}`;
+        assert.equal(await href(page), expected);
+        await Promise.all([page.waitForURL(url => url.pathname === '/login' && !url.search), signOut(page).click()]);
+        assert.equal(await href(page), expected, 'after logout');
+        await Promise.all([page.waitForURL(url => url.searchParams.get('error') !== null), page.getByRole('link', { name: 'Continue with EZiL ID' }).click()]);
+        assert.equal(new URL(page.url()).searchParams.get('returnUrl'), destination, 'after a cancelled retry');
+        assert.equal(hops().logout.length, 1);
+        assert.equal(hops().authorize.length, 1);
+        await context.close();
+    });
+}
+
 await check('a tampered sign-out field is narrowed by the server before it is kept', async () => {
     const { context } = await contextWith();
     const page = await context.newPage();
