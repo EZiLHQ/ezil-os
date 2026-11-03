@@ -112,6 +112,8 @@
 .ezil-feedback-muted { color: var(--fb-muted); margin: 4px 0 12px; }
 .ezil-feedback-warning { padding: 10px; background: var(--fb-warn-bg); color: var(--fb-warn); border-radius: 6px; }
 .ezil-feedback-consent { display: flex; align-items: center; gap: 6px; margin: 12px 0; }
+/* What a box sends, read right under it (and by `aria-describedby`). */
+.ezil-feedback-consent + .ezil-feedback-help { margin: -8px 0 12px; font-size: 13px; }
 .ezil-feedback-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .ezil-feedback-dialog button {
     border: 1px solid var(--fb-border);

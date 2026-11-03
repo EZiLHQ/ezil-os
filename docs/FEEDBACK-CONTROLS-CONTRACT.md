@@ -1,4 +1,13 @@
-# Floating controls + Feedback — pinned contract (v1, 2026-10-14)
+# Floating controls + Feedback — pinned contract (v1, 2026-10-14; Feedback v2, 2026-11-03)
+
+**v2 (founder request 88e642df, 3 Nov 2026), Feedback only.** Diagnostics are included
+by default and the form says what they contain; the user can untick them. A
+"Recent activity log" (this tab's console ring and recorded events, redacted, last
+15 minutes, at most 60 lines of 200 characters) can be added by ticking it. The
+report records the app in front by its address name. Both new fields live inside
+the existing `diagnostics` jsonb (no migration), and the shell sends them only when
+the boot payload says the server accepts them (`ui.feedbackLogs`). Sections 1, 2,
+3, 4a and 5 below carry the v2 changes; everything else is unchanged.
 
 The single source of truth for the parallel lanes. A lane that needs to change
 anything here stops and reports instead of changing it. Plan of record:
@@ -12,6 +21,7 @@ as recommended).
 | `EZIL_OS_FLOATING_CONTROLS=1` | `desktopState.ui.floatingControls = true` — **not read in the round-3 feedback-only port**: the pill lane is not shipped, so `floatingControls` is always `false` |
 | `EZIL_OS_FEEDBACK=1` | `desktopState.endpoints.feedback = '/api/shell/feedback'` (absent otherwise); route returns 404 when off |
 | `EZIL_OS_FEEDBACK_SCREENSHOTS=1` | `desktopState.ui.feedbackScreenshots = true` (only meaningful with feedback on) |
+| (none; v2) | `desktopState.ui.feedbackLogs = true` whenever feedback is on: this server accepts `diagnostics.app` and `diagnostics.logs`. Absent on an older server, so a newer shell sends only v1 fields there |
 | `FEEDBACK_PILOT_EMAILS` | comma list; when set, feedback (and screenshots) are on ONLY for these emails |
 | `FEEDBACK_ADMIN_EMAILS` | comma list; `/admin/feedback` fail-closed when unset |
 
@@ -19,7 +29,7 @@ as recommended).
 Shell side: features are feature-detected exactly like `endpoints.focus`.
 
 ```
-desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean }
+desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean, feedbackLogs: boolean }
 desktopState.endpoints.feedback?: '/api/shell/feedback'
 ```
 
@@ -114,7 +124,11 @@ full-bleed window, Code's included. A 16px
 glyph on a 20px disc, low emphasis; hit target 24×24 on a fine pointer, 44×44 under
 `pointer: coarse`. z-index above every app window (phone/tablet windows are `9999999
 !important`), below context menus, the upgrade sheet and the dialog's top layer.
-`shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics() → Diagnostics` (§3 shape only).
+`shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics({ extended } = {}) → Diagnostics` (§3 shape
+only; `extended` adds `app`), and v2 `build_recent_logs({ now } = {}) → Array<{t, source, text}>`, called
+only when the user ticks "Include recent activity log", once per tick. A collector that throws leaves its
+part out with a visible note; it never blocks Send. The form drops the oldest log lines, then the oldest
+`recentEvents`, until the body is within 32 KiB (the screenshot's data excepted), never the description.
 Teardown, history navigation and page exit close the form and any nested editor,
 cancel pending captures, and discard late results without suppressing shell Back.
 Editor Cancel returns to the draft; form Cancel discards it. Once submission starts,
@@ -145,8 +159,16 @@ Diagnostics (strict, every field optional):
 { shellVersion ≤64, appCommit ≤64, browser {family ≤32, major int}, os ≤32,
   deviceClass 'phone'|'tablet'|'desktop', viewport {w,h int, dpr number},
   fullscreen bool, fullbleed bool, computerStatus ≤32, traceId ≤64, phases string[≤24]≤40,
-  recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int} }
+  recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int},
+  // v2, sent only when desktopState.ui.feedbackLogs is true:
+  app ≤32,                      // the front app's address name (`browser`, `code`, `settings`…), from data-app
+  logs {t: UTC ISO instant, source 'console'|'event', text ≤200}[≤60] }   // only when ticked
 ```
+Every string, `app` and each log `text` included, is re-redacted on ingest (`redact.ts`
+`sanitizeDiagnostics`: credentials, emails, UUIDs, URLs, absolute paths); the server does not rely
+on the shell's own scrub. A v1 body is accepted unchanged. A v2 body sent to a v1 server is a 400 (the
+schema is strict); the flag above prevents that, and a body queued before a rollback falls back to
+the draft like any other definitive refusal (§4a).
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).
@@ -172,7 +194,8 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 `__EZIL_BOOT__.user.id` (never the email), never sent anywhere:
 - `ezil:feedback:draft:v1:<accountId>` — `{clientRequestId, category, description}` of the
   unsent form. Survives closing the dialog; removed when the form is emptied or a send with
-  that id is confirmed (200/201). Consent boxes and screenshots are never remembered.
+  that id is confirmed (200/201). The checkboxes and screenshots are never remembered: each new form
+  starts with diagnostics ticked and the log and screenshot unticked.
 - `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body}` entries: the
   exact submitted request bodies (including any diagnostics the user consented to) that have
   not been confirmed. Re-sent byte-for-byte, same `clientRequestId`, on the `online` event,
@@ -183,6 +206,9 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   (blocked, quota, private mode) only lose the convenience.
 
 ## 5. Never collected
-`document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
-clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
+`document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, headers, clipboard, keystrokes,
+another tab, an app's iframe content, file or folder paths; no continuous recording. The `log.js` ring
+is read only for the v2 "Recent activity log", only when that box is ticked, and every line passes
+telemetry's `redact()` plus the form's secret scan before it is shown. v2: diagnostics are ticked by
+default and described next to the box; the log and screenshot boxes default OFF; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.

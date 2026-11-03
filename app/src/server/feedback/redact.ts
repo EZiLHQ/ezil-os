@@ -1,5 +1,5 @@
 import { sanitizeErrorMessage } from '@/server/telemetry/sanitize';
-import type { FeedbackDiagnostics } from './types';
+import { FEEDBACK_LOG_LIMITS, type FeedbackDiagnostics } from './types';
 
 const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 
@@ -43,6 +43,7 @@ export function sanitizeDiagnostics(input: FeedbackDiagnostics | null | undefine
     if (!input) return null;
     const out: FeedbackDiagnostics = {};
     if (input.shellVersion !== undefined) out.shellVersion = diagnosticString(input.shellVersion, 64);
+    if (input.app !== undefined) out.app = diagnosticString(input.app, 32);
     if (input.appCommit !== undefined) out.appCommit = diagnosticString(input.appCommit, 64);
     if (input.browser) out.browser = { family: diagnosticString(input.browser.family, 32), major: input.browser.major };
     if (input.os !== undefined) out.os = diagnosticString(input.os, 32);
@@ -62,5 +63,9 @@ export function sanitizeDiagnostics(input: FeedbackDiagnostics | null | undefine
         out.stream = { ...input.stream };
         if (input.stream.state !== undefined) out.stream.state = diagnosticString(input.stream.state, 24);
     }
+    // The shell redacts each line before sending; this is the boundary that has to hold.
+    if (input.logs) out.logs = input.logs.map((line) => ({
+        t: line.t, source: line.source, text: diagnosticString(line.text, FEEDBACK_LOG_LIMITS.lineChars),
+    }));
     return out;
 }

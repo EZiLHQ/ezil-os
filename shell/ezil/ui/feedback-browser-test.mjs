@@ -66,7 +66,7 @@ const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
     computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false } } };
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackLogs: true } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The streamed desktop: reports decoded frames so the window goes full-bleed.
@@ -222,9 +222,43 @@ try {
             posts.length = 0;
         });
 
+        await check(`${tag}: keyboard only — diagnostics start ticked, Space toggles them and the log, Enter sends the previewed body`, async () => {
+            await openByChip();
+            await description.fill('[synthetic 88e] keyboard only');
+            const focused = () => page.evaluate(() => document.activeElement?.getAttribute('name') ?? document.activeElement?.getAttribute('type'));
+            const tabTo = async name => {
+                for ( let i = 0; i < 12 && await focused() !== name; i++ ) await page.keyboard.press('Tab');
+                assert.equal(await focused(), name, `Tab reaches ${name}`);
+            };
+            await tabTo('diagnostics');
+            assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'included by default');
+            assert.equal(JSON.parse(await preview()).diagnostics.app, 'browser', 'the Browser in front, by its address name');
+            assert.equal(await page.locator('#ezil-feedback-diagnostics-help').isVisible(), true, 'what is included is on screen');
+            await page.keyboard.press('Space');
+            assert.equal(JSON.parse(await preview()).diagnostics, null, 'Space unticks: none sent');
+            await page.keyboard.press('Space');
+            assert.notEqual(JSON.parse(await preview()).diagnostics, null);
+            await tabTo('logs');
+            await page.keyboard.press('Space');
+            assert.equal(await page.locator('input[name="logs"]').isChecked(), true);
+            const logs = JSON.parse(await preview()).diagnostics.logs ?? [];
+            const note = await page.locator('[data-role="logs-note"]').textContent();
+            assert.match(note, logs.length ? new RegExp(`^${logs.length} lines? will be included\\.`) : /^Nothing was recorded/);
+            assert.ok(logs.every(line => line.text.length <= 200), 'bounded lines');
+            assert.doesNotMatch(JSON.stringify(logs), /https?:|os-fixture\.test|fixture@example|33333333-3333|11111111-1111/, 'no links, addresses or ids');
+            await tabTo('submit');
+            const shown = await preview();
+            await page.keyboard.press('Enter');
+            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(posts.length, 1);
+            assert.equal(posts[0].body, shown, 'what the keyboard user previewed is what was sent');
+            await closeDialog();
+            posts.length = 0;
+        });
+
         for ( const [code, copy] of [
             [429, "You've sent several reports this hour — try again later."],
-            [413, 'This report is too large. Remove the screenshot and try again.'],
+            [413, 'This report is too large. Shorten the description and try again.'],
             [415, 'This page could not send the report. Reload EZiL OS and try again.'],
         ] ) await check(`${tag}: ${code} keeps the text, says so and is not retried`, async () => {
             reply = () => ({ status: code, body: { error: 'x' } });

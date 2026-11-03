@@ -81,3 +81,49 @@ describe('diagnostics sanitization', () => {
         expect(sanitizeDiagnostics({ stream: {} })).toEqual({ stream: {} });
     });
 });
+
+describe('v2 diagnostics: the app in front and the recent activity log', () => {
+    const t = '2026-11-03T21:30:00.000Z';
+
+    it('redacts every log line on the server even when the shell sent it raw', () => {
+        // The shell scrubs first; this proves the server does not depend on it.
+        const raw = [
+            'error GET https://os.example.test/api/shell/start?token=abc failed',
+            fake('Authorization: Bearer ', 'abcdefghijklmnopqrstuvwxyz0123456789'),
+            'cookie: __Host-ezil-os-auth=top-secret-cookie',
+            `opened /home/alice/workspace/secret-project/src/main.ts for 550e8400-e29b-41d4-a716-446655440000`,
+            'mailed carol@example.com about eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature',
+            fake('key=', 'AKIA', '1234567890ABCDEF'),
+        ];
+        const result = sanitizeDiagnostics({ app: 'dave@example.com', logs: raw.map((text) => ({ t, source: 'console', text })) })!;
+        const sent = JSON.stringify(result);
+        for (const leaked of ['os.example.test', 'abcdefghijklmnopqrstuvwxyz0123456789', 'top-secret-cookie', 'alice',
+            'secret-project', '550e8400', 'carol@', 'eyJhbGci', 'AKIA1234567890ABCDEF', 'dave@']) {
+            expect(sent).not.toContain(leaked);
+        }
+        expect(result.app).toBe('[redacted:email]');
+        expect(result.logs).toHaveLength(raw.length);
+        expect(result.logs!.every((line) => line.t === t && line.source === 'console')).toBe(true);
+        expect(diagnosticsSchema.safeParse(result).success).toBe(true);
+    });
+
+    it('keeps an ordinary app name and log line readable', () => {
+        const result = sanitizeDiagnostics({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });
+        expect(result).toEqual({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });
+    });
+
+    it('bounds the log: at most 60 lines of 200 characters, closed sources, UTC instants only', () => {
+        const line = { t, source: 'console' as const, text: 'x'.repeat(200) };
+        expect(diagnosticsSchema.safeParse({ logs: Array(60).fill(line) }).success).toBe(true);
+        expect(diagnosticsSchema.safeParse({ logs: Array(61).fill(line) }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, text: 'x'.repeat(201) }] }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, source: 'network' }] }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, t: 'Mon Nov 03 2026 22:30 GMT+0100' }] }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, url: 'https://example.test/' }] }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ app: 'x'.repeat(33) }).success).toBe(false);
+        // A redaction that lengthens a line still fits the bound it is stored under.
+        const expanded = sanitizeDiagnostics({ logs: [{ t, source: 'console', text: 'a@b.co '.repeat(28) }] })!;
+        expect(expanded.logs![0].text.length).toBeLessThanOrEqual(200);
+        expect(diagnosticsSchema.safeParse(expanded).success).toBe(true);
+    });
+});

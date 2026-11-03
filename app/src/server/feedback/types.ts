@@ -25,12 +25,18 @@ export const FEEDBACK_LIMITS = Object.freeze({
 
 export const FEEDBACK_RETENTION_DAYS = Object.freeze({ attachments: 30, reports: 180, accessLog: 365 });
 
+/** "Recent activity log" (contract §3, v2): the shell's tab-local console and event rings. */
+export const FEEDBACK_LOG_LIMITS = Object.freeze({ lines: 60, lineChars: 200 });
+
 const short = (max: number) => z.string().max(max);
 const int = z.number().int().min(0).max(1_000_000_000);
+const isoInstant = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/);
 
 export const diagnosticsSchema = z
     .object({
         shellVersion: short(64),
+        /** v2: the app in front, by its address name (`browser`, `code`); never a URL or folder. */
+        app: short(32),
         appCommit: short(64),
         browser: z.object({ family: short(32), major: int }).strict(),
         os: short(32),
@@ -43,6 +49,10 @@ export const diagnosticsSchema = z
         phases: z.array(short(40)).max(24),
         recentEvents: z.array(z.object({ eventClass: short(40), site: short(80), code: short(80) }).strict()).max(50),
         stream: z.object({ state: short(24).optional(), kbps: int.optional(), rttMs: int.optional() }).strict(),
+        /** v2, sent only when the user ticks it; re-redacted on ingest (`redact.ts`). */
+        logs: z.array(z.object({
+            t: isoInstant, source: z.enum(['console', 'event']), text: short(FEEDBACK_LOG_LIMITS.lineChars),
+        }).strict()).max(FEEDBACK_LOG_LIMITS.lines),
     })
     .partial()
     .strict();

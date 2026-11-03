@@ -23,7 +23,7 @@ const computerId = '11111111-1111-4111-8111-111111111111';
 const reportId = '22222222-2222-4222-8222-222222222222';
 const accountId = '33333333-3333-4333-8333-333333333333';
 window.__EZIL_BOOT__ = { computer: { id: computerId }, user: { id: accountId, email: 'BOOT_SECRET@example.test' },
-    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true } } };
+    desktopState: { endpoints: { feedback: '/api/shell/feedback' }, ui: { feedbackScreenshots: true, feedbackLogs: true } } };
 globalThis.ezil = { version: '1' };
 document.cookie = '__Host-ezil-os-auth=SECRET; Secure; Path=/';
 assert.match(document.cookie, /SECRET/);
@@ -308,22 +308,26 @@ try {
         feedback.mount_feedback_chip();
         await tick();
     });
-    await check('native dialog semantics, default-off consent, live preview, no pre-submit request', () => {
+    await check('native dialog semantics, diagnostics on by default, logs and screenshot off, live preview, no pre-submit request', () => {
         open();
         assert.equal(modalCalls, 1);
         assert.equal(current().getAttribute('aria-labelledby'), current().querySelector('h2').id);
         assert.equal(form().elements.description.required, true);
         assert.equal(form().elements.description.maxLength, 4000);
-        assert.equal(form().elements.diagnostics.checked, false);
+        assert.equal(form().elements.diagnostics.checked, true, 'founder 88e: diagnostics are included by default');
+        assert.equal(form().elements.logs.checked, false);
         assert.equal(form().elements.screenshot.checked, false);
         assert.equal(payload().category, 'bug');
-        assert.equal(payload().diagnostics, null);
+        diagnosticsSchema.parse(payload().diagnostics);
+        assert.equal(payload().diagnostics.logs, undefined);
         assert.equal(payload().screenshot, null);
         assert.equal(payload().computerId, computerId);
         feedback.open_feedback_dialog({ source: 'chip' });
         assert.equal(modalCalls, 1);
         setDescription('The desktop froze.');
         assert.match(current().querySelector('#ezil-feedback-counter').textContent, /18 \/ 4000/);
+        change('diagnostics', false);
+        assert.equal(payload().diagnostics, null, 'unticking removes them from the body');
         change('diagnostics', true);
         assert.doesNotMatch(current().querySelector('pre').textContent, /SECRET|example\.test/);
         assert.equal(calls.length, 0);
@@ -562,7 +566,7 @@ try {
         flushing = false;
     });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
-        open(); setDescription('Half-written report'); change('diagnostics', true);
+        open(); setDescription('Half-written report'); change('diagnostics', false);
         form().elements.category.value = 'idea';
         form().querySelector('input[value="idea"]').dispatchEvent(new window.Event('change', { bubbles: true }));
         const id = payload().clientRequestId;
@@ -571,7 +575,7 @@ try {
         assert.equal(form().elements.description.value, 'Half-written report');
         assert.equal(form().elements.category.value, 'idea');
         assert.equal(payload().clientRequestId, id);
-        assert.equal(form().elements.diagnostics.checked, false, 'consent is never remembered');
+        assert.equal(form().elements.diagnostics.checked, true, 'choices are never remembered: diagnostics are back on');
         close();
         for ( let i = 0; i < window.localStorage.length; i++ ) {
             const key = window.localStorage.key(i);
@@ -734,6 +738,208 @@ try {
         const count = calls.length;
         assert.equal(await feedback.delete_my_report('invalid'), false);
         assert.equal(calls.length, count);
+    });
+    // ── v2 (founder 88e642df): diagnostics by default, an opt-in recent log ──
+    const V1_DIAGNOSTICS = ['shellVersion', 'appCommit', 'browser', 'os', 'deviceClass', 'viewport', 'fullscreen',
+        'fullbleed', 'computerStatus', 'traceId', 'phases', 'recentEvents', 'stream'];
+    const note = role => current().querySelector(`[data-role="${role}"]`).textContent;
+    const submitDisabled = () => current().querySelector('[type="submit"]').disabled;
+    window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+    await check('v2: diagnostics are described in plain words, name only the app in front, and unticking removes them', async () => {
+        open(); setDescription('Default diagnostics');
+        const box = form().elements.diagnostics;
+        assert.equal(box.checked, true);
+        const help = document.getElementById(box.getAttribute('aria-describedby'));
+        assert.match(help.textContent, /Included unless\s+you untick it/);
+        assert.match(help.textContent, /the app in front/);
+        assert.match(help.textContent, /Never your files, what you type in apps, links, cookies or sign-in\./);
+        const win = (app, z) => {
+            const el = document.createElement('div');
+            el.className = 'window'; el.setAttribute('data-app', app); el.style.zIndex = String(z);
+            document.body.append(el);
+            return el;
+        };
+        const windows = [win('desktop', 10), win('code', 20), win('not-an-app', 99)];
+        setDescription('Default diagnostics.');
+        assert.equal(payload().diagnostics.app, 'code', 'the front registry app; an unknown data-app is ignored');
+        windows[1].setAttribute('data-is_minimized', '1');
+        setDescription('Default diagnostics..');
+        assert.equal(payload().diagnostics.app, 'browser', 'the Browser by its address name, never `desktop` or a URL');
+        for ( const el of windows ) el.remove();
+        setDescription('Default diagnostics...');
+        assert.equal(payload().diagnostics.app, undefined, 'no app window: no app');
+        assert.ok(Object.keys(payload().diagnostics).every(key => [...V1_DIAGNOSTICS, 'app'].includes(key)));
+        change('diagnostics', false);
+        assert.equal(payload().diagnostics, null);
+        change('diagnostics', true);
+        assert.notEqual(payload().diagnostics, null);
+        setDescription('');
+        close();
+    });
+    await check('v2: a diagnostics collector that throws leaves them out, says so, and the report still sends', async () => {
+        const realEzil = globalThis.ezil;
+        Object.defineProperty(globalThis, 'ezil', { configurable: true, get () { throw new Error('collector failed'); } });
+        try {
+            open(); setDescription('Collector failed');
+            assert.equal(payload().diagnostics, null);
+            assert.match(note('diagnostics-note'), /couldn't be collected in this tab, so this report will be sent without them/);
+            assert.equal(submitDisabled(), false);
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+            send(); await until(() => status().includes(reportId));
+            assert.equal(JSON.parse(calls.at(-1).body).diagnostics, null);
+            close();
+        } finally {
+            Object.defineProperty(globalThis, 'ezil', { configurable: true, writable: true, value: realEzil });
+        }
+    });
+    await check('v2: the recent log is read only when ticked, once, from this tab\'s last 15 minutes, redacted and bounded', async () => {
+        let reads = 0;
+        log.ringBuffer = () => { reads++; return readRing(); };
+        const realNow = Date.now;
+        Date.now = () => realNow() - 20 * 60 * 1000;
+        log.debug('OLD_LINE from twenty minutes ago');
+        Date.now = realNow;
+        log.debug('GET https://os.example.test/api/shell/start?token=abc failed for 550e8400-e29b-41d4-a716-446655440000');
+        log.debug(['Authorization: Bearer ', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('') + ' cookie: __Host-ezil-os-auth=COOKIEVALUE');
+        log.debug('opened /home/alice/workspace/secret-project/main.ts');
+        log.debug(`mail ${'carol'}@example.com jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature`);
+        log.debug({ nested: 'y'.repeat(600) });
+        open(); setDescription('With logs');
+        assert.equal(form().elements.logs.checked, false);
+        assert.equal(reads, 0, 'unticked: the console ring is never read');
+        assert.equal(payload().diagnostics.logs, undefined);
+        change('logs', true);
+        assert.equal(reads, 1, 'read once, when ticked');
+        setDescription('With logs.');
+        assert.equal(reads, 1, 'typing does not read it again');
+        const lines = payload().diagnostics.logs;
+        assert.ok(lines.length > 5 && lines.length <= 60, `${lines.length} lines`);
+        assert.ok(lines.every(line => Object.keys(line).join() === 't,source,text' && ['console', 'event'].includes(line.source)
+            && line.text.length <= 200 && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(line.t)));
+        assert.deepEqual(lines.map(line => line.t), lines.map(line => line.t).toSorted(), 'oldest first');
+        const text = JSON.stringify(lines);
+        assert.doesNotMatch(text, /OLD_LINE|os\.example\.test|token=abc|550e8400|abcdefghijklmnopqrstuvwxyz0123456789|COOKIEVALUE|alice|secret-project|carol@|eyJhbGci|EVENT_SECRET@|example\.test/);
+        // telemetry's redact() turns `…?token=abc` into `<url>]` (the server's twin does too).
+        assert.match(text, /debug GET <url>\]? failed for <uuid>/);
+        assert.match(text, /debug opened <path>/);
+        assert.ok(lines.some(line => line.source === 'event' && line.text.startsWith('api_failure <opaque> failure')));
+        assert.equal(note('logs-note'), `${lines.length} lines will be included.`);
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        send(); await until(() => status().includes(reportId));
+        assert.deepEqual(JSON.parse(calls.at(-1).body).diagnostics.logs, lines, 'what was previewed is what was sent');
+        close();
+        open();
+        assert.equal(form().elements.logs.checked, false, 'never remembered');
+        close();
+    });
+    await check('v2: size — a 4,000-character multibyte or escape-heavy description plus a full log stays within 32 KiB', async () => {
+        log.ringBuffer = readRing;
+        for ( let i = 0; i < 70; i++ ) log.debug(`${i} ${'漢'.repeat(220)}`);
+        open(); setDescription('漢'.repeat(4000)); change('logs', true);
+        const kib = () => Buffer.byteLength(current().querySelector('pre').textContent, 'utf8');
+        assert.ok(kib() <= 32 * 1024, `${kib()} bytes`);
+        const kept = payload().diagnostics.logs;
+        assert.ok(kept.length > 0 && kept.length < 60, `${kept.length} lines kept`);
+        assert.match(kept.at(-1).text, /^debug 69 /, 'the newest lines are the ones kept');
+        assert.match(note('logs-note'), new RegExp(`^${kept.length} lines will be included\\. \\d+ older lines were left out to keep the report small\\.$`));
+        // Six bytes per escaped control character: then the oldest error codes go too, never the description.
+        setDescription('\u0001'.repeat(4000));
+        assert.ok(kib() <= 32 * 1024, `${kib()} bytes`);
+        assert.equal(payload().description.length, 4000);
+        assert.ok((payload().diagnostics.recentEvents?.length ?? 0) < 50, 'older error codes were dropped to fit');
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        send(); await until(() => status().includes(reportId));
+        assert.ok(Buffer.byteLength(calls.at(-1).body, 'utf8') <= 32 * 1024);
+        close();
+    });
+    await check('v2: an unreadable log leaves only the log out, says so, and the report still sends', async () => {
+        log.ringBuffer = () => { throw new Error('ring unavailable'); };
+        open(); setDescription('Ring unavailable'); change('logs', true);
+        assert.match(note('logs-note'), /couldn't be read in this tab, so this report will be sent without it/);
+        assert.equal(payload().diagnostics.logs, undefined);
+        diagnosticsSchema.parse(payload().diagnostics);
+        assert.equal(submitDisabled(), false);
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        send(); await until(() => status().includes(reportId));
+        close();
+        log.ringBuffer = readRing;
+    });
+    await check('v2: an older server (no ui.feedbackLogs) gets only v1 keys and no log option', async () => {
+        window.__EZIL_BOOT__.desktopState.ui.feedbackLogs = false;
+        const el = document.createElement('div');
+        el.className = 'window'; el.setAttribute('data-app', 'code');
+        document.body.append(el);
+        open(); setDescription('Older server');
+        assert.equal(form().elements.logs, undefined);
+        assert.doesNotMatch(document.getElementById('ezil-feedback-diagnostics-help').textContent, /app in front/);
+        assert.ok(Object.keys(payload().diagnostics).every(key => V1_DIAGNOSTICS.includes(key)), Object.keys(payload().diagnostics).join());
+        setDescription(''); close();
+        el.remove();
+        window.__EZIL_BOOT__.desktopState.ui.feedbackLogs = true;
+    });
+    await check('v2: a queued report with a log that an older server refuses (rollback, 400) returns to the draft, unretried', async () => {
+        open(); setDescription('Queued before a rollback'); change('logs', true);
+        setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        close();
+        assert.equal(stored(outboxKey).length, 1);
+        assert.ok(JSON.parse(stored(outboxKey)[0].body).diagnostics.logs.length > 0);
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 400 });
+        window.dispatchEvent(new window.Event('online'));
+        await until(() => stored(outboxKey) === null);
+        flushing = false;
+        assert.equal(stored(draftKey).description, 'Queued before a rollback');
+        const count = calls.length;
+        window.dispatchEvent(new window.Event('online')); await tick();
+        assert.equal(calls.length, count, 'a refusal is not retried');
+        open(); assert.equal(form().elements.description.value, 'Queued before a rollback'); setDescription(''); close();
+    });
+    await check('v2: a stale session (401) asks to sign in again, keeps the text, is not retried; another account never sends it', async () => {
+        open(); setDescription('Session expired');
+        respond = async () => ({ status: 401 });
+        send(); await until(() => /session expired/.test(status()));
+        assert.equal(status(), 'Your session expired — sign in again to send feedback.');
+        assert.equal(stored(outboxKey), null);
+        assert.equal(form().elements.description.value, 'Session expired');
+        assert.equal(stored(draftKey).description, 'Session expired');
+        close();
+        // Queue one offline for this account, then sign in as someone else in the same browser.
+        open(); setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        close();
+        const user = window.__EZIL_BOOT__.user;
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: '55555555-5555-4555-8555-555555555555' } });
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        await feedback.flush_feedback_outbox();
+        assert.equal(calls.length, count, "the other account's queue is not this account's");
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
+        await feedback.flush_feedback_outbox();
+        assert.equal(calls.length, count + 1);
+        assert.equal(JSON.parse(calls.at(-1).body).description, 'Session expired');
+        flushing = false;
+        assert.equal(stored(outboxKey), null);
+    });
+    await check('v2: every option is a labelled native checkbox wired to its description; notes are announced', () => {
+        open();
+        for ( const name of ['diagnostics', 'logs', 'screenshot'] ) {
+            const input = form().elements[name];
+            if ( ! input ) continue;
+            assert.equal(input.tagName, 'INPUT'); assert.equal(input.type, 'checkbox');
+            assert.ok(input.closest('label').textContent.trim().length > 8, `${name} has a visible label`);
+            assert.ok(input.tabIndex >= 0);
+        }
+        for ( const name of ['diagnostics', 'logs'] ) {
+            assert.ok(document.getElementById(form().elements[name].getAttribute('aria-describedby')), `${name} is described`);
+        }
+        assert.equal(current().querySelector('[data-role="logs-note"]').getAttribute('aria-live'), 'polite');
+        close();
     });
     await check('Troubleshoot entry and reports are gated; explicit load, escaped preview and confirmed deletion', async () => {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;

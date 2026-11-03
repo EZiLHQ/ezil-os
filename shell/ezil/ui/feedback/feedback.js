@@ -1,6 +1,6 @@
-// feedback.js — EZiL-authored. Explicit consent, preview, then one submission.
+// feedback.js — EZiL-authored. Visible defaults, preview, then one submission.
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
-import { build_diagnostics } from './diagnostics.js';
+import { build_diagnostics, build_recent_logs, LOG_MAX_LINES } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
@@ -12,6 +12,8 @@ const CATEGORIES = ['bug', 'idea', 'other'];
 const DRAFT_KEY = 'ezil:feedback:draft:v1:';
 const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
 const OUTBOX_MAX = 10;
+/** The server's body cap without a screenshot (types.ts `bodyBytesNoScreenshot`), in UTF-8 bytes. */
+const BODY_BYTES_MAX = 32 * 1024;
 let chipObserver = null;
 /** `matchMedia('(pointer: coarse)')` and the icon's sync it calls on a change. */
 let chipPointer = null;
@@ -318,9 +320,15 @@ function read_blob (blob, signal) {
     });
 }
 
-function error_copy (status) {
+/** The UTF-8 size of the part of a body the 32 KiB cap applies to (all but the screenshot's data). */
+function body_bytes (serialized, screenshot) {
+    return new TextEncoder().encode(serialized).length - (screenshot?.dataBase64?.length ?? 0);
+}
+
+function error_copy (status, { screenshot = false } = {}) {
     if ( status === 429 ) return "You've sent several reports this hour — try again later.";
-    if ( status === 413 ) return 'This report is too large. Remove the screenshot and try again.';
+    if ( status === 413 ) return screenshot ? 'This report is too large. Remove the screenshot and try again.'
+        : 'This report is too large. Shorten the description and try again.';
     if ( status === 415 ) return 'This page could not send the report. Reload EZiL OS and try again.';
     if ( status === 400 ) return 'This report could not be accepted. Check the description or remove the screenshot and try again.';
     if ( status === 401 ) return 'Your session expired — sign in again to send feedback.';
@@ -339,6 +347,9 @@ export function open_feedback_dialog (_opts) {
     const computer = window.__EZIL_BOOT__?.computer?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
+    // A server that sets this accepts `diagnostics.app` and `diagnostics.logs`;
+    // without it the form sends only what every earlier server accepts.
+    const extended = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackLogs === true;
     const dialog = document.createElement('dialog');
     dialog.className = 'ezil-feedback-dialog';
     dialog.setAttribute('aria-labelledby', 'ezil-feedback-heading');
@@ -356,7 +367,18 @@ export function open_feedback_dialog (_opts) {
                     aria-describedby="ezil-feedback-counter ezil-feedback-warning" autofocus></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
-                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics"> Include diagnostics</label>
+                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked
+                    aria-describedby="ezil-feedback-diagnostics-help"> Include diagnostics (recommended)</label>
+                <p id="ezil-feedback-diagnostics-help" class="ezil-feedback-muted ezil-feedback-help">Included unless
+                    you untick it: the EZiL OS version, browser and system type, screen size,
+                    ${extended ? 'the app in front, ' : ''}your computer's status, connection quality and recent error
+                    codes from this tab. Never your files, what you type in apps, links, cookies or sign-in.
+                    <span data-role="diagnostics-note"></span></p>
+                ${extended ? `<label class="ezil-feedback-consent"><input type="checkbox" name="logs"
+                    aria-describedby="ezil-feedback-logs-help"> Include recent activity log</label>
+                <p id="ezil-feedback-logs-help" class="ezil-feedback-muted ezil-feedback-help">Up to ${LOG_MAX_LINES} lines
+                    from the last 15 minutes in this tab. Links, file paths, addresses, ids and anything that looks
+                    like a password or token are replaced. <span data-role="logs-note" aria-live="polite"></span></p>` : ''}
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
                 <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
                     <div class="ezil-feedback-actions">
@@ -384,12 +406,16 @@ export function open_feedback_dialog (_opts) {
     const fields = dialog.querySelector('.ezil-feedback-fields');
     const description = form.elements.description;
     const diagnostics = form.elements.diagnostics;
+    const logsConsent = form.elements.logs;
     const screenshotConsent = form.elements.screenshot;
     const preview = dialog.querySelector('pre');
     const result = dialog.querySelector('.ezil-feedback-result');
     const submit = dialog.querySelector('[type="submit"]');
     const cancel = dialog.querySelector('[data-action="cancel"]');
     let screenshot = null;
+    /** Read once when "Include recent activity log" is ticked; what the preview shows is what is sent. */
+    let logs = null;
+    let logsFailed = false;
     let serialized = '';
     let sending = false;
     let sent = false;
@@ -456,13 +482,59 @@ export function open_feedback_dialog (_opts) {
         dialog.querySelector('#ezil-feedback-counter').textContent = `${description.value.length} / 4000`;
         const imageSection = dialog.querySelector('.ezil-feedback-capture');
         if ( imageSection ) imageSection.hidden = ! screenshotConsent.checked;
+        // Collecting must never stop a report: a reader that throws leaves its part out and says so.
+        let diag = null;
+        let diagnosticsFailed = false;
+        if ( diagnostics.checked ) {
+            try { diag = build_diagnostics({ extended }); } catch { diagnosticsFailed = true; }
+        }
+        const lines = logsConsent?.checked && logs?.length ? logs : null;
+        if ( lines ) diag = { ...diag, logs: lines };
+        const image = screenshotConsent?.checked ? screenshot : null;
         const payload = { v: 1, clientRequestId, category: form.elements.category.value,
-            description: description.value, computerId,
-            diagnostics: diagnostics.checked ? build_diagnostics() : null,
-            screenshot: screenshotConsent?.checked ? screenshot : null };
+            description: description.value, computerId, diagnostics: diag, screenshot: image };
         serialized = JSON.stringify(payload, null, 2);
+        // The visible preview is the body, so it must fit the server's cap: drop
+        // the oldest log lines first, then the oldest recorded error codes.
+        let left_out = 0;
+        for ( const key of ['logs', 'recentEvents'] ) {
+            while ( body_bytes(serialized, image) > BODY_BYTES_MAX && payload.diagnostics?.[key]?.length ) {
+                const over = body_bytes(serialized, image) - BODY_BYTES_MAX;
+                const list = payload.diagnostics[key];
+                // The fewest oldest entries whose compact size covers the excess (the
+                // pretty-printed body frees a little more, never less).
+                let drop = 0;
+                for ( let freed = 0; drop < list.length && freed < over; drop++ ) {
+                    freed += new TextEncoder().encode(JSON.stringify(list[drop])).length;
+                }
+                payload.diagnostics = { ...payload.diagnostics, [key]: list.slice(drop) };
+                if ( ! payload.diagnostics[key].length ) delete payload.diagnostics[key];
+                if ( ! Object.keys(payload.diagnostics).length ) payload.diagnostics = null;
+                if ( key === 'logs' ) left_out += drop;
+                serialized = JSON.stringify(payload, null, 2);
+            }
+        }
         preview.textContent = serialized;
+        const diagnosticsNote = dialog.querySelector('[data-role="diagnostics-note"]');
+        diagnosticsNote.textContent = diagnosticsFailed
+            ? "Diagnostics couldn't be collected in this tab, so this report will be sent without them." : '';
+        const logsNote = dialog.querySelector('[data-role="logs-note"]');
+        if ( logsNote ) {
+            const count = payload.diagnostics?.logs?.length ?? 0;
+            logsNote.textContent = ! logsConsent.checked ? ''
+                : logsFailed ? "The activity log couldn't be read in this tab, so this report will be sent without it."
+                    : ! logs?.length ? 'Nothing was recorded in this tab in the last 15 minutes.'
+                        : `${count} ${count === 1 ? 'line' : 'lines'} will be included.`
+                            + (left_out ? ` ${left_out} older ${left_out === 1 ? 'line was' : 'lines were'} left out to keep the report small.` : '');
+        }
         submit.disabled = capturing || ! description.value.trim() || description.value.length > 4000;
+    }
+
+    function read_logs () {
+        logs = null;
+        logsFailed = false;
+        if ( ! logsConsent?.checked ) return;
+        try { logs = build_recent_logs(); } catch { logsFailed = true; }
     }
 
     function clear_screenshot () {
@@ -549,6 +621,8 @@ export function open_feedback_dialog (_opts) {
     screenshotConsent?.addEventListener('change', () => {
         if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
     });
+    // On the box itself, so it runs before the form's `change` refresh below sees the event.
+    logsConsent?.addEventListener('change', read_logs);
     form.addEventListener('input', () => { refresh(); save_draft(); });
     form.addEventListener('change', () => { refresh(); save_draft(); });
     form.addEventListener('submit', async event => {
@@ -584,7 +658,7 @@ export function open_feedback_dialog (_opts) {
             result.textContent = navigator.onLine === false
                 ? "You're offline. Your report is saved and will be sent when you're back online."
                 : error_copy(outcome.status) + " We'll also send it automatically when your connection comes back.";
-        } else result.textContent = error_copy(outcome.status);
+        } else result.textContent = error_copy(outcome.status, { screenshot: !! JSON.parse(body).screenshot });
         refresh();
     });
 

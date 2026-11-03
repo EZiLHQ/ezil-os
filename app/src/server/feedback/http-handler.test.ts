@@ -156,6 +156,34 @@ describe('feedback HTTP boundary', () => {
         expect(h.statements.some((s) => s.sql.startsWith('insert') || s.sql.includes('count(*)'))).toBe(false);
     });
 
+    it('accepts v2 diagnostics (the app in front, a recent log) and stores only the re-redacted copy', async () => {
+        const h = harness();
+        const diagnostics = { shellVersion: '1', app: 'browser', recentEvents: [{ eventClass: 'api_failure', site: 'shell.start', code: 'x' }],
+            logs: [{ t: '2026-10-15T11:59:00.000Z', source: 'console', text: 'error GET https://private-host.example.test/a?token=1 for bob@example.com' }] };
+        expect((await handleFeedbackRequest(request({ ...VALID, diagnostics }), h.deps)).status).toBe(201);
+        const insert = h.statements.find((s) => s.sql.startsWith('insert into "ezil_feedback_reports"'))!;
+        const stored = JSON.stringify(insert.params);
+        expect(stored).toContain('browser');
+        expect(stored).toContain('<url>');
+        expect(stored).not.toMatch(/private-host|bob@example|token=1/);
+    });
+
+    it('still accepts a v1 body: no app, no logs, diagnostics off or null', async () => {
+        for (const diagnostics of [undefined, null, { shellVersion: '1', deviceClass: 'desktop', recentEvents: [] }]) {
+            const h = harness();
+            expect((await handleFeedbackRequest(request({ ...VALID, diagnostics }), h.deps)).status).toBe(201);
+        }
+    });
+
+    it('drops a computer that is not the caller\'s instead of attaching it (owner mismatch)', async () => {
+        const h = harness(); const foreign = '660e8400-e29b-41d4-a716-446655440009';
+        expect((await handleFeedbackRequest(request({ ...VALID, computerId: foreign }), h.deps)).status).toBe(201);
+        const lookup = h.statements.find((s) => s.sql.startsWith('select') && s.sql.includes('"computers"'))!;
+        expect(lookup.params).toEqual(expect.arrayContaining([foreign, USER.id]));
+        const insert = h.statements.find((s) => s.sql.startsWith('insert into "ezil_feedback_reports"'))!;
+        expect(insert.params).not.toContain(foreign);
+    });
+
     it('returns 201 only after the report is written', async () => {
         const h = harness(); const response = await handleFeedbackRequest(request(), h.deps);
         expect(response.status).toBe(201); expect(await response.json()).toEqual({ id: expect.any(String), createdAt: NOW.toISOString(), screenshotAccepted: false });
