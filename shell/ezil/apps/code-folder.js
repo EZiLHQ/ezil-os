@@ -295,8 +295,8 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
 const COPY = {
     // No copy promises that unsaved changes come back: code-server keeps its hot-exit backups in its user-data
     // directory, which a Cloudflare container recreates on every start. "Nothing was deleted" is what is known.
-    missing: (n) => `Couldn't reopen “${n}”: it isn't on this computer right now. Code opened its usual folder. Nothing was deleted.`,
-    not_directory: (n) => `Couldn't reopen “${n}”: it isn't a folder right now. Code opened its usual folder. Nothing was deleted.`,
+    missing: (n) => `Couldn't reopen “${n}”: it isn't on this computer right now. Nothing was deleted.`,
+    not_directory: (n) => `Couldn't reopen “${n}”: it isn't a folder right now. Nothing was deleted.`,
     symlink: (n) => `“${n}” is reached through a link. Code reopens real folders inside your workspace only. Open it from File > Open Recent.`,
     outside: (n) => `“${n}” is outside your workspace, so it isn't reopened automatically. Open it from File > Open Recent.`,
     not_allowed: (n) => `“${n}” belongs to a project or to EZiL. Open the project to work there.`,
