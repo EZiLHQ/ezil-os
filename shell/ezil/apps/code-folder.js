@@ -191,6 +191,47 @@ export function tagFolderMint (url, { asked, answer } = {}) {
     }
 }
 
+// The editor's own document path (`location.pathname`), as its bridge reports it: `/` on AWS, `/preview/` on
+// Cloudflare. Only plain directory paths; never a host, a query or a dot segment.
+const BASE_RE = /^\/(?:[A-Za-z0-9_-]{1,32}\/){0,4}$/;
+
+/**
+ * The editor document URL for a folder (or the empty window) the editor itself just opened in the frame: the
+ * frame's origin, the document path the editor reported, and `folder=` (or `ew=true`). Null for anything else.
+ * Only ever the editor's own navigation, never a minted (token) URL, and never authority over what is opened.
+ */
+export function editorDocumentUrl (frameUrl, report) {
+    if ( ! report || typeof report.base !== 'string' || ! BASE_RE.test(report.base) ) return null;
+    let u;
+    try { u = new URL(report.base, new URL(frameUrl).origin); } catch { return null; }
+    if ( report.kind === 'folder' ) {
+        const path = plainFolderPath(report.path);
+        if ( ! path ) return null;
+        u.searchParams.set('folder', path);
+    } else if ( report.kind === 'empty' ) {
+        u.searchParams.set('ew', 'true');
+    } else {
+        return null;
+    }
+    return u.href;
+}
+
+/**
+ * Load `url` into `iframe` as a NEW browsing context when it already shows a document. Chrome keeps a frame's
+ * document per joint history entry, so assigning `src` to a live frame adds an entry, and Back would then take the
+ * editor to the previous URL (an expired bootstrap token, or the folder before an in-frame Open Folder) while the
+ * shell stays put. A frame removed and inserted again is a new one that no earlier entry knows, so Back/Forward
+ * leave it alone. Same element, same listeners, same place. Measured in Chromium 151 (lead scratch f2exp).
+ */
+export function loadFrame (iframe, url) {
+    if ( ! iframe.getAttribute('src') || ! iframe.parentNode ) { iframe.src = url; return; }
+    const parent = iframe.parentNode;
+    const next = iframe.nextSibling;
+    iframe.remove();
+    iframe.src = url;
+    parent.insertBefore(iframe, next);
+}
+
 const bridges = new WeakMap();
 
 /** Stop listening for `iframe`'s editor (the window closed). */
@@ -213,20 +254,27 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  * A mint-driven report that is not exactly the asked folder, or is but the
  * server found it missing or not a directory, shows the notice once for this
  * binding and leaves the record as it was.
+ *
+ * `continued`: `frameUrl` is the editor's own document URL that `loadFrame` put
+ * in a fresh frame (no mint): its documents are all user-driven. `onUserFolder`
+ * hears each user-driven folder or empty window that differs from the last one
+ * reported, with the URL to reload it at (`editorDocumentUrl`, null if the
+ * editor did not say its document path).
  */
-export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
+export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, continued = false }) {
     bridges.get(iframe)?.detach();
     let origin, mintId;
     try {
         const u = new URL(frameUrl);
         origin = u.origin;
-        mintId = u.searchParams.get(MINT_PARAM);
+        mintId = continued ? null : u.searchParams.get(MINT_PARAM);
     } catch { return () => {}; }
-    if ( ! TOKEN_RE.test(mintId ?? '') ) return () => {};
-    const mint = mints.get(mintId) ?? { asked: null, outcome: null };
-    mints.delete(mintId);
+    if ( ! continued && ! TOKEN_RE.test(mintId ?? '') ) return () => {};
+    const mint = (mintId && mints.get(mintId)) || { asked: null, outcome: null };
+    if ( mintId ) mints.delete(mintId);
     let nonce = null;
-    let firstSeen = false;
+    let firstSeen = continued;
+    let last = null; // the last folder/empty report, so onUserFolder hears changes only
     let fallbackShown = false; // the first document answers each hello (attach, ready, load): one notice per mint
     const live = () => iframe.isConnected && iframe.src === frameUrl;
     const hello = () => {
@@ -242,7 +290,7 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
         if ( d.type === 'ezil.code.ready' ) { hello(); return; }
         if ( d.type !== 'ezil.code.folder' || ! TOKEN_RE.test(d.nonce ?? '') || d.nonce !== nonce ) return;
         nonce = null; // one report per hello
-        const mintDriven = d.mint === mintId;
+        const mintDriven = mintId !== null && d.mint === mintId;
         if ( ! mintDriven && ! (d.mint === null && firstSeen) ) return;
         firstSeen = true;
         if ( mintDriven && mint.asked
@@ -272,11 +320,19 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice }) {
                 if ( prev?.kind === 'folder' && prev.path !== path ) notice?.projectChild?.(prev.path);
             }
             putFolderRecord(bind, { kind: 'folder', path });
+            changed(mintDriven, `folder:${path}`, { kind: 'folder', path, base: d.base });
         } else if ( d.kind === 'empty' ) {
             if ( ! mintDriven ) putFolderRecord(bind, null); // Close Folder: the tab has no folder now
+            changed(mintDriven, 'empty', { kind: 'empty', base: d.base });
         } else if ( d.kind === 'workspace' || d.kind === 'foreign' ) {
             if ( ! mintDriven ) putFolderRecord(bind, { kind: 'unsupported', reason: d.kind });
         }
+    };
+    // A user-driven document that changed what the frame shows: the shell may reload it in a fresh frame (F2).
+    const changed = (mintDriven, key, report) => {
+        const moved = last !== null && last !== key;
+        last = key;
+        if ( ! mintDriven && moved ) onUserFolder?.({ url: editorDocumentUrl(frameUrl, report) });
     };
     const detach = () => {
         iframe.removeEventListener('load', hello);

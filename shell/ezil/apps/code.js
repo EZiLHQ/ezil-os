@@ -59,6 +59,15 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 //      there, deliberately — see `boot-payload.ts`);
 //   3. `el_iframe.src` is assigned EXACTLY ONCE per `start_boot()`.
 //
+// A frame that already shows a document is never re-navigated by `src`: Chrome
+// keeps a frame's document per joint history entry, so that would add an entry
+// and Back would take the editor to the previous (expired) URL while the shell
+// stays put. `loadFrame` (./code-folder.js) removes and re-inserts the same
+// element instead, a fresh frame no earlier entry knows. The one other URL it
+// ever loads is the editor's own document after an in-frame Open Folder, and
+// only when the frame has outlived a history push (F2: Back/Forward would
+// otherwise reload the workbench at the mint's first folder). Never a token URL.
+//
 // ── 🔴 Frame honesty, inherited — not reinvented ────────────────────────────
 // Same contract as `preview.js` and `desktop-window.js`: an iframe `load`
 // event fires identically for an HTTP error page and a real one, so this
@@ -136,13 +145,13 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import { attachFolderBridge, createFolderNotice, detachFolderBridge, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
+import { attachFolderBridge, createFolderNotice, detachFolderBridge, folderAskFor, forgetFolder, loadFrame, tagFolderMint } from './code-folder.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import { createFullView } from '../ui/full-view.js';
-import { appUrl } from '../app-history.js';
+import { appUrl, historyPushes } from '../app-history.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
@@ -582,6 +591,8 @@ export async function openCodeWindow (ctx = {}) {
     let stop_confirmation = () => {};
     /** Per-tab folder continuity: this window's notice band (`./code-folder.js`), replaced at each bind. */
     let folder_notice = null;
+    // `historyPushes()` when the frame last got a new browsing context (`loadFrame`).
+    let frame_pushes = 0;
     /**
      * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
      * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
@@ -892,7 +903,8 @@ export async function openCodeWindow (ctx = {}) {
         paint_handoff();
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
-        el_iframe.src = code_preview_url;
+        loadFrame(el_iframe, code_preview_url);
+        frame_pushes = historyPushes();
         trace.step('frame_nav');
         settle_frame(my_attempt);
     }
@@ -943,7 +955,17 @@ export async function openCodeWindow (ctx = {}) {
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
                     folder_notice?.close();
                     folder_notice = createFolderNotice(el_body, { retry: () => { void start_boot(); }, forget: () => forgetFolder(bind) });
-                    attachFolderBridge({ iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice });
+                    // F2: an in-frame Open Folder replaces only the CURRENT entry's document, so a shell entry pushed
+                    // since this frame loaded still holds the earlier one. Reload the editor's new document in a
+                    // fresh frame then, and only then (one extra load; never when no push happened).
+                    const follow = ({ url }) => {
+                        if ( disposed || my_attempt !== attempt || ! url || historyPushes() === frame_pushes ) return;
+                        loadFrame(el_iframe, url);
+                        frame_pushes = historyPushes();
+                        trace.step('frame_follow');
+                        attachFolderBridge({ iframe: el_iframe, frameUrl: el_iframe.src, bind, notice: folder_notice, onUserFolder: follow, continued: true });
+                    };
+                    attachFolderBridge({ iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice, onUserFolder: follow });
                 }
                 console.info(`[${PHASE}] code frame confirmed by the server`);
                 // Terminal: a confirmed frame IS the whole verdict for this
@@ -1008,7 +1030,8 @@ export async function openCodeWindow (ctx = {}) {
                 if ( asks >= max_asks ) { finish(undefined); return; }
                 needs_reload = false;
                 awaiting_reload = true;
-                el_iframe.src = frame_url;
+                loadFrame(el_iframe, frame_url);
+                frame_pushes = historyPushes();
                 trace.step('frame_recover');
                 return;
             }

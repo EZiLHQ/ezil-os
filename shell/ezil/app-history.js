@@ -35,6 +35,10 @@
 import { parseAppLink } from './app-link.js';
 
 export const OS_PATH = '/os';
+// Every `pushState` this module has written, for a window whose frame must know whether a shell entry was added
+// since it loaded (apps/code.js, F2).
+let pushes = 0;
+export function historyPushes () { return pushes; }
 // Page-level: the server picks the computer from it on a reload, so it rides
 // on every URL written here, whichever app is focused.
 const PAGE_KEYS = ['computer'];
@@ -229,6 +233,7 @@ export function createAppHistory () {
     };
     const write = (method, url, patch) => {
         win().history[method](mergeHistoryState(win().history.state, patch), '', url);
+        if ( method === 'pushState' ) pushes += 1;
     };
     // Record what this launch says about the app's own URL parameters:
     // Settings' tab always follows the launch (it reopens at Account without

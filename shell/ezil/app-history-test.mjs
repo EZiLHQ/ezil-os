@@ -10,7 +10,7 @@ const dataUrl = text => `data:text/javascript;base64,${Buffer.from(text).toStrin
 // app-history.js imports './app-link.js'; a data: module cannot resolve that.
 const link = dataUrl(readFileSync(new URL('./app-link.js', import.meta.url), 'utf8'));
 const history = readFileSync(new URL('./app-history.js', import.meta.url), 'utf8').replace("from './app-link.js'", `from '${link}'`);
-const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
+const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, routeLaunchContext, createAppHistory, OS_PATH, historyPushes } = await import(dataUrl(history));
 let checks = 0;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const same = (actual, expected, message) => { assert.deepEqual(plain(actual), plain(expected), message); checks += 1; };
@@ -139,8 +139,10 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, '... and keeps the parameters it had');
     controller.commit('settings', { initialTab: 'usage', historyMode: 'none' });
     same(url(), `/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, "historyMode 'none' writes nothing");
+    const pushesBeforeRoute = historyPushes();
     controller.commit('settings', { historyMode: 'replace' });
     same([url(), w.history.length], [`/app/settings?computer=${C}`, 5], 'a route launch never pushes');
+    same(historyPushes(), pushesBeforeRoute, 'and historyPushes does not count its replace');
     controller.commit('code', { historyMode: 'replace' });
     same([url(), w.history.length], [`/app/code?project=${P}&repo=${R}&path=src&computer=${C}`, 5]);
     same([controller.begin('unknown'), w.history.length], [null, 5], 'an app the registry does not list is ignored');
@@ -374,8 +376,10 @@ for (const fail of [false, true]) {
     // Positive control: the same end() with no newer intent still decides.
     const { w, controller, open, url } = harness('/os');
     settledLaunch(controller, 'settings', open('settings', 20));
+    const pushesBefore = historyPushes();
     const launch = controller.begin('code');
     same([url(), w.history.length], ['/app/code', 3], 'positive control: a single click pushes exactly one entry');
+    same(historyPushes(), pushesBefore + 1, 'historyPushes counts that push (apps/code.js F2)');
     launch.end(fail ? null : open('code', 10));
     same([url(), w.history.length, w.history.state.ezilApp], fail ? ['/app/settings', 3, 'settings'] : ['/app/code', 3, 'code'],
         fail ? 'positive control: the latest launch that failed rolls back' : 'positive control: the latest launch keeps its entry');

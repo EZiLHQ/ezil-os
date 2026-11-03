@@ -218,6 +218,55 @@ M.detachFolderBridge(F); eq(listeners.size, 0, 'detach: no message listener'); e
 url = mintAndAttach('t8', { v: 1, path: '/workspace/a' }, { v: 1, outcome: '/etc/passwd' }); F.load(); report(mintOf(url), 'folder', '/workspace');
 eq(notices.at(-1)[0], 'unsupported_server', 'a non-code answer is treated as no answer');
 M.detachFolderBridge(F);
+// 18 F2: the editor's own document URL, the user-driven change callback, and a continued (re-inserted) frame
+const DOC = (q) => `${ORIGIN}${q}`;
+eq(M.editorDocumentUrl(minted('x'), { kind: 'folder', path: '/workspace/a b/日本', base: '/' }),
+    DOC('/?folder=%2Fworkspace%2Fa+b%2F%E6%97%A5%E6%9C%AC'), 'folder: frame origin + base + folder=');
+eq(M.editorDocumentUrl(minted('x'), { kind: 'folder', path: '/workspace/a/', base: '/preview/' }), DOC('/preview/?folder=%2Fworkspace%2Fa'),
+    'the Cloudflare document path, folder normalised');
+eq(M.editorDocumentUrl(minted('x'), { kind: 'empty', base: '/preview/' }), DOC('/preview/?ew=true'), 'empty window: ew=true');
+for ( const base of [undefined, '', 'preview/', '//evil.example/', '/a/../', '/./', '/a//', '/a?x=1/', '/a#/', '/%2e%2e/', '/a', `/${'a/'.repeat(5)}`, 5, '/\\/'] ) {
+    eq(M.editorDocumentUrl(minted('x'), { kind: 'folder', path: '/workspace/a', base }), null, `base ${JSON.stringify(base)} refused`);
+}
+for ( const r of [{ kind: 'folder', path: '/workspace/../etc', base: '/' }, { kind: 'workspace', base: '/' }, { kind: 'foreign', base: '/' }, null] ) {
+    eq(M.editorDocumentUrl(minted('x'), r), null, `report ${JSON.stringify(r)}: no URL`);
+}
+eq(M.editorDocumentUrl('not a url', { kind: 'empty', base: '/' }), null, 'unparsable frame URL: no URL');
+const follows = [];
+const attachF2 = (t) => {
+    const u = M.tagFolderMint(minted(t), {}); F.src = u;
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onUserFolder: (x) => follows.push(x) });
+    return u;
+};
+const reportB = (mint, kind, path, base) => fire({ type: 'ezil.code.folder', v: 1, nonce: F.sent.at(-1).m.nonce, mint, kind, ...(path ? { path } : {}), ...(base ? { base } : {}) });
+url = attachF2('t9'); F.load(); reportB(mintOf(url), 'folder', '/workspace/a', '/');
+eq(follows, [], 'the mint\'s first document is not a change');
+F.load(); reportB(null, 'folder', '/workspace/a', '/'); eq(follows, [], 'the same folder again is not a change');
+F.load(); reportB(null, 'folder', '/workspace/b', '/'); eq(follows, [{ url: DOC('/?folder=%2Fworkspace%2Fb') }], 'Open Folder in the frame: one change, with its URL');
+F.load(); reportB(null, 'empty', null, '/'); eq(follows.at(-1), { url: DOC('/?ew=true') }, 'Close Folder: a change to the empty window');
+F.load(); reportB(null, 'folder', '/workspace/c'); eq(follows.at(-1), { url: null }, 'no document path from the editor: a change without a URL');
+F.load(); reportB(null, 'workspace', null, '/'); eq(follows.length, 3, 'a workspace document is no folder change');
+M.detachFolderBridge(F);
+// A continued frame (re-inserted at the editor's own URL, no mint): its first report is the folder it was loaded at
+// (no change, so no reload loop); later user-driven changes are heard and recorded.
+follows.length = 0; F.src = DOC('/?folder=%2Fworkspace%2Fb');
+M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onUserFolder: (x) => follows.push(x), continued: true });
+ok(F.sent.at(-1)?.m?.type === 'ezil.code.hello' && F.sent.at(-1).o === ORIGIN, 'continued: hello to the frame origin');
+F.load(); reportB(null, 'folder', '/workspace/b', '/'); eq(follows, [], 'continued: its first document is no change');
+eq(M.folderAskFor(bind), { v: 1, path: '/workspace/b' }, 'continued: the record follows the screen');
+F.load(); reportB(null, 'folder', '/workspace/d', '/'); eq(follows, [{ url: DOC('/?folder=%2Fworkspace%2Fd') }], 'continued: a later Open Folder is heard');
+F.load(); reportB(mintOf(url), 'folder', '/workspace/a', '/'); eq(M.folderAskFor(bind), { v: 1, path: '/workspace/d' }, 'continued: an earlier mint\'s document is dropped');
+M.detachFolderBridge(F);
+// loadFrame: a frame with no document gets `src`; a live one is removed and inserted again at the same place
+const host = { kids: [], insertBefore (el, next) { const i = next ? this.kids.indexOf(next) : -1; this.kids.splice(i < 0 ? this.kids.length : i, 0, el); el.parentNode = this; } };
+const el = (name) => ({ name, parentNode: null, attrs: {}, src: '', getAttribute (k) { return this.attrs[k] ?? null; },
+    get nextSibling () { const k = this.parentNode?.kids; return k ? k[k.indexOf(this) + 1] ?? null : null; }, remove () { const i = this.parentNode.kids.indexOf(this); this.parentNode.kids.splice(i, 1); this.parentNode = null; this.removed = (this.removed ?? 0) + 1; } });
+const fr = el('frame'); const after = el('notice'); host.insertBefore(fr, null); host.insertBefore(after, null);
+Object.defineProperty(fr, 'src', { get () { return this.attrs.src ?? ''; }, set (v) { this.attrs.src = v; this.assigned = [...(this.assigned ?? []), { v, connected: !! this.parentNode }]; } });
+M.loadFrame(fr, 'https://h/first'); eq(fr.removed, undefined, 'no document yet: not re-inserted'); eq(fr.assigned, [{ v: 'https://h/first', connected: true }], 'src set in place');
+M.loadFrame(fr, 'https://h/second'); eq(fr.removed, 1, 'a live frame is removed once');
+eq(fr.assigned.at(-1), { v: 'https://h/second', connected: false }, 'its src is set while detached (no navigation of the old frame)');
+eq(host.kids.map(k => k.name), ['frame', 'notice'], 'inserted again at the same place, before its next sibling');
 
 // ── the notice band: text only, actions per outcome ─────────────────────────
 globalThis.document = { createElement: (t) => ({ t, children: [], attrs: {}, listeners: {}, className: '', textContent: '',

@@ -619,14 +619,29 @@ await settle(4);
     const frame = () => q('.window[data-app="code"] .window-app-iframe');
     const before = mintedUrls.length, src = frame()?.getAttribute('src');
     push('a Code window is open before the restart', !! frame() && !! src);
+    // F2 / remint: the re-mint must load into a FRESH frame (the same element removed and inserted again), never
+    // re-navigate the live one, whose new joint history entry would let Back load the expired bootstrap URL.
+    const el0 = frame();
+    const srcWhileConnected = [];
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLIFrameElement.prototype, 'src');
+    Object.defineProperty(el0, 'src', { configurable: true, get () { return desc.get.call(this); },
+        set (v) { srcWhileConnected.push(this.isConnected); desc.set.call(this, v); } });
+    let removals = 0;
+    const mo = new window.MutationObserver(records => { for ( const r of records ) for ( const n of r.removedNodes ) if ( n === el0 ) removals += 1; });
+    mo.observe(el0.parentNode, { childList: true });
     window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: 'some-other-computer' } }));
     await settle(10);
     push('a restart of ANOTHER computer does not re-mint Code', mintedUrls.length === before, `${mintedUrls.length - before}`);
     window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: COMPUTER.id } }));
     await settle(20);
+    mo.disconnect();
     push('🔴 a restart of THIS computer re-mints Code exactly once', mintedUrls.length === before + 1, `${mintedUrls.length - before}`);
     push('the Code frame now shows the freshly minted URL',
         !! frame() && untag(frame().getAttribute('src')) === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
+    push('the re-mint loads a fresh frame: the same element, removed once and inserted again, src set while detached',
+        frame() === el0 && removals === 1 && srcWhileConnected.length === 1 && srcWhileConnected[0] === false,
+        `same element: ${frame() === el0}; removals: ${removals}; src set while connected: ${JSON.stringify(srcWhileConnected)}`);
+    delete el0.src;
     await window.$(q('.window[data-app="code"]')).close();
     await settle(6);
     const closedMints = mintedUrls.length;
