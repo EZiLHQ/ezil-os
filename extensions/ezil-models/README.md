@@ -55,11 +55,16 @@ definitions against the advertised input, one count per schema key and string
 value (it never counts numbers, booleans or punctuation), for its tool budget and
 for its text tool-result cap. Its prompt renderer counts message text with its
 own o200k_base tokenizer instead (measured on the image). A string counts as the
-exact bytes of its JSON literal, quotes and escapes included (`"你好"` is 8):
-never fewer than a schema string adds to a Messages body. For `openai-responses`
-models a string counts with non-ASCII escaped as `\uXXXX` plus the 23-byte
-text-block margin, because the Gateway's Responses bound escapes tool text and
-adds 128 bytes per tool and 32 per item. Advertised input defaults to
+text block it would be sent as, its JSON literal plus 23 bytes, so 38 agent
+tools count about 87,400 against 53,066 bytes on the wire. That is deliberate.
+Copilot starts background compaction (a summary request to the active model)
+when message plus tool tokens reach about 0.8 of the advertised input. Measured
+with a mock on the image, this count compacts every one to three turns and a
+growing chat keeps going. Counting bare literals (57,084) delayed compaction
+until the summary request was itself over the byte bound, and every growing chat
+was refused at its seventh turn. For `openai-responses` models a string also
+counts with non-ASCII escaped as `\uXXXX`, because the Gateway's Responses bound
+escapes tool text and adds 128 bytes per tool and 32 per item. Advertised input defaults to
 `131072 - 1056 - 1536 - 8000 = 120480`; `toolReserve` (default 8000) is only a
 margin for counting differences.
 
@@ -69,12 +74,10 @@ above, 512 items, 256 KiB). A request over a bound is refused on the computer
 with `local_input_too_large`, `local_too_many_messages` or
 `local_too_many_blocks`: nothing is sent or charged, the conversation history
 is kept, and the message gives the sizes (body bytes including tool-definition
-bytes, and the limit). Measured on the image with 38 tools, Copilot's renderer
-budget was 57,056 o200k tokens, and typical chat content is about 4-9 bytes per
-o200k token, so a long chat reaches `local_input_too_large` long before Copilot
-would summarize. Summarization was reachable only with unusually dense content
-(about 1-1.4 bytes per token). Any other failure before sending is
-`local_build_error` (the exception's class name only).
+bytes, and the limit). Background compaction normally keeps a chat under the
+bound. A chat can still reach it if compaction does not run or does not finish
+in time, for example with very sparse content or a summary that fails. Any other
+failure before sending is `local_build_error` (the exception's class name only).
 
 Calls share a FIFO admission queue per base URL and Bearer auth context, the same
 identity used by the model catalog cache. `GATEWAY_MAX_IN_FLIGHT = 2` is coupled

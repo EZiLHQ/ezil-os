@@ -196,16 +196,19 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
  * Copilot 0.69 calls this for its own tool definitions against maxInputTokens (countToolTokens: one
  * countTokens(string) per schema key and string value; numbers, booleans and falsy entries are not passed; plus 8
  * per tool, 16, and 10%), for its tool budget arithmetic and for its text tool-result cap. Its prompt renderer
- * counts message text with its own o200k_base tokenizer, not this call (measured by an A/B on the image). A string
- * counts as the exact bytes of its JSON string literal in a Messages body, quotes and escapes included: never fewer
- * than a schema string adds to the request. A text chunk sent as a text block adds about 23 more bytes; the
- * unchanged byte bound in buildGatewayBody still refuses that locally. The Responses bound escapes non-ASCII tool
- * text and adds 128 bytes per tool and 32 per item, so Responses strings keep the 23-byte text-block margin and
- * count escaped. Messages count as their serialized wire message.
+ * counts message text with its own o200k_base tokenizer, not this call. A string counts as the text block it would be
+ * sent as, about 23 bytes over its JSON literal, so 38 agent tools count about 87,400 against 53,066 bytes on the
+ * wire. Keep that: Copilot starts background compaction when message plus tool tokens reach about 0.8 of the
+ * advertised input, and only this heavier tool count starts it while its summary request still fits the byte bound.
+ * Measured on the image (mock A/B, 3 Nov 2026): counting bare literals (57,084) delayed compaction until the summary
+ * itself was over the bound, and every growing chat was refused at its 7th turn; this count compacted and continued
+ * through 10. The Responses bound also escapes non-ASCII tool text and adds 128 bytes per tool and 32 per item, so
+ * Responses strings count escaped. Messages count as their serialized wire message.
  */
 export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
     if (typeof value === 'string') {
-        return protocol === 'openai-responses' ? escapeNonAscii(JSON.stringify(text(value))).length : Buffer.byteLength(JSON.stringify(value), 'utf8');
+        const block = JSON.stringify(text(value));
+        return protocol === 'openai-responses' ? escapeNonAscii(block).length : Buffer.byteLength(block, 'utf8');
     }
     if (value.role === 'system') {
         const blocks = value.parts.map(partText).filter(Boolean).map(text);

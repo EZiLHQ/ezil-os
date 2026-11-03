@@ -101,8 +101,8 @@ describe('gateway sanitizer', () => {
     test('byte count matches serialized UTF-8 wire messages and text parts', () => {
         const message = msg('user', txt('你好 🌍\n"'));
         expect(gatewayTokenCount(message)).toBe(Buffer.byteLength(JSON.stringify(gatewayMessage(message))));
-        // A string counts as its JSON literal (quotes included), not wrapped in a text block (gateway-budget.test.ts).
-        expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength(JSON.stringify('你好')));
+        // A string counts as the text block it would be sent as (gateway-budget.test.ts says why).
+        expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength(JSON.stringify({ type: 'text', text: '你好' })));
         expect(gatewayTokenCount(msg('system', thinking))).toBe(0);
         expect(gatewayInputTokens(gw())).toBe(104480);
         expect(gatewayInputTokens({ ...gw(), toolReserve: 1000 })).toBe(127480);

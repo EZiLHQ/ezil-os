@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { parseModelsConfig, type ResolvedModel } from '../src/config';
-import { buildGatewayBody, escapeNonAscii, gatewayConversation, gatewayInputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError, QWEN } from '../src/gateway-messages';
+import { buildGatewayBody, escapeNonAscii, gatewayConversation, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError, QWEN } from '../src/gateway-messages';
 import { buildGatewayResponsesBody } from '../src/gateway-responses';
 import type { ChatRequest, Message, Part, Tool } from '../src/types';
 import { FIXTURES, loadFixture } from './fixtures/load';
@@ -35,7 +35,6 @@ function copilotToolTokens(tools: readonly Tool[], count: (text: string) => numb
     for (const tool of tools) total += 8 + object({ name: tool.name, description: tool.description, parameters: tool.inputSchema });
     return Math.floor(total * 1.1);
 }
-const copilotMessages = (messages: readonly Message[]) => 3 + messages.reduce((sum, message) => sum + 3 + gatewayTokenCount(message), 0);
 const request = (messages: Message[], tools: readonly Tool[] = []): ChatRequest => ({ messages, tools: [...tools], toolMode: 'auto', modelOptions: {} });
 const user = (text: string): Message => ({ role: 'user', parts: [{ type: 'text', value: text }] });
 const messagesToolBytes = (model: ResolvedModel, tools: readonly Tool[]) =>
@@ -56,11 +55,11 @@ function refusal(run: () => unknown): LocalRequestError {
 
 describe('string counting never under-counts a string in any protocol', () => {
     const corpus = ['你好', 'a', 'name', 'quote"backslash\\', 'line\nbreak\ttab', '\u0001ctrl', '🌍', 'é', '\ud800', 'x'.repeat(100), '中文 and ascii', '</script>', ''];
-    test('Messages: the exact bytes of the JSON string literal, quotes and escapes included', () => {
-        // Measured: '你好' adds 8 bytes to a Messages body ("你好" with its quotes); content-only counting (6) would under-count.
-        expect(gatewayTokenCount('你好')).toBe(8);
-        expect(gatewayTokenCount('a"b\\c\n')).toBe(Buffer.byteLength('"a\\"b\\\\c\\n"'));
-        for (const text of corpus) expect(gatewayTokenCount(text)).toBe(Buffer.byteLength(JSON.stringify({ k: text })) - Buffer.byteLength('{"k":}'));
+    test('Messages: the bytes of the text block it would be sent as, its JSON literal plus the 23-byte wrapper', () => {
+        expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength('{"type":"text","text":"你好"}'));
+        for (const text of corpus) {
+            expect(gatewayTokenCount(text)).toBe(Buffer.byteLength(JSON.stringify(text)) + '{"type":"text","text":}'.length);
+        }
     });
     test('Responses: escaped non-ASCII as the Gateway bound counts it, plus the text-block margin', () => {
         expect(gatewayTokenCount('你好', 'openai-responses')).toBe('{"type":"text","text":"\\u4f60\\u597d"}'.length);
@@ -77,13 +76,16 @@ describe('string counting never under-counts a string in any protocol', () => {
 });
 
 describe('Copilot tool counting against real tool bytes (measured)', () => {
-    test('Messages, 39 and 64 agent tools: Copilot counts at least the real bytes, at most 1.1x', () => {
-        for (const [tools, real, counted] of [[tools39, 53_535, 57_539], [tools64, 83_921, 90_142]] as const) {
+    test('Messages, 39 and 64 agent tools: Copilot counts the text-block bytes, well over the real bytes', () => {
+        // Deliberately heavy (see gatewayTokenCount): this count is what starts Copilot's background compaction while
+        // its summary request still fits. A mock A/B on the image measured counting bare literals (57,539 here)
+        // leaving every growing chat refused at its 7th turn; do not "correct" it to the real bytes. 64 tools count
+        // over the 120,480 advertised input, as before 2 Nov 2026; Copilot's behaviour there is unmeasured.
+        for (const [tools, real, counted] of [[tools39, 53_535, 88_254], [tools64, 83_921, 139_882]] as const) {
             for (const model of [kimi, qwen]) expect(messagesToolBytes(model, tools)).toBe(real);
             const p = copilotToolTokens(tools, text => gatewayTokenCount(text));
             expect(p).toBe(counted);
-            expect(p).toBeGreaterThanOrEqual(real);
-            expect(p).toBeLessThanOrEqual(Math.floor(real * 1.1));
+            expect(p).toBeGreaterThan(Math.floor(real * 1.5));
         }
     });
     test('Responses, 39 and 64 agent tools: the kept margin covers the bound (escaping and 128 per tool)', () => {
@@ -94,35 +96,6 @@ describe('Copilot tool counting against real tool bytes (measured)', () => {
             expect(p).toBeGreaterThanOrEqual(bound);
         }
     });
-    test('the old text-block count over-counted 39 Messages tools 1.65x', () => {
-        expect(copilotToolTokens(tools39, text => Buffer.byteLength(JSON.stringify({ type: 'text', text })))).toBe(88_254);
-    });
-});
-
-describe('the normal agent render fits the local bound', () => {
-    const text = (n: number, seed: number) => { let s = ''; for (let i = seed; Buffer.byteLength(s) < n; i++) s += `${i} export const v${i} = { ok: true, "note": "请检查 ${i}" };\n`; return s; };
-    function rounds(count: number, size: number, parallel: number): Message[] {
-        const out: Message[] = [];
-        for (let i = 0; i < count; i++) {
-            const ids = Array.from({ length: parallel }, (_, j) => `toolu_${i}_${j}`);
-            out.push({ role: 'assistant', parts: [{ type: 'text', value: 'Reading.' }, ...ids.map((id): Part => ({ type: 'tool_call', callId: id, name: 'read_file', input: { filePath: `/workspace/${id}.ts`, startLine: 1, endLine: 400 } }))] });
-            for (const id of ids) out.push({ role: 'user', parts: [{ type: 'tool_result', callId: id, content: [{ type: 'text', value: text(size, i) }] }] });
-        }
-        return out;
-    }
-    const system = fixture.messages.find(message => message.role === 'system')!;
-    const context = fixture.messages.filter(message => message.role === 'user').slice(0, 2);
-    for (const model of [kimi, qwen]) for (const [tools, name] of [[tools39, '39'], [tools64, '64']] as const) for (const [size, parallel] of [[300, 1], [4000, 1], [12000, 1], [1500, 4]] as const) {
-        test(`${model.model}, ${name} tools, ${parallel}x${size} B results: history pruned to Copilot's budget builds`, () => {
-            // Agent intent endpoint I: floor((maxInputTokens - toolTokens) * 0.9), newest history kept.
-            const budget = Math.max(1, Math.floor((gatewayInputTokens(model) - copilotToolTokens(tools, value => gatewayTokenCount(value))) * 0.9));
-            const all = rounds(300, size, parallel);
-            const render = (kept: number) => [system, ...context, ...all.slice(all.length - kept * (parallel + 1)), user('Continue.')];
-            let kept = 0;
-            while (kept < 300 && copilotMessages(render(kept + 1)) <= budget) kept++;
-            expect(() => buildGatewayBody(model, request(render(kept), tools))).not.toThrow();
-        });
-    }
 });
 
 describe('local refusals carry sizes only and send nothing', () => {
