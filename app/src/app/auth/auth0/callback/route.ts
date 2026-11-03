@@ -10,16 +10,21 @@ import { ownedPublicOrigin } from '@/utils/forwarded';
 
 export async function GET(request: NextRequest) {
     let destination: string;
+    // Set only once the signed transaction has been read: a failure after that (cancelled, unverified email, conflict)
+    // goes back to the sign-in page still headed for the same page; a failure before it keeps nothing, because then
+    // nothing vouches for any destination. Never read from the callback's own query.
+    let returnUrl: string | undefined;
     try {
         if (!auth0Enabled()) throw new Auth0Error('auth0_disabled');
         const params = request.nextUrl.searchParams;
         const transaction = readTransaction(request.cookies.get(AUTH0_COOKIE)?.value, params.get('state'));
+        returnUrl = safeReturnUrl(transaction.returnUrl);
         const code = params.get('code');
         const providerError = params.get('error');
         if (transaction.silent && providerError !== null && SILENT_LOGIN_FALLBACK_ERRORS.has(providerError)) {
             // `prompt=none` found no id.ezil.work session to ride on. One interactive sign-in instead, never another
             // silent one, so this cannot loop.
-            destination = `/auth/auth0/login?${new URLSearchParams({ returnUrl: safeReturnUrl(transaction.returnUrl) })}`;
+            destination = `/auth/auth0/login?${new URLSearchParams({ returnUrl })}`;
         } else {
             if (params.has('error') || !code) throw new Auth0Error('auth0_failed');
             const token = await exchangeCode(code, { origin: ownedPublicOrigin(request.headers, request.url), codeVerifier: transaction.codeVerifier });
@@ -31,12 +36,12 @@ export async function GET(request: NextRequest) {
             // After the bridge, so the token is bound to the session it just minted. Additive: a failure here never
             // fails the OS sign-in; opening a project then asks for a refresh (IDENTITY_REFRESH_REQUIRED).
             try { await retainProjectIdentity(token); } catch { console.warn('[auth0] identity not retained'); }
-            destination = safeReturnUrl(transaction.returnUrl);
+            destination = returnUrl;
         }
     } catch (error) {
         const code = error instanceof Auth0Error ? error.code : 'auth0_failed';
         console.warn('[auth0] callback failed', { code });
-        destination = `/login?error=${code}`;
+        destination = `/login?${new URLSearchParams({ error: code, ...(returnUrl === undefined ? {} : { returnUrl }) })}`;
     }
     const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });

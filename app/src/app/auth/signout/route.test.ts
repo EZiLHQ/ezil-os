@@ -19,11 +19,13 @@ const stub = vi.hoisted(() => ({
     error: null as { message: string } | null,
     identityThrows: false,
     identityAt: [] as number[],
+    createThrows: false,
 }));
 
 vi.mock('@/utils/supabase/server', () => ({
-    createClient: async () => ({
-        auth: {
+    createClient: async () => {
+        if (stub.createThrows) throw new Error('supabase env missing');
+        return { auth: {
             getUser: () => stub.getUser(),
             signOut: async (options?: { scope?: string }) => {
                 stub.order.push('signout');
@@ -31,8 +33,8 @@ vi.mock('@/utils/supabase/server', () => ({
                 stub.scopes.push(options?.scope);
                 return { error: stub.error };
             },
-        },
-    }),
+        } };
+    },
 }));
 
 vi.mock('@/server/auth/retained-identity', () => ({
@@ -59,6 +61,7 @@ beforeEach(() => {
     stub.throws = false;
     stub.identityThrows = false;
     stub.identityAt = [];
+    stub.createThrows = false;
     stub.order = [];
     vi.stubGlobal('fetch', vi.fn(async () => { stub.order.push('delete'); return new Response('{}'); }));
 });
@@ -188,5 +191,94 @@ describe('signout clears the retained EZiL ID token', () => {
         const response = await POST(signOutRequest());
         expect(response.status).toBe(303);
         expect(stub.order).toContain('signout');
+    });
+});
+
+describe('/login "Sign out and use another account" (auth recovery)', () => {
+    const decode = (value: string | undefined) => Buffer.from(value ?? '', 'base64url').toString('utf8');
+    function formRequest(fields: [string, string][], cookie = '') {
+        return new NextRequest(`${ORIGIN}/auth/signout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
+            body: new URLSearchParams(fields).toString(),
+        });
+    }
+    const auth0 = () => { vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'private-secret'); };
+
+    it('🔴 with no OS session cookie: still leaves id.ezil.work through the unchanged logout URL and keeps the page in a host-only cookie', async () => {
+        auth0();
+        stub.getUser.mockResolvedValue({ data: { user: null } });
+        const response = await POST(formRequest([['returnUrl', '/app/browser']]));
+        expect(response.status).toBe(303);
+        const url = new URL(response.headers.get('location')!);
+        expect(url.origin + url.pathname).toBe('https://id.ezil.work/oidc/logout');
+        // Exactly the registered post-logout URL: nothing rides on it.
+        expect(Object.fromEntries(url.searchParams)).toEqual({ client_id: 'test-client', post_logout_redirect_uri: `${ORIGIN}/login` });
+        const kept = response.cookies.get('__Host-ezil-login-return');
+        expect(kept).toMatchObject({ httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 600 });
+        expect(decode(kept?.value)).toBe('/app/browser');
+        expect(fetch).not.toHaveBeenCalled();
+        expect(stub.identityAt).toEqual([0]);
+    });
+
+    it('🔴 a Supabase client that cannot be built never traps the person: logout, cookies expired by hand, page kept', async () => {
+        auth0();
+        stub.createThrows = true;
+        const response = await POST(formRequest([['returnUrl', '/app/browser']], '__Host-ezil-os-auth=stale; theme=dark'));
+        expect(response.status).toBe(303);
+        expect(new URL(response.headers.get('location')!).pathname).toBe('/oidc/logout');
+        expect(response.cookies.get('__Host-ezil-os-auth')).toMatchObject({ value: '', maxAge: 0, secure: true, path: '/' });
+        expect(response.cookies.get('theme')).toBeUndefined();
+        expect(decode(response.cookies.get('__Host-ezil-login-return')?.value)).toBe('/app/browser');
+        expect(stub.order).toEqual([]);
+        expect(stub.identityAt).toEqual([0]);
+    });
+
+    it('expires an abandoned sign-in transaction, and only when one is present', async () => {
+        auth0();
+        const withTx = await POST(formRequest([['returnUrl', '/os']], '__Host-ezil-auth0=abandoned'));
+        expect(withTx.cookies.get('__Host-ezil-auth0')).toMatchObject({ value: '', maxAge: 0, secure: true, httpOnly: true, path: '/' });
+        const without = await POST(formRequest([['returnUrl', '/os']]));
+        expect(without.cookies.get('__Host-ezil-auth0')).toBeUndefined();
+    });
+
+    it.each([
+        ['https://evil.example/', '/computers'], ['//evil.example', '/computers'], ['/\\evil.example', '/computers'],
+        ['%2F%2Fevil.example', '/computers'], ['/app/%2e%2e/admin', '/os'], ['/app/browser?x=1#frag', '/app/browser?x=1#frag'],
+        ['javascript:alert(1)', '/computers'], ['/os\nSet-Cookie: x=y', '/computers'],
+    ])('narrows the field %j to %j before keeping it', async (field, kept) => {
+        auth0();
+        const response = await POST(formRequest([['returnUrl', field]]));
+        expect(decode(response.cookies.get('__Host-ezil-login-return')?.value)).toBe(kept);
+        expect(response.headers.get('location')).not.toContain('evil');
+    });
+
+    it('a repeated field counts by its first value only', async () => {
+        auth0();
+        const response = await POST(formRequest([['returnUrl', '/app/browser'], ['returnUrl', 'https://evil.example/']]));
+        expect(decode(response.cookies.get('__Host-ezil-login-return')?.value)).toBe('/app/browser');
+    });
+
+    it('an over-long destination is dropped, never truncated', async () => {
+        auth0();
+        const response = await POST(formRequest([['returnUrl', `/os?x=${'a'.repeat(2100)}`]]));
+        expect(response.status).toBe(303);
+        expect(response.cookies.get('__Host-ezil-login-return')).toBeUndefined();
+    });
+
+    it("the shell's body-less sign-out is unchanged: no kept page", async () => {
+        auth0();
+        const response = await POST(signOutRequest());
+        expect(response.cookies.get('__Host-ezil-login-return')).toBeUndefined();
+        const empty = await POST(formRequest([['returnUrl', '']]));
+        expect(empty.cookies.get('__Host-ezil-login-return')).toBeUndefined();
+    });
+
+    it('without Auth0 the narrowed page rides on /login itself and no cookie is set', async () => {
+        const response = await POST(formRequest([['returnUrl', '//evil.example']]));
+        expect(response.headers.get('location')).toBe(`${ORIGIN}/login?returnUrl=%2Fcomputers`);
+        const fine = await POST(formRequest([['returnUrl', '/app/browser']]));
+        expect(fine.headers.get('location')).toBe(`${ORIGIN}/login?returnUrl=%2Fapp%2Fbrowser`);
+        expect(fine.cookies.get('__Host-ezil-login-return')).toBeUndefined();
     });
 });

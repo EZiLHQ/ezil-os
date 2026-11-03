@@ -37,3 +37,28 @@ describe('Auth0 login route: silent re-auth', () => {
         expect(plain.searchParams.has('prompt')).toBe(false);
     });
 });
+
+describe('Auth0 login route: auth recovery', () => {
+    const KEPT = '__Host-ezil-login-return';
+    const withKept = (query: string) => new NextRequest(`https://os-staging.ezil.work/auth/auth0/login?${query}`, { headers: { cookie: `${KEPT}=L2FwcC9icm93c2Vy` } });
+    it('an interactive sign-in takes over the page a sign-out kept, and expires it', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'test-secret');
+        const response = await GET(withKept('returnUrl=%2Fapp%2Fbrowser'));
+        expect(new URL(response.headers.get('location')!).pathname).toBe('/authorize');
+        expect(response.cookies.get(KEPT)).toMatchObject({ value: '', maxAge: 0, secure: true, httpOnly: true, path: '/' });
+    });
+    it('a silent re-auth leaves it alone, and nothing is set when there is none', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'test-secret');
+        expect((await GET(withKept('prompt=none&returnUrl=%2Fos'))).cookies.get(KEPT)).toBeUndefined();
+        expect((await GET(new NextRequest('https://os-staging.ezil.work/auth/auth0/login?returnUrl=/os'))).cookies.get(KEPT)).toBeUndefined();
+    });
+    it.each([['/app/browser', '%2Fapp%2Fbrowser'], ['//evil.example', '%2Fcomputers'], ['https://evil.example/', '%2Fcomputers']])(
+        'a failed start goes back to sign-in still headed for %j, narrowed', async (returnUrl, encoded) => {
+            vi.stubEnv('AUTH0_CLIENT_ID', ''); vi.stubEnv('AUTH0_SECRET_ID', '');
+            const response = await GET(new NextRequest(`https://os-staging.ezil.work/auth/auth0/login?${new URLSearchParams({ returnUrl })}`));
+            expect(response.headers.get('location')).toBe(`https://os-staging.ezil.work/login?error=auth0_disabled&returnUrl=${encoded}`);
+            expect(response.headers.get('cache-control')).toBe('no-store');
+            expect(set).not.toHaveBeenCalled();
+        },
+    );
+});

@@ -32,6 +32,10 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 function request(query: Record<string, string> = {}, cookieValue: string | null = cookie) {
     return new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state, code: 'private-code', ...query })}`, { headers: cookieValue === null ? {} : { cookie: `${AUTH0_COOKIE}=${cookieValue}` } });
 }
+/** `/login` after a failure; `returnUrl` only when a signed transaction vouched for it, narrowed. */
+function failed(code: string, returnUrl?: string) {
+    return `${origin}/login?${new URLSearchParams({ error: code, ...(returnUrl === undefined ? {} : { returnUrl }) })}`;
+}
 function expectCleared(response: Awaited<ReturnType<typeof GET>>) {
     expect(response.cookies.get(AUTH0_COOKIE)).toMatchObject({ value: '', maxAge: 0, secure: true, httpOnly: true, sameSite: 'lax', path: '/' });
     expect(response.headers.get('cache-control')).toBe('no-store');
@@ -59,7 +63,13 @@ describe('Auth0 callback', () => {
         if (failure === 'provider_error') query = { error: secret, error_description: 'private@example.com' };
         if (failure === 'disabled') vi.stubEnv('AUTH0_CLIENT_ID', '');
         const response = await GET(request(query, value));
-        expect(response.headers.get('location')).toMatch(new RegExp(`^${origin}/login\\?error=(invalid_transaction|state_mismatch|auth0_failed|auth0_disabled)$`));
+        if (failure === 'missing_code' || failure === 'provider_error') {
+            // The signed transaction was read before the refusal: back to sign-in, still headed for its page.
+            expect(response.headers.get('location')).toBe(failed('auth0_failed', '/os?computer=one'));
+        } else {
+            // Nothing vouched for a destination, so none is kept.
+            expect(response.headers.get('location')).toMatch(new RegExp(`^${origin}/login\\?error=(invalid_transaction|state_mismatch|auth0_disabled)$`));
+        }
         expect(stub.exchangeCode).not.toHaveBeenCalled();
         expect(stub.verifyIdToken).not.toHaveBeenCalled();
         expect(stub.bridge).not.toHaveBeenCalled();
@@ -69,7 +79,7 @@ describe('Auth0 callback', () => {
         const logs = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'warn').mockImplementation(() => {}), vi.spyOn(console, 'error').mockImplementation(() => {})];
         stub[method].mockRejectedValue(new Error(`${secret} private-code private-id-token private@example.com`));
         const response = await GET(request());
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
+        expect(response.headers.get('location')).toBe(failed('auth0_failed', '/os?computer=one'));
         // Only the fixed failure code may be logged; never provider text, tokens or user data.
         expect(logs[0]).not.toHaveBeenCalled();
         expect(logs[2]).not.toHaveBeenCalled();
@@ -80,7 +90,7 @@ describe('Auth0 callback', () => {
     it('reports an account conflict using only its fixed error code', async () => {
         stub.bridge.mockRejectedValue(new Auth0Error('account_conflict'));
         const response = await GET(request());
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=account_conflict`);
+        expect(response.headers.get('location')).toBe(failed('account_conflict', '/os?computer=one'));
         expectCleared(response);
     });
     it('sanitises even a correctly signed cookie destination at the final redirect', async () => {
@@ -147,7 +157,7 @@ describe('Auth0 callback after a silent (prompt=none) attempt', () => {
     it('any other provider error after a silent attempt is still the plain refusal', async () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const response = await GET(await silentRequest({ error: 'access_denied' }));
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
+        expect(response.headers.get('location')).toBe(failed('auth0_failed', '/app/code?project=p&repo=r'));
     });
     it('a silent success retains the token like an interactive one', async () => {
         const response = await GET(await silentRequest({ code: 'private-code' }));
@@ -164,7 +174,7 @@ describe('Auth0 callback after a silent (prompt=none) attempt', () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
         const response = await GET(await silentRequest({ code: 'private-code' }));
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=account_conflict`);
+        expect(response.headers.get('location')).toBe(failed('account_conflict', '/app/code?project=p&repo=r'));
         expect(stub.bridge).not.toHaveBeenCalled();
         expect(stub.retain).not.toHaveBeenCalled();
         expectCleared(response);
@@ -177,6 +187,63 @@ describe('Auth0 callback after a silent (prompt=none) attempt', () => {
     it('an interactive transaction never takes the silent fallback', async () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const response = await GET(request({ error: 'login_required', code: '' }));
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=auth0_failed`);
+        expect(response.headers.get('location')).toBe(failed('auth0_failed', '/os?computer=one'));
+    });
+});
+
+describe('Auth0 callback failure keeps only a vouched-for destination (auth recovery)', () => {
+    async function transactionFor(returnUrl: string) {
+        stub.set.mockClear();
+        const url = await buildAuthorizeUrl({ origin, returnUrl });
+        state = url.searchParams.get('state')!; cookie = stub.set.mock.calls[0][1];
+    }
+    beforeEach(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
+    it('🔴 an unverified email is refused (no bridge, no session, no retained token) and the sign-in page keeps /app/browser', async () => {
+        await transactionFor('/app/browser');
+        stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+        const response = await GET(request());
+        expect(response.headers.get('location')).toBe(failed('email_unverified', '/app/browser'));
+        expect(stub.bridge).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expect(response.headers.get('location')).not.toContain('private');
+        expectCleared(response);
+    });
+    it('a verified retry of the same page lands on it', async () => {
+        await transactionFor('/app/browser');
+        const response = await GET(request());
+        expect(response.headers.get('location')).toBe(`${origin}/app/browser`);
+        expect(stub.bridge).toHaveBeenCalledOnce();
+    });
+    it('a cancelled sign-in (access_denied) keeps the page, query and hash included', async () => {
+        await transactionFor('/app/code?project=p&repo=r&path=src/main.ts#L4');
+        const response = await GET(request({ error: 'access_denied', code: '' }));
+        expect(response.headers.get('location')).toBe(failed('auth0_failed', '/app/code?project=p&repo=r&path=src/main.ts#L4'));
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+    });
+    it.each(['//evil.example', 'https://evil.example/', '/\\evil.example', '/app/%2e%2e/admin', '/os\tx'])(
+        'a signed transaction carrying %j is narrowed again on the failure path', async hostile => {
+            const value = JSON.parse(Buffer.from(cookie.split('.')[0], 'base64url').toString());
+            const payload = Buffer.from(JSON.stringify({ ...value, returnUrl: hostile })).toString('base64url');
+            const key = Buffer.from(hkdfSync('sha256', secret, 'https://id.ezil.work/', 'ezil/auth0/transaction/v1', 32));
+            stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+            const response = await GET(request({}, `${payload}.${createHmac('sha256', key).update(payload).digest('base64url')}`));
+            const location = new URL(response.headers.get('location')!);
+            expect(location.origin + location.pathname).toBe(`${origin}/login`);
+            expect(['/computers', '/os']).toContain(location.searchParams.get('returnUrl'));
+            expect(response.headers.get('location')).not.toContain('evil');
+        },
+    );
+    it.each(['missing_cookie', 'expired_cookie', 'state_mismatch'])('🔴 %s: the callback query never supplies a destination', async failure => {
+        let value: string | null = cookie; let query: Record<string, string> = { returnUrl: '/app/browser' };
+        if (failure === 'missing_cookie') value = null;
+        if (failure === 'expired_cookie') { vi.useFakeTimers(); vi.setSystemTime(Date.now() + 600_001); }
+        if (failure === 'state_mismatch') query = { ...query, state: 'other' };
+        const response = await GET(request(query, value));
+        expect(new URL(response.headers.get('location')!).searchParams.has('returnUrl')).toBe(false);
+    });
+    it('a transaction-backed failure ignores a returnUrl in the callback query', async () => {
+        stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+        const response = await GET(request({ returnUrl: '/app/settings' }));
+        expect(response.headers.get('location')).toBe(failed('email_unverified', '/os?computer=one'));
     });
 });

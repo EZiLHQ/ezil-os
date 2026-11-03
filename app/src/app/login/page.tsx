@@ -1,11 +1,13 @@
 import Link from 'next/link';
 import type { Viewport } from 'next';
+import { cookies } from 'next/headers';
 
 import { auth0Enabled } from '@/server/auth/auth0';
 import { readBillingConfig } from '@/server/billing/config';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
 import { LoginForm } from './login-form';
+import { decodeLoginReturn, LOGIN_RETURN_COOKIE } from './return-cookie';
 
 /** `/login?method=email` opens the email and password panel straight away. */
 const METHOD_PARAM = 'method';
@@ -26,9 +28,20 @@ export const viewport: Viewport = {
 function noticeFor(error: string | string[] | undefined): string | null {
     if (error === undefined) return null;
     if (error === 'auth_callback_failed') return 'Sign-in did not finish. Please try again.';
-    if (error === 'email_unverified') return 'Verify your email address with EZiL ID first, then sign in again.';
+    if (error === 'email_unverified') {
+        return 'The email address on this EZiL ID is not verified yet. Open the verification link EZiL ID emailed you, then choose Continue with EZiL ID again. Wrong account? Sign out and use another one below.';
+    }
     if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
     return 'We could not sign you in. Please try again.';
+}
+
+/** The destination a "Sign out and use another account" left behind, if any (see `./return-cookie`). */
+async function keptReturnUrl(): Promise<string | undefined> {
+    try {
+        return decodeLoginReturn((await cookies()).get(LOGIN_RETURN_COOKIE)?.value);
+    } catch {
+        return undefined;
+    }
 }
 
 /**
@@ -66,8 +79,9 @@ export default async function LoginPage({
     const params = await searchParams;
     // Narrowed here, at the edge, so the value handed to the form (and from
     // there to `window.location.assign`) can only ever be a path on this
-    // origin. See `safeReturnUrl`.
-    const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM]);
+    // origin. See `safeReturnUrl`. A `returnUrl` in the link wins over one
+    // kept across a sign-out, and both are narrowed alike.
+    const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM] ?? await keptReturnUrl());
     const notice = noticeFor(params.error);
     const useAuth0 = auth0Enabled();
 
@@ -108,6 +122,25 @@ export default async function LoginPage({
                     <a className="ezil-lock-google" href={`/auth/auth0/login?${new URLSearchParams({ returnUrl })}`}>
                         Continue with EZiL ID
                     </a>
+                )}
+
+                {/*
+                  Leaves id.ezil.work's session, whose account Continue would otherwise
+                  pick again (a refused, unverified one included), and comes back here
+                  still headed for the same page. A plain same-origin form POST: it needs
+                  no OS session, no JavaScript, and is the document load `/auth/signout`
+                  answers with a 303.
+                */}
+                {useAuth0 && (
+                    <form method="post" action="/auth/signout" className="flex w-full flex-col items-center">
+                        <input type="hidden" name={RETURN_URL_PARAM} value={returnUrl} />
+                        <button type="submit" aria-describedby="switch-account-hint" className="ezil-lock-disclosure">
+                            Sign out and use another account
+                        </button>
+                        <p id="switch-account-hint" className="text-center text-xs leading-relaxed text-white/65">
+                            Signs this browser out of EZiL ID so you can choose an account.
+                        </p>
+                    </form>
                 )}
 
                 <LoginForm returnUrl={returnUrl} startWithEmail={params[METHOD_PARAM] === 'email'} />
