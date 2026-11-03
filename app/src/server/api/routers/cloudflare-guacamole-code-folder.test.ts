@@ -207,4 +207,38 @@ describe('codePreviewUrl, AWS: the hint rides the signed Code preview body; the 
         expect(out).not.toHaveProperty('codeFolder');
         expect(JSON.stringify(out)).not.toContain('/workspace/x');
     });
+
+    // A folder answer is only ever on an open: a refusal (terminal or still starting) is returned unchanged, so it
+    // neither passes a code the refusing Worker sent nor says `invalid` for a hint this app refused.
+    const refusals = [
+        { status: 503, body: { ok: false, error: 'aws_desktop_failed' }, errorCode: 'desktop_failed' },
+        { status: 503, body: { ok: false, error: 'aws_desktop_starting' }, errorCode: 'sandbox_starting' },
+    ];
+    it('a refused open carries no codeFolder, even when the refusing Worker sent a folder code', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => {});
+        for (const { status, body, errorCode } of refusals) {
+            fetchMock.mockImplementation(async () => Response.json({ ...body, codeFolder: { v: 1, outcome: 'restored' } }, { status }));
+            const { db } = routerDb([awsRow()]);
+            const out = await caller(db).codePreviewUrl({ computerId: C1, intent: 'open', codeFolder: ASK });
+            expect(out).toMatchObject({ ok: false, errorCode, computeProvider: 'aws-ec2' });
+            expect(out).not.toHaveProperty('codeFolder');
+            expect(previewBodies().length).toBeGreaterThan(0);
+            for (const b of previewBodies()) expect(b).toMatchObject({ surface: 'code', codeFolder: { v: 1, path: ASK.path } });
+            fetchMock.mockClear();
+        }
+    });
+
+    it('a refused open with a malformed hint does not say `invalid` (that is an open\'s answer only)', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => {});
+        for (const { status, body, errorCode } of refusals) {
+            fetchMock.mockImplementation(async () => Response.json(body, { status }));
+            const { db } = routerDb([awsRow()]);
+            const out = await caller(db).codePreviewUrl({ computerId: C1, intent: 'open', codeFolder: { v: 1, path: 'relative' } });
+            expect(out).toMatchObject({ ok: false, errorCode, computeProvider: 'aws-ec2' });
+            expect(out).not.toHaveProperty('codeFolder');
+            expect(previewBodies().length).toBeGreaterThan(0);
+            for (const b of previewBodies()) expect(b).not.toHaveProperty('codeFolder');
+            fetchMock.mockClear();
+        }
+    });
 });
