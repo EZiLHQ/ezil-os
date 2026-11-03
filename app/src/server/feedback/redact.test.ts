@@ -107,6 +107,25 @@ describe('v2 diagnostics: the app in front and the recent activity log', () => {
         expect(diagnosticsSchema.safeParse(result).success).toBe(true);
     });
 
+    // FB-R1 (independent review, 22:12Z): telemetry's sanitizer alone kept these. Raw input, server only.
+    it.each([
+        ['opened sports/sports-mobile-main/next.config.ts', 'opened <path…>', ['sports', 'next.config']],
+        [String.raw`\\fileserver\private\candidate.txt opened`, '<path…>', ['fileserver', 'private', 'candidate']],
+        ['{"password":"synthetic-short-secret","status":"failed"}', '{"password":[redacted],"status":"failed"}', ['synthetic-short-secret']],
+        ['open /home/alice/workspace/my project failed', 'open <path…>', ['alice', 'workspace', 'project']],
+        [String.raw`saved C:\Users\bob\Documents\plan final.docx`, 'saved <path…>', ['bob', 'Documents', 'plan', 'final']],
+        ['loaded next.config.ts and .env.local', 'loaded <file> and <file>', ['next.config', '.env', 'local']],
+        ['Authorization: Bearer abc123 then more', 'Authorization=[redacted]', ['abc123', 'more']],
+        ['retry token=short1 api_key: k2 session_id=s3 done', 'retry token=[redacted] api_key=[redacted] session_id=[redacted] done', ['short1', 'k2', 's3']],
+        ['GET https://private.example.test/a/b?x=1 failed', 'GET <url> failed', ['private.example', '/a/b']],
+    ])('a raw log line %j is scrubbed by the server alone', (raw, expected, leaks) => {
+        for (const source of ['console', 'event'] as const) {
+            const text = sanitizeDiagnostics({ logs: [{ t, source, text: raw }] })!.logs![0].text;
+            expect(text).toBe(expected);
+            for (const leak of leaks) expect(text).not.toContain(leak);
+        }
+    });
+
     it('keeps an ordinary app name and log line readable', () => {
         const result = sanitizeDiagnostics({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });
         expect(result).toEqual({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });

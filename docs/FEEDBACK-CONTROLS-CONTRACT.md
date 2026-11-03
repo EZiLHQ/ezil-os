@@ -216,7 +216,13 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, headers, clipboard, keystrokes,
 another tab, an app's iframe content, file or folder paths; no continuous recording. The `log.js` ring
-is read only for the v2 "Recent activity log", only when that box is ticked, and every line passes
-telemetry's `redact()` plus the form's secret scan before it is shown. v2: diagnostics are ticked by
+is read only for the v2 "Recent activity log", only when that box is ticked. Event lines carry only
+their structured fields (`eventClass site code outcome`; never `detail`). Console lines get the log's own
+stricter scrub, in the shell (`diagnostics.js` `console_line`) and again on the server (`redact.ts`
+`logLine`): links are masked; a secret-named key keeps its name, not its value (JSON, `k=v`, `k: v`); a
+header-shaped secret (Authorization, Cookie) runs to the end of the line; the line STOPS at the first
+remaining token containing `/` or `\` (relative, absolute, UNC, Windows path: a path with spaces has no
+knowable end); file names by extension and dotfiles are masked; then telemetry's `redact()` and the secret
+scan. Shared telemetry semantics are unchanged (FB-R1 review, 3 Nov 2026). v2: diagnostics are ticked by
 default and described next to the box; the log and screenshot boxes default OFF; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.

@@ -129,6 +129,38 @@ export function build_diagnostics ({ extended = false } = {}) {
     return result;
 }
 
+// ── The activity log's own, stricter scrub (FB-R1 review, 3 Nov 2026) ──────
+// A console line is free text, so this is deliberately harsher than
+// telemetry's `redact()` (which stays as it is for its own callers). The
+// server applies the same rules again (`app/src/server/feedback/redact.ts`
+// `logLine`); keep the two in step.
+/** Keys whose value is never kept: `"password":"…"`, `token=…`, `api_key: …`. */
+const SECRET_KEY = /(["']?)\b(pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth|session(?:[-_]?id)?|credentials?|signature|sig)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi;
+/** Header-shaped secrets run to the end of the line (`Authorization: Bearer x`). */
+const SECRET_HEADER = /\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=].*$/gi;
+/** A file name by its extension (`next.config.ts`, `candidate.txt`). */
+const FILE_NAME = /\b[\w@+-]+(?:\.[\w@+-]+)*\.(?:[cm]?[jt]sx?|json[c5]?|map|py|ipynb|rb|go|rs|java|kts?|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|ps1|bat|sql|mdx?|txt|rtf|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|lock|xml|html?|s?css|less|vue|svelte|astro|png|jpe?g|gif|webp|svg|pdf|docx?|xlsx?|pptx?|zip|t?gz|tar|7z|rar|key|pem|crt|p12|db|sqlite)\b/gi;
+/** A dotfile (`.env`, `.npmrc`). A capture group, not a lookbehind: Safari < 16.4 cannot parse one. */
+const DOTFILE = /(^|[^\w.])\.[A-Za-z][\w.-]*/g;
+
+/**
+ * A console line for the activity log. Links go first (their slashes are not
+ * paths); then a secret-named key keeps its name but not its value; then the
+ * line STOPS at the first remaining token with `/` or `\` (relative, absolute,
+ * UNC or Windows path), because nothing can tell where a path with spaces
+ * ends; then file names; then `scrub()`.
+ */
+function console_line (text) {
+    let s = String(text)
+        .replace(/\b(?:https?|wss?|ftp|file):\/\/[^\s'"<>)\]]+/gi, '<url>')
+        .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
+        .replace(SECRET_HEADER, '$1: [redacted]')
+        .replace(SECRET_KEY, '$1$2$1$3[redacted]');
+    const path = s.search(/[^\s]*[\\/]/);
+    if ( path !== -1 ) s = `${s.slice(0, path)}<path…>`;
+    return scrub(s.replace(FILE_NAME, '<file>').replace(DOTFILE, '$1<file>'));
+}
+
 /**
  * One log line made safe to send: telemetry's `redact()` (links, paths, ids,
  * addresses, header and token shapes; 200 characters), then every match the
@@ -155,15 +187,17 @@ function scrub (text) {
 export function build_recent_logs ({ now = Date.now() } = {}) {
     const since = now - LOG_WINDOW_MS;
     const lines = [];
-    const add = (t, source, text) => {
+    const add = (t, source, safe) => {
         if ( ! Number.isFinite(t) || t < since || t > now + 1000 ) return;
-        const safe = scrub(text);
         if ( safe ) lines.push({ at: t, line: { t: new Date(t).toISOString(), source, text: safe } });
     };
-    for ( const entry of log.ringBuffer() ) add(entry?.t, 'console', `${entry?.level ?? ''} ${entry?.msg ?? ''}`.trim());
+    for ( const entry of log.ringBuffer() ) {
+        add(entry?.t, 'console', console_line(`${entry?.level ?? ''} ${entry?.msg ?? ''}`.trim()));
+    }
+    // Events: their structured, hand-written fields only. `detail` is free text and stays out.
     for ( const event of recentEvents() ) {
-        add(event?.t, 'event', [event?.eventClass, event?.site, event?.code, event?.outcome, event?.detail]
-            .filter(part => typeof part === 'string' && part).join(' '));
+        add(event?.t, 'event', scrub([event?.eventClass, event?.site, event?.code, event?.outcome]
+            .filter(part => typeof part === 'string' && part).join(' ')));
     }
     lines.sort((a, b) => a.at - b.at);
     return lines.slice(-LOG_MAX_LINES).map(item => item.line);

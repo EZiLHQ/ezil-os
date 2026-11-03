@@ -39,6 +39,27 @@ function diagnosticString(value: string, max: number): string {
         .slice(0, max);
 }
 
+// The activity log's stricter rules (FB-R1 review, 3 Nov 2026), in step with
+// `shell/ezil/ui/feedback/diagnostics.js` `console_line`. A log line is free
+// console text, so it gets more than diagnosticString: telemetry's sanitizer
+// keeps relative and UNC paths, quoted JSON secrets and a spaced path's tail.
+const SECRET_KEY = /(["']?)\b(pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth|session(?:[-_]?id)?|credentials?|signature|sig)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi;
+const SECRET_HEADER = /\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=].*$/gi;
+const FILE_NAME = /\b[\w@+-]+(?:\.[\w@+-]+)*\.(?:[cm]?[jt]sx?|json[c5]?|map|py|ipynb|rb|go|rs|java|kts?|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|ps1|bat|sql|mdx?|txt|rtf|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|lock|xml|html?|s?css|less|vue|svelte|astro|png|jpe?g|gif|webp|svg|pdf|docx?|xlsx?|pptx?|zip|t?gz|tar|7z|rar|key|pem|crt|p12|db|sqlite)\b/gi;
+const DOTFILE = /(^|[^\w.])\.[A-Za-z][\w.-]*/g;
+
+/** Links first; a secret key keeps its name only; the line stops at the first path; then file names. */
+export function logLine(value: string): string {
+    let s = value
+        .replace(/\b(?:https?|wss?|ftp|file):\/\/[^\s'"<>)\]]+/gi, '<url>')
+        .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
+        .replace(SECRET_HEADER, '$1: [redacted]')
+        .replace(SECRET_KEY, '$1$2$1$3[redacted]');
+    const path = s.search(/[^\s]*[\\/]/);
+    if (path !== -1) s = `${s.slice(0, path)}<path…>`;
+    return diagnosticString(s.replace(FILE_NAME, '<file>').replace(DOTFILE, '$1<file>'), FEEDBACK_LOG_LIMITS.lineChars);
+}
+
 export function sanitizeDiagnostics(input: FeedbackDiagnostics | null | undefined): FeedbackDiagnostics | null {
     if (!input) return null;
     const out: FeedbackDiagnostics = {};
@@ -63,9 +84,8 @@ export function sanitizeDiagnostics(input: FeedbackDiagnostics | null | undefine
         out.stream = { ...input.stream };
         if (input.stream.state !== undefined) out.stream.state = diagnosticString(input.stream.state, 24);
     }
-    // The shell redacts each line before sending; this is the boundary that has to hold.
-    if (input.logs) out.logs = input.logs.map((line) => ({
-        t: line.t, source: line.source, text: diagnosticString(line.text, FEEDBACK_LOG_LIMITS.lineChars),
-    }));
+    // The shell scrubs each line before sending; this is the boundary that has to hold,
+    // for every line whatever its claimed `source`.
+    if (input.logs) out.logs = input.logs.map((line) => ({ t: line.t, source: line.source, text: logLine(line.text) }));
     return out;
 }

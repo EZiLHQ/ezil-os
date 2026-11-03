@@ -815,6 +815,12 @@ try {
         log.debug('opened /home/alice/workspace/secret-project/main.ts');
         log.debug(`mail ${'carol'}@example.com jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature`);
         log.debug({ nested: 'y'.repeat(600) });
+        // FB-R1 (independent review, 22:12Z): what telemetry's redact() alone let through.
+        log.debug('opened sports/sports-mobile-main/next.config.ts');
+        log.debug(String.raw`\\fileserver\private\candidate.txt opened`);
+        log.debug({ password: 'synthetic-short-secret', status: 'failed' });
+        log.debug('open /home/alice/workspace/my project failed');
+        log.debug('loaded next.config.ts and .env.local');
         open(); setDescription('With logs');
         assert.equal(form().elements.logs.checked, false);
         assert.equal(reads, 0, 'unticked: the console ring is never read');
@@ -829,10 +835,16 @@ try {
             && line.text.length <= 200 && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(line.t)));
         assert.deepEqual(lines.map(line => line.t), lines.map(line => line.t).toSorted(), 'oldest first');
         const text = JSON.stringify(lines);
-        assert.doesNotMatch(text, /OLD_LINE|os\.example\.test|token=abc|550e8400|abcdefghijklmnopqrstuvwxyz0123456789|COOKIEVALUE|alice|secret-project|carol@|eyJhbGci|EVENT_SECRET@|example\.test/);
+        assert.doesNotMatch(text, /OLD_LINE|os\.example\.test|token=abc|550e8400|abcdefghijklmnopqrstuvwxyz0123456789|COOKIEVALUE|alice|secret-project|carol@|eyJhbGci|EVENT_SECRET|example\.test/);
+        assert.doesNotMatch(text, /sports|fileserver|candidate|synthetic-short-secret|workspace|project failed|next\.config|\.env/, 'FB-R1 probes');
+        assert.match(text, /debug opened <path…>"/, 'a relative path ends the line');
+        assert.match(text, /\{\\"password\\":\[redacted\],\\"status\\":\\"failed\\"\}/, 'a secret key keeps its name, never its value');
+        assert.match(text, /debug open <path…>"/, 'nothing after a spaced path survives');
+        assert.match(text, /debug loaded <file> and <file>/);
+        assert.ok(lines.filter(line => line.source === 'event').every(line => ! /redacted/.test(line.text)), 'event detail is never included');
         // telemetry's redact() turns `…?token=abc` into `<url>]` (the server's twin does too).
         assert.match(text, /debug GET <url>\]? failed for <uuid>/);
-        assert.match(text, /debug opened <path>/);
+        assert.match(text, /debug \[redacted-header\]"/, "a header-shaped secret runs to the end of the line");
         assert.ok(lines.some(line => line.source === 'event' && line.text.startsWith('api_failure <opaque> failure')));
         assert.equal(note('logs-note'), `${lines.length} lines will be included.`);
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });

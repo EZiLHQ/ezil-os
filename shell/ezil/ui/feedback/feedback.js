@@ -389,8 +389,9 @@ export function open_feedback_dialog (_opts) {
                 ${extended ? `<label class="ezil-feedback-consent"><input type="checkbox" name="logs"
                     aria-describedby="ezil-feedback-logs-help"> Include recent activity log</label>
                 <p id="ezil-feedback-logs-help" class="ezil-feedback-muted ezil-feedback-help">Up to ${LOG_MAX_LINES} lines
-                    from the last 15 minutes in this tab. Links, file paths, addresses, ids and anything that looks
-                    like a password or token are replaced. <span data-role="logs-note" aria-live="polite"></span></p>` : ''}
+                    from the last 15 minutes in this tab, which keeps them only until it reloads. Links, file names
+                    and paths (with the rest of that line), addresses, ids and anything that looks like a password or
+                    token are removed. <span data-role="logs-note" aria-live="polite"></span></p>` : ''}
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
                 <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
                     <div class="ezil-feedback-actions">
