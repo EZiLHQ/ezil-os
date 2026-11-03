@@ -22,13 +22,16 @@ export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
  * reads the upstream body and settles before sending headers), so a 30 s first-byte deadline would cap every
  * Kimi reply at 30 s. Bounded instead by one completion deadline from the request's first send (only a transport
  * failure within its first 30 s is resent, and the resend shares it; see gatewayChat), the same value as the OS proxy's
- * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts) and below the Gateway's 180 s upstream headers
- * deadline (EZiL AI Gateway src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS), which starts only at its
- * upstream fetch, after admission. When a client leaves, the Gateway keeps the upstream call for a 20 s drain;
- * a call still unanswered after that becomes upstream_timeout, pending, and disables that model route for
- * everyone. 165 + 20 >= 180, so abandoning here never pauses a route earlier than the Gateway's own deadline
- * would (agreed with the Gateway owner, 2 Nov 2026); a shorter deadline would turn 150-180 s replies into route
- * pauses. A reply abandoned here may still be charged if the model finished. Streaming deadlines are unchanged.
+ * AI_PROXY_COMPLETION_TIMEOUT_MS (worker/src/ai-proxy.ts). The Gateway figures below are cited from the Gateway
+ * owner, not verifiable in this repo: a 180 s upstream headers deadline (EZiL AI Gateway src/config.ts
+ * DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS) that starts only at its upstream fetch, after the proxy hop and admission;
+ * and, when a client leaves, a 20 s drain, after which a call still unanswered becomes upstream_timeout, pending,
+ * and disables that model route for everyone. Abandoning here therefore pauses a route no earlier than the
+ * Gateway's own deadline would only when the request reaches the Gateway's upstream fetch within 5 s of its first
+ * send (165 + 20 = 180 + 5). Admission time or a resend moves the Gateway's clock later, so a reply that would have
+ * finished before the Gateway's own deadline, but after the drain, is abandoned and its route paused. Changing the
+ * value needs the Gateway owner. A reply abandoned here may still be charged if the model finished. Streaming
+ * deadlines are unchanged.
  */
 export const GATEWAY_COMPLETION_TIMEOUT_MS = 165_000;
 /** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */

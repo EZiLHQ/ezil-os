@@ -193,12 +193,15 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
 }
 
 /**
- * Copilot 0.69 counts its own tool definitions against maxInputTokens: one countTokens(string) per schema key
- * and string value (numbers, booleans and falsy entries are not passed), plus 8 per tool, 16, and 10%. Prompt
- * pruning estimates text chunks through the same call. A string therefore counts as the exact bytes of its JSON
- * string literal in a Messages body, quotes and escapes included: never fewer than it adds to the request.
- * The Responses bound escapes non-ASCII tool text and adds 128 bytes per tool and 32 per item, so Responses
- * strings keep the 23-byte text-block margin and count escaped. Messages count as their serialized wire message.
+ * Copilot 0.69 calls this for its own tool definitions against maxInputTokens (countToolTokens: one
+ * countTokens(string) per schema key and string value; numbers, booleans and falsy entries are not passed; plus 8
+ * per tool, 16, and 10%), for its tool budget arithmetic and for its text tool-result cap. Its prompt renderer
+ * counts message text with its own o200k_base tokenizer, not this call (measured by an A/B on the image). A string
+ * counts as the exact bytes of its JSON string literal in a Messages body, quotes and escapes included: never fewer
+ * than a schema string adds to the request. A text chunk sent as a text block adds about 23 more bytes; the
+ * unchanged byte bound in buildGatewayBody still refuses that locally. The Responses bound escapes non-ASCII tool
+ * text and adds 128 bytes per tool and 32 per item, so Responses strings keep the 23-byte text-block margin and
+ * count escaped. Messages count as their serialized wire message.
  */
 export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
     if (typeof value === 'string') {
