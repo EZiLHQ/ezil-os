@@ -46,8 +46,12 @@ headers are `x-ezil-request-id`, `x-ezil-hold-micro`, `x-ezil-trace-id`,
 `traceparent`, `retry-after`, `content-type`, `cache-control` and
 `x-accel-buffering`. SSE is forwarded chunk by chunk with backpressure;
 cancelling the response or disconnecting the client aborts the upstream fetch.
-Header timeout is **185 seconds** and body idle timeout is **125 seconds**,
-leaving the gateway's own deadlines the first chance to return its answer.
+Streams must send headers within **30 seconds** and then a chunk at least every
+**30 seconds**. A nonstreaming (JSON) request, whose headers the gateway sends
+only after the whole generation, gets one **200-second** headers deadline
+instead (`AI_PROXY_COMPLETION_TIMEOUT_MS`, paired with the extension). It leaves
+the gateway's own 180-second upstream deadline, a figure cited from the gateway
+owner, the first chance to answer.
 Error inspection for logging is bounded and never replaces a gateway body.
 
 ## Boot token v2

@@ -17,14 +17,14 @@ export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
  * from the Gateway owner, not verifiable in this repo: a 180 s upstream headers deadline (EZiL AI Gateway
  * src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS) that starts at its upstream fetch, after admission; and,
  * when this proxy aborts, a 20 s drain, after which a call still unanswered becomes upstream_timeout, pending,
- * and disables that model route for everyone. An abort here therefore pauses a route no earlier than the
- * Gateway's own deadline would only when the Gateway reaches its upstream fetch within 5 s of this fetch
- * (165 + 20 = 180 + 5); admission time moves the Gateway's clock later. The extension's deadline, counted from
- * its first send, usually aborts first, under the same condition from that send. Changing the value needs the
- * Gateway owner. A reply abandoned here may still be charged if the model finished. Streams keep the 30 s
- * headers deadline.
+ * and disables that model route for everyone. 200 s is the Gateway owner's choice (3 Nov 2026): when the Gateway
+ * reaches its upstream fetch within 20 s of this fetch, its own deadline answers first (a 504 with its request
+ * id); within 40 s, its deadline still fires during the drain. Later than that, an abort here can pause a route the
+ * Gateway would still have answered. The extension's deadline, counted from its first send, usually aborts first,
+ * under the same condition from that send. A reply abandoned here may still be charged if the model finished.
+ * Streams keep the 30 s headers deadline.
  */
-export const AI_PROXY_COMPLETION_TIMEOUT_MS = 165_000;
+export const AI_PROXY_COMPLETION_TIMEOUT_MS = 200_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
 export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */

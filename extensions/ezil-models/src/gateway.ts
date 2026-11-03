@@ -26,14 +26,14 @@ export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
  * owner, not verifiable in this repo: a 180 s upstream headers deadline (EZiL AI Gateway src/config.ts
  * DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS) that starts only at its upstream fetch, after the proxy hop and admission;
  * and, when a client leaves, a 20 s drain, after which a call still unanswered becomes upstream_timeout, pending,
- * and disables that model route for everyone. Abandoning here therefore pauses a route no earlier than the
- * Gateway's own deadline would only when the request reaches the Gateway's upstream fetch within 5 s of its first
- * send (165 + 20 = 180 + 5). Admission time or a resend moves the Gateway's clock later, so a reply that would have
- * finished before the Gateway's own deadline, but after the drain, is abandoned and its route paused. Changing the
- * value needs the Gateway owner. A reply abandoned here may still be charged if the model finished. Streaming
- * deadlines are unchanged.
+ * and disables that model route for everyone. 200 s is the Gateway owner's choice (3 Nov 2026): when the request
+ * reaches the Gateway's upstream fetch within 20 s of its first send, counting admission and any resend, the
+ * Gateway's own deadline answers first (a 504 with its request id); within 40 s, its deadline still fires during
+ * the drain, so abandoning here never pauses a route the Gateway itself would not have paused. Later than that, a
+ * reply that would have finished before the Gateway's deadline is abandoned and its route paused. A reply abandoned
+ * here may still be charged if the model finished. Streaming deadlines are unchanged.
  */
-export const GATEWAY_COMPLETION_TIMEOUT_MS = 165_000;
+export const GATEWAY_COMPLETION_TIMEOUT_MS = 200_000;
 /** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */
 export const GATEWAY_MAX_IN_FLIGHT = 2;
 const CONCURRENCY_WAIT_BUDGET_MS = 60_000;
