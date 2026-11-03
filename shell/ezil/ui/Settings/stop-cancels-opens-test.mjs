@@ -36,7 +36,7 @@
 //   - a request ALREADY ON THE WIRE at Stop: its signal is aborted before the stop
 //     leaves, and when the transport ignores the abort the stop waits for it to
 //     answer (closeSandboxWindows awaits the cancelled loops);
-//   - Open desktop on the current computer keeps a Code window that streams it
+//   - Open Browser on the current computer keeps a Code window that streams it
 //     AND its loop (the `keep` branch).
 import fs from 'node:fs';
 import path from 'node:path';
@@ -310,7 +310,7 @@ for ( const honourAbort of [false, true] ) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6. Open desktop on the CURRENT computer keeps a Code window streaming it,
+// 6. Open Browser on the CURRENT computer keeps a Code window streaming it,
 //    and keeps its loop asking (closeSandboxWindows(undefined, keepId)).
 // ═══════════════════════════════════════════════════════════════════════════
 progressState = 'RUNNING';
@@ -325,12 +325,12 @@ click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]')
 await settle(10);
 const openBtn = q('.window[data-app="settings"] [data-role="computer-actions"] [data-action="open"]')
     ?? q('.window[data-app="settings"] [data-action="open"]');
-push('setup: Settings offers Open desktop', !! openBtn);
+push('setup: Settings offers Open Browser', !! openBtn);
 click(openBtn);
 await tick(800);
 const keptFrom = seq;
 await tick(3_200);
-push('🔴 Open desktop on the current computer keeps its Code window', q('.window[data-app="code"]') === codeWin6 && codeWin6?.isConnected === true);
+push('🔴 Open Browser on the current computer keeps its Code window', q('.window[data-app="code"]') === codeWin6 && codeWin6?.isConnected === true);
 push('🔴 … and that window keeps asking (its loop was not cancelled)', asksTo('/api/shell/code-preview-url', keptFrom).length >= 1,
     `${asksTo('/api/shell/code-preview-url', keptFrom).length} asks`);
 

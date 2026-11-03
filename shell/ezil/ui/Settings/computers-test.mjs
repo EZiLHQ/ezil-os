@@ -182,7 +182,7 @@ check('progress steps follow server milestones; warm vs cold wording; bar monoto
     assert.ok(c < 1, 'never 100 % before done');
 });
 
-check('done: "Now running on" + Open desktop only for a transition seen in flight', () => {
+check('done: "Now running on" + Open Browser only for a transition seen in flight', () => {
     const flying = running('m6i.large', { transition: { transitionId: 't-done', kind: 'switch', current: 'std-2', target: 'cmp-4', phase: 'waking', reason: null, revertAvailable: false } });
     // computerModel alone does not record in-flight ids; the tab does on render.
     const unseen = computerModel({ computer: me, data: premium(), prog: running('m6i.xlarge', { transition: { ...flying.transition, phase: 'done' } }) });
@@ -340,7 +340,7 @@ check('Round 6 held std-2 Running: current with a Free limits pill, 4/8 vCPU loc
     assert.deepEqual(roles(html), ['files-held']);
     assert.match(text(html), /Your computer My computer AWS \(India\) Running/);
     assert.match(text(html), /2 vCPU · 8 GB memory · 50 GB disk/);
-    assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
+    assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open Browser<\/button>/);
     assert.match(card(html, 'std-2'), /data-state="current"/);
     assert.match(card(html, 'std-2'), /data-role="config-current">Current<\/span><span class="ezil-settings-pill" data-role="config-free-limits">Free limits<\/span>/);
     assert.doesNotMatch(card(html, 'std-2'), /Included in|config-upgrade/);
@@ -373,7 +373,7 @@ check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented h
     assert.equal(under.holdLine, 'Free sessions last 1 hour · Less than an hour left this month');
 });
 
-check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
+check('Round 6 (R4-02) held 4 or 8 vCPU: no Open Browser, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
     for ( const [type, size, vcpu] of [['m6i.xlarge', 'cmp-4', 4], ['m6i.2xlarge', 'cmp-8', 8]] ) {
         const prog = stoppedAws(type);
         const model = computerModel({ computer: me, data: heldData(), prog, usage: heldUsage, now: HELD_NOW });
@@ -382,7 +382,7 @@ check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on
         assert.equal(model.holdLine, null);
         const html = scan(computerHtml(model, prog, []));
         assert.doesNotMatch(html, /data-action="open"/);
-        assert.doesNotMatch(html, /ezil-settings-btn-primary/, 'D6: no primary stands in for Open desktop');
+        assert.doesNotMatch(html, /ezil-settings-btn-primary/, 'D6: no primary stands in for Open Browser');
         assert.match(text(html), new RegExp(`Your files are still on your ${vcpu} vCPU AWS \\(India\\) computer\\. The Free plan can't open it at that size; upgrade to open it again\\.`));
         assert.match(html, /data-action="held-upgrade" href="\/os\?settings=billing&amp;upgrade=pro">Upgrade<\/a>/);
         assert.match(card(html, size), /data-state="current"/);
@@ -646,7 +646,7 @@ check('Phase B §6.3 committed: the files are on the Free computer, what was not
     assert.match(text(done(1)), /, and 1 item that can't be copied, like links that point outside your Workspace folder\./);
     const html = done(0);
     assert.ok(html.includes('data-role="move-done"'));
-    assert.doesNotMatch(html.split('data-role="move-done"')[1].split('</div>')[0], /data-action="open"/, 'Open desktop is the header\'s only');
+    assert.doesNotMatch(html.split('data-role="move-done"')[1].split('</div>')[0], /data-action="open"/, 'Open Browser is the header\'s only');
     assert.match(html, /data-role="computer-actions">\s*<button[^>]*data-action="open"/);
     assert.equal(moveCardCopy(moveView(reverseMove({ stage: 'committed', retainUntil: null }))).text, `Your files are on your Free computer. Not moved: ${NOT_MOVED}.`);
 });
@@ -658,14 +658,14 @@ check('Phase B pre-move (§6.3): moveAvailable false keeps 6a\'s banner exactly;
     assert.doesNotMatch(plain, /data-role="move-|data-action="move-/);
     const onOpen = render(held({ moveAvailable: true, moveOnOpen: true })).html;
     // r8 (§6.3, §5.9): the copy names the two opens that start the move, the desktop and Code (Preview and a hover never do).
-    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
+    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open the Browser or Code, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
     assert.doesNotMatch(text(onOpen), /open your computer/);
     assert.match(onOpen, /data-action="move-start">Move my files now<\/button>/);
     assert.ok(onOpen.includes(BANNER.replace(/'/g, '&#39;')), '6a\'s banner stays');
     const later = render(held({ moveAvailable: true, moveOnOpen: false })).html;
     assert.match(text(later), new RegExp(`Your files are on your AWS computer\\. Opening it uses your Free limits\\. You can move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files to my Free computer`));
     assert.match(later, /data-action="move-start">Move my files to my Free computer<\/button>/);
-    for ( const html of [onOpen, later] ) assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
+    for ( const html of [onOpen, later] ) assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open Browser<\/button>/);
 });
 
 check('Phase B pre-move, held closed (6a\'s card first, then the move; never the next-open variant, never "Opening it uses your Free limits")', () => {
@@ -871,9 +871,9 @@ if ( haveBundle ) {
     await settle(3);
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
     await settle();
-    check('bundle: done reads "Now running on 4 vCPU · 16 GB" with Open desktop, and the id is cleared', () => {
+    check('bundle: done reads "Now running on 4 vCPU · 16 GB" with Open Browser, and the id is cleared', () => {
         assert.match(pane().querySelector('[data-role="switch-done"]')?.textContent ?? '', /Now running on 4 vCPU · 16 GB/);
-        // One primary per state (D6): Open desktop is the header's, not repeated in the done box.
+        // One primary per state (D6): Open Browser is the header's, not repeated in the done box.
         assert.equal(pane().querySelector('[data-role="switch-done"] [data-action="open"]'), null);
         assert.equal(pane().querySelectorAll('.ezil-settings-btn-primary').length, 1);
         assert.ok(pane().querySelector('[data-role="computer-actions"] [data-action="open"].ezil-settings-btn-primary'));
@@ -996,7 +996,7 @@ if ( haveBundle ) {
     await settle(3);
     click(q('.window[data-app="settings"] .ezil-settings-tab[data-tab="computers"]'));
     await settle();
-    check('bundle: Round 6 (R4-02) held 4 vCPU: no Open desktop; it says so with Upgrade', () => {
+    check('bundle: Round 6 (R4-02) held 4 vCPU: no Open Browser; it says so with Upgrade', () => {
         assert.equal(pane()?.querySelector('[data-action="open"]'), null);
         assert.match(pane()?.querySelector('[data-role="files-held"]')?.textContent ?? '', /The Free plan can't open it at that size/);
         assert.ok(pane()?.querySelector('[data-role="files-held"] [data-action="held-upgrade"]'));

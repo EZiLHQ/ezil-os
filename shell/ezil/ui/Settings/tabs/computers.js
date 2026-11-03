@@ -699,12 +699,12 @@ export function moveCardCopy (view) {
 
 /**
  * §6.3 the pre-move sentences (after the files-held words): `onOpen` is the `moveOnOpen` variant ("the next time
- * you open your desktop or Code": r8, the two opens that start the move; Preview and a hover never do, §5.9).
+ * you open the Browser or Code": r8, the two opens that start the move; Preview and a hover never do, §5.9).
  * `lead`: the card's own first sentence; a held-closed card continues 6a's instead.
  */
 export function moveOfferCopy ({ onOpen = false, lead = true } = {}) {
     const kept = `Not moved: ${MOVE_NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
-    if ( onOpen ) return { lead: 'Your files are on your AWS computer.', text: `The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files now' };
+    if ( onOpen ) return { lead: 'Your files are on your AWS computer.', text: `The next time you open the Browser or Code, we'll first move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files now' };
     return { lead: lead ? 'Your files are on your AWS computer.' : '', text: `${lead ? 'Opening it uses your Free limits. ' : ''}You can move the files in your Workspace folder to your Free computer. ${kept}`, action: 'Move my files to my Free computer' };
 }
 
@@ -956,7 +956,7 @@ export function computerHtml (model, prog = progress, older = []) {
                 ${model.chip ? `<span class="ezil-settings-pill ezil-computer-chip" data-role="computer-chip" data-state="${model.chip.state}">${html_encode(model.chip.text)}</span>` : ''}</p>
                 ${summaryLine ? `<p class="ezil-computer-summary" data-role="computer-summary">${html_encode(summaryLine)}</p>` : ''}</div>
             <div class="ezil-settings-row-actions" data-role="computer-actions">
-                ${model.heldClosed || moveOnly ? '' : `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open desktop</button>`}
+                ${model.heldClosed || moveOnly ? '' : `<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open"${model.busy || busyId ? ' disabled' : ''}>Open Browser</button>`}
                 ${stoppable || stopBusy ? `<button type="button" class="ezil-settings-btn" data-action="stop"${stopBusy ? ' disabled' : ''}>${stopBusy ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
         </header>
         ${moveOnly ? '' : statusHtml(model, prog)}
@@ -1004,7 +1004,7 @@ function webModel () {
 function renderWeb ($list) {
     const model = webModel();
     if ( ! model ) {
-        $list.html('<div class="ezil-settings-muted" data-role="no-computer">Your computer is set up the first time you open the desktop.</div>');
+        $list.html('<div class="ezil-settings-muted" data-role="no-computer">Your computer is set up the first time you open the Browser or Code.</div>');
         return;
     }
     $list.html(computerHtml(model, currentProgress(model.computer), computers.filter(c => c.id !== model.computer.id)));
@@ -1167,7 +1167,7 @@ export function confirmCopy (kind, { target = null, current = null, data = summa
     return { title: 'Stop your computer?', confirmLabel: 'Stop', busyLabel: 'Stopping…', lines: [
         'Open apps close; save your work first.',
         'Your files stay on your disk.',
-        'Start it again any time with Open desktop.',
+        'Start it again any time with Open Browser.',
     ] };
 }
 

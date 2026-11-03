@@ -124,7 +124,7 @@ try {
 
     click(openButton());
     await settle(20, 40);
-    push('Open desktop opens a desktop stamped c-2', stamp('desktop') === 'c-2');
+    push('Open Browser opens a desktop stamped c-2', stamp('desktop') === 'c-2');
     await dock('code');
     push('real dock Code uses c-2', stamp('code') === 'c-2', stamp('code'));
     push('session exposes the current computer c-2',
@@ -155,13 +155,13 @@ try {
     const code = appWindow('code');
     await closeApp('desktop');
     await reopenSettings();
-    push('🔴 closing the desktop keeps c-2 as "Your computer", offering Open desktop',
-        isYours('c-2') && openButton()?.textContent.trim() === 'Open desktop' && stamp('code') === 'c-2');
+    push('🔴 closing the desktop keeps c-2 as "Your computer", offering Open Browser',
+        isYours('c-2') && openButton()?.textContent.trim() === 'Open Browser' && stamp('code') === 'c-2');
     click(openButton());
     await settle(20, 40);
-    push('Open desktop preserves the same Code window on c-2',
+    push('Open Browser preserves the same Code window on c-2',
         !! code && code.isConnected && appWindow('code') === code && stamp('code') === 'c-2');
-    push('Open desktop restores the desktop on c-2', stamp('desktop') === 'c-2');
+    push('Open Browser restores the desktop on c-2', stamp('desktop') === 'c-2');
     push('Settings never mutates the boot computer', window.__EZIL_BOOT__.computer === C2);
     push('Computers list was loaded through the fetch stub', calls.some(call => call.url.includes('computer.list')));
 } catch (error) {

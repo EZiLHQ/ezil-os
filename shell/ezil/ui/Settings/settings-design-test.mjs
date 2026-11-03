@@ -451,7 +451,7 @@ await check('Computer: the header names the computer, where it runs, its configu
     assert.match(clean(el.querySelector('[data-role="computer-summary"]')), /4 vCPU · 16 GB memory · 50 GB disk/);
     assert.match(clean(render({ data: plan('free'), prog: null, streaming: true }).querySelector('[data-role="computer-header"]')), /Cloudflare/);
 });
-await check('Computer: at most ONE primary in every state, and it is Open desktop in the header', () => {
+await check('Computer: at most ONE primary in every state, and it is Open Browser in the header', () => {
     const T = '2026-10-29T10:00:00Z';
     const tr = (phase, extra = {}) => ({ transitionId: `t-${phase}`, kind: 'switch', current: 'std-2', target: 'cmp-4', phase, reason: null, requestedAt: T, endedAt: null, revertAvailable: false, ...extra });
     tab.markSeen('t-done');
@@ -478,14 +478,14 @@ await check('Computer: at most ONE primary in every state, and it is Open deskto
         const el = render(args);
         const primaries = [...el.querySelectorAll('.ezil-settings-btn-primary')];
         assert.ok(primaries.length <= 1, `${name}: ${primaries.map(clean).join(' | ')}`);
-        for ( const p of primaries ) assert.ok(p.closest('[data-role="computer-actions"]') && p.dataset.action === 'open', `${name}: the primary is the header Open desktop`);
+        for ( const p of primaries ) assert.ok(p.closest('[data-role="computer-actions"]') && p.dataset.action === 'open', `${name}: the primary is the header Open Browser`);
     }
     // HF3 copy survives the demotion: the failed card still names the size and offers Try again.
     const failedText = clean(render(cases.failed));
     assert.match(failedText, /We couldn't switch to 4 vCPU · 16 GB\. Your computer is on 2 vCPU · 8 GB and your files are safe\./);
     assert.match(failedText, /Try again/);
     assert.match(clean(render(cases.healFailed)), /Try again/);
-    assert.equal(render(cases.done).querySelectorAll('[data-action="open"]').length, 1, 'done: one Open desktop');
+    assert.equal(render(cases.done).querySelectorAll('[data-action="open"]').length, 1, 'done: one Open Browser');
 });
 await check('Computer: during a switch only the target tile is highlighted; finished steps are marked done', () => {
     const prog = running('m6i.large', { operation: 'opening', milestones: [{ key: 'host_claimed', at: '2026-10-29T10:00:30Z' }],

@@ -842,7 +842,7 @@ push('after the stop the chip reads Stopped from the server state',
 // 5f. 🔴 CLOSING THE DESKTOP WINDOW DOES NOT CHANGE WHICH COMPUTER YOU ARE ON.
 //     Founder-reported 2026-10-02: with the desktop window closed, the
 //     computer the session was on was offered a "Switch" button like a
-//     stranger's computer. It stays "Your computer" and offers Open desktop.
+//     stranger's computer. It stays "Your computer" and offers Open Browser.
 // ═══════════════════════════════════════════════════════════════════════════
 push('setup: no desktop window is open', qa('.window[data-app="desktop"]').length === 0);
 await reopenSettings();
@@ -853,7 +853,7 @@ push('🔴 with no desktop open, c-d is still "Your computer" and exactly one co
     && q('.window[data-app="settings"] [data-role="your-computer"]')?.getAttribute('data-id') === 'c-d');
 click(q('.window[data-app="settings"] [data-role="your-computer"] [data-action="open"]'));
 await settle(20, 40);
-push('Open desktop relaunches the desktop for c-d',
+push('Open Browser relaunches the desktop for c-d',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-d"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════

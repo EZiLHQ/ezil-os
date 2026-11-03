@@ -872,7 +872,7 @@ export function holdAfterStop (computerId) {
     if ( computerId ) stoppedHolds.add(computerId);
 }
 
-/** An explicit open of `computerId` (Browser window, Settings → Open desktop): hover may warm it again. */
+/** An explicit open of `computerId` (Browser window, Settings → Open Browser): hover may warm it again. */
 export function releaseStopHold (computerId) {
     stoppedHolds.delete(computerId);
 }

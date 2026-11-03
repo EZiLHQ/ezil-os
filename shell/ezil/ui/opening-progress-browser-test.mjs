@@ -347,7 +347,7 @@ window.__systemSession = { currentComputer: () => window.__computer, payload: ()
                 notComputer: /Back to/, system: ["Switch to 4 vCPU / 16 GB didn't finish", 'Your computer is on 2 vCPU / 8 GB. Your files are safe. Try again from Settings → Computer.'] },
             { name: 'recovered', on: 'cmp-4', lifecycle: 'RUNNING', size: 'cmp-4', transition: tr('std-2', 'cmp-4', 'done', { endedAt: T }), seen: true,
                 stage: 'running', operation: 'none', plan: { status: 'ready', current: 'cmp-4', selected: 'cmp-4' }, planTransition: null,
-                computer: [/Now running on 4 vCPU · 16 GB/, /Open desktop/, /Running/], notComputer: /couldn't switch|Needs attention/, system: ['4 vCPU / 16 GB on AWS (India)', ''] },
+                computer: [/Now running on 4 vCPU · 16 GB/, /Open Browser/, /Running/], notComputer: /couldn't switch|Needs attention/, system: ['4 vCPU / 16 GB on AWS (India)', ''] },
             { name: 'reopened-after-failure', on: 'cmp-4', lifecycle: 'RUNNING', size: 'cmp-4', transition: null, stage: 'running', operation: 'none',
                 plan: { status: 'ready', current: 'cmp-4', selected: 'cmp-4' },
                 computer: [/Running/, /4 vCPU · 16 GB memory/], notComputer: /couldn't switch|switch-failed|Now running on|Needs attention/, system: ['4 vCPU / 16 GB on AWS (India)', ''] },
