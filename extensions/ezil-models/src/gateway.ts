@@ -117,6 +117,8 @@ async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof
     return { status: response.status, json };
 }
 
+const KNOWN_PROTOCOLS: readonly GatewayProtocol[] = ['anthropic-messages', 'openai-responses'];
+
 function asModels(json: unknown): GatewayModels | undefined {
     if (typeof json !== 'object' || json === null || !Array.isArray((json as GatewayModels).data)) return undefined;
     const raw = json as Record<string, unknown>;
@@ -124,9 +126,12 @@ function asModels(json: unknown): GatewayModels | undefined {
         || typeof entry.id !== 'string' || typeof entry.enabled !== 'boolean'
         || !Number.isSafeInteger(entry.max_input_tokens) || entry.max_input_tokens <= 0
         || !Number.isSafeInteger(entry.max_output_tokens) || entry.max_output_tokens <= 0
-        || (entry.protocols !== undefined && (!Array.isArray(entry.protocols)
-            || entry.protocols.some((protocol: unknown) => protocol !== 'anthropic-messages' && protocol !== 'openai-responses'))))) return undefined;
-    return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data: raw.data as GatewayModel[] };
+        || (entry.protocols !== undefined && (!Array.isArray(entry.protocols) || entry.protocols.some((protocol: unknown) => typeof protocol !== 'string'))))) return undefined;
+    // A protocol this client does not speak is dropped from its row, never a reason to distrust the whole catalog:
+    // a row left with no known protocol is selectable by nobody here (gatewayModelAvailable).
+    const data = (raw.data as GatewayModel[]).map(entry => entry.protocols === undefined ? entry
+        : { ...entry, protocols: entry.protocols.filter(protocol => KNOWN_PROTOCOLS.includes(protocol)) });
+    return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
 }
 
 /** Legacy catalogs imply Messages only. Responses requires an explicit, enabled catalog route. */

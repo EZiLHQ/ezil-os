@@ -15,7 +15,8 @@ const micro = (value: unknown): value is number => typeof value === 'number' && 
 // The member_controls response from GET /v1/me/limits. Keep only fields used by the UI.
 const numericLimitKeys = ['concurrency', 'rpm', 'tpm', 'max_output_tokens', 'daily_budget_micro', 'monthly_budget_micro'] as const;
 type NumericLimit = typeof numericLimitKeys[number];
-type LimitPolicy = Partial<Record<NumericLimit, number>> & { allowed_models?: string[] };
+// `null` is a configured "no limit at this level" (Gateway catalog consumer contract §4), never unknown.
+type LimitPolicy = Partial<Record<NumericLimit, number | null>> & { allowed_models?: string[] };
 type Source = 'default' | 'role' | 'plan' | 'account' | 'user';
 type EffectivePolicy = { policy: LimitPolicy; sources: Partial<Record<keyof LimitPolicy, Source>> };
 const counterKeys = ['inflight', 'pending', 'rpm', 'tpm', 'day_micro', 'month_micro'] as const;
@@ -42,7 +43,7 @@ function parsePolicy(value: unknown): EffectivePolicy | undefined {
         if (!(key in value.policy)) continue;
         const n = value.policy[key];
         const s = value.sources[key];
-        if (!count(n) || !source(s)) return undefined;
+        if (!(n === null || count(n)) || !source(s)) return undefined;
         policy[key] = n;
         sources[key] = s;
     }
@@ -181,8 +182,10 @@ const limitLabels: Record<NumericLimit, string> = {
 function policyLines(effective: EffectivePolicy, ceilings?: EffectiveLimits['ceilings']): string[] {
     const lines: string[] = [];
     for (const key of Object.keys(limitLabels) as NumericLimit[]) {
-        const configured = effective.policy[key];
+        const set = effective.policy[key];
         const ceiling = key === 'concurrency' || key === 'rpm' ? ceilings?.[key] : undefined;
+        if (set === null && ceiling === undefined) { lines.push(`${limitLabels[key]}: No limit set (${effective.sources[key]})`); continue; }
+        const configured = set ?? undefined;
         const limit = configured === undefined ? ceiling : ceiling === undefined ? configured : Math.min(configured, ceiling);
         if (limit === undefined) {
             if (ceilings) lines.push(`${limitLabels[key]}: unknown`);
@@ -236,8 +239,8 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     else if (limits?.entitlement.required && limits.entitlement.basis === null) text = 'EZiL AI · AI access needed';
     else {
         if (window && BigInt(window.remaining_micro) === 0n) text += ' · window used';
-        else if (limits?.policy.policy.daily_budget_micro !== undefined && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
-        else if (limits?.policy.policy.monthly_budget_micro !== undefined && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
+        else if (typeof limits?.policy.policy.daily_budget_micro === 'number' && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
+        else if (typeof limits?.policy.policy.monthly_budget_micro === 'number' && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
         else if (balance?.available_micro === 0 && balance.held_micro > 0) text = 'EZiL AI · Credits held';
         else if (balance?.available_micro === 0) text = 'EZiL AI · 0 credits';
         if (!limits) text += ' · limits unavailable';

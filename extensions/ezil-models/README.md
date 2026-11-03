@@ -157,7 +157,13 @@ request logging is enabled. Cancellation aborts fetch, stops reporting parts,
 and logs `cancelled; may still be charged (request …)`.
 
 The model picker optionally reconciles disabled entries using `/models`, cached
-for five minutes per base URL and auth context. The EZiL AI status item,
+for five minutes per base URL and auth context. It lists only the models
+configured here, never other catalog rows. A protocol it does not speak drops
+out of that row, never out of the whole catalog, and a row left with none is
+not selectable. Newer catalog fields (`contract`, `catalog_ttl_seconds`,
+`availability`) are accepted and not yet read. A `null` limit in `/me/limits`
+is a configured "No limit set", never unknown. Only the session window's
+`resets_at` is shown as a reset time. The EZiL AI status item,
 `Show AI Status` and `EZiL Models: Show AI Credits` read `/me/balance`,
 `/me/limits`, `/me/usage?limit=5` and the global `/models` pause catalog using
 the same boot bearer. All four reads bypass HTTP caches, refuse redirects and
