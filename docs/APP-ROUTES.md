@@ -396,7 +396,13 @@ route tree (the tree of the document that wrote it).
   remount the page and destroy the shell), this lane did not take that on.
 - Back/Forward to an entry written by a document that has since been
   reloaded is a full document load, which boots the shell at that entry's
-  URL.
+  URL. Correction (3 Nov 2026, §9): measured in Chromium without Next's
+  router, Forward after a reload to an entry the old document pushed was a
+  same-document traversal of the reloaded document. Popstate focused or
+  launched the entry's app, and no document was loaded. The suite models
+  Next's `__NA` state keys, but Next's own popstate handler was not
+  exercised. Under the real Next router this may differ, so neither outcome
+  is assumed.
 
 ## 6. Sign-in return URLs
 
@@ -600,7 +606,7 @@ EZiL ID:
 | Fresh `/app/browser?x=1`, signed out | `/login?returnUrl=/app/browser?x=1`; after sign-in, `/app/browser?x=1` with one Browser. Nothing is started before sign-in. |
 | The same link, already signed in; refresh | `/app/browser`, one Browser, no new entry |
 | `/app/desktop?computer=<own>&x=%41#top`, `/os?app=desktop`, `/os?app=browser&x=1` | rewritten to `/app/browser…` in place, query and hash kept |
-| Back/Forward between the Browser and Settings, and after a reload | the entry's app is focused or launched, nothing is closed, never a second Browser. Forward after a reload was a same-document traversal in Chromium. |
+| Back/Forward between the Browser and Settings, and after a reload | the entry's app is focused or launched, nothing is closed, never a second Browser. Forward after a reload was a same-document traversal in Chromium (§5, "Next.js"; Next's own popstate handler not exercised). |
 | `/app/code?project=…&repo=…&path=src/main.ts` | unchanged |
 | `/app/unknown`, `/app/Browser`, `/app/browser%2fx`, `/app/desktop.`, `/app/__proto__` | 404, nothing started |
 | Another user's computer in the link (`?computer=<A's>` opened by B), signed in or after sign-in | the gate's "Couldn't open your computer"; nothing is started, and neither A's computer nor B's own is substituted. The real page is pinned by `os/page.test.ts` ("does not substitute another computer for an unowned target"). |

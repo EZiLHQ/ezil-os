@@ -28,9 +28,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // The return-URL rules are TypeScript. Node 24 strips types by default; the
 // portable CI job runs Node 22, which needs the flag, so ask for it once.
-if (!process.features?.typescript) {
+// Once only: a child that still cannot strip types fails below, never relaunches.
+if (!process.features?.typescript && process.env.EZIL_STRIP_TYPES_RELAUNCHED !== '1') {
     const { spawnSync } = await import('node:child_process');
-    process.exit(spawnSync(process.execPath, ['--experimental-strip-types', ...process.argv.slice(1)], { stdio: 'inherit' }).status ?? 1);
+    process.exit(spawnSync(process.execPath, ['--experimental-strip-types', ...process.argv.slice(1)],
+        { stdio: 'inherit', env: { ...process.env, EZIL_STRIP_TYPES_RELAUNCHED: '1' } }).status ?? 1);
 }
 const require = createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR || '/opt/ezil-testkit', 'noop.js'));
 let checks = 0;
