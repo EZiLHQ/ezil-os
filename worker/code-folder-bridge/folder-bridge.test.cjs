@@ -6,7 +6,8 @@
 // source, nonce, version, the mint read from this document's URL, folder / foreign / workspace / empty, the
 // top-level no-op, provider identity, a throwing provider, and B3's location.replace.
 // With FOLDER_BRIDGE_TEST_ROOT set to an unmodified, locally extracted code-server 4.141.0 lib/vscode (or the
-// shipped image's copy), the same script is applied to the real workbench.js and gated, and its bridge is run too.
+// shipped image's copy), the same script is applied to the real workbench.js and gated, and its bridge is run too;
+// without it that case is reported as skipped, never as a pass.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -199,9 +200,10 @@ test('the shell origin allowlist is validated and embedded as given', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('real code-server 4.141.0 workbench (FOLDER_BRIDGE_TEST_ROOT)', () => {
-  const source = process.env.FOLDER_BRIDGE_TEST_ROOT;
-  if (!source) { console.log('folder-bridge: FOLDER_BRIDGE_TEST_ROOT unset; the real-bundle case did not run'); return; }
+const source = process.env.FOLDER_BRIDGE_TEST_ROOT;
+test('real code-server 4.141.0 workbench (FOLDER_BRIDGE_TEST_ROOT)', {
+  skip: source ? false : 'FOLDER_BRIDGE_TEST_ROOT unset: point it at an unmodified code-server 4.141.0 lib/vscode to run the real-bundle case',
+}, () => {
   const root = tmpRoot(fs.readFileSync(path.join(source, WB), 'utf8'));
   try {
     let r = run([root]); assert.equal(r.status, 0, r.stdout + r.stderr);
