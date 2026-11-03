@@ -157,7 +157,7 @@ const run = (e: ReturnType<typeof edge>, i: RepoOpenInput = input(), extra: Part
 
 describe('aws relay constants equal the vectors and the contract', () => {
   it('vectors are the pinned file', () => {
-    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('092d76d10018156d585424caee993ad6cac3ce56c52f5fee74f56917e60e92ff');
+    expect(createHash('sha256').update(VECTORS_BYTES).digest('hex')).toBe('4ede80c69322d806c283691456c128d249d7f90105d08e93c4d818a83e98f150');
   });
   it('the poll interval is the vectors AWS_RELAY_POLL_MS, inside the Worker deadline', () => {
     expect(AWS_RELAY_POLL_MS).toBe(T.AWS_RELAY_POLL_MS);
@@ -1348,12 +1348,14 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
     expect(await runAs(job(() => ok(okAssessment)), assessmentInput(), 'assessment')).toEqual({ status: 200, body: okAssessment } as RepoOpenAnswer);
   });
 
-  it('awsJobAnswer for class project: the wrapper exactly, no path, exactly defaultBranch, the 7-key shape (pure)', () => {
+  it('awsJobAnswer for class project: the wrapper exactly, no path, the 7-key shape; a fresh placement exactly defaultBranch, a reopen its current branch (pure)', () => {
     const answer = (body: unknown, folder = PROJECT_W, branch: string | undefined = ASSESS_BRANCH) =>
       awsJobAnswer({ status: 200, body }, 'open', folder, 'project', undefined, branch);
     const empty = { ...okProject, state: 'initialized_empty', empty: true };
     const existing = { ...okProject, state: 'existing' };
-    for (const good of [okProject, empty, existing, { ...okProject, empty: true }]) expect(answer(good)).toEqual({ status: 200, body: good } as RepoOpenAnswer);
+    for (const good of [okProject, empty, existing, { ...okProject, empty: true }, { ...existing, branch: 'feature' }, { ...existing, branch: 'trunk', empty: true }]) {
+      expect(answer(good)).toEqual({ status: 200, body: good } as RepoOpenAnswer);
+    }
     for (const [label, bad] of [
       ['the clone as folder', { ...okProject, folder: `${PROJECT_W}/repository`, openFolder: `${PROJECT_W}/repository` }],
       ['the clone as openFolder', { ...okProject, openFolder: `${PROJECT_W}/repository` }],
@@ -1363,6 +1365,9 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
       ['another repository\'s wrapper', { ...okProject, folder: OTHER_W, openFolder: OTHER_W }],
       ['another branch', { ...okProject, branch: 'trunk' }],
       ['a branch below defaultBranch', { ...okProject, branch: `${ASSESS_BRANCH}/x` }],
+      ['another branch on an empty placement', { ...empty, branch: 'trunk' }],
+      ['an invalid branch on a reopen', { ...existing, branch: 'x..y' }],
+      ['a reopen elsewhere', { ...existing, folder: OTHER_W, openFolder: OTHER_W }],
       ['the assessment 10-key shape', okAssessment],
       ['an extra key', { ...okProject, extra: 1 }],
       ['an unknown state', { ...okProject, state: 'adopted' }],
@@ -1382,6 +1387,9 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
     expect(await runProject(first)).toEqual({ status: 200, body: okProject } as RepoOpenAnswer);
     const again = job(() => ok({ ...okProject, state: 'existing' }));
     expect(await runProject(again)).toEqual({ status: 200, body: { ...okProject, state: 'existing' } } as RepoOpenAnswer);
+    // the Creator switched branches since: the reopen names that branch and is still answered
+    const switched = job(() => ok({ ...okProject, state: 'existing', branch: 'feature' }));
+    expect(await runProject(switched)).toEqual({ status: 200, body: { ...okProject, state: 'existing', branch: 'feature' } } as RepoOpenAnswer);
     const refresh = job(() => ok({ ok: true, state: 'refreshed' }));
     expect(await runProject(refresh, projectInput({ op: 'refresh' }))).toEqual({ status: 200, body: { ok: true, state: 'refreshed' } });
     expect(JSON.parse(refresh.calls[0]!.init.body as string)).toMatchObject({ op: 'refresh', class: 'project', path: null });

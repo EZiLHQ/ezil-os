@@ -57,23 +57,24 @@
 -    kernel checks out exactly defaultBranch for class assessment). Personal ignores `branch`."""
 +    kernel checks out exactly defaultBranch for class assessment). Personal ignores `branch`. Class project
 +    (contract 1.0.4, kernel.project): exactly OPEN_KEYS (`existing` included: the reopen), openFolder exactly the
-+    wrapper W, pathNotFound False, and the branch exactly `branch`."""
++    wrapper W, pathNotFound False; the branch exactly `branch` for a fresh placement, any valid one for `existing`."""
      if value is None:
          return refusal("workspace_failed")
      if value.get("ok") is False:
-@@ -555,6 +567,11 @@
+@@ -555,6 +567,12 @@
          # r56: exactly the branch this job's own body asked for.
          if not _str(branch) or value["branch"] != branch:
              return refusal("workspace_failed")
 +    if cls == "project":
-+        # 1.0.4 (kernel.project): the 7-key shape at the wrapper W itself, no path, exactly defaultBranch.
-+        if (value["openFolder"] != folder or value["pathNotFound"] is not False
-+                or not _str(branch) or value["branch"] != branch):
++        # 1.0.4 (kernel.project.branchRule): the 7-key shape at the wrapper W itself, no path; a fresh placement
++        # exactly defaultBranch, an `existing` reopen the folder's current branch (any valid one, checked below).
++        if (value["openFolder"] != folder or value["pathNotFound"] is not False or not _str(branch)
++                or (value["state"] != "existing" and value["branch"] != branch)):
 +            return refusal("workspace_failed")
      of = value.get("openFolder")
      if (value["ok"] is not True or value["state"] not in OPEN_STATES
              or value["folder"] != folder or not _str(of) or not (of == folder or of.startswith(folder + "/"))
-@@ -1049,9 +1066,9 @@
+@@ -1049,9 +1067,9 @@
          self.cleanup = None            # the CleanupPending that ended the flight, if any
          # The folder the answer must name, rebuilt from this job's own validated body: the repository folder
          # (personal), or the wrapper W plus the expected remote (assessment, E1-6).
@@ -157,7 +158,7 @@
      def test_the_kernel_asset_carries_the_same_class_table(self):
          kernel = ro.load_assets()["ezil-repo-open.mjs"].decode()
          t = V["constants"]["REPO_OPEN_CLASS_GIT_HOSTS"]
-@@ -1170,6 +1201,53 @@
+@@ -1170,6 +1201,56 @@
              self.wait_idle()
  
  
@@ -165,13 +166,16 @@
 +    def test_a_project_open_answer_is_the_7_key_shape_at_the_wrapper_with_exactly_defaultBranch(self):
 +        failed = ro.refusal("workspace_failed")
 +        ok = lambda v, folder=ASSESS_W, branch=ASSESS_BRANCH: ro.open_answer(dict(v), folder, "project", None, branch)
-+        for good in (PROJECT_OK, {**PROJECT_OK, "state": "existing"}, {**PROJECT_OK, "state": "initialized_empty", "empty": True}):
++        for good in (PROJECT_OK, {**PROJECT_OK, "state": "existing"}, {**PROJECT_OK, "state": "initialized_empty", "empty": True},
++                     {**PROJECT_OK, "state": "existing", "branch": "feature"}):
 +            self.assertEqual(ok(good), {"status": 200, "body": good})
 +        clone = ASSESS_W + "/repository"
 +        for bad in ({**PROJECT_OK, "folder": clone, "openFolder": clone}, {**PROJECT_OK, "openFolder": clone},
 +                    {**PROJECT_OK, "openFolder": ASSESS_W + "/src"}, {**PROJECT_OK, "pathNotFound": True},
 +                    {**PROJECT_OK, "folder": FOLDER, "openFolder": FOLDER}, {**PROJECT_OK, "branch": "trunk"},
-+                    ASSESS_OK, {**PROJECT_OK, "extra": 1}, {**PROJECT_OK, "state": "adopted"}):
++                    ASSESS_OK, {**PROJECT_OK, "extra": 1}, {**PROJECT_OK, "state": "adopted"},
++                    {**PROJECT_OK, "state": "initialized_empty", "empty": True, "branch": "trunk"},
++                    {**PROJECT_OK, "state": "existing", "branch": "x..y"}):
 +            self.assertEqual(ok(bad), failed, bad)
 +        self.assertEqual(ok(PROJECT_OK, ro.assessment_folder(OTHER_REPO_ID)), failed)
 +        self.assertEqual(ok(PROJECT_OK, branch=None), failed)
@@ -211,7 +215,7 @@
  class AssessmentJob(JobBase):
      """Contract 1.0.3: the relay's class reaches the kernel request only when it was sent, the
      grant names the class's host, and an assessment commit answer is validated as okOpenAssessment."""
-@@ -1906,6 +1984,45 @@
+@@ -1906,6 +1987,48 @@
          self.assertEqual(re.sub(r"/run/ezil/[a-z/]+:|/workspace/\.ezil-staging:|acme__site\.json", "", left.stdout).strip(), "")
          self.no_token_in_container_except_grant()
  
@@ -239,6 +243,9 @@
 +        self.assertEqual(self.sh(f"cat {wrapper}/repository/wip.txt").stdout, "wip\n")
 +        grant = self.sh("cat /run/ezil/git/grants/acme__proj.json")
 +        self.assertEqual(json.loads(grant.stdout)["host"], QA_HOST)
++        # the Creator's own branch: the reopen names it and the host accepts it (kernel.project.branchRule)
++        self.assertEqual(self.sh(f"git -C {wrapper}/repository switch -q -c feature").returncode, 0)
++        self.assertEqual(self.run_real("b5" * 32, name="proj", **project()), {"status": 200, "body": {**answer, "branch": "feature"}})
 +        # unmarked, or marked through a symlink: folder_conflict, the tree untouched
 +        for job, tamper in (("b2" * 32, "rm .git/ezil-repo-class"),
 +                            ("b3" * 32, "printf 'project\\n' > /tmp/m; ln -s /tmp/m .git/ezil-repo-class")):

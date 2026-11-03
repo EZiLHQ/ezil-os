@@ -6,25 +6,28 @@ Journey `journey-9aae-20261103-repo-aws-local-v1` (founder request 9aae). This i
 
 | Piece | File | Pin |
 |---|---|---|
-| Contract 1.0.4 | `docs/contracts/universe-repo-open-v1.{md,vectors.json,check.mjs}`, README | vectors `092d76d1…`, gateway extract `085a783a…` |
+| Contract 1.0.4 | `docs/contracts/universe-repo-open-v1.{md,vectors.json,check.mjs}`, README | vectors `4ede80c6…`, gateway extract `4920f98d…` |
 | Kernel, class `project` | `worker/src/repo-open-assets/ezil-repo-open.mjs` and the byte-identical host copy `infra/host-agent/lib/ezil_host/repo_open_assets/ezil-repo-open.mjs` | kernel `1362a691…` (pinned in `repo_open.py` REPO_OPEN_ASSETS, the only line changed in that file) |
 | Worker relay gate | `worker/src/aws-repo-open.ts`, `worker/src/repo-open-u2.ts` | both inert; nothing imports them |
-| Tests | `ezil-repo-open-test.mjs` (T-2PUSH-K and three more), `aws-repo-open.test.ts`, `repo-open-u2.test.ts` | |
+| Tests | `ezil-repo-open-test.mjs` (T-2PUSH-K, reopen including a switched branch, crossovers, request rules, grant cleanup), `aws-repo-open.test.ts`, `repo-open-u2.test.ts` | |
 
 ## H1. Host-op patch for cb1d14e6 (not applied here)
 
-- **File:** `docs/contracts/handoffs/universe-repo-open-1.0.4-host-op.patch`. Apply it on this commit with `git apply`.
+- **File:** `docs/contracts/handoffs/universe-repo-open-1.0.4-host-op.patch`. Apply it on this branch's head with `git apply`.
+- **Hard merge constraint:** this branch must merge together with H1. Without H1, cb1's `test_repo_open_op` is red here by design: its version pin reads 1.0.3, and `parse_relay` refuses the vectors' valid class `project` body. The only line this branch changes in `repo_open.py` is the kernel sha256 in REPO_OPEN_ASSETS, because the request asked to keep both kernel copies and their hash pins consistent.
 - **Production change (`repo_open.py`):**
   - `REPO_OPEN_CLASSES` gains `project`, with `REPO_OPEN_PROJECT_GIT_HOSTS = (github.ezil.work, git-qa.ezil.work)`. The host cannot know the deployment, so it accepts either host. The route binding belongs to the Worker.
   - The project grant window is at most 330 s, and `path` must be null.
-  - `open_answer` checks the 7-key shape at W, with `pathNotFound` false and exactly `defaultBranch`.
+  - `open_answer` checks the 7-key shape at W, with `pathNotFound` false. A fresh placement must name exactly `defaultBranch`; an `existing` reopen may name any valid current branch.
   - The job folder is W; the commit timeout stays `workspace_busy`, because the reopen is idempotent.
 - **Test changes (`test_repo_open_op.py`):**
   - The version pin moves to 1.0.4.
   - The stale "single-host table = all classes" assertion is corrected.
   - New tests cover the class rules, `ProjectAnswer` and `ProjectJob`.
   - A real-kernel test checks that a bound and marked W reopens `existing` with no network, that an unmarked or symlink-marked W is `folder_conflict` and left untouched, and that a fresh open offline is `network_unavailable`.
-- **Host suite at this commit without H1:** red by design on the 1.0.4 version pin and on the vectors' valid class `project` body. With H1 applied: 111 tests. The only failures seen were TimingChain bounds under host load. Those same failures also occur at the pin-only base, and TimingChain passes 7/7 when rerun alone. The `RepoOpenEdge` start test is also flaky at the pin-only base.
+- **Host suite evidence:**
+  - With H1 applied: 111/111 passed (15:46:16–15:47:26Z).
+  - Earlier runs at higher host load also missed TimingChain bounds. Those same misses occur at the pin-only base, and TimingChain passes 7/7 when rerun alone. The `RepoOpenEdge` start test is also flaky at the pin-only base.
 
 ## H2. Worker activation sketch for the `index.ts` owner (not applied here)
 
@@ -66,6 +69,13 @@ if (v2.provider === 'aws-ec2') {
 | D3 | Works (slot5) | W2/W3: an OS-scoped write grant of at most 5 min, bound to the Creator's `sub` and computer. W1 (`scope`, `defaultRef` in the response) is root's Codex task in a separate Works worktree. | W1 in progress elsewhere; W2/W3 open |
 | D4 | cb1d14e6 (app) | Lift the open-project `isAws` refusal only after D1–D3 and H2, sending the class `project` body. | blocked on D1–D3 |
 | D5 | Universe, Works, EZiL CLI | No code change. The vectors copy (1.0.4, `092d76d1…`) and the CLI gateway extract (`085a783a…`) are re-seeded as a consumer step. | open |
+
+## Owner, attempt and subject fences (where each lives)
+
+- **No subject field.** There is none in the class `project` body, the kernel request or the persisted job, so a caller cannot name a subject at all.
+- **Owner fence:** `awsControlTarget` matches the v2 claims (computerId, sandboxId, generation, leaseEpoch) against the live tunnel record, and anything else is a Response. The relay answers `workspace_unsupported` for that before asking any gate (tested).
+- **Assessment fence:** `computerFree` (D2), which fails closed.
+- **Grant↔subject binding:** Works W2/W3 (D3) binds the OS-scoped grant to the Creator's `sub` and computer, and the route mints it for the signed-in owner only. EZiL ID alone is never checkout proof.
 
 ## Residuals
 

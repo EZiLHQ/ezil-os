@@ -213,8 +213,10 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     return refusal('workspace_failed');
   }
   if (project) {
-    // 1.0.4: the editor root is the wrapper W itself (never a folder below it), no path, exactly defaultBranch.
-    if (body.openFolder !== folder || body.pathNotFound !== false || typeof defaultBranch !== 'string' || body.branch !== defaultBranch) {
+    // 1.0.4: the editor root is the wrapper W itself (never a folder below it), no path. A fresh placement checked out
+    // exactly defaultBranch; an `existing` reopen names the folder's current branch (the Creator's own work), any valid one.
+    if (body.openFolder !== folder || body.pathNotFound !== false || typeof defaultBranch !== 'string'
+      || (body.state !== 'existing' && body.branch !== defaultBranch)) {
       return refusal('workspace_failed');
     }
     const { state, branch, empty } = body as unknown as RepoOpenOpenResult;

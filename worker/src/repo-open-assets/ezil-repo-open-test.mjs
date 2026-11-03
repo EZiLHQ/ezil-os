@@ -27,7 +27,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SOURCE_KERNEL = path.join(HERE, 'ezil-repo-open.mjs');
 export const SOURCE_HELPER = path.join(HERE, 'ezil-git-grant.mjs');
 const VECTORS_PATH = path.join(HERE, '../../../docs/contracts/universe-repo-open-v1.vectors.json');
-export const VECTORS_SHA256 = '092d76d10018156d585424caee993ad6cac3ce56c52f5fee74f56917e60e92ff';
+export const VECTORS_SHA256 = '4ede80c69322d806c283691456c128d249d7f90105d08e93c4d818a83e98f150';
 export const KERNEL_PATH = '/run/ezil/bin/ezil-repo-open.mjs';
 export const HELPER_PATH = '/run/ezil/bin/ezil-git-grant.mjs';
 export const WRAPPER_PATH = '/run/ezil/bin/ezil-git-grant';
@@ -2235,6 +2235,35 @@ async function main() {
     assert.equal(fx.server.state.requests, requests); assert.equal(fx.proxy.state.connects.length, connects);
     assert.equal(fs.readFileSync(`${F}/wip.txt`, 'utf8'), 'mine\n');
     assert.equal(sh('git', ['-C', F, 'rev-parse', 'HEAD'], { env: USER_ENV }).trim(), head);
+    // the Creator's own branch work: a reopen names the folder's current branch (never forced back to defaultBranch);
+    // a detached HEAD names defaultBranch, as a personal reopen does (currentBranch)
+    sh('git', ['-C', F, 'switch', '-q', '-c', 'feature'], { env: USER_ENV });
+    resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token: newToken(), ...PROJECT })).committed, projected(root, { state: 'existing', branch: 'feature' }));
+    sh('git', ['-C', F, 'switch', '-q', '--detach'], { env: USER_ENV });
+    resetRun();
+    assert.deepEqual((await openFlow(fx, { root, token: newToken(), ...PROJECT })).committed, projected(root, { state: 'existing' }));
+    assert.equal(fx.server.state.requests, requests); assert.equal(fx.proxy.state.connects.length, connects);
+  });
+
+  test('class project (1.0.4): a fresh project commit refused (an unmarked bound W appeared after prepare) removes the grant its prepare installed; never adopted', async () => {
+    const k = await kernel();
+    const root = newRoot(); const token = newToken(); fx.server.state.token = token;
+    makeRemote(fx, { branches: { main: { 'a.txt': 'a' } } });
+    const uuid = crypto.randomUUID(); writeIncoming(uuid, { token, host: QA_HOST });
+    assert.equal((await k.runKernel('prepare', writeRequest({ phase: 'prepare', uuid, root, ...PROJECT }), fx.seam)).state, 'cloned');
+    const W = wrapperOf(root), planted = cloneOf(root);
+    sh('git', ['init', '-q', '-b', 'main', planted], { env: USER_ENV });
+    sh('git', ['-C', planted, '-c', 'user.name=P', '-c', 'user.email=p@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'planted'], { env: USER_ENV });
+    fs.writeFileSync(`${planted}/.git/ezil-repo.json`, `${JSON.stringify({ v: 1, repositoryId: REPO_ID, handle: 'acme', name: 'site', gitHost: QA_HOST })}\n`);
+    writeIncoming(uuid, { token, host: QA_HOST });
+    const before = manifest(W);
+    assert.deepEqual(cli('commit', writeRequest({ phase: 'commit', uuid, root, ...PROJECT })).result, { ok: false, errorCode: 'folder_conflict' });
+    assert.deepEqual(manifest(W), before, 'commit touched the planted folder');
+    assert.equal(exists(lockOf()), false, 'commit kept its lock');
+    assert.equal(exists(grantOf()), false, 'the refused commit left the grant its prepare installed beside a folder it did not place');
+    assert.deepEqual(cli('release', writeRequest({ phase: 'release', uuid, root, ...PROJECT })).result, { ok: true });
+    assert.equal(exists(`${root}/.ezil-staging/${uuid}`), false);
   });
 
   test('class project (1.0.4) crossovers: no class adopts a folder another class placed; a folder bound elsewhere, unmarked or marked through a link is folder_conflict; refresh never grants one', async () => {

@@ -478,7 +478,8 @@ for (const m of V.workerRequest.invalidMutations) ok(!workerBodyValid(mutate(V.w
     ok(/PROJECT_MARKER_FILE/.test(K.rule) && /never adopted/.test(K.rule) && /assessment adopts nothing/.test(K.rule) && /5-key/.test(K.rule), 'kernel.project.rule: marker, no adoption either way, the 5-key binding');
     ok(/never followed/.test(K.layoutRule) && /ASSESSMENT_DIR_TEMPLATE/.test(K.layoutRule), 'kernel.project.layoutRule: the assessment wrapper, no symlink');
     ok(/regular file/.test(K.markerRule) && /never a symlink/.test(K.markerRule) && /PROJECT_MARKER_CONTENT/.test(K.markerRule), 'kernel.project.markerRule');
-    ok(/repository_unavailable/.test(K.branchRule) && /defaultBranch/.test(K.branchRule), 'kernel.project.branchRule: exactly defaultBranch');
+    ok(/repository_unavailable/.test(K.branchRule) && /exactly defaultBranch/.test(K.branchRule) && /current branch/.test(K.branchRule) && /state existing only/.test(K.branchRule),
+        'kernel.project.branchRule: a fresh placement exactly defaultBranch, a reopen its current branch');
     ok(/DIFFERENT token/.test(K.twoPushRule) && /index and HEAD are unchanged/.test(K.twoPushRule) && /no network/.test(K.twoPushRule), 'kernel.project.twoPushRule (T-2PUSH-K)');
     ok(/class project/.test(V.kernel.requestKeysRule) || /REPO_OPEN_PROJECT_GIT_HOSTS/.test(V.kernel.requestKeysRule), 'requestKeysRule names the project host rule');
     const A = V.awsProject;
