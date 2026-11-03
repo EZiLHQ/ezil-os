@@ -304,7 +304,7 @@ export interface ShellDesktopState {
     status: 'idle';
     endpoints: Partial<typeof SHELL_API_ROUTES>;
     /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
-    ui?: { floatingControls: boolean; feedbackScreenshots: boolean };
+    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackLogs: boolean };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -374,7 +374,8 @@ export function toShellDesktopState(
         hasHmacSecret: provider?.hasHmacSecret === true,
         status: 'idle',
         endpoints,
-        ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots },
+        ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
+            feedbackLogs: features.feedbackLogs },
     };
 }
 

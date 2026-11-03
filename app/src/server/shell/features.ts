@@ -20,12 +20,15 @@ export interface ShellFeatures {
     floatingControls: boolean;
     feedback: boolean;
     feedbackScreenshots: boolean;
+    /** Feedback v2: this server accepts `diagnostics.app` and `diagnostics.logs`. On with feedback; no env. */
+    feedbackLogs: boolean;
 }
 
 export const NO_SHELL_FEATURES: ShellFeatures = Object.freeze({
     floatingControls: false,
     feedback: false,
     feedbackScreenshots: false,
+    feedbackLogs: false,
 });
 
 function onList(email: string | null | undefined, list: string): boolean {
@@ -45,5 +48,6 @@ export function shellFeaturesFor(email: string | null | undefined, envIn: ShellF
         floatingControls: false,
         feedback,
         feedbackScreenshots: feedback && envIn.EZIL_OS_FEEDBACK_SCREENSHOTS === '1',
+        feedbackLogs: feedback,
     };
 }

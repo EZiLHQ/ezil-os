@@ -4,7 +4,7 @@ import { shellFeaturesFor } from './features';
 
 describe('shellFeaturesFor — every flag fails closed', () => {
     it('is all-off with no env', () => {
-        expect(shellFeaturesFor('a@b.c', {})).toEqual({ floatingControls: false, feedback: false, feedbackScreenshots: false });
+        expect(shellFeaturesFor('a@b.c', {})).toEqual({ floatingControls: false, feedback: false, feedbackScreenshots: false, feedbackLogs: false });
     });
     it('only exactly "1" turns a flag on', () => {
         expect(shellFeaturesFor('a@b.c', { EZIL_OS_FEEDBACK: 'yes' }).feedback).toBe(false);
@@ -18,6 +18,13 @@ describe('shellFeaturesFor — every flag fails closed', () => {
     it('screenshots need feedback on', () => {
         expect(shellFeaturesFor('a@b.c', { EZIL_OS_FEEDBACK_SCREENSHOTS: '1' }).feedbackScreenshots).toBe(false);
         expect(shellFeaturesFor('a@b.c', { EZIL_OS_FEEDBACK: '1', EZIL_OS_FEEDBACK_SCREENSHOTS: '1' }).feedbackScreenshots).toBe(true);
+    });
+    it('the v2 log capability follows feedback exactly and has no env of its own', () => {
+        expect(shellFeaturesFor('a@b.c', { EZIL_OS_FEEDBACK: '1' }).feedbackLogs).toBe(true);
+        expect(shellFeaturesFor('a@b.c', { EZIL_OS_FEEDBACK: '0' }).feedbackLogs).toBe(false);
+        const pilot = { EZIL_OS_FEEDBACK: '1', FEEDBACK_PILOT_EMAILS: 'x@y.z' };
+        expect(shellFeaturesFor('other@ezil.work', pilot).feedbackLogs).toBe(false);
+        expect(shellFeaturesFor('x@y.z', pilot).feedbackLogs).toBe(true);
     });
     it('a pilot list narrows feedback to listed emails, case-insensitively', () => {
         const e = { EZIL_OS_FEEDBACK: '1', EZIL_OS_FEEDBACK_SCREENSHOTS: '1', FEEDBACK_PILOT_EMAILS: ' Founder@Ezil.work , x@y.z' };
