@@ -80,6 +80,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
+import { cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
@@ -5139,11 +5140,12 @@ async function handlePreview(
     // See `codePreviewFolderParams`'s doc comment above for the full "empty
     // file tree" mechanism/contract this closes.
     // Per-tab folder continuity (`./code-folder.ts`): the tab's hint, stripped of THIS computer's root (the mount,
-    // else the container's own fallback root) and walked on the computer with no symlink followed. The in-container
-    // walk is e1cd418a's `code-folder-resolve.ts` (single writer of Worker path resolution); until it is wired a
-    // resolvable ask answers `unverified` and today's default opens. Only `restored` adds a folder.
+    // else the container's own fallback root) and walked in the container with no symlink followed
+    // (`./code-folder-resolve.ts`, e1cd418a: one exec, the whole resolve bounded, a code back, never a path).
+    // Only `restored` adds a folder; any other outcome opens today's default.
     const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;
-    const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot);
+    const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,
+      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));
     let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));
     if (codeFolder.folder && codePreviewUrl && !fitsCodeFolderUrl(codePreviewUrl)) {
       // The shell's frame confirmation caps the URL: a deep folder opens today's default with a visible notice.
