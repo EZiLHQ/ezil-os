@@ -5,21 +5,41 @@
  * `-` in names; the root itself), then end to end through `settleCodeFolder`.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import gw from './aws-gateway.vectors.json';
+import {
+  AWS_GATEWAY_HEADER,
+  awsOriginHostname,
+  decodeControlKey,
+  handleAwsPreview,
+  verifyGatewayHeader,
+  type AwsTunnelRecord,
+  type FetchLike,
+} from './aws-origin';
 import { settleCodeFolder } from './code-folder';
 import {
+  AWS_CODE_FOLDER_CONTROL_PATH,
   CODE_FOLDER_REL_ENV,
   CODE_FOLDER_RESOLVE_BOUND_MS,
   CODE_FOLDER_RESOLVE_SCRIPT,
   CODE_FOLDER_RESOLVE_TIMEOUT_MS,
   CODE_FOLDER_ROOT_ENV,
   CODE_FOLDER_WALK_OUTCOMES,
+  awsCodeFolderBody,
+  awsCodeFolderOutcome,
+  awsCodeFolderResolver,
   cloudflareCodeFolderResolver,
   codeFolderWalkOutcome,
 } from './code-folder-resolve';
 import type { RepoOpenExec } from './repo-open';
+
+/** The shared v1 table (shell, app, Worker, host agent): its `walk` rows are every resolver's cases. */
+const V = JSON.parse(readFileSync(new URL('../../docs/contracts/code-folder-v1.vectors.json', import.meta.url), 'utf8')) as {
+  walk: Array<{ tree: string; rel: string; expect: string }>;
+};
 
 describe('codeFolderWalkOutcome: exit 0 and exactly one known result line, else error', () => {
   it('reads each walk outcome, with or without the trailing newline', () => {
@@ -176,6 +196,26 @@ describe('the walk script in real shells', () => {
     });
   }
 
+  it('every shared `walk` vector (docs/contracts/code-folder-v1.vectors.json) in every shell', () => {
+    const shared = join(dir, 'shared');
+    mkdirSync(join(shared, 'sports', 'sports-web'), { recursive: true });
+    mkdirSync(join(shared, 'My Project', '日本'), { recursive: true });
+    mkdirSync(join(shared, 'via-target', 'child'), { recursive: true });
+    writeFileSync(join(shared, 'sports', 'next.config.ts'), 'x');
+    symlinkSync('/etc', join(shared, 'link-out'));
+    symlinkSync('sports', join(shared, 'link-in'));
+    symlinkSync('via-target', join(shared, 'via-link'));
+    expect(V.walk.length).toBeGreaterThanOrEqual(8);
+    for (const shell of SHELLS) {
+      for (const v of V.walk) {
+        const p = Bun.spawnSync([shell, '-c', CODE_FOLDER_RESOLVE_SCRIPT], {
+          cwd: shared, env: { PATH: process.env.PATH!, [CODE_FOLDER_ROOT_ENV]: shared, [CODE_FOLDER_REL_ENV]: v.rel },
+        });
+        expect({ shell, tree: v.tree, got: codeFolderWalkOutcome(p.exitCode, p.stdout.toString()) }).toEqual({ shell, tree: v.tree, got: v.expect });
+      }
+    }
+  });
+
   it('settles end to end: only a walked real directory becomes the folder', async () => {
     const exec: RepoOpenExec = async (command, options) => {
       const p = Bun.spawnSync(['bash', '-c', command], { cwd: root, env: { PATH: process.env.PATH!, ...options.env } });
@@ -191,5 +231,145 @@ describe('the walk script in real shells', () => {
     // the planner's refusals never reach the walk
     expect(await settleCodeFolder({ v: 1, path: `${dir}/outside` }, root, resolve)).toEqual({ outcome: 'outside' });
     expect(await settleCodeFolder({ v: 1, path: `${root}/projects/00000000-0000-4000-8000-000000000000/repository` }, root, resolve)).toEqual({ outcome: 'not_allowed' });
+  });
+});
+
+describe('awsCodeFolderResolver: the host edge folder op (host-agent edge.py `_folder`)', () => {
+  const KEY = decodeControlKey(gw.controlKeyBase64)!;
+  const ZONE = 'origin.example.net';
+  const CID = '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b';
+  const SID = 'guac-0a0a0a0a0a0a0a0a-0b0b0b0b0b0b4b0b';
+  const record = (over: Partial<AwsTunnelRecord> = {}): AwsTunnelRecord => ({
+    computerId: CID, sandboxId: SID, generation: 1, leaseEpoch: 2, instanceId: 'i-0123456789abcdef0', region: 'ap-south-1',
+    publicIp: '13.200.1.2', tunnelId: 't-1', dnsRecordId: 'd-1', hostname: `c-${SID}-g1-e2.${ZONE}`, controlKey: gw.controlKeyBase64,
+    createdAt: 1, originVerified: true, originVerifiedAt: Date.now(), ...over,
+  });
+  const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
+  /** The walk's code → the host's `result` (the inverse of the resolver's table). */
+  const HOST_RESULT: Record<string, string> = { restored: 'ok', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink' };
+
+  /**
+   * A host edge stand-in that holds the Worker to the op's contract before answering: POST, the record's own origin,
+   * no query, a gw1 header that verifies for exactly this path and binding, the path digest equal to sha256 of the
+   * bytes sent, and a body of exactly {"v":1,"rel":…}. Then it answers from the shared `walk` vectors.
+   */
+  const strictHost = (answerFor: (rel: string) => Response | Promise<Response>, rec = record()) => {
+    const seen: string[] = [];
+    const fetch: FetchLike = async (url, init) => {
+      const u = new URL(url);
+      expect(u.protocol).toBe('https:');
+      expect(u.hostname).toBe(awsOriginHostname(rec.sandboxId, rec.generation, rec.leaseEpoch, ZONE));
+      expect(u.search).toBe('');
+      expect(init.method).toBe('POST');
+      expect(init.redirect).toBe('manual');
+      const body = init.body as string;
+      expect(u.pathname).toBe(`${AWS_CODE_FOLDER_CONTROL_PATH}/${sha(body)}`);
+      const header = new Headers(init.headers).get(AWS_GATEWAY_HEADER);
+      expect(await verifyGatewayHeader(header, KEY, rec, 'POST', u.pathname, Math.floor(Date.now() / 1000))).toEqual({ ok: true });
+      const parsed = JSON.parse(body) as { v: number; rel: string };
+      expect(Object.keys(parsed)).toEqual(['v', 'rel']);
+      expect(parsed.v).toBe(1);
+      seen.push(parsed.rel);
+      return answerFor(parsed.rel);
+    };
+    return { fetch, seen };
+  };
+  const fromVectors = (rel: string) => {
+    const v = V.walk.find((w) => w.rel === rel);
+    return v ? Response.json({ ok: true, result: HOST_RESULT[v.expect] }) : new Response('{}', { status: 500 });
+  };
+
+  it('sends exactly the signed, digested op and maps every shared `walk` vector', async () => {
+    const host = strictHost(fromVectors);
+    const resolve = awsCodeFolderResolver(ZONE, host.fetch, Date.now);
+    for (const v of V.walk) expect({ tree: v.tree, got: await resolve(record(), v.rel) }).toEqual({ tree: v.tree, got: v.expect });
+    expect(host.seen).toEqual(V.walk.map((w) => w.rel));
+    expect(awsCodeFolderBody('My Project/日本')).toBe('{"v":1,"rel":"My Project/日本"}');
+  });
+
+  it('the host answer: exact {ok:true,result} only; 404 (an agent without the op) is unverified; anything else is error', async () => {
+    const res = (body: string, status = 200) => new Response(body, { status });
+    for (const [r, want] of [
+      [res('{"ok":true,"result":"ok"}'), 'restored'],
+      [res('{"result":"symlink","ok":true}'), 'symlink'],
+      [res('{"ok":false,"error":"not_found"}', 404), 'unverified'],
+      [res('{"ok":true,"result":"bad_path"}'), 'error'],
+      [res('{"ok":true,"result":"restored"}'), 'error'],
+      [res('{"ok":true,"result":"ok","path":"/workspace"}'), 'error'],
+      [res('{"ok":"true","result":"ok"}'), 'error'],
+      [res('{"ok":true,"result":"toString"}'), 'error'],
+      [res('{"ok":true,"result":"__proto__"}'), 'error'],
+      [res('[true,"ok"]'), 'error'],
+      [res('not json'), 'error'],
+      [res(`{"ok":true,"result":"ok","pad":"${'x'.repeat(300)}"}`), 'error'],
+      [res('{"ok":false,"error":"folder_body_invalid"}', 400), 'error'],
+      [res('{"ok":false,"error":"gw_stale"}', 401), 'error'],
+      [res('', 302), 'error'],
+      [res('', 502), 'error'],
+      [res('', 503), 'error'],
+    ] as const) {
+      expect(await awsCodeFolderOutcome(r)).toBe(want);
+    }
+  });
+
+  it('never throws and never fetches without a usable control key; a refused fetch is error', async () => {
+    let calls = 0;
+    const counting: FetchLike = async () => { calls += 1; return Response.json({ ok: true, result: 'ok' }); };
+    expect(await awsCodeFolderResolver(ZONE, counting, Date.now)(record({ controlKey: 'bad' }), 'a')).toBe('error');
+    expect(await awsCodeFolderResolver('not a zone', counting, Date.now)(record(), 'a')).toBe('error');
+    expect(calls).toBe(0);
+    const throwing: FetchLike = async () => { throw new TypeError('network'); };
+    expect(await awsCodeFolderResolver(ZONE, throwing, Date.now)(record(), 'a')).toBe('error');
+  });
+
+  it('settles as error by its bound when the host never answers, and is not cut when it answers in time', async () => {
+    const hung: FetchLike = () => new Promise(() => undefined);
+    const started = Date.now();
+    expect(await awsCodeFolderResolver(ZONE, hung, Date.now, 50)(record(), 'a')).toBe('error');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    const slowish: FetchLike = () => new Promise((r) => setTimeout(() => r(Response.json({ ok: true, result: 'missing' })), 20));
+    expect(await awsCodeFolderResolver(ZONE, slowish, Date.now, 500)(record(), 'a')).toBe('missing');
+  });
+
+  it('a stale record (another generation or lease epoch) addresses its own host, never the current one', async () => {
+    const current = record();
+    const stale = record({ generation: 1, leaseEpoch: 1 });
+    const hosts: string[] = [];
+    const f: FetchLike = async (url) => { hosts.push(new URL(url).hostname); return new Response('', { status: 404 }); };
+    await awsCodeFolderResolver(ZONE, f, Date.now)(stale, 'a');
+    expect(hosts).toEqual([awsOriginHostname(SID, 1, 1, ZONE)]);
+    expect(hosts[0]).not.toBe(awsOriginHostname(current.sandboxId, current.generation, current.leaseEpoch, ZONE));
+  });
+
+  it('end to end through handleAwsPreview: the folder opens only on `ok`; the answer is a code; the ask never reaches the host unplanned', async () => {
+    const SECRET = 'aws-folder-test-secret';
+    const claims = { ts: Date.now(), sandboxId: SID, computerId: CID, userId: 'u1', provider: 'aws-ec2', store: '', generation: 1, leaseEpoch: 2 } as const;
+    const host = strictHost(fromVectors);
+    const preview = (path: string) => handleAwsPreview(claims, {
+      zone: ZONE, secrets: [SECRET], zoneRoot: 'preview.example.org', lookup: async () => record(), verifyOrigin: async () => 'verified',
+      surface: 'code', ensureConfig: async () => ({ state: 'applied' }) as never, codeAnswers: async () => true, nowMs: Date.now,
+      codeFolder: { v: 1, path }, resolveFolder: awsCodeFolderResolver(ZONE, host.fetch, Date.now),
+    });
+    const read = async (path: string) => (await (await preview(path)).json()) as { codePreviewUrl: string; codeFolder?: unknown };
+    const ok = await read('/workspace/sports/sports-web');
+    expect(ok.codeFolder).toEqual({ v: 1, outcome: 'restored' });
+    expect(new URL(ok.codePreviewUrl).searchParams.get('folder')).toBe('/workspace/sports/sports-web');
+    const unicode = await read('/workspace/My Project/日本');
+    expect(unicode.codeFolder).toEqual({ v: 1, outcome: 'restored' });
+    for (const [path, outcome] of [['/workspace/sports/gone', 'missing'], ['/workspace/link-out', 'symlink'], ['/workspace/via-link/child', 'symlink']] as const) {
+      const body = await read(path);
+      expect(body.codeFolder).toEqual({ v: 1, outcome });
+      expect(new URL(body.codePreviewUrl).searchParams.get('folder')).toBeNull();
+    }
+    // Refused by the planner before any host call: another root, a project's repository, the shell's own files.
+    host.seen.length = 0;
+    for (const [path, outcome] of [
+      ['/etc', 'outside'],
+      ['/workspace/projects/0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b/repository', 'not_allowed'],
+      ['/workspace/.ezil/x', 'not_allowed'],
+    ] as const) {
+      expect((await read(path)).codeFolder).toEqual({ v: 1, outcome });
+    }
+    expect(host.seen).toEqual([]);
   });
 });

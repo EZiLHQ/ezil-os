@@ -1189,7 +1189,9 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
     expect(src).toContain('...codeFolderAnswer(codeFolder.outcome),');
     expect(src).toContain('codeFolder: body.codeFolder,');
     // The walk is e1cd418a's (code-folder-resolve.ts): one exec, the whole resolve bounded; it answers a code, never a path.
-    expect(src).toContain("import { cloudflareCodeFolderResolver } from './code-folder-resolve';");
+    expect(src).toContain("import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';");
+    // AWS: the host edge's folder op, signed for the record's own origin; with no zone nothing is wired (`unverified`).
+    expect(src).toContain('...(zone ? { resolveFolder: awsCodeFolderResolver(zone, awsFetch, Date.now) } : {}),');
   });
 
   it('a mint failure is caught and degrades to null rather than failing the whole /sandbox/preview response', () => {

@@ -25,7 +25,19 @@
  * Trust: the walk runs in the person's own container and reports to that person's own mint, so a
  * result the container's root could shape changes only which of their own folders opens. A folder
  * swapped for a symlink or a bind mount after the walk is that same person's act (residual).
+ *
+ * AWS (`awsCodeFolderResolver`): the same walk on the HOST, below `<dataMount>/workspace`, by the host
+ * edge's `folder` op (host-agent `edge.py` `_folder`, `fsops.classify_dir_below`): one gw1-signed POST to
+ * the tunnel record's own origin, the body's sha256 in the signed path, a code back, never the path.
  */
+import {
+  AWS_GATEWAY_HEADER,
+  awsOriginHostname,
+  decodeControlKey,
+  signGatewayHeader,
+  type AwsTunnelRecord,
+  type FetchLike,
+} from './aws-origin';
 import type { CodeFolderOutcome, CodeFolderResolver } from './code-folder';
 import type { RepoOpenExec } from './repo-open';
 
@@ -98,6 +110,93 @@ export function cloudflareCodeFolderResolver(exec: RepoOpenExec, root: string, b
           origin: 'internal',
         });
         return codeFolderWalkOutcome(result.exitCode, result.stdout);
+      } catch {
+        return 'error';
+      }
+    })();
+    try {
+      return await Promise.race([walked, late]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+}
+
+/** The host edge's folder op: `POST <this>/<sha256hex(body)>`, nothing else in the path, no query. */
+export const AWS_CODE_FOLDER_CONTROL_PATH = '/__ezil/control/folder';
+/** The host's `result` (`fsops.classify_dir_below`) → the walk's code. `bad_path` and anything else are `error`. */
+const AWS_FOLDER_RESULTS: Readonly<Record<string, CodeFolderOutcome>> = {
+  ok: 'restored', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink',
+};
+/** The host's whole answer is `{"ok": true, "result": "not_directory"}`; anything longer is not one. */
+const AWS_FOLDER_ANSWER_MAX_BYTES = 256;
+
+/**
+ * The op's exact body bytes, built ONCE (this key order, no whitespace): the gw1 signature covers the
+ * path only, so the body's sha256 travels in the signed path and the host hashes the bytes it read
+ * before parsing them. Never re-serialize between hashing and sending.
+ */
+export function awsCodeFolderBody(rel: string): string {
+  return JSON.stringify({ v: 1, rel });
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+  return [...digest].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The host's answer → the walk's code: 200 with exactly `{ok: true, result}` and a known result; 404 is an
+ * agent without the op (an AMI from before it), which is `unverified` exactly as with no resolver; anything
+ * else (a refused body or signature, a 5xx, a redirect, an odd body) is `error`. The body is never echoed.
+ */
+export async function awsCodeFolderOutcome(res: Response): Promise<CodeFolderOutcome> {
+  if (res.status === 404) {
+    await res.body?.cancel().catch(() => undefined);
+    return 'unverified';
+  }
+  if (res.status !== 200) {
+    await res.body?.cancel().catch(() => undefined);
+    return 'error';
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength > AWS_FOLDER_ANSWER_MAX_BYTES) return 'error';
+  let answer: unknown;
+  try { answer = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)); } catch { return 'error'; }
+  if (typeof answer !== 'object' || answer === null || Array.isArray(answer)) return 'error';
+  const { ok, result } = answer as { ok?: unknown; result?: unknown };
+  if (Object.keys(answer).sort().join(',') !== 'ok,result' || ok !== true || typeof result !== 'string') return 'error';
+  return Object.hasOwn(AWS_FOLDER_RESULTS, result) ? AWS_FOLDER_RESULTS[result]! : 'error';
+}
+
+/**
+ * The AWS resolver for `handleAwsPreview`'s `resolveFolder`: one gw1-signed POST of `{"v":1,"rel":…}` to the
+ * record's own origin (its generation and lease epoch name the host, so an earlier host never answers), the
+ * request bounded by CODE_FOLDER_RESOLVE_TIMEOUT_MS and the whole call by `boundMs`. Never throws: a record
+ * without a usable control key, a refused fetch or a late host is `error`.
+ */
+export function awsCodeFolderResolver(
+  zone: string,
+  fetchFn: FetchLike,
+  nowMs: () => number,
+  boundMs = CODE_FOLDER_RESOLVE_BOUND_MS,
+): (record: AwsTunnelRecord, rel: string) => Promise<CodeFolderOutcome> {
+  return async (record, rel) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<CodeFolderOutcome>((resolve) => { timer = setTimeout(() => resolve('error'), boundMs); });
+    const walked = (async (): Promise<CodeFolderOutcome> => {
+      try {
+        const key = decodeControlKey(record.controlKey);
+        if (!key) return 'error';
+        const body = awsCodeFolderBody(rel);
+        const path = `${AWS_CODE_FOLDER_CONTROL_PATH}/${await sha256Hex(body)}`;
+        const host = awsOriginHostname(record.sandboxId, record.generation, record.leaseEpoch, zone);
+        const header = await signGatewayHeader(key, record, 'POST', path, Math.floor(nowMs() / 1000));
+        const res = await fetchFn(`https://${host}${path}`, {
+          method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header, 'content-type': 'application/json' }, body,
+          redirect: 'manual', signal: AbortSignal.timeout(CODE_FOLDER_RESOLVE_TIMEOUT_MS),
+        });
+        return await awsCodeFolderOutcome(res);
       } catch {
         return 'error';
       }

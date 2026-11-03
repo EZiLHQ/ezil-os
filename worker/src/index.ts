@@ -80,7 +80,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
-import { cloudflareCodeFolderResolver } from './code-folder-resolve';
+import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
@@ -4937,9 +4937,10 @@ async function handlePreview(
           surface: awsPreviewSurface(body.surface),
           ensureConfig: async (record) => ensureAwsDesktopConfig(await desktop(record)),
           codeAnswers: async (record) => !!zone && awsCodeServerAnswers(record, zone, awsFetch, Date.now),
-          // Per-tab folder continuity (Code only, aws-origin.ts). The host walk (`resolveFolder`) is e1cd418a's
-          // `code-folder-resolve.ts`; until it is wired, a resolvable ask answers `unverified`.
+          // Per-tab folder continuity (Code only, aws-origin.ts): the host edge's no-follow walk
+          // (`code-folder-resolve.ts`); an agent without the op answers `unverified`.
           codeFolder: body.codeFolder,
+          ...(zone ? { resolveFolder: awsCodeFolderResolver(zone, awsFetch, Date.now) } : {}),
           nowMs: Date.now,
         });
         if (answer.status !== 200) {
