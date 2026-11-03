@@ -102,7 +102,7 @@ for (const target of ['code', 'browser']) {
     const { w, ctx, url, win, opens } = await boot(`/os?app=${target}&project=demo&path=%2Fa%20b`);
     const id = target === 'browser' ? 'desktop' : target;
     same([...w.document.querySelectorAll('.window[data-app]')].map(el => el.dataset.app), [id], 'fresh target opens only requested app');
-    same(url(), `/app/${id}?project=demo&path=%2Fa%20b`, 'the alias is canonicalised in place, other keys byte for byte');
+    same(url(), `/app/${target}?project=demo&path=%2Fa%20b`, 'the alias is canonicalised in place, other keys byte for byte');
     same(w.history.length, 1, 'canonicalising adds no history entry');
     if (id === 'code') same(opens.map(c => c.view), ['full'], 'Code opened from its route is full (contract item 3)');
     const original = win(id);
@@ -131,7 +131,7 @@ for (const target of ['code', 'browser']) {
     same(w.document.querySelectorAll('.window').length, 2, 'history app request preserves other windows');
     ok(win(id) === original, 'same app focuses its original window');
     ok(original.classList.contains('window-active'), 'Back focused it');
-    same(url(), `/app/${id}?project=demo&path=%2Fa%20b`, 'the entry kept its own URL');
+    same(url(), `/app/${target}?project=demo&path=%2Fa%20b`, 'the entry kept its own URL');
     done(w);
 }
 {
@@ -163,7 +163,10 @@ for (const [entry, canonical] of [
     [`/app/settings?tab=billing&upgrade=pro&computer=${COMPUTER}`, `/app/settings?tab=billing&computer=${COMPUTER}`],
     [`/os?settings=billing&section=ai-credits`, '/app/settings?tab=billing'],
     [`/os?app=settings&settings=system&computer=${COMPUTER}`, `/app/settings?tab=system&computer=${COMPUTER}`],
-    [`/app/browser?computer=${COMPUTER}`, `/app/desktop?computer=${COMPUTER}`],
+    [`/app/browser?computer=${COMPUTER}`, `/app/browser?computer=${COMPUTER}`],
+    // Legacy Browser links: the registry id and the old alias form.
+    [`/app/desktop?computer=${COMPUTER}&x=%41`, `/app/browser?computer=${COMPUTER}&x=%41`],
+    [`/os?app=desktop&computer=${COMPUTER}`, `/app/browser?computer=${COMPUTER}`],
     [`/os?computer=${COMPUTER}&app=code&${pr}&path=a%2Fb`, `/app/code?computer=${COMPUTER}&${pr}&path=a%2Fb`],
 ]) {
     const { w, url } = await boot(entry);

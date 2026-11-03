@@ -21,8 +21,9 @@ contract, it says so.
 The canonical URL of an open app is **`/app/<appId>`**, where `appId` is a
 shell registry id (`APPS` in `shell/ezil/apps/registry.js`):
 `desktop`, `code`, `settings`, `app-store`, `preview`, `secure-browser`.
-`browser` is an alias of `desktop`; there is no `launcher` app in the
-registry today.
+The one exception is the Browser: its registry id is `desktop`, and its URL
+is **`/app/browser`** (§9). `/app/desktop` is a legacy spelling of the same
+app. There is no `launcher` app in the registry today.
 
 - **`/app/<appId>` renders the same document as `/os`.** Not a redirect: the
   `/app/[appId]` page calls the `/os` page component with `params.appId`.
@@ -207,7 +208,7 @@ front, because its window is shown and re-asserted.
   decides again (its `end`, its window's late focus and its `ensureOnTop`
   count). If that launch has failed meanwhile, it gives back in turn,
   provided the entry is still the one it held. So three clicks that end
-  Settings fails, Code fails, Desktop opens leave `/app/desktop`, and two
+  Settings fails, Code fails, Desktop opens leave `/app/browser`, and two
   that both fail leave the URL from before them, in either order. A close
   or Back/Forward in between ends the chain: nothing is given back over it.
 - **Settling.** UIWindow focuses a restored window 80ms after `showWindow`,
@@ -474,6 +475,7 @@ on `/auth/confirm` links. An absent `next` lands on `/os`.
 Sign-in returns to the exact path and query: `/app/code?…` and
 `/app/desktop?…` come back as written (`app/src/app/os/page.test.ts`, which
 also runs the return through the shell's parser and `routeLaunchContext`).
+The shell then rewrites `/app/desktop` to `/app/browser` in place (§9).
 The return is a full document load, and the boot then opens the linked app
 from the URL alone, with no click:
 
@@ -501,7 +503,7 @@ open (§5 launches it). Not changed here, because it is not a clear bug:
   computer.
 - Settings → Stop closes every window on the computer first, so this tab's
   own address bar falls back to `/os` (or the app still in front). Earlier
-  entries keep their `/app/desktop` URLs, so Back to one relaunches the
+  entries keep their `/app/browser` URLs, so Back to one relaunches the
   Browser. `session.holdAfterStop` blocks only hover warms; any window open
   releases it, a route launch included.
 - Contrast for the owner: since lane A2, Code's return-from-away check no
@@ -558,3 +560,67 @@ Still open:
 ## 8. Visual choices
 
 None. This lane changes no pixels.
+
+## 9. The Browser's address, and shared links (3 Nov 2026)
+
+The founder asked for `/app/browser`, not `/app/desktop`: the app is a
+browser, and "desktop" read as the whole OS. The app streams a full X
+session, but its only focusable app is Chromium (`FOCUS_APPS` in
+`desktop-window.js`). Its name is already "Browser" in the registry and in
+the server's `SHELL_APPS`.
+
+- **The id stays `desktop`.** It is DOM and wire plumbing:
+  `.window[data-app="desktop"]`, telemetry sites, `SHELL_APPS` and the
+  tests. Only the address changes. `routeName` (`app-link.js`) reads
+  `ALIASES` backwards, and `appUrl` and `canonicalUrl` (`app-history.js`)
+  write through it, so every URL the shell writes says `/app/browser`.
+- **Legacy links keep working.** `/app/desktop`, `/os?app=desktop` and
+  `/os?app=browser` parse to the same app. The boot rewrites them in place
+  (`replaceState`, no new entry), keeping every other query pair and the
+  hash byte for byte, as §1 does for any alias. Hosts that serve only `/os`
+  are still never rewritten.
+- **No server change.** `isShellAppId` and `safeReturnUrl` case 3 already
+  accepted both spellings, and `returnUrlFor` keeps the path through
+  sign-in. `/app/desktop` therefore returns to `/app/desktop` and is
+  rewritten after the boot.
+- **A shared link is the address bar.** There is no share or copy-link
+  control. It grants nothing: the server checks the session and the
+  computer's owner exactly as for any page load.
+- **What the "OS desktop" still means.** Wording about the computer or the
+  OS session ("Starting your desktop", the troubleshoot restart copy) is
+  not the Browser's and is unchanged.
+
+Measured in `shell/ezil/browser-route-browser-test.mjs`. That suite runs
+in Chromium with the real bundle and the app's real `constants.ts` rules.
+Its gate, its computer lookup and its sign-in are labelled fixtures, not
+EZiL ID:
+
+| Case | Result |
+|---|---|
+| Fresh `/app/browser?x=1`, signed out | `/login?returnUrl=/app/browser?x=1`; after sign-in, `/app/browser?x=1` with one Browser. Nothing is started before sign-in. |
+| The same link, already signed in; refresh | `/app/browser`, one Browser, no new entry |
+| `/app/desktop?computer=<own>&x=%41#top`, `/os?app=desktop`, `/os?app=browser&x=1` | rewritten to `/app/browser…` in place, query and hash kept |
+| Back/Forward between the Browser and Settings, and after a reload | the entry's app is focused or launched, nothing is closed, never a second Browser. Forward after a reload was a same-document traversal in Chromium. |
+| `/app/code?project=…&repo=…&path=src/main.ts` | unchanged |
+| `/app/unknown`, `/app/Browser`, `/app/browser%2fx`, `/app/desktop.`, `/app/__proto__` | 404, nothing started |
+| Another user's computer in the link (`?computer=<A's>` opened by B), signed in or after sign-in | the gate's "Couldn't open your computer"; nothing is started, and neither A's computer nor B's own is substituted. The real page is pinned by `os/page.test.ts` ("does not substitute another computer for an unowned target"). |
+| A's link, signed in as A on another device | A's Browser |
+| Forged return targets (`//evil.example/…`, `https://evil.example/…`, a backslash, `/app/unknown`) | `/computers`, `/computers`, `/computers`, `/os`; never another origin |
+
+Open, and not changed here:
+
+- **A page load at `/app/browser` (or `/app/desktop`) asks to start the
+  signed-in user's own computer with no click** (§6, "After sign-in"): one
+  request, then one retry. Opening the Browser from a shared link is
+  therefore a compute start. It is only ever the user's own computer, never
+  a second one or another user's. Whether such a load should ask first is
+  still an owner decision.
+- **A link copied from a session that picked a computer carries
+  `computer=<uuid>`** (`PAGE_KEYS`). For anyone else it lands on "Couldn't
+  open your computer… try again", which can never succeed for them. It is
+  safe, but it is not the Browser they expected. A fix belongs to
+  `app/src/app/os/page.tsx` (an explicit-click page, never a silent
+  fallback to the default computer) and is not made in this lane.
+- **The hash through sign-in** is the login page's behaviour. The browser
+  carries `#frag` to `/login`, and the fixture's form drops it. The real
+  login and callback pages decide this.

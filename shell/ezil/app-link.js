@@ -1,4 +1,5 @@
-// Explicit shell entry intent. Browser's internal app id remains `desktop`.
+// Explicit shell entry intent. Browser's internal app id remains `desktop`;
+// its address is `/app/browser` (`routeName`).
 // Two spellings reach the same app: the canonical path form `/app/<id>?…` and
 // the older query alias `/os?app=<id>` / `/os?settings=<tab>` (app-history.js
 // rewrites the alias to the path form). See docs/APP-ROUTES.md.
@@ -13,6 +14,16 @@ const APP_PATH = /^\/app\/([a-z0-9-]+)$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 const PATH_MAX_BYTES = 255;
+// `ALIASES` read backwards: the address an app is written at, where it is not
+// its registry id. The Browser's id stays `desktop` (DOM and wire plumbing),
+// but the address bar, and so every link copied from it, says `/app/browser`.
+// `/app/desktop` still opens the Browser; the boot rewrites it in place.
+const ROUTE_NAMES = Object.freeze(Object.fromEntries(Object.entries(ALIASES).map(([name, id]) => [id, name])));
+
+/** The `<name>` of `/app/<name>` for registry id `id`. */
+export function routeName (id) {
+    return Object.hasOwn(ROUTE_NAMES, id) ? ROUTE_NAMES[id] : id;
+}
 
 /**
  * `{pathname, search}` from a Location/URL, a "/path?query" string, or (the
