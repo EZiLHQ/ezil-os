@@ -87,7 +87,10 @@ export function plainFolderPath(value: unknown): string | null {
 /** `{v:1, path}` exactly (an unknown key, another version or a non-plain path is refused), else null. */
 export function parseCodeFolderAsk(value: unknown): { path: string } | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-  if (Object.keys(value).sort().join(',') !== 'path,v' || (value as { v?: unknown }).v !== 1) return null;
+  // v1 has exactly two keys, so never sort more than that (the signed body is the app's rebuild, but the Worker
+  // does not rely on it).
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || keys.sort().join(',') !== 'path,v' || (value as { v?: unknown }).v !== 1) return null;
   const path = plainFolderPath((value as { path?: unknown }).path);
   return path ? { path } : null;
 }

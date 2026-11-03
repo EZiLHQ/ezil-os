@@ -46,6 +46,15 @@ describe('code-folder v1 shared vectors', () => {
     for (const [input, want] of V.ask.accept as [unknown, string][]) expect(parseCodeFolderAsk(input)).toEqual({ path: want });
     for (const input of V.ask.reject as unknown[]) expect(parseCodeFolderAsk(input)).toBeNull();
   });
+  it('parseCodeFolderAsk refuses a caller-sized object without sorting its keys', () => {
+    const big: Record<string, unknown> = { v: 1, path: '/workspace/a' };
+    for (let i = 0; i < 10_000; i++) big[`k${i}`] = i;
+    const sort = Array.prototype.sort;
+    let sorts = 0;
+    Array.prototype.sort = function (this: unknown[], ...args: Parameters<typeof sort>) { sorts++; return sort.apply(this, args); } as typeof sort;
+    try { expect(parseCodeFolderAsk(big)).toBeNull(); } finally { Array.prototype.sort = sort; }
+    expect(sorts).toBe(0);
+  });
 
   it('planCodeFolder strips the SERVER root and refuses outside / not_allowed / invalid', () => {
     for (const c of V.plan as { root: string; path: string; expect: { resolve?: string; refused?: string } }[]) {
