@@ -818,6 +818,14 @@ export async function handlePreviewBootstrap(
   // carries it forward onto same-origin client-side requests for the rest of
   // that page load.
   const locationUrl = new URL(`/preview${destPath}`, url);
+  // `..` segments pop `/preview` itself: `path=/../..//evil.com` normalises to `//evil.com`, which the Location
+  // below would hand the browser as another host (with this cookie as `ezil_pv`).
+  if (locationUrl.pathname.startsWith('//')) {
+    return new Response(JSON.stringify({ ok: false, error: 'invalid_redirect' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
   // 🔴 code-server's file tree gap: see this function's doc comment above.
   // `handlePreviewProxy` forwards every remaining query param on the
   // eventual `/preview` request straight to the container

@@ -779,6 +779,35 @@ describe('handlePreviewBootstrap', () => {
     expect(locUrl.searchParams.has(PREVIEW_COOKIE_QUERY_PARAM)).toBe(true);
   });
 
+  it('refuses a `path` whose `..` segments pop /preview into `//host` (invalid_redirect, no cookie), both targets', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    for (const [port, label, target] of [
+      [APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, 'app'],
+      [CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN, 'code'],
+    ] as const) {
+      for (const path of ['/..//evil.com', '/../..//evil.com', '/%2e%2e//evil.com']) {
+        const url = new URL(
+          `https://${port}-${SID}-${label}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`,
+        );
+        const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, target);
+        expect(res.status).toBe(400);
+        expect(res.headers.get('content-type')).toBe('application/json');
+        expect(await res.json()).toEqual({ ok: false, error: 'invalid_redirect' });
+        expect(res.headers.get('location')).toBeNull();
+        expect(res.headers.get('set-cookie')).toBeNull();
+      }
+    }
+    // A `//host` or `/.//host` path stays under /preview, and a plain path still redirects.
+    for (const [path, pathname] of [['//evil.com', '/preview//evil.com'], ['/.//evil.com', '/preview//evil.com'], ['/app?x=1', '/preview/app']]) {
+      const url = new URL(
+        `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path!)}`,
+      );
+      const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')!.startsWith(`${pathname}?`)).toBe(true);
+    }
+  });
+
   // ── `folder=` passthrough — the "Code opens with an empty file tree" fix ───
   //
   // GAP: production never sent `folder=` on the code-server bridge URL, so

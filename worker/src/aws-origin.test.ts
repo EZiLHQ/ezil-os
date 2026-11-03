@@ -209,6 +209,23 @@ describe('handleAwsBrowserHost', () => {
     const wrong = await mintPreviewBootstrapToken(SECRET, 'guac-other-sandbox');
     expect((await call(`/preview-bootstrap?token=${encodeURIComponent(wrong)}`, d))!.status).toBe(401);
   });
+  it('bootstrap: a path whose dot segments normalise to `//host` is invalid_redirect, never a Location', async () => {
+    const { d } = deps();
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const boot = (path: string) => call(`/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`, d);
+    for (const path of ['/.//evil.com', '/..//evil.com', '/%2e//evil.com']) {
+      const res = (await boot(path))!;
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ ok: false, error: 'invalid_redirect' });
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('set-cookie')).toBeNull();
+    }
+    // A raw `//host` still falls back to the root, and a plain path is forwarded unchanged.
+    expect((await boot('//evil.com/x'))!.headers.get('location')).toBe('/');
+    const ok = (await boot('/app?x=1'))!;
+    expect(ok.status).toBe(302);
+    expect(ok.headers.get('location')).toBe('/app?x=1');
+  });
   it('no or wrong-sandbox cookie: 401 and nothing forwarded', async () => {
     const { f, d } = deps();
     expect((await call('/', d))!.status).toBe(401);

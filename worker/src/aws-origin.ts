@@ -355,6 +355,9 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     const raw = url.searchParams.get('path') || '/';
     const dest = new URL(raw.startsWith('/') && !raw.startsWith('//') ? raw : '/', url);
     if (dest.origin !== url.origin) return json({ ok: false, error: 'invalid_redirect' }, 400);
+    // The raw check above runs before dot segments resolve: `/.//evil.com`, `/..//evil.com` and `/%2e//evil.com`
+    // all normalise to `//evil.com`, which the Location below would hand the browser as another host.
+    if (dest.pathname.startsWith('//')) return json({ ok: false, error: 'invalid_redirect' }, 400);
     if (port === CODE_PREVIEW_PORT) {
       // Per-tab folder continuity (./code-folder.ts): what a Code document opens may only arrive as THIS
       // bootstrap's own `folder`, plain-absolute and under /workspace, never hidden in `path`'s query
