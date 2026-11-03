@@ -9,13 +9,25 @@
  * non-local request is aborted. The token exchange and JWKS are server-side and not reached by these flows; a verified
  * sign-in is covered by the route tests only.
  *
- * Start the app with fixture settings (no real client, no .env), ideally in a network namespace with only loopback:
- *   AUTH0_CLIENT_ID=local-fixture-client AUTH0_SECRET_ID=<any> NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:9
- *   NEXT_PUBLIC_SUPABASE_ANON_KEY=fixture SUPABASE_DATABASE_URL=postgres://fixture@127.0.0.1:9/none
- *   next dev --webpack --hostname 127.0.0.1 --port 3187
- * then: PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules node e2e/auth-recovery-local.mjs
- * Optional: AUTH_RECOVERY_BASE_URL (default http://localhost:3187), PLAYWRIGHT_CHROMIUM_EXECUTABLE.
- * A self-signed pair: openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=id.ezil.work -days 1 -keyout k.pem -out c.pem
+ * How it was run (os-share-auth evidence), as root, everything inside ONE network namespace with no way out:
+ *   unshare -n bash -c '
+ *     ip link set lo up
+ *     # Chromium refuses to navigate while it believes it is offline; a black-hole default route lets nothing out.
+ *     ip link add dummy0 type dummy && ip addr add 10.255.255.1/24 dev dummy0 && ip link set dummy0 up \
+ *       && ip route add default dev dummy0
+ *     cd app && setsid env -i PATH="$PATH" HOME="$HOME" NODE_ENV=development NEXT_TELEMETRY_DISABLED=1 \
+ *       AUTH0_CLIENT_ID=local-fixture-client AUTH0_SECRET_ID=local-fixture-secret-not-a-real-one \
+ *       NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:9 NEXT_PUBLIC_SUPABASE_ANON_KEY=fixture-anon \
+ *       SUPABASE_DATABASE_URL=postgres://fixture@127.0.0.1:9/none \
+ *       node node_modules/next/dist/bin/next dev --webpack --hostname 127.0.0.1 --port 3187 &
+ *     # wait for http://127.0.0.1:3187/login to answer 200, then:
+ *     PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules \
+ *       PLAYWRIGHT_CHROMIUM_EXECUTABLE=~/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell \
+ *       AUTH_RECOVERY_IDP_CERT=c.pem AUTH_RECOVERY_IDP_KEY=k.pem node ../e2e/auth-recovery-local.mjs'
+ * (No .env file may exist in app/. That Playwright expects headless shell 1228; 1248 is the one installed here.)
+ * The self-signed pair: openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=id.ezil.work -days 1 -keyout k.pem -out c.pem
+ * Chromium maps id.ezil.work:443 to the stand-in itself (--host-resolver-rules), and localhost to 127.0.0.1.
+ * Optional: AUTH_RECOVERY_BASE_URL (default http://localhost:3187), AUTH_RECOVERY_IDP_PORT (default 8443).
  * Exit 2 means unable to run.
  */
 import assert from 'node:assert/strict';
@@ -107,7 +119,7 @@ await check('unverified refusal: alert, accessible sign-out right after Continue
     const button = signOut(page);
     assert.equal(await button.count(), 1);
     const hint = await button.getAttribute('aria-describedby');
-    assert.match(await page.locator(`#${hint}`).innerText(), /Signs this browser out of EZiL ID/);
+    assert.match(await page.locator(`#${hint}`).textContent(), /Signs this browser out of EZiL ID/);
     await page.getByRole('link', { name: 'Continue with EZiL ID' }).focus();
     await page.keyboard.press('Tab');
     assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Sign out and use another account');
@@ -135,6 +147,7 @@ for (const [mode, options, activate] of [
         assert.equal(hops().logout.length, 1);
         assert.deepEqual(Object.fromEntries(hops().logout[0].searchParams), { client_id: 'local-fixture-client', post_logout_redirect_uri: `${base.origin}/login` });
         assert.equal(await page.getByRole('alert').count(), 0, 'the stale refusal is gone');
+        assert.equal(await signOut(page).count(), 0, 'the plain lock screen has no sign-out control');
         assert.equal(await href(page), '/auth/auth0/login?returnUrl=%2Fapp%2Fbrowser');
         const cookie = await kept(context);
         assert(cookie && cookie.httpOnly && cookie.secure && cookie.sameSite === 'Lax' && cookie.path === '/', 'kept in a host-only, httpOnly cookie');

@@ -129,17 +129,24 @@ export default async function LoginPage({
                   pick again (a refused, unverified one included), and comes back here
                   still headed for the same page. A plain same-origin form POST: it needs
                   no OS session, no JavaScript, and is the document load `/auth/signout`
-                  answers with a 303.
+                  answers with a 303. Shown with a refusal, which is when id.ezil.work's
+                  account is the problem; the plain lock screen keeps its height
+                  (e2e/login-layout.mjs, short desktop).
                 */}
-                {useAuth0 && (
+                {useAuth0 && notice && (
                     <form method="post" action="/auth/signout" className="flex w-full flex-col items-center">
                         <input type="hidden" name={RETURN_URL_PARAM} value={returnUrl} />
-                        <button type="submit" aria-describedby="switch-account-hint" className="ezil-lock-disclosure">
+                        {/* Styled like the email disclosure without its class: that one is the disclosure. */}
+                        <button
+                            type="submit"
+                            aria-describedby="switch-account-hint"
+                            className="mt-1 inline-flex min-h-11 max-w-full items-center justify-center rounded-md p-2 text-[0.8125rem] text-white/70 transition-colors hover:text-white"
+                        >
                             Sign out and use another account
                         </button>
-                        <p id="switch-account-hint" className="text-center text-xs leading-relaxed text-white/65">
+                        <span id="switch-account-hint" className="sr-only">
                             Signs this browser out of EZiL ID so you can choose an account.
-                        </p>
+                        </span>
                     </form>
                 )}
 

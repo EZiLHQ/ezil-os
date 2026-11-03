@@ -105,17 +105,25 @@ describe('auth recovery: Sign out and use another account', () => {
         expect(form).toContain('<input type="hidden" name="returnUrl" value="/app/browser"/>');
         expect(form).toContain('<button type="submit" aria-describedby="switch-account-hint"');
         expect(form).toContain('>Sign out and use another account</button>');
-        expect(form).toContain('id="switch-account-hint"');
+        expect(form).toContain('<span id="switch-account-hint" class="sr-only">');
+        // Not the email disclosure's class: `.ezil-lock-disclosure` is that toggle (e2e/login-layout.mjs selects it).
+        expect(form).not.toContain('ezil-lock-disclosure');
         // Order: Continue with EZiL ID, then the sign-out, then the Google and password forms.
         expect(html.indexOf('Continue with EZiL ID</a>')).toBeLessThan(html.indexOf(form!));
         expect(html.indexOf(form!)).toBeLessThan(html.indexOf('Continue with Google'));
         expect(html).not.toContain('private-test-secret');
     });
 
-    it.each([undefined, 'account_conflict', 'auth0_failed'])('offers the same sign-out on every EZiL ID render (error %j)', async error => {
+    it.each(['account_conflict', 'auth0_failed', 'invalid_transaction', '<script>x</script>'])('offers the same sign-out with every refusal (error %j)', async error => {
         auth0();
-        const html = await render(error ? { error } : {});
+        const html = await render({ error });
         expect(signOutForm(html)).toContain('name="returnUrl" value="/os"');
+    });
+
+    it('the plain lock screen (no refusal) keeps its height: no sign-out control', async () => {
+        auth0();
+        expect(await render()).not.toContain('/auth/signout');
+        expect(await render({ returnUrl: '/app/browser' })).not.toContain('/auth/signout');
     });
 
     it('never without Auth0: there is no id.ezil.work session to leave', async () => {
@@ -139,9 +147,10 @@ describe('auth recovery: Sign out and use another account', () => {
         for (let i = 0; i < 2; i += 1) {
             const html = await render();
             expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fapp%2Fbrowser"');
-            expect(signOutForm(html)).toContain('value="/app/browser"');
             expect(html).not.toContain('role="alert"');
         }
+        // A refusal on the next attempt offers the sign-out again, for the same page.
+        expect(signOutForm(await render({ error: 'email_unverified' }))).toContain('value="/app/browser"');
     });
 
     it('a returnUrl in the link wins over the kept page', async () => {
