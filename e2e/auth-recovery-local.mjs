@@ -185,6 +185,26 @@ for (const [mode, options, activate] of [
     });
 }
 
+await check('small phone 320x568: the unverified notice and the sign-out fit across, 44px target, scrolls into view unobstructed', async () => {
+    const { context } = await contextWith({ viewport: { width: 320, height: 568 }, isMobile: true, hasTouch: true });
+    const page = await context.newPage();
+    await page.goto(loginFor('/app/browser'));
+    const button = signOut(page);
+    await button.scrollIntoViewIfNeeded();
+    const measured = await button.evaluate(element => {
+        const rect = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return { width: rect.width, height: rect.height, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+            unobstructed: hit === element || element.contains(hit), scrollWidth: document.documentElement.scrollWidth, innerWidth, innerHeight };
+    });
+    assert(measured.scrollWidth <= measured.innerWidth + 1, 'no horizontal overflow');
+    assert(measured.width >= 44 && measured.height >= 44, '44px touch target');
+    assert(measured.left >= 0 && measured.right <= measured.innerWidth && measured.top >= 0 && measured.bottom <= measured.innerHeight, 'in view');
+    assert(measured.unobstructed, 'unobstructed');
+    if (process.env.AUTH_RECOVERY_SHOTS) await page.screenshot({ path: path.join(process.env.AUTH_RECOVERY_SHOTS, 'unverified-320x568.png'), fullPage: true });
+    await context.close();
+});
+
 for (const [hostile, expected] of [
     ['https://evil.example/', '/computers'], ['//evil.example', '/computers'], ['/\\evil.example', '/computers'],
     ['/%2F%2Fevil.example', '/computers'], ['javascript:alert(1)', '/computers'], ['/app/%2e%2e/admin', '/os'],
@@ -209,9 +229,14 @@ for (const [hostile, expected] of [
 await check('a tampered sign-out field is narrowed by the server before it is kept', async () => {
     const { context } = await contextWith();
     const page = await context.newPage();
-    await page.goto(loginFor('/app/browser'));
-    await page.locator('form[action="/auth/signout"] input[name="returnUrl"]').evaluate(input => { input.value = 'https://evil.example/'; });
-    await Promise.all([page.waitForURL(url => url.pathname === '/login' && !url.search), signOut(page).click()]);
+    // After hydration, which would otherwise put the rendered value back before the POST.
+    await page.goto(loginFor('/app/browser'), { waitUntil: 'networkidle' });
+    const field = page.locator('form[action="/auth/signout"] input[name="returnUrl"]');
+    await field.evaluate(input => { input.value = 'https://evil.example/'; });
+    assert.equal(await field.inputValue(), 'https://evil.example/', 'the field was tampered');
+    const [request] = await Promise.all([page.waitForRequest(r => r.method() === 'POST' && r.url().endsWith('/auth/signout')), signOut(page).click()]);
+    assert.equal(request.postData(), 'returnUrl=https%3A%2F%2Fevil.example%2F', 'the tampered value was sent');
+    await page.waitForURL(url => url.pathname === '/login' && !url.search);
     assert.equal(await href(page), '/auth/auth0/login?returnUrl=%2Fcomputers');
     await context.close();
 });
