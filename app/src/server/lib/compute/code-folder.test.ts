@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { CODE_FOLDER_OUTCOME_RE, codeFolderAnswer, parseCodeFolderAsk, plainFolderPath } from './code-folder';
 
@@ -30,6 +30,25 @@ describe('code-folder v1 shared vectors (app)', () => {
     it('parseCodeFolderAsk: exactly {v:1, path}', () => {
         for (const [input, want] of V.ask.accept as [unknown, string][]) expect(parseCodeFolderAsk(input)).toEqual({ v: 1, path: want });
         for (const input of V.ask.reject as unknown[]) expect(parseCodeFolderAsk(input)).toBeNull();
+    });
+});
+
+describe('parseCodeFolderAsk: a caller-sized object', () => {
+    it('more keys than v1 has is refused before any sort, and answers `invalid` like any malformed hint', () => {
+        const big: Record<string, unknown> = { v: 1, path: '/workspace/a' };
+        for (let i = 0; i < 10_000; i += 1) big[`k${i}`] = i;
+        const sort = vi.spyOn(Array.prototype, 'sort');
+        let parsed: ReturnType<typeof parseCodeFolderAsk> | undefined;
+        let sorts = -1;
+        try {
+            parsed = parseCodeFolderAsk(big);
+        } finally {
+            sorts = sort.mock.calls.length;
+            sort.mockRestore();
+        }
+        expect(parsed).toBeNull();
+        expect(sorts).toBe(0);
+        expect(codeFolderAnswer(undefined, big, parsed)).toEqual({ codeFolder: { v: 1, outcome: 'invalid' } });
     });
 });
 
