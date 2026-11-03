@@ -213,7 +213,8 @@ describe('handleAwsBrowserHost', () => {
     const { d } = deps();
     const token = await mintPreviewBootstrapToken(SECRET, SID);
     const boot = (path: string) => call(`/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`, d);
-    for (const path of ['/.//evil.com', '/..//evil.com', '/%2e//evil.com']) {
+    for (const path of ['/.//evil.com', '/..//evil.com', '/%2e//evil.com', '/%2E//evil.com', '/.%2e//evil.com', '/a/..//evil.com',
+      '/\\evil.com', '/\t//evil.com', '/\\[']) {
       const res = (await boot(path))!;
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ ok: false, error: 'invalid_redirect' });

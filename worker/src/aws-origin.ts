@@ -353,7 +353,12 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
     // Same-origin only: a `//host` or absolute `path` must not become an open redirect.
     const raw = url.searchParams.get('path') || '/';
-    const dest = new URL(raw.startsWith('/') && !raw.startsWith('//') ? raw : '/', url);
+    let dest: URL;
+    try {
+      dest = new URL(raw.startsWith('/') && !raw.startsWith('//') ? raw : '/', url);
+    } catch {
+      return json({ ok: false, error: 'invalid_redirect' }, 400); // `/\[` parses as an authority with a bad host
+    }
     if (dest.origin !== url.origin) return json({ ok: false, error: 'invalid_redirect' }, 400);
     // The raw check above runs before dot segments resolve: `/.//evil.com`, `/..//evil.com` and `/%2e//evil.com`
     // all normalise to `//evil.com`, which the Location below would hand the browser as another host.

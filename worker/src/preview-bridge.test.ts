@@ -785,7 +785,7 @@ describe('handlePreviewBootstrap', () => {
       [APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, 'app'],
       [CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN, 'code'],
     ] as const) {
-      for (const path of ['/..//evil.com', '/../..//evil.com', '/%2e%2e//evil.com']) {
+      for (const path of ['/..//evil.com', '/../..//evil.com', '/%2e%2e//evil.com', '/%2E%2E//evil.com', '/.%2e//evil.com', '/a/../..//evil.com']) {
         const url = new URL(
           `https://${port}-${SID}-${label}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`,
         );
