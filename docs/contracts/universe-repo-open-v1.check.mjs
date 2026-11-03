@@ -826,12 +826,29 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     for (const code of ['runtime_not_running', 'workspace_busy', 'workspace_failed']) {
         ok(originsOf(O.codes[code]).includes('host') && originsOf(O.codes[code]).includes('guest'), `awsOutcomeOrigin: ${code} is answered by the host and inducible by guest root`);
     }
-    ok(/first grant issuance/.test(O.consumerRule) && /candidate-forgeable/.test(O.consumerRule) && /consuming/.test(O.consumerRule)
-        && /head, clean, remote and branch/.test(O.consumerRule) && /in-guest evidence only/.test(O.consumerRule),
-        'awsOutcomeOrigin consumerRule: after the first grant issuance a guest-origin outcome consumes; success fields are in-guest evidence only');
+    // Founder 32d1100d: PREPARE, one atomic START, AFTER START. It replaces the r61 clock, which started at the first grant issuance.
+    const CR = O.consumerRule;
+    ok(/an admission before START binds identity only; no candidate has computer access/.test(CR) && /a grant of scope read/.test(CR)
+        && /every PREPARE outcome, whatever its origin, is non-consuming/.test(CR),
+        'awsOutcomeOrigin consumerRule PREPARE: identity-only admission, no computer access, a read-scope grant, every outcome non-consuming');
+    ok(/never reads \/workspace/.test(CR) && /starter-SHA pin equal to head/.test(CR) && /the pre-admission precondition: the guest's root state is fresh for this attempt/.test(CR)
+        && /root volume replaced from the pinned AMI, or a new instance, in PREPARE before the open, with the AMI and volume ids from AWS API receipts/.test(CR)
+        && /is never started/.test(CR) && /gate defect/.test(CR),
+        'awsOutcomeOrigin consumerRule readiness: trusted checks on a fresh root state (CK-1), or the attempt is never started');
+    ok(/START is one atomic consumer transaction: countdown start, immutable deadline, task release, and the candidate's computer access and write grant/.test(CR)
+        && /Works mints it before START, idempotent per attempt and undelivered; START commits; then the brief, the access and the grant are delivered/.test(CR)
+        && /only by op refresh with scope write/.test(CR) && /re-delivers the same grant, never a second, and never moves the deadline/.test(CR),
+        'awsOutcomeOrigin consumerRule START: one atomic transaction; the grant minted before it (CK-3) and delivered only by refresh after it');
+    ok(/AFTER START, every outcome the candidate can cause is consuming and never extends the deadline/.test(CR)
+        && /an instance-initiated shutdown, an instance status-check failure, an idle stop from inactivity/.test(CR)
+        && /Only a provider loss proven from the AWS API \(r63 CK-2: an EC2 Server\.\* state reason, a failed system status check or an AWS Health event; never the guest or the instance itself\) is non-consuming/.test(CR)
+        && /Restarts are capped, and no restart reopens the clock/.test(CR),
+        'awsOutcomeOrigin consumerRule AFTER START: candidate-causable outcomes consume and never extend the deadline; only an AWS-API-proven provider loss does not (CK-2)');
+    ok(/head, clean, remote and branch/.test(CR) && /in-guest evidence only/.test(CR), 'awsOutcomeOrigin consumerRule: the success fields are in-guest evidence only');
+    ok(!/first grant/.test(CR) && !/clock starts at/.test(CR) && !/not candidate-forgeable/.test(CR) && !/the host or the control plane/.test(CR),
+        'awsOutcomeOrigin consumerRule: the withdrawn r61 clock (from the first grant issuance) is gone, and the host never proves provider loss');
     // r56 recheck: under identity A the owner can cause worker- and host-origin outcomes after the grant (a stop, a restart, an idle stop).
-    ok(!/not candidate-forgeable/.test(O.consumerRule) && /whatever the origin/.test(O.consumerRule) && /identity A/.test(O.consumerRule),
-        'awsOutcomeOrigin consumerRule: the clock starts at the first grant issuance whatever the origin of a later outcome; no outcome is called unforgeable by origin');
+    ok(/identity A/.test(CR) && /Creator or company capacity/.test(CR), 'awsOutcomeOrigin consumerRule: the owner notes assume identity A; the consumer classifies an owner stop in another placement');
     ok(!/can only delay/.test(O.rule) && /may never become final/.test(O.rule), 'awsOutcomeOrigin rule: running may never become final (an owner stop), not only be delayed');
     for (const code of ['workspace_unsupported', 'runtime_not_running', 'workspace_not_ready']) {
         ok(O.codes[code] && O.codes[code].paths.some((p) => /owner/.test(p)), `awsOutcomeOrigin: ${code} carries the owner note (identity A)`);
