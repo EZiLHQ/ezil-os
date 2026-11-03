@@ -831,14 +831,17 @@ ok(C.STAGING_DIR_TEMPLATE === `${C.STAGING_ROOT_NAME}/<uuid>` && !C.STAGING_ROOT
     ok(/an admission before START binds identity only; no candidate has computer access/.test(CR) && /a grant of scope read/.test(CR)
         && /every PREPARE outcome, whatever its origin, is non-consuming/.test(CR),
         'awsOutcomeOrigin consumerRule PREPARE: identity-only admission, no computer access, a read-scope grant, every outcome non-consuming');
-    ok(/never reads \/workspace/.test(CR) && /starter-SHA pin equal to head/.test(CR) && /the pre-admission precondition: the guest's root state is fresh for this attempt/.test(CR)
-        && /root volume replaced from the pinned AMI, or a new instance, in PREPARE before the open, with the AMI and volume ids from AWS API receipts/.test(CR)
-        && /is never started/.test(CR) && /gate defect/.test(CR),
-        'awsOutcomeOrigin consumerRule readiness: trusted checks on a fresh root state (CK-1), or the attempt is never started');
+    ok(/never reads \/workspace/.test(CR) && /starter-SHA pin equal to head/.test(CR) && /the pre-admission precondition: the guest's state is fresh for this attempt/.test(CR)
+        && /a fresh data volume \(upper, \/workspace, profiles\) claimed from the pinned image in PREPARE before the open, with the AMI, instance and both volume ids from AWS API receipts/.test(CR)
+        && /a new instance or a new root volume alone keeps the data volume and clears nothing/.test(CR) && /no candidate or owner has reached the guest/.test(CR)
+        && !/root volume replaced/.test(CR) && /is never started/.test(CR) && /gate defect/.test(CR),
+        'awsOutcomeOrigin consumerRule readiness: trusted checks on a fresh DATA volume (F-SEAT-RESET (A), r65), or the attempt is never started');
     ok(/START is one atomic consumer transaction: countdown start, immutable deadline, task release, and the candidate's computer access and write grant/.test(CR)
-        && /Works mints it before START, idempotent per attempt and undelivered; START commits; then the brief, the access and the grant are delivered/.test(CR)
-        && /only by op refresh with scope write/.test(CR) && /re-delivers the same grant, never a second, and never moves the deadline/.test(CR),
-        'awsOutcomeOrigin consumerRule START: one atomic transaction; the grant minted before it (CK-3) and delivered only by refresh after it');
+        && /only by op refresh with scope write/.test(CR) && /in one of two orders \(f6a67dd0 decides\)/.test(CR)
+        && /\(i\) r63 CK-3: Works mints it before START, idempotent per attempt and undelivered; START commits; then the brief, the access and the grant are delivered, and a delivery failure that no AWS API record proves to be provider loss consumes the attempt/.test(CR)
+        && /\(ii\) r64: minted and delivered as the last PREPARE step, only while the seat is bound, fresh and unreachable, expiring by S\+G\+D and revoked at E1 or a no-show; START records it, remote services admit only the committed START epoch, and a delivery failure aborts PREPARE, non-consuming/.test(CR)
+        && /re-delivers the same grant, never a second, and never moves the deadline/.test(CR),
+        'awsOutcomeOrigin consumerRule START: one atomic transaction; the write grant by refresh only, in order (i) CK-3 or (ii) r64');
     ok(/AFTER START, every outcome the candidate can cause is consuming and never extends the deadline/.test(CR)
         && /an instance-initiated shutdown, an instance status-check failure, an idle stop from inactivity/.test(CR)
         && /Only a provider loss proven from the AWS API \(r63 CK-2: an EC2 Server\.\* state reason, a failed system status check or an AWS Health event; never the guest or the instance itself\) is non-consuming/.test(CR)
