@@ -79,7 +79,10 @@ function bridgeBehaviour(patched, origins = ['https://os-staging.ezil.work']) {
   t.fire({ source: t.parent, origin: 'https://evil.example', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
   t.fire({ source: t.parent, origin: `${ALLOWED}.evil.example`, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
   if (!origins.includes('https://os.ezil.work')) t.fire({ source: t.parent, origin: 'https://os.ezil.work', data: { type: 'ezil.code.hello', v: 1, nonce: N } });
-  t.fire({ source: {}, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+  // another window (a sibling or child frame) at an allowed origin, able to receive: it is not window.parent, so no report
+  const stranger = [];
+  t.fire({ source: { postMessage: (m, o) => stranger.push({ m, o }) }, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: N } });
+  assert.deepEqual(stranger, [], 'a hello from a window other than window.parent gets no report');
   t.fire({ source: t.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 1, nonce: 'short' } });
   t.fire({ source: t.parent, origin: ALLOWED, data: { type: 'ezil.code.hello', v: 2, nonce: N } });
   t.fire({ source: t.parent, origin: ALLOWED, data: '{"type":"ezil.code.hello","v":1}' });
