@@ -179,6 +179,15 @@ If you believe an attribution is missing or inaccurate, please open an issue
   (`telemetry.telemetryLevel: off`, `--disable-telemetry`,
   `APPLICATION_INSIGHTS_NO_STATSBEAT`), and the Copilot/telemetry-only hosts
   are additionally mapped to loopback at boot by `worker/scripts/editor-state.sh`.
+- **Folder bridge (build-time modification of the code-server workbench):**
+  `worker/code-folder-bridge/patch-folder-bridge.sh` also edits the
+  shipped `out/vs/code/browser/workbench/workbench.js`. It adds a
+  workspace provider that tells the EZiL shell, through an origin- and
+  nonce-checked `postMessage`, which folder this editor document opened,
+  and it makes an in-editor Open Folder replace the frame's history entry
+  instead of pushing one. The file then carries a second one-line
+  "EZiL build-time modification" notice naming that script. Same MIT
+  terms, no endorsement claimed.
 - **Also bundled by code-server, not by this repository, and not used by
   EZiL:** the core "Agent Host" runtime `@github/copilot-sdk` and
   `@github/copilot-sdk-linux-x64` (`lib/vscode/node_modules/@github/`,
