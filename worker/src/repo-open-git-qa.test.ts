@@ -151,7 +151,8 @@ describe('opted in ({ stagingGitQa: true }), git-qa.ezil.work opens as Basic aut
       ok: true,
       request: {
         repositoryId: REPO, canonicalURL: GIT_QA_P, ref: 'refs/heads/feature/x-1', branch: 'feature/x-1',
-        token: GRANT, expiresAt: EXPIRES, auth: 'basic', timeoutMs: 45_000,
+        // the scope is kept since repo-grant: an EZiL Git open with one installs push access
+        token: GRANT, expiresAt: EXPIRES, scope: 'write', auth: 'basic', timeoutMs: 45_000,
       },
     });
   });

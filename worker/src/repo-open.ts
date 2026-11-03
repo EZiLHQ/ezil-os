@@ -263,6 +263,8 @@ export interface RepoOpenRequest {
   branch: string;
   token: string;
   expiresAt: string;
+  /** The grant's scope when the caller sent it (`git.scope`): an EZiL Git open then installs push access (`./repo-grant.ts`). */
+  scope?: 'read' | 'write';
   /** Chosen from the URL's host by `parseRepoOpenRequest`, never by the caller. */
   auth: RepoOpenAuth;
   /** The whole open's bound, ms: the caller's `timeoutMs`, or `REPO_OPEN_EXEC_TIMEOUT_MS`. */
@@ -364,7 +366,10 @@ export function parseRepoOpenRequest(
   if (expiry - now < REPO_OPEN_MIN_TOKEN_LIFETIME_MS) return { ok: false, error: 'repo_open_token_expired' };
   return {
     ok: true,
-    request: { repositoryId, canonicalURL: canonicalURL as string, ref: ref as string, branch, token, expiresAt, auth, timeoutMs },
+    request: {
+      repositoryId, canonicalURL: canonicalURL as string, ref: ref as string, branch, token, expiresAt,
+      ...(git.scope === 'read' || git.scope === 'write' ? { scope: git.scope } : {}), auth, timeoutMs,
+    },
   };
 }
 
