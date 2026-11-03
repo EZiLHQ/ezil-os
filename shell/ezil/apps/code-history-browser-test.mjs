@@ -1,6 +1,8 @@
-// code-history-browser-test.mjs — EZiL-authored. REAL-BROWSER test that shell
-// Back/Forward never reloads the Code editor at an older document (F2) and that
-// a re-mint never adds a history entry for the editor (apps/code.js `loadFrame`).
+// code-history-browser-test.mjs — EZiL-authored. REAL-BROWSER test of how the
+// Code window's editor frame lives through shell history, with unsaved work as
+// the rule: the shell never tears a live editor down by itself, and every
+// replacement of an editor document goes through that document's own
+// `beforeunload` (code-server's "pending backups" veto).
 //
 // Run:  node shell/ezil/apps/code-history-browser-test.mjs
 //       (after shell/build-shell.sh — it tests the BUILT bundle; or point
@@ -12,18 +14,25 @@
 // workbench's bridge (worker/code-folder-bridge): `ezil.code.ready`, a report
 // per hello `{mint, kind, path, base}` to the shell origin only, and an
 // in-editor Open Folder as `location.replace` (the bridge's B3). Its bootstrap
-// 302s to the first document with `ezil_mint`, as the Worker does on AWS.
+// 302s to the first document with `ezil_mint`, as the Worker does on AWS. Each
+// editor document reports `beforeunload` and `pagehide` to its own server
+// (sendBeacon), so the test sees whether a document was navigated away (its
+// veto ran) or removed (it did not).
 //
-//   F2           Code open, another app pushed, Code back (push), Open Folder in
-//                the editor: Back/Forward walk the shell entries and the editor
-//                document never reloads; the folder record stays on the new one.
-//   control      the same with an editor that reports no `base` (an older
-//                bridge): the shell cannot reload it, and Back DOES reload the
-//                editor at the mint's first folder. Proves the check sees F2.
-//   no push      Open Folder with no shell push since the frame loaded: no
-//                extra load at all.
-//   remint       a restart re-mints Code: no new history entry; Back leaves the
-//                shell, never takes the editor to the expired bootstrap URL.
+//   no teardown  Code open, another app pushed, Code back, Open Folder in the
+//                editor: one editor load, the new document is never torn down
+//                by the shell, and the old one left through its beforeunload.
+//   F2 OPEN      Back then reloads the editor at the mint's first folder (known
+//                gap: fixing it needs a durable-backup + edit-quiescence
+//                handshake with the editor). Even so, the document it leaves
+//                gets its beforeunload. When F2 is fixed this check flips.
+//   no push      Open Folder with no shell push: one load.
+//   remint       a restart re-mints Code by NAVIGATING the live frame: the old
+//                document gets its beforeunload (it is never removed). Known
+//                cost while F2 is open: one history entry.
+//
+// The fake editor has no working copy: unsaved-edit survival itself needs real
+// code-server (not run here).
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -42,7 +51,8 @@ const ok = (cond, msg) => { assert.ok(cond, msg); checks += 1; console.log(`PASS
 
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
 let mints = 0;
-const docs = []; // every editor document the browser loaded, by query, in order
+const docs = []; // every editor document the browser loaded, by query, in order (its index is its id)
+const events = []; // [{ e: 'beforeunload' | 'pagehide', doc }] the documents reported about themselves
 let reportBase = true;
 let shellOrigin = '';
 let editorOrigin = '';
@@ -82,6 +92,9 @@ const folder = q.get('folder');
 const report = folder ? { kind: 'folder', path: folder } : { kind: 'empty' };
 ${reportBase ? 'report.base = location.pathname;' : ''}
 document.getElementById('doc').textContent = location.search;
+const DOC = __DOC__;
+addEventListener('beforeunload', () => navigator.sendBeacon('/event?e=beforeunload&doc=' + DOC));
+addEventListener('pagehide', () => navigator.sendBeacon('/event?e=pagehide&doc=' + DOC));
 addEventListener('message', (ev) => {
   const d = ev.data;
   if ( ev.source !== parent || ev.origin !== SHELL || ! d || d.type !== 'ezil.code.hello' || d.v !== 1 || ! /^[A-Za-z0-9_-]{22}$/.test(d.nonce || '') ) return;
@@ -101,8 +114,10 @@ const editor = createServer((req, res) => {
     if ( url.pathname === '/' ) {
         // Every editor document is one request here (no-store: a history reload cannot come from a cache).
         docs.push(url.search);
-        res.setHeader('content-type', 'text/html'); res.setHeader('cache-control', 'no-store'); res.end(editorHtml()); return;
+        res.setHeader('content-type', 'text/html'); res.setHeader('cache-control', 'no-store');
+        res.end(editorHtml().replace('__DOC__', String(docs.length - 1))); return;
     }
+    if ( url.pathname === '/event' ) { events.push({ e: url.searchParams.get('e'), doc: Number(url.searchParams.get('doc')) }); res.statusCode = 204; res.end(); return; }
     res.statusCode = 404; res.end();
 });
 await new Promise(r => shell.listen(0, '127.0.0.1', r));
@@ -145,71 +160,60 @@ async function openCodeFromDock (t) {
     await t.waitRecord('/workspace/a'); // the mint's first document reported, bound to this mint
 }
 
-// ── F2 and its control ─────────────────────────────────────────────────────
-for ( const withBase of [true, false] ) {
-    reportBase = withBase;
-    const label = withBase ? 'F2' : 'control (no base)';
+const on = (e, doc) => events.some(x => x.e === e && x.doc === doc);
+
+// ── no automatic teardown after a shell push; F2 stays open ────────────────
+{
     const t = await tab();
     await openCodeFromDock(t);
     await t.page.locator('.taskbar-item[data-app="settings"]').click(); await t.at('/app/settings');
     await t.page.locator('.taskbar-item[data-app="code"]').click(); await t.at('/app/code');
     const before = t.loads.length;
+    const first = before - 1; // the mint's first document
     await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
     await t.waitRecord('/workspace/b');
-    await t.quiet();
+    await t.quiet(); await t.quiet();
     const opened = t.loads.length - before;
-    if ( withBase ) ok(opened === 2, `${label}: Open Folder after a shell push loads the editor twice (its replace, then a fresh frame) [${opened}]`);
-    else ok(opened === 1, `${label}: an editor without a document path is not reloaded by the shell [${opened}]`);
-    const afterOpen = t.loads.length;
-    const len = await t.page.evaluate(() => history.length);
+    const b = before; // the Open Folder document
+    ok(opened === 1, `no teardown: after a shell push, Open Folder loads the editor once; the shell never replaces it [${opened}]`);
+    ok(! on('pagehide', b), 'no teardown: the new document is never torn down while it is on screen');
+    ok(on('beforeunload', first), 'no teardown: the document Open Folder left went through its own beforeunload');
     await t.page.goBack(); await t.at('/app/settings'); await t.quiet();
     await t.page.goBack(); await t.at('/app/code'); await t.quiet();
-    const back = t.loads.slice(afterOpen);
-    if ( withBase ) {
-        ok(back.length === 0, `${label}: Back twice across the shell entries never reloads the editor [${JSON.stringify(back)}]`);
-        ok(new URL(t.editorFrame().url()).searchParams.get('folder') === '/workspace/b', `${label}: the editor still shows /workspace/b after Back`);
-        ok(await t.record() === '/workspace/b', `${label}: the folder record stays /workspace/b after Back`);
-        await t.page.goForward(); await t.at('/app/settings'); await t.quiet();
-        await t.page.goForward(); await t.at('/app/code'); await t.quiet();
-        ok(t.loads.length === afterOpen, `${label}: Forward twice never reloads the editor [${JSON.stringify(t.loads.slice(afterOpen))}]`);
-        ok(await t.page.evaluate(() => history.length) === len, `${label}: the shell's history length is unchanged by any of it`);
-    } else {
-        ok(back.some(u => new URLSearchParams(u).get('folder') === '/workspace/a'),
-            `${label}: positive control: Back DOES reload the editor at the mint's first folder (F2 is visible to this check) [${JSON.stringify(back)}]`);
-    }
+    const back = t.loads.slice(b + 1);
+    ok(back.some(u => new URLSearchParams(u).get('folder') === '/workspace/a'),
+        `F2 OPEN (known gap, not a fix): Back reloads the editor at the mint's first folder [${JSON.stringify(back)}]`);
+    ok(on('beforeunload', b), 'F2 OPEN: even so, the document Back replaced went through its own beforeunload (its veto ran)');
     await t.context.close();
 }
-reportBase = true;
 
-// ── no push since the frame loaded: no extra load ──────────────────────────
+// ── no push since the frame loaded: one load ───────────────────────────────
 {
     const t = await tab();
     await openCodeFromDock(t);
     const before = t.loads.length;
     await t.editorFrame().evaluate(() => window.openFolder('/workspace/c'));
     await t.waitRecord('/workspace/c'); await t.quiet();
-    ok(t.loads.length - before === 1, `no push: Open Folder loads the editor once, no shell reload [${t.loads.length - before}]`);
+    ok(t.loads.length - before === 1, `no push: Open Folder loads the editor once [${t.loads.length - before}]`);
     await t.context.close();
 }
 
-// ── remint: no history entry; Back never loads the expired bootstrap URL ────
+// ── remint: the live frame is navigated, never removed ─────────────────────
 {
     const t = await tab();
     await openCodeFromDock(t);
     const len = await t.page.evaluate(() => history.length);
     const firstMint = mints;
+    const old = t.loads.length - 1;
     await t.page.evaluate((computerId) => window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } })), computerId);
     await t.quiet();
     ok(mints === firstMint + 1, `remint: the restart re-minted once [${mints - firstMint}]`);
     await t.waitRecord('/workspace/a'); await t.quiet();
-    ok(await t.page.evaluate(() => history.length) === len, 'remint: no history entry added by the re-mint');
-    const afterRemint = t.loads.length;
-    await t.page.goBack(); await t.at('/os'); await t.quiet();
-    const back = t.loads.slice(afterRemint);
-    ok(back.length === 0, `remint: Back leaves the shell entry and loads no editor document (never the expired bootstrap's) [${JSON.stringify(back)}]`);
+    ok(on('beforeunload', old), 'remint: the live editor document went through its own beforeunload (navigated, never removed)');
+    ok(await t.page.evaluate(() => history.length) === len + 1, 'remint: known cost while F2 is open, the navigation adds one history entry');
     await t.context.close();
 }
 
 ok(errors.length === 0, `no uncaught page errors [${errors.join(' | ')}]`);
 await browser.close(); shell.close(); editor.close();
-console.log(`PASS ${checks} checks: Code history (F2 Back/Forward, its control, no push, remint)`);
+console.log(`PASS ${checks} checks: Code history (no automatic teardown, F2 open, no push, remint navigates)`);

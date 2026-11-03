@@ -216,22 +216,6 @@ export function editorDocumentUrl (frameUrl, report) {
     return u.href;
 }
 
-/**
- * Load `url` into `iframe` as a NEW browsing context when it already shows a document. Chrome keeps a frame's
- * document per joint history entry, so assigning `src` to a live frame adds an entry, and Back would then take the
- * editor to the previous URL (an expired bootstrap token, or the folder before an in-frame Open Folder) while the
- * shell stays put. A frame removed and inserted again is a new one that no earlier entry knows, so Back/Forward
- * leave it alone. Same element, same listeners, same place. Measured in Chromium 151 (lead scratch f2exp).
- */
-export function loadFrame (iframe, url) {
-    if ( ! iframe.getAttribute('src') || ! iframe.parentNode ) { iframe.src = url; return; }
-    const parent = iframe.parentNode;
-    const next = iframe.nextSibling;
-    iframe.remove();
-    iframe.src = url;
-    parent.insertBefore(iframe, next);
-}
-
 const bridges = new WeakMap();
 
 /** Stop listening for `iframe`'s editor (the window closed). */
@@ -255,11 +239,21 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  * server found it missing or not a directory, shows the notice once for this
  * binding and leaves the record as it was.
  *
- * `continued`: `frameUrl` is the editor's own document URL that `loadFrame` put
- * in a fresh frame (no mint): its documents are all user-driven. `onUserFolder`
- * hears each user-driven folder or empty window that differs from the last one
- * reported, with the URL to reload it at (`editorDocumentUrl`, null if the
- * editor did not say its document path).
+ * `continued`: `frameUrl` is the editor's own document URL in a frame that has
+ * no mint: its documents are all user-driven. `onUserFolder` hears each
+ * user-driven folder or empty window that differs from the last one reported,
+ * with the URL of that document (`editorDocumentUrl`, null if the editor did not
+ * say its document path).
+ *
+ * 🔴 F2 IS OPEN, and nothing here may tear the editor down by itself. Chrome
+ * keeps a frame's document per joint history entry, so after an in-frame Open
+ * Folder, Back to a shell entry pushed while Code was open reloads the editor at
+ * the mint's first folder (measured, Chromium 151). Reloading the editor's own
+ * document in a fresh frame (remove + re-insert) avoids that, but removing a live
+ * frame skips its `beforeunload`, i.e. code-server's "pending backups" veto, and
+ * can lose unsaved edits (independent review, 3 Nov 2026). No shell code may do
+ * that until the editor can confirm its backups are durable and editing has
+ * stopped. A delay or a generic ready message is not that confirmation.
  */
 export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, continued = false }) {
     bridges.get(iframe)?.detach();

@@ -619,8 +619,9 @@ await settle(4);
     const frame = () => q('.window[data-app="code"] .window-app-iframe');
     const before = mintedUrls.length, src = frame()?.getAttribute('src');
     push('a Code window is open before the restart', !! frame() && !! src);
-    // F2 / remint: the re-mint must load into a FRESH frame (the same element removed and inserted again), never
-    // re-navigate the live one, whose new joint history entry would let Back load the expired bootstrap URL.
+    // Unsaved work: a re-mint NAVIGATES the live frame in place, so the editor's own `beforeunload` (code-server's
+    // "pending backups" veto) still runs. It is never removed and re-inserted, which would skip that veto
+    // (independent review, 3 Nov 2026). Known cost: the navigation adds a joint history entry (F2 is open).
     const el0 = frame();
     const srcWhileConnected = [];
     const desc = Object.getOwnPropertyDescriptor(window.HTMLIFrameElement.prototype, 'src');
@@ -638,8 +639,8 @@ await settle(4);
     push('🔴 a restart of THIS computer re-mints Code exactly once', mintedUrls.length === before + 1, `${mintedUrls.length - before}`);
     push('the Code frame now shows the freshly minted URL',
         !! frame() && untag(frame().getAttribute('src')) === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
-    push('the re-mint loads a fresh frame: the same element, removed once and inserted again, src set while detached',
-        frame() === el0 && removals === 1 && srcWhileConnected.length === 1 && srcWhileConnected[0] === false,
+    push('the re-mint navigates the live frame in place (never removed, src set while connected): the editor can still veto',
+        frame() === el0 && removals === 0 && srcWhileConnected.length === 1 && srcWhileConnected[0] === true,
         `same element: ${frame() === el0}; removals: ${removals}; src set while connected: ${JSON.stringify(srcWhileConnected)}`);
     delete el0.src;
     await window.$(q('.window[data-app="code"]')).close();

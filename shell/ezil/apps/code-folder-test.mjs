@@ -247,7 +247,7 @@ F.load(); reportB(null, 'empty', null, '/'); eq(follows.at(-1), { url: DOC('/?ew
 F.load(); reportB(null, 'folder', '/workspace/c'); eq(follows.at(-1), { url: null }, 'no document path from the editor: a change without a URL');
 F.load(); reportB(null, 'workspace', null, '/'); eq(follows.length, 3, 'a workspace document is no folder change');
 M.detachFolderBridge(F);
-// A continued frame (re-inserted at the editor's own URL, no mint): its first report is the folder it was loaded at
+// A continued frame (the editor's own URL, no mint): its first report is the folder it was loaded at
 // (no change, so no reload loop); later user-driven changes are heard and recorded.
 follows.length = 0; F.src = DOC('/?folder=%2Fworkspace%2Fb');
 M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onUserFolder: (x) => follows.push(x), continued: true });
@@ -257,16 +257,6 @@ eq(M.folderAskFor(bind), { v: 1, path: '/workspace/b' }, 'continued: the record 
 F.load(); reportB(null, 'folder', '/workspace/d', '/'); eq(follows, [{ url: DOC('/?folder=%2Fworkspace%2Fd') }], 'continued: a later Open Folder is heard');
 F.load(); reportB(mintOf(url), 'folder', '/workspace/a', '/'); eq(M.folderAskFor(bind), { v: 1, path: '/workspace/d' }, 'continued: an earlier mint\'s document is dropped');
 M.detachFolderBridge(F);
-// loadFrame: a frame with no document gets `src`; a live one is removed and inserted again at the same place
-const host = { kids: [], insertBefore (el, next) { const i = next ? this.kids.indexOf(next) : -1; this.kids.splice(i < 0 ? this.kids.length : i, 0, el); el.parentNode = this; } };
-const el = (name) => ({ name, parentNode: null, attrs: {}, src: '', getAttribute (k) { return this.attrs[k] ?? null; },
-    get nextSibling () { const k = this.parentNode?.kids; return k ? k[k.indexOf(this) + 1] ?? null : null; }, remove () { const i = this.parentNode.kids.indexOf(this); this.parentNode.kids.splice(i, 1); this.parentNode = null; this.removed = (this.removed ?? 0) + 1; } });
-const fr = el('frame'); const after = el('notice'); host.insertBefore(fr, null); host.insertBefore(after, null);
-Object.defineProperty(fr, 'src', { get () { return this.attrs.src ?? ''; }, set (v) { this.attrs.src = v; this.assigned = [...(this.assigned ?? []), { v, connected: !! this.parentNode }]; } });
-M.loadFrame(fr, 'https://h/first'); eq(fr.removed, undefined, 'no document yet: not re-inserted'); eq(fr.assigned, [{ v: 'https://h/first', connected: true }], 'src set in place');
-M.loadFrame(fr, 'https://h/second'); eq(fr.removed, 1, 'a live frame is removed once');
-eq(fr.assigned.at(-1), { v: 'https://h/second', connected: false }, 'its src is set while detached (no navigation of the old frame)');
-eq(host.kids.map(k => k.name), ['frame', 'notice'], 'inserted again at the same place, before its next sibling');
 
 // ── the notice band: text only, actions per outcome ─────────────────────────
 globalThis.document = { createElement: (t) => ({ t, children: [], attrs: {}, listeners: {}, className: '', textContent: '',
