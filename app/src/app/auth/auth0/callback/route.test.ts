@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn() }));
+const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn(), getUser: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => ({ set: stub.set }) }));
 vi.mock('@/server/auth/auth0', async importOriginal => ({ ...await importOriginal<typeof import('@/server/auth/auth0')>(), exchangeCode: stub.exchangeCode, verifyIdToken: stub.verifyIdToken }));
 vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge, refuseSilentAccountSwitch: stub.refuseSwitch }));
 vi.mock('@/server/auth/retained-identity', () => ({ retainProjectIdentity: stub.retain }));
+// The OS session, asked only on a replayed or lost transaction. None by default.
+vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.getUser } }) }));
 
 import { AUTH0_COOKIE, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
 import { GET } from './route';
@@ -23,6 +25,7 @@ beforeEach(async () => {
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network call'); }));
     stub.exchangeCode.mockResolvedValue('private-id-token');
     stub.verifyIdToken.mockResolvedValue({ sub: 'auth0|one', email: 'private@example.com' });
+    stub.getUser.mockResolvedValue({ data: { user: null }, error: null });
     const url = await buildAuthorizeUrl({ origin, returnUrl: '/os?computer=one' });
     state = url.searchParams.get('state')!;
     cookie = stub.set.mock.calls[0][1];
@@ -260,5 +263,43 @@ describe('Auth0 callback failure keeps only a vouched-for destination (auth reco
         stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
         const response = await GET(request({ returnUrl: '/app/settings' }));
         expect(response.headers.get('location')).toBe(failed('email_unverified', '/os?computer=one'));
+    });
+});
+
+describe('Auth0 callback: Back after a successful sign-in (fd0 QA-SH-1)', () => {
+    const signedIn = () => stub.getUser.mockResolvedValue({ data: { user: { id: 'abcdef01-2345-6789-abcd-ef0123456789' } }, error: null });
+    beforeEach(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
+    it.each([
+        ['the spent transaction is gone', () => ({ query: {}, value: null as string | null })],
+        ['another tab holds the transaction', () => ({ query: { state: 'replayed-state' }, value: cookie as string | null })],
+    ])('🔴 %s and the person is still signed in: back into the OS, the replayed code never used', async (_label, setup) => {
+        signedIn();
+        const { query, value } = setup();
+        const response = await GET(request({ code: 'replayed-code', ...query }, value));
+        expect(response.headers.get('location')).toBe(`${origin}/os`);
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+        expect(stub.bridge).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expectCleared(response);
+    });
+    it('without a session it is still the plain refusal, and an unreadable session counts as none', async () => {
+        expect((await GET(request({ code: 'replayed-code' }, null))).headers.get('location')).toBe(failed('invalid_transaction'));
+        stub.getUser.mockResolvedValue({ data: { user: { id: 'x' } }, error: { message: 'jwt expired' } });
+        expect((await GET(request({ code: 'replayed-code' }, null))).headers.get('location')).toBe(failed('invalid_transaction'));
+        stub.getUser.mockRejectedValue(new Error('auth unreachable'));
+        expect((await GET(request({ code: 'replayed-code' }, null))).headers.get('location')).toBe(failed('invalid_transaction'));
+    });
+    it('a refusal with a valid transaction is never turned into a pass, signed in or not', async () => {
+        signedIn();
+        stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+        expect((await GET(request())).headers.get('location')).toBe(failed('email_unverified', '/os?computer=one'));
+        expect((await GET(request({ error: 'access_denied', code: '' }))).headers.get('location')).toBe(failed('auth0_failed', '/os?computer=one'));
+    });
+    it('the session is only asked on a replayed or lost transaction', async () => {
+        signedIn();
+        await GET(request());
+        vi.stubEnv('AUTH0_CLIENT_ID', '');
+        expect((await GET(request())).headers.get('location')).toBe(failed('auth0_disabled'));
+        expect(stub.getUser).not.toHaveBeenCalled();
     });
 });

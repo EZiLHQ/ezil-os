@@ -6,8 +6,19 @@ import {
 } from '@/server/auth/auth0';
 import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
-import { safeReturnUrl } from '@/utils/constants';
+import { Routes, safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
+import { createClient } from '@/utils/supabase/server';
+
+/** A session Supabase Auth itself vouches for (`getUser`, not the cookie alone). Any failure counts as none. */
+async function hasOsSession(): Promise<boolean> {
+    try {
+        const { data, error } = await (await createClient()).auth.getUser();
+        return !error && Boolean(data.user);
+    } catch {
+        return false;
+    }
+}
 
 export async function GET(request: NextRequest) {
     let destination: string;
@@ -45,6 +56,10 @@ export async function GET(request: NextRequest) {
         const code = error instanceof Auth0Error ? error.code : 'auth0_failed';
         console.warn('[auth0] callback failed', { code });
         destination = `/login?${new URLSearchParams({ error: code, ...(returnUrl === undefined ? {} : { returnUrl }) })}`;
+        // Back after a successful sign-in replays id.ezil.work's authorize entry with a state this browser has already
+        // spent. Someone still signed in to the OS goes back in instead of reading a refusal; the replayed code is
+        // never used, and nobody without a session gets anything new.
+        if ((code === 'invalid_transaction' || code === 'state_mismatch') && await hasOsSession()) destination = Routes.OS;
     }
     const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
