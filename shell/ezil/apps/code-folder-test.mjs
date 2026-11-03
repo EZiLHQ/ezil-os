@@ -5,8 +5,9 @@
 //     in BOTH load orderings, and a stale earlier document dropped;
 //   - the record rules (a transient miss never erases; Close Folder clears; multi-root
 //     announced; a project child announced, never asked; an ask whose first document
-//     opened anything else is always said, once per mint);
-//   - the notice band (text only, actions wired);
+//     opened anything else, or the asked folder after a definite non-restore, is always
+//     said, once per mint);
+//   - the notice band (text only, actions wired; `unverified` offers no Try again);
 //   - storage that throws never breaks the window.
 //
 // Run: node --experimental-strip-types shell/ezil/apps/code-folder-test.mjs
@@ -165,6 +166,31 @@ for ( const kind of ['empty', 'workspace', 'foreign'] ) {
     F.load(); report(mintOf(url), kind);
     eq(notices.length, before, `no ask, first document ${kind}: no notice`); eq(M.readFolderRecord(bind), null, `no ask, ${kind}: nothing written`);
 }
+// 11h the first document is EXACTLY the asked folder but the server answered a definite non-restore: no folder= was
+//     added, so the editor opened its own last folder, which can be the asked one even when it is missing (VS Code
+//     then shows only its own "does not exist"). Said, once per mint, and the record untouched (`at` included).
+//     restored, unverified (the editor's own pick, existence unknown) and no answer with a matching report: silent.
+url = mintAndAttach('t13', undefined, undefined); F.load(); report(mintOf(url), 'folder', '/workspace/sub');
+const seeded = M.readFolderRecord(bind); eq(seeded?.path, '/workspace/sub', 'seeded /workspace/sub');
+const realNow = Date.now; Date.now = () => seeded.at + 60_000; // a write that falls through would move `at`
+for ( const outcome of ['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'too_long', 'error'] ) {
+    url = mintAndAttach(`t13-${outcome}`, M.folderAskFor(bind), { v: 1, outcome }); before = notices.length;
+    F.load(); report(mintOf(url), 'folder', '/workspace/sub');
+    eq(notices.slice(before), [[outcome, '/workspace/sub']], `${outcome} + the asked folder on screen: the notice is shown`);
+    eq(M.readFolderRecord(bind), seeded, `${outcome} + the asked folder on screen: the record is untouched`);
+}
+url = mintAndAttach('t14', M.folderAskFor(bind), { v: 1, outcome: 'missing' }); before = notices.length;
+F.load(); report(mintOf(url), 'folder', '/workspace/sub'); fire({ type: 'ezil.code.ready', v: 1 }); report(mintOf(url), 'folder', '/workspace/sub');
+eq(notices.slice(before), [['missing', '/workspace/sub']], 'missing + the asked folder on screen: one notice for the mint, not one per hello');
+eq(M.readFolderRecord(bind), seeded, 'and the record is still untouched');
+for ( const [i, answer] of [{ v: 1, outcome: 'restored' }, { v: 1, outcome: 'unverified' }, undefined, { v: 1, outcome: 'later_code' }].entries() ) {
+    const what = answer?.outcome ?? 'no answer';
+    url = mintAndAttach(`t15-${i}`, M.folderAskFor(bind), answer); before = notices.length;
+    F.load(); report(mintOf(url), 'folder', '/workspace/sub');
+    eq(notices.length, before, `${what} + the asked folder on screen: no notice`);
+    eq(M.folderAskFor(bind), { v: 1, path: '/workspace/sub' }, `${what} + the asked folder on screen: still asked`);
+}
+Date.now = realNow; M.forgetFolder(bind);
 // 12 a project tab never asks; a hand-opened child is announced once on the next mint, then follows the screen
 const pb = { userId: 'u1', computerId: 'c1', project: { projectId: '0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b', repoId: '1b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b' } };
 const PF = `/workspace/projects/${pb.project.repoId}`;
@@ -210,6 +236,10 @@ ok(band.removed, 'an action closes the band');
 nb.projectChild(`${PF}/repository/web`); eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Dismiss'], 'child: Dismiss only');
 nb.fallback('symlink', '/workspace/link'); eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Forget it', 'Dismiss'], 'symlink: not retryable');
 nb.fallback('unsupported', null); eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Dismiss'], 'unsupported: Dismiss');
+// No resolver is wired yet, so a re-mint answers `unverified` again: the notice stays, Try again does not.
+nb.fallback('unverified', '/workspace/sub');
+eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Forget it', 'Dismiss'], 'unverified: no Try again');
+ok(/couldn't check “\/workspace\/sub”/.test(body.children.at(-1).children[0].textContent), 'unverified: the notice is still said');
 nb.fallback('too_long', `/workspace/${'x'.repeat(300)}`); ok(body.children.at(-1).children[0].textContent.includes('…'), 'a long path is shortened');
 nb.fallback('not_reopened', '/workspace/sub');
 eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Try again', 'Forget it', 'Dismiss'], 'not_reopened: Try again, Forget it, Dismiss');
