@@ -1410,6 +1410,12 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
       expect(await awsRepoOpenPoll(partial as AwsRepoOpenJob, target, deps(r.fetch))).toEqual(done$(refusal('invalid_request')));
       expect(r.calls.length).toBe(0);
     }
+    // a persisted job is untrusted: a repositoryId that is not a lowercase UUID, or a branch outside the grammar, sends nothing
+    for (const bad of [{ repositoryId: '../x' }, { repositoryId: REPO_ID.toUpperCase() }, { repositoryId: 7 }, { defaultBranch: 'x..y' }, { defaultBranch: '' }]) {
+      const r = replay();
+      expect([bad, await awsRepoOpenPoll(projectJobOf(bad as Partial<AwsRepoOpenJob>), target, deps(r.fetch))]).toEqual([bad, done$(refusal('invalid_request'))]);
+      expect(r.calls.length).toBe(0);
+    }
   });
 
   it('host errors: every result refusal keeps its code and §8 status; a lost start is read by status, never restarted', async () => {
@@ -1428,6 +1434,14 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
     expect(e.calls.every((c) => c.at < NOW + WORKER_DEADLINE_MS)).toBe(true);
     const d = deps(edge(() => ok(okProject)).fetch);
     expect(await awsRepoOpenPoll(projectJobOf(), target, d, NOW)).toEqual(done$(refusal('workspace_busy')));
+    // a slow or hung edge ends the same way, never workspace_failed (unlike an assessment)
+    for (const reply of [() => ({ latencyMs: 9_000, reply: running() }), () => ({ latencyMs: Infinity, reply: running() }),
+      () => ({ latencyMs: 9_000, reply: 'throw' as const })] as (() => Answer)[]) {
+      const slow = edge(reply);
+      expect(await runProject(slow)).toEqual(refusal('workspace_busy'));
+      expect(clock).toBeLessThanOrEqual(NOW + WORKER_DEADLINE_MS);
+      expect(slow.starts().length).toBe(1);
+    }
   });
 
   it('an awsControlTarget Response (claims mismatch, origin unavailable) is workspace_unsupported before any gate', async () => {
