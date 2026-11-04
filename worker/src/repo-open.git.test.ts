@@ -425,6 +425,17 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(readFileSync(join(folder, 'mine.txt'), 'utf8')).toBe('untracked\n');
   });
 
+  // Defence in depth below parseRepoOpenRequest (which never pairs `none` with a token): the in-computer script
+  // itself refuses an anonymous fetch that was handed a token, before any git runs.
+  it('🔴 an anonymous open handed a token is refused by the script itself, with nothing fetched or created', async () => {
+    const id = '00000000-0000-4000-8000-0000000000ad';
+    const mark = seen.length;
+    const answer = await open({ repositoryId: id, canonicalURL: `${base}/public/acme/site.git`, auth: 'none', token: TOKEN });
+    expect(answer).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(seen.slice(mark)).toEqual([]);
+    expect(existsSync(folderOf(id))).toBe(false);
+  });
+
   it('🔴 an anonymous open of a repository that needs credentials fails as auth, never prompting or sending one', async () => {
     const mark = seen.length;
     const answer = await open({ repositoryId: '00000000-0000-4000-8000-0000000000ac', canonicalURL: url, auth: 'none', token: '', expiresAt: '' });
