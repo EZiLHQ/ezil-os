@@ -51,7 +51,7 @@ import { billingV2EntitlementReader } from '../v2/compute-access';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { CATALOG_V3 } from './contract';
 import { deriveStanding } from './standing';
-import { normalizeEmail, TRIAL_SKU } from './trial';
+import { normalizeEmail, TRIAL_SKU, TRIAL_CHECKOUT_TTL_SECONDS } from './trial';
 
 const migrationCalls = vi.hoisted(() => [] as { userId: string; sku: string }[]);
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -587,7 +587,7 @@ async function startTrial(s: Scenario, expect: TestContext['expect'], user: Link
     };
     expect(checkoutFacts).toEqual({ mode: 'subscription', status: 'open', customer: user.customerId, clientReference: true,
         paymentMethodCollection: 'always', trialMetadata: true, trialEndMetadata: String(epochSeconds(expectedEnd)),
-        expiresInSeconds: 3600 });
+        expiresInSeconds: TRIAL_CHECKOUT_TTL_SECONDS });
     check(s, `checkout:${checkout.sessionId}`, { ...checkoutFacts, trialMetadata: 'trial row id', amountToday: session.amount_total });
     expect(await trialRowFor(user.userId)).toMatchObject({ status: 'checkout', checkoutSessionId: checkout.sessionId, stripeCustomerId: user.customerId });
     // Headless: Checkout is never completed. Expire it so nothing else can complete it, as the template does.
