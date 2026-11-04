@@ -320,6 +320,20 @@ describe('billing router', () => {
         await checkoutControl(f);
     });
 
+    // Product entitlements v1: an operator assignment in effect is the account's plan; Stripe is never layered over it.
+    it('refuses a checkout while an operator assignment is in effect, before Stripe is called; an ended one does not block', async () => {
+        const f = fixture();
+        const row = { ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            sku: 'standard_monthly_v3' as const, startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        const store = f.store as unknown as { operatorEntitlementsFor: (id: string) => Promise<unknown[]> };
+        store.operatorEntitlementsFor = vi.fn(async () => [row]);
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        store.operatorEntitlementsFor = vi.fn(async () => [{ ...row, endedAt: new Date(now.getTime() - 1000) }]);
+        await checkoutControl(f);
+    });
+
     it('refuses another checkout for a v2 Standard subscription', async () => {
         const f = fixture();
         f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' })]);

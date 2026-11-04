@@ -10,6 +10,7 @@
  */
 import type { IntervalRow, SubscriptionRow } from './meters';
 import type { ComputeEpoch, EpochEndReason, GrantKindV2, GRANT_METER_COMPUTE, SizeCode } from './v2/contract';
+import type { OperatorEntitlementRow } from './v3/operator-access';
 
 // ── Store (implemented by `store.ts` over drizzle) ───────────────────────────
 
@@ -220,6 +221,11 @@ export interface BillingStore {
     stripeCustomerFor(userId: string): Promise<string | null>;
     userForStripeCustomer(stripeCustomerId: string): Promise<string | null>;
     subscriptionsFor(userId: string): Promise<SubscriptionRow[]>;
+    /**
+     * Product entitlements v1: the account's operator assignments (never Stripe rows), newest first. Optional: a store
+     * without it (or before 0019 is applied) has none, and every reader then resolves Stripe or Free exactly as before.
+     */
+    operatorEntitlementsFor?(userId: string): Promise<OperatorEntitlementRow[]>;
     /** Intervals that overlap `[since, ∞)`, open ones included. */
     intervalsFor(userId: string, since: Date): Promise<IntervalRow[]>;
     /** Newest sample per computer. */

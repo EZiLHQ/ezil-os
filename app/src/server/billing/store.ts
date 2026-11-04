@@ -26,6 +26,7 @@ import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, Outbox
 import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
+import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
 
 type Database = typeof import('@/server/db').db;
 
@@ -371,6 +372,8 @@ export function createBillingStore(db: Database): BillingStore {
                 .where(eq(billingCustomers.stripeCustomerId, stripeCustomerId)).limit(1);
             return row?.userId ?? null;
         },
+
+        operatorEntitlementsFor: userId => readOperatorEntitlements(db, userId),
 
         async subscriptionsFor(userId) {
             return db.select({

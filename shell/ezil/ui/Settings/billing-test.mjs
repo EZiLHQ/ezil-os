@@ -966,6 +966,19 @@ try {
     getUsage = usageBefore;
     pass('paid compute policy v1: Standard and Premium Billing usage is storage-first with no computer-hours row or reset');
 
+    // Product entitlements v1: a plan an EZiL operator assigned is access, not a payment: no price, renewal or Stripe action.
+    for ( const [access, line] of [[{ source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: '2026-12-04T12:00:00Z', untilRevoked: false }, 'Your access ends on Dec 4, 2026.'],
+        [{ source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: null, untilRevoked: true }, 'Your access continues until EZiL ends it.']] ) {
+        summary = summaryV3('standard');
+        summary.plan = { ...summary.plan, renewal: null, cancelsAt: null, access };
+        summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
+        await refresh(); audit();
+        contains('[data-role="plan-card"]', 'Assigned by EZiL · no payment');
+        contains('[data-role="plan-card"]', line);
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /Renews|\$20 \/ month|Cancel/);
+    }
+    pass('product entitlements v1: an operator-assigned plan shows as assigned access with its validity, never a price or renewal');
+
     // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
     {
         const M = credits => { const [whole, fraction = ''] = String(credits).split('.'); return (BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'))).toString(); };

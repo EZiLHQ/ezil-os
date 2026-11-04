@@ -1,5 +1,6 @@
 /** Single-use warm hosts. Callers own admission, lifecycle execution and transactions. */
 import { sql } from 'drizzle-orm';
+import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
 import { RUNNING_CLASS_STATES, type Placement, type PlacementExecutor } from './placement';
 import { AWS_REGION_PATTERN, INSTANCE_VCPU, instanceVcpu, readAwsRegions } from './aws-config';
 
@@ -230,9 +231,29 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
 }
 
 /** The paid-pool eligibility CTEs (effective subscription per user, then eligible), shared by demand planning and
- * capacity-demand reauthorization. `user` narrows to one subject. Ends inside the WITH list (caller continues it). */
-function eligibleCtes(at: string, user?: string) {
+ * capacity-demand reauthorization. `user` narrows to one subject. Ends inside the WITH list (caller continues it).
+ * `operator` (0019 applied): product entitlements v1 operator grants in effect are eligible too, as the paid plan they
+ * assign, unless Stripe still covers the user (Stripe wins; a past_due period conservatively counts as covered). */
+function eligibleCtes(at: string, user?: string, operator = false) {
     const only = user ? sql` AND s.user_id = ${user}::uuid` : sql``;
+    const operatorBranch = !operator ? sql`` : sql`
+            UNION ALL
+            SELECT o.user_id, o.sku, 'active' AS status, NULL::text AS stripe_subscription_id, o.starts_at AS current_period_start,
+                COALESCE(o.ends_at, 'infinity'::timestamptz) AS current_period_end,
+                CASE WHEN o.sku = 'standard_monthly_v3' THEN 'm6i.large'
+                    WHEN pref.size = 'cmp-4' THEN 'm6i.xlarge'
+                    WHEN pref.size = 'cmp-8' THEN 'm6i.2xlarge' ELSE 'm6i.large' END AS instance_type
+            FROM public.ezil_operator_entitlements o
+            JOIN auth.users u ON u.id = o.user_id
+            LEFT JOIN public.ezil_billing_size_preferences pref ON pref.user_id = o.user_id
+            WHERE o.ended_at IS NULL AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)
+                ${user ? sql`AND o.user_id = ${user}::uuid` : sql``}
+                AND o.sku IN ('standard_monthly_v3', 'premium_monthly_v3')
+                AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
+                AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_subscriptions paid WHERE paid.user_id = o.user_id
+                    AND paid.status IN ('active', 'trialing', 'past_due') AND paid.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
+                        'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1')
+                    AND paid.current_period_start <= ${at}::timestamptz AND paid.current_period_end > ${at}::timestamptz)`;
     return sql`
         effective AS (
             SELECT DISTINCT ON (s.user_id) s.user_id, s.sku, s.status, s.stripe_subscription_id, s.current_period_start, s.current_period_end,
@@ -256,7 +277,7 @@ function eligibleCtes(at: string, user?: string) {
                         AND g.period_end > ${at}::timestamptz), 0) > 0
                 AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_payment_issues issue
                     WHERE issue.user_id = s.user_id AND issue.subscription_id = s.stripe_subscription_id
-                        AND issue.invoice_kind = 'subscription' AND issue.resolved_at IS NULL AND issue.issue <> 'voided')
+                        AND issue.invoice_kind = 'subscription' AND issue.resolved_at IS NULL AND issue.issue <> 'voided')${operatorBranch}
         )`;
 }
 /** Capacity-demand reauthorization: the owner's paid-pool eligibility right now (active v3 period, compute grant, no
@@ -264,7 +285,7 @@ function eligibleCtes(at: string, user?: string) {
  * predicate and mapping pool planning uses. null when not eligible. */
 export async function readPaidPoolEligibility(db: PlacementExecutor, userId: string, now: Date): Promise<{ instanceType: string } | null> {
     const at = now.toISOString();
-    const rows = rowsOf(await db.execute(sql`WITH ${eligibleCtes(at, userId)} SELECT instance_type FROM eligible`));
+    const rows = rowsOf(await db.execute(sql`WITH ${eligibleCtes(at, userId, await operatorBranchEnabled(db))} SELECT instance_type FROM eligible`));
     if (rows.length > 1) throw new Error('pool_eligibility_ambiguous');
     return rows[0] ? { instanceType: String(rows[0].instance_type) } : null;
 }
@@ -294,11 +315,12 @@ export const SWITCH_DEMAND_WINDOW_MS = 830_000;
 export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolDemand> {
     checkClass(c);
     const at = now.toISOString();
+    const operator = await operatorBranchEnabled(db);
     const vcpu = (column: ReturnType<typeof sql>) => sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU)
         .map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `)} ELSE 8 END`;
     const running = sql.join(RUNNING_CLASS_STATES.map(state => sql`${state}`), sql`, `);
     const row = rowsOf(await db.execute(sql`
-        WITH ${eligibleCtes(at)}, subscribers AS (
+        WITH ${eligibleCtes(at, undefined, operator)}, subscribers AS (
             SELECT s.* FROM eligible s WHERE s.instance_type = ${c.instanceType}
                 AND (EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.owner_user_id = s.user_id
                     AND p.provider = 'aws-ec2' AND p.region = ${c.region} AND p.zone_id = ${c.zoneId}

@@ -299,6 +299,11 @@ export interface BillingSummaryV3 {
         graceEndsAt?: string | null;
         /** Round 4 (additive): a cancel at period end, the paid period's end ("Premium ends on <date>"). */
         planEndsAt?: string | null;
+        /**
+         * Product entitlements v1 (additive, present only then): the plan was assigned by an EZiL operator. It is not a
+         * payment: no renewal, checkout, upgrade, downgrade or cancel through Stripe, and no included AI credits.
+         */
+        access?: { source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean };
     };
     computer: {
         /** The size the next session opens with (the chosen size on Premium). */

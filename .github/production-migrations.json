@@ -70,6 +70,11 @@
       "path": "app/drizzle/0012_compute_reverse_moves.sql",
       "sha256": "3adc02973b2ea75d08b95cecb7355560391354cae5cea19783af310e7699d340",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0019_operator_entitlements.sql",
+      "sha256": "ffe4ec335eabc8213664e5a71e1fcd4f6edf36cefbcdc69d7a569b5198375fc4",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

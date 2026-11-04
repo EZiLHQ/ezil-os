@@ -19,6 +19,7 @@ import type { PaymentIssueRow } from '../ports';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { planFromSubscriptions } from './catalog';
 import type { ComputeStandingV3 } from './contract';
+import { operatorAccess, type OperatorEntitlementRow } from './operator-access';
 
 export const PAYMENT_GRACE_DAYS = 7 as const;
 export const PAYMENT_GRACE_SECONDS = PAYMENT_GRACE_DAYS * 86_400;
@@ -69,8 +70,11 @@ export function deriveStanding(input: {
     /** Any aws-ec2 placement among the user's live computers → 'aws-ec2'; null = unknown or none. */
     placementProvider: 'aws-ec2' | 'cloudflare' | null;
     now: Date;
+    /** The operator grant that decides the plan (`operatorAccessFor`): paid standing, no Stripe dates. */
+    operator?: OperatorEntitlementRow | null;
 }): StandingV3 {
     const filesOn = input.placementProvider === 'aws-ec2' ? 'aws' : 'cloudflare';
+    if (input.operator) return { standing: 'paid', graceEndsAt: null, planEndsAt: null, filesOn, heldSince: null };
     const now = epochSeconds(input.now);
     // The same subscription precedence as the plan the Billing tab shows.
     const plan = planFromSubscriptions({ subs: [...input.subscriptions], now: input.now, userCreatedAt: null });
@@ -105,3 +109,17 @@ function lastEndedPeriod(subs: readonly SubscriptionRow[], now: number): string 
     const newest = ends[0];
     return newest !== undefined && epochSeconds(newest) <= now ? at(newest) : null;
 }
+
+/**
+ * Product entitlements v1: the operator grant that decides this account's plan. Stripe paid access (paid, renewal grace,
+ * ending at period end) always wins and is never replaced; otherwise the grant in effect at `now`; otherwise null (the
+ * Stripe-only plan, Free when there is none). Every reader passes its result to `planFromSubscriptions` and
+ * `deriveStanding` as `operator`.
+ */
+export function operatorAccessFor(input: { subscriptions: readonly SubscriptionRow[]; paymentIssues: readonly StandingIssue[];
+    grants: readonly OperatorEntitlementRow[] | null | undefined; now: Date }): OperatorEntitlementRow | null {
+    if (!input.grants?.length) return null;
+    const stripe = deriveStanding({ subscriptions: input.subscriptions, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
+    return operatorAccess({ grants: input.grants, now: input.now, stripePaidAccess: paidAccess(stripe.standing) });
+}
+

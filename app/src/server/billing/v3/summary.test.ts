@@ -688,3 +688,23 @@ describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
         for (const value of [null, undefined, '', 'abc', '-5', BigInt(-1)]) expect(usedGiBOf(value as never)).toBeNull();
     });
 });
+
+// Product entitlements v1: an operator-assigned plan with checkout configured offers no Stripe action at all.
+describe('product entitlements v1: the summary of an operator-assigned plan', () => {
+    const row = (sku: 'standard_monthly_v3' | 'premium_monthly_v3') => ({ ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId: 'u',
+        accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku, startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null });
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'] as const)('%s: assigned access, no checkout, upgrade, downgrade, cancel or renewal, no credits', sku => {
+        const args = input();
+        args.operatorGrants = [row(sku)];
+        const summary = buildSummaryV3(args);
+        expect(summary.plan).toMatchObject({ sku, status: 'active', renewal: null, access: { source: 'operator', untilRevoked: true, endsAt: null } });
+        expect(summary.actions).toMatchObject({ checkout: false, upgrade: false, downgrade: false, cancel: false });
+        expect(summary.ai.grant).toEqual({ amount: 0, per: 'period' });
+        expect(summary.fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        // Positive controls with the same configuration: Free can check out, paid Stripe Standard can upgrade, Premium downgrade.
+        expect(buildSummaryV3(input()).actions.checkout).toBe(true);
+        expect(buildSummaryV3(input('standard_monthly_v3')).actions.upgrade).toBe(true);
+        expect(buildSummaryV3(input('premium_monthly_v3')).actions.downgrade).toBe(true);
+    });
+});
+

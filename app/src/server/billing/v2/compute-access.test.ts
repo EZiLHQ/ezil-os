@@ -13,6 +13,7 @@ import * as rating from './rating';
 import * as admissionV3 from '../v3/admission';
 import { epochSeconds, isoSeconds } from './time';
 import { resolveEntitlement } from '../../lib/compute/tier';
+import type { OperatorEntitlementRow } from '../v3/operator-access';
 
 vi.mock('../deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -52,8 +53,11 @@ function fixture(over: Partial<Input> = {}) {
         storage: [], sizePreference: null, hasCustomer: false, ...over,
     };
     const calls: { name: string; args: unknown[] }[] = [];
+    // Product entitlements v1: the account's operator assignments (none unless a test adds them).
+    const operator: OperatorEntitlementRow[] = [];
     const methods = {
         subscriptionsFor: async () => input.subs,
+        operatorEntitlementsFor: async () => [...operator],
         userCreatedAt: async () => input.userCreatedAt,
         openPlanChanges: async () => [...input.planChanges],
         epochsFor: async (_userId: string, since: Date) => input.epochs.filter(e => e.endedAt === null || new Date(e.endedAt) > since).map(stored),
@@ -92,7 +96,7 @@ function fixture(over: Partial<Input> = {}) {
         },
     }) as unknown as BillingStore;
     const deps: BillingDeps = { config: input.config, store, stripe: null, usage: null, now: () => NOW };
-    return { input, deps, calls };
+    return { input, deps, calls, operator };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -107,8 +111,9 @@ describe('loadComputeBillingState', () => {
             usedStdSeconds: 14400, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null,
         });
         expect(state.summary).toEqual(buildSummaryV3(input));
+        // Product entitlements v1 adds one read (operator grants); with none, nothing else changes.
         expect(calls.map(c => c.name).sort()).toEqual([
-            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'sizePreference', 'subscriptionsFor', 'userCreatedAt',
+            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'operatorEntitlementsFor', 'sizePreference', 'subscriptionsFor', 'userCreatedAt',
         ]);
     });
 
@@ -761,3 +766,96 @@ describe('round 6 R2-3: a paid period whose compute grant has not landed yet', (
         await expect(computeGrantPending(USER, () => broken.deps)).rejects.toThrow('db down');
     });
 });
+
+// Product entitlements v1 (producer ezil-os): an operator-assigned plan is real product access through the same readers
+// as a paid plan (gate, ready-time epoch, entitlement reader, paid policy, summary), with no Stripe row, receipt or AI
+// credits; Stripe paid access always wins; Free is unchanged without a grant.
+describe('product entitlements v1: operator-assigned access', () => {
+    const DAY = 86_400_000;
+    const grantRow = (over: Partial<OperatorEntitlementRow> = {}): OperatorEntitlementRow => ({ ref: 'osg-00000000-0000-4000-8000-000000000001',
+        revision: 1, userId: USER, accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'standard_monthly_v3',
+        startsAt: new Date(NOW.getTime() - DAY), endsAt: new Date(NOW.getTime() + 30 * DAY), endedAt: null, ...over });
+    const enforced = () => readBillingConfig({ BILLING_ENFORCEMENT: '1' });
+    // 69 h of 2 vCPU this month: past Standard's 40 h, Free's 5 h and the old per-person cap's scale alike.
+    const heavy = () => Array.from({ length: 3 }, (_, i) => ({ ...epoch(`2026-10-1${i + 1}T00:00:00Z`, `2026-10-1${i + 1}T23:00:00Z`), size: 'std-2' as const, weight: 1 as const }));
+
+    it.each([['standard_monthly_v3', 'std-2', 'm6i.large'], ['premium_monthly_v3', 'cmp-8', 'm6i.2xlarge']] as const)(
+        'an operator %s grant: paid state, unmetered, no hours cutoff, active entitlement, six-hour sessions', async (sku, size, instanceType) => {
+            const { deps, operator, calls } = fixture({ config: enforced(), epochs: heavy(), sizePreference: 'cmp-8' });
+            operator.push(grantRow({ sku }));
+            const state = await loadComputeBillingState(deps, USER, NOW);
+            expect(state).toMatchObject({ planSku: sku, v3: { sku }, planActive: true, paymentIssue: false, subscriptionId: null, provider: 'aws',
+                entitledSize: size, sessionMaxSeconds: 21_600, grantPending: false, freeSince: null });
+            expect(paidComputeUnmeteredState(state)).toBe(true);
+            expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' }, plan: { sku, status: 'active', renewal: null,
+                cancelsAt: null, access: { source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', untilRevoked: false } },
+                ai: { grant: { amount: 0, per: 'period' } }, actions: { checkout: false, upgrade: false, downgrade: false, cancel: false } });
+            expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType, now: NOW })).toEqual({ allowed: true });
+            expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt: NOW, overheadSeconds: 0 }))
+                .toMatchObject({ status: 'opened', decision: { admit: true, maxRunSeconds: 21_600 } });
+            const record = await billingV2EntitlementReader(() => deps).read(USER);
+            expect(record).toMatchObject({ source: 'billing_v2', status: 'active', planId: sku, provider: 'aws', size, paymentIssue: false });
+            expect(paidComputeUnmetered(record)).toBe(true);
+            // Only reads, plus the session's own epoch: no subscription, grant or credit write (the strict store throws on any other method).
+            expect([...new Set(calls.map(c => c.name))].sort()).toEqual(['epochsFor', 'grantsForPeriod', 'openEpoch', 'openEpochFor', 'openPaymentIssues',
+                'openPlanChanges', 'operatorEntitlementsFor', 'sizePreference', 'subscriptionsFor', 'userCreatedAt']);
+        });
+
+    it('an operator plan never waits for a renewal grant (it has no Stripe period), even at the start of the month', async () => {
+        const monthStart = new Date('2026-11-01T00:02:00.000Z');
+        const { deps, operator } = fixture({ config: enforced(), now: monthStart });
+        deps.now = () => monthStart;
+        operator.push(grantRow({ startsAt: new Date('2026-10-20T00:00:00Z') }));
+        const state = await loadComputeBillingState(deps, USER, monthStart);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', grantPending: false });
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: monthStart })).toEqual({ allowed: true });
+    });
+
+    it('until revoked is access with no end; the summary says so', async () => {
+        const { deps, operator } = fixture({ config: enforced() });
+        operator.push(grantRow({ endsAt: null }));
+        expect((await loadComputeBillingState(deps, USER, NOW)).summary).toMatchObject({ plan: { access: { endsAt: null, untilRevoked: true } } });
+    });
+
+    it.each([
+        ['ended by an operator', { endedAt: new Date(NOW.getTime() - 1000) }],
+        ['past its end date', { endsAt: new Date(NOW.getTime() - 1000) }],
+        ['not started yet', { startsAt: new Date(NOW.getTime() + 60_000) }],
+    ])('a grant %s gives nothing: Free, with Free hours and Free refusals', async (_name, over) => {
+        // Eight full Free hours (Free rates each session at its one-hour cap): this account's Free allowance, used up.
+        const freeHours = Array.from({ length: 8 }, (_, i) => ({ ...epoch(`2026-10-0${i + 1}T00:00:00Z`, `2026-10-0${i + 1}T01:00:00Z`), size: 'free-cf' as const, weight: 1 as const }));
+        const { deps, operator } = fixture({ config: enforced(), epochs: freeHours });
+        operator.push(grantRow(over));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'free_v3', provider: 'cloudflare' });
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
+            .toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    it('Stripe paid access wins: the operator grant is ignored while a paid subscription covers the account', async () => {
+        const { deps, operator } = fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3' })], grants: [grant({ amount: BigInt(1_800_000) })] });
+        operator.push(grantRow({ sku: 'standard_monthly_v3' }));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'premium_monthly_v3', subscriptionId: 'sub_a' });
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ planId: 'premium_monthly_v3' });
+    });
+
+    it('a Stripe plan past its grace (Free) lets the operator grant decide', async () => {
+        const { deps, operator } = fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3', status: 'past_due' })],
+            paymentIssues: [issue({ stripeEventCreated: new Date(NOW.getTime() - 8 * DAY) })] });
+        operator.push(grantRow());
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'standard_monthly_v3', subscriptionId: null });
+    });
+
+    it('without a grant nothing changes: Free stays Free, with its quota', async () => {
+        const { deps } = fixture({ config: enforced() });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'free_v3', allowanceStdSeconds: expect.any(Number) });
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+    });
+});
+

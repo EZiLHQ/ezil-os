@@ -43,6 +43,7 @@
 
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
+import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
@@ -1979,18 +1980,26 @@ export interface PaidMigrationCandidate {
     toSize: 'standard' | 'premium';
 }
 
-/** One computer per paid owner, including the implicit Cloudflare placement. */
+/**
+ * One computer per paid owner, including the implicit Cloudflare placement. Product entitlements v1 (0019 applied): an
+ * operator grant in effect is a paid owner too (provider-migrate-reconcile then re-checks the entitlement and admission).
+ */
 export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
     if (!count) return [];
+    const at = now.toISOString();
+    const owners = await operatorBranchEnabled(db) ? sql`(SELECT user_id, sku, status, current_period_start, current_period_end
+            FROM public.ezil_billing_subscriptions
+        UNION ALL SELECT user_id, sku, 'active', starts_at, COALESCE(ends_at, 'infinity'::timestamptz) FROM public.ezil_operator_entitlements
+            WHERE ended_at IS NULL)` : sql`public.ezil_billing_subscriptions`;
     const result = await db.execute(sql`SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id,
         c.id::text AS computer_id, s.sku
-        FROM public.ezil_billing_subscriptions s
+        FROM ${owners} s
         JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
         LEFT JOIN public.ezil_computer_placements p ON p.computer_id = c.id
         WHERE s.sku IN ('standard_monthly_v3', 'premium_monthly_v3') AND s.status = 'active'
-          AND s.current_period_start <= ${now.toISOString()}::timestamptz
-          AND s.current_period_end > ${now.toISOString()}::timestamptz
+          AND s.current_period_start <= ${at}::timestamptz
+          AND s.current_period_end > ${at}::timestamptz
           AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations done WHERE done.computer_id = c.id
             AND done.state = 'committed' AND done.last_error = 'fresh_provision')

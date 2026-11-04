@@ -32,6 +32,7 @@ import type { ReverseMovePlacementView } from '@/server/lib/compute/provider-rev
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
+import { operatorGrantInEffect } from '@/server/billing/v3/operator-access';
 
 /** All router domain failures use the pinned UI vocabulary. */
 function billingError(code: BillingErrorCode, trpcCode: TRPCError['code']): TRPCError {
@@ -415,7 +416,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
             // Round 6 (R1-07/R1-09): the placement provider and open payment issues give usage the summary's
             // standing, so under the D16 hold both show the held AWS computer and its disk.
-            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
+            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues, operatorGrants] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
@@ -424,12 +425,13 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.sizePreference(ctx.user.id),
                 placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
                 deps.store.openPaymentIssues(ctx.user.id),
+                deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
                 hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider,
-                liveComputers: placement.liveComputers });
+                liveComputers: placement.liveComputers, operatorGrants });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -444,7 +446,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
             const [periodEpochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
-                enrollmentState, ezilIdUrl] = await Promise.all([
+                enrollmentState, ezilIdUrl, operatorGrants] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -457,6 +459,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 placementAndVolume(ctx.db, ctx.user.id),
                 aiEnrollmentOf(aiMember, ctx.db, ctx.user),
                 ezilIdSignInUrl(),
+                deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
@@ -484,6 +487,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, liveComputers: placement.liveComputers,
                 enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
+                operatorGrants,
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -512,6 +516,11 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const stripe = configuredStripe(deps);
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
+            // Product entitlements v1: an operator assignment in effect is the account's plan; no Stripe checkout is layered
+            // over it (the operator ends it first), refused before Stripe is called.
+            if (operatorGrantInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
+                throw billingError('already_subscribed', 'CONFLICT');
+            }
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) {

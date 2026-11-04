@@ -13,7 +13,8 @@ import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './cata
 import {
     CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
 } from './contract';
-import { deriveStanding, paidAccess } from './standing';
+import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
+import type { OperatorEntitlementRow } from './operator-access';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
@@ -50,6 +51,9 @@ export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineA
 export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
     if (plan.sku === 'legacy') throw new TypeError('Legacy allowances use v2 rating');
     if (plan.sku === 'free_v3') return plan.legacyFree ? plan.offer.legacyFairUseSeconds! : plan.offer.fairUseSeconds;
+    // Product entitlements v1: an operator grant has no Stripe receipt; the plan's own fair use stands (paid compute
+    // policy v1 leaves it unmetered, so it is never a cutoff).
+    if (plan.operator) return plan.offer.fairUseSeconds;
     const start = new Date(plan.window.start), end = new Date(plan.window.end);
     const rows = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
         && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
@@ -70,7 +74,7 @@ export const GRANT_PENDING_SECONDS = 10 * 60;
  * the start gate (compute-access.ts) and the summary (paid compute policy v1), so neither shows a renewal as used up.
  */
 export function renewalGrantPending(plan: ResolvedPlanV3, standing: ComputeStandingV3, grants: readonly GrantRow[], now: Date): boolean {
-    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
+    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.operator || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
     const start = Date.parse(plan.window.start);
     return !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId)
         && now.getTime() >= start && now.getTime() - start < GRANT_PENDING_SECONDS * 1000;
@@ -385,10 +389,13 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     liveComputers?: readonly DiskComputer[];
     /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
     reverseMove?: ReverseMoveSummaryInput;
+    /** Product entitlements v1: the account's operator assignments; omitted = none (Stripe or Free, as before). */
+    operatorGrants?: readonly OperatorEntitlementRow[];
 }): BillingSummaryV3 {
-    const plan = planFromSubscriptions(input);
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const plan = planFromSubscriptions({ ...input, operator });
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
-        placementProvider: input.placementProvider ?? null, now: input.now });
+        placementProvider: input.placementProvider ?? null, now: input.now, operator });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
     const changes = input.planChanges.filter(change => change.subscriptionId === plan.subscriptionId);
     const upgrade = changes.find(change => change.kind === 'upgrade' && sellable(change.toSku)
@@ -445,7 +452,10 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             : plan.offer.family === 'compute' ? 'Compute (legacy)' : 'Standard (legacy)' : plan.offer.name,
         status: pendingUpgrade && plan.planActive ? 'upgrade_pending' : plan.status,
         renewal: plan.renewsAt !== null ? input.renewal ?? null : null, cancelsAt: plan.cancelsAt,
-        scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt },
+        scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt,
+        // Product entitlements v1: assigned by an EZiL operator, not paid (no renewal, no Stripe actions); key absent otherwise.
+        ...(operator ? { access: { source: 'operator' as const, ref: operator.ref, endsAt: operator.endsAt === null ? null : iso(operator.endsAt),
+            untilRevoked: operator.endsAt === null } } : {}) },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
             opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
             machineChoice: (rated.sku === 'legacy' ? [size.code] : rated.offer.machineChoice).map(code => ({
@@ -461,7 +471,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             // Phase B (§6.1): the move rides its own key; `move` above stays null so an old shell never renders it.
             ...reverseMoveFields(input.reverseMove, standing.standing) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
-        ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
+        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access).
+        ai: { grant: plan.sku === 'legacy' || operator ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
                 account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
@@ -472,8 +483,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
-            upgrade: enabled && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
-            downgrade: enabled && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            upgrade: enabled && !operator && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            downgrade: enabled && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },

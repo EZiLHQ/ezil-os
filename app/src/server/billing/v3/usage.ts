@@ -5,7 +5,8 @@ import { SIZES, type SizeCode } from '../v2/contract';
 import { HOLD_SIZE } from './admission';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
-import { deriveStanding } from './standing';
+import { deriveStanding, operatorAccessFor } from './standing';
+import type { OperatorEntitlementRow } from './operator-access';
 import { computePlanV3, fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow, type DiskComputer } from './summary';
 
 type Input = Parameters<typeof buildSummaryV2>[0] & {
@@ -18,16 +19,19 @@ type Input = Parameters<typeof buildSummaryV2>[0] & {
     freeEffectiveAt?: string | null;
     /** The user's live computers (summary.ts `storageDisk`): the disk counts only their samples; omitted = every sample. */
     liveComputers?: readonly DiskComputer[];
+    /** Product entitlements v1: the account's operator assignments; omitted = none. */
+    operatorGrants?: readonly OperatorEntitlementRow[];
 };
 
 /** Read-only meter observations, not provider readiness or a live storage inventory. */
 export function buildUsageV3(input: Input) {
-    const plan = planFromSubscriptions(input);
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const plan = planFromSubscriptions({ ...input, operator });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
     // The summary's standing (round 6): the D16 hold, and (review) a dunning cancel rated as Free, with Free's
     // month, session cap and allowance as the start gate rates it; in grace the plan's fair use, as the summary.
     const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
-        placementProvider: input.placementProvider ?? null, now: input.now });
+        placementProvider: input.placementProvider ?? null, now: input.now, operator });
     const rated = computePlanV3(plan, standing, input);
     const allowance = legacy?.compute.allowanceStdSeconds ?? fairUseAllowance(rated, input.grants, { grace: standing === 'grace' });
     const used = legacy?.compute.usedStdSeconds ?? usedSecondsInWindow(input.epochs, rated.window, input.now,
