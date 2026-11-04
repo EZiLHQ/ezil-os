@@ -40,9 +40,13 @@ check('🔴 every server restart code has its own sentence (no collapse into "co
 });
 check('D11: the AWS monthly cap has its own copy, distinct from plan time, and never says fair use', () => {
     for ( const code of ['user_hours_cap', 'aws_monthly_cap', 'billing_user_hours_cap'] ) {
-        assert.equal(reasonCopy(code), "You've used this month's AWS computer time. It resets on the 1st — or contact us.");
+        assert.equal(reasonCopy(code), "Your computer reached EZiL's monthly AWS limit, which is separate from your plan's time. It resets on the 1st (UTC) — or contact us.");
     }
     assert.doesNotMatch(reasonCopy('user_hours_cap'), /fair use|standard-hour|Paused until/i);
+    // P0 2026-11-04: a Premium user with plan time left was told they had "used this month's AWS computer time".
+    assert.doesNotMatch(reasonCopy('user_hours_cap'), /you've used|used up/i);
+    const settingsCap = readFileSync(new URL('./tabs/computers.js', import.meta.url), 'utf8').match(/export const AWS_CAP_COPY = "([^"]+)";/)?.[1];
+    assert.equal(reasonCopy('user_hours_cap'), settingsCap, 'Troubleshoot and Computer say the same sentence');
 });
 check('unknown codes stay honest and never echo the server string', () => {
     assert.equal(reasonCopy('<img src=x>'), 'Something went wrong. Please try again.');

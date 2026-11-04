@@ -127,8 +127,8 @@ describe.each(['previewUrl', 'codePreviewUrl', 'appPreviewUrl'] as const)('%s AW
         ['kill_switch', 'Your AWS computer is paused by operations'],
         ['aws_disabled', 'Your AWS computer is paused by operations'],
         ['capacity_unavailable', 'No capacity in India right now'],
-        ['user_hours_cap', "This month's computer hours are used up"],
-        ['global_hours_cap', "This month's computer hours are used up"],
+        ['user_hours_cap', "Your computer reached EZiL's monthly AWS limit"],
+        ['global_hours_cap', "All AWS computers reached EZiL's monthly limit"],
         ['aws_lifecycle_start_failed', 'Something went wrong'],
     ])('%s returns its code as a value and renders %s', async (errorCode, title) => {
         mocks.ensure.mockResolvedValue({ ok: false, error: errorCode, errorCode, retryable: false });

@@ -313,8 +313,8 @@ const AWS_SIZES = ['std-2', 'cmp-4', 'cmp-8'];
 const VCPU_SIZE = { 2: 'std-2', 4: 'cmp-4', 8: 'cmp-8' };
 const IN_FLIGHT = new Set(['requested', 'stopping', 'waking']);
 const SWITCH_KEY = 'ezil-os:switch.';
-/** D11: the AWS ledger cap is not plan time; it gets its own sentence. */
-export const AWS_CAP_COPY = "You've used this month's AWS computer time. It resets on the 1st — or contact us.";
+/** D11: the AWS ledger cap is not plan time; it gets its own sentence (P0 2026-11-04: it never says the user used their time). */
+export const AWS_CAP_COPY = "Your computer reached EZiL's monthly AWS limit, which is separate from your plan's time. It resets on the 1st (UTC) — or contact us.";
 const CAP_REASONS = new Set(['billing_user_hours_cap', 'billing_aws_monthly_cap', 'user_hours_cap', 'aws_monthly_cap']);
 /** Failure reasons another attempt can fix; billing, retirement or a missing placement cannot. */
 const RETRYABLE = /^(capacity_unavailable|capacity:|stop_|release_heal_|wake_timeout|unconfirmed|size_not_applied|placement_unavailable|computer_starting)/;
