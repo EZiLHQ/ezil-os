@@ -122,6 +122,19 @@ export function planTrialOf (summary) {
     return trial;
 }
 
+/**
+ * Current paid access on a v3 summary, never the SKU alone: a paid standing (paid, plan_ending, grace) with no trial,
+ * or a live free month (trialing, ending). A free month that ended (payment_pending, payment_failed) is paused. A
+ * checkout is confirmed only by this plus the purchased SKU (upgrade-sheet.js).
+ */
+const PAID_STANDINGS = new Set(['paid', 'plan_ending', 'grace']);
+export function paidAccess (summary) {
+    if ( summary?.enabled !== true || summary.version !== 3 ) return false;
+    const trial = summary.plan?.trial;
+    if ( trial ) return trial.state === 'trialing' || trial.state === 'ending';
+    return PAID_STANDINGS.has(summary.computer?.standing);
+}
+
 /** "$20.00": the trial's first charge from the server, else the Standard offer's price; null when neither reads. */
 export function trialAmount (summary, trial = planTrialOf(summary)) {
     const cents = Number.isSafeInteger(trial?.amountCents) && trial.amountCents > 0 ? trial.amountCents

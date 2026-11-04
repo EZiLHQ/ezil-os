@@ -13,7 +13,8 @@ const { JSDOM } = shellRequire('jsdom');
 const STANDARD = 'standard_monthly_v3';
 const PREMIUM = 'premium_monthly_v3';
 const free = { enabled: true, plan: { sku: 'free_v3', status: 'active' } };
-const matching = { enabled: true, plan: { sku: STANDARD, status: 'active' } };
+// The webhook-backed plan as the server sends it: the SKU and a paid standing (the SKU alone is not access).
+const matching = { enabled: true, plan: { sku: STANDARD, status: 'active' }, computer: { standing: 'paid' } };
 const completed = (paymentStatus: unknown, sku: unknown = STANDARD) => ({ status: 'complete', paymentStatus, sku });
 const deferred = <T>() => {
     let resolve!: (value: T) => void;
@@ -141,36 +142,98 @@ describe('Checkout return payment and plan confirmation', () => {
         assertReadOnly();
     });
 
-    it('Standard trial: no_payment_required is "starting", then "has started" with the first charge once the plan reports its trial', async () => {
-        const zone = process.env.TZ;
-        process.env.TZ = 'America/Los_Angeles';
-        try {
-            const trial = { state: 'trialing', startedAt: '2027-01-31T03:00:00Z', endsAt: '2027-02-28T03:00:00Z', firstChargeAt: '2027-02-28T03:00:00Z', amountCents: 2000, currency: 'usd' };
-            status = () => completed('no_payment_required');
+    describe('Standard trial lifecycle (checkoutStatus.trial and plan.trial)', () => {
+        const trial = { state: 'trialing', startedAt: '2027-01-31T03:00:00Z', endsAt: '2027-02-28T03:00:00Z', firstChargeAt: '2027-02-28T03:00:00Z', amountCents: 2000, currency: 'usd' };
+        const trialPlan = (state: string, extra: object = {}, standing = 'paid') => ({ enabled: true,
+            plan: { sku: STANDARD, status: 'active', paymentIssue: null, trial: { ...trial, state, ...extra } }, computer: { standing }, actions: { upgrade: false } });
+        const trialCheckout = () => ({ ...completed('no_payment_required'), trial: true });
+        let zone: string | undefined;
+        beforeEach(() => { zone = process.env.TZ; process.env.TZ = 'America/Los_Angeles'; });
+        afterEach(() => { if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone; });
+        const neverPaidOrActive = () => expect(text()).not.toMatch(/payment received|\bpaid\b|Your plan is active|No payment is required/i);
+
+        it('trialing: "is starting", then "has started" with the first charge by date', async () => {
+            status = trialCheckout;
             summary = () => free;
             await render();
             expect(text()).toMatch(/^Your free month is starting\. Waiting for your plan to update\./);
-            summary = () => ({ ...matching, plan: { ...matching.plan, trial } });
+            summary = () => trialPlan('trialing');
             await tick(2000);
-            // The first charge in the viewer's zone: 03:00 UTC on 28 Feb is 27 Feb in Los Angeles.
-            // A date, never a minute: Stripe collects the first charge about an hour after the end.
+            // 03:00 UTC on 28 Feb is 27 Feb in Los Angeles; a date, never a minute (Stripe collects about an hour later).
             expect(text()).toMatch(/^Your free month has started\. First charge \$20\.00 from Feb 27, 2027 unless you cancel\./);
-            expect(text()).not.toMatch(/payment received|\bpaid\b|Your plan is active|No payment is required/i);
-            // An ending trial (cancelled at once) has started too, with no charge to announce.
-            summary = () => ({ ...matching, plan: { ...matching.plan, status: 'cancels', trial: { ...trial, state: 'ending', firstChargeAt: null } } });
-            await render('cs_test_ending');
-            expect(text()).toMatch(/^Your free month has started\./);
+            neverPaidOrActive();
+        });
+
+        it('ending: has started; it ends on the date and you won\'t be charged', async () => {
+            status = trialCheckout;
+            summary = () => ({ ...trialPlan('ending', { firstChargeAt: null }, 'plan_ending'), plan: { ...trialPlan('ending', { firstChargeAt: null }).plan, status: 'cancels' } });
+            await render();
+            expect(text()).toMatch(/^Your free month has started; it ends on Feb 27, 2027 and you won't be charged\./);
             expect(text()).not.toMatch(/First charge/);
-            // A paid checkout is unchanged.
-            status = () => completed('paid');
+            neverPaidOrActive();
+        });
+
+        it('review U1: an old completed trial return opened while the first payment is pending is never "active" or "started"', async () => {
+            // The independent review's input (checkout-status-lifecycle.review.test.ts), unchanged: no trial flag.
+            status = () => completed('no_payment_required');
+            summary = () => ({ enabled: true, plan: { sku: STANDARD, status: 'active', paymentIssue: null,
+                trial: { state: 'payment_pending', startedAt: '2026-11-05T10:00:00Z', endsAt: '2026-12-05T10:00:00Z',
+                    firstChargeAt: '2026-12-05T10:00:00Z', amountCents: 2000, currency: 'usd' } },
+                computer: { standing: 'free', filesOn: 'cloudflare' }, actions: { upgrade: false } });
+            await render('cs_test_old_completed_trial');
+            expect(text()).not.toMatch(/Your plan is active|Your free month has started/);
+            expect(text()).toMatch(/^Your free month has ended; we're collecting the first \$20\.00 payment\. Standard is paused until it goes through\./);
+            // The same with the server's trial flag.
+            status = trialCheckout;
+            await render('cs_test_old_completed_trial_flagged');
+            expect(text()).toMatch(/^Your free month has ended; we're collecting the first \$20\.00 payment\./);
+            neverPaidOrActive();
+        });
+
+        it('payment_failed: the first payment didn\'t go through; Standard is paused; files kept', async () => {
+            status = trialCheckout;
+            summary = () => ({ ...trialPlan('payment_failed', {}, 'free'), plan: { ...trialPlan('payment_failed').plan, status: 'past_due', paymentIssue: 'payment_failed' } });
+            await render();
+            expect(text()).toMatch(/^Your free month has ended and the first \$20\.00 payment didn't go through\. Standard is paused; your files are kept\./);
+            neverPaidOrActive();
+        });
+
+        it('converted (no plan.trial, paid standing): ordinary Standard is active', async () => {
+            status = trialCheckout;
             summary = () => matching;
-            await render('cs_test_paid');
+            await render();
+            expect(text()).toMatch(/^Your plan is active\./);
+        });
+
+        it('no plan.trial and no paid standing: neutral "confirming", never active, then Check Settings at the deadline', async () => {
+            status = trialCheckout;
+            summary = () => ({ enabled: true, plan: { sku: STANDARD, status: 'active' }, computer: { standing: 'free' } });
+            await render();
+            expect(text()).toMatch(/^Your free month is starting/);
+            await tick(2000);
+            expect(text()).toMatch(/^We’re confirming your plan\./);
+            await tick(60_000);
+            expect(text()).toMatch(/^We’re confirming your plan\. Check Settings → Billing for updates\./);
+            expect(text()).not.toMatch(/active|has started|is starting/i);
+            expect(target.querySelector('a[href="/os?settings=billing"]')?.textContent).toBe('Back to Billing');
+        });
+
+        it('a non-trial checkout with nothing to pay (trial: false) keeps its own words', async () => {
+            status = () => ({ ...completed('no_payment_required'), trial: false });
+            summary = () => free;
+            await render();
+            expect(text()).toMatch(/^No payment is required\. Waiting for your plan to update\./);
+            expect(text()).not.toMatch(/free month/i);
+        });
+
+        it('a paid checkout is unchanged', async () => {
+            status = () => ({ ...completed('paid'), trial: false });
+            summary = () => matching;
+            await render();
             expect(text()).toMatch(/Your plan is active\./);
             expect(text()).not.toMatch(/free month/i);
             assertReadOnly();
-        } finally {
-            if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone;
-        }
+        });
     });
 
     it('bank completion can become paid while the webhook plan still lags, then activate', async () => {
@@ -206,8 +269,20 @@ describe('Checkout return payment and plan confirmation', () => {
 
     it('same SKU scheduled to cancel retains confirmed active access', async () => {
         status = () => completed('paid');
-        summary = () => ({ enabled: true, plan: { sku: STANDARD, status: 'cancels' } });
+        summary = () => ({ enabled: true, plan: { sku: STANDARD, status: 'cancels' }, computer: { standing: 'plan_ending' } });
         await render();
+        expect(active()).toBe(true);
+    });
+
+    it.each([undefined, 'free', 'files_on_aws', 'unknown'])('the SKU alone (standing %s) is never active access', async standing => {
+        status = () => completed('paid');
+        summary = () => ({ enabled: true, plan: { sku: STANDARD, status: 'active' }, ...(standing ? { computer: { standing } } : {}) });
+        await render();
+        await tick(2000);
+        expect(active()).toBe(false);
+        expect(text()).toMatch(/Payment received/);
+        summary = () => matching;
+        await tick(2000);
         expect(active()).toBe(true);
     });
 
@@ -364,7 +439,7 @@ describe('Checkout return payment and plan confirmation', () => {
         await act(async () => { old.resolve(completed('paid', STANDARD)); await settle(); });
         expect(active()).toBe(false);
         expect(count('billing.summary')).toBe(1);
-        summary = () => ({ enabled: true, plan: { sku: PREMIUM, status: 'active' } });
+        summary = () => ({ enabled: true, plan: { sku: PREMIUM, status: 'active' }, computer: { standing: 'paid' } });
         await tick(2000);
         expect(active()).toBe(true);
         expect(reads.filter(read => read.procedure === 'billing.checkoutStatus').map(read => read.sessionId))

@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, trialMomentLabel } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, trialMomentLabel, paidAccess } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -390,7 +390,9 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         clearTimers();
         mount.hidden = true;
         const credits = creditedCredits ?? pack?.aiCredits;
-        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : trialMode ? `Your free month of ${name} has started` : `You're on ${name}`, 'Done', returnToBilling);
+        // A free month is named only when the summary reports it live; otherwise the plan is ordinary Standard.
+        const freeMonth = trialMode && ['trialing', 'ending'].includes(summary?.plan?.trial?.state);
+        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : freeMonth ? `Your free month of ${name} has started` : `You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -401,7 +403,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         // The refreshed balance is the server's, for the signed-in person only; otherwise point to Billing.
         const view = pack && summary?.version === 3 ? accountCredits(summary.ai?.account, { userId }) : null;
         allowances.textContent = pack ? view && ! view.stale ? `Your balance is now ${view.left} credits.` : 'Check your AI credits in Billing.'
-            : trialMode && quote ? `First charge ${trialAmount()} from ${trialDayLabel(quote.trialEndsAt, { timeZone })} unless you cancel before then.` : allowance;
+            : freeMonth && quote ? `First charge ${trialAmount()} from ${trialDayLabel(quote.trialEndsAt, { timeZone })} unless you cancel before then.` : allowance;
         if ( pack ) allowances.dataset.role = 'topup-new-balance';
         state.querySelector('button').before(allowances);
         state.querySelector('button').focus();
@@ -468,7 +470,9 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             const summary = unwrap(await trpc.query('billing.summary'));
             if ( closed || finished ) return;
             if ( now() >= deadline ) { timedOut(); return; }
-            if ( summary?.plan?.sku === sku ) { success(); return; }
+            // The purchased SKU is not access by itself: a v3 plan also needs paid access (a paid standing or a live
+            // free month). A v2 summary has no standing; its SKU check stands.
+            if ( summary?.plan?.sku === sku && (summary.version !== 3 || paidAccess(summary)) ) { success(summary); return; }
         } catch { /* A transient read failure must not imply that payment failed. */ }
         if ( ! closed && ! finished ) later(() => { void poll(); }, CONFIRM_POLL_MS);
     }

@@ -71,7 +71,7 @@ export function trialSummaryV3(state, { endsAt = TRIAL_END, reason = 'trial_used
     if ( state === 'payment_pending' ) {
         ratedAsFree(s, standing ?? 'free');
         s.fairUse = { status: 'ok', resetsAt: s.fairUse.resetsAt };
-        // The server still allows cancelAtPeriodEnd here (status active); Billing does not offer it (see tabs/billing.js).
+        // The server keeps cancelAtPeriodEnd here (status active): it stops later renewals, never the first payment.
         Object.assign(s.actions, { checkout: false, downgrade: false });
     }
     if ( state === 'payment_failed' ) {

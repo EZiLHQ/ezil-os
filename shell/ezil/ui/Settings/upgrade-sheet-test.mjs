@@ -1328,7 +1328,14 @@ for ( const tier of ['standard', 'premium'] ) test(`v3 ${tier} checkout requires
     assert.match(h.text(), new RegExp(`${offer.name} starts after payment and ${tier === 'premium' ? '1,000' : '200'} AI credits are added\\.`));
     assert.doesNotMatch(v3CopyForAudit(h.text()), banned); assert.doesNotMatch(h.text(), honestyBans);
     h.complete(); await settle(); assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    // The purchased SKU alone is not access (review U1): no standing, or a standing without paid access, waits.
     h.summary = async () => summary;
+    await h.tick(1500); assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    for ( const standing of ['free', 'files_on_aws'] ) {
+        h.summary = async () => ({ ...summary, computer: { ...summary.computer, standing } });
+        await h.tick(1500); assert.equal(h.q('[data-role="upgrade-success"]'), null, standing);
+    }
+    h.summary = async () => ({ ...summary, computer: { ...summary.computer, standing: 'paid' } });
     await h.tick(1500); assert.match(h.text(), new RegExp(`You're on ${offer.name}`));
     h.click('[data-action="done"]'); assert.equal(h.done, 1); assert.equal(h.destroyed, 1);
 });

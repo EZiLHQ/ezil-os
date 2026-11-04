@@ -196,19 +196,33 @@ function cancelCopyV3 (summary, trial = null) {
     return `${lead} ${after} your computer opens under Free limits${hours ? ` (sessions up to ${hours} hour${hours === 1 ? '' : 's'})` : ''}; your files stay on your AWS computer.`;
 }
 
+/**
+ * Standard trial, `payment_pending`: the free month has ended and Stripe is collecting the first charge. The same
+ * cancelAtPeriodEnd stops later renewals; it never voids that first payment, and Standard is paused, not "active".
+ */
+function cancelCopyPending (trial) {
+    const amount = Number.isSafeInteger(trial.amountCents) && trial.amountCents > 0 ? `${dollars(trial.amountCents)} ` : '';
+    return `Your free month has ended and your first ${amount}payment is still being collected. Cancelling stops later renewals; it doesn't cancel that first payment. Standard stays paused until it goes through; if it does, Standard runs to the end of that month and then ends.`;
+}
+
 export function openCancelSheet (options) {
-    // Standard trial: the same cancelAtPeriodEnd, in the free month's words (only a live trial can be cancelled).
-    const trial = planTrialOf(options.summary)?.state === 'trialing' ? options.summary.plan.trial : null;
+    // Standard trial: the same cancelAtPeriodEnd, in the free month's words (a live trial, or one whose first payment
+    // is being collected). Normal paid plans keep their copy.
+    const state = planTrialOf(options.summary)?.state;
+    const trial = state === 'trialing' ? options.summary.plan.trial : null;
+    const pending = state === 'payment_pending' ? options.summary.plan.trial : null;
     const sheet = billingSheet(options, 'cancel', trial ? 'Cancel your free month' : `Cancel ${options.summary.version === 3 ? options.summary.plan.name : planName(options.summary.plan.family)}`);
     if ( sheet.existing ) return sheet.existing;
-    sheet.node('p', options.summary.version === 3
+    sheet.node('p', pending ? cancelCopyPending(pending) : options.summary.version === 3
         ? cancelCopyV3(options.summary, trial)
         : `Your plan stays active until ${dateLabel(options.summary.plan.periodEnd)}, then moves to Free. You can resume any time before then.`);
     const actions = sheet.node('div', null);
     actions.className = 'ezil-billing-sheet-actions';
-    sheet.button(trial ? 'Cancel free month' : 'Cancel plan', 'confirm', () => {
+    sheet.button(trial ? 'Cancel free month' : pending ? 'Cancel later renewals' : 'Cancel plan', 'confirm', () => {
         void sheet.request('billing.cancelAtPeriodEnd', { cancel: true }, data => {
-            sheet.result([trial ? `Your free month ends on ${trialDayLabel(data.cancelsAt ?? trial.endsAt)}. You won't be charged.` : `Your plan ends ${dateLabel(data.cancelsAt)}.`]);
+            sheet.result([trial ? `Your free month ends on ${trialDayLabel(data.cancelsAt ?? trial.endsAt)}. You won't be charged.`
+                : pending ? `Later renewals are cancelled. Your first payment is still being collected; if it goes through, Standard runs${Number.isFinite(Date.parse(data.cancelsAt ?? '')) ? ` until ${trialDayLabel(data.cancelsAt)}` : ' to the end of that month'} and then ends.`
+                : `Your plan ends ${dateLabel(data.cancelsAt)}.`]);
         });
     }, actions).className = 'ezil-billing-sheet-danger';
     sheet.button(trial ? 'Keep free month' : 'Keep plan', 'keep', sheet.close, actions).className = 'ezil-billing-sheet-secondary';

@@ -6,16 +6,53 @@ const checking = 'Checking your payment…';
 const unconfirmed = 'Payment confirmation is pending. Your plan updates after payment is confirmed.';
 type View = { sessionId: string; message: string; canCheckAgain: boolean };
 
+type Trial = { state?: unknown; endsAt?: unknown; firstChargeAt?: unknown; amountCents?: unknown };
+type SummaryRead = { enabled?: unknown; plan?: { sku?: unknown; status?: unknown; trial?: unknown }; computer?: { standing?: unknown } } | null | undefined;
+/** Standings in which the plan's computer is usable as a paid plan (the server's STANDING-CONTRACT). */
+const PAID_ACCESS = ['paid', 'plan_ending', 'grace'];
+
+/** "$20.00" from whole cents, or null. */
+function money(cents: unknown): string | null {
+    return typeof cents === 'number' && Number.isSafeInteger(cents) && cents > 0
+        ? `$${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}` : null;
+}
+
+/** "Feb 27, 2027": an instant's day in the viewer's zone, or null. */
+function day(iso: unknown): string | null {
+    const at = typeof iso === 'string' ? Date.parse(iso) : NaN;
+    return Number.isFinite(at) ? new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric' }).format(new Date(at)) : null;
+}
+
 /**
  * " First charge $20.00 from Feb 27, 2027 unless you cancel." from the server's `plan.trial`, in the viewer's zone; ''
  * when unreadable. A date, never a minute: Stripe collects the first charge about an hour after the trial end.
  */
-function firstCharge(trial: { state?: unknown; firstChargeAt?: unknown; amountCents?: unknown }): string {
-    const at = typeof trial.firstChargeAt === 'string' ? Date.parse(trial.firstChargeAt) : NaN;
-    const cents = trial.amountCents;
-    if (trial.state !== 'trialing' || !Number.isFinite(at) || typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents <= 0) return '';
-    const day = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric' }).format(new Date(at));
-    return ` First charge $${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')} from ${day} unless you cancel.`;
+function firstCharge(trial: Trial): string {
+    const amount = money(trial.amountCents), on = day(trial.firstChargeAt);
+    return trial.state === 'trialing' && amount && on ? ` First charge ${amount} from ${on} unless you cancel.` : '';
+}
+
+/**
+ * What the webhook-backed summary says about this checkout's plan: a final message, or null to keep checking. The SKU
+ * alone is never access: "active" needs a paid standing, and a free month is named by its own state, including an old
+ * return link opened after the free month ended (Standard paused while the first payment is collected, or after it
+ * failed). Never "active" for either.
+ */
+function confirmedMessage(summary: SummaryRead, expectedSku: string): string | null {
+    if (summary?.enabled !== true || !summary.plan || summary.plan.sku !== expectedSku) return null;
+    const trial = summary.plan.trial && typeof summary.plan.trial === 'object' ? summary.plan.trial as Trial : null;
+    if (trial) {
+        const first = money(trial.amountCents) ? `first ${money(trial.amountCents)} payment` : 'first payment';
+        switch (trial.state) {
+            case 'trialing': return `Your free month has started.${firstCharge(trial)}`;
+            case 'ending': return day(trial.endsAt) ? `Your free month has started; it ends on ${day(trial.endsAt)} and you won't be charged.` : 'Your free month has started.';
+            case 'payment_pending': return `Your free month has ended; we're collecting the ${first}. Standard is paused until it goes through.`;
+            case 'payment_failed': return `Your free month has ended and the ${first} didn't go through. Standard is paused; your files are kept.`;
+            default: return null;
+        }
+    }
+    return typeof summary.plan.status === 'string' && ['active', 'cancels'].includes(summary.plan.status)
+        && typeof summary.computer?.standing === 'string' && PAID_ACCESS.includes(summary.computer.standing) ? 'Your plan is active.' : null;
 }
 
 /** Checkout is a receipt only; the webhook remains responsible for applying the plan. */
@@ -30,6 +67,9 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
         const controller = new AbortController();
         let stopped = false;
         let lastMessage = unconfirmed;
+        // A free-month checkout whose plan a summary has not confirmed yet: neutral from then on, never "starting"
+        // for a return link opened long after (the summary is the authority).
+        let confirming = false;
         let pollTimer: ReturnType<typeof setTimeout> | undefined;
         const deadline = setTimeout(() => {
             stopped = true;
@@ -70,11 +110,13 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
                     const expectedSku = typeof checkout.sku === 'string' && checkout.sku.trim() ? checkout.sku : null;
                     const paymentStatus = checkout.paymentStatus;
                     const receiptConfirmed = paymentStatus === 'paid' || paymentStatus === 'no_payment_required';
-                    // A subscription checkout that needs no payment is the Standard free month ($0 today): it is
-                    // starting, never "paid" or "payment received".
-                    const freeMonth = paymentStatus === 'no_payment_required';
+                    // The server names our free-month checkout (checkoutStatus.trial); $0 today is never "paid" or
+                    // "payment received". Without the flag, a subscription checkout with nothing to pay is the free month.
+                    const freeMonth = paymentStatus === 'no_payment_required'
+                        && (typeof checkout.trial === 'boolean' ? checkout.trial : true);
                     lastMessage = paymentStatus === 'paid' ? 'Payment received. Waiting for your plan to update.'
-                        : freeMonth ? 'Your free month is starting. Waiting for your plan to update.'
+                        : freeMonth ? confirming ? 'We’re confirming your plan.' : 'Your free month is starting. Waiting for your plan to update.'
+                        : paymentStatus === 'no_payment_required' ? 'No payment is required. Waiting for your plan to update.'
                         : paymentStatus === 'unpaid' ? 'Your payment is processing. Bank payments can take a few days. Your plan updates after payment is confirmed.'
                         : unconfirmed;
                     if (!expectedSku) lastMessage += ' The purchased plan could not be confirmed.';
@@ -82,15 +124,14 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
                     if (expectedSku) {
                         const summary = await query('summary');
                         if (stopped) return;
-                        // Payment receipt alone is insufficient. This read is the
+                        // Payment receipt alone is insufficient, and so is the SKU. This read is the
                         // webhook-backed plan, not a client-side entitlement.
-                        if (receiptConfirmed && summary?.enabled === true && summary?.plan?.sku === expectedSku
-                            && ['active', 'cancels'].includes(summary.plan.status)) {
-                            // The free month is named only when the webhook-backed plan reports its trial.
-                            const trial = freeMonth ? summary.plan.trial : null;
-                            finish(trial && ['trialing', 'ending'].includes(trial.state) ? `Your free month has started.${firstCharge(trial)}` : 'Your plan is active.');
+                        const message = receiptConfirmed ? confirmedMessage(summary, expectedSku) : null;
+                        if (message) {
+                            finish(message);
                             return;
                         }
+                        if (freeMonth) confirming = true;
                     }
                 } else {
                     lastMessage = unconfirmed;
