@@ -229,9 +229,11 @@ function requestBody(input: RelayBody): RelayBody {
   return {
     v: 1, op: input.op, repositoryId: input.repositoryId, handle: input.handle, name: input.name, gitHost: input.gitHost,
     defaultBranch: input.defaultBranch, path: input.path,
-    // class public carries no grant at all; every other class requires one, and a missing grant there throws
-    // exactly as before (caught by the caller -> workspace_failed), never a silent grant-less relay.
-    ...(cls === 'public' ? {} : { grant: { username: grant!.username, token: grant!.token, expiresAt: grant!.expiresAt, scope: grant!.scope } }),
+    // Class public carries no grant (the host clones github.com anonymously). A present grant is NEVER
+    // stripped to "no credential": it is KEPT so validPublicRelayBody's exact-keys check refuses the body
+    // (invalid_request, nothing relayed), never a silent anonymous relay of a credentialled open. Every
+    // non-public class requires a grant, and a missing one there throws as before (caught -> workspace_failed).
+    ...(cls !== 'public' || grant !== undefined ? { grant: { username: grant!.username, token: grant!.token, expiresAt: grant!.expiresAt, scope: grant!.scope } } : {}),
     ...(cls !== undefined ? { class: cls } : {}),
   } as RelayBody;
 }

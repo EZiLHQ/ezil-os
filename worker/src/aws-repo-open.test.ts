@@ -1579,6 +1579,15 @@ describe('class public: a grant-free open relayed to an AWS computer', () => {
     }
   });
 
+  it('a public input carrying a grant is REFUSED (invalid_request), never relayed anonymously (no credential-collapse)', async () => {
+    const e = edge(() => ok(okPublic));
+    // A present credential must never silently become "no credential": the body keeps the grant, fails the
+    // exact-keys check, and nothing is sent — rather than being stripped to an anonymous relay.
+    const withGrant = { ...publicInput(), grant: input().grant } as unknown as PublicRepoOpenInput;
+    expect(await awsRepoOpenStart(withGrant, SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('invalid_request')));
+    expect(e.calls).toEqual([]);
+  });
+
   it('a defaultBranch u2 refuses (_x: branchOf accepts it) is a pre-send invalid_request, never relayed', async () => {
     const e = edge(() => ok(okPublic));
     expect(await awsRepoOpenStart(publicInput({ defaultBranch: '_x' }), SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('invalid_request')));
