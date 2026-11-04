@@ -63,11 +63,15 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
         const flush = () => { if (content) input.push({ type: 'message', role: message.role, content }); content = ''; };
         for (const part of message.parts) {
             if (part.type === 'tool_call') {
-                flush();
                 const id = identifier(part.callId);
                 if (message.role !== 'assistant' || typeof part.name !== 'string' || !NAME.test(part.name) || calls.has(id) || !isObject(part.input)) throw new Error('Invalid function call');
                 jsonSafe(part.input);
-                calls.add(id); pending.add(id);
+                calls.add(id);
+                // A model without tool calling gets earlier calls as text and their results as earlier output, as on
+                // Messages: the Gateway refuses any function item for it ("Model does not support tools").
+                if (!model.capabilities.toolCalling) { content += '[tool call omitted: unavailable tool]'; continue; }
+                flush();
+                pending.add(id);
                 input.push({ type: 'function_call', call_id: id, name: part.name, arguments: JSON.stringify(part.input) });
             } else if (part.type === 'tool_result') {
                 flush();

@@ -51,6 +51,31 @@ describe('Responses request subset', () => {
         expect(new TextDecoder().decode(built.bytes)).not.toContain('private prior reasoning');
     });
 
+    test('a model without tool calling gets earlier calls and results as text, never as function items', () => {
+        // The picker switched from a tool-capable model; provider.ts has already left the tools out.
+        const history = [
+            msg('user', txt('Read a.ts')),
+            msg('assistant', txt('Opening the file.'), call('call/1', 'read_file', { path: 'a.ts' })),
+            msg('user', result('call/1', [txt('export const a = 1;')]), txt('Explain it.')),
+            msg('assistant', call('call/2', 'read_file', { path: 'b.ts' })),
+        ];
+        const toolless = { ...model(), capabilities: { ...model().capabilities, toolCalling: false } };
+        const body = buildGatewayResponsesBody(toolless, { ...ask(history), tools: [] }).body;
+        expect(body.tools).toBeUndefined();
+        expect(body.input).toEqual([
+            { type: 'message', role: 'user', content: 'Read a.ts' },
+            { type: 'message', role: 'assistant', content: 'Opening the file.[tool call omitted: unavailable tool]' },
+            { type: 'message', role: 'user', content: '[Earlier tool output]\nexport const a = 1;' },
+            { type: 'message', role: 'user', content: 'Explain it.' },
+            { type: 'message', role: 'assistant', content: '[tool call omitted: unavailable tool]' },
+        ]);
+        // Control: a model with tool calling keeps the pairs, with or without tools on this turn.
+        for (const tools of [[tool], []]) {
+            expect(build({ ...ask(history), tools }).body.input.filter(item => item.type !== 'message').map(item => item.type))
+                .toEqual(['function_call', 'function_call_output', 'function_call', 'function_call_output']);
+        }
+    });
+
     test('no-tool requests omit tool controls and ignore caller attempts to add hosted/stateful options', () => {
         const built = build({ ...ask(), modelOptions: {
             store: true, previous_response_id: 'resp-secret', conversation: 'conv-secret', background: true,
