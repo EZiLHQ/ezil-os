@@ -324,7 +324,7 @@ test('narrow viewport: the dialog takes the screen and the options wrap without 
     h.window.innerWidth = 375;
     h.open();
     assert.ok(h.q('.ezil-upgrade-backdrop').classList.contains('is-compact'), 'compact frame below 760 px');
-    assert.match(css, /grid-template-columns: repeat\(auto-fit, minmax\(132px, 1fr\)\)/);
+    assert.match(css, /\.ezil-topup-options \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
     assert.match(css, /\.is-compact \.ezil-topup-sheet \.ezil-billing-sheet-actions button \{ flex: 1 1 100%; \}/);
 });
 

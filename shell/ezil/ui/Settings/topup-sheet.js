@@ -162,15 +162,16 @@ export function openTopupSheet (options) {
         const radio = el('input', { type: 'radio', name: 'ezil-topup-amount', value }, label);
         const text = el('span', { className: 'ezil-topup-option-text' }, label);
         el('strong', {}, text, lines[0]);
-        if ( lines[1] ) el('span', {}, text, lines[1]);
-        if ( lines[2] ) el('span', { className: 'ezil-topup-save' }, text, lines[2]);
+        const meta = el('span', { className: 'ezil-topup-option-meta' }, text);
+        if ( lines[1] ) el('span', {}, meta, lines[1]);
+        if ( lines[2] ) el('span', { className: 'ezil-topup-save' }, meta, lines[2]);
         radios.push(radio);
         return radio;
     }
     for ( const pack of offer.packs ) {
         option(pack.sku, [`${whole(pack.aiCredits)} credits`, money(pack.totalCents), pack.discountPercent ? `Save ${pack.discountPercent}%` : ''], { sku: pack.sku });
     }
-    const customRadio = offer.custom ? option('custom', ['Custom amount', 'Any whole-dollar amount']) : null;
+    const customRadio = offer.custom ? option('custom', ['Custom amount', 'Whole dollars']) : null;
     const customBox = offer.custom ? el('div', { className: 'ezil-topup-custom', dataset: { role: 'topup-custom' } }, form) : null;
     let input = null, inputError = null;
     if ( customBox ) {
@@ -179,6 +180,8 @@ export function openTopupSheet (options) {
         el('span', { 'aria-hidden': 'true' }, wrap, '$');
         input = el('input', { id: 'ezil-topup-custom-input', type: 'text', inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false',
             maxlength: '16', 'aria-describedby': 'ezil-topup-custom-hint ezil-topup-custom-error', placeholder: String(offer.custom.minCents / 100) }, wrap);
+        // The whole field (with its "$") is the target, not only the text box inside it.
+        wrap.addEventListener('pointerdown', event => { if ( event.target !== input && ! input.disabled ) { event.preventDefault(); input.focus(); } });
         el('p', { id: 'ezil-topup-custom-hint', className: 'ezil-upgrade-caption' }, customBox, customHint(offer.custom));
         inputError = el('p', { id: 'ezil-topup-custom-error', className: 'ezil-topup-error', dataset: { role: 'topup-custom-error' } }, customBox);
         inputError.hidden = true;
