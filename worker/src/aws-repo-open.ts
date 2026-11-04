@@ -224,12 +224,14 @@ function validPublicRelayBody(body: RelayBody): boolean {
  * key is written.
  */
 function requestBody(input: RelayBody): RelayBody {
-  const grant = (input as RepoOpenBody).grant;
   const cls = (input as { class?: AwsRelayClass }).class;
+  const grant = (input as RepoOpenBody).grant;
   return {
     v: 1, op: input.op, repositoryId: input.repositoryId, handle: input.handle, name: input.name, gitHost: input.gitHost,
     defaultBranch: input.defaultBranch, path: input.path,
-    ...(grant !== undefined ? { grant: { username: grant.username, token: grant.token, expiresAt: grant.expiresAt, scope: grant.scope } } : {}),
+    // class public carries no grant at all; every other class requires one, and a missing grant there throws
+    // exactly as before (caught by the caller -> workspace_failed), never a silent grant-less relay.
+    ...(cls === 'public' ? {} : { grant: { username: grant!.username, token: grant!.token, expiresAt: grant!.expiresAt, scope: grant!.scope } }),
     ...(cls !== undefined ? { class: cls } : {}),
   } as RelayBody;
 }

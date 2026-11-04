@@ -23,11 +23,14 @@ import { awsOriginHostname, decodeControlKey, verifyGatewayHeader, type AwsTunne
 import {
   AWS_EDGE_CALL_MAX_MS, AWS_EDGE_REPLY_MAX_BYTES, AWS_HOST_ERROR_CODES, AWS_JOB_ID_RE, AWS_KERNEL_ERROR_CODES, AWS_RELAY_POLL_MS,
   AWS_REPO_OPEN_PATH, AWS_REPO_OPEN_RELAY_MAX_BYTES, AWS_REPO_OPEN_ROOT, AWS_REPO_OPEN_STATUS_PATH, AWS_RESULT_ERROR_CODES,
-  awsJobAnswer, awsRepoOpenPoll, awsRepoOpenRelayBody, awsRepoOpenStart, handleAwsRepoOpen,
-  type AwsRepoOpenDeps, type AwsRepoOpenJob, type AwsRepoOpenStep, type AwsRepoOpenTarget,
+  GITHUB_NAME_RE, GITHUB_OWNER_RE, REPO_OPEN_PUBLIC_GIT_HOST, isPublicRepoName,
+  awsJobAnswer, awsPublicRepoOpenInput, awsPublicRepoOpenResult, awsRepoOpenPoll, awsRepoOpenRelayBody, awsRepoOpenStart,
+  handleAwsRepoOpen, relayPublicRepoOpen,
+  type AwsRepoOpenDeps, type AwsRepoOpenJob, type AwsRepoOpenStep, type AwsRepoOpenTarget, type PublicRepoOpenInput,
 } from './aws-repo-open';
+import { PUBLIC_GITHUB_REPOSITORY_URL } from './repo-open';
 import {
-  OPEN_RESULT_STATES, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse,
+  OPEN_RESULT_STATES, REPO_OPEN_STATUS, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, refusal, repoOpenResponse, validName,
   type RepoOpenAnswer, type RepoOpenClass, type RepoOpenErrorCode, type RepoOpenInput,
 } from './repo-open-u2';
 
@@ -1458,5 +1461,162 @@ describe('contract 1.0.4: class project is gated, wrapped and answered exactly',
     const refused$ = new Response('origin unavailable', { status: 503 });
     expect(await handleAwsRepoOpen(projectInput(), SANDBOX, refused$, deps(e.fetch, gates()), 'project', { projectGitHost: QA })).toEqual(refusal('workspace_unsupported'));
     expect([e.calls.length, gateCalls.length, refused$.bodyUsed]).toEqual([0, 0, false]);
+  });
+});
+
+// ── worker extension: class public (a grant-free anonymous public github.com open) ────────────
+
+/** A class-public §8 input: no grant, github.com, op open, the wrapper W folder, a mixed-case owner. */
+const PUB_W = `${AWS_REPO_OPEN_ROOT}/projects/${REPO_ID}`;
+const publicInput = (patch: Partial<PublicRepoOpenInput> = {}, receivedAt = NOW): PublicRepoOpenInput =>
+  ({ v: 1, op: 'open', repositoryId: REPO_ID, handle: 'EZiLHQ', name: 'ezil-os', gitHost: REPO_OPEN_PUBLIC_GIT_HOST,
+    defaultBranch: 'main', path: null, class: 'public', receivedAt, ...patch });
+const okPublic = { ...okOpen, folder: PUB_W, openFolder: PUB_W };
+const publicJobOf = (patch: Partial<AwsRepoOpenJob> = {}): AwsRepoOpenJob =>
+  ({ jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'public', handle: 'a-b', name: 'x-', repositoryId: REPO_ID,
+    defaultBranch: 'main', acknowledged: true, ...patch });
+
+describe('class public: the github.com owner/name grammar (copied from app repo-url.ts)', () => {
+  it('OWNER/NAME behave exactly like repo-open.ts PUBLIC_GITHUB_REPOSITORY_URL (behavioural parity)', () => {
+    const owners = ['a', 'EZiLHQ', 'a-b', 'a'.repeat(39), '-a', 'a-', 'a--b', 'a'.repeat(40), 'a_b', 'a.b', ''];
+    const names = ['b', 'ezil-os', 'x-', '_x', 'c.d_e-f', 'a'.repeat(100), '.hidden', 'b..c', 'a'.repeat(101), 'a/b', '-x', ''];
+    for (const owner of owners) for (const name of names) {
+      const viaParts = GITHUB_OWNER_RE.test(owner) && GITHUB_NAME_RE.test(name);
+      const viaUrl = PUBLIC_GITHUB_REPOSITORY_URL.test(`https://github.com/${owner}/${name}.git`);
+      expect([owner, name, viaParts]).toEqual([owner, name, viaUrl]);
+    }
+  });
+
+  it('the regex sources are copied verbatim from app/src/server/works/repo-url.ts OWNER and NAME', () => {
+    const src = readFileSync(here('../../app/src/server/works/repo-url.ts'), 'utf8');
+    expect(GITHUB_OWNER_RE.toString()).toBe(/^const OWNER = (\/.+\/);$/m.exec(src)?.[1]);
+    expect(GITHUB_NAME_RE.toString()).toBe(/^const NAME = (\/.+\/);$/m.exec(src)?.[1]);
+  });
+
+  it('accepts names u2 refuses (x-, _x) and a mixed-case owner; refuses a .git suffix and a bad owner', () => {
+    for (const n of ['x-', '_x']) {
+      expect([n, validName(n)]).toEqual([n, false]);        // u2 refuses it
+      expect([n, isPublicRepoName(n)]).toEqual([n, true]);  // public accepts it
+    }
+    expect(GITHUB_NAME_RE.test('foo.git')).toBe(true);      // the NAME grammar alone accepts it
+    expect(isPublicRepoName('foo.git')).toBe(false);        // but the .git suffix is refused (repo-url.ts)
+    expect([GITHUB_OWNER_RE.test('EZiLHQ'), GITHUB_OWNER_RE.test('-a'), GITHUB_OWNER_RE.test('a-')]).toEqual([true, false, false]);
+    expect(REPO_OPEN_PUBLIC_GIT_HOST).toBe('github.com');
+  });
+});
+
+describe('class public: build the relay input from a canonical github.com URL', () => {
+  it('extracts owner/name (mixed case preserved), passes repositoryId and branch through unchanged', () => {
+    expect(awsPublicRepoOpenInput('https://github.com/EZiLHQ/ezil-os.git', REPO_ID, 'main', NOW)).toEqual(publicInput());
+    // a name u2 refuses but github accepts
+    expect(awsPublicRepoOpenInput('https://github.com/a/x-.git', REPO_ID, 'main', NOW))
+      .toEqual(publicInput({ handle: 'a', name: 'x-' }));
+  });
+
+  it('returns null when the owner/name fail the grammar, so the dispatch answers unsupported (never relays)', () => {
+    for (const url of [
+      'https://github.com/a/x.git.git',      // name x.git: the URL regex accepts, repo-url.ts (and we) refuse
+      'https://github.com/-a/b.git',         // bad owner
+      'https://github.com/a-/b.git',         // bad owner
+      'https://github.com/a/b..c.git',       // .. in name
+      'https://gitlab.com/a/b.git',          // not github.com
+      'https://github.com/a/b',              // no .git
+    ]) {
+      expect([url, awsPublicRepoOpenInput(url, REPO_ID, 'main', NOW)]).toEqual([url, null]);
+    }
+  });
+});
+
+describe('class public: a grant-free open relayed to an AWS computer', () => {
+  it('relays no grant and class public, and answers the wrapper folder /workspace/projects/<repositoryId>', async () => {
+    const e = job(() => ok(okPublic), 2);
+    expect(await handleAwsRepoOpen(publicInput(), SANDBOX, target, deps(e.fetch), 'public'))
+      .toEqual({ status: 200, body: okPublic } as RepoOpenAnswer);
+    const relayed = JSON.parse(e.calls[0]!.init.body as string);
+    expect('grant' in relayed).toBe(false);          // NO credential is ever relayed
+    expect(JSON.stringify(relayed)).not.toContain('egg_');
+    expect([relayed.class, relayed.gitHost, relayed.handle, relayed.name, relayed.path])
+      .toEqual(['public', 'github.com', 'EZiLHQ', 'ezil-os', null]);
+    expect(Object.keys(relayed)).toEqual(['jobId', 'v', 'op', 'repositoryId', 'handle', 'name', 'gitHost', 'defaultBranch', 'path', 'class']);
+    // positive control: a personal open still carries its grant
+    const p = job(() => ok(okOpen), 2);
+    await run(p);
+    expect('grant' in JSON.parse(p.calls[0]!.init.body as string)).toBe(true);
+  });
+
+  it('relayPublicRepoOpen maps the wrapper answer to the Cloudflare {ok, folder, status} the app consumes', async () => {
+    const e = job(() => ok(okPublic));
+    expect(await relayPublicRepoOpen(publicInput(), SANDBOX, target, deps(e.fetch)))
+      .toEqual({ ok: true, folder: PUB_W, status: 'cloned' });
+  });
+
+  it('start 404 (an AMI without the repo-open op) -> workspace_unsupported, no status read; a 200 start is the positive control', async () => {
+    const e = edge(() => json({ ok: false, error: 'repo_open_unsupported' }, 404));
+    expect(await awsRepoOpenStart(publicInput(), SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('workspace_unsupported')));
+    expect(e.reads()).toEqual([]);
+    const ok$ = job(() => ok(okPublic));
+    expect((await handleAwsRepoOpen(publicInput(), SANDBOX, target, deps(ok$.fetch), 'public')).status).toBe(200);
+  });
+
+  it('start 409 repo_open_invalid (a pre-public AMI) -> workspace_unsupported; the SAME 409 on a personal route -> workspace_failed', async () => {
+    const e = edge(() => json({ ok: false, error: 'repo_open_invalid' }, 409));
+    expect(await awsRepoOpenStart(publicInput(), SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('workspace_unsupported')));
+    // positive control: the public remap does NOT touch the personal route — there a 409 stays workspace_failed
+    const p = edge(() => json({ ok: false, error: 'repo_open_invalid' }, 409));
+    expect(await awsRepoOpenStart(input(), SANDBOX, target, deps(p.fetch), 'personal')).toEqual(done$(refusal('workspace_failed')));
+  });
+
+  it('class public needs no grant; a grant-less personal/project input is refused before any edge call', async () => {
+    const e = job(() => ok(okPublic));
+    expect((await handleAwsRepoOpen(publicInput(), SANDBOX, target, deps(e.fetch), 'public')).status).toBe(200);
+    // personal/project still REQUIRE a grant: a grant-less input never reaches the host
+    for (const [cls, i] of [['personal', { ...input(), grant: undefined }], ['project', { ...projectInput(), grant: undefined }]] as const) {
+      const g = edge(() => ok(okOpen));
+      const started = await awsRepoOpenStart(i as unknown as RepoOpenInput, SANDBOX, target, deps(g.fetch), cls, { projectGitHost: QA });
+      expect([cls, started.state]).toEqual([cls, 'done']);
+      expect([cls, (started as { answer: RepoOpenAnswer }).answer]).toEqual([cls, refusal('workspace_failed')]);
+      expect([cls, g.calls]).toEqual([cls, []]);
+    }
+  });
+
+  it('a defaultBranch u2 refuses (_x: branchOf accepts it) is a pre-send invalid_request, never relayed', async () => {
+    const e = edge(() => ok(okPublic));
+    expect(await awsRepoOpenStart(publicInput({ defaultBranch: '_x' }), SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('invalid_request')));
+    expect(e.calls).toEqual([]);
+    // positive control: a valid branch relays
+    const ok$ = job(() => ok({ ...okPublic, branch: 'feature/x' }));
+    expect((await handleAwsRepoOpen(publicInput({ defaultBranch: 'feature/x' }), SANDBOX, target, deps(ok$.fetch), 'public')).status).toBe(200);
+  });
+
+  it('validJob validates a public job name with the github grammar; the same name on a personal job is invalid_request', async () => {
+    const e = edge((path) => path.startsWith(AWS_REPO_OPEN_STATUS_PATH) ? ok(okPublic) : running());
+    expect(await awsRepoOpenPoll(publicJobOf(), target, deps(e.fetch))).toEqual(done$({ status: 200, body: okPublic } as RepoOpenAnswer));
+    // positive control: name 'x-' is invalid under u2's validName, so a personal job is refused before any read
+    const p = edge(() => running());
+    const personalXdash: AwsRepoOpenJob = { jobId: JOB, sandboxName: SANDBOX, op: 'open', class: 'personal', handle: 'a-b', name: 'x-', acknowledged: true };
+    expect(await awsRepoOpenPoll(personalXdash, target, deps(p.fetch))).toEqual(done$(refusal('invalid_request')));
+    expect(p.calls).toEqual([]);
+  });
+});
+
+describe('class public: the §8 answer mapped to the Cloudflare response (awsPublicRepoOpenResult)', () => {
+  it('workspace_unsupported and a pre-send invalid_request both -> repo_open_unsupported_provider (today\'s behaviour)', () => {
+    for (const code of ['workspace_unsupported', 'invalid_request'] as RepoOpenErrorCode[]) {
+      expect([code, awsPublicRepoOpenResult(refusal(code))]).toEqual([code, { ok: false, error: 'repo_open_unsupported_provider' }]);
+    }
+  });
+
+  it('every other refusal -> repo_open_failed (the app collapses these anyway)', () => {
+    for (const code of ['workspace_failed', 'workspace_busy', 'runtime_not_running', 'folder_conflict', 'git_auth_rejected'] as RepoOpenErrorCode[]) {
+      expect([code, awsPublicRepoOpenResult(refusal(code))]).toEqual([code, { ok: false, error: 'repo_open_failed' }]);
+    }
+  });
+
+  it('a success answer -> {ok, folder, status}, folder = the wrapper W, state mapped to the Cloudflare status', () => {
+    expect(awsPublicRepoOpenResult({ status: 200, body: okPublic } as RepoOpenAnswer)).toEqual({ ok: true, folder: PUB_W, status: 'cloned' });
+    expect(awsPublicRepoOpenResult({ status: 200, body: { ...okPublic, state: 'initialized_empty', empty: true } } as RepoOpenAnswer))
+      .toEqual({ ok: true, folder: PUB_W, status: 'created' });
+    expect(awsPublicRepoOpenResult({ status: 200, body: { ...okPublic, state: 'existing' } } as RepoOpenAnswer))
+      .toEqual({ ok: true, folder: PUB_W, status: 'fetched' });
   });
 });
