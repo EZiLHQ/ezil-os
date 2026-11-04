@@ -626,6 +626,10 @@ import {
   type RepoOpenRequest,
   type RepoOpenRoot,
 } from './repo-open';
+// The AWS repo-open relay. Only the class-`public` entry is mounted (an anonymous public-github.com
+// open relayed to an AWS computer, inert until the host op ships); the personal/assessment/project
+// lanes stay unmounted. See worker/src/aws-repo-open.ts.
+import { awsPublicRepoOpenInput, relayPublicRepoOpen } from './aws-repo-open';
 import {
   parseRepoGrantRequest,
   repoGrantStatus,
@@ -5421,6 +5425,32 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   if (!v2) {
     const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
     return json({ ok: false, error }, 401);
+  }
+  if (v2.provider === 'aws-ec2') {
+    // AWS computers: every repo-open is refused here today (repo_open_unsupported_provider), and still is,
+    // EXCEPT an anonymous public-github.com open opted in on os-staging (`parseRepoOpenRequest` auth 'none',
+    // `repoOpenRemotesFor` publicGitHub) — that one is relayed to the AWS host as class `public`
+    // (`./aws-repo-open`). The relay is inert on today's fleet: AMI 1.0.30 has no repo-open op, so the start
+    // edge answers 404 -> workspace_unsupported -> repo_open_unsupported_provider, exactly today's behaviour.
+    // Any other aws-ec2 body (a parse failure, a grant-bearing remote, production's Gateway) keeps answering
+    // repo_open_unsupported_provider as now; a parse 400 is never surfaced on AWS, and nothing is fetched.
+    const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
+    if (read.ok) {
+      const parsed = parseRepoOpenRequest(read.body, Date.now(), repoOpenRemotesFor(env));
+      if (parsed.ok && parsed.request.auth === 'none') {
+        const input = awsPublicRepoOpenInput(parsed.request.canonicalURL, parsed.request.repositoryId, parsed.request.branch, Date.now());
+        if (input) {
+          const target = await awsControlTarget(env, request, sandboxName, 'repo_open');
+          if (target !== null) {
+            const mapped = await relayPublicRepoOpen(input, sandboxName, target, { fetch: (u, i) => fetch(u, i), now: () => Date.now() });
+            return mapped.ok
+              ? json({ ok: true, folder: mapped.folder, status: mapped.status })
+              : json({ ok: false, error: mapped.error }, repoOpenStatus(mapped.error));
+          }
+        }
+      }
+    }
+    return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
   }
   if (v2.provider !== 'cloudflare') {
     return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));

@@ -644,10 +644,10 @@ describe('target and module boundaries', () => {
     expect(source).not.toContain('runKernel');
   });
 
-  it('inert in this lane: no Worker module imports aws-repo-open (the lead\'s activation commit mounts it and updates this check)', () => {
+  it('class public is mounted by index.ts (this activation commit updates the check); no other Worker module imports aws-repo-open', () => {
     const importers = readdirSync(here('.')).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && f !== 'aws-repo-open.ts')
       .filter((f) => readFileSync(here(`./${f}`), 'utf8').includes('aws-repo-open'));
-    expect(importers).toEqual([]);
+    expect(importers).toEqual(['index.ts']);
   });
 });
 
