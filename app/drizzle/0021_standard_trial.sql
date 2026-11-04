@@ -70,6 +70,49 @@ CREATE POLICY "Service role full access billing trial identities"
 --> statement-breakpoint
 CREATE INDEX "ezil_billing_trial_identities_value_idx" ON "ezil_billing_trial_identities" USING btree ("kind","value");--> statement-breakpoint
 CREATE INDEX "ezil_billing_trial_identities_domain_idx" ON "ezil_billing_trial_identities" USING btree ("email_domain") WHERE "ezil_billing_trial_identities"."kind" = 'email';--> statement-breakpoint
+-- Capture at the source (review R4): when a started trial's account changes its email, its email confirmation or its
+-- app metadata (the linked Auth0 subject), and just before the account is deleted (BEFORE DELETE: the trial row still
+-- points at it; the FK then sets user_id null), keep the old and the current verified identities. Identities are the
+-- same keys the app reads: a lower-cased verified email, and 'auth0:<sub>' when linked else 'supabase:<id>'. The hook
+-- never blocks the auth change: any failure is a warning, and the minute sweep and Billing reads still record.
+CREATE FUNCTION "public"."ezil_billing_trial_identity_capture"()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = ''
+    AS $$
+BEGIN
+    BEGIN
+        INSERT INTO public.ezil_billing_trial_identities (trial_id, kind, value, email_domain)
+        SELECT DISTINCT t.id, v.kind, v.value, v.email_domain
+        FROM public.ezil_billing_trials t
+        CROSS JOIN LATERAL (
+            SELECT 'subject'::text AS kind, CASE WHEN coalesce(trim(u.raw_app_meta_data->>'auth0_sub'), '') <> ''
+                    THEN 'auth0:' || trim(u.raw_app_meta_data->>'auth0_sub') ELSE 'supabase:' || u.id::text END AS value, NULL::text AS email_domain
+            FROM (SELECT OLD.id, OLD.raw_app_meta_data UNION ALL SELECT NEW.id, NEW.raw_app_meta_data WHERE TG_OP = 'UPDATE') u (id, raw_app_meta_data)
+            UNION ALL
+            SELECT 'email', lower(trim(e.email)), split_part(lower(trim(e.email)), '@', 2)
+            FROM (SELECT OLD.email, OLD.email_confirmed_at UNION ALL SELECT NEW.email, NEW.email_confirmed_at WHERE TG_OP = 'UPDATE') e (email, email_confirmed_at)
+            WHERE e.email_confirmed_at IS NOT NULL AND lower(trim(e.email)) ~ '^[^[:space:]@]+@[^[:space:]@]+$'
+        ) v
+        WHERE t.user_id = OLD.id AND t.stripe_subscription_id IS NOT NULL
+        ON CONFLICT DO NOTHING;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'ezil_billing_trial_identity_capture skipped: %', SQLSTATE;
+    END;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION "public"."ezil_billing_trial_identity_capture"() FROM public, anon, authenticated;--> statement-breakpoint
+CREATE TRIGGER "ezil_billing_trial_identity_on_change"
+    AFTER UPDATE OF "email", "email_confirmed_at", "raw_app_meta_data" ON "auth"."users"
+    FOR EACH ROW EXECUTE FUNCTION "public"."ezil_billing_trial_identity_capture"();
+--> statement-breakpoint
+CREATE TRIGGER "ezil_billing_trial_identity_on_delete"
+    BEFORE DELETE ON "auth"."users"
+    FOR EACH ROW EXECUTE FUNCTION "public"."ezil_billing_trial_identity_capture"();
+--> statement-breakpoint
 -- Stripe's trial window as last read, and the first positive paid period: a trial that never paid gets no grace.
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_start" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_end" timestamp with time zone;--> statement-breakpoint

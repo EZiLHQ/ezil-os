@@ -171,10 +171,59 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
         await start(a);
         await client`update auth.users set email = ${`sweepnew.${run}@example.com`}, email_confirmed_at = now(),
             raw_app_meta_data = ${JSON.stringify({ auth0_sub: `auth0|sweep2-${run}` })}::jsonb where id = ${a}::uuid`;
-        expect(await store.recordTrialIdentities!()).toBeGreaterThanOrEqual(2);
+        // The change hook already captured both; the sweep is a second, idempotent checkpoint (nothing new to add).
+        expect(await store.recordTrialIdentities!()).toBeGreaterThanOrEqual(0);
+        expect((await client`select kind, value from public.ezil_billing_trial_identities i join public.ezil_billing_trials t on t.id = i.trial_id
+            where t.user_id = ${a}::uuid order by kind, value`).map(row => `${row.kind}:${row.value}`)).toEqual(expect.arrayContaining([
+            `email:sweepnew.${run}@example.com`, `email:sweepold.${run}@example.com`, `subject:auth0:auth0|sweep-${run}`, `subject:auth0:auth0|sweep2-${run}`]));
         await client`delete from auth.users where id = ${a}::uuid`;
         expect((await store.trialFacts(await account(`sweepnew.${run}@example.com`))).claimedElsewhere).toBe(true);
         expect((await store.trialFacts(await account(`unrelated.${run}@example.com`, { auth0: `auth0|sweep2-${run}` }))).claimedElsewhere).toBe(true);
+    });
+
+    it('R4: an email changed and verified, then the account deleted at once (no read, event or sweep), keeps both claimed', async () => {
+        const a = await account(`hot.old.${run}@gmail.com`);
+        await quote(a);
+        const { trialId } = await start(a);
+        await client`update auth.users set email = ${`hot.new.${run}@gmail.com`}, email_confirmed_at = now() where id = ${a}::uuid`;
+        await client`delete from auth.users where id = ${a}::uuid`;
+        expect((await client`select kind, value from public.ezil_billing_trial_identities where trial_id = ${trialId}::uuid and kind = 'email' order by value`)
+            .map(row => row.value)).toEqual([`hot.new.${run}@gmail.com`, `hot.old.${run}@gmail.com`]);
+        const viaNew = await account(`h.o.t.n.e.w.${run}+alias@gmail.com`);
+        expect((await store.trialFacts(viaNew)).claimedElsewhere).toBe(true);
+        expect((await quote(viaNew)).status).toBe('refused');
+        expect((await store.trialFacts(await account(`hot.old.${run}+b@gmail.com`))).claimedElsewhere).toBe(true);
+    });
+
+    it('R4: a newly linked Auth0 subject, then an immediate deletion, keeps the subject claimed for any new account', async () => {
+        const a = await account(`subj.${run}@example.com`);
+        await quote(a);
+        await start(a);
+        await client`update auth.users set raw_app_meta_data = ${JSON.stringify({ auth0_sub: `auth0|linked-${run}` })}::jsonb where id = ${a}::uuid`;
+        await client`delete from auth.users where id = ${a}::uuid`;
+        const other = await account(`fresh.subj.${run}@example.com`, { auth0: `auth0|linked-${run}` });
+        expect((await store.trialFacts(other)).claimedElsewhere).toBe(true);
+        expect((await quote(other)).status).toBe('refused');
+    });
+
+    it('R4: the capture hook never blocks an auth change or a deletion, even when it cannot record', async () => {
+        const a = await account(`noblock.${run}@example.com`);
+        await quote(a);
+        await start(a);
+        // Ordinary sign-in bookkeeping is untouched; an unverified change is not an identity.
+        await client`update auth.users set last_sign_in_at = now() where id = ${a}::uuid`;
+        await client`update auth.users set email = ${`noblock.unverified.${run}@example.com`}, email_confirmed_at = null where id = ${a}::uuid`;
+        // A failing insert inside the hook is a warning only: the auth row still changes and still deletes.
+        await client.begin(async tx => {
+            await tx`alter table public.ezil_billing_trial_identities add constraint ezil_trial_hook_probe check (false) not valid`;
+            await tx`update auth.users set email = ${`noblock.v2.${run}@example.com`}, email_confirmed_at = now() where id = ${a}::uuid`;
+            await tx`delete from auth.users where id = ${a}::uuid`;
+            expect((await tx`select count(*)::int as n from auth.users where id = ${a}::uuid`)[0]!.n).toBe(0);
+            throw new Error('rollback probe');
+        }).catch(error => { if (!String(error).includes('rollback probe')) throw error; });
+        expect((await client`select count(*)::int as n from auth.users where id = ${a}::uuid`)[0]!.n).toBe(1);
+        expect((await client`select value from public.ezil_billing_trial_identities i join public.ezil_billing_trials t on t.id = i.trial_id
+            where t.user_id = ${a}::uuid and i.kind = 'email'`).map(row => row.value)).toEqual([`noblock.${run}@example.com`]);
     });
 
     it('R4: an unverified email is never retained as an identity; a never-started quote retains nothing', async () => {

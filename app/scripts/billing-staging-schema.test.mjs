@@ -516,7 +516,18 @@ test('the Standard trial follows 0020, stays additive and is a production snapsh
     // Nothing is dropped except the two CHECKs it re-adds wider; no data is written.
     assert.deepEqual([...sql.matchAll(/DROP CONSTRAINT "([^"]+)"/g)].map(match => match[1]),
         ['ezil_billing_grants_kind_chk', 'ezil_billing_grants_source_type_chk']);
-    assert.doesNotMatch(sql, /DROP (?:TABLE|COLUMN|INDEX)|INSERT INTO|UPDATE "|UPDATE public|DELETE FROM|TRUNCATE|GRANT |DISABLE ROW LEVEL SECURITY/i);
+    // Review R4: the only DML is the capture hook's own insert into the identities table, inside its function body;
+    // it runs on auth.users changes and deletions and never writes auth.users itself.
+    const hook = /CREATE FUNCTION "public"\."ezil_billing_trial_identity_capture"\(\)[\s\S]*?\$\$([\s\S]*?)\$\$;/.exec(sql);
+    assert.ok(hook, 'capture hook function');
+    assert.deepEqual([...hook[1].matchAll(/INSERT INTO ([\w.]+)/g)].map(match => match[1]), ['public.ezil_billing_trial_identities']);
+    assert.match(hook[1], /EXCEPTION WHEN OTHERS THEN\s+RAISE WARNING/);
+    assert.match(sql, /SECURITY DEFINER\s+SET search_path = ''/);
+    assert.match(sql, /CREATE TRIGGER "ezil_billing_trial_identity_on_change"\s+AFTER UPDATE OF "email", "email_confirmed_at", "raw_app_meta_data" ON "auth"\."users"/);
+    assert.match(sql, /CREATE TRIGGER "ezil_billing_trial_identity_on_delete"\s+BEFORE DELETE ON "auth"\."users"/);
+    assert.match(sql, /REVOKE ALL ON FUNCTION "public"\."ezil_billing_trial_identity_capture"\(\) FROM public, anon, authenticated;/);
+    const outside = sql.replace(hook[0], '');
+    assert.doesNotMatch(outside, /DROP (?:TABLE|COLUMN|INDEX)|INSERT INTO|UPDATE "|UPDATE public|DELETE FROM|TRUNCATE|GRANT |DISABLE ROW LEVEL SECURITY|ALTER TABLE "auth"/i);
     const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
     assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
