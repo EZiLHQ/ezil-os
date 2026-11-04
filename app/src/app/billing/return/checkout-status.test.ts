@@ -121,7 +121,8 @@ describe('Checkout return payment and plan confirmation', () => {
     it.each([
         ['unpaid', /processing|pending/i, false],
         ['paid', /Payment received/i, true],
-        ['no_payment_required', /No payment is required/i, true],
+        // A subscription checkout with nothing to pay is the Standard free month: starting, never "paid".
+        ['no_payment_required', /Your free month is starting/i, true],
         [null, /confirmation is pending|could not confirm/i, false],
         [undefined, /confirmation is pending|could not confirm/i, false],
         ['PAID', /confirmation is pending|could not confirm/i, false],
@@ -138,6 +139,37 @@ describe('Checkout return payment and plan confirmation', () => {
         if (!canActivate) expect(text()).not.toMatch(/Payment received|Your plan is active/);
         expect(target.querySelector('a[href="/os?settings=billing"]')).toBeTruthy();
         assertReadOnly();
+    });
+
+    it('Standard trial: no_payment_required is "starting", then "has started" with the first charge once the plan reports its trial', async () => {
+        const zone = process.env.TZ;
+        process.env.TZ = 'America/Los_Angeles';
+        try {
+            const trial = { state: 'trialing', startedAt: '2027-01-31T03:00:00Z', endsAt: '2027-02-28T03:00:00Z', firstChargeAt: '2027-02-28T03:00:00Z', amountCents: 2000, currency: 'usd' };
+            status = () => completed('no_payment_required');
+            summary = () => free;
+            await render();
+            expect(text()).toMatch(/^Your free month is starting\. Waiting for your plan to update\./);
+            summary = () => ({ ...matching, plan: { ...matching.plan, trial } });
+            await tick(2000);
+            // The first charge in the viewer's zone: 03:00 UTC on 28 Feb is 27 Feb in Los Angeles.
+            expect(text()).toMatch(/^Your free month has started\. First charge \$20\.00 on Feb 27, 2027 unless you cancel\./);
+            expect(text()).not.toMatch(/payment received|\bpaid\b|Your plan is active|No payment is required/i);
+            // An ending trial (cancelled at once) has started too, with no charge to announce.
+            summary = () => ({ ...matching, plan: { ...matching.plan, status: 'cancels', trial: { ...trial, state: 'ending', firstChargeAt: null } } });
+            await render('cs_test_ending');
+            expect(text()).toMatch(/^Your free month has started\./);
+            expect(text()).not.toMatch(/First charge/);
+            // A paid checkout is unchanged.
+            status = () => completed('paid');
+            summary = () => matching;
+            await render('cs_test_paid');
+            expect(text()).toMatch(/Your plan is active\./);
+            expect(text()).not.toMatch(/free month/i);
+            assertReadOnly();
+        } finally {
+            if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone;
+        }
     });
 
     it('bank completion can become paid while the webhook plan still lags, then activate', async () => {
