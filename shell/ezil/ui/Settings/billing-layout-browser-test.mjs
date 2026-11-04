@@ -52,7 +52,8 @@ const renderers = buildSync({
     stdin: { contents: `
         import { summaryV3Html } from './tabs/billing.js';
         import { openConfirmSheet } from './sheet-frame.js';
-        window.layout = { summaryV3Html, openConfirmSheet };
+        import { openTopupSheet } from './topup-sheet.js';
+        window.layout = { summaryV3Html, openConfirmSheet, openTopupSheet };
     `, resolveDir: here },
     bundle: true, write: false, format: 'iife', target: 'es2022',
 }).outputFiles[0].text;
@@ -97,13 +98,14 @@ try {
                 body.innerHTML = html;
                 const offers = [...document.querySelectorAll('[data-role="plan-offer"]')].map(el => el.getBoundingClientRect());
                 const pane = document.querySelector('.ezil-settings-billing');
-                const summary = document.querySelector('[data-role="ai-topup"] summary');
+                const row = document.querySelector('[data-role="meter-ai"]'), add = row?.querySelector('[data-action="topup"]');
                 return {
                     tops: offers.map(r => Math.round(r.top)), widths: offers.map(r => Math.round(r.width)),
                     paneWidth: Math.round(pane.getBoundingClientRect().width),
                     overflow: pane.scrollWidth - pane.clientWidth,
                     docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-                    marker: summary ? getComputedStyle(summary, '::after').content : 'none',
+                    add: add ? { fits: add.getBoundingClientRect().right <= row.getBoundingClientRect().right + 0.5, h: Math.round(add.getBoundingClientRect().height),
+                        visible: add.getBoundingClientRect().width > 0 } : null,
                 };
             }, html);
             if ( width === 760 ) {
@@ -113,7 +115,7 @@ try {
                 push(`${label} · ${tier}: the plan cards stack`, m.tops.length === 3 && new Set(m.tops).size === 3, `${m.tops}`);
             }
             push(`${label} · ${tier}: no horizontal overflow`, m.overflow <= 0 && m.docOverflow <= 0, `pane ${m.overflow} doc ${m.docOverflow}`);
-            push(`${label} · ${tier}: the Add AI credits disclosure shows a marker`, m.marker !== 'none' && m.marker !== 'normal', m.marker);
+            push(`${label} · ${tier}: Add credits sits beside the balance, inside its row`, m.add?.visible && m.add.fits && m.add.h >= 32, JSON.stringify(m.add));
         }
         // Identity credits (`ai.account`): the headline and the exact details line fit the pane, with a bar over the total.
         const identity = billingSummary('premium');
@@ -173,6 +175,40 @@ try {
     push('confirm sheet: Cancel and the primary are at least 44 px tall', sheet.cancel.h >= 44 && sheet.primary.h >= 44, `${sheet.cancel.h} / ${sheet.primary.h}`);
     push('confirm sheet: initial focus is Cancel', sheet.focused === 'cancel', sheet.focused);
     await page.close();
+
+    // Add AI credits (synthetic catalog in the live shape): the dialog fits the viewport, the presets wrap, one accent primary.
+    for ( const [label, viewport] of [['desktop 1440x1000', { width: 1440, height: 1000 }], ['laptop 1280x720', { width: 1280, height: 720 }], ['phone 375x667', { width: 375, height: 667 }]] ) {
+        const topupPage = await browser.newPage({ viewport });
+        await topupPage.setContent(page_html(Math.min(760, viewport.width)));
+        await topupPage.addScriptTag({ content: renderers });
+        const summary = billingSummary('standard');
+        summary.catalog.packs = [1000, 5000, 10000].map((aiCredits, i) => ({ sku: `ai_pack_fixture_${i}`, aiCredits, creditCents: aiCredits * 10,
+            discountPercent: i ? 30 : 20, totalCents: [8000, 35000, 70000][i], currency: 'usd' }));
+        summary.catalog.customTopup = { minCents: 1000, maxCents: 1000000, centsPerCredit: 10 };
+        summary.ai.account = { userId: null, remainingMicro: '0', totalMicro: '200000000', labelled: false, grants: [] };
+        const t = await topupPage.evaluate(summary => {
+            window.layout.openTopupSheet({ container: document.querySelector('.window-body'), summary, trpc: { query: async () => ({ ok: false }) } });
+            const dialog = document.querySelector('[data-sheet="topup"]'), rect = dialog.getBoundingClientRect();
+            // Recovery (zero balance) is the tallest state: on a laptop its actions must show without scrolling.
+            const continueVisible = dialog.querySelector('[data-action="topup-continue"]').getBoundingClientRect().bottom <= rect.bottom + 0.5;
+            const custom = dialog.querySelector('input[value="custom"]');
+            custom.checked = true; custom.dispatchEvent(new Event('change', { bubbles: true }));
+            const options = [...dialog.querySelectorAll('.ezil-topup-option')].map(el => el.getBoundingClientRect());
+            const primaries = [...dialog.querySelectorAll('button')].filter(button => getComputedStyle(button).backgroundColor === 'rgb(0, 173, 181)');
+            const input = dialog.querySelector('.ezil-topup-input').getBoundingClientRect();
+            return { continueVisible, inside: rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth + 0.5 && rect.bottom <= innerHeight + 0.5,
+                scrolls: dialog.scrollHeight > dialog.clientHeight, columns: new Set(options.map(r => Math.round(r.left))).size,
+                minOption: Math.round(Math.min(...options.map(r => r.width))), primaries: primaries.map(b => b.dataset.action),
+                overflow: dialog.scrollWidth - dialog.clientWidth, input: Math.round(input.height),
+                buttons: [...dialog.querySelectorAll('.ezil-billing-sheet-actions button')].map(b => Math.round(b.getBoundingClientRect().height)) };
+        }, summary);
+        push(`${label} · top-up dialog stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
+        push(`${label} · top-up presets and Custom form a 2 x 2 grid, each at least 140 px wide`, t.columns === 2 && t.minOption >= 140, `${t.columns} cols, min ${t.minOption}px`);
+        if ( viewport.width >= 760 ) push(`${label} · top-up recovery: Continue is visible without scrolling`, t.continueVisible, JSON.stringify(t.continueVisible));
+        push(`${label} · top-up: Continue is the one accent primary; the upgrade is secondary`, t.primaries.length === 1 && t.primaries[0] === 'topup-continue', `${t.primaries}`);
+        push(`${label} · top-up: input and actions are at least 44 px tall`, t.input >= 44 && t.buttons.every(h => h >= 44), `${t.input} / ${t.buttons}`);
+        await topupPage.close();
+    }
 } finally {
     await browser.close();
 }
