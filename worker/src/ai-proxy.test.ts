@@ -405,6 +405,21 @@ describe('forwarding', () => {
     expect(d.logs.at(-1)).toMatchObject({ event: 'ai_proxy', route: 'POST /v1/messages', status: 429, code: 'rate_limited', request_id: 'req-9', idempotency_key: 'turn-0123456789' });
   });
 
+  it('passes routing and entitlement refusals through by code, so the editor can re-list', async () => {
+    for (const [status, code] of [[503, 'model_unavailable'], [402, 'no_entitlement'], [403, 'model_not_allowed'],
+      [502, 'upstream_error'], [502, 'upstream_unavailable']] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code, message: USER_JWT, request_id: 'req-r', attempts: 2 } }, { status }));
+      const d = await deps({ fetch: gw.fetch });
+      const res = await handleAiProxyRequest(
+        new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-route-0001' }, body: '{}' }),
+        d,
+      );
+      expect(res.status).toBe(status);
+      expect(await res.json()).toEqual({ error: { code, request_id: 'req-r' } });
+      expect(gw.calls).toHaveLength(1);
+    }
+  });
+
   it('passes the credit-window refusal through with Retry-After, in one upstream call', async () => {
     const body = '{"error":{"code":"window_budget_reached","message":"m","request_id":"req-w"}}';
     const gw = mockGateway(() => new Response(body, { status: 429, headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': '7200' } }));

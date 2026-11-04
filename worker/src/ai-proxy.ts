@@ -552,6 +552,8 @@ const GATEWAY_ERROR_CODES = new Set([
   'idempotency_conflict', 'idempotency_key_required', 'idempotency_replay', 'killswitch', 'paused', 'pause',
   'global_cap_reached', 'daily_budget_reached', 'window_budget_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
   'rate_limited', 'concurrency_limit', 'tpm_limited', 'internal_error',
+  // Routing and entitlement refusals: the editor re-lists its models after these, so they must not become gateway_error.
+  'model_unavailable', 'no_entitlement', 'model_not_allowed', 'upstream_error', 'upstream_unavailable',
 ]);
 const GATEWAY_ERROR_REASONS = new Set(['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired',
   'wrong_audience', 'missing_token', 'invalid_token', 'revoked']);
