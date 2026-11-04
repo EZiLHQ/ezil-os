@@ -101,6 +101,8 @@ function harness () {
         text: () => document.querySelector('[data-role="upgrade-sheet"]')?.textContent ?? '',
         create: async () => embedded,
         status: async () => 'complete',
+        // Top-ups: the session's state plus its fulfilment; credited only when a test says so.
+        topup: async () => ({ ...(await h.status()), fulfillment: 'processing', credits: null }),
         summary: async () => standard,
         get mounted () { return mounted; },
         get destroyed () { return destroyed; },
@@ -140,7 +142,7 @@ function harness () {
         mutate: async (method, input) => { calls.push({ method, input }); return h.create(); },
         query: async (method, input) => {
             calls.push({ method, input });
-            return method === 'billing.checkoutStatus' ? h.status() : h.summary();
+            return method === 'billing.checkoutStatus' ? h.status() : method === 'billing.topupStatus' ? h.topup() : h.summary();
         },
     };
     h.open = (options = {}) => {
@@ -788,27 +790,31 @@ test('AI pack checkout uses the exact SKU and mode-free embedded response with o
     assert.equal(h.destroyed, 1);
 });
 
+// Synthetic fixtures only: a fake session, fake receipts and a fake balance for a fixture user.
+const credited = { status: 'complete', paymentStatus: 'paid', fulfillment: 'credited', credits: pack.aiCredits };
+const withAccount = (remainingMicro, userId = 'fixture-user') => {
+    const summary = summaryV3();
+    summary.ai.account = { userId, remainingMicro, totalMicro: remainingMicro, labelled: false, grants: [] };
+    return summary;
+};
 for ( const paymentStatus of ['paid', 'no_payment_required', 'unpaid', null] ) {
-    test(`AI pack confirmation with ${paymentStatus} refreshes the summary and only confirms settled payment`, async h => {
+    test(`AI pack with ${paymentStatus} is never credited by payment alone: only a delivered receipt finishes`, async h => {
         h.create = async () => topupSession;
         h.status = async () => ({ status: 'complete', paymentStatus, sku: pack.sku });
+        h.topup = async () => ({ status: 'complete', paymentStatus, fulfillment: paymentStatus === 'paid' ? 'processing' : 'awaiting_payment', credits: null });
         h.summary = async () => summaryV3();
         h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
-        assert.equal(h.calls.find(call => call.method === 'billing.checkoutStatus').input.sessionId, topupSession.sessionId);
-        assert.equal(h.count('billing.summary'), 1);
+        assert.equal(h.calls.find(call => call.method === 'billing.topupStatus').input.sessionId, topupSession.sessionId);
+        assert.equal(h.count('billing.summary'), 0, 'no balance refresh before the receipt is delivered');
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
         assert.doesNotMatch(h.text(), /You're on|credits added|Your plan updates/);
-        if ( ['paid', 'no_payment_required'].includes(paymentStatus) ) {
-            assert.ok(h.q('[data-role="upgrade-success"]'));
-            assert.match(h.text(), paymentStatus === 'paid' ? /Payment received/ : /Checkout complete/);
-            h.click('[data-action="done"]');
-        } else {
-            assert.equal(h.q('[data-role="upgrade-success"]'), null);
-            assert.match(h.text(), /Bank payments can take a few days\. Your AI credits update after payment is confirmed/);
-            await h.tick(60000);
-            assert.match(h.text(), /Check Settings → Billing for updates/);
-            assert.doesNotMatch(h.text(), /Payment received/);
-            h.click('[data-action="return-to-billing"]');
-        }
+        assert.match(h.text(), paymentStatus === 'paid' ? /Payment received\. Adding your AI credits/
+            : paymentStatus === 'unpaid' ? /Bank payments can take a few days\. Your AI credits update after payment is confirmed/
+            : /Your AI credits update after payment is confirmed/);
+        await h.tick(60000);
+        assert.match(h.text(), /Check Settings → Billing for updates/);
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
+        h.click('[data-action="return-to-billing"]');
         assert.equal(h.count('billing.createTopupCheckout'), 1);
         assert.equal(h.done, 1);
         assert.equal(h.closed, 1);
@@ -816,9 +822,100 @@ for ( const paymentStatus of ['paid', 'no_payment_required', 'unpaid', null] ) {
     });
 }
 
+test('AI pack: processing → credited refreshes the balance once and shows the signed-in person\'s new balance', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => ({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing', credits: null });
+    h.summary = async () => withAccount('4718550000');
+    h.open({ sku: pack.sku, pack, userId: 'fixture-user' }); await settle(); h.complete(); await settle();
+    assert.match(h.text(), /Payment received\. Adding your AI credits…/);
+    assert.equal(h.count('billing.summary'), 0);
+    h.topup = async () => credited;
+    await h.tick(1500);
+    assert.ok(h.q('[data-role="upgrade-success"]'));
+    assert.match(h.text(), /2,000 AI credits added/);
+    assert.equal(h.q('[data-role="topup-new-balance"]').textContent, 'Your balance is now 4,718 credits.');
+    assert.equal(h.count('billing.summary'), 1);
+    assert.equal(h.document.activeElement, h.q('[data-action="done"]'));
+    h.click('[data-action="done"]');
+    assert.equal(h.done, 1);
+    assert.equal(h.count('billing.createTopupCheckout'), 1, 'one checkout, one grant');
+});
+
+test('AI pack success never shows another person\'s balance', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => credited;
+    h.summary = async () => withAccount('999000000', 'someone-else');
+    h.open({ sku: pack.sku, pack, userId: 'fixture-user' }); await settle(); h.complete(); await settle();
+    assert.ok(h.q('[data-role="upgrade-success"]'));
+    assert.equal(h.q('[data-role="topup-new-balance"]').textContent, 'Check your AI credits in Billing.');
+    assert.doesNotMatch(h.text(), /999/);
+});
+
+test('AI pack: a delivery that needs review says so and never claims credits or asks to pay again', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => ({ status: 'complete', paymentStatus: 'paid', fulfillment: 'review', credits: null });
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.match(h.text(), /couldn't be added automatically\. You don't need to pay again/);
+    assert.equal(h.timers.size, 0, 'no polling after the review answer');
+    assert.equal(h.count('billing.summary'), 0);
+    h.click('[data-action="return-to-billing"]');
+    assert.equal(h.done, 1);
+});
+
+test('AI pack: an expired session is a failed checkout with nothing charged; unknown fulfilment keeps waiting', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => ({ status: 'complete', paymentStatus: 'paid', fulfillment: 'surprise', credits: 5 });
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    assert.equal(h.q('[data-role="upgrade-success"]'), null, 'an unknown fulfilment is not credited');
+    h.topup = async () => ({ status: 'expired', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null });
+    await h.tick(1500);
+    assert.match(h.text(), /This checkout expired before payment, so you were not charged/);
+    assert.equal(h.timers.size, 0);
+});
+
+test('AI pack: closing before payment finishes reports a cancel once; closing after success does not', async h => {
+    let cancels = 0;
+    h.create = async () => topupSession;
+    h.open({ sku: pack.sku, pack, onCancel: () => { cancels++; } }); await settle();
+    h.handle.close();
+    assert.equal(cancels, 1);
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => credited;
+    h.summary = async () => summaryV3();
+    h.open({ sku: pack.sku, pack, onCancel: () => { cancels++; } }); await settle(); h.complete(); await settle();
+    assert.ok(h.q('[data-role="upgrade-success"]'));
+    h.click('[data-action="done"]');
+    assert.equal(cancels, 1);
+});
+
+test('a quoted custom top-up sends exactly its quoted input, once, and shows its own credits and discount', async h => {
+    h.create = async () => topupSession;
+    const custom = { sku: 'ai_custom_v2', aiCredits: 500, totalCents: 5000, creditCents: 5000, discountPercent: 0, currency: 'usd',
+        checkout: { customAmountCents: 5000, expectedTotalCents: 5000, expectedCredits: 500 } };
+    h.open({ sku: custom.sku, pack: custom }); h.open({ sku: custom.sku, pack: custom }); await settle();
+    assert.equal(h.count('billing.createTopupCheckout'), 1);
+    assert.equal(JSON.stringify(h.calls.find(call => call.method === 'billing.createTopupCheckout').input), JSON.stringify(custom.checkout));
+    assert.match(h.text(), /500 AI credits/);
+    assert.equal(h.q('[data-role="price"]').textContent, '$50');
+    assert.doesNotMatch(h.text(), /% off/);
+    h.handle.close();
+    const discounted = { sku: 'ai_pack_fixture', aiCredits: 1000, totalCents: 8000, creditCents: 10000, discountPercent: 20, currency: 'usd',
+        checkout: { sku: 'ai_pack_fixture', expectedTotalCents: 8000, expectedCredits: 1000 } };
+    h.open({ sku: discounted.sku, pack: discounted }); await settle();
+    assert.match(h.text(), /1,000 AI credits/);
+    assert.match(h.text(), /Includes 20% off/);
+    assert.equal(h.q('[data-role="price"]').textContent, '$80');
+});
+
 test('AI pack retries loading the same checkout and provider portals retain focus ownership', async h => {
     h.create = async () => topupSession;
     h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => credited;
     h.summary = async () => summaryV3();
     let attempts = 0;
     h.open({ sku: pack.sku, pack, loadStripe: async key => {
@@ -847,10 +944,12 @@ test('AI pack retries loading the same checkout and provider portals retain focu
 test('AI pack confirmation waits for a successful summary read and can settle after bank processing', async h => {
     h.create = async () => topupSession;
     h.status = async () => ({ status: 'complete', paymentStatus: 'unpaid', sku: pack.sku });
+    h.topup = async () => ({ status: 'complete', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null });
     h.summary = async () => summaryV3();
     h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
     assert.equal(h.q('[data-role="upgrade-success"]'), null);
     h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => credited;
     h.summary = async () => { throw new Error('offline'); };
     await h.tick(1500); assert.equal(h.q('[data-role="upgrade-success"]'), null);
     h.summary = async () => summaryV3();
