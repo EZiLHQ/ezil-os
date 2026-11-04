@@ -15,7 +15,7 @@ import type { SubscriptionRow } from '@/server/billing/meters';
 import type { BillingDeps, PaymentIssueRow, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { readStripePacks } from '@/server/billing/stripe/packs';
-import { BillingProviderError } from '@/server/billing/stripe/client';
+import { BillingProviderError, StripeRequestError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
@@ -115,6 +115,21 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
 /** Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`). */
 function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete'): TRPCError {
     return new TRPCError({ code: code === 'trial_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
+}
+
+/**
+ * A trial checkout's Stripe key is fixed per quote. If a deployment's checkout configuration changed since the first
+ * attempt (Stripe answers `idempotency_error`), the quote is stale: the client re-quotes, never a different session.
+ */
+async function trialCheckoutCall<T>(call: () => Promise<T>): Promise<T> {
+    try {
+        return await call();
+    } catch (error) {
+        if (error instanceof StripeRequestError && error.type === 'idempotency_error') throw trialError('trial_quote_stale');
+        if (error instanceof TRPCError) throw error;
+        console.error('Billing Stripe unavailable');
+        throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
+    }
 }
 
 /** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
@@ -611,7 +626,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
             const terms = trialTerms(deps.now());
             const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
-                emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd });
+                emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd,
+                returnOrigin: billingReturnOrigin(ctx.headers) });
             if (claim.status === 'refused') throw trialError('trial_unavailable');
             return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
                 firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
@@ -655,10 +671,11 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 if (linked === 'conflict') throw billingError('customer_conflict', 'CONFLICT');
                 customerId = customer.id;
             }
-            const origin = billingReturnOrigin(ctx.headers);
+            // A trial's return origin is the quote's, so a retry from another owned origin sends identical terms.
+            const origin = trial ? trial.row.returnOrigin : billingReturnOrigin(ctx.headers);
             const publishableKey = deps.config.stripePublishableKey;
             const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
-            const session = await stripeCall(() => stripe.createCheckoutSession({
+            const session = await (trial ? trialCheckoutCall : stripeCall)(() => stripe.createCheckoutSession({
                 customerId,
                 userId: ctx.user.id,
                 sku: input.sku,

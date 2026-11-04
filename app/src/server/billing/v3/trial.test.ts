@@ -115,7 +115,8 @@ describe('the trial AI root', () => {
 describe('eligibility from server facts', () => {
     const own = (status: TrialRow['status']): TrialRow => ({ id: 't1', userId: 'u1', authSubject: 'supabase:u1', emailNormalized: 'a@x.io',
         sku: 'standard_monthly_v3', policyVersion: 1, status, quotedAt: at('2026-11-05T10:00:00Z'), trialEnd: at('2026-12-05T10:00:00Z'),
-        checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: status === 'quoted' || status === 'checkout' ? null : 'sub_1', trialStart: null });
+        checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: status === 'quoted' || status === 'checkout' ? null : 'sub_1', trialStart: null,
+        returnOrigin: 'https://os.ezil.work' });
     const facts = (patch: Partial<TrialFacts> = {}): TrialFacts => ({ emailNormalized: 'a@x.io', emailVerified: true, authSubject: 'supabase:u1',
         own: null, claimedElsewhere: false, paidBefore: false, ...patch });
     const decide = (patch: Partial<TrialFacts> = {}, planFamily = 'free', operatorPlan = false) =>

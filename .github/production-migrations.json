@@ -83,7 +83,7 @@
     },
     {
       "path": "app/drizzle/0021_standard_trial.sql",
-      "sha256": "5f3be68afbe64c83e89d501fc6bb8cf80c0ce619032b7e63d3887bd706815f39",
+      "sha256": "a1128c8a5c6b22fd3a4e4b01dbd7bccf653a5bea442202be84823525d0490819",
       "kind": "snapshot"
     }
   ],

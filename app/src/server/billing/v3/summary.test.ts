@@ -764,6 +764,8 @@ describe('Standard trial summary', () => {
         expect(summary.plan.trial).toMatchObject({ state: 'payment_pending', endsAt: '2026-11-10T00:00:00Z', firstChargeAt: '2026-11-10T00:00:00Z' });
         expect(summary.computer.standing).toBe('free');
         expect(summary.fairUse.policy).toBeUndefined();
+        // No paid affordance while the first payment is unconfirmed (core review R1 residual); cancelling stays possible.
+        expect(summary.actions).toMatchObject({ upgrade: false, downgrade: false, cancel: true });
         // One second before the end it is still the trial.
         expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).plan.trial?.state).toBe('trialing');
         expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).computer.standing).toBe('paid');

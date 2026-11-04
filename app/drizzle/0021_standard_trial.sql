@@ -21,6 +21,7 @@ CREATE TABLE "ezil_billing_trials" (
 	"stripe_customer_id" text,
 	"stripe_subscription_id" text,
 	"trial_start" timestamp with time zone,
+	"return_origin" text NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "ezil_billing_trials_user_unique" UNIQUE("user_id"),
@@ -34,7 +35,8 @@ CREATE TABLE "ezil_billing_trials" (
 	CONSTRAINT "ezil_billing_trials_bound_chk" CHECK (("ezil_billing_trials"."stripe_subscription_id" is null) = ("ezil_billing_trials"."status" in ('quoted', 'checkout'))),
 	CONSTRAINT "ezil_billing_trials_email_chk" CHECK ("ezil_billing_trials"."email_normalized" = lower("ezil_billing_trials"."email_normalized") and position('@' in "ezil_billing_trials"."email_normalized") > 1),
 	CONSTRAINT "ezil_billing_trials_subject_chk" CHECK (length("ezil_billing_trials"."auth_subject") between 1 and 255),
-	CONSTRAINT "ezil_billing_trials_end_chk" CHECK ("ezil_billing_trials"."trial_end" > "ezil_billing_trials"."quoted_at")
+	CONSTRAINT "ezil_billing_trials_end_chk" CHECK ("ezil_billing_trials"."trial_end" > "ezil_billing_trials"."quoted_at"),
+	CONSTRAINT "ezil_billing_trials_origin_chk" CHECK ("ezil_billing_trials"."return_origin" ~ '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$')
 );
 --> statement-breakpoint
 ALTER TABLE "ezil_billing_trials" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint

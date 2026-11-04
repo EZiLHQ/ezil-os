@@ -450,6 +450,8 @@ export const billingTrials = pgTable(
         stripeCustomerId: text('stripe_customer_id'),
         stripeSubscriptionId: text('stripe_subscription_id'),
         trialStart: timestamp('trial_start', { withTimezone: true }),
+        /** The owned app origin the quote was made on: every checkout of this quote returns there (stable request terms). */
+        returnOrigin: text('return_origin').notNull(),
         createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
         updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     },
@@ -466,6 +468,7 @@ export const billingTrials = pgTable(
         check('ezil_billing_trials_email_chk', sql`${table.emailNormalized} = lower(${table.emailNormalized}) and position('@' in ${table.emailNormalized}) > 1`),
         check('ezil_billing_trials_subject_chk', sql`length(${table.authSubject}) between 1 and 255`),
         check('ezil_billing_trials_end_chk', sql`${table.trialEnd} > ${table.quotedAt}`),
+        check('ezil_billing_trials_origin_chk', sql`${table.returnOrigin} ~ '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$'`),
         foreignKey({
             name: 'ezil_billing_trials_user_id_fkey',
             columns: [table.userId],

@@ -1934,7 +1934,7 @@ describe('trial checkout retries', () => {
         const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
             emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted' as const,
             quotedAt: new Date(clock), trialEnd, checkoutSessionId: null, stripeCustomerId: null,
-            stripeSubscriptionId: null, trialStart: null };
+            stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
         Object.assign(f.store, {
             trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
                 authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
@@ -1959,7 +1959,7 @@ describe('trial checkout retries', () => {
         const trialEnd = new Date('2026-11-11T12:00:00Z');
         const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
             emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt: new Date(clock),
-            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null };
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
         Object.assign(f.store, {
             trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
                 authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
@@ -1982,7 +1982,7 @@ describe('trial checkout retries', () => {
         const trialEnd = new Date('2026-11-11T12:00:00Z');
         const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
             emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt,
-            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null };
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
         Object.assign(f.store, {
             trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
                 authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
@@ -2004,7 +2004,7 @@ describe('Standard trial router', () => {
     const trialEnd = new Date('2026-11-11T12:00:00Z');
     type Own = { id: string; userId: string | null; authSubject: string; emailNormalized: string; sku: string; policyVersion: number;
         status: 'quoted' | 'checkout' | 'trialing' | 'converted' | 'canceled' | 'ended' | 'payment_failed'; quotedAt: Date; trialEnd: Date;
-        checkoutSessionId: string | null; stripeCustomerId: string | null; stripeSubscriptionId: string | null; trialStart: Date | null };
+        checkoutSessionId: string | null; stripeCustomerId: string | null; stripeSubscriptionId: string | null; trialStart: Date | null; returnOrigin: string };
     function trialFixture(facts: { emailNormalized?: string | null; emailVerified?: boolean; authSubject?: string; own?: Own | null;
         claimedElsewhere?: boolean; paidBefore?: boolean } = {}) {
         const f = fixture();
@@ -2012,7 +2012,7 @@ describe('Standard trial router', () => {
             claimedElsewhere: false, paidBefore: false, ...facts } };
         const trial = {
             trialFacts: vi.fn(async () => state.facts),
-            claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string }) => {
+            claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string; returnOrigin: string }) => {
                 const own: Own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, sku, policyVersion: 1, status: 'quoted', checkoutSessionId: null,
                     stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, ...input };
                 state.facts.own = own;
@@ -2026,14 +2026,14 @@ describe('Standard trial router', () => {
     }
     const quoted = (patch: Partial<Own> = {}): Own => ({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: `supabase:${userId}`,
         emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt, trialEnd, checkoutSessionId: null,
-        stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, ...patch });
+        stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work', ...patch });
 
     it('quoteTrial fixes the exact end one calendar month after the server clock, $0 today and $20 then', async () => {
         const f = trialFixture();
         await expect(f.caller.quoteTrial()).resolves.toEqual({ sku, todayCents: 0, trialEndsAt: '2026-11-11T12:00:00Z',
             firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z' });
         expect(f.trial.claimTrialQuote).toHaveBeenCalledWith({ userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org',
-            quotedAt, trialEnd });
+            quotedAt, trialEnd, returnOrigin: 'https://os.ezil.work' });
     });
 
     it.each([
@@ -2088,6 +2088,24 @@ describe('Standard trial router', () => {
         const quote = await f.caller.quoteTrial();
         expect(f.trial.claimTrialQuote).toHaveBeenCalledWith(expect.objectContaining({ emailNormalized: 'new@gmail.com' }));
         await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt } })).resolves.toMatchObject({ sessionId: session.id });
+    });
+
+    it('R2: a retry from another owned origin sends identical terms (the quote\'s origin), and a changed configuration re-quotes', async () => {
+        const f = trialFixture({ own: quoted({ returnOrigin: 'https://os-staging.ezil.work' }) });
+        f.trial.attachTrialCheckout.mockRejectedValueOnce(new Error('attach failed after provider create'));
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        await expect(f.caller.createCheckout(input)).rejects.toThrow('attach failed after provider create');
+        const other = f.router.createCaller({ ...f.ctx, headers: new Headers({ origin: 'https://os.ezil.org' }) });
+        await expect(other.createCheckout(input)).resolves.toMatchObject({ sessionId: session.id });
+        const [first] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        const [second] = f.stripe.createCheckoutSession.mock.calls[1]!;
+        expect(second).toEqual(first);
+        expect(first.returnUrl).toBe('https://os-staging.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}');
+        expect(first.cancelUrl).toBe('https://os-staging.ezil.work/os');
+        f.stripe.createCheckoutSession.mockRejectedValueOnce(new StripeRequestError(400, null, 'idempotency_error'));
+        await expect(f.caller.createCheckout(input)).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        f.stripe.createCheckoutSession.mockRejectedValueOnce(new StripeRequestError(500, null, 'api_error'));
+        await expect(f.caller.createCheckout(input)).rejects.toMatchObject({ message: 'stripe_unavailable' });
     });
 
     it('a superseded attach expires the session it opened and refuses', async () => {

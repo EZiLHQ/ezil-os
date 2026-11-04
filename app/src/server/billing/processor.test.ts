@@ -2601,7 +2601,8 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
         const deps: ProcessorDeps = { store, stripe, now: () => new Date(current) };
         store.trials.set(TRIAL_ID, { id: TRIAL_ID, userId: 'user_local', authSubject: 'supabase:user_local', emailNormalized: 'a@x.io',
             sku: 'standard_monthly_v3', policyVersion: 1, status: 'checkout', quotedAt: new Date('2026-11-05T09:59:00.000Z'), trialEnd,
-            checkoutSessionId: 'cs_trial', stripeCustomerId: 'cus_local', stripeSubscriptionId: null, trialStart: null });
+            checkoutSessionId: 'cs_trial', stripeCustomerId: 'cus_local', stripeSubscriptionId: null, trialStart: null,
+            returnOrigin: 'https://os.ezil.work' });
         stripe.subscription = { ...stripe.subscription, sku: 'standard_monthly_v3', status: 'trialing',
             currentPeriodStart: trialStart, currentPeriodEnd: trialEnd, trialStart, trialEnd, trialId: TRIAL_ID, endedAt: null,
             items: [{ id: 'si_trial', priceId: 'price_v3', lookupKey: 'ezil_standard_monthly_v3' }] };

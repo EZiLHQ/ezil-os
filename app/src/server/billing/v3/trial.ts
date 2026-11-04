@@ -52,6 +52,8 @@ export interface TrialRow {
     stripeCustomerId: string | null;
     stripeSubscriptionId: string | null;
     trialStart: Date | null;
+    /** The owned app origin of the quote (billing/return-origin.ts): the checkout's return URLs never vary by request. */
+    returnOrigin: string;
 }
 
 const whole = (date: Date) => new Date(Math.floor(date.getTime() / 1000) * 1000);
@@ -201,7 +203,7 @@ export interface TrialStore {
      * email or subject, refuses `trial_used` (the unique constraints decide a race). Returns the superseded open
      * checkout session, if any, so the caller can expire it.
      */
-    claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date }):
+    claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date; returnOrigin: string }):
         Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' }>;
     /** Record the checkout opened for exactly this quote (CAS on quoted_at); 'stale' when the quote changed or bound. */
     attachTrialCheckout(input: { trialId: string; userId: string; quotedAt: Date; checkoutSessionId: string; customerId: string }):

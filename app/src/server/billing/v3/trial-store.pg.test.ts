@@ -55,7 +55,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
         const facts = await store.trialFacts(userId);
         const terms = trialTerms(now);
         return store.claimTrialQuote({ userId, authSubject: facts.authSubject, emailNormalized: facts.emailNormalized!,
-            quotedAt: terms.quotedAt, trialEnd: terms.trialEnd });
+            quotedAt: terms.quotedAt, trialEnd: terms.trialEnd, returnOrigin: 'https://os-staging.ezil.work' });
     }
     async function start(userId: string, subscriptionId = `sub_${randomUUID().replace(/-/g, '')}`) {
         const facts = await store.trialFacts(userId);
@@ -230,14 +230,18 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
     it('0021 refuses malformed rows', async () => {
         const a = await account(`chk.${run}@example.com`);
         const insert = (patch: Record<string, unknown>) => client`insert into public.ezil_billing_trials
-            (user_id, auth_subject, email_normalized, sku, policy_version, status, quoted_at, trial_end)
+            (user_id, auth_subject, email_normalized, sku, policy_version, status, quoted_at, trial_end, return_origin)
             values (${a}::uuid, ${String(patch.subject ?? `supabase:${a}`)}, ${String(patch.email ?? `chk.${run}@example.com`)},
                 ${String(patch.sku ?? 'standard_monthly_v3')}, 1, ${String(patch.status ?? 'quoted')}, ${at.toISOString()}::timestamptz,
-                ${String(patch.end ?? '2026-12-05T10:00:00Z')}::timestamptz)`;
+                ${String(patch.end ?? '2026-12-05T10:00:00Z')}::timestamptz, 'https://os-staging.ezil.work')`;
         await expect(insert({ sku: 'premium_monthly_v3' })).rejects.toThrow(/sku_chk/);
         await expect(insert({ email: `Chk.${run}@Example.com` })).rejects.toThrow(/email_chk/);
         await expect(insert({ status: 'trialing' })).rejects.toThrow(/bound_chk/);
         await expect(insert({ end: '2026-11-05T10:00:00Z' })).rejects.toThrow(/end_chk/);
+        await expect(client`insert into public.ezil_billing_trials
+            (user_id, auth_subject, email_normalized, sku, policy_version, status, quoted_at, trial_end, return_origin)
+            values (${a}::uuid, ${`supabase:${a}`}, ${`chk.${run}@example.com`}, 'standard_monthly_v3', 1, 'quoted', ${at.toISOString()}::timestamptz,
+                '2026-12-05T10:00:00Z'::timestamptz, 'https://evil.example/path?x=1')`).rejects.toThrow(/origin_chk/);
         await expect(client`insert into public.ezil_billing_grants (user_id, meter, kind, amount, source_type, source_id)
             values (${a}::uuid, 'compute_std_seconds', 'trial_bonus', 1, 'trial', 'x')`).rejects.toThrow(/kind_chk/);
     });

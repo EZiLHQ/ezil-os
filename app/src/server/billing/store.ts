@@ -62,7 +62,7 @@ function trialRow(row: BillingTrialRow): TrialRow {
     return { id: row.id, userId: row.userId, authSubject: row.authSubject, emailNormalized: row.emailNormalized, sku: row.sku,
         policyVersion: row.policyVersion, status: row.status, quotedAt: row.quotedAt, trialEnd: row.trialEnd,
         checkoutSessionId: row.checkoutSessionId, stripeCustomerId: row.stripeCustomerId,
-        stripeSubscriptionId: row.stripeSubscriptionId, trialStart: row.trialStart };
+        stripeSubscriptionId: row.stripeSubscriptionId, trialStart: row.trialStart, returnOrigin: row.returnOrigin };
 }
 
 /** Postgres unique_violation: a concurrent claim by another account (email or subject) or a second quote. */
@@ -134,7 +134,7 @@ export function createBillingStore(db: Database): BillingStore {
                     if (existing) {
                         // The claim follows the current verified identity; the unique keys refuse one another account holds.
                         const [row] = await tx.update(billingTrials).set({ quotedAt: input.quotedAt, trialEnd: input.trialEnd, status: 'quoted',
-                            authSubject: input.authSubject, emailNormalized: input.emailNormalized,
+                            authSubject: input.authSubject, emailNormalized: input.emailNormalized, returnOrigin: input.returnOrigin,
                             checkoutSessionId: null, policyVersion: TRIAL_POLICY_VERSION, updatedAt: sql`now()` })
                             .where(and(eq(billingTrials.id, existing.id), isNull(billingTrials.stripeSubscriptionId))).returning();
                         if (!row) return { status: 'refused' as const, reason: 'trial_used' as const };
@@ -142,7 +142,7 @@ export function createBillingStore(db: Database): BillingStore {
                     }
                     const [row] = await tx.insert(billingTrials).values({ userId: input.userId, authSubject: input.authSubject,
                         emailNormalized: input.emailNormalized, sku: TRIAL_SKU, policyVersion: TRIAL_POLICY_VERSION, status: 'quoted',
-                        quotedAt: input.quotedAt, trialEnd: input.trialEnd }).returning();
+                        quotedAt: input.quotedAt, trialEnd: input.trialEnd, returnOrigin: input.returnOrigin }).returning();
                     return { status: 'quoted' as const, trial: trialRow(row!), supersededCheckoutSessionId: null };
                 });
             } catch (error) {
