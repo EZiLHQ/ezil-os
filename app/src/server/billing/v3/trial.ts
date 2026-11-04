@@ -214,6 +214,12 @@ export interface TrialStore {
     setTrialStatus(input: { trialId: string; subscriptionId: string; status: TrialStatus; from: readonly TrialStatus[] }): Promise<void>;
     /** first_paid_at = coalesce(first_paid_at, at): set once, by the first positive paid period grant. */
     markSubscriptionPaid(subscriptionId: string, at: Date): Promise<void>;
+    /**
+     * Review R4: append every CURRENT verified identity (email, sign-in subject) of started trials' accounts to
+     * ezil_billing_trial_identities: one trial (its own account), or every started trial with a live account (the
+     * sweep). Never removes one, so a later account deletion keeps them all. Returns the rows added.
+     */
+    recordTrialIdentities?(trialId?: string): Promise<number>;
     /** The stored AI receipt with this event key, if any. */
     outboxByEventKey(eventKey: string): Promise<{ eventKey: string; userId: string; kind: string; payload: Record<string, unknown> } | null>;
 }

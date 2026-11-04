@@ -497,6 +497,11 @@ test('the Standard trial follows 0020, stays additive and is a production snapsh
     assert.equal(EXPLICIT_FILES.at(-1), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
+    // Review R4: every verified identity of a started trial, append-only, removed only with its trial.
+    assert.match(sql, /CREATE TABLE "ezil_billing_trial_identities" \(/);
+    assert.match(sql, /ALTER TABLE "ezil_billing_trial_identities" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /REFERENCES "public"\."ezil_billing_trials"\("id"\) ON DELETE cascade ON UPDATE cascade;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing trial identities"/);
     for (const constraint of ['user_unique', 'subject_unique', 'email_unique', 'checkout_unique', 'subscription_unique', 'bound_chk']) {
         assert.match(sql, new RegExp(`CONSTRAINT "ezil_billing_trials_${constraint}"`));
     }

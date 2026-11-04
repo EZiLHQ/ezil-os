@@ -8,6 +8,7 @@ import {
     index,
     jsonb,
     pgTable,
+    primaryKey,
     text,
     timestamp,
     unique,
@@ -474,6 +475,36 @@ export const billingTrials = pgTable(
             columns: [table.userId],
             foreignColumns: [authUsers.id],
         }).onDelete('set null').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+/**
+ * 0021 (review R4): every verified identity (email, sign-in subject) a STARTED trial's account has had, append-only, so
+ * a deleted account's later identities stay claimed with its trial tombstone.
+ */
+export const billingTrialIdentities = pgTable(
+    'ezil_billing_trial_identities',
+    {
+        trialId: uuid('trial_id').notNull(),
+        kind: text('kind', { enum: ['email', 'subject'] }).notNull(),
+        value: text('value').notNull(),
+        emailDomain: text('email_domain'),
+        firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        primaryKey({ name: 'ezil_billing_trial_identities_pkey', columns: [table.trialId, table.kind, table.value] }),
+        check('ezil_billing_trial_identities_kind_chk', sql`${table.kind} in ('email', 'subject')`),
+        check('ezil_billing_trial_identities_value_chk', sql`length(${table.value}) between 1 and 320`),
+        check('ezil_billing_trial_identities_email_chk', sql`${table.kind} = 'subject' or (${table.value} = lower(${table.value})
+            and position('@' in ${table.value}) > 1 and ${table.emailDomain} = split_part(${table.value}, '@', 2))`),
+        check('ezil_billing_trial_identities_domain_chk', sql`(${table.kind} = 'email') = (${table.emailDomain} is not null)`),
+        index('ezil_billing_trial_identities_value_idx').on(table.kind, table.value),
+        index('ezil_billing_trial_identities_domain_idx').on(table.emailDomain).where(sql`${table.kind} = 'email'`),
+        foreignKey({
+            name: 'ezil_billing_trial_identities_trial_id_fkey',
+            columns: [table.trialId],
+            foreignColumns: [billingTrials.id],
+        }).onDelete('cascade').onUpdate('cascade'),
     ],
 ).enableRLS();
 

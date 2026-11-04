@@ -223,6 +223,17 @@ describe('billing session sweep', () => {
         expect(f.isStillRunning).not.toHaveBeenCalled();
     });
 
+    it('Standard trial (review R4): a metered run retains started trials\' identities, and a retention failure never blocks the sweep', async () => {
+        const f = fixture();
+        const retain = vi.fn(async () => 2);
+        Object.assign(f.deps.store, { recordTrialIdentities: retain });
+        await f.run(21600);
+        expect(retain).toHaveBeenCalledWith();
+        const g = fixture();
+        Object.assign(g.deps.store, { recordTrialIdentities: vi.fn(async () => { throw new Error('db down'); }) });
+        await expect(g.run(21600)).resolves.toMatchObject({ examined: 1 });
+    });
+
     it('a second run at the same time does not stop or close an already stopped session', async () => {
         const f = fixture();
         await f.run(21600);

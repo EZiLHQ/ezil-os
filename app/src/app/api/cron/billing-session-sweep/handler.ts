@@ -110,6 +110,13 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     // metering off too; after drain(), because reconcile and the outbox start no work after + 40 s and the pass may take 90 s.
     if (!billingMeteringActive(deps.config)) { await drain(); await advanceReverseMoves(startedAt); return finish(); }
 
+    // Standard trial (review R4): every metered minute, keep each started trial account's current verified identity, so
+    // a later account deletion keeps all of them claimed. Best effort: it never blocks the sweep.
+    try {
+        const store = deps.store as { recordTrialIdentities?: () => Promise<number> };
+        if (typeof store.recordTrialIdentities === 'function') await store.recordTrialIdentities();
+    } catch { console.warn('[billing.trial] identity retention unavailable'); }
+
     // Phase B (§5.4, r7 fixer): the reverse pass runs even when a step below throws (the epoch read, one user's billing
     // state, a close): only it enforces a move's deadlines, and while a row is in flight every open meets the waiting
     // provider. The error still fails the sweep afterwards.

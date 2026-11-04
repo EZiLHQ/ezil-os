@@ -44,6 +44,32 @@ ALTER TABLE "ezil_billing_trials" ADD CONSTRAINT "ezil_billing_trials_user_id_fk
 CREATE POLICY "Service role full access billing trials"
     ON "ezil_billing_trials" FOR ALL USING (auth.role() = 'service_role');
 --> statement-breakpoint
+-- Every verified identity a STARTED trial's account has had (append-only). The trial row keeps the identity it was
+-- quoted under; this keeps the later ones (a changed verified email or sign-in subject), so deleting the account keeps
+-- all of them as claims. Rows go only with their trial (a reclaimed never-started quote never has any).
+CREATE TABLE "ezil_billing_trial_identities" (
+	"trial_id" uuid NOT NULL,
+	"kind" text NOT NULL,
+	"value" text NOT NULL,
+	"email_domain" text,
+	"first_seen_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "ezil_billing_trial_identities_pkey" PRIMARY KEY("trial_id","kind","value"),
+	CONSTRAINT "ezil_billing_trial_identities_kind_chk" CHECK ("ezil_billing_trial_identities"."kind" in ('email', 'subject')),
+	CONSTRAINT "ezil_billing_trial_identities_value_chk" CHECK (length("ezil_billing_trial_identities"."value") between 1 and 320),
+	CONSTRAINT "ezil_billing_trial_identities_email_chk" CHECK ("ezil_billing_trial_identities"."kind" = 'subject' or (
+		"ezil_billing_trial_identities"."value" = lower("ezil_billing_trial_identities"."value")
+		and position('@' in "ezil_billing_trial_identities"."value") > 1
+		and "ezil_billing_trial_identities"."email_domain" = split_part("ezil_billing_trial_identities"."value", '@', 2))),
+	CONSTRAINT "ezil_billing_trial_identities_domain_chk" CHECK (("ezil_billing_trial_identities"."kind" = 'email') = ("ezil_billing_trial_identities"."email_domain" is not null))
+);
+--> statement-breakpoint
+ALTER TABLE "ezil_billing_trial_identities" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+ALTER TABLE "ezil_billing_trial_identities" ADD CONSTRAINT "ezil_billing_trial_identities_trial_id_fkey" FOREIGN KEY ("trial_id") REFERENCES "public"."ezil_billing_trials"("id") ON DELETE cascade ON UPDATE cascade;--> statement-breakpoint
+CREATE POLICY "Service role full access billing trial identities"
+    ON "ezil_billing_trial_identities" FOR ALL USING (auth.role() = 'service_role');
+--> statement-breakpoint
+CREATE INDEX "ezil_billing_trial_identities_value_idx" ON "ezil_billing_trial_identities" USING btree ("kind","value");--> statement-breakpoint
+CREATE INDEX "ezil_billing_trial_identities_domain_idx" ON "ezil_billing_trial_identities" USING btree ("email_domain") WHERE "ezil_billing_trial_identities"."kind" = 'email';--> statement-breakpoint
 -- Stripe's trial window as last read, and the first positive paid period: a trial that never paid gets no grace.
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_start" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_end" timestamp with time zone;--> statement-breakpoint

@@ -146,6 +146,50 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
         expect((await client`select count(*)::int as n from public.ezil_billing_trials where email_normalized = ${`quoteonly.${run}@example.com`}`)[0]!.n).toBe(1);
     });
 
+    it('R4: a started trial keeps every verified identity it had: change and verify an email, read Billing, delete, recreate an alias', async () => {
+        const a = await account(`r4old.${run}@gmail.com`);
+        await quote(a);
+        const { trialId } = await start(a);
+        await client`update auth.users set email = ${`r4new.${run}@gmail.com`}, email_confirmed_at = now() where id = ${a}::uuid`;
+        // Billing reads the account (summary → trialFacts): the new verified identity is retained, not just selected.
+        expect((await store.trialFacts(a)).own).toMatchObject({ status: 'trialing', emailNormalized: `r4old${run}@gmail.com` });
+        expect((await client`select kind, value from public.ezil_billing_trial_identities where trial_id = ${trialId}::uuid order by kind, value`)
+            .map(row => `${row.kind}:${row.value}`)).toEqual([`email:r4new.${run}@gmail.com`, `email:r4old.${run}@gmail.com`, `subject:supabase:${a}`]);
+        await client`delete from auth.users where id = ${a}::uuid`;
+        const viaNew = await account(`r.4.n.e.w.${run}+alias@gmail.com`);
+        expect((await store.trialFacts(viaNew)).claimedElsewhere).toBe(true);
+        expect((await quote(viaNew)).status).toBe('refused');
+        const viaOld = await account(`r4old.${run}+again@gmail.com`);
+        expect((await store.trialFacts(viaOld)).claimedElsewhere).toBe(true);
+        // Deletion itself was never blocked, and the identities stay with the tombstone.
+        expect((await client`select count(*)::int as n from public.ezil_billing_trial_identities where trial_id = ${trialId}::uuid`)[0]!.n).toBe(3);
+    });
+
+    it('R4: the sweep retains a changed verified identity even if Billing was never opened before the deletion', async () => {
+        const a = await account(`sweepold.${run}@example.com`, { auth0: `auth0|sweep-${run}` });
+        await quote(a);
+        await start(a);
+        await client`update auth.users set email = ${`sweepnew.${run}@example.com`}, email_confirmed_at = now(),
+            raw_app_meta_data = ${JSON.stringify({ auth0_sub: `auth0|sweep2-${run}` })}::jsonb where id = ${a}::uuid`;
+        expect(await store.recordTrialIdentities!()).toBeGreaterThanOrEqual(2);
+        await client`delete from auth.users where id = ${a}::uuid`;
+        expect((await store.trialFacts(await account(`sweepnew.${run}@example.com`))).claimedElsewhere).toBe(true);
+        expect((await store.trialFacts(await account(`unrelated.${run}@example.com`, { auth0: `auth0|sweep2-${run}` }))).claimedElsewhere).toBe(true);
+    });
+
+    it('R4: an unverified email is never retained as an identity; a never-started quote retains nothing', async () => {
+        const a = await account(`unv.${run}@example.com`);
+        await quote(a);
+        const { trialId } = await start(a);
+        await client`update auth.users set email = ${`unvnew.${run}@example.com`}, email_confirmed_at = null where id = ${a}::uuid`;
+        await store.recordTrialIdentities!(trialId);
+        expect((await client`select value from public.ezil_billing_trial_identities where trial_id = ${trialId}::uuid and kind = 'email'`)
+            .map(row => row.value)).toEqual([`unv.${run}@example.com`]);
+        const q = await account(`quote.only.r4.${run}@example.com`);
+        const claim = await quote(q);
+        expect(await store.recordTrialIdentities!(claim.status === 'quoted' ? claim.trial.id : undefined)).toBe(0);
+    });
+
     it('E2: custom-domain plus addresses are distinct people; the same address is not', async () => {
         const a = await account(`team+a.${run}@acme.dev`);
         const b = await account(`team+b.${run}@acme.dev`);
@@ -242,6 +286,10 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
             (user_id, auth_subject, email_normalized, sku, policy_version, status, quoted_at, trial_end, return_origin)
             values (${a}::uuid, ${`supabase:${a}`}, ${`chk.${run}@example.com`}, 'standard_monthly_v3', 1, 'quoted', ${at.toISOString()}::timestamptz,
                 '2026-12-05T10:00:00Z'::timestamptz, 'https://evil.example/path?x=1')`).rejects.toThrow(/origin_chk/);
+        await expect(client`insert into public.ezil_billing_trial_identities (trial_id, kind, value, email_domain)
+            select id, 'email', 'Upper@Example.com', 'Example.com' from public.ezil_billing_trials limit 1`).rejects.toThrow(/email_chk/);
+        await expect(client`insert into public.ezil_billing_trial_identities (trial_id, kind, value, email_domain)
+            select id, 'subject', 'supabase:x', 'example.com' from public.ezil_billing_trials limit 1`).rejects.toThrow(/domain_chk/);
         await expect(client`insert into public.ezil_billing_grants (user_id, meter, kind, amount, source_type, source_id)
             values (${a}::uuid, 'compute_std_seconds', 'trial_bonus', 1, 'trial', 'x')`).rejects.toThrow(/kind_chk/);
     });

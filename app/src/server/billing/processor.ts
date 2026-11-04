@@ -56,6 +56,8 @@ async function applyTrial(subscription: StripeSubscription, userId: string, even
                 subscriptionId: subscription.id, trialStart });
             if (bound !== 'bound') return `review:trial_${bound}`;
         }
+        // Review R4: each delivery keeps the started trial account's current verified identity.
+        await store.recordTrialIdentities?.(trial.id);
         // A replay after the trial ended mints nothing: Stripe would no longer say trialing, and the clock agrees.
         if (deps.now() >= trialEnd) return 'applied';
         await store.insertGrant({
@@ -71,7 +73,9 @@ async function applyTrial(subscription: StripeSubscription, userId: string, even
         await store.enqueueOutbox(aiCreditOutboxItem(userId, trialEntitlement({ subscriptionId: subscription.id, trialStart, trialEnd }), 'grant', null));
         return 'applied';
     }
-    if (trial.stripeSubscriptionId === null || trial.status === 'converted') return 'applied';
+    if (trial.stripeSubscriptionId === null) return 'applied';
+    await store.recordTrialIdentities?.(trial.id);
+    if (trial.status === 'converted') return 'applied';
     const ended = subscription.status === 'canceled' || subscription.status === 'incomplete_expired' || subscription.endedAt != null;
     const failed = subscription.status === 'past_due' || subscription.status === 'unpaid';
     if (!ended && !failed) return 'applied';
