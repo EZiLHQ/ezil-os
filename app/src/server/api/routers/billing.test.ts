@@ -1974,4 +1974,27 @@ describe('trial checkout retries', () => {
         expect(await f.caller.createCheckout(input)).toEqual(first);
         expect(f.stripe.createCheckoutSession.mock.calls[1]?.[0]).toEqual(f.stripe.createCheckoutSession.mock.calls[0]?.[0]);
     });
+    it('keeps a safe provider lifetime at the last fresh quote boundary without changing its immutable expiry', async () => {
+        const f = fixture();
+        const quotedAt = new Date('2026-10-11T12:00:00Z');
+        const clock = new Date(quotedAt.getTime() + 30 * 60_000);
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt,
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(), attachTrialCheckout: vi.fn().mockResolvedValue('attached'),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } }))
+            .resolves.toMatchObject({ sessionId: session.id });
+        const [request] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        expect(request.trial!.expiresAt).toEqual(new Date('2026-10-11T14:00:00Z'));
+        expect(request.trial!.expiresAt.getTime() - clock.getTime()).toBeGreaterThanOrEqual(90 * 60_000);
+        expect(request.trial!.expiresAt.getTime() - clock.getTime()).toBeLessThan(24 * 60 * 60_000);
+    });
+
 });
