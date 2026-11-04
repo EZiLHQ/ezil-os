@@ -23,7 +23,7 @@ import { awsOriginHostname, decodeControlKey, verifyGatewayHeader, type AwsTunne
 import {
   AWS_EDGE_CALL_MAX_MS, AWS_EDGE_REPLY_MAX_BYTES, AWS_HOST_ERROR_CODES, AWS_JOB_ID_RE, AWS_KERNEL_ERROR_CODES, AWS_RELAY_POLL_MS,
   AWS_REPO_OPEN_PATH, AWS_REPO_OPEN_RELAY_MAX_BYTES, AWS_REPO_OPEN_ROOT, AWS_REPO_OPEN_STATUS_PATH, AWS_RESULT_ERROR_CODES,
-  GITHUB_NAME_RE, GITHUB_OWNER_RE, REPO_OPEN_PUBLIC_GIT_HOST, isPublicRepoName,
+  GITHUB_NAME_RE, GITHUB_OWNER_RE, REPO_OPEN_PUBLIC_GIT_HOST, awsPublicRelayAllowed, isPublicRepoName,
   awsJobAnswer, awsPublicRepoOpenInput, awsPublicRepoOpenResult, awsRepoOpenPoll, awsRepoOpenRelayBody, awsRepoOpenStart,
   handleAwsRepoOpen, relayPublicRepoOpen,
   type AwsRepoOpenDeps, type AwsRepoOpenJob, type AwsRepoOpenStep, type AwsRepoOpenTarget, type PublicRepoOpenInput,
@@ -1586,6 +1586,26 @@ describe('class public: a grant-free open relayed to an AWS computer', () => {
     const withGrant = { ...publicInput(), grant: input().grant } as unknown as PublicRepoOpenInput;
     expect(await awsRepoOpenStart(withGrant, SANDBOX, target, deps(e.fetch), 'public')).toEqual(done$(refusal('invalid_request')));
     expect(e.calls).toEqual([]);
+  });
+
+  it('a public input naming any host but github.com is a pre-send invalid_request, never relayed', async () => {
+    for (const gitHost of ['gitlab.com', 'git-qa.ezil.work', 'github.com.evil.example', 'GitHub.com']) {
+      const e = edge(() => ok(okPublic));
+      expect([gitHost, await awsRepoOpenStart(publicInput({ gitHost } as Partial<PublicRepoOpenInput>), SANDBOX, target, deps(e.fetch), 'public')])
+        .toEqual([gitHost, done$(refusal('invalid_request'))]);
+      expect([gitHost, e.calls]).toEqual([gitHost, []]);
+    }
+    // positive control: github.com relays
+    const ok$ = job(() => ok(okPublic));
+    expect((await handleAwsRepoOpen(publicInput({ gitHost: 'github.com' }), SANDBOX, target, deps(ok$.fetch), 'public')).status).toBe(200);
+  });
+
+  it('only the os-staging Worker may relay to an AWS host, whatever the remotes allowlist says', () => {
+    for (const gateway of [undefined, '', 'https://ai.ezil.work', 'https://ai-staging.ezil.work.evil.example', 'http://ai-staging.ezil.work']) {
+      expect([gateway, awsPublicRelayAllowed({ EZIL_AI_GATEWAY_URL: gateway })]).toEqual([gateway, false]);
+    }
+    expect(awsPublicRelayAllowed({ EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' })).toBe(true);
+    expect(awsPublicRelayAllowed({ EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work/' })).toBe(true);
   });
 
   it('a defaultBranch u2 refuses (_x: branchOf accepts it) is a pre-send invalid_request, never relayed', async () => {

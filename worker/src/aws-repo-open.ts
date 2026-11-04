@@ -115,6 +115,7 @@ import { readLimited, sha256HexBytes } from './ai-proxy';
 import {
   AWS_GATEWAY_HEADER, awsOriginHostname, decodeControlKey, isComputerId, signGatewayHeader, type AwsTunnelRecord, type FetchLike,
 } from './aws-origin';
+import { OS_STAGING_AI_GATEWAY_ORIGIN } from './repo-open';
 import {
   ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HANDLE_RE, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
   REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, UUID_RE, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, assessmentEditorRoot, assessmentRemoteUrl,
@@ -136,6 +137,15 @@ import {
 export type AwsRelayClass = RepoOpenClass | 'public';
 /** The one git host class `public` names: public github.com, read anonymously. */
 export const REPO_OPEN_PUBLIC_GIT_HOST = 'github.com';
+/**
+ * The relay's own environment gate, stated separately from repo-open.ts `repoOpenRemotesFor`: that allowlist
+ * says which remotes a Cloudflare open accepts and may one day include public github.com in production; this
+ * says only the os-staging Worker (its Gateway is exactly ai-staging) may relay anything to an AWS host.
+ */
+export function awsPublicRelayAllowed(env: { EZIL_AI_GATEWAY_URL?: unknown }): boolean {
+  const raw = env.EZIL_AI_GATEWAY_URL;
+  return raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/`;
+}
 /**
  * github.com owner/name grammar, copied verbatim from app/src/server/works/repo-url.ts OWNER (~:26) /
  * NAME (~:28) — the same grammar repo-open.ts's `PUBLIC_GITHUB_REPOSITORY_URL` embeds between
