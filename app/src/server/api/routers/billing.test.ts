@@ -759,6 +759,152 @@ describe('billing top-up checkout', () => {
     });
 });
 
+describe('top-up quote, stale-quote guard and confirmed fulfilment (synthetic fixtures)', () => {
+    function topupFixture() {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        return f;
+    }
+    const topupSession = (overrides: Partial<StripeCheckoutSession> = {}): StripeCheckoutSession => ({
+        ...session, mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_custom_v2', ...overrides });
+    function withReceipt(f: ReturnType<typeof fixture>, receipt: Awaited<ReturnType<AiTopupReceiptStore['aiTopupReceipt']>> | Error) {
+        const aiTopupReceipt = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>(async () => { if (receipt instanceof Error) throw receipt; return receipt; });
+        Object.assign(f.store, { aiTopupReceipt, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+        return aiTopupReceipt;
+    }
+    const receipt = (delivery: Record<string, unknown> | undefined, owner = userId) => ({
+        eventKey: 'ezil-os:v1:topup:ai_custom_v2:pi_fixture:grant', userId: owner, kind: 'ai_grant' as const,
+        payload: { protocol: 'ezil-ai-credits-v1', credits: 500, paymentIntentId: 'pi_fixture', ...(delivery ? { delivery } : {}) } });
+
+    it('quotes the offered pack from the Stripe catalog and a custom amount at the fixed tariff, with no discount', async () => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_fixture' })).resolves.toEqual({ sku: 'ai_pack_fixture', custom: false,
+            aiCredits: offeredPack.aiCredits, creditCents: offeredPack.creditCents, discountPercent: offeredPack.discountPercent,
+            totalCents: offeredPack.totalCents, currency: 'usd' });
+        await expect(f.caller.quoteTopup({ customAmountCents: 5000 })).resolves.toEqual({ sku: 'ai_custom_v2', custom: true,
+            aiCredits: 500, creditCents: 5000, discountPercent: 0, totalCents: 5000, currency: 'usd' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -100, 999, 1050, 1000.5, 1000100, Number.NaN])('refuses an invalid custom quote %s (bounds and whole dollars)', async customAmountCents => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ customAmountCents })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    });
+
+    it('refuses tampered quote input: unknown SKU, the custom SKU by name, both fields, or extra fields', async () => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ sku: 'ai_custom_v2' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_tampered' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_fixture', customAmountCents: 1000 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.caller.quoteTopup({ customAmountCents: 1000, aiCredits: 100000 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000, totalCents: 1 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('quote follows the same enrollment and configuration gates as checkout', async () => {
+        const f = topupFixture();
+        const unenrolled = createBillingRouter(() => f.deps, { aiMember: async () => null }).createCaller(f.ctx);
+        await expect(unenrolled.quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        f.deps.config.stripePublishableKey = undefined;
+        await expect(f.caller.quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'billing_not_configured' });
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+
+    it('a stale quote is refused before any customer or checkout is created; the matching quote proceeds', async () => {
+        const f = topupFixture();
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedTotalCents: offeredPack.totalCents + 1 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedCredits: offeredPack.aiCredits + 1 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 5000, expectedCredits: 625 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        await f.caller.createTopupCheckout({ customAmountCents: 5000, expectedTotalCents: 5000, expectedCredits: 500 });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku: 'ai_custom_v2', customAmountCents: 5000 }));
+        expect(f.stripe.createCheckoutSession.mock.calls[0]![0]).not.toHaveProperty('expectedTotalCents');
+        // A coupon that ended between quote and checkout: the old discounted total no longer matches.
+        resetStripePackCachesForTests();
+        f.stripe.retrieveCoupon.mockResolvedValue(null);
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedTotalCents: offeredPack.totalCents }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('payment alone is never credited: open, unpaid, expired and paid-without-receipt stay uncredited', async () => {
+        const f = topupFixture();
+        withReceipt(f, null);
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ status: 'open', paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ status: 'complete', fulfillment: 'awaiting_payment' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ status: 'expired', paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ status: 'expired', fulfillment: 'awaiting_payment' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing', credits: null });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ paymentIntentId: null }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+    });
+
+    it.each([
+        [undefined, 'processing'], [{ status: 'pending' }, 'processing'], [{ status: 'processing' }, 'processing'],
+        [{ status: 'retry' }, 'processing'], [{ status: 'failed' }, 'review'], [{ status: 'done' }, 'credited'],
+    ] as const)('maps the receipt delivery %j to %s, reading only this user\'s receipt', async (delivery, fulfillment) => {
+        const f = topupFixture();
+        const read = withReceipt(f, receipt(delivery));
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+            fulfillment, credits: fulfillment === 'credited' ? 500 : null });
+        expect(read).toHaveBeenCalledWith(userId, 'pi_fixture');
+    });
+
+    it('never reports another person\'s session or receipt, nor a non-top-up session', async () => {
+        const f = topupFixture();
+        const read = withReceipt(f, receipt({ status: 'done' }));
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ clientReferenceId: '22222222-2222-4222-8222-222222222222' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'unknown_checkout' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ mode: 'subscription', sku }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ sku: null }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(read).not.toHaveBeenCalled();
+        // A receipt row for another owner (defence in depth beside the store's own user filter) is not credited.
+        withReceipt(f, receipt({ status: 'done' }, '22222222-2222-4222-8222-222222222222'));
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+        await expect(f.caller.topupStatus({ sessionId: 'not-a-session' })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+
+    it('an unreadable receipt or store without receipts keeps waiting, never failed or credited', async () => {
+        const f = topupFixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        withReceipt(f, new Error('db down'));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+    });
+
+    it('duplicate webhook delivery still writes one receipt, and status reports it credited once delivered', async () => {
+        const f = topupFixture();
+        const receipts: Parameters<AiTopupReceiptStore['recordAiTopup']>[1][] = [];
+        const recordAiTopup = vi.fn<AiTopupReceiptStore['recordAiTopup']>(async (_grant, item) => { receipts.push(item); return 'applied'; });
+        Object.assign(f.store, { aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>(async () => receipts[0] ?? null), recordAiTopup });
+        const paid = topupSession({ amountTotal: 5000, currency: 'usd', metadataCredits: '500' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(paid);
+        const event = { id: 'evt_dup', type: 'checkout.session.completed', created: now.getTime() / 1000, livemode: false,
+            data: { object: { id: session.id, customer: 'cus_fixture', mode: 'payment', payment_status: 'paid', payment_intent: 'pi_fixture', metadata: { sku: 'ai_custom_v2' } } } };
+        const deps = { store: f.store, stripe: f.stripe, now: () => now };
+        expect(await processStripeEvent(event, deps)).toBe('applied');
+        expect(await processStripeEvent(event, deps)).toBe('applied');
+        expect(recordAiTopup).toHaveBeenCalledTimes(1);
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+        receipts[0]!.payload.delivery = { status: 'done' };
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', fulfillment: 'credited', credits: 500 });
+    });
+});
+
 async function paidFixture(planSku = sku) {
     const f = fixture();
     await f.store.linkCustomer(userId, 'cus_fixture');

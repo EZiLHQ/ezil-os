@@ -228,16 +228,19 @@ await check('Billing: needs_ezil_id shows waiting credits, the EZiL ID link and 
     const unsafe = billingState('needs_ezil_id'); unsafe.actions.ezilId = 'javascript:alert(1)';
     assert.equal(fragment(summaryV3Html(unsafe)).querySelector('a[data-action="ezil-id"]'), null, 'only an http(s) or same-site link');
 });
-await check('Billing: the AI top-up is a closed disclosure, only when enrolled with packs', () => {
+await check('Billing: Add AI credits is one card and one balance control into the same dialog, only when enrolled', () => {
     const el = fragment(summaryV3Html(billingState('premium')));
-    const topup = el.querySelector('details[data-role="ai-topup"]');
-    assert.ok(topup, 'disclosure exists');
-    assert.equal(topup.open, false);
-    assert.match(clean(topup.querySelector('summary')), /Add AI credits/);
-    assert.equal(topup.querySelectorAll('[data-action="topup"]').length, 2);
-    for ( const button of topup.querySelectorAll('button') ) assert.ok(! button.classList.contains('ezil-settings-btn-primary'));
+    assert.equal(el.querySelector('details[data-role="ai-topup"]'), null, 'no buried disclosure');
+    const topup = el.querySelector('section[data-role="ai-topup"]');
+    assert.ok(topup, 'card exists');
+    assert.match(clean(topup.querySelector('h4')), /Add AI credits/);
+    assert.equal(topup.querySelectorAll('[data-action="topup"]').length, 1, 'one entry, not one checkout per pack');
+    const meter = el.querySelector('#ai-credits [data-action="topup"]');
+    assert.ok(meter, 'Add credits beside the balance');
+    for ( const button of [...topup.querySelectorAll('button'), meter] ) assert.ok(! button.classList.contains('ezil-settings-btn-primary'));
     const none = billingState('premium'); none.actions.topup = false;
     assert.equal(fragment(summaryV3Html(none)).querySelector('[data-role="ai-topup"]'), null);
+    assert.equal(fragment(summaryV3Html(none)).querySelector('[data-action="topup"]'), null);
 });
 await check('Billing: three plan cards with configurations, storage and credits; the current one says "Current plan"', () => {
     for ( const name of ['free', 'standard', 'premium'] ) {

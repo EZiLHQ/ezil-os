@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -80,6 +80,20 @@ const checkoutStatus = result => {
 // summary below establishes the plan; neither this status nor onComplete is paid.
 const PAYMENT_PENDING_COPY = 'Payment confirmation is pending. Bank payments can take a few days.';
 
+// A top-up is done only when the server says its receipt reached the AI ledger
+// (`billing.topupStatus` fulfillment `credited`); a paid session is not credits.
+const FULFILLMENTS = ['awaiting_payment', 'processing', 'credited', 'review'];
+const topupStatus = result => {
+    const data = unwrap(result);
+    return {
+        status: data?.status,
+        paymentStatus: ['paid', 'unpaid', 'no_payment_required'].includes(data?.paymentStatus) ? data.paymentStatus : null,
+        fulfillment: FULFILLMENTS.includes(data?.fulfillment) ? data.fulfillment : 'processing',
+        credits: Number.isSafeInteger(data?.credits) && data.credits > 0 ? data.credits : null,
+    };
+};
+const TOPUP_REVIEW_COPY = "Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.";
+
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
 // modal frames in body portals. Validate their URL only; never inspect their DOM.
 function isStripeModalFrame (iframe) {
@@ -92,7 +106,7 @@ function isStripeModalFrame (iframe) {
     } catch { return false; }
 }
 
-export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, loadStripe = defaultLoadStripe, now = Date.now }) {
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -109,6 +123,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     let confirmationCopy = null;
     let finished = false;
     let deadline = 0;
+    let fulfillment = null;
+    let creditedCredits = null;
     const timers = new Set();
     const v3 = sku.endsWith('_v3');
     const name = pack ? 'AI credits' : v3 ? offer.name : planName(offer.family);
@@ -121,6 +137,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         container, title, role: 'upgrade-sheet', onClose,
         canDismissBackdrop: () => ! busy && ! (confirming && ! finished),
         dispose: () => {
+            // Closed before Stripe finished the session: say so in Billing, without claiming nothing was paid.
+            if ( pack && ! finished && ! sessionCompleted ) { try { onCancel?.(); } catch { /* Closing must still tear down. */ } }
             closed = true;
             clearTimers();
             controller.abort();
@@ -160,7 +178,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}${pack ? '' : '/month'} · before applicable tax`;
     dialog.querySelector('[data-role="price"]').textContent = price;
     let lines;
-    if ( pack ) lines = [allowance];
+    if ( pack ) lines = [allowance, ...(Number.isFinite(pack.discountPercent) && pack.discountPercent > 0 ? [`Includes ${pack.discountPercent}% off`] : [])];
     else if ( v3 ) {
         // Round 3 (plan §6.4, M8): the bullets in plan order, then "What happens next" beside the payment form.
         lines = planBullets(offer).bullets;
@@ -241,7 +259,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         try { onDone?.(); } finally { close(); }
     }
     function showConfirmation (timeout = false) {
-        const waiting = `Waiting for your ${pack ? 'AI credits' : 'plan'} to update.`;
+        const waiting = pack ? 'Adding your AI credits…' : 'Waiting for your plan to update.';
         const message = paymentStatus === 'paid' ? `Payment received. ${waiting}`
             : paymentStatus === 'no_payment_required' ? `No payment is required. ${waiting}`
             : paymentStatus === 'unpaid' ? `Your payment is processing. Bank payments can take a few days. ${paymentUpdate}`
@@ -258,11 +276,12 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         if ( sessionCompleted ) showConfirmation(true);
         else show('We could not confirm your payment yet. Check Settings → Billing in a moment.', 'Back to Billing', returnToBilling, 'return-to-billing');
     }
-    function success () {
+    function success (summary = null) {
         finished = true;
         clearTimers();
         mount.hidden = true;
-        show(pack ? paymentStatus === 'paid' ? 'Payment received' : 'Checkout complete' : `You're on ${name}`, 'Done', returnToBilling);
+        const credits = creditedCredits ?? pack?.aiCredits;
+        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : `You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -270,13 +289,54 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         icon.setAttribute('aria-hidden', 'true');
         state.prepend(icon);
         const allowances = doc.createElement('p');
-        allowances.textContent = pack ? 'Check your AI credits in Billing.' : allowance;
+        // The refreshed balance is the server's, for the signed-in person only; otherwise point to Billing.
+        const view = pack && summary?.version === 3 ? accountCredits(summary.ai?.account, { userId }) : null;
+        allowances.textContent = pack ? view && ! view.stale ? `Your balance is now ${view.left} credits.` : 'Check your AI credits in Billing.' : allowance;
+        if ( pack ) allowances.dataset.role = 'topup-new-balance';
         state.querySelector('button').before(allowances);
         state.querySelector('button').focus();
+    }
+    /** Top-ups: the session, then the receipt's delivery, then one fresh summary for the new balance. */
+    async function pollTopup () {
+        if ( fulfillment !== 'credited' ) {
+            const result = topupStatus(await trpc.query('billing.topupStatus', { sessionId: session.sessionId }));
+            if ( closed || finished ) return;
+            if ( result.status === 'expired' ) {
+                finished = true;
+                clearTimers();
+                show('This checkout expired before payment, so you were not charged. Close this and try again.');
+                return;
+            }
+            if ( result.status === 'complete' ) {
+                sessionCompleted = true;
+                paymentStatus = result.paymentStatus;
+                confirming = true;
+            }
+            fulfillment = result.fulfillment;
+            creditedCredits = result.credits;
+            if ( fulfillment === 'review' ) {
+                finished = true;
+                clearTimers();
+                show(TOPUP_REVIEW_COPY, 'Back to Billing', returnToBilling, 'return-to-billing');
+                return;
+            }
+            if ( sessionCompleted ) showConfirmation();
+            if ( fulfillment !== 'credited' ) { later(() => { void poll(); }, CONFIRM_POLL_MS); return; }
+        }
+        const summary = unwrap(await trpc.query('billing.summary'));
+        if ( closed || finished ) return;
+        if ( now() >= deadline ) { timedOut(); return; }
+        if ( summary?.enabled === true && summary.version === 3 ) { success(summary); return; }
+        later(() => { void poll(); }, CONFIRM_POLL_MS);
     }
     async function poll () {
         if ( closed || finished ) return;
         if ( now() >= deadline ) { timedOut(); return; }
+        if ( pack ) {
+            try { await pollTopup(); return; } catch { /* A transient read failure must not imply that payment failed. */ }
+            if ( ! closed && ! finished ) later(() => { void poll(); }, CONFIRM_POLL_MS);
+            return;
+        }
         try {
             if ( ! sessionCompleted || ! ['paid', 'no_payment_required'].includes(paymentStatus) ) {
                 const result = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
@@ -298,8 +358,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             const summary = unwrap(await trpc.query('billing.summary'));
             if ( closed || finished ) return;
             if ( now() >= deadline ) { timedOut(); return; }
-            if ( pack ? summary?.enabled === true && summary.version === 3 && ['paid', 'no_payment_required'].includes(paymentStatus)
-                : summary?.plan?.sku === sku ) { success(); return; }
+            if ( summary?.plan?.sku === sku ) { success(); return; }
         } catch { /* A transient read failure must not imply that payment failed. */ }
         if ( ! closed && ! finished ) later(() => { void poll(); }, CONFIRM_POLL_MS);
     }
@@ -309,7 +368,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
      * and then never calls onComplete. While the form is open the sheet also
      * asks the server about the session itself. Completion starts verification;
      * it does not establish receipt of an asynchronous bank payment. Only the
-     * webhook-backed plan can confirm a subscription; packs confirm receipt.
+     * webhook-backed plan can confirm a subscription; top-ups confirm delivered credits.
      */
     async function watchSession () {
         if ( closed || polling || finished ) return;
@@ -368,7 +427,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         busy = true;
         show('Preparing your checkout…');
         try {
-            session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout', { sku }));
+            // A quoted top-up sends exactly what was quoted (a preset or a custom amount, pinned to its total).
+            session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout', pack?.checkout ?? { sku }));
             if ( closed ) return;
             if ( pack ) session = { ...session, mode: 'embedded' };
             if ( session.mode === 'redirect' ) {

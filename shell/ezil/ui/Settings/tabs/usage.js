@@ -368,6 +368,12 @@ export default {
         };
         states.set(win.get(0), state);
         win.on('click', '[data-action="refresh-usage"]', () => { void load(state, true); });
+        // Add credits opens Billing's top-up dialog in this window; the link stays the fallback without a Billing tab.
+        win.on('click', '[data-action="usage-add-credits"]', event => {
+            if (!win.find('.ezil-settings-tab[data-tab="billing"]').length) return;
+            event.preventDefault();
+            win.trigger('ezil:billing-topup', [{ reason: null }]);
+        });
     },
     onActivate(win) {
         stop(active); active = states.get(win.get(0)); if (!active) return;

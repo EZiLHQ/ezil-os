@@ -6,6 +6,7 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
+import { openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
     accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
@@ -18,7 +19,8 @@ const ATTENTION = new Set(['low', 'exhausted', 'over_cap']);
 const windows = new WeakMap();
 const FOCUS_RELOAD_MS = 5 * 60 * 1000;
 let upgradeSheetOpener = openUpgradeSheet;
-let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet };
+let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet,
+    topup: openTopupSheet };
 
 export function setUpgradeSheetOpener (fn) { upgradeSheetOpener = fn; }
 export function setBillingSheetOpeners (openers) { sheetOpeners = { ...sheetOpeners, ...openers }; }
@@ -261,11 +263,13 @@ function ezilIdHref (value) {
 }
 
 /** One meter row. `percent` is the share LEFT (null: no bar); tone comes from the server state. */
-function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', notes = [], extra = '' }) {
+function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', notes = [], extra = '', action = '' }) {
     const bar = percent === null ? '' : `<div class="ezil-billing-gauge" role="meter" aria-label="${encode(`${label}: ${value}`)}"
             aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${encode(value)}"><span style="width: ${percent}%"></span></div>`;
     return `<div class="ezil-billing-meter-row is-${tone}" data-role="${role}"${id ? ` id="${id}"` : ''}>
-        <div class="ezil-billing-meter-head"><h4${id ? ' tabindex="-1"' : ''}>${encode(label)}</h4><span class="ezil-billing-meter-value">${encode(value)}</span></div>
+        <div class="ezil-billing-meter-head"><h4${id ? ' tabindex="-1"' : ''}>${encode(label)}</h4>${action
+            ? `<span class="ezil-billing-meter-trail"><span class="ezil-billing-meter-value">${encode(value)}</span>${action}</span>`
+            : `<span class="ezil-billing-meter-value">${encode(value)}</span>`}</div>
         ${bar}${notes.filter(Boolean).map(note => typeof note === 'string' ? paragraph(note, 'ezil-billing-note') : note.html).join('')}${extra}</div>`;
 }
 
@@ -319,7 +323,7 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
     const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
     const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
     const periodEnd = ai.included && Number.isFinite(Date.parse(ai.included.periodEnd ?? '')) ? ai.included.periodEnd : null;
-    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
+    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', action: topupMeterAction(summary), value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
         percent: view.percent, tone, notes: [
             view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
             { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
@@ -389,7 +393,7 @@ function aiMeterV3 (summary, options = {}) {
     const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.`
         : (starter && starter.remaining > 0) || beyondStarter ? '' : `${whole(grant.amount)} credits to start.` : '';
     split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
-    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
+    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, action: topupMeterAction(summary), notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
         // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
         ...extras, included && (paidComputeUnmetered(summary) || dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true)) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
@@ -481,13 +485,16 @@ function planPrimaryV3 (summary) {
     // Identity credits: the AI meter's own warning (a large added grant beside a spent plan bucket is not low).
     const view = 'account' in ai ? accountCredits(ai.account) : undefined;
     const low = view === undefined ? ['low', 'exhausted'].includes(ai.state) : view !== null && (view.empty || view.low);
-    if ( plan.sku === 'premium_monthly_v3' && low && topupPacks(summary).length ) {
+    if ( plan.sku === 'premium_monthly_v3' && low && topupOffer(summary) ) {
         return '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-topup">Add AI credits</button>';
     }
     return '';
 }
 
-const topupPacks = ({ ai, actions, catalog }) => (ai.enrollment ?? 'enrolled') === 'enrolled' && actions.topup === true ? catalog.packs ?? [] : [];
+/** Beside the balance: the same top-up dialog every entry opens (secondary; the page keeps one primary). */
+function topupMeterAction (summary) {
+    return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup" aria-label="Add AI credits">Add credits</button>' : '';
+}
 
 function yourComputerV3 (summary) {
     const { computer, plan } = summary;
@@ -591,11 +598,15 @@ function plansV3 (summary) {
         ${paragraph(`Storage is the disk on your computer; some space is used by the system.${keeps}`, 'ezil-billing-note')}</section>`;
 }
 
+/** The top-up entry below the plans: one button into the same dialog (presets and a custom amount), never a second purchase surface. */
 function topupV3 (summary) {
-    const packs = topupPacks(summary);
-    if ( ! packs.length ) return '';
-    return `<details class="ezil-billing-card ezil-billing-topup" data-role="ai-topup"><summary>Add AI credits</summary>
-        <div class="ezil-billing-actions">${packs.map(pack => actionHtml('topup', `Add ${whole(pack.aiCredits)} credits — ${dollars(pack.totalCents, { compact: true })}${pack.discountPercent ? ` (save ${pack.discountPercent}%)` : ''}`, false, pack.sku)).join('')}</div></details>`;
+    const offer = topupOffer(summary);
+    if ( ! offer ) return '';
+    const presets = offer.packs.map(pack => `${whole(pack.aiCredits)}`);
+    const choices = presets.length ? `${presets.length > 1 ? `${presets.slice(0, -1).join(', ')} or ${presets.at(-1)}` : presets[0]} credits${offer.custom ? ', or a custom amount' : ''}` : 'Choose any whole-dollar amount';
+    return `<section class="ezil-billing-card ezil-billing-topup" data-role="ai-topup" aria-labelledby="billing-topup-heading">
+        <div><h4 id="billing-topup-heading">Add AI credits</h4>${paragraph(`One-time purchase in USD. ${choices}.`, 'ezil-billing-note')}</div>
+        <div class="ezil-billing-actions">${actionHtml('topup', 'Add credits')}</div></section>`;
 }
 
 /** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
@@ -610,6 +621,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
         ${plansV3(summary)}
         ${topupV3(summary)}
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
+        <p class="ezil-billing-note" data-role="billing-action-status" role="status"></p>
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3 tabindex="-1">Invoices</h3>
             <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>
         <div class="ezil-billing-v3-footer"><p class="ezil-billing-note">Prices before tax.</p>
@@ -720,14 +732,19 @@ async function load ($win, state) {
             $body.attr('aria-busy', 'false');
         }
     }
+    // An Add credits request (the Usage tab's link, the Code recovery link) is consumed once, on whichever
+    // load first has a summary: the top-up dialog when this account can buy, else the AI credits row.
+    const topup = state.summary ? state.openTopup : null;
+    if ( topup ) state.openTopup = null;
+    if ( topup && ! openSheet($win, state, 'topup', undefined, topup) ) {
+        const card = $body.find('#ai-credits').get(0);
+        card?.scrollIntoView?.({ block: 'nearest' });
+        card?.querySelector('h4')?.focus({ preventScroll: true });
+    }
     if ( state.summary && ! state.autoOpened ) {
         state.autoOpened = true;
         const sku = state.openUpgrade;
-        if ( state.openSection === 'ai-credits' ) {
-            const card = $body.find('#ai-credits').get(0);
-            card?.scrollIntoView?.({ block: 'nearest' });
-            card?.querySelector('h4')?.focus({ preventScroll: true });
-        } else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
+        if ( topup ) { /* The deep link's section was the top-up request above. */ } else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
             if ( state.summary.version === 3 ) openSheet($win, state, 'choose');
@@ -761,14 +778,22 @@ async function loadUsage ($win, state, request) {
 }
 
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }
+/** A neutral outcome (not an error) beside the actions, e.g. a checkout closed before payment finished. */
+function actionStatus ($win, copy) { $win.find('[data-role="billing-action-status"]').text(copy); }
 
-function openSheet ($win, state, action, sku) {
-    if ( state.pending || state.sheet || state.closed || state.summary?.actions[action === 'choose' ? 'checkout' : action] !== true ) return;
+/**
+ * `topup` opens the Add AI credits dialog (`sku` preselects a preset; `intent.reason` frames exhaustion);
+ * `topup-checkout` is that dialog's hand-off: the payment sheet for the server's quote (`intent.pack`).
+ */
+function openSheet ($win, state, action, sku, intent = null) {
+    const flag = action === 'choose' ? 'checkout' : action === 'topup-checkout' ? 'topup' : action;
+    if ( state.pending || state.sheet || state.closed || state.summary?.actions[flag] !== true ) return false;
     const summary = state.summary;
     const offer = action === 'checkout' ? offerFor(summary, sku) : null;
-    const pack = action === 'topup' ? summary.catalog.packs?.find(pack => pack.sku === sku) : null;
-    if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return;
-    if ( action === 'topup' && (summary.version !== 3 || ! pack) ) return;
+    const pack = action === 'topup-checkout' ? intent?.pack : null;
+    if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return false;
+    if ( action === 'topup' && ! topupOffer(summary) ) return false;
+    if ( action === 'topup-checkout' && (summary.version !== 3 || ! pack) ) return false;
     const container = $win.find('.window-body').get(0);
     const token = {};
     state.sheet = token;
@@ -779,6 +804,7 @@ function openSheet ($win, state, action, sku) {
     };
     const onDone = () => { onClose(); void load($win, state); };
     actionError($win, '');
+    actionStatus($win, '');
     try {
         // After an upgrade, "Switch to 4 vCPU · 16 GB" hands over to the Computer tab, which owns the switch.
         const onSwitch = size => {
@@ -786,7 +812,12 @@ function openSheet ($win, state, action, sku) {
             $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
         };
         const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => openSheet($win, state, 'checkout', params.sku) };
-        token.handle = action === 'topup' ? upgradeSheetOpener({ ...options, sku, pack })
+        token.handle = action === 'topup' ? sheetOpeners.topup({ ...options, summary, userId: state.userId, lastAccount: state.lastAccount,
+            preselect: sku, reason: intent?.reason ?? null,
+            checkout: params => openSheet($win, state, 'topup-checkout', null, params),
+            upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
+            : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, userId: state.userId,
+                onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
             : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
@@ -801,7 +832,9 @@ function openSheet ($win, state, action, sku) {
     } catch {
         onClose();
         actionError($win, 'Could not open billing. Try again.');
+        return false;
     }
+    return true;
 }
 
 function invoiceUrl (state, kind) {
@@ -895,7 +928,7 @@ export default {
                 <a href="/refunds" target="_blank" rel="noopener">Refund policy</a><a href="/pricing" target="_blank" rel="noopener">Plans</a></footer></div>`;
     },
     init ($win) {
-        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openSection: null, timer: null, active: false, closed: false,
+        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openTopup: null, timer: null, active: false, closed: false,
             lastAccount: null, loadedAt: undefined, userId: null };
         windows.set($win.get(0), state);
         // Back from another window or tab (a hosted checkout, a top-up) with a pane older than five minutes: read it again.
@@ -914,22 +947,29 @@ export default {
                 heading?.scrollIntoView?.({ block: 'start' });
                 heading?.focus({ preventScroll: true });
             } else if ( action === 'computer-tab' ) $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
-            else if ( action === 'open-topup' ) {
-                // Premium's "Add AI credits" opens the top-up disclosure; the pack rows stay secondary.
-                const details = $pane.find('[data-role="ai-topup"]').get(0);
-                if ( details ) {
-                    details.open = true;
-                    details.scrollIntoView?.({ block: 'nearest' });
-                    details.querySelector('summary')?.focus();
-                }
-            }
-            else if ( ['checkout', 'topup', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
+            // Every Add credits control (Premium's primary, the balance, the card) opens the same dialog.
+            else if ( action === 'open-topup' || action === 'topup' ) openSheet($win, state, 'topup', this.dataset.sku);
+            else if ( ['checkout', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {
             if ( ! this.disabled && this.checked ) void act($win, state, 'size', this.value);
         });
+        // In-window Add credits (the Usage tab): switch to Billing and open the dialog once it has a summary,
+        // with no page navigation (Code and its conversation keep running in their own window).
+        $win.on('ezil:billing-topup', (_event, detail) => {
+            if ( state.closed ) return;
+            const request = { reason: detail?.reason === 'insufficient_credits' ? 'insufficient_credits' : null };
+            const tab = $win.find('.ezil-settings-tab[data-tab="billing"]');
+            if ( tab.hasClass('active') && state.summary && ! state.loading ) {
+                if ( ! openSheet($win, state, 'topup', undefined, request) ) $pane.find('#ai-credits h4').get(0)?.focus();
+                return;
+            }
+            state.openTopup = request;
+            tab.trigger('click');
+        });
         $win.on('remove.billing', () => {
+            $win.off('ezil:billing-topup');
             window.removeEventListener?.('focus', state.focus);
             state.closed = true;
             state.request++;
@@ -950,7 +990,10 @@ export default {
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));
-            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) state.openSection = 'ai-credits';
+            // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
+            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
+                state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
+            }
             void load($win, state);
         }
     },

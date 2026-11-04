@@ -144,7 +144,7 @@ const opener = kind => options => {
     return handle;
 };
 window.billing.setUpgradeSheetOpener(opener('checkout'));
-window.billing.setBillingSheetOpeners(Object.fromEntries(['upgrade', 'downgrade', 'cancel', 'overage'].map(kind => [kind, opener(kind)])));
+window.billing.setBillingSheetOpeners(Object.fromEntries(['upgrade', 'downgrade', 'cancel', 'overage', 'topup'].map(kind => [kind, opener(kind)])));
 window.ezil.boot();
 window.$.fx.off = true;
 const payload = { user: { id: 'test-user', name: 'Test user' }, features: { billing: true }, desktopState: {} };
@@ -1315,37 +1315,59 @@ try {
         summary.ai.balance = balance; summary.ai.state = state; await refresh();
         contains('#ai-credits .ezil-billing-meter-value', label);
         assert.equal(q('#ai-credits').classList.contains(`is-${tone}`), true);
-        assert.equal(qa('[data-role="ai-topup"] [data-action="topup"]').length, 2);
-        assert.equal(q('[data-role="ai-topup"]').open, false, 'the top-up is a closed disclosure');
+        has('details[data-role="ai-topup"]', false);
+        assert.equal(qa('[data-role="ai-topup"] [data-action="topup"]').length, 1, 'one card entry, not one checkout per pack');
+        assert.equal(qa('#ai-credits [data-action="topup"]').length, 1, 'Add credits beside the balance');
         if ( balance === null ) { has('#ai-credits [role="meter"]', false); assert.doesNotMatch(q('#ai-credits').textContent, /1\.000001|Not available|Unavailable/); }
     }
-    assert.deepEqual(qa('[data-role="ai-topup"] [data-action="topup"]').map(button => button.textContent), ['Add 2,000 credits — $10', 'Add 5,000 credits — $25']);
-    for ( const pack of packs ) {
-        const button = q(`[data-role="ai-topup"] [data-sku="${pack.sku}"]`);
+    contains('[data-role="ai-topup"]', '2,000 or 5,000 credits');
+    // Every entry opens the same dialog with the live summary; a double click opens one.
+    for ( const entry of ['#ai-credits [data-action="topup"]', '[data-role="ai-topup"] [data-action="topup"]'] ) {
+        const button = q(entry);
         assert.equal(button.classList.contains('ezil-settings-btn-primary'), false);
         const before = sheets.length;
         click(button); click(button);
         assert.equal(sheets.length, before + 1);
-        assert.equal(sheets.at(-1).sku, pack.sku);
-        assert.deepEqual(sheets.at(-1).pack, pack);
-        assert.equal(sheets.at(-1).offer, undefined);
-        const reads = count();
-        sheets.at(-1).onDone(); await closeSheet();
-        assert.equal(count(), reads + 1, 'finishing a top-up refreshes Billing');
+        assert.equal(sheets.at(-1).kind, 'topup');
+        assert.deepEqual(sheets.at(-1).summary.catalog.packs, packs);
+        assert.equal(sheets.at(-1).userId, 'test-user');
+        assert.equal(sheets.at(-1).reason, null);
+        await closeSheet();
     }
-    packs[0].totalCents = 1234; await refresh(); contains('[data-role="ai-topup"] button', 'Add 2,000 credits — $12.34');
-    const beforeInvalid = sheets.length;
-    q('[data-role="ai-topup"] button').dataset.sku = 'unknown_pack'; click(q('[data-role="ai-topup"] button'));
-    assert.equal(sheets.length, beforeInvalid, 'unknown packs cannot open a checkout');
-    const staleButton = q('[data-role="ai-topup"] button'); staleButton.dataset.sku = packs[0].sku;
+    // The dialog's hand-off: the server's quote goes to the payment sheet; finishing refreshes Billing.
+    click(q('#ai-credits [data-action="topup"]'));
+    const quote = { sku: 'ai_custom_v2', aiCredits: 500, totalCents: 5000, creditCents: 5000, discountPercent: 0, currency: 'usd',
+        checkout: { customAmountCents: 5000, expectedTotalCents: 5000, expectedCredits: 500 } };
+    const dialog = sheets.at(-1); dialog.handle.close();
+    dialog.checkout({ pack: quote }); await settle();
+    assert.equal(sheets.at(-1).kind, 'checkout');
+    assert.deepEqual(sheets.at(-1).pack, quote);
+    assert.equal(sheets.at(-1).sku, 'ai_custom_v2');
+    assert.equal(sheets.at(-1).userId, 'test-user');
+    const reads = count();
+    sheets.at(-1).onDone(); await closeSheet();
+    assert.equal(count(), reads + 1, 'finishing a top-up refreshes Billing');
+    // Closing the payment sheet early says so neutrally (never an error, never "not charged").
+    click(q('#ai-credits [data-action="topup"]'));
+    const again = sheets.at(-1); again.handle.close(); again.checkout({ pack: quote }); await settle();
+    assert.equal(sheets.at(-1).kind, 'checkout');
+    sheets.at(-1).onCancel(); contains('[data-role="billing-action-status"]', 'Checkout closed before payment finished');
+    assert.equal(q('[data-role="billing-action-error"]').textContent, '');
+    await closeSheet();
+    const staleButton = q('[data-role="ai-topup"] button');
+    const beforeStale = sheets.length;
     summary.actions.topup = false; await refresh(); q('#ai-credits').append(staleButton); click(staleButton);
-    assert.equal(sheets.length, beforeInvalid, 'top-up actions are checked again at click time');
-    // Premium with credits running low: the page's one primary opens the top-up disclosure.
+    assert.equal(sheets.length, beforeStale, 'top-up actions are checked again at click time');
+    // Premium with credits running low: the page's one primary opens the same dialog.
     summary = summaryV3('premium'); summary.ai.state = 'low'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
     assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Add AI credits']);
     click(q('[data-action="open-topup"]')); await settle();
-    assert.equal(q('[data-role="ai-topup"]').open, true);
-    assert.equal(window.document.activeElement, q('[data-role="ai-topup"] summary'));
+    assert.equal(sheets.at(-1).kind, 'topup');
+    await closeSheet();
+    // Only a custom tariff (an empty Stripe catalog): still one entry, into the dialog.
+    summary.catalog.packs = []; summary.catalog.customTopup = { minCents: 1000, maxCents: 1000000, centsPerCredit: 10 }; await refresh();
+    contains('[data-role="ai-topup"]', 'Choose any whole-dollar amount');
+    click(q('#ai-credits [data-action="topup"]')); assert.equal(sheets.at(-1).kind, 'topup'); await closeSheet();
     // needs_ezil_id (D1): the waiting credits and the EZiL ID link; no top-up and no "Unavailable".
     summary = summaryV3('free'); Object.assign(summary.ai, { enrollment: 'needs_ezil_id', waiting: { credits: 100 }, balance: null, state: 'unavailable' });
     summary.actions.ezilId = '/login?method=ezil-id'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
@@ -1384,6 +1406,47 @@ try {
         assert.equal(creditsScrolled, 2, `${url} does not focus the card`);
     }
     pass('AI credits deep-link heading focus survives URL cleanup and a failed summary without refocusing; /app/settings?tab=billing is the same link');
+
+    // Founder regression (4 Nov): the Usage link focused a heading and left the purchase accordion closed far
+    // below the viewport. With a top-up available, every Add credits link now opens the dialog itself.
+    summary = summaryV3('premium'); summary.actions.topup = true; summary.catalog.packs = packs;
+    for ( const [search, reason] of [['?settings=billing&section=ai-credits&reason=insufficient_credits', 'insufficient_credits'],
+        ['?settings=billing&section=ai-credits', null], ['?settings=billing&section=ai-credits&reason=rate_limited', null]] ) {
+        window.history.replaceState(null, '', `/os${search}`);
+        const before = sheets.length; await open();
+        assert.equal(sheets.length, before + 1, `${search} opens the dialog`);
+        assert.equal(sheets.at(-1).kind, 'topup');
+        assert.equal(sheets.at(-1).reason, reason, 'only insufficient_credits frames recovery');
+        await closeSheet(); await refresh();
+        assert.equal(sheets.length, before + 1, 'the request is consumed once');
+    }
+    window.history.replaceState(null, '', '/os');
+    // Usage → Add credits: an in-window switch to Billing that opens the dialog, never a page navigation.
+    await open({ ...context, initialTab: 'usage' });
+    const usageLink = q('[data-action="usage-add-credits"]');
+    assert.ok(usageLink, 'Usage shows Add credits');
+    assert.equal(usageLink.getAttribute('href'), '/os?settings=billing&section=ai-credits', 'the link stays the no-Billing fallback');
+    const navigation = new window.MouseEvent('click', { bubbles: true, cancelable: true });
+    const beforeUsage = sheets.length;
+    usageLink.dispatchEvent(navigation); await settle();
+    assert.equal(navigation.defaultPrevented, true, 'no page navigation');
+    assert.equal(active(), 'billing');
+    assert.equal(sheets.length, beforeUsage + 1);
+    assert.equal(sheets.at(-1).kind, 'topup');
+    await closeSheet();
+    // Twice in a row from Usage: each request opens one dialog; a pending one is not duplicated.
+    click(q('[data-tab="usage"]')); await settle();
+    q('[data-action="usage-add-credits"]').dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    q('[data-action="usage-add-credits"]')?.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await settle();
+    assert.equal(sheets.length, beforeUsage + 2);
+    await closeSheet();
+    // Without a top-up (needs EZiL ID) the same request falls back to the AI credits row, as before.
+    summary.actions.topup = false; click(q('[data-tab="usage"]')); await settle();
+    window.$(q('.window[data-app="settings"]')).trigger('ezil:billing-topup', [{ reason: 'insufficient_credits' }]); await settle();
+    assert.equal(sheets.length, beforeUsage + 2);
+    assert.equal(window.document.activeElement, q('#ai-credits h4'));
+    pass('Add credits links (Usage, Code recovery deep link) open the top-up dialog directly, once, in this window');
     // Round 5 (D6): no operator internals on the user surface, in any AI state.
     summary = summaryV3(); await refresh();
     for ( const role of ['ai-usage', 'ai-limits', 'ai-recent', 'ai-spending'] ) has(`[data-role="${role}"]`, false);
