@@ -40,6 +40,11 @@ case "${1:-}" in
     done
     psql_in -tAc "select to_regclass('auth.users') is not null and to_regprocedure('auth.role()') is not null" | grep -qx t \
       || { echo "billing-test-db: image lacks auth.users / auth.role()" >&2; exit 1; }
+    # GoTrue columns the app reads (the trial's verified-email facts, the paid-compute SQL) that this image's
+    # older auth.users lacks. Additive, as the image's superuser: `postgres` does not own auth.users.
+    docker exec -i "$NAME" psql -v ON_ERROR_STOP=1 -q -U supabase_admin -d postgres -c "alter table auth.users
+      add column if not exists email_confirmed_at timestamptz, add column if not exists deleted_at timestamptz,
+      add column if not exists banned_until timestamptz" >/dev/null
     # The app schema references Supabase's auth users; drizzle's journal fixes the order.
     for tag in $(node -e "for (const e of require('$APP_DIR/drizzle/meta/_journal.json').entries) console.log(e.tag)"); do
       psql_in < "$APP_DIR/drizzle/$tag.sql" >/dev/null
