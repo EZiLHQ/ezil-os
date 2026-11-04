@@ -93,6 +93,10 @@ export function deriveStanding(input: {
     if (!sub || plan.subscriptionId === null) return free(lastEndedPeriod(input.subscriptions, now));
     // planStatusFromStripe folds `unpaid` into past_due; D18 drops it at once (Stripe's final action).
     if (sub.status === 'unpaid' || plan.status === 'incomplete') return free(null);
+    // A new Stripe period/status is not first-payment proof. Trial access ends at its exact boundary,
+    // including while the first invoice or its failure webhook is still arriving. A prior paid receipt
+    // (firstPaidAt) keeps genuine renewal pending/grace behavior unchanged.
+    if (neverPaidTrial(sub) && sub.trialEnd && now >= epochSeconds(sub.trialEnd)) return free(at(sub.trialEnd));
     const issues = subscriptionIssues(input.paymentIssues, plan.subscriptionId);
     const planEndsAt = plan.status === 'cancels' || sub.cancelAtPeriodEnd ? plan.cancelsAt : null;
     if (sub.status === 'past_due' || issues.length) {

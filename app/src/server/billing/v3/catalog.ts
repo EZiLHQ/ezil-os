@@ -40,6 +40,8 @@ export function billingOfferByLookupKey(key: string) {
 
 type LegacyPlan = ReturnType<typeof legacyPlan>;
 type CommonPlan = Omit<LegacyPlan, 'sku' | 'offer'> & { legacyFree: boolean; sessionMaxSeconds: number | null;
+    /** Trial funding facts stay on the resolved plan so never-paid trials cannot use paid-renewal pending access. */
+    trialEnd?: Date | null; firstPaidAt?: Date | null;
     /** Product entitlements v1: set only when an operator grant decides the plan (operator-access.ts); never a Stripe row. */
     operator?: OperatorEntitlementRow };
 export type ResolvedPlanV3 = CommonPlan & (
@@ -64,7 +66,8 @@ export function planFromSubscriptions(input: {
     const sub = input.subs.find(sub => sub.stripeSubscriptionId === selected.subscriptionId);
     const offer = sub ? offerBySku(sub.sku) : CATALOG_V3.free_v3;
     const legacyFree = freeSkuFor(input.userCreatedAt, input.freeEffectiveAt) === 'free_v1_legacy';
-    if (offer) return { ...selected, sku: offer.sku, offer, legacy: null, legacyFree, sessionMaxSeconds: offer.sessionMaxSeconds };
+    if (offer) return { ...selected, sku: offer.sku, offer, legacy: null, legacyFree, sessionMaxSeconds: offer.sessionMaxSeconds,
+        ...(sub?.trialEnd != null ? { trialEnd: sub.trialEnd, firstPaidAt: sub.firstPaidAt ?? null } : {}) };
     return { ...selected, sku: 'legacy', legacy: selected, legacyFree, sessionMaxSeconds: SESSION_MAX_SECONDS };
 }
 

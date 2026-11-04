@@ -1924,3 +1924,54 @@ describe('round 5 D3: the volume size reader (describeVolume, cached)', () => {
         await expect(read(volume)).resolves.toBeNull();
     });
 });
+
+describe('trial checkout retries', () => {
+    it('retains identical provider parameters after successful create followed by local attach failure', async () => {
+        const f = fixture();
+        let clock = new Date('2026-10-11T12:00:00Z');
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted' as const,
+            quotedAt: new Date(clock), trialEnd, checkoutSessionId: null, stripeCustomerId: null,
+            stripeSubscriptionId: null, trialStart: null };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(),
+            attachTrialCheckout: vi.fn().mockRejectedValueOnce(new Error('QA local attach failed after provider create')).mockResolvedValue('attached'),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        await expect(f.caller.createCheckout(input)).rejects.toThrow('QA local attach failed after provider create');
+        clock = new Date(clock.getTime() + 1000);
+        await expect(f.caller.createCheckout(input)).resolves.toMatchObject({ mode: 'redirect', sessionId: session.id });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(2);
+        const [first] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        const [second] = f.stripe.createCheckoutSession.mock.calls[1]!;
+        expect(second.idempotencyKey).toBe(first.idempotencyKey);
+        expect(second).toEqual(first);
+    });
+    it('returns the same logical session after a completed local attachment and a lost response', async () => {
+        const f = fixture();
+        let clock = new Date('2026-10-11T12:00:00Z');
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt: new Date(clock),
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(),
+            attachTrialCheckout: vi.fn(async () => { Object.assign(own, { status: 'checkout', checkoutSessionId: session.id,
+                stripeCustomerId: 'cus_fixture' }); return 'attached'; }),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        const first = await f.caller.createCheckout(input);
+        clock = new Date(clock.getTime() + 1000);
+        expect(await f.caller.createCheckout(input)).toEqual(first);
+        expect(f.stripe.createCheckoutSession.mock.calls[1]?.[0]).toEqual(f.stripe.createCheckoutSession.mock.calls[0]?.[0]);
+    });
+});
