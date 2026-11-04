@@ -9,6 +9,8 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   deriveAiProxyToken,
+  exactCacheEligible,
+  exactCacheScope,
   AI_PROXY_COMPLETION_TIMEOUT_MS,
   AI_PROXY_HEADERS_TIMEOUT_MS,
   handleAiProxyRequest,
@@ -1102,5 +1104,62 @@ describe('non-stream completion deadline', () => {
     })();
     expect(response.status).toBe(504);
     expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_completion_timeout');
+  });
+});
+
+describe('exact response cache opt-in (Gateway docs/RESPONSE-CACHE.md)', () => {
+  const enc = (value: unknown) => new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
+  const kimi = { model: 'us.moonshotai.kimi-k3', max_tokens: 64, stream: false, messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }] };
+  it('is eligible only for Messages JSON without tools', () => {
+    expect(exactCacheEligible('/v1/messages', enc(kimi))).toBe(true);
+    expect(exactCacheEligible('/v1/messages', enc({ ...kimi, tools: [] }))).toBe(true);
+    for (const body of [{ ...kimi, stream: true }, { ...kimi, stream: undefined }, { ...kimi, stream: 'false' },
+      { ...kimi, tools: [{ name: 'read_file', input_schema: { type: 'object' } }] }, { ...kimi, tools: {} }]) {
+      expect(exactCacheEligible('/v1/messages', enc(body))).toBe(false);
+    }
+    // The Gateway ignores the opt-in on Responses: never sent there.
+    expect(exactCacheEligible('/v1/responses', enc({ model: 'gpt-6-sol', input: 'q', stream: false }))).toBe(false);
+    for (const raw of ['', 'not json', '[]', 'null', '{"stream":false']) expect(exactCacheEligible('/v1/messages', enc(raw))).toBe(false);
+    expect(exactCacheEligible('/v1/messages', undefined)).toBe(false);
+  });
+  it('scopes by an HMAC of the computer, never the id itself, within the Gateway grammar', async () => {
+    const scope = await exactCacheScope(SECRET, SANDBOX);
+    expect(scope).toMatch(/^os-[0-9a-f]{32}$/);
+    expect(scope).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    expect(scope).not.toContain(SANDBOX);
+    expect(await exactCacheScope(SECRET, SANDBOX)).toBe(scope);
+    expect(await exactCacheScope(SECRET, `${SANDBOX}x`)).not.toBe(scope);
+    expect(await exactCacheScope(`${SECRET}x`, SANDBOX)).not.toBe(scope);
+  });
+  async function send(body: unknown, overrides: Partial<AiProxyDeps> = {}, path = '/ai/v1/messages', extra: Record<string, string> = {}) {
+    const gw = mockGateway(() => new Response('{"id":"msg_1"}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': 'HIT', 'x-ezil-request-id': 'req-c' } }));
+    const d = await deps({ fetch: gw.fetch, exactCache: 'on', ...overrides });
+    const res = await handleAiProxyRequest(new Request(`${HOST}${path}`, { method: 'POST',
+      headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-1', ...extra }, body: JSON.stringify(body) }), d);
+    return { res, call: gw.calls[0]!, logs: d.logs };
+  }
+  it('opts an eligible call in with the computer scope, strips a client opt-in, and passes HIT/MISS back', async () => {
+    const { res, call, logs } = await send(kimi, {}, '/ai/v1/messages', { 'x-ezil-cache': 'exact', 'x-ezil-cache-scope': 'client-chosen' });
+    expect(call.headers['x-ezil-cache']).toBe('exact');
+    expect(call.headers['x-ezil-cache-scope']).toBe(await exactCacheScope(SECRET, SANDBOX));
+    expect(res.headers.get('x-ezil-cache')).toBe('HIT');
+    await res.text();
+    expect(logs.at(-1)).toMatchObject({ status: 200, request_id: 'req-c', cache: 'HIT' });
+  });
+  it('sends nothing for tool turns, streams, Responses, or with the switch off, and drops any client cache header', async () => {
+    const cases: [unknown, Partial<AiProxyDeps>, string][] = [
+      [{ ...kimi, tools: [{ name: 'read_file', input_schema: { type: 'object' } }] }, {}, '/ai/v1/messages'],
+      [{ ...kimi, stream: true }, {}, '/ai/v1/messages'],
+      [{ model: 'gpt-6-sol', input: 'q', stream: false }, {}, '/ai/v1/responses'],
+      [kimi, { exactCache: undefined }, '/ai/v1/messages'],
+      [kimi, { exactCache: 'off' }, '/ai/v1/messages'],
+    ];
+    for (const [body, overrides, path] of cases) {
+      const { res, call, logs } = await send(body, overrides, path, { 'x-ezil-cache': 'exact', 'x-ezil-cache-scope': 'client-chosen' });
+      expect(call.headers['x-ezil-cache']).toBeUndefined();
+      expect(call.headers['x-ezil-cache-scope']).toBeUndefined();
+      await res.text();
+      expect(logs.at(-1)!.cache).toBeUndefined();
+    }
   });
 });

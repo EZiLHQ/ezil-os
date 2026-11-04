@@ -57,6 +57,8 @@ describe('staging Worker resources and routes', () => {
       SANDBOX_AI_PROXY: 'on',
       // os-staging's own Gateway (isolated issuer and store); production stays ai.ezil.work.
       EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work',
+      // Eligible EZiL Chat calls opt into the Gateway's exact cache (staging HIT rule: zero debit).
+      EZIL_AI_EXACT_CACHE: 'on',
       AWS_ROUTING_ENABLED: 'on',
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
@@ -70,6 +72,8 @@ describe('staging Worker resources and routes', () => {
   it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
     expect(config.vars.SANDBOX_AI_PROXY).toBe('off');
     expect(config.vars.EZIL_AI_GATEWAY_URL).toBe('https://ai.ezil.work');
+    // No exact-cache opt-in in production until its fee rule exists.
+    expect(config.vars.EZIL_AI_EXACT_CACHE).toBeUndefined();
   });
 
   it('covers the API and every preview token without claiming a zone catch-all', () => {

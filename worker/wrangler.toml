@@ -349,6 +349,9 @@ AWS_ORIGIN_ZONE = "ezil.work"
 AWS_ORIGIN_ZONE_ALLOWLIST = "ezil.work"
 SANDBOX_AI_PROXY = "on"
 EZIL_AI_GATEWAY_URL = "https://ai-staging.ezil.work"
+# Exact response cache opt-in for eligible EZiL Chat calls (Messages JSON without tools); a confirmed HIT settles
+# zero debit under the staging rule (Gateway docs/RESPONSE-CACHE.md). Production stays off until its fee rule exists.
+EZIL_AI_EXACT_CACHE = "on"
 SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
 SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"

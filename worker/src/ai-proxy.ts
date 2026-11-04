@@ -281,10 +281,13 @@ export interface AiProxyDeps {
   readonly completionTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
   readonly now?: () => number;
+  /** "on": opt eligible calls into the Gateway's exact response cache (`exactCacheEligible`); staging only for now. */
+  readonly exactCache?: string;
 }
 
 const PASS_THROUGH_RESPONSE_HEADERS = [
   'content-type', 'cache-control', 'x-ezil-request-id', 'x-ezil-hold-micro', 'x-ezil-trace-id', 'traceparent', 'retry-after', 'x-accel-buffering',
+  'x-ezil-cache',
 ] as const;
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -512,6 +515,31 @@ export function isNonStreamBody(body: Uint8Array | undefined): boolean {
   }
 }
 
+/**
+ * The Gateway's opt-in exact response cache (EZiL AI Gateway docs/RESPONSE-CACHE.md) caches only POST /v1/messages
+ * with `stream: false`; /v1/responses ignores the opt-in. Tool turns stay out too: a HIT would hand Copilot a recorded
+ * tool call to run again. So: Messages, `stream` exactly false, and no tools or an empty tools array.
+ */
+export function exactCacheEligible(upstreamPath: string, body: Uint8Array | undefined): boolean {
+  if (upstreamPath !== '/v1/messages' || body === undefined || body.byteLength === 0) return false;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+    const { stream, tools } = parsed as { stream?: unknown; tools?: unknown };
+    return stream === false && (tools === undefined || (Array.isArray(tools) && tools.length === 0));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `x-ezil-cache-scope` for this computer: an HMAC of the sandbox id under the proxy secret, never the id itself. The
+ * Gateway keys by the caller and payer as well, so a scope can only split one user's cache, never widen it.
+ */
+export async function exactCacheScope(secret: string, sandboxId: string): Promise<string> {
+  return `os-${(await hmacSha256Hex(secret, `ezil-exact-cache-scope:v1:${sandboxId}`)).slice(0, 32)}`;
+}
+
 export async function readLimited(body: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array | null> {
   if (body === null) return new Uint8Array(0);
   const reader = body.getReader();
@@ -634,6 +662,12 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     const value = request.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
+  // Set here only; a client's own x-ezil-cache* headers are never forwarded (the allow-list above).
+  const exactCache = deps.exactCache === 'on' && route.method === 'POST' && exactCacheEligible(route.upstreamPath, body);
+  if (exactCache) {
+    headers.set('x-ezil-cache', 'exact');
+    headers.set('x-ezil-cache-scope', await exactCacheScope(deps.proxySecret, deps.sandboxId));
+  }
 
   const abort = new AbortController();
   const completion = route.method === 'POST' && isNonStreamBody(body);
@@ -715,7 +749,8 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   const responses = route.upstreamPath === '/v1/responses';
   const stream = passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS, isSse, (outcome, terminal, code, usage) => {
     cleanup();
-    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}) });
+    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}),
+      ...(exactCache ? { cache: upstream.headers.get('x-ezil-cache') } : {}) });
   }, abort, !upstream.ok, responses);
   return new Response(stream, { status: upstream.status, headers: outHeaders });
 }

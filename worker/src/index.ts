@@ -386,6 +386,8 @@ interface Env extends SandboxEnv {
   EZIL_AI_GATEWAY_URL?: string;
   /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
   SANDBOX_AI_PROXY?: string;
+  /** "on" opts eligible EZiL Chat calls into the Gateway's exact response cache (ai-proxy.ts exactCacheEligible). */
+  EZIL_AI_EXACT_CACHE?: string;
 }
 
 /**
@@ -7662,6 +7664,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     gatewayUrl,
     sandboxId,
     enabled: env.SANDBOX_AI_PROXY,
+    exactCache: env.EZIL_AI_EXACT_CACHE,
     proxySecret: resolveNekoDerivationSecret(env),
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
