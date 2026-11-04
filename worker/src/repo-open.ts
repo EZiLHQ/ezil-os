@@ -221,7 +221,21 @@ export const STAGING_GIT_QA_REPOSITORY_URL = new RegExp(String.raw`^https:\/\/gi
 export interface RepoOpenRemotes {
   /** Also accept `STAGING_GIT_QA_REPOSITORY_URL` (Basic auth). */
   stagingGitQa?: boolean;
+  /** Also accept `PUBLIC_GITHUB_REPOSITORY_URL` (anonymous: no credential at all). */
+  publicGitHub?: boolean;
 }
+
+/**
+ * A public github.com repository, opened from a direct repository URL
+ * (`/app/code?repo=<https URL>`, founder 547ed35a): `https://github.com/<owner>/<name>.git`
+ * with GitHub's owner rule (letters, digits and single inner hyphens, at most
+ * 39) and a plain name (no leading dot, no `..`). Fetched ANONYMOUSLY: no
+ * token, header or helper is ever configured, so only a public repository can
+ * be read and no EZiL credential can reach GitHub. Accepted only when the
+ * caller opts in (`RepoOpenRemotes.publicGitHub`, os-staging).
+ */
+export const PUBLIC_GITHUB_REPOSITORY_URL =
+  /^https:\/\/github\.com\/[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}\/(?!\.)(?![A-Za-z0-9._-]*\.\.)[A-Za-z0-9._-]{1,100}\.git$/;
 
 /**
  * os-staging's own AI Gateway origin. The Worker's existing `EZIL_AI_GATEWAY_URL`
@@ -240,7 +254,7 @@ export const OS_STAGING_AI_GATEWAY_ORIGIN = 'https://ai-staging.ezil.work';
  */
 export function repoOpenRemotesFor(env: { EZIL_AI_GATEWAY_URL?: unknown }): RepoOpenRemotes {
   const raw = env.EZIL_AI_GATEWAY_URL;
-  return raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/` ? { stagingGitQa: true } : {};
+  return raw === OS_STAGING_AI_GATEWAY_ORIGIN || raw === `${OS_STAGING_AI_GATEWAY_ORIGIN}/` ? { stagingGitQa: true, publicGitHub: true } : {};
 }
 /** The binding's `ref` pattern; its refinements are applied in `branchOf`. */
 const REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
@@ -252,8 +266,11 @@ const GIT_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const HEAD = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
-/** How git presents the token: Bearer to Cloudflare Artifacts, Basic `ezil:<token>` to EZiL Git's gateway (production or, opted in, staging). */
-export type RepoOpenAuth = 'bearer' | 'basic';
+/**
+ * How git presents the token: Bearer to Cloudflare Artifacts, Basic `ezil:<token>` to EZiL Git's gateway (production
+ * or, opted in, staging); `none` for an opted-in public github.com repository, which is fetched with no credential.
+ */
+export type RepoOpenAuth = 'bearer' | 'basic' | 'none';
 
 export interface RepoOpenRequest {
   repositoryId: string;
@@ -316,7 +333,13 @@ export function repoOpenAuthFor(url: unknown, remotes: RepoOpenRemotes = {}): Re
   if (ARTIFACTS_REPOSITORY_URL.test(url)) return 'bearer';
   if (EZIL_GIT_REPOSITORY_URL.test(url)) return 'basic';
   if (optedIntoStagingGitQa(remotes) && STAGING_GIT_QA_REPOSITORY_URL.test(url)) return 'basic';
+  if (optedIn(remotes, 'publicGitHub') && PUBLIC_GITHUB_REPOSITORY_URL.test(url)) return 'none';
   return null;
+}
+
+/** Own property only, the literal `true` only (as `optedIntoStagingGitQa`). */
+function optedIn(remotes: unknown, key: 'publicGitHub'): boolean {
+  return typeof remotes === 'object' && remotes !== null && Object.hasOwn(remotes, key) && (remotes as RepoOpenRemotes)[key] === true;
 }
 
 /** Own property only: an inherited `stagingGitQa` (a polluted prototype) never opts a caller in. */
@@ -339,11 +362,12 @@ export function parseRepoOpenRequest(
   const invalid = { ok: false as const, error: 'repo_open_invalid_request' as const };
   if (!isPlainObject(body)) return invalid;
   const keys = Object.keys(body).filter((k) => k !== 'timeoutMs').sort().join(',');
-  if (keys !== 'canonicalURL,git,ref,repositoryId') return invalid;
   const { repositoryId, canonicalURL, ref, git } = body;
-  if (typeof repositoryId !== 'string' || !UUID.test(repositoryId)) return invalid;
   const auth = repoOpenAuthFor(canonicalURL, remotes);
   if (auth === null) return invalid;
+  // An anonymous (public github.com) open carries no grant at all; every other remote carries exactly one.
+  if (keys !== (auth === 'none' ? 'canonicalURL,ref,repositoryId' : 'canonicalURL,git,ref,repositoryId')) return invalid;
+  if (typeof repositoryId !== 'string' || !UUID.test(repositoryId)) return invalid;
   const branch = branchOf(ref);
   if (branch === null) return invalid;
   let timeoutMs = REPO_OPEN_EXEC_TIMEOUT_MS;
@@ -351,6 +375,9 @@ export function parseRepoOpenRequest(
     const t = body.timeoutMs;
     if (typeof t !== 'number' || !Number.isInteger(t) || t < REPO_OPEN_MIN_TIMEOUT_MS || t > REPO_OPEN_EXEC_TIMEOUT_MS) return invalid;
     timeoutMs = t;
+  }
+  if (auth === 'none') {
+    return { ok: true, request: { repositoryId, canonicalURL: canonicalURL as string, ref: ref as string, branch, token: '', expiresAt: '', auth, timeoutMs } };
   }
   if (!isPlainObject(git)) return invalid;
   for (const key of Object.keys(git)) {
@@ -451,7 +478,6 @@ case "$step" in
 fetch)
   IFS= read -r tok <&3
   exec 3<&-
-  [ -n "$tok" ] || fail repo_open_invalid_request
   work=$(mktemp -d /tmp/ezil-repo-open.XXXXXX) || fail repo_open_git_failed
   trap 'rm -rf "$work"' EXIT ;;
 place)
@@ -464,7 +490,11 @@ esac
 cd "$work" || fail repo_open_git_failed
 mirror=$work/mirror
 root=$1; id=$2; url=$3; branch=$4; hydrated=$5; auth=$6; lockwait=$7; limit=$8
-case "$auth" in bearer|basic) ;; *) fail repo_open_invalid_request ;; esac
+case "$auth" in bearer|basic|none) ;; *) fail repo_open_invalid_request ;; esac
+# A token for every credentialed remote, and none at all for an anonymous one.
+if [ "$step" = fetch ]; then
+  if [ "$auth" = none ]; then [ -z "$tok" ] || fail repo_open_invalid_request; else [ -n "$tok" ] || fail repo_open_invalid_request; fi
+fi
 case "$lockwait" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
 case "$limit" in ''|*[!0-9]*) fail repo_open_invalid_request ;; esac
 case "$url" in https://?*/*) ;; *) fail repo_open_invalid_request ;; esac
@@ -515,7 +545,10 @@ net() {
     [ "$s" -ge 1 ] || exit 124
     set -- git --git-dir="$mirror" fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head \
       --no-auto-maintenance -- "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
-    if [ "$auth" = bearer ]; then
+    if [ "$auth" = none ]; then
+      # Anonymous: no header and no helper (key 0 already empties credential.helper); key 9 is unset, so count 9.
+      GIT_CONFIG_COUNT=9 timeout -k 5 "$s" "$@"
+    elif [ "$auth" = bearer ]; then
       export GIT_CONFIG_KEY_9="http.$url.extraHeader"
       GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"
     else
@@ -636,7 +669,7 @@ export function repoOpenCommand(params: {
 }): string {
   const { lockWaitS, gitTimeoutS } = repoOpenBounds(params.timeoutMs);
   const script = ['bash', '-c', shq(REPO_OPEN_SCRIPT), 'ezil-repo-open', 'fetch', shq(params.root), shq(params.repositoryId),
-    shq(params.url), shq(params.branch), params.requireHydrated ? '1' : '0', params.auth === 'bearer' ? 'bearer' : 'basic',
+    shq(params.url), shq(params.branch), params.requireHydrated ? '1' : '0', params.auth === 'bearer' ? 'bearer' : params.auth === 'none' ? 'none' : 'basic',
     String(lockWaitS), String(gitTimeoutS)].join(' ');
   return `(t=$${REPO_OPEN_TOKEN_ENV}; unset ${REPO_OPEN_TOKEN_ENV}; exec ${script} 3<<<"$t")`;
 }
@@ -709,8 +742,8 @@ export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, 
     return { ok: false, error: 'repo_open_failed' };
   }
   // Belt and braces: the script never prints the token, and nothing that
-  // contains it is ever parsed.
-  if (stdout.includes(request.token)) return { ok: false, error: 'repo_open_failed' };
+  // contains it is ever parsed. (An anonymous open has none: '' is in every string.)
+  if (request.token !== '' && stdout.includes(request.token)) return { ok: false, error: 'repo_open_failed' };
   const parsed = parseRepoOpenOutput(stdout);
   if (!parsed) return { ok: false, error: 'repo_open_failed' };
   if (!parsed.ok) return parsed;

@@ -83,6 +83,20 @@ string. It returns `null` (open nothing) or
   `projectRejected` says why: `project_missing`, `repo_missing`,
   `project_invalid`, `repo_invalid`.
   Result: `project: { projectId, repoId, path? }`.
+- **A repository by its address** (founder 547ed35a, 2026-11-04):
+  `/app/code?repo=<URL-encoded https repository URL>`, with no `project`.
+  Navigation intent only: shape-checked here (https, no whitespace, query,
+  fragment, userinfo, backslash or escape, at most 508 characters) and then
+  canonicalised, authorised and resolved by the server
+  (`app/src/server/works/repo-url.ts`): today a public
+  `https://github.com/<owner>/<name>[.git]`, opened on the person's selected
+  computer into the folder the computer's checkout returns. EZiL Git hosts are
+  refused for now (`repo_url_unsupported`). A missing or private repository is
+  "This repository doesn't exist." An address that is not plain https is
+  `projectRejected: 'repo_url_invalid'`; beside a `project` it is
+  `repo_invalid`. `path` is not read with an address.
+  Result: `project: { repoUrl }`. Example:
+  `/app/code?repo=https%3A%2F%2Fgithub.com%2FEZiLHQ%2Fezil-os.git`.
 - **`path`.** A relative POSIX path, at most 255 UTF-8 bytes, segments
   matching `/^[A-Za-z0-9._-]+$/`, no `.` or `..` segment, no leading `/`, no
   backslash, no NUL/control character, no empty segment, and no
@@ -90,8 +104,8 @@ string. It returns `null` (open nothing) or
   An invalid path is dropped (the project is not) with `pathRejected`:
   `empty`, `encoded_separator`, `too_long`, `absolute`, `backslash`,
   `control`, `dot_segment`, `segment`.
-- **Never read from the URL:** a repo URL, a ref, a folder, a user or account
-  id, a token. Unknown keys are ignored by the parser and preserved in the
+- **Never read from the URL:** a ref, a folder, a user or account id, a
+  token. (A repository address is read only as above.) Unknown keys are ignored by the parser and preserved in the
   address bar.
 - **Writing `path`.** `/` is left unencoded in query values everywhere this
   codebase writes one (`appUrl` in `app-history.js`, `returnUrlFor` in

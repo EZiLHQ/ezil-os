@@ -424,6 +424,8 @@ const RETRY_DELAY_MS = 1_500;
 const TERMINAL_ERROR_CODES = [
     'code_preview_unavailable', 'app_preview_unavailable',
     'project_not_authorized', 'identity_refresh_required', 'repo_open_unsupported_provider',
+    // A repository address that names nothing openable: retrying cannot change the answer (founder 547ed35a).
+    'repo_not_found', 'repo_url_invalid', 'repo_url_unsupported', 'repo_url_moved', 'repo_url_empty',
 ];
 
 /**

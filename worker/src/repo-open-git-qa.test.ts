@@ -283,7 +283,8 @@ describe('repoOpenRemotesFor: the personal route opts in on os-staging only (its
   it('os-staging: exactly the staging Gateway origin, with or without a bare /', () => {
     expect(OS_STAGING_AI_GATEWAY_ORIGIN).toBe('https://ai-staging.ezil.work');
     for (const v of ['https://ai-staging.ezil.work', 'https://ai-staging.ezil.work/']) {
-      expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true });
+      // Founder 547ed35a: os-staging also opts in to the anonymous public github.com remote (repo-open-public-github.test.ts).
+      expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true, publicGitHub: true });
       expect(repoOpenAuthFor(GIT_QA_P, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBe('basic');
     }
   });
@@ -325,7 +326,7 @@ describe('docs/contracts/os-builder-project-open-v1.vectors.json osWorker: the c
       'deleted or missing folder', 'duplicate / retry', 'unicode', 'nested repository', 'git 2.34.1', 'ordinary non-assignment Builder project']);
   });
   it('routeGate: accept opts in, refuse does not', () => {
-    for (const v of C.osWorker.routeGate.accept) expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true });
+    for (const v of C.osWorker.routeGate.accept) expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true, publicGitHub: true });
     for (const v of C.osWorker.routeGate.refuse) expect({ v, got: repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v ?? undefined }) }).toEqual({ v, got: {} });
   });
   it('remotes: staging accepts as Basic only with the gate; the refused list is refused with and without it', () => {

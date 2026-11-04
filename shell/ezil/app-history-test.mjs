@@ -29,6 +29,14 @@ same(appUrl('settings', [['tab', 'billing'], ['computer', C]]), `/app/settings?t
 same(appUrl('settings', { tab: undefined, x: '', y: null }), '/app/settings', 'empty values are left out');
 same(linkParams({ id: 'settings', initialTab: 'usage' }), { tab: 'usage' });
 same(linkParams({ id: 'code', project: { projectId: P, repoId: R } }), { project: P, repo: R });
+// Founder 547ed35a: a repository address is written back as `repo` alone, so history, reload and relaunch keep it.
+{
+    const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+    same(linkParams({ id: 'code', project: { repoUrl: GH } }), { repo: GH });
+    const url = appUrl('code', linkParams({ id: 'code', project: { repoUrl: GH } }));
+    same(url, '/app/code?repo=https%3A//github.com/EZiLHQ/ezil-os.git');
+    same(new URLSearchParams(url.split('?')[1]).get('repo'), GH);
+}
 same(linkParams({ id: 'desktop' }), {});
 same(linkParams(null), {});
 // History-state merge: unknown keys (Next's, a later lane's) survive.
