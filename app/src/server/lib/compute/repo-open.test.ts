@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isRepositoryFolder, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, requestRepoOpen, withRepositoryFolder } from './repo-open';
+import { isRepositoryFolder, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, requestRepoOpen, withRepositoryFolder, type RepoOpenRequest } from './repo-open';
 import type { ControlTarget } from './aws-control-auth';
 
 const REPO = '44444444-4444-4444-8444-44444444abcd';
@@ -13,7 +13,7 @@ const request = { repositoryId: REPO, canonicalURL: 'https://github.ezil.work/ac
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => { warn = vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 afterEach(() => { vi.restoreAllMocks(); });
-const run = (respond: () => Response | Promise<Response>, target = cloudflare, secret = 'secret', over: Partial<typeof request> = {}, signal?: AbortSignal) => {
+const run = (respond: () => Response | Promise<Response>, target = cloudflare, secret = 'secret', over: Partial<RepoOpenRequest> = {}, signal?: AbortSignal) => {
     const fetcher = vi.fn<(url: URL, init: RequestInit) => Promise<Response>>(async () => respond());
     return { fetcher, result: requestRepoOpen('https://worker.example', secret, target, computer, { ...request, ...over },
         { fetch: fetcher as unknown as typeof fetch, ...(signal ? { signal } : {}) }) };
