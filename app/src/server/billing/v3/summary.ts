@@ -488,8 +488,9 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             // A trial is not upgraded: its $0 proration would turn a free Standard month into a free Premium one.
             upgrade: enabled && !operator && !trial && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
-            // While a trial's first $20 is being collected, a cancel would not stop that charge: no cancel action then.
-            cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade && trial?.state !== 'payment_pending',
+            // payment_pending keeps the supported cancel (cancelAtPeriodEnd): it stops renewals; the first charge already
+            // being collected is not voided, and clients say so (paused access, no "stays active").
+            cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && !operator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
