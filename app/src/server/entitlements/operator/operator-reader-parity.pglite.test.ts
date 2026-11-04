@@ -13,6 +13,7 @@ import { billingV2EntitlementReader, gateComputerStart, loadComputeBillingState,
 import { paidCloudflareCandidates } from '@/server/lib/compute/placement';
 import { readPaidPoolEligibility } from '@/server/lib/compute/ready-pool';
 import { sourceCatalog, type Result } from './contract';
+import type { CommandStore } from './service';
 import { handleAdminEntitlementRequest, type Endpoint } from './http';
 import { HEADERS, SENDER_KEYS_ENV, signingInput } from './signature';
 import { createOperatorEntitlementDeps, readOperatorEntitlements, resetOperatorEntitlementsInstalled, type Executor, type TransactionalExecutor } from './store';
@@ -118,6 +119,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
             CREATE TABLE public.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text);
             CREATE TABLE public.ezil_compute_migrations (computer_id uuid, user_id uuid, state text, last_error text, updated_at timestamptz);`);
         await pg.exec(readFileSync(path.resolve(__dirname, '../../../../drizzle/0019_operator_entitlements.sql'), 'utf8'));
+        await pg.exec(readFileSync(path.resolve(__dirname, '../../../../drizzle/0020_operator_refusal_receipts.sql'), 'utf8'));
     });
     beforeEach(async () => {
         now = new Date(NOW); resetOperatorEntitlementsInstalled();
@@ -168,7 +170,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         expect(await send(command())).toMatchObject({ refusal: { code: 'paid_subscription_conflict' }, effective_access: { state: 'none' } });
         expect(await pool()).toBeNull(); expect(await migration()).toEqual([]);
         expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toHaveLength(1);
-        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(1);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(2);
     });
 
     it('RF1: a current Stripe source wins over a later delinquent row, without borrowing its funding', async () => {
@@ -219,7 +221,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         now = new Date('2026-11-04T13:34:00.000Z');
         expect((await state()).planSku).toBe('standard_monthly_v3'); expect(await pool()).toEqual({ instanceType: 'm6i.large' });
         expect(await rows(sql`SELECT ended_at FROM public.ezil_operator_entitlements`)).toEqual([{ ended_at: null }]);
-        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(1);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(2);
     });
 
     it('RF7: a legacy future-start row is never closed as lapsed; a genuinely expired grant closes at its own end', async () => {
@@ -240,4 +242,98 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         expect(await assignmentRead()).toMatchObject({ effective_access: { state: 'none' }, assignments: [{ state: 'ended' }] });
         expect((await state()).planSku).toBe('free_v3'); expect(await pool()).toBeNull(); expect(await migration()).toEqual([]);
     });
+
+    it('receipt boundary: structure and initially unresolved identity do not reserve a command ID', async () => {
+        const body = command();
+        expect((await send({ ...body, quantity: 1 })).refusal?.code).toBe('invalid_command');
+        await db.execute(sql`TRUNCATE ezil_works.ai_members`);
+        expect((await send(body)).refusal?.code).toBe('identity_not_found');
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toEqual([]);
+        await db.execute(sql`INSERT INTO ezil_works.ai_members VALUES (${USER}::uuid, ${ACCOUNT}::uuid)`);
+        expect(await send(body)).toMatchObject({ outcome: 'applied' });
+    });
+
+    it('refusal receipt: paid conflict stays refused after Stripe clears', async () => {
+        await stripe('active', 'standard_monthly_v3');
+        const body = command();
+        const first = await send(body);
+        expect(first.refusal?.code).toBe('paid_subscription_conflict');
+        await db.execute(sql`UPDATE public.ezil_billing_subscriptions SET status = 'canceled'`);
+        expect(await send(body)).toEqual(first);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual([]);
+        const events = await rows(sql`SELECT assignment_ref, revision, result FROM public.ezil_operator_entitlement_events`);
+        expect(events).toEqual([{ assignment_ref: null, revision: null, result: first }]);
+    });
+
+    it.each([
+        ['SKU', { product: { ref: 'premium_monthly_v3', catalog_revision: REVISION } }],
+        ['validity', { validity: { ends_at: '2026-12-01T00:00:00.000Z' } }],
+        ['target', { target: { kind: 'individual', os_user_id: '00000000-0000-4000-8000-000000000099',
+            account_public_id: '10000000-0000-4000-8000-000000000099' } }],
+    ])('refusal receipt: changed %s conflicts under a refused command ID', async (_name, patch) => {
+        await stripe('active', 'standard_monthly_v3');
+        const body = command();
+        expect((await send(body)).refusal?.code).toBe('paid_subscription_conflict');
+        await db.execute(sql`UPDATE public.ezil_billing_subscriptions SET status = 'canceled'`);
+        expect(await send({ ...body, ...patch })).toMatchObject({ refusal: { code: 'payload_mismatch' } });
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual([]);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(1);
+    });
+
+    it('refusal receipt: a stale revision cannot apply once that revision later exists', async () => {
+        const assigned = await assign();
+        const stale = command({ action: 'change', product: null, validity: { ends_at: '2026-12-04T00:00:00.000Z' },
+            assignment: { ref: assigned.assignment!.ref, expected_revision: 2 } });
+        const first = await send(stale);
+        expect(first.refusal?.code).toBe('stale_revision');
+        expect(await send(command({ action: 'change', product: null, validity: { ends_at: '2026-11-11T00:00:00.000Z' },
+            assignment: { ref: assigned.assignment!.ref, expected_revision: 1 } }))).toMatchObject({ assignment: { revision: 2 } });
+        const before = await rows(sql`SELECT * FROM public.ezil_operator_entitlements`);
+        expect(await send(stale)).toEqual(first);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual(before);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(3);
+    });
+
+    it('refusal receipt: a well-formed unknown product reserves the ID without fabricating access', async () => {
+        const body = command({ product: { ref: 'not_in_os_catalog', catalog_revision: REVISION } });
+        const first = await send(body);
+        expect(first.refusal?.code).toBe('product_not_assignable');
+        expect(await send(body)).toEqual(first);
+        expect(await send({ ...body, product: { ref: 'standard_monthly_v3', catalog_revision: REVISION } }))
+            .toMatchObject({ refusal: { code: 'payload_mismatch' } });
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual([]);
+    });
+
+    it('refusal receipt: a late refusal rolls back access changes before recording its audit', async () => {
+        const assigned = await assign();
+        const before = await rows(sql`SELECT * FROM public.ezil_operator_entitlements`);
+        const original = source.withCommand.bind(source);
+        // Force a late compare-and-set refusal after a real SQL update, to verify the transaction boundary.
+        source.withCommand = async <T>(id: string, user: string, run: (store: CommandStore) => Promise<T>): Promise<T> =>
+            original(id, user, store => run({ ...store, async updateAssignment(...args) {
+                await store.updateAssignment(...args);
+                return false;
+            } }));
+        let result: Result;
+        try {
+            result = await send(command({ action: 'change', product: null, validity: { ends_at: '2026-11-11T00:00:00.000Z' },
+                assignment: { ref: assigned.assignment!.ref, expected_revision: 1 } }));
+        } finally { source.withCommand = original; }
+        expect(result.refusal?.code).toBe('stale_revision');
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual(before);
+        expect(await rows(sql`SELECT assignment_ref, revision FROM public.ezil_operator_entitlement_events
+            WHERE result ->> 'outcome' = 'refused'`)).toEqual([{ assignment_ref: null, revision: null }]);
+    });
+
+    it('refusal receipt: audit remains append-only with no assignment or revision', async () => {
+        const body = command({ product: { ref: 'not_in_os_catalog', catalog_revision: REVISION } });
+        const first = await send(body);
+        const events = await rows(sql`SELECT assignment_ref, revision, operator_actor, sender_kid, result
+            FROM public.ezil_operator_entitlement_events`);
+        expect(events).toEqual([{ assignment_ref: null, revision: null, operator_actor: 'synthetic_operator', sender_kid: 'synthetic-ae', result: first }]);
+        await expect(db.execute(sql`UPDATE public.ezil_operator_entitlement_events SET reason = 'changed'`)).rejects.toThrow(/append-only/);
+        await expect(db.execute(sql`DELETE FROM public.ezil_operator_entitlement_events`)).rejects.toThrow(/append-only/);
+        expect(await send(body)).toEqual(first);
+    });
+
 });

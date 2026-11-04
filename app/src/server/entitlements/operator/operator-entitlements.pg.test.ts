@@ -77,6 +77,7 @@ describe.skipIf(!PG)('product entitlements v1 on PostgreSQL: source command → 
             CREATE TABLE ${schema}.ezil_compute_migrations (computer_id uuid, user_id uuid, state text, last_error text, updated_at timestamptz);`);
         // The migration under test, exactly as released (schema-scoped like the other PostgreSQL suites).
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0019_operator_entitlements.sql'), 'utf8')));
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0020_operator_refusal_receipts.sql'), 'utf8')));
     });
     beforeEach(async () => {
         subs = [];
@@ -144,7 +145,8 @@ describe.skipIf(!PG)('product entitlements v1 on PostgreSQL: source command → 
         expect([x.outcome, y.outcome].sort()).toEqual(['applied', 'refused']);
         expect([x, y].find(r => r.outcome === 'refused')).toMatchObject({ refusal: { code: 'invalid_command' } });
         expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlements WHERE ended_at IS NULL`)).toEqual([{ n: 2 }]);
-        expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlement_events`)).toEqual([{ n: 2 }]);
+        expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlement_events WHERE result ->> 'outcome' = 'applied'`)).toEqual([{ n: 2 }]);
+        expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlement_events WHERE result ->> 'outcome' = 'refused'`)).toEqual([{ n: 1 }]);
     });
 
     it('identity: unlinked, deleted, another user\'s account and a doubly linked account are refused; nothing written', async () => {

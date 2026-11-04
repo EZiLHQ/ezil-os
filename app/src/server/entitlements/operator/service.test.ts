@@ -17,8 +17,19 @@ const id = (n = ++ids) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')
 function harness(options: { identity?: IdentityCheck; stripe?: StripeView } = {}) {
     const rows: OperatorEntitlementRow[] = [];
     const events = new Map<string, { payloadSha256: string; result: unknown; senderKid: string; reason: string; operatorActor: string }>();
-    const state = { now: T0, identity: options.identity ?? 'ok' as IdentityCheck, stripe: options.stripe ?? NO_STRIPE, writes: 0 };
+    const state = { now: T0, identity: options.identity ?? 'ok' as IdentityCheck, stripe: options.stripe ?? NO_STRIPE, accessWrites: 0 };
     const store: CommandStore = {
+        async withAccessTransaction(run) {
+            const savedRows = structuredClone(rows), savedEvents = structuredClone([...events]), savedWrites = state.accessWrites;
+            const result = await run();
+            if (result.outcome === 'refused') {
+                rows.splice(0, rows.length, ...savedRows);
+                events.clear();
+                for (const [key, value] of savedEvents) events.set(key, value);
+                state.accessWrites = savedWrites;
+            }
+            return result;
+        },
         async findEvent(commandId) {
             const e = events.get(commandId);
             return e ? { payloadSha256: e.payloadSha256, result: structuredClone(e.result) as never } : null;
@@ -26,20 +37,19 @@ function harness(options: { identity?: IdentityCheck; stripe?: StripeView } = {}
         async assignments(userId) { return rows.filter(r => r.userId === userId).map(r => ({ ...r })).sort((a, b) => b.startsAt.getTime() - a.startsAt.getTime()); },
         async insertAssignment(row) {
             if (rows.some(r => r.userId === row.userId && r.endedAt === null)) throw new Error('one live assignment');
-            rows.push({ ...row }); state.writes++;
+            rows.push({ ...row }); state.accessWrites++;
         },
         async updateAssignment(ref, expected, next) {
             const row = rows.find(r => r.ref === ref && r.revision === expected && r.endedAt === null);
             if (!row) return false;
-            Object.assign(row, next); state.writes++;
+            Object.assign(row, next); state.accessWrites++;
             return true;
         },
-        async closeLapsed(ref, now) { const row = rows.find(r => r.ref === ref && r.endedAt === null); if (row && row.endsAt && row.endsAt <= now) { row.endedAt = row.endsAt; state.writes++; } },
+        async closeLapsed(ref, now) { const row = rows.find(r => r.ref === ref && r.endedAt === null); if (row && row.endsAt && row.endsAt <= now) { row.endedAt = row.endsAt; state.accessWrites++; } },
         async insertEvent(event) {
             if (events.has(event.commandId)) throw new Error('duplicate command_id');
             events.set(event.commandId, { payloadSha256: event.payloadSha256, result: structuredClone(event.result), senderKid: event.senderKid,
                 reason: event.reason, operatorActor: event.operatorActor });
-            state.writes++;
         },
     };
     const deps: OperatorEntitlementDeps = {
@@ -119,16 +129,16 @@ describe('ezil-os commands: assign, change, end', () => {
         expect(h.rows[0]!.endedAt).toEqual(later(DAY));
     });
 
-    it('a stale revision, an unknown or foreign assignment, and an ended one are refused with nothing written', async () => {
+    it('a stale revision, an unknown or foreign assignment, and an ended one are refused without access writes', async () => {
         const h = harness();
         const a = await run(h, command());
-        const writes = h.state.writes;
+        const writes = h.state.accessWrites;
         const end = (over: Record<string, unknown>) => run(h, command({ action: 'end', product: null, validity: null, ...over }));
         expect(await end({ assignment: { ref: a.assignment!.ref, expected_revision: 2 } })).toMatchObject({ refusal: { code: 'stale_revision' } });
         expect(await end({ assignment: { ref: 'osg-00000000-0000-4000-8000-00000000dead', expected_revision: 1 } })).toMatchObject({ refusal: { code: 'assignment_not_found' } });
         expect(await end({ assignment: { ref: a.assignment!.ref, expected_revision: 1 },
             target: { kind: 'individual', os_user_id: USER, account_public_id: '10000000-0000-4000-8000-0000000000b2' } })).toMatchObject({ refusal: { code: 'assignment_not_found' } });
-        expect(h.state.writes).toBe(writes);
+        expect(h.state.accessWrites).toBe(writes);
         await end({ assignment: { ref: a.assignment!.ref, expected_revision: 1 } });
         expect(await end({ assignment: { ref: a.assignment!.ref, expected_revision: 2 } })).toMatchObject({ refusal: { code: 'invalid_command' } });
     });
@@ -152,10 +162,10 @@ describe('ezil-os commands: assign, change, end', () => {
         ['a back-dated start', { starts_at: later(-301_000).toISOString() }, 'invalid_command'],
         ['an end in the past', { validity: { ends_at: later(-1000).toISOString() } }, 'invalid_command'],
         ['a malformed command', { quantity: 2 }, 'invalid_command'],
-    ])('assign refuses %s with nothing written', async (_name, over, code) => {
+    ])('assign refuses %s without access writes', async (_name, over, code) => {
         const h = harness();
         expect(await run(h, command(over))).toMatchObject({ outcome: 'refused', refusal: { code }, assignment: null, audit_receipt: null });
-        expect(h.state.writes).toBe(0);
+        expect(h.state.accessWrites).toBe(0);
     });
 
     it('a start within ±300 s is normalized to server now', async () => {
@@ -167,18 +177,18 @@ describe('ezil-os commands: assign, change, end', () => {
         const h = harness({ identity, stripe: { paidAccess: true, computeActive: true, productRef: 'premium_monthly_v3', state: 'active', checkoutOpen: false } });
         const result = await run(h, command());
         expect(result).toMatchObject({ outcome: 'refused', refusal: { code: identity }, effective_access: { state: 'none' } });
-        expect(h.state.writes).toBe(0);
+        expect(h.state.accessWrites).toBe(0);
         expect(await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT })).toBeNull();
     });
 });
 
 describe('ezil-os commands never replace Stripe', () => {
     const paid: StripeView = { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
-    it('paid access refuses an assign with paid_subscription_conflict and reports via stripe; nothing written', async () => {
+    it('paid access refuses an assign with paid_subscription_conflict and reports via stripe; no access writes', async () => {
         const h = harness({ stripe: paid });
         expect(await run(h, command())).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' },
             effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' } });
-        expect(h.state.writes).toBe(0);
+        expect(h.state.accessWrites).toBe(0);
     });
     it('an incomplete Stripe checkout refuses too', async () => {
         const h = harness({ stripe: { ...NO_STRIPE, state: 'incomplete', checkoutOpen: true } });

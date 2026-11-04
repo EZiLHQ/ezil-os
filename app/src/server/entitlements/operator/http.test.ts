@@ -29,7 +29,7 @@ function deps(over: Partial<OperatorEntitlementDeps> = {}): () => Promise<Operat
         now: () => new Date(NOW * 1000), newId: () => '00000000-0000-4000-8000-000000000001',
         identity: async () => 'ok', stripe: async () => ({ paidAccess: false, computeActive: false, productRef: null, state: null, checkoutOpen: false }),
         readAssignments: async () => [], withCommand: async (_c, _u, run) => run({
-            findEvent: async () => null, assignments: async () => [], insertAssignment: async () => {}, updateAssignment: async () => true,
+            findEvent: async () => null, withAccessTransaction: run => run(), assignments: async () => [], insertAssignment: async () => {}, updateAssignment: async () => true,
             closeLapsed: async () => {}, insertEvent: async () => {} }),
         ...over,
     };

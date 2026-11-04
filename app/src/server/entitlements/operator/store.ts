@@ -104,6 +104,19 @@ export async function stripeView(billing: Pick<BillingDeps, 'store' | 'config'>,
 
 function commandStore(tx: Executor): CommandStore {
     return {
+        async withAccessTransaction(run) {
+            await tx.execute(sql`SAVEPOINT ezil_operator_access`);
+            try {
+                const result = await run();
+                if (result.outcome === 'refused') await tx.execute(sql`ROLLBACK TO SAVEPOINT ezil_operator_access`);
+                await tx.execute(sql`RELEASE SAVEPOINT ezil_operator_access`);
+                return result;
+            } catch (error) {
+                await tx.execute(sql`ROLLBACK TO SAVEPOINT ezil_operator_access`);
+                await tx.execute(sql`RELEASE SAVEPOINT ezil_operator_access`);
+                throw error;
+            }
+        },
         async findEvent(commandId) {
             const rows = rowsOf(await tx.execute(sql`SELECT payload_sha256, result FROM public.ezil_operator_entitlement_events WHERE command_id = ${commandId}::uuid`));
             const row = rows[0];

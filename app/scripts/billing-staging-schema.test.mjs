@@ -432,10 +432,10 @@ test('reverse moves production apply and baseline refuse before connecting', () 
 });
 
 // Product entitlements v1 (producer ezil-os): two new tables, additive; staging-only like 0011/0012.
-test('operator entitlements follow 0012, are last, additive, server-only and a production snapshot only', () => {
+test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
     const file = 'app/drizzle/0019_operator_entitlements.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.at(-2), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     // New tables only: no existing (Stripe, billing or compute) table is altered or written.
     assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
@@ -457,6 +457,31 @@ test('operator entitlements follow 0012, are last, additive, server-only and a p
 
 test('operator entitlements production apply and baseline refuse before connecting', () => {
     for (const mode of [['baseline', '0019_operator_entitlements.sql', '--yes'], ['baseline', './app/drizzle/0019_operator_entitlements.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+
+test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
+    const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
+    assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
+    assert.match(sql, /ADD CONSTRAINT ezil_operator_entitlement_events_result_links/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP TABLE|INSERT INTO|UPDATE public|DELETE FROM|TRUNCATE/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('operator refusal receipts production apply and baseline refuse before connecting', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0020_operator_refusal_receipts.sql', '--yes'],
+        ['baseline', './app/drizzle/0020_operator_refusal_receipts.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
