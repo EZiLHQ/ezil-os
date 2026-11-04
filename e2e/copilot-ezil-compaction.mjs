@@ -3,8 +3,8 @@
  * chat ended in "Conversation too large or invalid — start a new chat" with a raw stack). Kimi K3, about 24 KB per answer
  * (mock EZIL_E2E_LONG), with Copilot's own summariser off so only ezil-models' compaction can keep the chat going:
  * - every turn is answered in the same chat, with no refusal, stack or "start a new chat";
- * - every request the gateway saw is within the byte bound; the late ones carry the marked compaction note, the first
- *   turn's requirement and the current question;
+ * - every chat request is within the byte bound; the ones over it as Copilot built them were compacted (the
+ *   extension's metadata line), mark what they left out, and keep every user prompt Copilot sent;
  * - the chat view's title bar shows "Conversation compacted to fit the model";
  * - the saved conversation in <workspace>/.ezil/chat still holds the first answer whole.
  * Exit 2 means not run.
@@ -109,26 +109,37 @@ try {
   await page.screenshot({ path: join(OUT, 'compaction-final.png') });
   check('the chat view title bar showed "Conversation compacted to fit the model"', compactedSeen);
 
-  const posts = captured();
+  // Chat turns only (Agent mode, so they carry tools): Copilot's title and progress utility calls quote the prompt but go
+  // to Qwen without tools by design (provider.ts isUtilityRequest).
+  const turnOf = r => { const users = (r.body?.messages ?? []).filter(m => m.role === 'user'); const text = JSON.stringify(users.at(-1) ?? ''); return Number(/EZIL_E2E_LONG turn (\d+)/.exec(text)?.[1] ?? 0); };
+  const posts = captured().filter(r => turnOf(r) > 0 && (r.body?.tools ?? []).length > 0);
   const sizes = posts.map(r => r.bytes);
-  info('request bytes per call', JSON.stringify(sizes));
-  check('every request reached the gateway as Kimi JSON', posts.length >= TURNS && posts.every(r => r.body?.model === KIMI && r.body?.stream === false), `${posts.length} posts`);
+  info('chat request bytes per turn', JSON.stringify(posts.map(r => [turnOf(r), r.bytes])));
+  check('every chat turn reached the gateway as Kimi JSON', posts.length >= TURNS && posts.every(r => r.body?.model === KIMI && r.body?.stream === false), `${posts.length} chat posts`);
   check('every request is within the byte bound', sizes.every(bytes => bytes <= BOUND), `max ${Math.max(...sizes)} of ${BOUND}`);
-  const last = JSON.stringify(posts.at(-1)?.body ?? {});
-  check('the last request carries the marked compaction note', last.includes('[EZiL compacted') && last.includes('The full conversation is still saved in this chat'));
-  check("the last request keeps turn 1's requirement and the current question", last.includes(CODEWORD) && last.includes(`EZIL_E2E_LONG turn ${TURNS}`));
-  check('the last request no longer repeats every earlier answer in full', !last.includes('EZIL_LONG_BODY_1'));
+  const last = posts.filter(r => turnOf(r) === TURNS).at(-1);
+  check('the last turn was sent with its question', Boolean(last) && JSON.stringify(last.body).includes(`EZIL_E2E_LONG turn ${TURNS}`));
+
+  // The extension's own metadata lines (sizes only): which turns were compacted, from how many bytes to how many.
+  const logs = sh('cat /tmp/code-server-data/logs/*/exthost*/output_logging_*/*EZiL*Models*.log 2>/dev/null || true');
+  const compactions = logs.split('\n').filter(line => line.startsWith('{') && line.includes('"compacted"')).map(line => JSON.parse(line));
+  info('compactions logged (from, to bytes)', JSON.stringify(compactions.map(line => [line.compacted.from_bytes, line.compacted.to_bytes, line.compacted.folded, line.compacted.shortened])));
+  check('the chat outgrew the bound and was compacted, not refused', compactions.length > 0 && compactions.every(line => line.model === KIMI && line.http_status === 200 && line.compacted.from_bytes > BOUND && line.compacted.to_bytes <= BOUND));
+  // Compacted bodies are the ones over the bound as Copilot built them; every shortening there is marked.
+  const marked = posts.filter(r => compactions.some(line => line.compacted.to_bytes === r.bytes));
+  check('every compacted request marks what it left out', marked.length > 0 && marked.every(r => /characters left out by EZiL|\[EZiL compacted/.test(JSON.stringify(r.body))), `${marked.length} compacted requests`);
+  check('compacted requests keep every user prompt Copilot sent, whole', marked.every(r => {
+    const users = JSON.stringify((r.body.messages ?? []).filter(m => m.role === 'user'));
+    return [...users.matchAll(/EZIL_E2E_LONG turn (\d+)/g)].every(([, turn]) => users.includes(turn === '1' ? CODEWORD : `EZIL_E2E_LONG turn ${turn}: continue the same task`));
+  }));
+  // Copilot itself drops older turns once its own budget is full (its summariser is off here): what it never sends,
+  // the extension cannot keep. Recorded, not asserted.
+  info('turns Copilot still sent per request', JSON.stringify(posts.map(r => [turnOf(r), [...JSON.stringify(r.body.messages).matchAll(/EZIL_E2E_LONG turn (\d+)/g)].map(m => Number(m[1]))])));
 
   // The saved conversation is not compacted: Copilot writes it to <workspace>/.ezil/chat.
   const saved = () => sh(`grep -l -F EZIL_LONG_BODY_1 ${quote(join(FOLDER, '.ezil', 'chat'))}/*.json* 2>/dev/null || true`).split('\n').filter(Boolean);
   check('the saved conversation still holds the first answer whole', await until(async () => saved().length > 0, 'saved session with turn 1', 90_000), JSON.stringify(saved()));
-
-  // The extension's own metadata lines: sizes only, never content.
-  const logs = sh("find /tmp /home/neko -path '*exthost*' -name '*EZiL Models*.log' 2>/dev/null | xargs -r cat 2>/dev/null || true");
-  const compactions = logs.split('\n').filter(line => line.includes('"compacted"'));
-  info('metadata lines with a compaction', String(compactions.length));
-  if (logs.trim()) check('no metadata line carries conversation text', !logs.includes(CODEWORD) && !logs.includes('quick brown fox'));
-  else info('EZiL Models output log', 'not found in the container; metadata check skipped');
+  check('no metadata line carries conversation text', logs.trim() !== '' && !logs.includes(CODEWORD) && !logs.includes('quick brown fox'));
 } catch (e) {
   check('suite completed without an unexpected exception', false, String(e).slice(0, 300));
 } finally {
