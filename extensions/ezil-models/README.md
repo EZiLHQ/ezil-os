@@ -156,17 +156,60 @@ Prompts, bodies and tokens are never logged for the gateway, even when legacy
 request logging is enabled. Cancellation aborts fetch, stops reporting parts,
 and logs `cancelled; may still be charged (request …)`.
 
-The model picker optionally reconciles disabled entries using `/models`, cached
-for five minutes per base URL and auth context. It lists only the models
-configured here, never other catalog rows. A protocol it does not speak drops
-out of that row, never out of the whole catalog, and a row left with none is
-not selectable. Newer catalog fields (`contract`, `catalog_ttl_seconds`,
-`availability`) are accepted and not yet read. A `null` limit in `/me/limits`
-is a configured "No limit set", never unknown. Only the session window's
-`resets_at` is shown as a reset time. The EZiL AI status item,
-`Show AI Status` and `EZiL Models: Show AI Credits` read `/me/balance`,
-`/me/limits`, `/me/usage?limit=5` and the global `/models` pause catalog using
-the same boot bearer. All four reads bypass HTTP caches, refuse redirects and
+The model picker reads `/models`, cached for five minutes per base URL and
+auth context.
+
+- **Which models it lists.**
+  - The models configured here, hiding any the catalog disables or marks
+    `unavailable`.
+  - Each other catalog row that the Gateway marks `availability.state:
+    "available"` for this caller over a protocol this client speaks
+    (`ezil.gateway.models.v1`; Messages before Responses).
+  - **One account per entry.** A catalog-only model's picker id is
+    `<provider name>/<alias>`, such as `ezil/some-alias`. Neither part can
+    contain `/`, so the id names exactly one configured Gateway provider (one
+    account) and never equals a configured model's id. Only the alias is sent
+    upstream.
+  - **Requests stay on that provider.** A request reads only that provider's
+    catalog and uses only its credential. An id that does not name exactly one
+    configured Gateway provider is refused before anything is sent. Title,
+    summary and progress requests go to Qwen on the same provider, or else to
+    the selected model.
+  - A model configured on the same provider with the same alias wins; another
+    provider's configuration never hides this account's row. A catalog without
+    `availability`, as served today, adds nothing.
+- **What it assumes.** Nothing a row does not state. A catalog-only row has no
+  tool calling or streaming unless `capabilities.tool_calling` or
+  `capabilities.streaming` says so, and never takes image input. It keeps its
+  own caps and is named by `name`, else its alias. The catalog can only take a
+  configured capability away.
+  - `streaming: false` sends JSON from the first request, never a stream
+    followed by a JSON resend.
+  - Tools offered to a model without tool calling are left out, as Copilot
+    0.69 does for its own endpoints without tool calls. Earlier tool calls go
+    as text.
+  - Kimi K3 is always JSON.
+- **Unknown is not unavailable.**
+  - When a read fails, the configured models stay listed.
+  - The catalog-only rows last read for the same base URL and token stay
+    listed for up to 30 minutes, and the request decides.
+  - A catalog-only model that cannot be checked is not sent.
+  - Another model is never sent in place of the selected one.
+- **When it lists again.**
+  - After an availability refusal (`killswitch`, `model_disabled`,
+    `model_not_found`, `no_provider_route`), which also clears the cache.
+  - After a request whose catalog read changed the list.
+  - When Show AI Status opens.
+- **Protocols.** A protocol it does not speak drops out of that row, never out
+  of the whole catalog, and a row left with none is not selectable.
+
+A `null` limit in `/me/limits` is a configured "No limit set", never unknown.
+Only the session window's `resets_at` is shown as a reset time. The EZiL AI
+status item, `Show AI Status` and `EZiL Models: Show AI Credits` read
+`/me/balance`, `/me/limits`, `/me/usage?limit=5` and `/models` using the same
+boot bearer. From `/models` they read the global pause and, where a row states
+it, that row's availability, in the contract's reason copy. `unknown` is
+"Availability unknown — retry", never unavailable. All four reads bypass HTTP caches, refuse redirects and
 share refresh cancellation, with a five-second deadline per read. They show
 window credits and reset time,
 effective account limits capped by platform ceilings, per-model limits,

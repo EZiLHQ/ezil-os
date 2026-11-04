@@ -1,10 +1,10 @@
 // The VS Code consumer of the Gateway catalog and user limits, against a FULL catalog shaped like the Gateway's
 // proposed consumer contract (`ezil.gateway.models.v1`, EZiL AI Gateway feat/gw-budgetcatalog-20261103,
 // docs/CATALOG-CONSUMER-CONTRACT.md; PROPOSED, not ACKed). Zero inference: every response is a fixture.
-// What this client does with it today: it lists only the models configured in models.json and reconciles them
-// with the catalog (enabled, protocols, caps). New contract fields (contract, catalog_ttl_seconds, availability)
-// are tolerated and not yet read. A protocol it does not speak never discards the catalog. `null` limits are
-// "No limit set", never "unknown"; only the session window's resets_at is ever shown as a reset time.
+// What this client does with it: it lists the models configured in models.json, reconciled with the catalog
+// (enabled, availability, protocols, caps), plus each row marked available for this caller (catalog-listing.test.ts).
+// A protocol it does not speak never discards the catalog. `null` limits are "No limit set", never "unknown"; only
+// the session window's resets_at is ever shown as a reset time.
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { parseModelsConfig, type ResolvedProvider } from '../src/config';
