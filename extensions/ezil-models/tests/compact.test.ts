@@ -237,11 +237,16 @@ describe('compactRequest', () => {
         for (let i = 0; i < 8; i++) expect(new TextDecoder().decode(built.bytes)).toContain(`Please do task ${i}`);
     });
     test('a cut never separates a call from a result that shares its message with new text', () => {
-        const request = { ...ask([msg('system', txt(SYSTEM)), ...Array.from({ length: 30 }, (_, i) => [
-            msg('assistant', call(`c${i}`)), msg('user', result(`c${i}`, [txt('x'.repeat(6000))]), txt(`and now step ${i}`)),
-        ]).flat()]), tools: [tool] };
-        const { built } = compactRequest(request, first(request), build(gw()));
-        expectPairedMessages(built.body);
+        // Enough rounds that folding is needed even with outputs shortened; several sizes, so some fold an odd count.
+        for (let rounds = 120; rounds < 128; rounds++) {
+            const request = { ...ask([msg('system', txt(SYSTEM)), ...Array.from({ length: rounds }, (_, i) => [
+                msg('assistant', call(`c${i}`)), msg('user', result(`c${i}`, [txt('x'.repeat(6000))]), txt(`and now step ${i}`)),
+            ]).flat()]), tools: [tool] };
+            const { built, info } = compactRequest(request, first(request), build(gw()));
+            expect(info.folded).toBeGreaterThan(0);
+            expectPairedMessages(built.body);
+            expect(new TextDecoder().decode(built.bytes)).not.toContain('(no result recorded)');
+        }
     });
     test('the current request alone too large: refused, marked as after compaction, with the most compacted sizes', () => {
         const request = ask([...longChat(4, 100), msg('user', txt('字'.repeat(50_000)))]);
