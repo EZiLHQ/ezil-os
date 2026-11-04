@@ -39,8 +39,17 @@ export function summaryV3(tier = 'standard') {
  *                    no payment issue, standing free (or `standing`), fairUse without the paid 'unmetered' policy;
  *   'payment_failed' the first charge failed: past_due + payment_failed, NO grace (graceEndsAt null), standing
  *                    files_on_aws (or `standing`), no cancel, no checkout.
+ * After the free month (payment_pending, payment_failed) the server rates the computer as Free (summary.ts
+ * computePlanV3 with the standing): Free's session cap and machine choice; standing free is the Cloudflare computer
+ * with no disk figure, files_on_aws the held AWS computer at HOLD_SIZE (std-2) with its own disk.
  */
 const HOUR = 3600 * 1000;
+function ratedAsFree (s, standing) {
+    const free = summaryV3('free').computer;
+    s.computer = standing === 'files_on_aws'
+        ? { ...s.computer, size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: free.sessionMaxSeconds, machineChoice: free.machineChoice, standing, filesOn: 'aws' }
+        : { ...free, standing, filesOn: 'cloudflare', disk: { provisionedGiB: null, usedBytes: null, growsOnSwitch: false } };
+}
 export const TRIAL_END = '2026-12-05T14:30:00Z';
 export function trialSummaryV3(state, { endsAt = TRIAL_END, reason = 'trial_used', standing } = {}) {
     if ( state === 'offer' || state === 'ineligible' ) {
@@ -60,15 +69,14 @@ export function trialSummaryV3(state, { endsAt = TRIAL_END, reason = 'trial_used
         s.computer.standing = 'plan_ending';
     }
     if ( state === 'payment_pending' ) {
-        s.computer.standing = standing ?? 'free';
-        s.computer.filesOn = s.computer.standing === 'files_on_aws' ? 'aws' : 'cloudflare';
+        ratedAsFree(s, standing ?? 'free');
         s.fairUse = { status: 'ok', resetsAt: s.fairUse.resetsAt };
         // The server still allows cancelAtPeriodEnd here (status active); Billing does not offer it (see tabs/billing.js).
         Object.assign(s.actions, { checkout: false, downgrade: false });
     }
     if ( state === 'payment_failed' ) {
         Object.assign(s.plan, { status: 'past_due', paymentIssue: 'payment_failed', renewal: null });
-        s.computer.standing = standing ?? 'files_on_aws';
+        ratedAsFree(s, standing ?? 'files_on_aws');
         Object.assign(s.actions, { cancel: false, checkout: false, downgrade: false });
     }
     return s;

@@ -244,6 +244,9 @@ test('payment_pending: "Your free month has ended. We\'re collecting your first 
         // Never "active", never the trial's live lines, never the renewal preview as a charge or date.
         assert.doesNotMatch(clean(el), /\bActive\b|Free trial|Free until|First charge|Renews|Cancel plan|Cancel free month|grace|upgrade for sessions|didn't go through/i, standing);
         assert.equal(el.querySelector('[data-action="cancel"], [data-action="upgrade"], [data-action="trial"], [data-action="checkout"]'), null, standing);
+        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions.
+        assert.match(clean(el.querySelector('[data-role="your-computer"]')), standing === 'free'
+            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare Sessions up to 1 hour/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\) Sessions up to 1 hour on Free/, standing);
     }
     // No portal for this account: the banner still says what happens, with no button.
     const noPortal = trialSummaryV3('payment_pending'); noPortal.actions.portal = false;
