@@ -1,9 +1,12 @@
 /**
  * Phase B: POST /sandbox/:name/repo-open for an AWS computer (contract universe-repo-open-v1 §13,
- * LANES A2r; carried from cf27920b, contract 1.0.3). INERT: nothing imports this module. The lead's
- * activation commit (after the A2h security review, the AMI promotion and the canary E2E) mounts it;
- * this lane does not. Its protocol symbols come from ./repo-open-u2 (the u2 module's, 2ca90211):
- * in this tree ./repo-open is open-project's live module.
+ * LANES A2r; carried from cf27920b, contract 1.0.3). The u2 personal/assessment/project lanes are
+ * still unmounted. The one entry index.ts imports is the class-`public` relay (`relayPublicRepoOpen`,
+ * below): a grant-free anonymous public-github.com open (worker extension beyond the frozen contract).
+ * It is INERT AT RUNTIME on today's fleet — AWS AMI 1.0.30 carries no repo-open op, so the start edge
+ * answers 404 -> workspace_unsupported -> the app's `repo_open_unsupported_provider`, exactly today's
+ * behaviour; the un-refusal on the app side lives on another branch. Its protocol symbols come from
+ * ./repo-open-u2 (the u2 module's, 2ca90211): in this tree ./repo-open is open-project's live module.
  *
  * The calling route (u2's `handleRepoOpenRoute` at 2ca90211, or an assessment route) has already
  * verified its signature (own path, 5-minute skew) and the strict §8 body FOR ITS CLASS before
@@ -114,11 +117,50 @@ import {
 } from './aws-origin';
 import {
   ASSESSMENT_OPEN_RESULT_KEYS, ASSESSMENT_OPEN_RESULT_STATES, HANDLE_RE, HEAD_RE, OPEN_RESULT_KEYS, OPEN_RESULT_STATES,
-  REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, UUID_RE, WORKER_DEADLINE_MS, assessmentEditorRoot, assessmentRemoteUrl,
+  REPO_OPEN_CLASS_DEFAULT, REPO_OPEN_STATUS, UUID_RE, WORKER_DEADLINE_MS, WORKER_REQUEST_MAX_BYTES, assessmentEditorRoot, assessmentRemoteUrl,
   isRepoOpenClass, isWrappedClass, parseRepoOpenBody, refusal, validBranch, validName,
   type RepoOpenAnswer, type RepoOpenAssessmentOpenResult, type RepoOpenBody, type RepoOpenClass, type RepoOpenErrorCode,
   type RepoOpenInput, type RepoOpenOpenResult,
 } from './repo-open-u2';
+
+// ── class `public`: a grant-free anonymous public github.com open ────────────────────────────
+/**
+ * A worker-level relay class BEYOND contract universe-repo-open-v1's frozen REPO_OPEN_CLASSES
+ * (personal/assessment/project, pinned by the vectors): the OS `?repo=<public github URL>` open that
+ * Cloudflare already serves (repo-open.ts `PUBLIC_GITHUB_REPOSITORY_URL`, auth 'none'), relayed to an
+ * AWS computer with NO grant. The host clones `https://github.com/<handle>/<name>.git` ANONYMOUSLY
+ * into the wrapper W = /workspace/projects/<repositoryId> (the flat layout of class project), op
+ * `open` only. `public` is NOT a member of REPO_OPEN_CLASSES and never reaches `parseRepoOpenBody`
+ * (which stays the frozen three-class validator); its body is validated by `validPublicRelayBody`.
+ */
+export type AwsRelayClass = RepoOpenClass | 'public';
+/** The one git host class `public` names: public github.com, read anonymously. */
+export const REPO_OPEN_PUBLIC_GIT_HOST = 'github.com';
+/**
+ * github.com owner/name grammar, copied verbatim from app/src/server/works/repo-url.ts OWNER (~:26) /
+ * NAME (~:28) — the same grammar repo-open.ts's `PUBLIC_GITHUB_REPOSITORY_URL` embeds between
+ * `github.com/` and `.git$` (a parity test pins the three together). u2's lowercase HANDLE_RE/validName
+ * MUST NOT be used for public: GitHub owners/names are spelled case-sensitively (e.g. `EZiLHQ`) and
+ * accept names u2 refuses (`x-`, `_x`).
+ */
+export const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+export const GITHUB_NAME_RE = /^(?!\.)(?![A-Za-z0-9._-]*\.\.)[A-Za-z0-9._-]{1,100}$/;
+/** A public repository name: the app's NAME grammar, and (like repo-url.ts) never a `.git`-suffixed name. */
+export const isPublicRepoName = (s: string): boolean => GITHUB_NAME_RE.test(s) && !s.toLowerCase().endsWith('.git');
+
+/** The grant-free §public body (no `grant` key): the §8 shape minus the grant, class fixed `public`. */
+export interface PublicRepoOpenBody {
+  v: 1; op: 'open'; repositoryId: string; handle: string; name: string;
+  gitHost: string; defaultBranch: string; path: null; class: 'public'; grant?: undefined;
+}
+export interface PublicRepoOpenInput extends PublicRepoOpenBody { receivedAt: number }
+type RelayBody = RepoOpenBody | PublicRepoOpenBody;
+type RelayInput = RepoOpenInput | PublicRepoOpenInput;
+
+/** A known relay class: one of the contract three, or the worker's `public`. */
+const isAwsRelayClass = (value: unknown): value is AwsRelayClass => isRepoOpenClass(value) || value === 'public';
+/** The classes whose repository sits in the wrapper W (assessment/project, E1-6/1.0.4; public, flat like project). */
+const isWrappedRelayClass = (cls: AwsRelayClass): boolean => cls === 'public' || isWrappedClass(cls as RepoOpenClass);
 
 // ── protocol constants (AWS_RELAY_POLL_MS is compared with the vectors by the test) ──────────
 
@@ -152,22 +194,48 @@ const exactKeys = (value: unknown, keys: readonly string[]): value is Record<str
 const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 const byteLength = (text: string) => new TextEncoder().encode(text).byteLength;
 
+/** The exact keys of a grant-free class-`public` relay body (no `grant`; `class` required). */
+const PUBLIC_RELAY_BODY_KEYS = ['v', 'op', 'repositoryId', 'handle', 'name', 'gitHost', 'defaultBranch', 'path', 'class'];
+/**
+ * The class-`public` re-validation `awsRepoOpenStart` runs in place of `parseRepoOpenBody` (which only
+ * knows the frozen three classes): "never relay a field the Worker would refuse." Grant-free, exactly
+ * PUBLIC_RELAY_BODY_KEYS, github.com host, op `open`, path null, and the github.com owner/name grammar
+ * (NOT u2's lowercase HANDLE_RE/validName). A `_x` defaultBranch that `branchOf` accepts but u2's
+ * validBranch refuses is rejected here (invalid_request), never relayed.
+ */
+function validPublicRelayBody(body: RelayBody): boolean {
+  if (byteLength(JSON.stringify(body)) > WORKER_REQUEST_MAX_BYTES) return false;
+  if (!exactKeys(body, PUBLIC_RELAY_BODY_KEYS)) return false;
+  const b = body as PublicRepoOpenBody;
+  return b.v === 1 && b.op === 'open'
+    && typeof b.repositoryId === 'string' && UUID_RE.test(b.repositoryId)
+    && typeof b.handle === 'string' && GITHUB_OWNER_RE.test(b.handle)
+    && typeof b.name === 'string' && isPublicRepoName(b.name)
+    && b.gitHost === REPO_OPEN_PUBLIC_GIT_HOST
+    && typeof b.defaultBranch === 'string' && validBranch(b.defaultBranch)
+    && b.path === null && b.class === 'public';
+}
+
 /**
  * The §8 fields only, in the vectors' key order (re-validated before anything is relayed), then
  * (1.0.3) `class` only when the input carried it (vectors workerRequest.classRule: the host forwards
- * it to the kernel only when relayed), so a personal body without class relays byte-identically.
+ * it to the kernel only when relayed), so a personal body without class relays byte-identically. A
+ * class-`public` input carries no grant at all (the host clones github.com anonymously), so no grant
+ * key is written.
  */
-function requestBody(input: RepoOpenBody): RepoOpenBody {
+function requestBody(input: RelayBody): RelayBody {
+  const grant = (input as RepoOpenBody).grant;
+  const cls = (input as { class?: AwsRelayClass }).class;
   return {
     v: 1, op: input.op, repositoryId: input.repositoryId, handle: input.handle, name: input.name, gitHost: input.gitHost,
     defaultBranch: input.defaultBranch, path: input.path,
-    grant: { username: input.grant.username, token: input.grant.token, expiresAt: input.grant.expiresAt, scope: input.grant.scope },
-    ...(input.class !== undefined ? { class: input.class } : {}),
-  };
+    ...(grant !== undefined ? { grant: { username: grant.username, token: grant.token, expiresAt: grant.expiresAt, scope: grant.scope } } : {}),
+    ...(cls !== undefined ? { class: cls } : {}),
+  } as RelayBody;
 }
 
 /** The relay body's exact bytes: the validated §8 body plus the job id. Never the raw input. */
-export function awsRepoOpenRelayBody(input: RepoOpenBody, jobId: string): string {
+export function awsRepoOpenRelayBody(input: RelayBody, jobId: string): string {
   return JSON.stringify({ jobId, ...requestBody(input) });
 }
 
@@ -183,8 +251,8 @@ export function awsRepoOpenRelayBody(input: RepoOpenBody, jobId: string): string
  * Personal reads neither. Each class's shape is invalid for the other.
  */
 export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: string,
-  cls: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT, remote?: string, defaultBranch?: string): RepoOpenAnswer {
-  if (!isRepoOpenClass(cls) || !exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
+  cls: AwsRelayClass = REPO_OPEN_CLASS_DEFAULT, remote?: string, defaultBranch?: string): RepoOpenAnswer {
+  if (!isAwsRelayClass(cls) || !exactKeys(result, ['status', 'body'])) return refusal('workspace_failed');
   const { status, body } = result;
   if (isObject(body) && body.ok === false) {
     const code = body.error as RepoOpenErrorCode;
@@ -197,7 +265,9 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
       ? { status: 200, body: { ok: true, state: 'refreshed' } } : refusal('workspace_failed');
   }
   const assessment = cls === 'assessment';
-  const project = cls === 'project';
+  // class project and class public both answer the flat wrapper W (openFolder === folder, no sub-path);
+  // only their inputs (grant, git host, name grammar) differ, and that is settled before this point.
+  const projectOrPublic = cls === 'project' || cls === 'public';
   const keys: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_KEYS : OPEN_RESULT_KEYS;
   const states: readonly string[] = assessment ? ASSESSMENT_OPEN_RESULT_STATES : OPEN_RESULT_STATES;
   if (!exactKeys(body, keys) || !states.includes(body.state as string)
@@ -212,9 +282,9 @@ export function awsJobAnswer(result: unknown, op: 'open' | 'refresh', folder: st
     || GRANT_SHAPE.test(body.openFolder) || GRANT_SHAPE.test(body.branch)) {
     return refusal('workspace_failed');
   }
-  if (project) {
-    // 1.0.4: the editor root is the wrapper W itself (never a folder below it), no path. A fresh placement checked out
-    // exactly defaultBranch; an `existing` reopen names the folder's current branch (the Creator's own work), any valid one.
+  if (projectOrPublic) {
+    // 1.0.4/public: the editor root is the wrapper W itself (never a folder below it), no path. A fresh placement
+    // checked out exactly defaultBranch; an `existing` reopen names the folder's current branch (any valid one).
     if (body.openFolder !== folder || body.pathNotFound !== false || typeof defaultBranch !== 'string'
       || (body.state !== 'existing' && body.branch !== defaultBranch)) {
       return refusal('workspace_failed');
@@ -288,8 +358,8 @@ export interface AwsRepoOpenJob {
   jobId: string;
   sandboxName: string;
   op: 'open' | 'refresh';
-  /** The route class the job was started for (1.0.3); its result is validated against that shape. */
-  class: RepoOpenClass;
+  /** The route class the job was started for (1.0.3; worker `public`); its result is validated against that shape. */
+  class: AwsRelayClass;
   handle: string;
   name: string;
   /** Wrapped classes only (assessment E1-6, project 1.0.4): names the wrapper W the result must answer. */
@@ -301,14 +371,20 @@ export interface AwsRepoOpenJob {
 /** Exact keys per class (E1-6, r56): the personal job is unchanged; an assessment job adds repositoryId and defaultBranch. */
 const JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'acknowledged'];
 const ASSESSMENT_JOB_KEYS = ['jobId', 'sandboxName', 'op', 'class', 'handle', 'name', 'repositoryId', 'defaultBranch', 'acknowledged'];
-const validJob = (job: unknown): job is AwsRepoOpenJob =>
-  isObject(job) && isRepoOpenClass(job.class) && exactKeys(job, isWrappedClass(job.class) ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
-  && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
-  && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh')
-  && typeof job.handle === 'string' && HANDLE_RE.test(job.handle) && typeof job.name === 'string' && validName(job.name)
-  && (!isWrappedClass(job.class) || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
-  && (!isWrappedClass(job.class) || (typeof job.defaultBranch === 'string' && validBranch(job.defaultBranch)))
-  && typeof job.acknowledged === 'boolean';
+const validJob = (job: unknown): job is AwsRepoOpenJob => {
+  if (!isObject(job) || !isAwsRelayClass(job.class)) return false;
+  const wrapped = isWrappedRelayClass(job.class);
+  // class public validates the handle/name with the github.com grammar, never u2's lowercase HANDLE_RE/validName.
+  const pub = job.class === 'public';
+  return exactKeys(job, wrapped ? ASSESSMENT_JOB_KEYS : JOB_KEYS)
+    && typeof job.jobId === 'string' && AWS_JOB_ID_RE.test(job.jobId)
+    && typeof job.sandboxName === 'string' && (job.op === 'open' || job.op === 'refresh') && (!pub || job.op === 'open')
+    && typeof job.handle === 'string' && (pub ? GITHUB_OWNER_RE.test(job.handle) : HANDLE_RE.test(job.handle))
+    && typeof job.name === 'string' && (pub ? isPublicRepoName(job.name) : validName(job.name))
+    && (!wrapped || (typeof job.repositoryId === 'string' && UUID_RE.test(job.repositoryId)))
+    && (!wrapped || (typeof job.defaultBranch === 'string' && validBranch(job.defaultBranch)))
+    && typeof job.acknowledged === 'boolean';
+};
 
 /** One start or poll: the job is still running (as far as that call can tell), or its final §8 answer. */
 export type AwsRepoOpenStep =
@@ -322,7 +398,7 @@ const finished = (answer: RepoOpenAnswer): AwsRepoOpenStep => ({ state: 'done', 
 const jobAnswer = (result: unknown, job: AwsRepoOpenJob): RepoOpenAnswer => (job.class === 'assessment'
   ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class,
     assessmentRemoteUrl(job.handle, job.name), job.defaultBranch)
-  : job.class === 'project'
+  : job.class === 'project' || job.class === 'public'
     ? awsJobAnswer(result, job.op, assessmentEditorRoot(AWS_REPO_OPEN_ROOT, job.repositoryId as string), job.class, undefined, job.defaultBranch)
     : awsJobAnswer(result, job.op, `${AWS_REPO_OPEN_ROOT}/repos/${job.handle}/${job.name}`, job.class));
 
@@ -393,20 +469,24 @@ function edgeOf(target: AwsRepoOpenTarget, sandboxName: string, deps: AwsRepoOpe
  *    validated like a status result.
  */
 export async function awsRepoOpenStart(
-  input: RepoOpenInput,
+  input: RelayInput,
   sandboxName: string,
   target: AwsRepoOpenTarget | Response,
   deps: AwsRepoOpenDeps,
-  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+  routeClass: AwsRelayClass = REPO_OPEN_CLASS_DEFAULT,
   options: { projectGitHost?: string } = {},
 ): Promise<AwsRepoOpenStep> {
   // A refusal from awsControlTarget (claims mismatch, origin unavailable or starting): its body is
   // never read or forwarded.
   if (target instanceof Response) return finished(refusal('workspace_unsupported'));
   try {
-    // Never relay a field the Worker would refuse, whoever the caller is.
+    // Never relay a field the Worker would refuse, whoever the caller is. class public is a worker
+    // extension beyond parseRepoOpenBody's frozen three classes, so it has its own grant-free validator.
     const body = requestBody(input);
-    if (!parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), deps.now(), routeClass, options)) return finished(refusal('invalid_request'));
+    const relayable = routeClass === 'public'
+      ? validPublicRelayBody(body)
+      : parseRepoOpenBody(new TextEncoder().encode(JSON.stringify(body)), deps.now(), routeClass, options) !== null;
+    if (!relayable) return finished(refusal('invalid_request'));
     // Class project (1.0.4): fail closed unless this computer's host says it knows the class AND the computer is not
     // bound to an assessment attempt. Nothing is sent otherwise (AMI 1.0.30 has no repo-open op at all).
     if (routeClass === 'project') {
@@ -423,9 +503,10 @@ export async function awsRepoOpenStart(
     if (byteLength(relay) > AWS_REPO_OPEN_RELAY_MAX_BYTES) return finished(refusal('workspace_failed'));
     const digest = await sha256HexBytes(new TextEncoder().encode(relay));
     const job: AwsRepoOpenJob = { jobId, sandboxName, op: body.op, class: routeClass, handle: body.handle, name: body.name,
-      ...(isWrappedClass(routeClass) ? { repositoryId: body.repositoryId, defaultBranch: body.defaultBranch } : {}), acknowledged: false };
+      ...(isWrappedRelayClass(routeClass) ? { repositoryId: body.repositoryId, defaultBranch: body.defaultBranch } : {}), acknowledged: false };
 
-    const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant.token);
+    // class public carries no grant (body.grant is undefined); the edge scan then relies on GRANT_SHAPE alone.
+    const started = await call(`${AWS_REPO_OPEN_PATH}${digest}`, input.receivedAt + WORKER_DEADLINE_MS, relay, body.grant?.token);
     if (started.kind === 'leak') return finished(refusal('workspace_failed'));
     if (started.kind === 'deadline') return finished(refusal('workspace_busy'));
     // A start that throws ('transport') or answers 5xx has an unknown outcome: the host may have
@@ -433,9 +514,11 @@ export async function awsRepoOpenStart(
     // agent's reply fails after delivery). The job's status says which; a second start is never sent.
     if (started.kind === 'transport' || started.status >= 500) return { state: 'running', job };
     if (started.status === 404) return finished(refusal('workspace_unsupported'));
-    // An A2h host whose closed class table predates 1.0.4 refuses class project as repo_open_invalid: the
-    // capability is absent there, never a request to retry.
-    if (routeClass === 'project' && started.status === 409 && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
+    // An A2h host whose closed class table predates this capability refuses class project (1.0.4) or class
+    // public (worker extension) as repo_open_invalid (relay_class -> None, or a grant-less relay key set):
+    // the capability is absent there, never a request to retry. Maps to unsupported, exactly like a 404.
+    if ((routeClass === 'project' || routeClass === 'public') && started.status === 409
+      && exactKeys(started.data, ['ok', 'error']) && started.data.ok === false
       && started.data.error === 'repo_open_invalid') {
       return finished(refusal('workspace_unsupported'));
     }
@@ -503,11 +586,11 @@ export async function awsRepoOpenPoll(
  * pair instead (this call can take the whole 105 s).
  */
 export async function handleAwsRepoOpen(
-  input: RepoOpenInput,
+  input: RelayInput,
   sandboxName: string,
   target: AwsRepoOpenTarget | Response,
   deps: AwsRepoOpenDeps,
-  routeClass: RepoOpenClass = REPO_OPEN_CLASS_DEFAULT,
+  routeClass: AwsRelayClass = REPO_OPEN_CLASS_DEFAULT,
   options: { projectGitHost?: string } = {},
 ): Promise<RepoOpenAnswer> {
   try {
@@ -530,4 +613,62 @@ export async function handleAwsRepoOpen(
   } catch {
     return refusal('workspace_failed');
   }
+}
+
+// ── class `public` entry points (what index.ts handleRepoOpen imports) ───────────────────────
+
+/**
+ * Build the class-`public` relay input from a canonical public-github.com URL (already validated by
+ * repo-open.ts `PUBLIC_GITHUB_REPOSITORY_URL`, auth 'none'), the app's `repositoryId` (used AS-IS: it is
+ * the same v8-UUID folder id the Cloudflare path uses, never re-derived here) and the resolved default
+ * `branch`. Returns null when the owner/name do not pass the github.com grammar — e.g. a `x.git`-suffixed
+ * name that the looser URL regex accepts but repo-url.ts refuses. No grant is ever built. `branch` is left
+ * for `validPublicRelayBody` to re-check, so a `_x` branch (accepted by `branchOf`, refused by u2's
+ * validBranch) is a pre-send invalid_request at the relay, not a null here.
+ */
+export function awsPublicRepoOpenInput(
+  canonicalURL: string, repositoryId: string, branch: string, receivedAt: number,
+): PublicRepoOpenInput | null {
+  const m = /^https:\/\/github\.com\/([^/]+)\/(.+)\.git$/.exec(canonicalURL);
+  if (!m) return null;
+  const handle = m[1]!;
+  const name = m[2]!;
+  if (!GITHUB_OWNER_RE.test(handle) || !isPublicRepoName(name)) return null;
+  return {
+    v: 1, op: 'open', repositoryId, handle, name, gitHost: REPO_OPEN_PUBLIC_GIT_HOST,
+    defaultBranch: branch, path: null, class: 'public', receivedAt,
+  };
+}
+
+/**
+ * The §8 u2 answer mapped to the Cloudflare `handleRepoOpen` response the OS app consumes
+ * (app/src/server/lib/compute/repo-open.ts: `ok`, `folder`, optional `head`; `status` is ignored there).
+ * Both the host's workspace_unsupported (today's 404-answering AMI 1.0.30, or a pre-public AMI's 409
+ * repo_open_invalid) and a pre-send invalid_request map to `repo_open_unsupported_provider`, which is
+ * exactly today's behaviour; every other refusal maps to `repo_open_failed` (the app collapses all
+ * non-unsupported worker answers to `repo_open_failed` regardless). On success the folder is the wrapper
+ * W = /workspace/projects/<repositoryId>, the same shape the Cloudflare path returns; u2's okOpen carries
+ * no head, which the app treats as optional.
+ */
+export type AwsPublicRepoOpenResult =
+  | { ok: true; folder: string; status: 'cloned' | 'fetched' | 'created' }
+  | { ok: false; error: 'repo_open_unsupported_provider' | 'repo_open_failed' };
+
+export function awsPublicRepoOpenResult(answer: RepoOpenAnswer): AwsPublicRepoOpenResult {
+  if (answer.status === 200 && answer.body.ok === true && 'folder' in answer.body) {
+    const open = answer.body as RepoOpenOpenResult;
+    const status = open.state === 'initialized_empty' ? 'created' : open.state === 'existing' ? 'fetched' : 'cloned';
+    return { ok: true, folder: open.folder, status };
+  }
+  const error = (answer.body as { error?: RepoOpenErrorCode }).error;
+  return error === 'workspace_unsupported' || error === 'invalid_request'
+    ? { ok: false, error: 'repo_open_unsupported_provider' }
+    : { ok: false, error: 'repo_open_failed' };
+}
+
+/** Relay a class-`public` open and map the §8 answer to the Cloudflare response shape, in one call. */
+export async function relayPublicRepoOpen(
+  input: PublicRepoOpenInput, sandboxName: string, target: AwsRepoOpenTarget | Response, deps: AwsRepoOpenDeps,
+): Promise<AwsPublicRepoOpenResult> {
+  return awsPublicRepoOpenResult(await handleAwsRepoOpen(input, sandboxName, target, deps, 'public'));
 }
