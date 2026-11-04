@@ -60,6 +60,22 @@ export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow
     return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
 }
 
+/** Round 6 R2-3: how long after a paid period starts a missing compute grant reads as not landed yet, never as used up. */
+export const GRANT_PENDING_SECONDS = 10 * 60;
+
+/**
+ * Round 6 R2-3: a paid AWS plan with paid access (not its grace, which has an allowance of its own) whose current period
+ * has no compute grant row yet, within GRANT_PENDING_SECONDS of the period start (Stripe reports the period before its
+ * invoice receipt is processed). A refund or revoke row is a real zero, not a grant still to come. One definition for
+ * the start gate (compute-access.ts) and the summary (paid compute policy v1), so neither shows a renewal as used up.
+ */
+export function renewalGrantPending(plan: ResolvedPlanV3, standing: ComputeStandingV3, grants: readonly GrantRow[], now: Date): boolean {
+    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
+    const start = Date.parse(plan.window.start);
+    return !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId)
+        && now.getTime() >= start && now.getTime() - start < GRANT_PENDING_SECONDS * 1000;
+}
+
 /**
  * Round 6 review (dunning into the hold): the plan the COMPUTER runs under. A paid subscription without paid
  * access (grace over, raw unpaid, never paid; STANDING-CONTRACT) runs the computer as Free, with Free's
@@ -398,9 +414,11 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         : standing.standing === 'files_on_aws' ? SIZES[HOLD_SIZE]
         : SIZES[input.sizePreference !== null && rated.offer.machineChoice.includes(input.sizePreference)
             ? input.sizePreference : rated.offer.size];
-    // Paid compute policy v1: a paid-access Standard/Premium computer with this period's grant (as compute-access.ts
-    // paidComputeUnmeteredState) has no hours cutoff, so no fair-use pause or deadline.
-    const unmetered = !legacy && UNMETERED_PAID_PLAN_IDS.includes(rated.sku) && allowance > 0;
+    // Paid compute policy v1: a paid-access Standard/Premium computer with this period's grant, its renewal grace, or a
+    // renewal grant still landing (as compute-access.ts paidComputeUnmeteredState) has no hours cutoff: no fair-use pause,
+    // and its session ends only at the six-hour session cap (never at a stored fair-use deadline).
+    const unmetered = !legacy && UNMETERED_PAID_PLAN_IDS.includes(rated.sku)
+        && (allowance > 0 || renewalGrantPending(plan, standing.standing, input.grants, input.now));
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
     // Recompute uncapped deadlines from period usage before this epoch. Old paid
@@ -414,10 +432,9 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         : latest ? epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight) : Infinity;
     const activeBound = latest ? Math.min(
         epochSeconds(latest.readyAt, 'ceil') + (rated.sessionMaxSeconds ?? Infinity),
-        rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
+        unmetered || rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
     ) : Infinity;
-    // Paid compute policy v1: an unmetered paid session with no session cap has no deadline at all.
     const activeDeadline = legacy ? legacy.compute.session.activeDeadline : Number.isFinite(activeBound) ? isoSeconds(activeBound) : null;
     const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;

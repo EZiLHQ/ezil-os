@@ -70,10 +70,11 @@ describe('paid Cloudflare reconciliation', () => {
         });
     it.each([false, true])('production wiring respects admission %s and advances the existing runtime', async admit => {
         fake.execute.mockResolvedValue([{ user_id: 'u', computer_id: 'c', sku: 'premium_monthly_v3' }]);
-        fake.entitlement.mockResolvedValue({ status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size: 'cmp-8' });
+        fake.entitlement.mockResolvedValue({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size: 'cmp-8' });
         fake.admission.mockReturnValue({ admit }); fake.create.mockResolvedValue({ id: 'm' });
         await reconcilePaidCloudflareUsers(Date.now(), env);
-        expect(fake.admission).toHaveBeenCalledWith(expect.objectContaining({ instanceType: 'm6i.2xlarge' }));
+        // Paid compute policy v1 (a521 review): a paid move is not refused by the per-person hour cap.
+        expect(fake.admission).toHaveBeenCalledWith(expect.objectContaining({ instanceType: 'm6i.2xlarge', userHoursExempt: true }));
         expect(fake.create).toHaveBeenCalledTimes(Number(admit)); expect(fake.advance).toHaveBeenCalledTimes(Number(admit));
         if (admit) expect(fake.create).toHaveBeenCalledWith({ userId: 'u', computerId: 'c', toSize: 'premium' });
     });

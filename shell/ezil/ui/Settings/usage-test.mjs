@@ -622,13 +622,24 @@ check('independent null sources and unsupported responses', () => {
     assert.equal(progress(noUsage, 'compute'), null);
     assert.equal(progress(noUsage, 'storage'), null);
     assert.match(noUsage.textContent, /Not measured yet/);
+    // Paid compute policy v1: with no summary the plan is unknown, so no computer-time meter, pause banner or reset
+    // (a paid user must never read "used up" from the usage figures alone); storage still shows.
     const noSummary = rendered(sample, null);
     assert.match(noSummary.textContent, /Plan unavailable/);
-    assert.ok(progress(noSummary, 'compute'));
+    assert.equal(meter(noSummary, 'compute'), null);
     assert.ok(progress(noSummary, 'storage'));
     assert.equal(progress(noSummary, 'ai'), null);
     assert.equal(noSummary.querySelector('.ezil-settings-btn-primary'), null);
-    assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 144000 }), null), 'compute').dataset.state, 'ok');
+    assert.equal(noSummary.querySelector('details[data-usage-detail="period"]'), null);
+    assert.doesNotMatch(noSummary.textContent, /Usage resets|Paused until/);
+    const spent = rendered(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 }), null);
+    assert.equal(spent.querySelector('.usage-banner'), null);
+    assert.equal(meter(spent, 'compute'), null);
+    assert.doesNotMatch(spent.textContent, /used up|paused/i);
+    // Positive control: the same figures under a known metered (Free) summary still pause, with the reset.
+    const freeSpent = rendered(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 }), { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, fairUse: { ...summary.fairUse, status: 'paused' } });
+    assert.match(freeSpent.querySelector('.usage-banner').textContent, /Computer time is used up/);
+    assert.equal(meter(freeSpent, 'compute').dataset.state, 'danger');
     assert.throws(() => usageHtml({ enabled: true, version: 99 }));
     assert.match(usageHtml({ enabled: false }, summary), /unavailable in this deployment/);
 });
@@ -667,12 +678,15 @@ try {
     assert.doesNotMatch(win.text(), /couldn't read|Plan unavailable|Unavailable/);
     assert.deepEqual(calls.slice(0, 2), [{ path: 'billing.usage', input: { computerId: 'computer-a' } }, { path: 'billing.summary', input: undefined }]);
     u.resolve({ ok: true, data: sample }); await tick();
-    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
+    // Paid compute policy v1: computer time waits for the summary (a paid plan has none to count down); storage does not.
+    assert.doesNotMatch(win.text(), /hours left|Computer time/);
+    assert.match(win.text(), /903 MB left/);
     // The summary is still on its way: its rows are loading, not failed.
     assert.match(win.text(), /Checking your plan…/);
     assert.doesNotMatch(win.text(), /Plan unavailable|couldn't read your balance/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'true');
     s.resolve({ ok: true, data: summary }); await tick();
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.match(win.text(), /120 of 200 left/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'false');
     assert.match(win.find('[data-role="usage-refresh-status"]').text(), /Updated/);
@@ -707,7 +721,9 @@ try {
     assert.match(win.text(), /120 of 200 left/);
     success(); replies['billing.summary'] = Promise.reject(Error('summary failed')); await refresh();
     assert.match(win.text(), /Plan unavailable/);
-    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
+    // An unknown plan shows no computer time (nor a pause); the usage that did load (storage) stays.
+    assert.doesNotMatch(win.text(), /hours left|used up/);
+    assert.match(win.text(), /903 MB left/);
     assert.equal(win.find('[data-action="usage-add-credits"]').length, 0);
     passed++; console.log('PASS partial failures retain usage honestly without blanking successful sections');
 

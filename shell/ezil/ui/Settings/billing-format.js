@@ -193,13 +193,17 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
 /**
  * Plan-sheet bullets in the plan's order: configurations → storage → AI
  * credits → computer time. Built from the offer's numbers, never from
- * `offer.bullets` (catalog copy that predates round 3).
+ * `offer.bullets` (catalog copy that predates round 3). Paid compute policy v1:
+ * Standard and Premium have no monthly computer-hours allowance, so their last
+ * bullet is the six-hour session (`offer.sessionMaxSeconds`), never hours a month.
  */
 export function planBullets (offer, { existingDisk } = {}) {
     // A field the offer lacks drops its bullet rather than printing "undefined".
     const known = value => Number.isSafeInteger(value) && value > 0;
     const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
     const hours = known(offer.fairUseHours) ? whole(offer.fairUseHours) : null;
+    const sessionHours = known(offer.sessionMaxSeconds) && offer.sessionMaxSeconds % 3600 === 0 ? offer.sessionMaxSeconds / 3600 : null;
+    const session = sessionHours && `Sessions up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}; your files are kept`;
     const size = known(offer.vcpu) && known(offer.memoryGiB) ? ` · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB` : '';
     const keep = list => list.filter(Boolean);
     if ( offer.sku === 'free_v3' ) return { lead: null, bullets: keep([
@@ -219,7 +223,7 @@ export function planBullets (offer, { existingDisk } = {}) {
         `Your own AWS computer${size}`,
         diskBullet,
         credits && `${credits} AI credits every month`,
-        hours && `${hours} hours of computer time each month`,
+        session,
     ]) };
     const choices = offer.machineChoice ?? [];
     const vcpus = { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8 };
@@ -230,7 +234,7 @@ export function planBullets (offer, { existingDisk } = {}) {
         listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
         diskBullet,
         credits && `${credits} AI credits every month`,
-        hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
+        session,
     ]) };
 }
 

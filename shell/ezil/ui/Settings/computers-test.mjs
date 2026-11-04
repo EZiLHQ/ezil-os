@@ -82,6 +82,28 @@ check('Premium running on 2 vCPU: current + two available, no slot UI', () => {
     assert.doesNotMatch(html, /data-slot|New computer|Empty slot|data-action="create"|Add computer/);
 });
 
+// Paid compute policy v1: the server marks a paid plan `fairUse.policy: 'unmetered'`; then no tile or confirmation counts
+// "monthly time", and neither does a Free viewer's AWS tile. A metered (or older) summary keeps the weight line (above).
+check('paid compute policy v1: no "monthly time" on paid tiles or the switch confirmation; the helper is pinned to Billing\'s', async () => {
+    const format = await import('./billing-format.js');
+    const unmetered = tier => { const s = tier === 'premium' ? premium() : standard(); return { ...s, fairUse: { ...s.fairUse, policy: 'unmetered' } }; };
+    for ( const value of [null, undefined, {}, premium(), unmetered('premium'), unmetered('standard'), { ...free(), fairUse: { ...free().fairUse, policy: 'unmetered' } },
+        { ...unmetered('premium'), plan: { ...premium().plan, sku: 'legacy' } }] ) {
+        assert.equal(tab.paidComputeUnmetered(value), format.paidComputeUnmetered(value));
+    }
+    const html = scan(computerHtml(computerModel({ computer: me, data: unmetered('premium'), prog: running() }), running(), []));
+    assert.doesNotMatch(text(html), /monthly time|Counts \d×/);
+    assert.match(text(html), /AWS \(India\) · sessions up to 6 hours/);
+    const sw = tab.confirmCopy('switch', { target: 'cmp-4', current: 'std-2', data: unmetered('premium') });
+    assert.ok(! sw.lines.some(line => /monthly time/.test(line)), sw.lines.join(' | '));
+    // Positive control: the same switch on a metered summary still says how the hour counts.
+    assert.ok(tab.confirmCopy('switch', { target: 'cmp-4', current: 'std-2', data: premium() }).lines.some(line => /2 hours of your monthly time/.test(line)));
+    // A Free viewer comparing plans is not sold monthly hours on the AWS tiles either.
+    const freeHtml = scan(computerHtml(computerModel({ computer: me, data: free(), prog: null }), null, []));
+    assert.doesNotMatch(text(freeHtml), /monthly time|Counts \d×/);
+    assert.match(text(freeHtml), /AWS \(India\) · sessions up to 6 hours/);
+});
+
 // Follow-up r5 (ACCEPT-9a755827 FINDING 2): until this activation's `computer.progress` answers,
 // the pane renders with `prog` null — and an unknown lifecycle is NEITHER Running nor Stopped.
 check('🔴 AWS with no lifecycle read yet (prog null): no chip, not running, not stopped, no Stop, no "Stopped"', () => {
@@ -347,13 +369,13 @@ check('Round 6 held std-2 Running: current with a Free limits pill, 4/8 vCPU loc
     for ( const size of ['cmp-4', 'cmp-8'] ) assert.match(text(card(html, size)), /Included in Premium Upgrade/);
     assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 2);
     assert.doesNotMatch(html, /data-size="free-cf"|data-action="switch-config"|Included in Standard/);
-    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits; upgrade for no session time limit\./);
+    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours\./);
     assert.match(html, /data-role="hold-time">Free sessions last 1 hour · About 5 of 8 hours left this month<\/p>/);
     assert.match(text(html), new RegExp(`This session ends at ${clock('2026-10-30T06:42:00Z')} ?\\.`));
     assert.match(html, /<time datetime="2026-10-30T06:42:00Z">/);
     assert.doesNotMatch(text(html), /Pick a size|More sizes come with|restore full use/);
     assert.match(text(html), /On the Free plan your AWS computer opens at 2 vCPU · 8 GB\. Upgrade to choose a size\./);
-    assert.match(text(html), /Standard and Premium have no session time limit; Premium unlocks 4 and 8 vCPU\. Compare plans/);
+    assert.match(text(html), /Standard and Premium sessions last up to 6 hours; Premium unlocks 4 and 8 vCPU\. Compare plans/);
 });
 
 check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented hours), a passed deadline (no line)', () => {
@@ -425,7 +447,7 @@ check('Round 6 review (R4-02): before the lifecycle read a held computer is show
         assert.equal(computerModel({ computer: me, data: heldData({ awsSize }), prog: null, now: HELD_NOW }).current, 'std-2', JSON.stringify(awsSize));
 });
 
-check('Round 6: a Free session on Cloudflare also says when it ends; a paid session (no cap) never does', () => {
+check('Round 6: a Free session on Cloudflare also says when it ends; so does a paid (six-hour) one; an uncapped one never does', () => {
     const cf = { ...free(), computer: { ...free().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
     const model = computerModel({ computer: me, data: cf, prog: { version: 2, computerId: 'c-1', operation: 'none', lifecycleState: null }, streaming: true, now: HELD_NOW });
     assert.match(scan(computerHtml(model, null, [])), /data-role="session-ends"/);
@@ -435,8 +457,15 @@ check('Round 6: a Free session on Cloudflare also says when it ends; a paid sess
         assert.equal(stale.sessionEnds, null);
         assert.doesNotMatch(scan(computerHtml(stale, prog, [])), /data-role="session-ends"/);
     }
+    // Paid compute policy v1: Standard and Premium sessions last up to six hours, then save and stop (files kept).
     const paid = { ...premium(), computer: { ...premium().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
-    assert.equal(computerModel({ computer: me, data: paid, prog: running(), now: HELD_NOW }).sessionEnds, null);
+    assert.equal(paid.computer.sessionMaxSeconds, 21600);
+    const paidModel = computerModel({ computer: me, data: paid, prog: running(), now: HELD_NOW });
+    assert.equal(paidModel.sessionEnds, '2026-10-30T06:42:00Z');
+    assert.match(scan(computerHtml(paidModel, running(), [])), /This session ends at .+\. Your files are kept; open it again to start a new session\./);
+    // An older server's uncapped paid summary still never shows an end.
+    const uncapped = { ...paid, computer: { ...paid.computer, sessionMaxSeconds: null } };
+    assert.equal(computerModel({ computer: me, data: uncapped, prog: running(), now: HELD_NOW }).sessionEnds, null);
 });
 
 check('Round 6 review (CR-2): sessionReads — the session edges re-read the deadline and the hold\'s hours, bounded', () => {
@@ -504,7 +533,7 @@ const held = (extra = {}, size = 'std-2') => withStanding(free(), 'files_on_aws'
 const afterCommit = extra => withStanding(free(), 'free', { filesOn: 'cloudflare', reverseMove: null, moveAvailable: false, moveOnOpen: false, ...extra });
 const tabProg = data => ({ ...data, computerId: 'c-1' });
 const render = (data, prog = stoppedAws()) => { const model = computerModel({ computer: me, data, prog }); return { model, html: scan(computerHtml(model, prog, [])) }; };
-const BANNER = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+const BANNER = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
 const NOT_MOVED = 'settings and programs you added on your AWS computer, saved browser sign-ins, installed packages, and build folders you can recreate (node_modules, .next, .turbo and dist, unless Git tracks them)';
 const KEPT = `Not moved: ${NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
 

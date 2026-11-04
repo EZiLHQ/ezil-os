@@ -649,6 +649,17 @@ describe('RETRY-118 capacity_attempt_expired', () => {
         expect(s.placements).toEqual([]);
         expect(s.starts).toEqual([]);
     });
+    // Paid compute policy v1 (a521 review): the capacity-pressure demand runs its own admission, so it carries the
+    // caller's per-person hour-cap exemption, resolved before any lock; a Free or legacy plan's demand is not exempt.
+    it.each([
+        [{ ...paid, planId: 'standard_monthly_v3' }, true], [{ ...paid, planId: 'premium_monthly_v3' }, true],
+        [paid, false], [{ ...paid, planId: 'premium_monthly_v3', paymentIssue: true }, false],
+    ] as const)('the demand for %j carries userHoursExempt %s', async (entitlement, exempt) => {
+        const s = setup({ entitlement });
+        pressured(s);
+        await s.ensure();
+        expect(vi.mocked(s.pool.reserveDemand!).mock.calls[0]![0]).toMatchObject({ kind: 'create', userId: U, userHoursExempt: exempt });
+    });
     it('wake of a stopped computer: the expired attempt id, the placement untouched, no launch', async () => {
         const row = stopped();
         const s = setup({ rows: [row] });

@@ -608,7 +608,7 @@ export function standingCopy (standing, data) {
         const placed = data?.computer?.awsSize;
         return placed && (placed.size === 'cmp-4' || placed.size === 'cmp-8') && Number.isSafeInteger(placed.vcpu) && placed.vcpu > 2
             ? heldClosedText(placed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
     }
     return '';
 }
@@ -792,7 +792,7 @@ function standingHtml (model) {
 function sessionEndsHtml (model) {
     if ( ! model.sessionEnds ) return '';
     const at = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(model.sessionEnds));
-    return `<p class="ezil-settings-muted" data-role="session-ends">This session ends at <time datetime="${html_encode(model.sessionEnds)}">${html_encode(at)}</time>.</p>`;
+    return `<p class="ezil-settings-muted" data-role="session-ends">This session ends at <time datetime="${html_encode(model.sessionEnds)}">${html_encode(at)}</time>. Your files are kept; open it again to start a new session.</p>`;
 }
 
 /**
@@ -837,9 +837,27 @@ export const CONFIG_BENEFIT = {
 };
 const LOCK_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 
+/** Paid compute policy v1: billing-format.js `paidComputeUnmetered`, pinned equal in computers-test (this tab stubs its imports). */
+export function paidComputeUnmetered (summary) {
+    const sku = summary?.plan?.sku;
+    return summary?.fairUse?.policy === 'unmetered' && (sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3');
+}
+
+/**
+ * Paid compute policy v1: an AWS configuration's line. Standard and Premium have no monthly computer-hours allowance, so
+ * a paid viewer (explicit server `fairUse.policy`) or a Free viewer (held on AWS too) comparing plans sees the session length, never
+ * "monthly time". Only a metered paid state, or no summary, keeps the weight line it always had.
+ */
+function awsCardLine (card, model) {
+    const cap = model.data?.catalog?.offers?.find(offer => offer.sku === 'standard_monthly_v3')?.sessionMaxSeconds;
+    const session = Number.isFinite(cap) && cap >= 3600 && cap % 3600 === 0 ? `AWS (India) · sessions up to ${cap / 3600} hour${cap === 3600 ? '' : 's'}` : 'AWS (India)';
+    if ( paidComputeUnmetered(model.data) || (model.data && model.free) ) return session;
+    return card.weight > 1 ? `Counts ${card.weight}× of your monthly time` : 'Counts 1× of your monthly time';
+}
+
 function cardHtml (card, model) {
     const title = `${card.vcpu} vCPU · ${card.memoryGiB} GB`;
-    const weight = card.size === 'free-cf' ? 'Cloudflare · sessions up to 1 hour' : card.weight > 1 ? `Counts ${card.weight}× of your monthly time` : 'Counts 1× of your monthly time';
+    const weight = card.size === 'free-cf' ? 'Cloudflare · sessions up to 1 hour' : awsCardLine(card, model);
     let action = '';
     // Round 6 (R1-08): the held computer's size is current, with what Free allows it (or, R4-02, that it can't open).
     if ( card.state === 'current' && model.held ) {
@@ -935,7 +953,7 @@ export function computerHtml (model, prog = progress, older = []) {
     const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
     const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
     const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
-    const planLine = ! data ? '' : model.held ? 'Standard and Premium have no session time limit; Premium unlocks 4 and 8 vCPU.' : premiumOnly.length && ! model.free
+    const planLine = ! data ? '' : model.held ? 'Standard and Premium sessions last up to 6 hours; Premium unlocks 4 and 8 vCPU.' : premiumOnly.length && ! model.free
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;
@@ -1103,6 +1121,9 @@ async function refreshProgress ($win) {
         deadlineRetries = step.retries;
         // A summary already in flight may still describe the session that ended: only a later one retires this.
         if ( ! runningNow ) { deadlineStale = true; staleAfter = summarySeq; }
+        // Paid compute policy v1: paid sessions are capped (six hours) too, so the chip never waits on a slow billing
+        // read: paint what computer.progress says first, then again with the deadline.
+        if ( (step.summary || step.usage) && ! editingId ) render($win);
         if ( step.summary ) await readSummary();
         if ( step.usage ) await readUsage();
         if ( mine !== generation ) return;
@@ -1161,7 +1182,8 @@ export function confirmCopy (kind, { target = null, current = null, data = summa
             'Your computer restarts on the new size. Open apps close; save your work first.',
             'Your files stay on your disk.',
             'This usually takes 1-4 minutes.',
-            ...(to !== from ? [`At this size, an hour of use counts as ${to} hour${to === 1 ? '' : 's'} of your monthly time.`] : []),
+            // Paid compute policy v1: no monthly computer-hours allowance to count against on a paid plan.
+            ...(to !== from && ! paidComputeUnmetered(data) ? [`At this size, an hour of use counts as ${to} hour${to === 1 ? '' : 's'} of your monthly time.`] : []),
         ] };
     }
     return { title: 'Stop your computer?', confirmLabel: 'Stop', busyLabel: 'Stopping…', lines: [

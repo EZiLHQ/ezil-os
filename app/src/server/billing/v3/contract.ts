@@ -80,8 +80,12 @@ export interface PlanOfferV3 {
     provider: ComputeProvider;
     vcpu: number;
     memoryGiB: number;
-    /** Hard wall-clock bound of one session. */
-    /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
+    /**
+     * Hard wall-clock bound of one session (null = none). Free: 1 h. Standard and Premium: 6 h (founder e713d157
+     * lifecycle, replacing the 2026-10-20 no-session-cap): at the cap the session is saved and the computer stopped
+     * through the ordinary stop (files and installed tools kept); the next open is a new session through the normal
+     * (pooled) open. It is independent of fair use and never resets monthly usage.
+     */
     sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
     poolPriority: PoolPriority;
@@ -127,20 +131,20 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sku: 'standard_monthly_v3', tier: 'standard', name: 'Standard', tagline: 'For regular work, every day.',
         priceCents: 2_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_standard_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
+        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
-        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'No session time limit'],
+        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 50,
     },
     premium_monthly_v3: {
         sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For bigger projects and long sessions.',
         priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
+        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'No session time limit', 'Bigger sizes count more of your monthly time'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 100,
     },
 });

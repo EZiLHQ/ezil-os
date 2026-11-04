@@ -61,8 +61,11 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
         : summary?.fairUse?.status === 'paused' || remainingSeconds === 0 ? 'danger'
         : summary?.fairUse?.status === 'near' ? 'warn' : 'ok';
     // Paid compute policy v1: a paid plan has no computer-hours cutoff, so nothing here pauses it or counts its hours down.
+    // Computer time (meter, pause, reset) shows only once the summary says the plan is metered: with no summary the plan
+    // is unknown, and a paid user must never read "used up" from the usage figures alone.
     const unmetered = paidComputeUnmetered(summary);
-    const paused = !unmetered && (summary?.fairUse?.status === 'paused' || timeState === 'danger');
+    const metered = summary !== null && !unmetered;
+    const paused = metered && (summary.fairUse?.status === 'paused' || timeState === 'danger');
     const primary = plan?.status === 'past_due'
         ? actions.portal === true ? billingLink('Fix payment', 'usage-payment', true) : ''
         : plan?.sku === 'free_v3' && actions.checkout === true ? billingLink('Upgrade', 'usage-upgrade', true, '&amp;upgrade=pro')
@@ -211,17 +214,17 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
     ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
     <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : summaryLoading ? 'Checking your plan…' : 'Plan unavailable'}</h4>
-        ${!unmetered && validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
+        ${metered && validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
-        ${unmetered ? storageMeter : meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
+        ${!metered ? storageMeter : meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
         ${meter('ai', 'AI credits', aiValue, aiPercent, aiText, aiNote, aiState, aiAction)}
-        ${unmetered ? '' : storageMeter}
+        ${!metered ? '' : storageMeter}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">
-        ${unmetered ? '' : `<details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
+        ${!metered ? '' : `<details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
             ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
             ${usageLoading ? '' : `<p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p>`}</details>`}

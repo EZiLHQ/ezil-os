@@ -99,8 +99,10 @@ describe('round 3 hours at the current configuration (D3/D8)', () => {
         args.sizePreference = 'std-2';
         expect(buildUsageV3(args).period.remainingHoursAtCurrent).toBe(0);
         args.epochs = [{ ...epoch, endedAt: '2026-10-26T11:30:00Z' }];
-        const period = buildUsageV3(args).period; // Rating stops a weight-2 session at the last whole second it can afford.
-        expect(period).toMatchObject({ remainingStandardSeconds: 1, remainingHoursAtCurrent: 0, currentWeight: 1 });
+        // Paid compute policy v1: a paid session is rated in full (bounded by its six-hour session cap), never clipped at
+        // the allowance it overran, and what is left floors at zero.
+        const period = buildUsageV3(args).period;
+        expect(period).toMatchObject({ remainingStandardSeconds: 0, remainingHoursAtCurrent: 0, currentWeight: 1 });
         expect(period.equivalents.every(item => item.hours === 0)).toBe(true);
     });
 });

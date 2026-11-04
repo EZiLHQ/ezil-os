@@ -18,7 +18,7 @@
       "size": "std-2",
       "vcpu": 2,
       "memoryGiB": 8,
-      "sessionMaxSeconds": null,
+      "sessionMaxSeconds": 21600,
       "opening": "standard",
       "activeDeadline": null,
       "machineChoice": [
@@ -199,7 +199,7 @@
           "priceCents": 2000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 40,
           "highlighted": false,
@@ -214,7 +214,7 @@
           "bullets": [
             "Your own 2 vCPU · 8 GB computer on AWS (India)",
             "50 GB disk for your projects",
-            "No session time limit"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 50
         },
@@ -225,7 +225,7 @@
           "priceCents": 10000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 500,
           "highlighted": true,
@@ -242,8 +242,7 @@
           "bullets": [
             "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
             "100 GB disk for your projects",
-            "No session time limit",
-            "Bigger sizes count more of your monthly time"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 100
         }
@@ -321,7 +320,7 @@
       "size": "std-2",
       "vcpu": 2,
       "memoryGiB": 8,
-      "sessionMaxSeconds": null,
+      "sessionMaxSeconds": 21600,
       "opening": "standard",
       "activeDeadline": null,
       "machineChoice": [
@@ -490,7 +489,7 @@
           "priceCents": 2000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 40,
           "highlighted": false,
@@ -505,7 +504,7 @@
           "bullets": [
             "Your own 2 vCPU · 8 GB computer on AWS (India)",
             "50 GB disk for your projects",
-            "No session time limit"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 50
         },
@@ -516,7 +515,7 @@
           "priceCents": 10000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 500,
           "highlighted": true,
@@ -533,8 +532,7 @@
           "bullets": [
             "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
             "100 GB disk for your projects",
-            "No session time limit",
-            "Bigger sizes count more of your monthly time"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 100
         }
@@ -566,7 +564,7 @@
       "size": "std-2",
       "vcpu": 2,
       "memoryGiB": 8,
-      "sessionMaxSeconds": null,
+      "sessionMaxSeconds": 21600,
       "opening": "standard",
       "activeDeadline": null,
       "machineChoice": [
@@ -685,7 +683,7 @@
           "priceCents": 2000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 40,
           "highlighted": false,
@@ -700,7 +698,7 @@
           "bullets": [
             "Your own 2 vCPU · 8 GB computer on AWS (India)",
             "50 GB disk for your projects",
-            "No session time limit"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 50
         },
@@ -711,7 +709,7 @@
           "priceCents": 10000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 500,
           "highlighted": true,
@@ -728,8 +726,7 @@
           "bullets": [
             "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
             "100 GB disk for your projects",
-            "No session time limit",
-            "Bigger sizes count more of your monthly time"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 100
         }
@@ -906,7 +903,7 @@
           "priceCents": 2000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 40,
           "highlighted": false,
@@ -921,7 +918,7 @@
           "bullets": [
             "Your own 2 vCPU · 8 GB computer on AWS (India)",
             "50 GB disk for your projects",
-            "No session time limit"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 50
         },
@@ -932,7 +929,7 @@
           "priceCents": 10000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 500,
           "highlighted": true,
@@ -949,8 +946,7 @@
           "bullets": [
             "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
             "100 GB disk for your projects",
-            "No session time limit",
-            "Bigger sizes count more of your monthly time"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 100
         }
@@ -1142,7 +1138,7 @@
           "priceCents": 2000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 40,
           "highlighted": false,
@@ -1157,7 +1153,7 @@
           "bullets": [
             "Your own 2 vCPU · 8 GB computer on AWS (India)",
             "50 GB disk for your projects",
-            "No session time limit"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 50
         },
@@ -1168,7 +1164,7 @@
           "priceCents": 10000,
           "vcpu": 2,
           "memoryGiB": 8,
-          "sessionMaxSeconds": null,
+          "sessionMaxSeconds": 21600,
           "opening": "standard",
           "fairUseHours": 500,
           "highlighted": true,
@@ -1185,8 +1181,7 @@
           "bullets": [
             "Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)",
             "100 GB disk for your projects",
-            "No session time limit",
-            "Bigger sizes count more of your monthly time"
+            "Sessions up to 6 hours; your files are kept"
           ],
           "storageGiB": 100
         }

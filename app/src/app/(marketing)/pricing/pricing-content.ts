@@ -72,11 +72,12 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
             items: [
                 {
                     question: 'What is a session?',
-                    answer: `A session is one stretch of time while your computer is running. Free sessions last up to 1 hour. Standard and Premium: No session time limit. Fair use still applies to every plan. At the Free session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
+                    answer: `A session is one stretch of time while your computer is running. Free sessions last up to ${hours(CATALOG_V3.free_v3.sessionMaxSeconds!)} hour. Standard and Premium sessions last up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours. At the session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
                 },
                 {
-                    question: 'What does fair use mean?',
-                    answer: `Usage is included for everyday work: ${offers.map(offer => `about ${hours(offer.fairUseSeconds)} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`).join(', ')}. Older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach fair use, your computer pauses until your allowance renews, or you can upgrade. Free renews each calendar month in UTC; paid plans renew each billing period. Starting another session does not reset fair use.`,
+                    // Paid compute policy v1 (founder e713d157): Free keeps a monthly allowance; Standard and Premium have none.
+                    question: 'How much computer time is included?',
+                    answer: `Free includes about ${hours(CATALOG_V3.free_v3.fairUseSeconds)} hours of computer time a month; older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach it, your computer pauses until it renews each calendar month in UTC, or you can upgrade. Starting another session does not reset it. Standard and Premium have no monthly computer-hours allowance: each session lasts up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours, and starting a computer depends on available capacity.`,
                 },
                 {
                     question: 'What stays after a session?',
@@ -87,8 +88,8 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
                     answer: 'Start a paid plan from Settings → Billing. Standard to Premium upgrades show the prorated price before you pay and apply once payment succeeds. Cancellations and changes to a lower plan take effect at the end of your billing period. Your paid plan stays active until then.',
                 },
                 {
-                    question: 'Why do bigger computers use time faster?',
-                    answer: 'Bigger computers use more resources: 4 vCPU counts double and 8 vCPU counts four times toward your monthly time. One hour on 2 vCPU uses one hour of that time; on 4 vCPU it uses two, and on 8 vCPU it uses four. Your choice applies to your next session.',
+                    question: 'Which computer sizes can I choose?',
+                    answer: 'Free runs a 2 vCPU computer on Cloudflare. Standard runs your own 2 vCPU · 8 GB computer on AWS (India). Premium lets you choose 2, 4 or 8 vCPU (8, 16 or 32 GB). Your choice applies to your next session.',
                 },
                 {
                     question: 'How much storage do I get?',

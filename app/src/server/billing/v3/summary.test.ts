@@ -68,12 +68,12 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([{ ...e, deadlineAt: null }], window, now)).toBe(14400);
         expect(usedSecondsInWindow([e], { ...window, end: '2026-10-19T11:15:00Z' }, now)).toBe(3600);
     });
-    it('a paid running session has no hours deadline, even with its grant nearly used (paid compute policy v1)', () => {
+    it('a paid running session ends only at its six-hour cap, even with its grant nearly used (paid compute policy v1)', () => {
         const args = input('premium_monthly_v3');
         args.sizePreference = 'std-2';
         args.epochs = [epoch({ size: 'cmp-8', weight: 4 })];
         args.grants = [{ ...args.grants[0]!, amount: BigInt(14400 + 241) }];
-        expect(buildSummaryV3(args).computer.activeDeadline).toBeNull();
+        expect(buildSummaryV3(args).computer.activeDeadline).toBe('2026-10-19T17:00:00Z'); // ready 11:00 + 6 h
         expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
     });
     it.each([['std-2', 2, 8], ['cmp-4', 4, 16], ['cmp-8', 8, 32]] as const)(
@@ -113,7 +113,7 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
             { start: start.toISOString(), end: end.toISOString() }, now)).toBe(14400);
         const args = input('premium_monthly_v3'); args.epochs = [epoch()]; args.sizePreference = 'cmp-4';
-        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: null, opening: 'standard', activeDeadline: null });
+        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: 21600, opening: 'standard', activeDeadline: '2026-10-19T17:00:00Z' });
     });
     it.each([0.8, 1, 2])('Standard at %s of its 40 hours is recorded but never near or paused (paid compute policy v1)', ratio => {
         const args = input('standard_monthly_v3');
@@ -145,10 +145,10 @@ describe('v3 summary', () => {
     });
 });
 
-describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans', () => {
+describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans, only the six-hour session cap', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
-        '%s / %s has no hours deadline, before or long after the old exhaustion point, and ignores a retired session deadline', (sku, size, weight) => {
+        '%s / %s ends only at ready + 6 h, before or long after the old exhaustion point, and ignores a stored earlier deadline', (sku, size, weight) => {
             const args = input(sku);
             args.grants[0]!.amount = BigInt(144000);
             const readyAt = '2026-10-19T00:00:00Z';
@@ -157,7 +157,7 @@ describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans
             const oldExhaustion = Date.parse(readyAt) + (144000 - 3600) / weight * 1000;
             for (const current of [new Date(readyAt), new Date(oldExhaustion + 3600000)]) {
                 args.now = current;
-                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: null });
+                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: 21600, activeDeadline: '2026-10-19T06:00:00Z' });
                 expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
             }
         });
@@ -165,6 +165,27 @@ describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans
         const args = input('standard_monthly_v3');
         args.grants = [{ ...args.grants[0]!, subscriptionId: 'other' }];
         expect(buildSummaryV3(args).fairUse).toEqual({ status: 'paused', resetsAt: '2026-11-10T00:00:00Z' });
+    });
+    // The start gate exempts a renewal whose grant is still landing (compute-access.ts); the summary agrees, so a genuine
+    // renewal never shows monthly time used up for those minutes. Bounded: past GRANT_PENDING_SECONDS, or with a refund
+    // or revoke row (a real zero), it is the unreceipted case above.
+    it('a renewal whose grant is still landing (zero allowance, within ten minutes) is unmetered; after that it is not', () => {
+        const renewal = (secondsAgo: number) => {
+            const args = input('standard_monthly_v3');
+            const periodStart = new Date(now.getTime() - secondsAgo * 1000), periodEnd = new Date(periodStart.getTime() + 30 * 86_400_000);
+            args.subs = [{ ...args.subs[0]!, currentPeriodStart: periodStart, currentPeriodEnd: periodEnd }];
+            args.grants = [];
+            return args;
+        };
+        expect(buildSummaryV3(renewal(120)).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(buildSummaryV3(renewal(599)).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(buildSummaryV3(renewal(600)).fairUse).toMatchObject({ status: 'paused' });
+        expect(buildSummaryV3(renewal(600)).fairUse).not.toHaveProperty('policy');
+        const revoked = renewal(120);
+        revoked.grants = [{ ...input('standard_monthly_v3').grants[0]!, kind: 'revoke', amount: BigInt(0), periodStart: revoked.subs[0]!.currentPeriodStart!, periodEnd: revoked.subs[0]!.currentPeriodEnd! }];
+        expect(buildSummaryV3(revoked).fairUse).not.toHaveProperty('policy');
+        const free = input(); free.grants = [];
+        expect(buildSummaryV3(free).fairUse).not.toHaveProperty('policy');
     });
 });
 
@@ -505,9 +526,9 @@ describe('round 4: standing fields (additive)', () => {
         expect(summary.fairUse).toEqual({ status: 'ok', resetsAt: free.window.end });
         // Without an AWS placement (standing free) it is still Free's limits, at Free's size.
         expect(buildSummaryV3({ ...lapsed, placementProvider: null, epochs: [] }).computer).toMatchObject({ standing: 'free', size: 'free-cf', sessionMaxSeconds: 3600 });
-        // Still in grace (11-05): the paid plan's limits stand (no session cap, the paid period).
+        // Still in grace (11-05): the paid plan's limits stand (six-hour sessions, the paid period, no hours cutoff).
         const grace = buildSummaryV3({ ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] });
-        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: null });
+        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: 21600 });
         expect(grace.fairUse).toMatchObject({ status: 'ok', resetsAt: '2026-12-01T00:00:00Z' });
         // A never-paid (incomplete) subscription is Free too.
         expect(buildSummaryV3({ ...lapsed, subs: [{ ...lapsed.subs[0]!, status: 'incomplete' }], paymentIssues: [] }).computer)

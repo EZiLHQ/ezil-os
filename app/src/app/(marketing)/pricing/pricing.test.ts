@@ -62,16 +62,21 @@ describe('v3 public plans', () => {
     it('explains sessions, fair use, persistence, billing changes and storage in six FAQs', () => {
         const faq = getPricingContent().faq.items;
         expect(faq).toHaveLength(6);
-        expect(faq[0].answer).toContain('Free sessions last up to 1 hour. Standard and Premium: No session time limit. Fair use still applies to every plan.');
+        expect(faq[0].answer).toContain('Free sessions last up to 1 hour. Standard and Premium sessions last up to 6 hours.');
         expect(faq[0].answer).toContain('computer stops');
-        for (const offer of Object.values(CATALOG_V3)) expect(faq[1].answer).toContain(`about ${offer.fairUseSeconds / 3600} ${offer.tier === 'premium' ? 'standard-hours' : 'hours'} a month on ${offer.name}`);
-        expect(faq[1].answer).toContain('does not reset fair use');
+        // Paid compute policy v1: Free keeps its monthly allowance; no paid plan is sold monthly hours (or "unlimited").
+        expect(faq[1].question).toBe('How much computer time is included?');
+        expect(faq[1].answer).toContain('Free includes about 5 hours of computer time a month; older Free accounts keep 8 hours.');
+        expect(faq[1].answer).toContain('Standard and Premium have no monthly computer-hours allowance: each session lasts up to 6 hours');
+        expect(faq[1].answer).toContain('does not reset it');
+        expect(faq[1].answer).not.toMatch(/40 hours|500|standard-hours/);
+        expect(JSON.stringify(faq)).not.toMatch(/monthly time|No session time limit/);
         expect(faq[2].answer).toContain('files and installed tools stay');
         expect(faq[2].answer).toContain('Running processes stop');
         expect(faq[3].answer).toContain('once payment succeeds');
         expect(faq[3].answer).toContain('end of your billing period');
-        expect(faq[4].question).toBe('Why do bigger computers use time faster?');
-        expect(faq[4].answer).toContain('4 vCPU counts double and 8 vCPU counts four times');
+        expect(faq[4].question).toBe('Which computer sizes can I choose?');
+        expect(faq[4].answer).toContain('Premium lets you choose 2, 4 or 8 vCPU (8, 16 or 32 GB)');
         expect(cards(render()).join('')).not.toMatch(/standard-hour|500|40 hours a month|5 hours a month/);
         expect(cards(render())[0]).toContain('2 vCPU · 6 GB');
         expect(cards(render())[2]).toContain('Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)');

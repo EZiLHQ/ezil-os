@@ -211,7 +211,7 @@ describe('billingV2EntitlementReader', () => {
     it.each([{ BILLING_TAB_ENABLED: '1' }, { BILLING_ENFORCEMENT: '1' }])('either metering flag reads billing (%j)', async config => {
         const { deps } = fixture({ config: readBillingConfig(config), subs: [subscription({ sku: 'compute_monthly_v2' })], grants:[grant()], sizePreference: 'cmp-8' });
         expect(await billingV2EntitlementReader(() => deps).read(USER)).toEqual({ source: 'billing_v2',
-            status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false });
+            status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false, grantPending: false });
     });
 
     it('a failed billing read is logged and resolves as no entitlement', async () => {
@@ -444,38 +444,43 @@ describe('v3 compute enforcement', () => {
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now: NOW })).toEqual({ allowed: true });
         expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ size: 'std-2' }));
     });
+    // Paid compute policy v1: an unmetered paid session stores readiness + its six-hour session cap (the sweep ends it there,
+    // never earlier for hours), which also marks it paid-era for the R1-04 drop rule (past Free's one hour).
+    const paidEra = (readyAt: Date, maxRunSeconds: number) => ({ decision: { admit: true, maxRunSeconds },
+        deadlineAt: new Date((Math.floor(readyAt.getTime() / 1000) + maxRunSeconds) * 1000).toISOString().replace('.000Z', 'Z') });
     // Paid compute policy v1 (founder e713d157): what used to be the 240-second cmp-8 floor no longer refuses a paid start.
-    it.each([0, 239, 240])('Premium cmp-8 starts with %s standard-seconds of its grant left, with no hours deadline', async remaining => {
+    it.each([0, 239, 240])('Premium cmp-8 starts with %s standard-seconds of its grant left, with no hours cutoff', async remaining => {
         const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku: 'premium_monthly_v3' })], sizePreference: 'cmp-8',
             epochs: [epoch(START, '2026-10-10T01:00:00Z')], grants: [grant({ amount: BigInt(14400 + remaining) })] });
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW }))
             .toEqual({ allowed: true });
+        // The six-hour session, never the 60 s left of the grant.
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'cmp-8', readyAt: NOW, overheadSeconds: 0 }))
-            .toMatchObject({ status: 'opened', deadlineAt: null, decision: { admit: true } });
+            .toMatchObject({ status: 'opened', ...paidEra(NOW, 21_600) });
     });
     it('rates an existing paid Cloudflare machine at weight one despite a cmp-8 preference', async () => {
         const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku: 'premium_monthly_v3' })], sizePreference: 'cmp-8', grants: [grant({ amount: BigInt(60) })] });
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW })).toEqual({ allowed: true });
-        // Weight one: the whole 500 h fair use in actual seconds (cmp-8 would be a quarter). Paid: no hours deadline.
+        // Weight one; the six-hour session cap.
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'free-cf', readyAt: NOW, overheadSeconds: 0 }))
-            .toMatchObject({ deadlineAt: null, decision: { admit: true, maxRunSeconds: 1_800_000, size: 'std-2' } });
+            .toMatchObject({ ...paidEra(NOW, 21_600), decision: { size: 'std-2' } });
     });
 
     it.each([
         ['standard_monthly_v3', 'std-2', 144000],
         ['premium_monthly_v3', 'cmp-8', 1800000],
-    ] as const)('%s records weighted standard-seconds and opens with no hours deadline (paid compute policy v1)', async (sku, size, allowance) => {
+    ] as const)('%s records weighted standard-seconds and opens with no hours cutoff (paid compute policy v1)', async (sku, size, allowance) => {
         const { deps, calls } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku })], grants: [grant({ amount: BigInt(allowance) })],
             epochs: [epoch(START, '2026-10-10T01:00:00Z')], sizePreference: 'cmp-8' });
         const state = await loadComputeBillingState(deps, USER, NOW);
-        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: null,
+        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: 21_600,
             usedStdSeconds: 14400, allowanceStdSeconds: allowance, overage: null });
         const readyAt = new Date('2026-10-18T13:00:00Z');
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt, overheadSeconds: 0 }))
-            .toMatchObject({ status: 'opened', decision: { admit: true }, deadlineAt: null });
+            .toMatchObject({ status: 'opened', ...paidEra(readyAt, 21_600) });
         expect(calls.find(call => call.name === 'epochsFor')?.args).toEqual([USER, new Date(START)]);
     });
     it('Free creates a one-hour deadline and refuses the next session with 59 seconds left', async () => {
@@ -516,15 +521,18 @@ describe('v3 compute enforcement', () => {
     // Paid compute policy v1 (founder e713d157): no hours cutoff for verified paid plans, the Standard trial included.
     const overGrant = () => Array.from({ length: 3 }, (_, i) => epoch(`2026-10-1${i + 1}T00:00:00Z`, `2026-10-1${i + 1}T23:00:00Z`)); // 69 h
     it.each([['active', 'standard_monthly_v3'], ['trialing', 'standard_monthly_v3'], ['active', 'premium_monthly_v3']] as const)(
-        '%s %s past its 40 h grant starts, opens with no hours deadline, and reads as exempt', async (status, sku) => {
+        '%s %s past its 40 h grant starts, opens with no hours cutoff, and reads as exempt', async (status, sku) => {
             const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }), subs: [subscription({ sku, status })],
                 grants: [grant({ amount: BigInt(144000) })], epochs: overGrant() });
             const state = await loadComputeBillingState(deps, USER, NOW);
-            expect(state.usedStdSeconds).toBe(144000); // recorded (clipped to the grant for rating), never a refusal
+            // Recorded past the 40 h grant, never clipped at it: each (pre-policy 23 h) session is rated to its six-hour
+            // cap at cmp-8's weight four (3 × 6 h × 4 = 72 h), and it is never a refusal.
+            expect(state.usedStdSeconds).toBe(3 * 21_600 * 4);
             expect(paidComputeUnmeteredState(state)).toBe(true);
             expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW })).toEqual({ allowed: true });
+            // Past the grant it still gets the whole six-hour session.
             expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'std-2', readyAt: NOW, overheadSeconds: 0 }))
-                .toMatchObject({ status: 'opened', deadlineAt: null, decision: { admit: true } });
+                .toMatchObject({ status: 'opened', ...paidEra(NOW, 21_600) });
             expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(true);
             expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' } });
         });
@@ -601,6 +609,39 @@ describe('round 4: grace (D17), dropped plans (D18) and the Free hold on AWS (D1
         expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: true });
         premium.input.grants = [grant({ periodStart: ago(2 * DAY), periodEnd: new Date(NOW.getTime() + 28 * DAY), amount: BigInt(0) })];
         expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    // Coordinator decision under founder e713d157: the EXISTING seven-day renewal grace of a previously paid plan gets the
+    // same no-monthly-hours policy. The renewal is unpaid, so the period has no receipt: the grace itself is the access.
+    it('paid compute policy v1: a renewal in its seven-day grace (no current receipt) has no hours cutoff', async () => {
+        // Two 22 h cmp-8 sessions this (renewal) period, rated to their six-hour caps at weight four: 48 standard-hours,
+        // over Standard's 40 h fair use, and no compute grant for the period.
+        const used = [epoch('2026-10-16T13:00:00Z', '2026-10-17T11:00:00Z'), epoch('2026-10-17T11:30:00Z', '2026-10-18T09:30:00Z')];
+        const { deps, input } = fixture({ config: enforced(), subs: [renewal()], paymentIssues: [issue({ stripeEventCreated: ago(2 * DAY) })], epochs: used });
+        expect(input.grants).toEqual([]);
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', planActive: true, paymentIssue: false, grantPending: false });
+        expect(state.usedStdSeconds).toBe(2 * 21_600 * 4); // never clipped at the 40 h allowance
+        expect(paidComputeUnmeteredState(state)).toBe(true);
+        const record = await billingV2EntitlementReader(() => deps).read(USER);
+        expect(record).toMatchObject({ status: 'active', paymentIssue: false });
+        expect(paidComputeUnmetered(record)).toBe(true);
+        expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' }, plan: { paymentIssue: 'payment_failed' } });
+        expect(await gate(deps)).toEqual({ allowed: true });
+        // The grace is not extended: on day 7 the plan runs as Free, with Free hours and no exemption.
+        input.paymentIssues = [issue({ stripeEventCreated: ago(7 * DAY) })];
+        const ended = await loadComputeBillingState(deps, USER, NOW);
+        expect(ended.planSku).toBe('free_v3');
+        expect(paidComputeUnmeteredState(ended)).toBe(false);
+        expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(false);
+    });
+
+    it.each(['unpaid', 'incomplete'])('paid compute policy v1: a raw %s plan (no grace, e.g. a never-paid first charge) is not exempt', async status => {
+        const { deps } = fixture({ config: enforced(), subs: [renewal({ status })], paymentIssues: [issue()] });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state.planSku).toBe('free_v3');
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(false);
     });
 
     it.each([
@@ -685,10 +726,14 @@ describe('round 6 R2-3: a paid period whose compute grant has not landed yet', (
     it('an AWS open passes the gate to ensure() (which waits) instead of a fair_use_paused refusal; the grant then admits it', async () => {
         const { deps, input } = fixture({ config: enforced(), subs: [started(120)] });
         expect(await gate(deps)).toEqual({ allowed: true });
-        // The Cloudflare path has no wait of its own: unchanged.
-        expect(await gate(deps, 'cloudflare')).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        // Paid compute policy v1: a renewal whose grant is still landing counts as paid, so the Cloudflare path (no wait
+        // of its own) is no longer refused for hours, and the per-person hour cap reads it as exempt.
+        expect(paidComputeUnmeteredState(await loadComputeBillingState(deps, USER, NOW))).toBe(true);
+        expect(await gate(deps, 'cloudflare')).toEqual({ allowed: true });
         // The entitlement stays unpaid until the grant lands (ensure() reads it as Free, so it must wait).
-        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ status: 'expired' });
+        const pending = await billingV2EntitlementReader(() => deps).read(USER);
+        expect(pending).toMatchObject({ status: 'expired', grantPending: true });
+        expect(paidComputeUnmetered(pending)).toBe(true);
         input.grants = [grant({ amount: BigInt(144000), periodStart: new Date(NOW.getTime() - 120_000), periodEnd: new Date(NOW.getTime() + 30 * 86_400_000) })];
         expect((await loadComputeBillingState(deps, USER, NOW)).grantPending).toBe(false);
         expect(await gate(deps)).toEqual({ allowed: true });

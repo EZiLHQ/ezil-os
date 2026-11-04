@@ -556,7 +556,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 const outcome = await deps.pool.reserveDemand({ kind: request.kind === 'create' ? 'create' : 'wake', userId: request.userId,
                     computerId: error.target.computerId, requestId: newId(), region: error.target.region, zoneId: error.target.zoneId,
                     instanceType: error.target.instanceType, deploymentDigest: demandDeploymentDigest(cold.intent.deployment),
-                    source: request.kind === 'lease' ? request.expected : null });
+                    source: request.kind === 'lease' ? request.expected : null, userHoursExempt });
                 if (typeof outcome === 'object') return { admitted: false as const, reason: 'capacity_attempt_expired' as const, capacityAttemptId: outcome.attemptId };
                 return outcome === 'refused' ? { admitted: false as const, reason: 'region_capacity' as const }
                     : { admitted: false as const, reason: 'capacity_waiting' as const };

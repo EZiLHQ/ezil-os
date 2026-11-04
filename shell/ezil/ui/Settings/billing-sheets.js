@@ -376,7 +376,9 @@ export function openSessionEndSheet (options) {
     const sheet = billingSheet(options, action, 'Your session ended');
     if ( sheet.existing ) return null;
     sheet.dialog.dataset.sheet = 'session-end';
-    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: No session time limit — ${money(offer.priceCents)}/month.`);
+    // Paid compute policy v1: paid sessions last up to six hours (offer.sessionMaxSeconds), never "no limit".
+    const longer = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600 ? `sessions up to ${offer.sessionMaxSeconds / 3600} hours` : 'longer sessions';
+    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: ${longer} — ${money(offer.priceCents)}/month.`);
     offerDetails(sheet, offer);
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
     sheet.button(free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {

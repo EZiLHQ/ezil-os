@@ -87,7 +87,7 @@ export function standingCopy (standing, data) {
         // Round 6 (R4-02): a held 4 or 8 vCPU computer does not open on Free (the hold never resizes).
         const closed = heldClosedSize(data?.computer);
         return closed ? heldClosedText(closed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
     }
     return '';
 }
@@ -327,7 +327,8 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
             awaitingPayment ? `${whole(pending.credits)} credits for this period. Added once your payment goes through.`
                 : pending ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
             // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
-            view.stale ? '' : periodEnd ? dateLabel(periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(periodEnd)}.` : ''
+            // Paid compute policy v1: an unmetered usage card names no reset date, so the credits always say theirs.
+            view.stale ? '' : periodEnd ? paidComputeUnmetered(summary) || dateLabel(periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(periodEnd)}.` : ''
                 : ai.grant?.per === 'period' && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? `Your plan adds ${whole(ai.grant.amount)} credits each month.` : '',
             'Used by EZiL AI in Code and Chat.',
         ] });
@@ -391,7 +392,7 @@ function aiMeterV3 (summary, options = {}) {
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
         // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
-        ...extras, included && dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
+        ...extras, included && (paidComputeUnmetered(summary) || dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true)) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
         'Used by EZiL AI in Code and Chat.',
     ] });
 }
@@ -546,10 +547,11 @@ function offerCardV3 (summary, offer) {
     const configs = (offer.machineChoice ?? []).map(code => {
         const size = sizeInfoV3(summary, code);
         if ( ! size ) return '';
-        const time = code === 'free-cf' ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}`
-            : `about ${whole(offer.fairUseHours / size.weight)} hours a month`;
+        // Paid compute policy v1: no plan card sells monthly computer hours; each configuration shows its session length.
+        const time = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
+            ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}` : '';
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
-        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now} <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span></li>`;
+        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}${time ? ` <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span>` : ''}</li>`;
     }).join('');
     // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
     const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;

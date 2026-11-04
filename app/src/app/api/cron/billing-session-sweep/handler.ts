@@ -178,21 +178,45 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             }
         }
 
+        async function closeDue(epoch: StoredComputeEpoch, reason: SweepReason, deadline: number) {
+            const computer = { userId: epoch.userId, computerId: epoch.computerId };
+            const endedAt = new Date(Math.min(now.getTime(), deadline));
+            if (!deps.config.enforcementEnabled) {
+                console.info('[billing.sweep] shadow', { ...computer, epochId: epoch.id, reason, endedAt });
+                counts.shadow++;
+                return;
+            }
+            // Failed/asynchronous provider stops never extend a billable session.
+            try {
+                await tryStop(computer, reason);
+            } finally {
+                if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt, reason }) === 'closed') counts.closed++;
+            }
+        }
+
         for (const epoch of policyCandidates) {
             const state = await stateFor(epoch.userId);
-            // Round 6 R2-3: a paid plan (no session cap) whose new period's grant is still on its way is not out of
-            // allowance; GRANT_PENDING_SECONDS bounds the wait (compute-access.ts).
-            if (state.grantPending) continue;
-            // Paid compute policy v1: a paid Standard/Premium session is never closed or stopped for hours.
-            if (paidComputeUnmeteredState(state)) continue;
             const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
+            // Paid compute policy v1: a paid Standard/Premium session is never closed or stopped for hours (a stored
+            // deadline from an older app or from fair use is no bound). Only its six-hour session cap ends it: saved and
+            // stopped through the ordinary stop, files kept; the next open is a new session. A renewal whose grant is
+            // still landing is paid here too: pending exempts the monthly quota, never the session cap.
+            if (paidComputeUnmeteredState(state)) {
+                if (now.getTime() < maximum) continue;
+                await closeDue(epoch, 'session_max', maximum);
+                continue;
+            }
+            // Round 6 R2-3: a paid plan whose new period's grant is still on its way is not out of allowance;
+            // GRANT_PENDING_SECONDS bounds the wait (compute-access.ts).
+            if (state.grantPending) continue;
             const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
                 ? state.summary.computer.activeDeadline : epoch.deadlineAt;
             const stored = storedDeadline === null ? Infinity : Date.parse(storedDeadline);
             // Round 6 R1-04: a session opened on a paid plan with no session cap (its stored deadline lies past this
             // plan's cap) and still open on Free ends at the drop: its recorded time, else now (the sweep runs every
             // minute), never back-dated to ready + 1 h, and never before the Free hour itself. Only a STORED deadline says
-            // paid era (openComputeEpochAtReady always stores one): a Worker-opened free-cf epoch has none, and keeps its hour.
+            // paid era (openComputeEpochAtReady always stores one, an unmetered paid session included): a Worker-opened
+            // free-cf epoch has none, and keeps its hour.
             const paidEra = state.planSku === 'free_v3' && storedDeadline !== null && maximum !== Infinity && stored > maximum + 1000;
             const dropAt = state.freeSince ? Math.min(Date.parse(state.freeSince), now.getTime()) : now.getTime();
             const deadline = paidEra ? Math.max(maximum, dropAt) : Math.min(maximum, stored);
@@ -214,27 +238,17 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
                 }
                 reason = overageOn ? 'overage_cap' : 'allowance_exhausted';
             }
-            const computer = { userId: epoch.userId, computerId: epoch.computerId };
-            const endedAt = new Date(Math.min(now.getTime(), deadline));
-            if (!deps.config.enforcementEnabled) {
-                console.info('[billing.sweep] shadow', { ...computer, epochId: epoch.id, reason, endedAt });
-                counts.shadow++;
-                continue;
-            }
-            // Failed/asynchronous provider stops never extend a billable session.
-            try {
-                await tryStop(computer, reason);
-            } finally {
-                if (await deps.store.closeEpoch({ computerId: epoch.computerId, epochId: epoch.id, endedAt, reason }) === 'closed') counts.closed++;
-            }
+            await closeDue(epoch, reason, deadline);
         }
 
         if (deps.config.enforcementEnabled) {
             const recent = await deps.store.policyClosedEpochsSince(new Date(now.getTime() - RETRY_WINDOW_MS), limit);
             for (const epoch of recent) {
                 if (attempted.has(epoch.computerId)) continue;
-                // A close under the retired paid cap must not stop a still-running job.
+                // A close under a session cap the plan no longer has must not stop a still-running job.
                 if (epoch.endReason === 'session_max' && (await stateFor(epoch.userId)).sessionMaxSeconds === null) continue;
+                // Paid compute policy v1: an hours close (an older app's) is never retried against a now-unmetered paid plan.
+                if (epoch.endReason === 'allowance_exhausted' && paidComputeUnmeteredState(await stateFor(epoch.userId))) continue;
                 const computer = { userId: epoch.userId, computerId: epoch.computerId };
                 let running = false;
                 try { running = await isStillRunning(computer, new Date(epoch.endedAt!)); } catch { /* No blind retries on an unavailable status. */ }

@@ -149,7 +149,7 @@ push('no code, no message → unavailable', describeScreenError(undefined, undef
     // computer cannot open on Free (the hold opens only 2 vCPU and never resizes).
     for ( const [name, info] of shapes ) {
         const plan = describePlan(info);
-        push(`Round 6: files_on_aws via ${name} → the Free limits hint`, plan.hint === 'It opens on the Free plan with Free limits; upgrade for no session time limit.', plan);
+        push(`Round 6: files_on_aws via ${name} → the Free limits hint`, plan.hint === 'It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.', plan);
     }
     const bigMachine = { ...held, machine: { ...held.machine, vcpu: 4, memoryMiB: 16384, instanceType: 'm6i.xlarge' } };
     const closed = [

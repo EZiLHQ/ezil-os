@@ -807,6 +807,8 @@ export async function reconcileAwsFleet(
     const claimed = await claimAwsPlacementsToReconcile(deps.db, limit);
     // One usage read per pass, only when caps can bind and a row may be RUNNING.
     const usage = policy?.caps && claimed.length > 0 ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : undefined;
+    // Paid compute policy v1: one billing-backed exemption per pass (one read per over-cap owner).
+    const userHoursExempt = policy?.userHoursExempt ?? paidUserHoursExemption();
     for (const { computerId } of claimed) {
         if (deps.signal?.aborted) break; // Out of budget: the rest rotate to the next pass.
         try {
@@ -829,7 +831,7 @@ export async function reconcileAwsFleet(
                 continue;
             }
             // Caps only: a lapsed technical lease alone never stops a running guest from the fleet pass (see enforceLeaseExpiry).
-            if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage, enforceLeaseExpiry: false }))) limitStops += 1;
+            if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage, userHoursExempt, enforceLeaseExpiry: false }))) limitStops += 1;
         } catch (error) {
             if (!(error instanceof PlacementIntegrityError || error instanceof ImageJobConflictError)) throw error;
         }
