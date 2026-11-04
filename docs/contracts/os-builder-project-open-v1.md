@@ -79,7 +79,7 @@ The route, the body `{userIdToken, projectId, repositoryId}`, identity verificat
 - **Never touched.** The working tree, the index and HEAD.
 - **Out of scope.** Cloudflare Artifacts (Bearer), because git 2.34.1 cannot take a Bearer token from a credential helper.
 
-**Refresh endpoint (for the app; the app calls it every ≤ 4 min while Code shows the project, and on reopen or remint).** `POST {worker}/sandbox/<sandboxName>/repo-grant`, v2-signed like repo-open, Cloudflare computers only. A stopped computer is refused (`runtime_not_running`), never started.
+**Refresh endpoint (for the app; 1.1.0: the app renews from the returned `expiresAt` while Code shows the project, and on reopen or remint, per universe-repo-open-v1 `works.projectGrantRenewal`: under 60 s left is not installed; at most 120 s left means reauthenticate once before the next ask; otherwise renew 120 s before expiry; one renewal in flight).** `POST {worker}/sandbox/<sandboxName>/repo-grant`, v2-signed like repo-open, Cloudflare computers only. A stopped computer is refused (`runtime_not_running`), never started.
 - **Request** (exactly these keys; no ref or branch, so a refresh never chooses one): `{ "repositoryId": "<lowercase uuid>", "canonicalURL": "https://github.ezil.work/<h>/<n>.git" | (os-staging) "https://git-qa.ezil.work/<h>/<n>.git", "git": { "token": "egg_<64 hex>", "expiresAt": "<ISO, 60 s..330 s ahead>", "scope": "read"|"write", "username"?: "ezil" } }`. The `git` object is Universe's `open` answer's `git` as it is.
 - **Answers:**
 
