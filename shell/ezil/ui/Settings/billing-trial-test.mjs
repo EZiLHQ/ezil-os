@@ -224,7 +224,7 @@ test('payment_failed: the free month ended and $20.00 did not go through; Standa
     return h.fragment(h.api.summaryV3Html(trialSummaryV3('payment_failed')));
 });
 
-test('payment_pending: "Your free month has ended. We\'re collecting your first $20.00 payment…"; never active; portal; no cancel', async h => {
+test('payment_pending: "Your free month has ended. We\'re collecting your first $20.00 payment…"; never active; portal; the server\'s cancel', async h => {
     for ( const standing of ['free', 'files_on_aws'] ) {
         const summary = trialSummaryV3('payment_pending', { standing });
         const el = h.fragment(h.api.summaryV3Html(summary));
@@ -242,12 +242,24 @@ test('payment_pending: "Your free month has ended. We\'re collecting your first 
         const chip = card.querySelector('[data-role="plan-status"]');
         assert.deepEqual([clean(chip), chip.dataset.status], ['Payment pending', 'payment_pending']);
         // Never "active", never the trial's live lines, never the renewal preview as a charge or date.
-        assert.doesNotMatch(clean(el), /\bActive\b|Free trial|Free until|First charge|Renews|Cancel plan|Cancel free month|grace|upgrade for sessions|didn't go through/i, standing);
-        assert.equal(el.querySelector('[data-action="cancel"], [data-action="upgrade"], [data-action="trial"], [data-action="checkout"]'), null, standing);
+        assert.doesNotMatch(clean(el), /\bActive\b|Free trial|Free until|First charge|Renews|Cancel free month|grace|upgrade for sessions|didn't go through/i, standing);
+        assert.equal(el.querySelector('[data-action="upgrade"], [data-action="trial"], [data-action="checkout"], [data-action="resume"]'), null, standing);
+        // Review U2: the server's cancel (actions.cancel) is offered; its sheet says what it does and does not do.
+        assert.equal(clean(el.querySelector('.ezil-billing-v3-footer [data-action="cancel"]')), 'Cancel plan', standing);
         // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions.
         assert.match(clean(el.querySelector('[data-role="your-computer"]')), standing === 'free'
             ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare Sessions up to 1 hour/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\) Sessions up to 1 hour on Free/, standing);
     }
+    // No cancel from the server: none offered.
+    const noCancel = trialSummaryV3('payment_pending'); noCancel.actions.cancel = false;
+    assert.equal(h.fragment(h.api.summaryV3Html(noCancel)).querySelector('[data-action="cancel"]'), null);
+    // Cancelled while the first payment is collected: said in the banner, with Resume; never "active" or "stays active".
+    const cancelled = trialSummaryV3('payment_pending');
+    Object.assign(cancelled.plan, { status: 'cancels', cancelsAt: '2027-01-05T14:30:00Z' });
+    const banner = h.fragment(h.api.summaryV3Html(cancelled)).querySelector('[data-role="trial-payment-pending"]');
+    assert.match(clean(banner), /You cancelled later renewals\. If that payment goes through, Standard runs until Jan 5, 2027 and then ends\./);
+    assert.equal(clean(banner.querySelector('[data-action="resume"]')), 'Resume plan');
+    assert.doesNotMatch(clean(banner), /stays active|\bActive\b/);
     // No portal for this account: the banner still says what happens, with no button.
     const noPortal = trialSummaryV3('payment_pending'); noPortal.actions.portal = false;
     assert.equal(h.fragment(h.api.summaryV3Html(noPortal)).querySelector('[data-role="trial-payment-pending"] button'), null);
@@ -374,6 +386,30 @@ test('completion: "Your free month is starting", then "has started" with the fir
     assert.equal(h.done, 1);
 });
 
+test('review U1: a completed trial checkout is confirmed only by paid access, never by the Standard SKU alone', async h => {
+    h.replies['billing.quoteTrial'] = () => quote('2027-02-28T03:00:00Z');
+    h.replies['billing.createCheckout'] = () => embedded;
+    h.replies['billing.checkoutStatus'] = () => ok({ status: 'complete', paymentStatus: 'no_payment_required', sku: 'standard_monthly_v3', trial: true });
+    let summary = trialSummaryV3('payment_pending', { endsAt: '2027-02-28T03:00:00Z' });
+    h.replies['billing.summary'] = () => ok(summary);
+    h.openTrial({ timeZone: 'UTC' });
+    await settle();
+    h.click('[data-action="trial-continue"]');
+    await settle();
+    h.complete();
+    // Standard SKU, but paused (payment_pending, standing free), then the SKU with no standing at all: no success.
+    await h.tick(1500);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    summary = summaryV3('standard');
+    await h.tick(1500);
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    // A converted plan (no trial, paid standing) is ordinary Standard, not "free month started".
+    summary = { ...summaryV3('standard'), computer: { ...summaryV3('standard').computer, standing: 'paid' } };
+    await h.tick(1500);
+    assert.equal(clean(h.q('[data-role="upgrade-success"] p')), "You're on Standard");
+    assert.doesNotMatch(h.text(), /free month of Standard has started/);
+});
+
 test('redirect mode: the trial checkout opens the same hosted tab and polls as Standard does', async h => {
     h.replies['billing.quoteTrial'] = () => quote('2027-02-28T03:00:00Z');
     h.replies['billing.createCheckout'] = () => ok({ mode: 'redirect', sessionId: 'cs_test_redirect', url: 'https://checkout.example.test/c/pay' });
@@ -390,6 +426,23 @@ test('redirect mode: the trial checkout opens the same hosted tab and polls as S
 });
 
 // ── Trial variants of the other billing sheets ────────────────────────────────
+
+test('cancel sheet while the first payment is collected (review U2): paused-access words; never "stays active"; never a voided invoice', async h => {
+    const summary = trialSummaryV3('payment_pending');
+    h.replies['billing.cancelAtPeriodEnd'] = input => { assert.deepEqual(plain(input), { cancel: true }); return ok({ cancelsAt: '2027-01-05T14:30:00Z' }); };
+    h.handle = h.api.openCancelSheet({ container: h.q('#container'), summary, trpc: h.trpc, onDone: () => {}, onClose: () => {} });
+    const sheet = h.q('[data-role="billing-sheet"]');
+    assert.equal(clean(sheet.querySelector('h2')), 'Cancel Standard');
+    assert.equal(clean(sheet.querySelector('[data-role="sheet-body"] > p')),
+        "Your free month has ended and your first $20.00 payment is still being collected. Cancelling stops later renewals; it doesn't cancel that first payment. Standard stays paused until it goes through; if it does, Standard runs to the end of that month and then ends.");
+    assert.doesNotMatch(clean(sheet), /stays active|\bActive\b|refund|void|won't be charged|pay nothing/i);
+    assert.equal(clean(sheet.querySelector('[data-action="confirm"]')), 'Cancel later renewals');
+    h.click('[data-action="confirm"]');
+    await settle();
+    assert.equal(h.count('billing.cancelAtPeriodEnd'), 1);
+    assert.match(clean(sheet), /Later renewals are cancelled\. Your first payment is still being collected; if it goes through, Standard runs until Jan 5, 2027 and then ends\./);
+    assert.doesNotMatch(clean(sheet), /stays active|won't be charged|void/i);
+});
 
 test('cancel sheet in a trial: the free month\'s words, the same cancelAtPeriodEnd, "you won\'t be charged"', async h => {
     const summary = trialSummaryV3('trialing', { endsAt: '2026-12-05T03:30:00Z' });

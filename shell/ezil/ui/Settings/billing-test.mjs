@@ -1326,9 +1326,10 @@ try {
     mutation = () => reply({ url: 'https://billing.example.test/trial-portal' });
     click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle();
     assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-portal');
-    // The first charge is being collected: the same portal (secondary), and no cancel whose copy would not hold.
+    // The first charge is being collected: the same portal (secondary), and the server's cancel (its sheet's words
+    // are pinned in billing-trial-test.mjs).
     summary = trialSummaryV3('payment_pending'); await refresh();
-    has('[data-action="cancel"]', false);
+    click(q('.ezil-billing-v3-footer [data-action="cancel"]')); assert.equal(sheets.at(-1).kind, 'cancel'); await closeSheet();
     mutation = () => reply({ url: 'https://billing.example.test/trial-pending-portal' });
     click(q('[data-role="trial-payment-pending"] [data-action="portal"]')); await settle();
     assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-pending-portal');

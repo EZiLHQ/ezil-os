@@ -429,13 +429,6 @@ function storageMeterV3 ({ computer }) {
         tone: percent === 0 ? 'danger' : percent <= 20 ? 'warn' : 'ok', notes: [`${diskText(usedBytes)} used of your ${gb} GB disk`] });
 }
 
-/**
- * The free month is over and its first payment is being collected (or failed). A cancel now ends the plan only after
- * the period that first payment buys, so "Cancel plan" (with its "stays active until" copy) is not offered here; the
- * payment portal is.
- */
-const afterTrial = summary => ['payment_pending', 'payment_failed'].includes(planTrialOf(summary)?.state);
-
 /** The one state banner, or null. It carries the page's only primary in its state. */
 function bannerV3 (summary) {
     const { plan, actions, fairUse } = summary;
@@ -457,10 +450,14 @@ function bannerV3 (summary) {
     }
     if ( trial?.state === 'payment_pending' ) {
         // Stripe collects the first charge about an hour after the end. Nothing has failed: no alarm, no primary.
+        // A cancel here (cancelAtPeriodEnd) stops later renewals only; that first payment is still collected.
         const amount = trialAmount(summary, trial);
+        const cancelled = plan.status === 'cancels';
+        const until = cancelled && Number.isFinite(Date.parse(plan.cancelsAt ?? '')) ? trialDayLabel(plan.cancelsAt) : null;
         return { primary: false, html: `<aside class="ezil-billing-banner is-warn" data-role="trial-payment-pending" role="status">
-        <div><p class="ezil-billing-banner-title">Your free month has ended.</p>${paragraph(`We're collecting your first ${amount ? `${amount} ` : ''}payment; Standard resumes as soon as it goes through. Your files are kept.`)}</div>${actions.portal
-            ? actionHtml('portal', 'Update payment method') : ''}</aside>` };
+        <div><p class="ezil-billing-banner-title">Your free month has ended.</p>${paragraph(`We're collecting your first ${amount ? `${amount} ` : ''}payment; Standard resumes as soon as it goes through. Your files are kept.`)}${cancelled
+            ? paragraph(`You cancelled later renewals. If that payment goes through, Standard runs ${until ? `until ${until}` : 'to the end of that month'} and then ends.`, 'ezil-billing-note') : ''}</div>${actions.portal
+            ? actionHtml('portal', 'Update payment method') : ''}${cancelled && actions.cancel ? actionHtml('resume', 'Resume plan') : ''}</aside>` };
     }
     if ( trial?.state === 'ending' ) {
         const amount = trialAmount(summary, trial);
@@ -684,7 +681,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3 tabindex="-1">Invoices</h3>
             <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>
         <div class="ezil-billing-v3-footer"><p class="ezil-billing-note">Prices before tax.</p>
-            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending' && ! afterTrial(summary)
+            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending'
                 ? linkAction('cancel', planTrialOf(summary)?.state === 'trialing' ? 'Cancel free month' : 'Cancel plan') : ''}</div>`;
 }
 
