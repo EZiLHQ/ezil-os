@@ -613,7 +613,9 @@ describe('round 4: grace (D17), dropped plans (D18) and the Free hold on AWS (D1
 
     // Coordinator decision under founder e713d157: the EXISTING seven-day renewal grace of a previously paid plan gets the
     // same no-monthly-hours policy. The renewal is unpaid, so the period has no receipt: the grace itself is the access.
-    it('paid compute policy v1: a renewal in its seven-day grace (no current receipt) has no hours cutoff', async () => {
+    // `renewal()` is past_due after a paid period: what Stripe reports for a failed renewal. (A trial's failed first charge
+    // is also past_due; trials are not issued yet, and the trial slice must exclude them from grace before they are.)
+    it('paid compute policy v1: a previously paid renewal in its seven-day grace (no current receipt) has no hours cutoff', async () => {
         // Two 22 h cmp-8 sessions this (renewal) period, rated to their six-hour caps at weight four: 48 standard-hours,
         // over Standard's 40 h fair use, and no compute grant for the period.
         const used = [epoch('2026-10-16T13:00:00Z', '2026-10-17T11:00:00Z'), epoch('2026-10-17T11:30:00Z', '2026-10-18T09:30:00Z')];

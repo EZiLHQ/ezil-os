@@ -203,7 +203,10 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             // still landing is paid here too: pending exempts the monthly quota, never the session cap.
             if (paidComputeUnmeteredState(state)) {
                 if (now.getTime() < maximum) continue;
-                await closeDue(epoch, 'session_max', maximum);
+                // Closed when the sweep stops it, never back-dated: no charge rides on paid runtime, the epoch keeps its
+                // real end (rating still bounds the session at the cap), and a stop that fails stays inside the retry
+                // window (policyClosedEpochsSince reads endedAt), even for a session first seen hours late (a deploy).
+                await closeDue(epoch, 'session_max', now.getTime());
                 continue;
             }
             // Round 6 R2-3: a paid plan whose new period's grant is still on its way is not out of allowance;

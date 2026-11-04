@@ -53,10 +53,13 @@ export { GRANT_PENDING_SECONDS } from '../v3/summary';
  * Paid compute policy v1 (`lib/compute/paid-compute-policy.ts`): a v3 Standard/Premium plan with paid access has no
  * computer-hours cutoff. Paid access is one of: this period's compute grant (the paid-period receipt, as the entitlement
  * reader's 'active' does; the Standard trial included); a renewal whose grant is still landing (grantPending, at most
- * GRANT_PENDING_SECONDS); or the existing seven-day renewal grace of a previously paid plan (D17: no receipt for the
- * current period, a fair-use allowance of its own). Raw unpaid, incomplete, cancelled and expired plans and a grace that
- * has ended run as Free here, and a payment issue outside the grace refuses: they fail closed (coordinator decision
- * under founder e713d157). A never-paid trial's failed first charge has no grace (it is incomplete or unpaid).
+ * GRANT_PENDING_SECONDS); or the existing seven-day renewal grace (D17: no receipt for the current period, a fair-use
+ * allowance of its own). Raw unpaid, incomplete, cancelled and expired plans and a grace that has ended run as Free
+ * here, and a payment issue outside the grace refuses: they fail closed (coordinator decision under founder e713d157).
+ * The grace assumes a previously paid plan: Stripe reports `past_due` only after an earlier invoice was paid, and a
+ * first charge that fails at checkout is `incomplete` (Free). Checkout creates no trials today; before any trial is
+ * issued, the trial slice (trial-safe grants) must make grace require an earlier paid, non-trial receipt, because a
+ * trial's $0 first invoice followed by a failed charge is also `past_due` and must get no grace.
  */
 export function paidComputeUnmeteredState(state: Pick<ComputeBillingState, 'v3' | 'planSku' | 'planActive' | 'paymentIssue' | 'provider' | 'allowanceStdSeconds' | 'grantPending'>): boolean {
     return !!state.v3 && UNMETERED_PAID_PLAN_IDS.includes(state.planSku) && state.planActive && !state.paymentIssue

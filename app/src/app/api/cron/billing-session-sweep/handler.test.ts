@@ -319,7 +319,7 @@ describe('v3 session deadlines', () => {
         expect(f.epochs[0]).toMatchObject({ endedAt: null, endReason: null });
         expect(await f.run(21_660)).toMatchObject({ stopped: 1, closed: 1 });
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_660), endReason: 'session_max' }); // the stop's time, not back-dated
     });
 
     it.each([[null, 3600]] as const)
@@ -456,12 +456,19 @@ describe('paid sessions: no hours cap, a six-hour session rotation', () => {
             expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
             expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
         });
-    it('a sweep that runs late still closes at ready + 6 h, and a failed stop never extends the session', async () => {
+    // Review (384e4181): a close back-dated to ready + 6 h by a late sweep (the first sweep after a deploy) fell outside the
+    // two-hour retry window, so one failed stop left the computer running with no session and no cap.
+    it('a late sweep closes at the stop it makes, so a failed stop is retried on the next pass; rating stays at six hours', async () => {
         const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 144000 });
-        f.stop.mockRejectedValue(new Error('missed stop'));
+        f.stop.mockRejectedValueOnce(new Error('missed stop'));
         expect(await f.run(144000)).toMatchObject({ stopped: 0, stopFailed: 1, closed: 1 });
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(144000), endReason: 'session_max' });
+        f.isStillRunning.mockResolvedValue(true);
+        expect(await f.run(144060)).toMatchObject({ retried: 1, stopped: 1 });
+        expect(f.stop).toHaveBeenLastCalledWith(ref, 'session_max');
+        expect(f.isStillRunning).toHaveBeenCalledWith(ref, at(144000));
+        expect((await loadComputeBillingState(f.deps, ref.userId, at(144060))).usedStdSeconds).toBe(21_600 * 4);
     });
     it('the next open after a six-hour stop is admitted, on the same period usage (never reset)', async () => {
         const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
