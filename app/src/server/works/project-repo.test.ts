@@ -219,5 +219,29 @@ describe('os-builder-project-open-v1: the staging Git host and the computer labe
         await withoutComputer.result;
         expect(withoutComputer.bodies).toEqual([{ userIdToken: 'id-token', projectId: PROJECT, repositoryId: REPO }]);
     });
+    it('a Universe from before 1.1.0 (exactly three keys, live 8a37db75) still opens a hired project: asked once more without the label', async () => {
+        const computerId = '00000000-0000-4000-8000-000000000101';
+        const bodies: Record<string, unknown>[] = [];
+        // OpenRepositoryController at 8a37db75: any other key set is 400 {"error":"project_repo_invalid_request"}.
+        const strict = async (_u: URL, i: RequestInit) => {
+            const body = JSON.parse(String(i.body)) as Record<string, unknown>;
+            bodies.push(body);
+            return Object.keys(body).sort().join() === 'projectId,repositoryId,userIdToken'
+                ? Response.json(answer())
+                : Response.json({ error: 'project_repo_invalid_request', message: 'Send a JSON object with userIdToken, projectId and repositoryId only.' }, { status: 400 });
+        };
+        await expect(open(strict, { computerId } as Partial<typeof input>)).resolves.toMatchObject({ role: 'builder' });
+        expect(bodies).toEqual([
+            { userIdToken: 'id-token', projectId: PROJECT, repositoryId: REPO, computerLabel: computerLabel(computerId) },
+            { userIdToken: 'id-token', projectId: PROJECT, repositoryId: REPO },
+        ]);
+        // Controls: any other 400, or a 400 with no label sent, is not asked again.
+        for (const [over, error] of [[{ computerId }, 'project_repo_identity_unavailable'], [{}, 'project_repo_invalid_request']] as const) {
+            bodies.length = 0;
+            const refusing = async (_u: URL, i: RequestInit) => { bodies.push(JSON.parse(String(i.body))); return Response.json({ error }, { status: 400 }); };
+            expect(await code(open(refusing, over as Partial<typeof input>))).toBe('unavailable');
+            expect(bodies).toHaveLength(1);
+        }
+    });
 });
 

@@ -181,6 +181,14 @@ async function boundedText(response: Response): Promise<string | undefined> {
     return Buffer.concat(chunks).toString('utf8');
 }
 
+/** Universe's `{"error": "<code>"}`, or null. */
+function universeErrorCode(text: string | undefined): string | null {
+    try {
+        const code = (JSON.parse(text ?? '') as { error?: unknown })?.error;
+        return typeof code === 'string' ? code : null;
+    } catch { return null; }
+}
+
 /** Universe's error statuses (`OpenRepositoryController`) to this client's codes. Anything else is `unavailable`. */
 const REFUSALS: Readonly<Record<number, ProjectRepoErrorCode>> = { 401: 'identity_refused', 403: 'not_authorized', 404: 'disabled', 429: 'rate_limited' };
 
@@ -191,16 +199,22 @@ export async function openProjectRepository(input: OpenProjectRepositoryInput, d
     const origin = projectRepoOrigin(deps.env);
     const now = deps.now ?? Date.now;
     const timeout = AbortSignal.timeout(TIMEOUT_MS);
-    let response: Response;
-    try {
-        response = await (deps.fetch ?? fetch)(new URL('/internal/project-repositories/open', origin), {
-            method: 'POST', redirect: 'error', cache: 'no-store', signal: deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout,
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ userIdToken, projectId, repositoryId, ...(input.computerId ? { computerLabel: computerLabel(input.computerId) } : {}) }),
-        });
-    } catch { throw new ProjectRepoError('unavailable'); }
-    let text: string | undefined;
-    try { text = await boundedText(response); } catch { throw new ProjectRepoError('unavailable'); }
+    const post = async (label: string | undefined): Promise<{ response: Response; text: string | undefined }> => {
+        try {
+            const response = await (deps.fetch ?? fetch)(new URL('/internal/project-repositories/open', origin), {
+                method: 'POST', redirect: 'error', cache: 'no-store', signal: deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ userIdToken, projectId, repositoryId, ...(label ? { computerLabel: label } : {}) }),
+            });
+            return { response, text: await boundedText(response) };
+        } catch { throw new ProjectRepoError('unavailable'); }
+    };
+    const label = input.computerId ? computerLabel(input.computerId) : undefined;
+    let { response, text } = await post(label);
+    // A Universe from before 1.1.0 accepts exactly {userIdToken, projectId, repositoryId} and answers any other body
+    // 400 project_repo_invalid_request. Asked once more without the label, so a hired project still opens until
+    // Universe 1.1.0 (where the label is optional for a hired project and needed for a Builder one) is live.
+    if (label && response.status === 400 && universeErrorCode(text) === 'project_repo_invalid_request') ({ response, text } = await post(undefined));
     const refused = REFUSALS[response.status];
     if (refused) throw new ProjectRepoError(refused);
     if (response.status !== 200 || text === undefined) throw new ProjectRepoError('unavailable');
