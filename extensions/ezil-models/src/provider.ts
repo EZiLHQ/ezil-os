@@ -2,6 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
+import type { CompactionInfo } from './compact';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
@@ -20,6 +21,8 @@ export type ProviderHost = {
     log(line: string): void;
     recordUsage(model: ResolvedModel, usage: Usage, elapsedMs: number): void;
     requestFinished?(model: ResolvedModel): void;
+    /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
+    compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
     fetch?: typeof fetch;
 };
 
@@ -112,6 +115,16 @@ export function requestForLog(body: Record<string, unknown>, secrets: readonly s
 /** Copilot uses initiator/role metadata for title, summary and progress utility calls. */
 export function isUtilityRequest(options: Record<string, unknown>): boolean {
     return ['role', 'requestInitiator'].some(key => typeof options[key] === 'string' && /(?:^|[./_-])(utility(?:Small)?|title|summary|summariz(?:e|ation)|progress)(?:$|[./_-])/i.test(options[key] as string));
+}
+
+/**
+ * Copilot 0.69 shows a failed request as "Reason:" plus the error's stack when it has one (toErrorMessage, verbose), so the
+ * user saw extension.js frames under a repeated message. The message alone goes; the output channel keeps the details.
+ */
+function withoutStack(error: unknown): Error {
+    const plain = error instanceof Error ? error : new Error(String(error));
+    plain.stack = '';
+    return plain;
 }
 
 function aiCreditsLink(): vscode.Uri | undefined {
@@ -213,6 +226,23 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
     ): Promise<void> {
+        let finish!: () => void;
+        const finished = new Promise<void>(resolve => { finish = resolve; });
+        try {
+            await this.respond(model, messages, options, progress, token, finished);
+        } catch (error) {
+            throw withoutStack(error);
+        } finally { finish(); }
+    }
+
+    private async respond(
+        model: vscode.LanguageModelChatInformation,
+        messages: readonly vscode.LanguageModelChatRequestMessage[],
+        options: vscode.ProvideLanguageModelChatResponseOptions,
+        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+        token: vscode.CancellationToken,
+        finished: Promise<void>,
+    ): Promise<void> {
         const controller = new AbortController();
         const cancellation = token.onCancellationRequested(() => controller.abort());
         if (token.isCancellationRequested) controller.abort();
@@ -254,9 +284,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     if ((model.capabilities as { toolCalling?: unknown } | undefined)?.toolCalling) this.refresh();
                 }
             }
+            const sending = resolved;
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
+                gateway: { onCompact: info => this.host.compacted?.(sending, info, finished) },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
                     if (resolved.provider.type === 'ezil-gateway') return;

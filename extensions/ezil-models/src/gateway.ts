@@ -7,7 +7,8 @@
 import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -76,6 +77,8 @@ export type GatewayOptions = {
     log?: (line: string) => void;
     /** Called with the built request (no credentials) before it is sent. */
     onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
+    /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
+    onCompact?: (info: CompactionInfo) => void;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
@@ -357,7 +360,9 @@ export function errorOrigin(body: ErrorBody): GatewayErrorOrigin {
     return typeof body.code === 'string' ? 'gateway' : 'transport';
 }
 
-const NOTHING_CHARGED = 'and your conversation history is kept. You can start a new chat';
+/** What helps once the earlier conversation is compacted: a smaller current request, or a model with a larger limit. */
+const SHORTEN = 'Shorten your last message or its attachments, or pick a model with a larger input limit';
+const NOTHING_CHARGED = `and the conversation is kept. ${SHORTEN}`;
 
 export function parseErrorBody(text: string): ErrorBody {
     try {
@@ -592,7 +597,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const now = options.now ?? Date.now;
     const started = now();
     const log = (line: string) => options.log?.(redact(line, [provider.apiKey ?? '', ...Object.values(provider.headers)]));
-    const idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
+    let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
     let requestId: string | undefined;
     let hold: string | null = null;
     let status: number | undefined;
@@ -600,6 +605,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let errorCode: string | undefined;
     let failureOrigin: GatewayErrorOrigin | undefined;
     let localCounts: LocalRequestCounts | undefined;
+    let compaction: CompactionInfo | undefined;
     let attempted = false;
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
@@ -616,7 +622,26 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined, undefined, 'local');
             model = withGatewayModelLimits(model, catalog);
         }
-        const built = responses ? buildGatewayResponsesBody(model, request, log) : buildGatewayBody(model, request, log);
+        // The protocol's own builder, with the input limit scaled for compaction's target.
+        const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
+            const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(Math.min(GATEWAY_INPUT_TOKENS, limits.maxInputTokens) * scale)) };
+            return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log);
+        };
+        const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
+            const compacted = compactRequest(request, first, builder(limits), cause);
+            compaction = compacted.info;
+            options.onCompact?.(compaction);
+            return compacted.built;
+        };
+        let built: ReturnType<ReturnType<typeof builder>>;
+        try {
+            built = builder(model)(request, 1);
+        } catch (error) {
+            // Too large for this model as Copilot sent it: send a compacted copy instead (nothing sent yet).
+            if (!(error instanceof LocalRequestError)) throw error;
+            built = compact(error, model);
+        }
+        let compactRetried = false;
         // Snapshot the serialized request's tools before callbacks or network waits can mutate input.
         const offeredTools = new Set(built.body.tools?.map(tool => tool.name));
         stream = built.body.stream;
@@ -714,7 +739,35 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 } else {
                     if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
                     const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
-                    throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
+                    // A size refusal by EZiL AI or EZiL OS answers before any model runs, so nothing was charged and nothing
+                    // has been shown: compact to the limit it reports (else to COMPACT_TARGET of ours) and send once more,
+                    // under a new key since the body changes. Once only; a second refusal is final.
+                    if (compactRetried || !['input_too_large', 'body_too_large'].includes(refusal.code ?? '') || !['gateway', 'os_proxy'].includes(refusal.origin ?? '')) {
+                        throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
+                    }
+                    compactRetried = true;
+                    const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+                    const reported = Number.isSafeInteger(body.max_input_tokens) && body.max_input_tokens! > 0 && body.max_input_tokens! < limit ? body.max_input_tokens! : undefined;
+                    const tighter = { ...model, maxInputTokens: reported ?? Math.floor(limit * COMPACT_TARGET) };
+                    const sent = Number.isSafeInteger(body.input_bound_tokens) ? body.input_bound_tokens! : built.bytes.byteLength;
+                    let retry: ReturnType<typeof compactRequest<typeof built>>;
+                    try {
+                        retry = compactRequest(request, new LocalRequestError('local_input_too_large', { bodyBytes: sent, limitBytes: tighter.maxInputTokens,
+                            messages: 0, maxBlocks: 0, tools: 0, toolBytes: 0 }), builder(tighter), 'remote');
+                    } catch (error) {
+                        if (error instanceof LocalRequestError) throw refusal;
+                        throw error;
+                    }
+                    // Nothing left to compact: the same body would only be refused again.
+                    if (!retry.info.folded && !retry.info.shortened) throw refusal;
+                    built = retry.built;
+                    compaction = retry.info;
+                    options.onCompact?.(compaction);
+                    idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
+                    headers['idempotency-key'] = idempotencyKey;
+                    resent = false;
+                    options.onRequest?.(url, built, idempotencyKey);
+                    waitMs = 0;
                 }
             } finally {
                 attemptAbort.abort();
@@ -747,6 +800,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : failureOrigin ?? null,
             ...(!cancelled && localCounts ? { body_bytes: localCounts.bodyBytes, limit_bytes: localCounts.limitBytes, messages: localCounts.messages,
                 max_blocks: localCounts.maxBlocks, tools: localCounts.tools, tool_bytes: localCounts.toolBytes } : {}),
+            ...(compaction ? { compacted: { cause: compaction.cause, from_bytes: compaction.fromBytes, to_bytes: compaction.toBytes,
+                limit_bytes: compaction.limitBytes, folded: compaction.folded, shortened: compaction.shortened } } : {}),
             ...(cancelled ? { notice: `cancelled; may still be charged (request ${requestId ?? 'unknown'})` } : {}) }));
     }
 }
@@ -769,16 +824,20 @@ function errorName(error: unknown): string {
 
 const bytes = (value: number) => value.toLocaleString('en-US');
 
-/** The user-facing text of a local refusal: what was measured, that nothing left this computer, what to do. */
+/**
+ * The user-facing text of a local refusal: what was measured, that nothing left this computer, what to do. By the time
+ * one reaches the user the earlier conversation was already compacted, so only the current request is left to shorten.
+ */
 function localRefusal(model: ResolvedModel, error: LocalRequestError): GatewayError {
     const c = error.counts;
-    const kept = 'Nothing was sent or charged, and your conversation history is kept.';
+    const compacted = error.afterCompaction ? ', even with the earlier conversation compacted' : '';
+    const kept = 'Nothing was sent or charged, and the conversation is kept.';
     const text = error.code === 'local_input_too_large'
-        ? `This conversation is too large to send to ${model.name}: ${bytes(c.bodyBytes)} bytes, including ${bytes(c.toolBytes)} bytes of tool definitions; `
-            + `the limit is ${bytes(c.limitBytes)} bytes. ${kept} You can start a new chat.`
+        ? `This request is too large for ${model.name}${compacted}: ${bytes(c.bodyBytes)} bytes (${bytes(c.toolBytes)} of them tool definitions), `
+            + `over the ${bytes(c.limitBytes)}-byte limit. ${kept} ${SHORTEN}.`
         : error.code === 'local_too_many_messages'
-            ? `This conversation has ${bytes(c.messages)} messages, more than EZiL AI accepts in one request. ${kept} You can start a new chat.`
-            : `One message in this conversation has ${bytes(c.maxBlocks)} parts, more than EZiL AI accepts in one message. ${kept} You can start a new chat.`;
+            ? `This request has ${bytes(c.messages)} messages${compacted}, more than EZiL AI accepts at once. ${kept} ${SHORTEN}.`
+            : `The latest step has ${bytes(c.maxBlocks)} parts, more than EZiL AI accepts in one message. ${kept} ${SHORTEN}.`;
     return new GatewayError(`EZiL Models: ${text} (${error.code})`, undefined, error.code, undefined, undefined, 'local', c);
 }
 
