@@ -27,3 +27,49 @@ export function summaryV3(tier = 'standard') {
         catalog: { version: 3, offers },
     });
 }
+/**
+ * Standard trial (request standard-trial-01b28d18-20261105-v1), in the combinations the server sends
+ * (app/src/server/billing/v3/summary.ts `trialBlock`, standing.ts):
+ *   'offer'          Free, `trialOffer.eligible` with the server's preview of the end;
+ *   'ineligible'     Free, `trialOffer.eligible: false` with `reason`;
+ *   'trialing'       status active, standing paid, no upgrade; the renewal preview (`plan.renewal.at`) is about one
+ *                    hour AFTER the end (Stripe collects the first charge then), never a second charge;
+ *   'ending'         cancelled in the trial: status cancels, cancelsAt/planEndsAt = the end, standing plan_ending;
+ *   'payment_pending' the free month ended and Stripe has not collected the first charge yet: status still active,
+ *                    no payment issue, standing free (or `standing`), fairUse without the paid 'unmetered' policy;
+ *   'payment_failed' the first charge failed: past_due + payment_failed, NO grace (graceEndsAt null), standing
+ *                    files_on_aws (or `standing`), no cancel, no checkout.
+ */
+const HOUR = 3600 * 1000;
+export const TRIAL_END = '2026-12-05T14:30:00Z';
+export function trialSummaryV3(state, { endsAt = TRIAL_END, reason = 'trial_used', standing } = {}) {
+    if ( state === 'offer' || state === 'ineligible' ) {
+        const s = summaryV3('free');
+        Object.assign(s.computer, { standing: standing ?? 'free', filesOn: 'cloudflare', disk: { provisionedGiB: null, usedBytes: null, growsOnSwitch: false } });
+        s.trialOffer = state === 'offer' ? { eligible: true, sku: 'standard_monthly_v3', endsAt, amountCents: 2000, currency: 'usd' } : { eligible: false, reason };
+        return s;
+    }
+    const s = summaryV3('standard');
+    s.plan.trial = { state, startedAt: '2026-11-05T14:30:00Z', endsAt, firstChargeAt: state === 'ending' ? null : endsAt, amountCents: 2000, currency: 'usd' };
+    const collected = new Date(Date.parse(endsAt) + HOUR).toISOString().replace('.000Z', 'Z');
+    Object.assign(s.plan, { renewal: { at: collected, amountCents: 2000 }, graceEndsAt: null, planEndsAt: null });
+    Object.assign(s.computer, { standing: 'paid', filesOn: 'aws', disk: { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false } });
+    s.actions.upgrade = false;
+    if ( state === 'ending' ) {
+        Object.assign(s.plan, { status: 'cancels', cancelsAt: endsAt, planEndsAt: endsAt, renewal: null });
+        s.computer.standing = 'plan_ending';
+    }
+    if ( state === 'payment_pending' ) {
+        s.computer.standing = standing ?? 'free';
+        s.computer.filesOn = s.computer.standing === 'files_on_aws' ? 'aws' : 'cloudflare';
+        s.fairUse = { status: 'ok', resetsAt: s.fairUse.resetsAt };
+        // The server still allows cancelAtPeriodEnd here (status active); Billing does not offer it (see tabs/billing.js).
+        Object.assign(s.actions, { checkout: false, downgrade: false });
+    }
+    if ( state === 'payment_failed' ) {
+        Object.assign(s.plan, { status: 'past_due', paymentIssue: 'payment_failed', renewal: null });
+        s.computer.standing = standing ?? 'files_on_aws';
+        Object.assign(s.actions, { cancel: false, checkout: false, downgrade: false });
+    }
+    return s;
+}

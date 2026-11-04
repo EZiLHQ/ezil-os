@@ -1,6 +1,6 @@
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
-import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
 import { reverseMove } from '../reverse-move-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -1293,6 +1293,46 @@ try {
     for ( const key of Object.keys(summary.actions) ) summary.actions[key] = false;
     await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false); has('[data-action="cancel"]', false);
     pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
+
+    // Standard trial: every entry from Free opens the checkout sheet in its trial mode (it quotes and confirms the
+    // exact end itself, billing-trial-test.mjs); ineligible keeps the paid Standard checkout; Premium is never a trial.
+    summary = trialSummaryV3('offer'); await open();
+    assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Start your free month']);
+    click(q('[data-role="plan-actions"] [data-action="trial"]'));
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]);
+    await closeSheet();
+    click(q('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="trial"]'));
+    assert.deepEqual([sheets.at(-1).sku, sheets.at(-1).trial], ['standard_monthly_v3', true]);
+    await closeSheet();
+    click(q('[data-role="plan-offer"][data-sku="premium_monthly_v3"] [data-action="checkout"]'));
+    assert.deepEqual([sheets.at(-1).sku, sheets.at(-1).trial], ['premium_monthly_v3', undefined]);
+    await closeSheet();
+    // The pricing page's Standard card advertises the free month: its deep link opens it when offered, else Standard.
+    await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]); await closeSheet();
+    summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', undefined]); await closeSheet();
+    has('[data-action="trial"]', false);
+    contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-role="trial-ineligible"]', "You've already used your free month.");
+    // A trial is cancelled with the same cancelAtPeriodEnd, resumed with the same Resume, never upgraded.
+    summary = trialSummaryV3('trialing'); await refresh();
+    has('[data-action="upgrade"]', false); has('[data-action="trial"]', false);
+    click(q('.ezil-billing-v3-footer [data-action="cancel"]')); assert.equal(sheets.at(-1).kind, 'cancel'); await closeSheet();
+    summary = trialSummaryV3('ending'); await refresh();
+    mutation = () => reply({ cancelsAt: null });
+    click(q('[data-role="trial-ending"] [data-action="resume"]')); await settle();
+    assert.deepEqual(calls.filter(call => call.url.includes('/billing.cancelAtPeriodEnd')).at(-1)?.input, { cancel: false });
+    summary = trialSummaryV3('payment_failed'); await refresh();
+    mutation = () => reply({ url: 'https://billing.example.test/trial-portal' });
+    click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-portal');
+    // The first charge is being collected: the same portal (secondary), and no cancel whose copy would not hold.
+    summary = trialSummaryV3('payment_pending'); await refresh();
+    has('[data-action="cancel"]', false);
+    mutation = () => reply({ url: 'https://billing.example.test/trial-pending-portal' });
+    click(q('[data-role="trial-payment-pending"] [data-action="portal"]')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-pending-portal');
+    pass('Standard trial: free-month entries (plan, card, deep link) open the trial checkout; ineligible stays paid; cancel, resume and portal unchanged');
 
     const packs = [
         { sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' },

@@ -27,7 +27,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
-import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
 import { honestyBans, v3CopyForAudit } from './billing-copy-test-helpers.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -66,6 +66,12 @@ const packs = [
 ];
 const EZIL_ID = 'https://ezil.work/login?method=ezil-id&returnUrl=%2Fos%3Fsettings%3Dbilling';
 function billingState (name) {
+    // Standard trial: the server's own combinations (billing-v3-fixtures.mjs), with this table's top-up catalog.
+    if ( name.startsWith('trial-') ) {
+        const s = trialSummaryV3(name.slice('trial-'.length));
+        s.ai.state = 'ok'; s.ai.balanceState = 'ok'; s.actions.topup = true; s.catalog.packs = packs;
+        return s;
+    }
     const tier = name.startsWith('free') || name === 'files_on_aws' || name.startsWith('needs') || name.startsWith('activating') ? 'free'
         : name.startsWith('standard') || name === 'upgrade_pending' || name === 'incomplete' || name === 'paused-standard' ? 'standard' : 'premium';
     const s = summaryV3(tier);
@@ -98,6 +104,11 @@ const STATES = {
     free: 'Upgrade to Standard', standard: 'Upgrade to Premium', premium: null, 'premium-low': 'Add AI credits', 'premium-exhausted': 'Add AI credits',
     grace: 'Update payment method', past_due: 'Update payment method', cancels: 'Resume plan', upgrade_pending: 'Finish payment', incomplete: 'Finish payment',
     'paused-standard': 'Upgrade to Premium', 'paused-premium': null, files_on_aws: 'Upgrade to Standard', needs_ezil_id: 'Upgrade to Standard', activating: 'Upgrade to Standard',
+    // Standard trial: the free month replaces Free's primary; a live trial has none (never an upgrade); ending resumes;
+    // a failed first charge updates the payment method; a first charge still being collected has none (nothing
+    // failed: the portal is a secondary). Ineligible keeps the paid Standard checkout.
+    'trial-offer': 'Start your free month', 'trial-ineligible': 'Upgrade to Standard', 'trial-trialing': null, 'trial-ending': 'Resume plan',
+    'trial-payment_failed': 'Update payment method', 'trial-payment_pending': null,
 };
 
 await check('Billing: at most ONE primary button in every page state, and it is the state\'s own CTA', () => {

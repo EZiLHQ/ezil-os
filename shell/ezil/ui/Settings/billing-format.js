@@ -50,12 +50,83 @@ const ERRORS = {
     size_not_allowed: "That size isn't included in your plan.",
     customer_conflict: "We couldn't match your billing account. Contact support.",
     stripe_unavailable: 'Payments are unavailable right now. Try again in a few minutes.',
+    // Standard trial (billing.quoteTrial / createCheckout({ trial })).
+    trial_unavailable: "The free month isn't available for this account.",
+    trial_quote_stale: "Your free month's end date changed. Check the new date before you continue.",
+    trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
 };
 
 // Optional DTO ceiling lets the consent sheet keep cap errors catalog-driven.
 export function errorCopy (message, maxCapCents) {
     if ( message === 'cap_out_of_range' && maxCapCents != null ) return `Choose a cap between $0 and ${dollars(maxCapCents, { compact: true })}.`;
     return Object.hasOwn(ERRORS, message) ? ERRORS[message] : 'Could not reach billing. Try again.';
+}
+
+// ── Standard trial (request standard-trial-01b28d18-20261105-v1) ─────────────
+// The server fixes the trial end as one UTC instant (one calendar month after the quote, month-end clamped); that
+// instant is the first charge. Every trial date is shown in the VIEWER's time zone, never Billing's UTC `dateLabel`,
+// so "Free until" and "ends on" never name different days near midnight. `timeZone` exists for tests only.
+
+export const TRIAL_SKU = 'standard_monthly_v3';
+// `payment_pending`: the free month ended and Stripe has not collected the first charge yet (it tries about an hour
+// after the end); Standard waits for it and is never shown as active.
+const TRIAL_STATES = new Set(['trialing', 'ending', 'payment_pending', 'payment_failed']);
+
+function zoned (options, timeZone) {
+    try { return new Intl.DateTimeFormat('en-US', { ...options, ...(timeZone ? { timeZone } : {}) }); }
+    catch { return new Intl.DateTimeFormat('en-US', options); }
+}
+
+/** "Feb 27, 2027": the trial instant's calendar day in the viewer's zone, or '—'. */
+export function trialDayLabel (iso, { timeZone } = {}) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? zoned({ year: 'numeric', month: 'short', day: 'numeric' }, timeZone).format(new Date(time)) : '—';
+}
+
+/**
+ * The trial instant in the viewer's zone, with the zone's name: "Feb 27, 2027 at 7:00 PM Pacific Standard Time";
+ * `full` adds the weekday, the long month and the IANA zone: "Saturday, February 27, 2027 at 7:00 PM Pacific Standard
+ * Time (America/Los_Angeles)". Seconds are never shown; the minute shown is never after the real instant. '—' when invalid.
+ */
+export function trialMomentLabel (iso, { timeZone, full = false } = {}) {
+    const time = Date.parse(iso ?? '');
+    if ( ! Number.isFinite(time) ) return '—';
+    const date = new Date(time);
+    const day = zoned(full ? { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' } : { year: 'numeric', month: 'short', day: 'numeric' }, timeZone);
+    const clock = zoned({ hour: 'numeric', minute: '2-digit', timeZoneName: 'long' }, timeZone);
+    const zone = clock.resolvedOptions().timeZone;
+    const id = full && typeof zone === 'string' && ! /^(Etc\/)?(UTC|GMT|UCT|Universal|Zulu)$/i.test(zone) ? ` (${zone})` : '';
+    return `${day.format(date)} at ${clock.format(date)}${id}`;
+}
+
+/** The server's eligible trial offer (`summary.trialOffer`), only while checkout is offered; null otherwise. */
+export function trialOfferOf (summary) {
+    const offer = summary?.trialOffer;
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== true || offer.sku !== TRIAL_SKU ) return null;
+    if ( ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
+    return summary.catalog?.offers?.some(item => item.sku === TRIAL_SKU) ? offer : null;
+}
+
+/** The quiet line for an ineligible viewer, for the three reasons a person can act on or understand; '' otherwise. */
+export function trialIneligibleCopy (summary) {
+    const offer = summary?.trialOffer;
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== false ) return '';
+    return { trial_used: "You've already used your free month.", paid_before: 'The free month is for accounts without an earlier paid plan.',
+        email_unverified: 'Verify your email to start a free month.' }[offer.reason] ?? '';
+}
+
+/** `plan.trial` when the server reports one of the four states with a readable end; null otherwise. */
+export function planTrialOf (summary) {
+    const trial = summary?.plan?.trial;
+    if ( summary?.version !== 3 || ! trial || ! TRIAL_STATES.has(trial.state) || ! Number.isFinite(Date.parse(trial.endsAt ?? '')) ) return null;
+    return trial;
+}
+
+/** "$20.00": the trial's first charge from the server, else the Standard offer's price; null when neither reads. */
+export function trialAmount (summary, trial = planTrialOf(summary)) {
+    const cents = Number.isSafeInteger(trial?.amountCents) && trial.amountCents > 0 ? trial.amountCents
+        : summary?.catalog?.offers?.find(offer => offer.sku === TRIAL_SKU)?.priceCents;
+    return Number.isSafeInteger(cents) && cents > 0 ? dollars(cents) : null;
 }
 
 export function webUrl (value) {
