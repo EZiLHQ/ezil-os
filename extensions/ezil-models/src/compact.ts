@@ -81,19 +81,32 @@ function typed(message: Message): boolean {
     return message.role === 'user' && message.parts.some(part => (part.type === 'text' && part.value.trim() !== '') || (part.type === 'data' && !isMarker(part)));
 }
 
-/** `open[i]` is true when a tool call before message i has its result at i or later: no cut may go there. */
-function openCalls(messages: readonly Message[]): boolean[] {
-    const calledAt = new Map<string, number>();
-    messages.forEach((message, index) => {
-        for (const part of message.parts) if (part.type === 'tool_call' && !calledAt.has(part.callId)) calledAt.set(part.callId, index);
-    });
-    const delta = new Array<number>(messages.length + 2).fill(0);
+/**
+ * Each tool result with the call it answers: the nearest earlier call with its id that has no result yet, so an id used
+ * again later pairs with its own call, not the first one (Copilot ids are not guaranteed unique).
+ */
+function pairCalls(messages: readonly Message[]): { result: Map<Part, { part: Extract<Part, { type: 'tool_result' }>; at: number }>; spans: [number, number][] } {
+    const waiting = new Map<string, { part: Part; at: number }[]>();
+    const result = new Map<Part, { part: Extract<Part, { type: 'tool_result' }>; at: number }>();
+    const spans: [number, number][] = [];
     messages.forEach((message, index) => {
         for (const part of message.parts) {
-            const at = part.type === 'tool_result' ? calledAt.get(part.callId) : undefined;
-            if (at !== undefined && at < index) { delta[at + 1]!++; delta[index + 1]!--; }
+            if (part.type === 'tool_call') waiting.set(part.callId, [...waiting.get(part.callId) ?? [], { part, at: index }]);
+            else if (part.type === 'tool_result') {
+                const call = waiting.get(part.callId)?.pop();
+                if (!call) continue;
+                result.set(call.part, { part, at: index });
+                if (call.at < index) spans.push([call.at, index]);
+            }
         }
     });
+    return { result, spans };
+}
+
+/** `open[i]` is true when a tool call before message i has its result at i or later: no cut may go there. */
+function openCalls(messages: readonly Message[]): boolean[] {
+    const delta = new Array<number>(messages.length + 2).fill(0);
+    for (const [call, answer] of pairCalls(messages).spans) { delta[call + 1]!++; delta[answer + 1]!--; }
     let depth = 0;
     return Array.from({ length: messages.length + 1 }, (_, index) => (depth += delta[index]!) > 0);
 }
@@ -101,7 +114,7 @@ function openCalls(messages: readonly Message[]): boolean[] {
 type Shape = {
     /** Messages before the protected part, as units (each starts at a safe cut). */
     history: Message[][];
-    /** The current user message and anything before it that a cut may not separate from it. */
+    /** The current user message and anything before or after it that a cut may not separate from it. */
     current: Message[];
     /** Assistant steps after the current user message; the last one is always kept. */
     steps: Message[][];
@@ -123,14 +136,16 @@ function shape(messages: readonly Message[]): Shape {
     let current = lastIndex(typed);
     if (current < 0) current = lastIndex(message => message.role === 'user');
     if (current < 0) return { history: [], current: [], steps: messages.length ? [messages.slice()] : [] };
+    // Widen the current message both ways until no call/result pair crosses either edge.
     let start = current;
     while (start > 0 && open[start]) start--;
-    // The current request's own tool steps: a new unit at each assistant message that no pair crosses.
-    const steps = splitUnits(messages, current + 1, messages.length, open, message => message.role === 'assistant');
+    let end = current + 1;
+    while (end < messages.length && open[end]) end++;
     return {
         history: splitUnits(messages, 0, start, open, message => message.role === 'assistant' || typed(message)),
-        current: messages.slice(start, current + 1),
-        steps,
+        current: messages.slice(start, end),
+        // The current request's own tool steps: a new unit at each assistant message that no pair crosses.
+        steps: splitUnits(messages, end, messages.length, open, message => message.role === 'assistant'),
     };
 }
 
@@ -167,10 +182,7 @@ function noteFor(messages: readonly Message[], detail: NoteDetail, steps: boolea
     } else {
         lines.push(`[EZiL compacted ${what} ${LIMIT_NOTE}. The full conversation is still saved in this chat. `
             + `Earlier user messages are kept below (long ones shortened)${detail.lines ? ', with a short record of the replies and tool calls' : ''}.]`);
-        const results = new Map<string, { text: string; error: boolean }>();
-        for (const message of messages) for (const part of message.parts) {
-            if (part.type === 'tool_result') results.set(part.callId, { text: partText(part), error: part.isError === true });
-        }
+        const results = pairCalls(messages).result;
         let left = 0;
         for (const message of messages) {
             if (message.role === 'user') {
@@ -181,9 +193,9 @@ function noteFor(messages: readonly Message[], detail: NoteDetail, steps: boolea
                     if (!detail.lines) { if (part.type === 'text' || part.type === 'tool_call') left++; continue; }
                     if (part.type === 'text' && part.value.trim()) lines.push(`Assistant: ${shorten(part.value.trim(), detail.line * 2)}`);
                     else if (part.type === 'tool_call') {
-                        const result = results.get(part.callId);
+                        const result = results.get(part)?.part;
                         const input = shorten(argumentsText(part.input), Math.max(40, detail.line / 2));
-                        lines.push(`Tool ${part.name} ${input} → ${result ? `${result.error ? '(error) ' : ''}${shorten(result.text.trim() || '(no output)', detail.line)}` : '(no result recorded)'}`);
+                        lines.push(`Tool ${part.name} ${input} → ${result ? `${result.isError === true ? '(error) ' : ''}${shorten(partText(result).trim() || '(no output)', detail.line)}` : '(no result recorded)'}`);
                     }
                 }
             }

@@ -24,7 +24,7 @@ export class CompactionNotice implements vscode.Disposable {
     private generation = 0;
     private timer: ReturnType<typeof setTimeout> | undefined;
 
-    constructor(private readonly log: (line: string) => void) {}
+    constructor(private readonly log: (line: string) => void, private readonly lingerMs = NOTICE_LINGER_MS) {}
 
     show(model: string, info: CompactionInfo, finished: Promise<void>): void {
         this.last = compactionText(model, info);
@@ -38,11 +38,11 @@ export class CompactionNotice implements vscode.Disposable {
             if (generation !== this.generation) return;
             this.timer = setTimeout(() => {
                 if (generation === this.generation) void Promise.resolve(vscode.commands.executeCommand('setContext', COMPACTING_CONTEXT, false)).catch(() => {});
-            }, NOTICE_LINGER_MS);
+            }, this.lingerMs);
         });
     }
 
-    /** The title-bar icon's command. */
+    /** The title-bar icon's command: the window's latest compaction (one at a time; the icon is per window too). */
     async explain(): Promise<void> {
         const choice = await vscode.window.showInformationMessage(this.last ?? 'EZiL has not compacted a conversation in this window.', 'Show AI Status');
         if (choice === 'Show AI Status') await vscode.commands.executeCommand('ezil-models.showStatus');

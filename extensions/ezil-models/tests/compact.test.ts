@@ -183,7 +183,7 @@ describe('one bounded compact-and-retry after a definitive size refusal', () => 
         expect(s.posts).toHaveLength(2);
         expect(s.posts.map(post => post.key)).toEqual(['key-1', 'key-2']);
         expect(s.posts[1]!.bytes + INPUT_FRAMING).toBeLessThanOrEqual(Math.floor(65_536 * COMPACT_TARGET));
-        expect(compacted).toEqual([expect.objectContaining({ cause: 'remote', fromBytes: 99_000, limitBytes: 65_536 })]);
+        expect(compacted).toEqual([expect.objectContaining({ cause: 'remote', fromBytes: s.posts[0]!.bytes, limitBytes: 65_536 - INPUT_FRAMING, toBytes: s.posts[1]!.bytes })]);
         expect(events.map(event => event.type)).toContain('stop');
     });
     test('a second size refusal is final: exactly two requests, no loop', async () => {
@@ -198,6 +198,28 @@ describe('one bounded compact-and-retry after a definitive size refusal', () => 
         await run(gw(), fitsLocally(), s.fetch);
         expect(s.posts).toHaveLength(2);
         expect(s.posts[1]!.bytes).toBeLessThan(s.posts[0]!.bytes);
+    });
+    test('only a 413: the same code with another status is not a size refusal and is never re-sent', async () => {
+        for (const status of [400, 500]) {
+            const s = server(() => refusal(status, { code: 'input_too_large', max_input_tokens: 65_536 }));
+            await failure(run(gw(), fitsLocally(), s.fetch));
+            expect(s.posts).toHaveLength(1);
+        }
+    });
+    test('already as compact as it gets: the same bytes are not sent again', async () => {
+        const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Read big.ts')), msg('assistant', call('big')), msg('user', result('big', [txt('B'.repeat(200_000))]))]), tools: [tool] };
+        const s = server(() => refusal(413, { code: 'input_too_large' }));
+        const seen: CompactionInfo[] = [];
+        const error = await failure(run({ ...gw(), maxInputTokens: 6000 }, request, s.fetch, { onCompact: info => seen.push(info) }));
+        expect(error.code).toBe('input_too_large');
+        expect(s.posts).toHaveLength(1);
+        expect(seen.map(info => info.cause)).toEqual(['local_input_too_large']);
+    });
+    test('a concurrency wait before the size refusal does not count against the compacted retry', async () => {
+        const s = server(index => index === 0 ? refusal(429, { code: 'concurrency_limit' }) : index === 1 ? refusal(413, { code: 'input_too_large', max_input_tokens: 65_536 }) : sse());
+        const { events } = await run(gw(), fitsLocally(), s.fetch);
+        expect(s.posts.map(post => post.key)).toEqual(['key-1', 'key-1', 'key-2']);
+        expect(events.map(event => event.type)).toContain('stop');
     });
     test('nothing left to compact: the refusal is final after one request', async () => {
         const s = server(() => refusal(413, { code: 'input_too_large', max_input_tokens: 65_536 }));
@@ -268,5 +290,47 @@ describe('compactRequest', () => {
         expect(error).toBeInstanceOf(LocalRequestError);
         expect((error as LocalRequestError).afterCompaction).toBe(true);
         expect((error as LocalRequestError).counts.limitBytes).toBe(LIMIT - INPUT_FRAMING);
+    });
+    for (const protocol of ['anthropic-messages', 'openai-responses'] as const) {
+        test(`${protocol}: a call before the current message whose result comes after it is never split (review BLOCKER-1)`, () => {
+            const model = { ...gw('reviewed-azure'), maxInputTokens: 60_000, ...(protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {}) } as ResolvedModel;
+            const builder = (request: ChatRequest, scale: number) => {
+                const scaled = { ...model, maxInputTokens: Math.floor(model.maxInputTokens * scale) };
+                return protocol === 'openai-responses' ? buildGatewayResponsesBody(scaled, request) : buildGatewayBody(scaled, request);
+            };
+            const request = { ...ask([msg('system', txt(SYSTEM)), msg('assistant', call('call_X'), call('call_Y')),
+                msg('user', result('call_X', [txt('contents of a.ts')]), txt('Now also check b.ts.')), msg('user', result('call_Y', [txt('contents of b.ts')])),
+                ...Array.from({ length: 200 }, (_, i) => [msg('assistant', call(`c${i}`)), msg('user', result(`c${i}`, [txt('x'.repeat(600))]))]).flat()]), tools: [tool] };
+            let initial: LocalRequestError | undefined;
+            try { builder(request, 1); } catch (error) { initial = error as LocalRequestError; }
+            expect(initial).toBeInstanceOf(LocalRequestError);
+            const { built, info } = compactRequest(request, initial!, builder);
+            expect(info.folded).toBeGreaterThan(0);
+            const text = new TextDecoder().decode(built.bytes);
+            expect(text).not.toMatch(/No result was recorded|Earlier tool output/);
+            expect(text).toContain('contents of b.ts');
+            expect(text).toContain('Now also check b.ts.');
+            if (protocol === 'anthropic-messages') expectPairedMessages((built as ReturnType<typeof buildGatewayBody>).body);
+        });
+    }
+    test('a reused tool call id still compacts, and each folded call is recorded with its own result (review HIGH-2)', () => {
+        const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Run the checks.')),
+            ...Array.from({ length: 120 }, (_, i) => [msg('assistant', call('call_0')), msg('user', result('call_0', [txt(`result ${i} ${'r'.repeat(6000)}`)]))]).flat()]), tools: [tool] };
+        const model = { ...gw(), maxInputTokens: 60_000 };
+        const { built, info } = compactRequest(request, first(request, model), build(model));
+        expect(info.folded).toBeGreaterThan(0);
+        const text = new TextDecoder().decode(built.bytes);
+        for (const i of [0, 1, 2]) expect(text).toMatch(new RegExp(`Tool read_file \\{\\} → result ${i} r`));
+    });
+    test('the latest step is kept verbatim, whatever is folded before it (review LOW-6)', () => {
+        const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Fix it.')),
+            ...Array.from({ length: 60 }, (_, i) => [msg('assistant', txt(`step ${i}`), call(`s${i}`)), msg('user', result(`s${i}`, [txt(`out ${i} ${'o'.repeat(3000)}`)]))]).flat()]), tools: [tool] };
+        const model = { ...gw(), maxInputTokens: 40_000 };
+        const { built, info } = compactRequest(request, first(request, model), build(model));
+        expect(info.folded).toBeGreaterThan(0);
+        const body = (built as ReturnType<typeof buildGatewayBody>).body;
+        expect(body.messages.at(-2)!.content).toContainEqual({ type: 'tool_use', id: 's59', name: 'read_file', input: {} });
+        expect(body.messages.at(-1)!.content).toContainEqual({ type: 'tool_result', tool_use_id: 's59', content: [{ type: 'text', text: `out 59 ${'o'.repeat(3000)}` }] });
+        expect(wire(body.messages.at(-2))).toContain('step 59');
     });
 });

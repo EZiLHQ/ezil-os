@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -743,33 +743,38 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 } else {
                     if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
                     const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
-                    // A size refusal by EZiL AI or EZiL OS answers before any model runs, so nothing was charged and nothing
-                    // has been shown: compact to the limit it reports (else to COMPACT_TARGET of ours) and send once more,
-                    // under a new key since the body changes. Once only; a second refusal is final.
-                    if (compactRetried || !['input_too_large', 'body_too_large'].includes(refusal.code ?? '') || !['gateway', 'os_proxy'].includes(refusal.origin ?? '')) {
+                    // A 413 size refusal by EZiL AI or EZiL OS answers before any model runs (the Gateway checks the body
+                    // against the model's input allowance before reserving; the proxy before forwarding), so nothing was
+                    // charged and nothing has been shown. Compact to the allowance it reports, else to COMPACT_TARGET of
+                    // ours, and send once more under a new key. Once only, and only with different bytes.
+                    if (compactRetried || status !== 413 || !['input_too_large', 'body_too_large'].includes(refusal.code ?? '')) {
                         throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
                     }
                     compactRetried = true;
                     const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+                    // The Gateway names its bound in tokens, but it is body bytes plus framing (messagesBounds), the bound
+                    // the builders check against maxInputTokens: so it applies as is.
                     const reported = Number.isSafeInteger(body.max_input_tokens) && body.max_input_tokens! > 0 && body.max_input_tokens! < limit ? body.max_input_tokens! : undefined;
                     const tighter = { ...model, maxInputTokens: reported ?? Math.floor(limit * COMPACT_TARGET) };
-                    const sent = Number.isSafeInteger(body.input_bound_tokens) ? body.input_bound_tokens! : built.bytes.byteLength;
+                    const refused = built.bytes;
                     let retry: ReturnType<typeof compactRequest<typeof built>>;
                     try {
-                        retry = compactRequest(request, new LocalRequestError('local_input_too_large', { bodyBytes: sent, limitBytes: tighter.maxInputTokens,
-                            messages: 0, maxBlocks: 0, tools: 0, toolBytes: 0 }), builder(tighter), 'remote');
+                        retry = compactRequest(request, new LocalRequestError('local_input_too_large', { bodyBytes: refused.byteLength,
+                            limitBytes: tighter.maxInputTokens - (responses ? 0 : INPUT_FRAMING), messages: 0, maxBlocks: 0, tools: 0, toolBytes: 0 }), builder(tighter), 'remote');
                     } catch (error) {
                         if (error instanceof LocalRequestError) throw refusal;
                         throw error;
                     }
-                    // Nothing left to compact: the same body would only be refused again.
-                    if (!retry.info.folded && !retry.info.shortened) throw refusal;
+                    // The same bytes (nothing more to compact) would only be refused again.
+                    if (Buffer.from(retry.built.bytes).equals(Buffer.from(refused))) throw refusal;
                     built = retry.built;
                     compaction = retry.info;
                     options.onCompact?.(compaction);
                     idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
                     headers['idempotency-key'] = idempotencyKey;
                     resent = false;
+                    // A new request: an earlier concurrency wait does not count against it.
+                    concurrencyError = undefined; concurrencyStarted = undefined; concurrencyWaited = 0; concurrencyRetries = 0;
                     options.onRequest?.(url, built, idempotencyKey);
                     waitMs = 0;
                 }
