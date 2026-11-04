@@ -13,9 +13,9 @@
  *   Checkout Session Stripe created and expires it, then starts the subscription with POST /v1/subscriptions from
  *   exactly `trialSubscriptionData()` (the builder Checkout's `subscription_data` uses), encoded by the product's own
  *   `createStripeRequest`, plus the v3 price item and a default payment method.
- * - The disposable database must already have the billing migrations through 0021. Its Supabase image's `auth.users`
- *   predates GoTrue's `email_confirmed_at`, `deleted_at` and `banned_until`; beforeAll adds them (IF NOT EXISTS)
- *   because the trial facts and the paid-compute SQL read them.
+ * - The disposable database must already have the billing migrations through 0021 and GoTrue's `email_confirmed_at`,
+ *   `deleted_at` and `banned_until` on `auth.users` (the trial facts and the paid-compute SQL read them; the image's
+ *   older auth schema lacks them, so app/scripts/billing-test-db.sh adds them). beforeAll refuses without them.
  * - The v3 Standard price (`ezil_standard_monthly_v3`) must already exist in the sandbox; the suite never creates one.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { TRPCError } from '@trpc/server';
-import { asc, eq, inArray, sql } from 'drizzle-orm';
+import { asc, eq, inArray, sql, TransactionRollbackError } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, it, vi, type TestContext } from 'vitest';
@@ -50,6 +50,7 @@ import { createStripeUsageBilling } from '../stripe/usage-billing';
 import { billingV2EntitlementReader } from '../v2/compute-access';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { CATALOG_V3 } from './contract';
+import { deriveStanding } from './standing';
 import { normalizeEmail, TRIAL_SKU } from './trial';
 
 const migrationCalls = vi.hoisted(() => [] as { userId: string; sku: string }[]);
@@ -689,6 +690,47 @@ async function expectConverted(s: Scenario, expect: TestContext['expect'], user:
         periodAiRoot: periodRoot, firstPaidAtSet: true, trialStatus: 'converted', planTrialPresent: false });
 }
 
+/**
+ * Non-vacuous "no grace" for a never-paid trial. The issue row records Stripe's `event.created`, which is WALL time
+ * even for test-clock objects, so at the advanced clock any 7-day grace would look over anyway. So the rule is checked
+ * where a renewal grace would still run: the issue placed at the invoice's own (clock) finalization, the clock's now.
+ * The same rows as a previously paid subscription (first_paid_at set) must be in grace: the counterfactual proves
+ * it is the trial rule, not the clock skew, that refuses. The SQL half runs in a transaction that is rolled back.
+ */
+async function noGraceControls(s: Scenario, expect: TestContext['expect'], user: TrialSubscriber, invoiceId: string) {
+    const invoice = await stripeRequest<Invoice & { status_transitions?: { finalized_at?: number | null } }>('GET', `/invoices/${invoiceId}`);
+    const finalizedAt = invoice.status_transitions?.finalized_at;
+    if (typeof finalizedAt !== 'number') throw new Error('First-charge invoice has no finalization time');
+    const failedAt = new Date(finalizedAt * 1000);
+    const now = clockOf(s);
+    expect(failedAt <= now && failedAt >= user.trialEnd).toBe(true);
+    const subs = await store.subscriptionsFor(user.userId);
+    const issues = (await store.openPaymentIssues(user.userId)).map(issue => ({ ...issue, stripeEventCreated: failedAt }));
+    const asTrial = deriveStanding({ subscriptions: subs, paymentIssues: issues, placementProvider: null, now });
+    const asPaid = deriveStanding({ subscriptions: subs.map(row => ({ ...row, firstPaidAt: user.trialStart })),
+        paymentIssues: issues, placementProvider: null, now });
+    const graceEnd = iso(new Date(failedAt.getTime() + 7 * DAY_MS));
+    expect({ trial: [asTrial.standing, asTrial.graceEndsAt], paid: [asPaid.standing, asPaid.graceEndsAt] })
+        .toEqual({ trial: ['free', null], paid: ['grace', graceEnd] });
+    const covers = { trial: undefined as unknown, paid: undefined as unknown };
+    const executor = (tx: unknown) => tx as Parameters<typeof readPaidPoolEligibility>[0];
+    await db.transaction(async tx => {
+        await tx.execute(sql`update public.ezil_billing_payment_issues set stripe_event_created = ${failedAt.toISOString()}::timestamptz
+            where stripe_invoice_id = ${invoiceId}`);
+        covers.trial = await readPaidPoolEligibility(executor(tx), user.userId, now);
+        await tx.execute(sql`update public.ezil_billing_subscriptions set first_paid_at = ${user.trialStart.toISOString()}::timestamptz
+            where stripe_subscription_id = ${user.subscriptionId}`);
+        covers.paid = await readPaidPoolEligibility(executor(tx), user.userId, now);
+        tx.rollback();
+    }).catch(error => { if (!(error instanceof TransactionRollbackError)) throw error; });
+    expect(covers).toEqual({ trial: null, paid: { instanceType: 'm6i.large' } });
+    const [kept] = await db.select().from(billingSubscriptions).where(eq(billingSubscriptions.stripeSubscriptionId, user.subscriptionId));
+    expect(kept?.firstPaidAt).toBeNull(); // Rolled back.
+    return { issueRecordedAtIsWallTime: true, issueAtClockFrame: iso(failedAt), clockNow: iso(now),
+        standing: { neverPaidTrial: asTrial.standing, sameRowsPreviouslyPaid: asPaid.standing, graceEndsAt: graceEnd },
+        paidComputeSql: { neverPaidTrial: 'not covered', sameRowsPreviouslyPaid: 'covered (rolled back)' } };
+}
+
 /** An accepted delivery, re-posted unsigned and forged while still fresh: both 400, no state change. */
 async function signatureControls(s: Scenario, expect: TestContext['expect']): Promise<void> {
     const capture = s.captures.find(c => !c.held && c.httpStatus === 200 && c.signatureHeader && c.signedAt !== null
@@ -712,7 +754,7 @@ async function signatureControls(s: Scenario, expect: TestContext['expect']): Pr
     expect(await db.select().from(billingEvents).where(eq(billingEvents.eventId, tamperedId))).toEqual([]);
 }
 
-function scenario(n: number, name: string, body: (s: Scenario, expect: TestContext['expect']) => Promise<void>): void {
+function scenario(n: number, name: string, body:(s: Scenario, expect: TestContext['expect']) => Promise<void>): void {
     const s: Scenario = { n, name: `${n}. ${name}`, status: 'pending', error: null, clock: null, nowSec: 0, users: [], captures: [],
         deliveries: [], reruns: [], hold: null, held: [], checks: {}, db: emptySnapshot(), controller: new AbortController(),
         stripe: { clock: null, customers: [], subscriptions: [], invoices: [], paymentIntents: [], charges: [], refunds: [],
@@ -772,9 +814,11 @@ function scenario(n: number, name: string, body: (s: Scenario, expect: TestConte
             usage = createStripeUsageBilling({ secretKey });
             // Wall time: Stripe signs with wall time. The processor's clock is injected per delivery (deliver()).
             webhookDeps = { config: billingConfig(), store, stripe, usage, now: () => new Date() };
-            // GoTrue's auth.users columns that the trial facts and the paid-compute SQL read (absent from the image).
-            await pool`alter table auth.users add column if not exists email_confirmed_at timestamptz,
-                add column if not exists deleted_at timestamptz, add column if not exists banned_until timestamptz`;
+            // GoTrue's auth.users columns that the trial facts and the paid-compute SQL read (billing-test-db.sh adds
+            // them as the image's superuser; `postgres` does not own auth.users).
+            const columns = await pool`select column_name from information_schema.columns where table_schema = 'auth'
+                and table_name = 'users' and column_name in ('email_confirmed_at', 'deleted_at', 'banned_until')`;
+            if (columns.length !== 3) throw new Error('auth.users lacks email_confirmed_at/deleted_at/banned_until; recreate the DB with billing-test-db.sh up');
             const [trials] = await pool`select to_regclass('public.ezil_billing_trials') is not null as present`;
             if (trials?.present !== true) throw new Error('Migration 0021 is not applied');
             // Read-only catalog lookup; prices are never created.
@@ -1055,8 +1099,10 @@ function scenario(n: number, name: string, body: (s: Scenario, expect: TestConte
         expect((await grantsFor(user.userId)).map(row => row.kind)).toEqual(['trial_period']);
         // The trial root expired at the trial end by itself: nothing to revoke.
         expect((await outboxFor(user.userId)).filter(item => item.kind === 'ai_revoke')).toEqual([]);
+        const noGrace = await noGraceControls(s, expect, user, invoiceId);
         check(s, 'paymentFailed', { invoiceId, subscriptionStatus: 'past_due', trialStatus: 'payment_failed', standing: 'free',
-            graceEndsAt: null, planTrialState: 'payment_failed', paidComputeSql: 'not covered', entitlementPlan: freeEntitlement?.planId });
+            graceEndsAt: null, planTrialState: 'payment_failed', paidComputeSql: 'not covered', entitlementPlan: freeEntitlement?.planId,
+            noGraceControls: noGrace });
 
         // Recovery: a working card as the default, then pay the open invoice.
         const visa = await stripeRequest('POST', '/payment_methods/pm_card_visa/attach', { customer: user.customerId });
