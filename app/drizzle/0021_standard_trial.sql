@@ -118,8 +118,8 @@ ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_start" timestamp with
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "trial_end" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "first_paid_at" timestamp with time zone;--> statement-breakpoint
 -- The trial's ledger row has its own kind and source, so it is never read as a paid invoice period.
-ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT "ezil_billing_grants_kind_chk";--> statement-breakpoint
+ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT IF EXISTS "ezil_billing_grants_kind_chk";--> statement-breakpoint
 ALTER TABLE "ezil_billing_grants" ADD CONSTRAINT "ezil_billing_grants_kind_chk" CHECK ("ezil_billing_grants"."kind" in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated', 'trial_period'));--> statement-breakpoint
-ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT "ezil_billing_grants_source_type_chk";--> statement-breakpoint
+ALTER TABLE "ezil_billing_grants" DROP CONSTRAINT IF EXISTS "ezil_billing_grants_source_type_chk";--> statement-breakpoint
 ALTER TABLE "ezil_billing_grants" ADD CONSTRAINT "ezil_billing_grants_source_type_chk" CHECK ("ezil_billing_grants"."source_type" in ('invoice', 'payment_intent', 'refund', 'dispute', 'trial'));--> statement-breakpoint
 CREATE UNIQUE INDEX "ezil_billing_grants_trial_once_uidx" ON "ezil_billing_grants" USING btree ("user_id","meter") WHERE "ezil_billing_grants"."kind" = 'trial_period';

@@ -514,7 +514,8 @@ test('the Standard trial follows 0020, stays additive and is a production snapsh
     assert.match(sql, /'dispute', 'trial'\)\);/);
     assert.match(sql, /CREATE UNIQUE INDEX "ezil_billing_grants_trial_once_uidx" ON "ezil_billing_grants" USING btree \("user_id","meter"\) WHERE "ezil_billing_grants"\."kind" = 'trial_period';/);
     // Nothing is dropped except the two CHECKs it re-adds wider; no data is written.
-    assert.deepEqual([...sql.matchAll(/DROP CONSTRAINT "([^"]+)"/g)].map(match => match[1]),
+    // cb1: each CHECK widening is DROP IF EXISTS plus ADD, inside 0021's one transaction.
+    assert.deepEqual([...sql.matchAll(/DROP CONSTRAINT IF EXISTS "([^"]+)"/g)].map(match => match[1]),
         ['ezil_billing_grants_kind_chk', 'ezil_billing_grants_source_type_chk']);
     // Review R4: the only DML is the capture hook's own insert into the identities table, inside its function body;
     // it runs on auth.users changes and deletions and never writes auth.users itself.
