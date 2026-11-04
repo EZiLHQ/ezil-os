@@ -443,7 +443,7 @@ function provenance() {
     let migration: string | null = null;
     try { migration = createHash('sha256').update(readFileSync(`${repo}app/drizzle/0021_standard_trial.sql`)).digest('hex'); } catch { /* recorded as null */ }
     let stripeCli: string | null = null;
-    try { stripeCli = execFileSync('/root/ezil-tools/stripe-sandbox/bin/stripe', ['--version'], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as NodeJS.ProcessEnv }).trim(); } catch { /* recorded as null */ }
+    try { stripeCli = execFileSync('/root/ezil-tools/stripe-sandbox/bin/stripe', ['--version'], { encoding: 'utf8', env: { ...process.env } }).trim(); } catch { /* recorded as null */ }
     let db: { host: string; port: string } | null = null;
     try { const url = new URL(databaseUrl); db = { host: url.hostname, port: url.port }; } catch { /* recorded as null */ }
     return { sourceSha: git('rev-parse', 'HEAD'), trackedChanges: dirty, migration0021Sha256: migration, stripeCli,
