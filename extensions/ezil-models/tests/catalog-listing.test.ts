@@ -28,7 +28,7 @@ const unavailable = (id: string, ...reasons: string[]) => row(id, 'unavailable',
 const v1 = (data: Row[], over: Row = {}) => ({ object: 'list', contract: 'ezil.gateway.models.v1', catalog_ttl_seconds: 10, killswitch: false, pause: null, data, ...over });
 const legacy = (data: Row[]) => ({ object: 'list', killswitch: false, pause: null, data });
 
-type Sent = { url: string; accept: string | null; body: Record<string, unknown> };
+type Sent = { url: string; accept: string | null; token: string; body: Record<string, unknown> };
 function gateway(config: ResolvedConfig, catalog: (token: string) => Response, answer: (body: Record<string, unknown>) => Response = defaultAnswer) {
     const posts: Sent[] = []; const gets: string[] = [];
     const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -37,7 +37,7 @@ function gateway(config: ResolvedConfig, catalog: (token: string) => Response, a
         const token = headers.get('authorization')?.replace('Bearer ', '') ?? '';
         if (String(input).endsWith('/models')) { gets.push(token); return catalog(token); }
         const body = JSON.parse(new TextDecoder().decode(init.body as Uint8Array));
-        posts.push({ url: String(input), accept: headers.get('accept'), body });
+        posts.push({ url: String(input), accept: headers.get('accept'), token, body });
         return answer(body);
     }) as typeof globalThis.fetch;
     const host = { models: () => config.models, configError: () => undefined, secrets: () => config.secrets, logRequests: () => false,
@@ -55,8 +55,8 @@ const token = () => ({ isCancellationRequested: false, onCancellationRequested: 
 const list = (provider: InstanceType<typeof EZiLModelsProvider>) => provider.provideLanguageModelChatInformation({} as never, token() as never);
 const message = (role: number, content: unknown[]) => ({ role, content });
 const READ_FILE = { name: 'read_file', description: 'Read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } } } };
-function send(provider: InstanceType<typeof EZiLModelsProvider>, info: { id: string; capabilities?: object }, messages: unknown[] = [message(1, [new TextPart('q')])], tools: unknown[] = []) {
-    return provider.provideLanguageModelChatResponse(info as never, messages as never, { tools, modelOptions: {} } as never, { report: () => {} }, token() as never);
+function send(provider: InstanceType<typeof EZiLModelsProvider>, info: { id: string; capabilities?: object }, messages: unknown[] = [message(1, [new TextPart('q')])], tools: unknown[] = [], modelOptions = {}) {
+    return provider.provideLanguageModelChatResponse(info as never, messages as never, { tools, modelOptions } as never, { report: () => {} }, token() as never);
 }
 const ids = (infos: { id: string }[]) => infos.map(info => info.id);
 
@@ -78,10 +78,10 @@ describe('the picker lists what the Gateway says this caller can use', () => {
             row('Synthetic Bad Alias', 'available'), row('synthetic-new-state', 'available-soon'), row('synthetic-no-protocols', 'available', { protocols: undefined }),
         ])));
         const infos = await list(g.provider);
-        expect(ids(infos)).toEqual([QWEN, KIMI, 'synthetic-chat-a', 'synthetic-chat-b']);
+        expect(ids(infos)).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a', 'ezil/synthetic-chat-b']);
         expect(infos[0]).toMatchObject({ name: 'Qwen3 Coder Next', isDefault: true, capabilities: { toolCalling: true, imageInput: false } });
         expect(infos[1]).toMatchObject({ name: 'Kimi K3 (no streaming)', isDefault: false });
-        expect(infos[2]).toEqual(expect.objectContaining({ id: 'synthetic-chat-a', name: 'Synthetic Chat A', family: 'synthetic-chat-a', isDefault: false,
+        expect(infos[2]).toEqual(expect.objectContaining({ id: 'ezil/synthetic-chat-a', name: 'Synthetic Chat A', family: 'synthetic-chat-a', isDefault: false,
             isUserSelectable: true, maxInputTokens: 100_000 - 1056 - 1536 - 8000, maxOutputTokens: 16_384, capabilities: { toolCalling: false, imageInput: false } }));
         expect(infos[3]!.name).toBe('synthetic-chat-b');
         // Prices and upstream ids are not contract and never reach the picker.
@@ -98,7 +98,7 @@ describe('the picker lists what the Gateway says this caller can use', () => {
             object: 'response', id: 'resp_1', status: 'completed', usage: { input_tokens: 10, output_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
             output: [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'hi', annotations: [] }] }] }));
         const infos = await list(g.provider);
-        expect(ids(infos)).toEqual([QWEN, KIMI, 'synthetic-responses']);
+        expect(ids(infos)).toEqual([QWEN, KIMI, 'ezil/synthetic-responses']);
         await send(g.provider, infos[2]!);
         expect(g.posts.map(post => [new URL(post.url).pathname, post.body.model, post.body.stream])).toEqual([['/ai/v1/responses', 'synthetic-responses', false]]);
     });
@@ -162,12 +162,12 @@ describe('refresh and model switching', () => {
         const g = gateway(load(), () => Response.json(catalog), body => body.model === 'synthetic-chat-a'
             ? Response.json({ error: { code: 'model_disabled', message: 'synthetic' } }, { status: 503 }) : defaultAnswer(body));
         const first = await list(g.provider);
-        const selected = first.find(info => info.id === 'synthetic-chat-a')!;
+        const selected = first.find(info => info.id === 'ezil/synthetic-chat-a')!;
         expect((await list(g.provider)).find(info => info.id === selected.id)).toEqual(selected);
         catalog = v1([unavailable('synthetic-chat-a', 'model_disabled'), row('synthetic-chat-b', 'available')]);
         await expect(send(g.provider, selected)).rejects.toThrow();
         expect(g.changes()).toBe(1);
-        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-b']);
+        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-b']);
         // VS Code may still hold the old entry: refused before sending, and never another model instead.
         await expect(send(g.provider, selected)).rejects.toThrow('EZiL Models: EZiL AI: This model is not available right now. Pick another model. Nothing was sent or charged.');
         expect(g.changes()).toBe(2);
@@ -200,15 +200,15 @@ describe('refresh and model switching', () => {
         let catalog: unknown = v1([row('synthetic-chat-a', 'available')]);
         const g = gateway(config, () => catalog === undefined ? Response.json({}, { status: 500 }) : Response.json(catalog));
         const opened = () => gatewayModels(config.models[0]!.provider, g.fetch, Date.now(), undefined, true).then(() => g.provider.refreshIfCatalogChanged());
-        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-a']);
+        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a']);
         catalog = undefined;
         await opened();
         expect([g.gets.length, g.changes()]).toEqual([2, 0]);
-        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-a']);
+        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a']);
         catalog = v1([row('synthetic-chat-a', 'available'), row('synthetic-chat-b', 'available')]);
         await opened();
         expect([g.gets.length, g.changes()]).toEqual([3, 1]);
-        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-a', 'synthetic-chat-b']);
+        expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a', 'ezil/synthetic-chat-b']);
     });
 
     test('a changed catalog read after a request re-lists once; an unchanged one does not', async () => {
@@ -223,7 +223,7 @@ describe('refresh and model switching', () => {
             now.mockReturnValue(1_000_000 + 5 * 60_000); // the five-minute cache has expired: the next turn reads it
             await send(g.provider, qwen);
             expect([g.gets.length, g.changes()]).toEqual([2, 1]);
-            expect(ids(await list(g.provider))).toContain('synthetic-chat-b');
+            expect(ids(await list(g.provider))).toContain('ezil/synthetic-chat-b');
             await send(g.provider, qwen);
             expect(g.changes()).toBe(1);
         } finally { now.mockRestore(); }
@@ -238,7 +238,7 @@ describe('catalog failure: unknown, never unavailable', () => {
                 return failure === 'not json' ? new Response('<html>', { status: 200 }) : Response.json({ error: { code: 'forbidden' } }, { status: Number(failure) });
             });
             expect(ids(await list(g.provider))).toEqual([QWEN, KIMI]);
-            await expect(send(g.provider, { id: 'synthetic-chat-a' })).rejects.toThrow('Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged.');
+            await expect(send(g.provider, { id: 'ezil/synthetic-chat-a' })).rejects.toThrow('Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged.');
             expect(g.posts).toHaveLength(0);
         });
     }
@@ -251,7 +251,7 @@ describe('catalog failure: unknown, never unavailable', () => {
             const selected = (await list(g.provider))[2]!;
             readable = false;
             now.mockReturnValue(2_000_000 + 6 * 60_000);
-            expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-a']);
+            expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a']);
             await send(g.provider, selected);
             expect(g.posts.map(post => [post.body.model, post.body.stream])).toEqual([['synthetic-chat-a', false]]);
             expect(g.changes()).toBe(0); // an outage does not re-list (and re-read) after every request
@@ -272,17 +272,88 @@ describe('isolation: each token reads and keeps its own catalog', () => {
                 : Response.json(v1([row(token === 'token-a' ? 'synthetic-a-only' : 'synthetic-b-only', 'available')]));
             const a = gateway(load('token-a'), catalog);
             const b = gateway(load('token-b'), catalog);
-            expect(ids(await list(a.provider))).toEqual([QWEN, KIMI, 'synthetic-a-only']);
-            expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'synthetic-b-only']);
+            expect(ids(await list(a.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-a-only']);
+            expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-b-only']);
             expect([a.gets, b.gets]).toEqual([['token-a'], ['token-b']]);
             readable = false;
             now.mockReturnValue(3_000_000 + 6 * 60_000);
-            expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'synthetic-b-only']);
+            expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-b-only']);
             // B's own last catalog answers for B: A's row is not in it, so it is not available to B.
-            await expect(send(b.provider, { id: 'synthetic-a-only' })).rejects.toThrow('This model is not available right now');
+            await expect(send(b.provider, { id: 'ezil/synthetic-a-only' })).rejects.toThrow('This model is not available right now');
             expect([...a.posts, ...b.posts]).toHaveLength(0);
             expect([a.gets, b.gets]).toEqual([['token-a'], ['token-b', 'token-b', 'token-b']]);
         } finally { now.mockRestore(); }
+    });
+});
+
+describe('two Gateway accounts in one config: a catalog row is always sent with its own account', () => {
+    // Root review of 6be5138a: one provider object, two configured Gateway credentials, the same dynamic alias.
+    const providers = { 'gw-a': { type: 'ezil-gateway', baseUrl: 'https://a.test/ai/v1', apiKey: 'synthetic-a' },
+        'gw-b': { type: 'ezil-gateway', baseUrl: 'https://b.test/ai/v1', apiKey: 'synthetic-b' } };
+    function accounts(order: 'a-first' | 'b-first', extra: Row[] = [], qwenB = true) {
+        const models: Row[] = [{ id: 'qwen-a', provider: 'gw-a', model: QWEN, default: true },
+            qwenB ? { id: 'qwen-b', provider: 'gw-b', model: QWEN } : { id: 'kimi-b', provider: 'gw-b', model: KIMI }, ...extra];
+        return parseModelsConfig(JSON.stringify(order === 'a-first' ? { providers, models }
+            : { providers: { 'gw-b': providers['gw-b'], 'gw-a': providers['gw-a'] }, models: [...models].reverse() }));
+    }
+    const host = (post: Sent) => new URL(post.url).host;
+    const shared = () => Response.json(v1([row('synthetic-shared', 'available')]));
+
+    for (const order of ['a-first', 'b-first'] as const) {
+        test(`the same alias from both accounts gets two picker ids, and B's is sent only to B (${order})`, async () => {
+            const g = gateway(accounts(order), shared);
+            const infos = await list(g.provider);
+            expect(new Set(ids(infos)).size).toBe(infos.length);
+            const a = infos.find(info => info.id === 'gw-a/synthetic-shared')!;
+            const b = infos.find(info => info.id === 'gw-b/synthetic-shared')!;
+            expect([a.detail, b.detail]).toEqual(['gw-a', 'gw-b']);
+            await send(g.provider, b);
+            expect(g.posts.map(post => [host(post), post.token, post.body.model])).toEqual([['b.test', 'synthetic-b', 'synthetic-shared']]);
+            await send(g.provider, a);
+            expect(g.posts.map(post => [host(post), post.token])).toEqual([['b.test', 'synthetic-b'], ['a.test', 'synthetic-a']]);
+        });
+    }
+
+    test('B\'s row removed, or B\'s catalog unreadable: B\'s entry fails closed and A\'s same alias never answers for it', async () => {
+        let bCatalog: () => Response = shared;
+        const g = gateway(accounts('a-first'), token => token === 'synthetic-b' ? bCatalog() : shared());
+        const b = (await list(g.provider)).find(info => info.id === 'gw-b/synthetic-shared')!;
+        bCatalog = () => Response.json(v1([unavailable('synthetic-shared', 'model_disabled')]));
+        forgetGatewayModels(); // the five minutes are up
+        await expect(send(g.provider, b)).rejects.toThrow('This model is not available right now. Pick another model. Nothing was sent or charged.');
+        bCatalog = () => Response.json({}, { status: 500 });
+        forgetGatewayModels(); // and no last catalog for B either
+        await expect(send(g.provider, b)).rejects.toThrow('Could not load the model list');
+        expect(g.posts).toHaveLength(0);
+        expect(ids(await list(g.provider))).toEqual(['qwen-a', 'qwen-b', 'gw-a/synthetic-shared']);
+    });
+
+    test('a model A configures with that alias hides only A\'s row; B\'s row stays B\'s', async () => {
+        const g = gateway(accounts('a-first', [{ id: 'shared-a', provider: 'gw-a', model: 'synthetic-shared' }]), shared);
+        expect(ids(await list(g.provider))).toEqual(['qwen-a', 'qwen-b', 'shared-a', 'gw-b/synthetic-shared']);
+        await send(g.provider, { id: 'gw-b/synthetic-shared' });
+        await send(g.provider, { id: 'shared-a' });
+        expect(g.posts.map(post => [host(post), post.token, post.body.model])).toEqual([
+            ['b.test', 'synthetic-b', 'synthetic-shared'], ['a.test', 'synthetic-a', 'synthetic-shared']]);
+    });
+
+    for (const id of ['synthetic-shared', 'gw-c/synthetic-shared', 'gw-b/synthetic-shared/x', '/synthetic-shared', 'gw-b/Synthetic Shared']) {
+        test(`an id that does not name exactly one configured account fails closed, with no request: ${id}`, async () => {
+            const g = gateway(accounts('a-first'), shared);
+            await list(g.provider);
+            await expect(send(g.provider, { id })).rejects.toThrow(`EZiL Models: model "${id}" is no longer in the config file. Pick another model.`);
+            expect(g.posts).toHaveLength(0);
+        });
+    }
+
+    test('a utility request on B\'s row goes to B\'s Qwen, or stays on B\'s row without one; never to A', async () => {
+        for (const qwenB of [true, false]) {
+            forgetGatewayModels();
+            const g = gateway(accounts('a-first', [], qwenB), shared);
+            await list(g.provider);
+            await send(g.provider, { id: 'gw-b/synthetic-shared' }, undefined, [], { requestInitiator: 'title' });
+            expect(g.posts.map(post => [host(post), post.token, post.body.model])).toEqual([['b.test', 'synthetic-b', qwenB ? QWEN : 'synthetic-shared']]);
+        }
     });
 });
 

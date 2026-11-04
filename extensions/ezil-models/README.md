@@ -164,8 +164,19 @@ auth context.
     `unavailable`.
   - Each other catalog row that the Gateway marks `availability.state:
     "available"` for this caller over a protocol this client speaks
-    (`ezil.gateway.models.v1`; Messages before Responses), listed by its alias.
-  - A configured model with the same alias wins. A catalog without
+    (`ezil.gateway.models.v1`; Messages before Responses).
+  - **One account per entry.** A catalog-only model's picker id is
+    `<provider name>/<alias>`, such as `ezil/some-alias`. Neither part can
+    contain `/`, so the id names exactly one configured Gateway provider (one
+    account) and never equals a configured model's id. Only the alias is sent
+    upstream.
+  - **Requests stay on that provider.** A request reads only that provider's
+    catalog and uses only its credential. An id that does not name exactly one
+    configured Gateway provider is refused before anything is sent. Title,
+    summary and progress requests go to Qwen on the same provider, or else to
+    the selected model.
+  - A model configured on the same provider with the same alias wins; another
+    provider's configuration never hides this account's row. A catalog without
     `availability`, as served today, adds nothing.
 - **What it assumes.** Nothing a row does not state. A catalog-only row has no
   tool calling or streaming unless `capabilities.tool_calling` or

@@ -2,7 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, withGatewayModelLimits, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -176,30 +176,32 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     /**
-     * A configured model, or a catalog-only one from this provider's catalog: read as for the picker (the five-minute
-     * cache, else a request, else the last read), or for `known` (token counts) the cache first.
+     * A configured model, or a catalog-only one. A catalog-only id names exactly one configured Gateway provider (one
+     * account): only that provider's catalog is read, as for the picker (the five-minute cache, else a request, else
+     * the last read; for `known`, token counts, the cache first), and only its credential is ever used. Anything that
+     * does not resolve to that one provider fails closed, never to another provider's model of the same alias.
      */
     private async resolve(model: vscode.LanguageModelChatInformation, signal?: AbortSignal, known = false): Promise<ResolvedModel> {
         const models = this.host.models();
         const found = models.find(candidate => candidate.id === model.id);
         if (found) return found;
-        let unread = false;
-        for (const provider of this.gatewayProviders()) {
+        const id = parseCatalogModelId(model.id);
+        const named = id ? this.gatewayProviders().filter(provider => provider.name === id.providerName) : [];
+        let catalog: GatewayModels | undefined;
+        if (named.length === 1) {
+            const provider = named[0]!;
             signal?.throwIfAborted();
             const read = () => gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
-            const catalog = known ? knownGatewayModels(provider) ?? await read() : await read() ?? knownGatewayModels(provider);
-            unread ||= !catalog;
+            catalog = known ? knownGatewayModels(provider) ?? await read() : await read() ?? knownGatewayModels(provider);
             const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
             if (listed) return listed;
         }
         const error = this.host.configError();
         if (error) throw new ProviderError(`EZiL Models: the config could not be loaded. ${error}`);
+        if (named.length !== 1) throw new ProviderError(`EZiL Models: model "${model.id}" is no longer in the config file. Pick another model.`);
         // Never another model in its place (contract §2 rule 3). Unknown is not unavailable.
-        if (unread) throw new GatewayError('EZiL AI: Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged. Try again.', undefined, 'catalog_unavailable', undefined, undefined, 'local');
-        if (/^[a-z0-9][a-z0-9._-]{0,63}$/.test(model.id) && this.gatewayProviders().length) {
-            throw new GatewayError('EZiL AI: This model is not available right now. Pick another model. Nothing was sent or charged.', undefined, 'model_unavailable', undefined, undefined, 'local');
-        }
-        throw new ProviderError(`EZiL Models: model "${model.id}" is no longer in the config file. Pick another model.`);
+        if (!catalog) throw new GatewayError('EZiL AI: Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged. Try again.', undefined, 'catalog_unavailable', undefined, undefined, 'local');
+        throw new GatewayError('EZiL AI: This model is not available right now. Pick another model. Nothing was sent or charged.', undefined, 'model_unavailable', undefined, undefined, 'local');
     }
 
     async provideLanguageModelChatResponse(
@@ -223,7 +225,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             throw new Error(`EZiL Models: ${error.message}`);
         }
         if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
-            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway'
+            // Qwen on the selected model's own provider (account) only; without one, the selected model serves it.
+            const selected = resolved;
+            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName
                 && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
         }
         const request = toNeutralRequest(messages, options);

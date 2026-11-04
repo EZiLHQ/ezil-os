@@ -210,22 +210,38 @@ function selectableProtocol(entry: GatewayModel): GatewayProtocol | undefined {
 }
 
 /**
+ * The picker id of a catalog-only model: `<provider config name>/<alias>`. Neither part can contain `/` (config
+ * ID_PATTERN, CATALOG_ALIAS), so the id names exactly one configured provider (one account) and can never equal a
+ * configured model's id. The alias alone is what is sent upstream.
+ */
+export function catalogModelId(provider: Pick<ResolvedProvider, 'name'>, alias: string): string {
+    return `${provider.name}/${alias}`;
+}
+
+/** The provider name and alias in a catalog-only picker id, or undefined for anything else (a configured id). */
+export function parseCatalogModelId(id: string): { providerName: string; alias: string } | undefined {
+    const parts = id.split('/');
+    return parts.length === 2 && parts[0] && CATALOG_ALIAS.test(parts[1]!) ? { providerName: parts[0], alias: parts[1]! } : undefined;
+}
+
+/**
  * The models a Gateway catalog adds to the configured ones (founder request 920): each row the Gateway marks
- * `available` for this caller over a protocol this client speaks, listed by its alias. A configured model with the
- * same alias or picker id wins, and a catalog without `availability` adds nothing. Nothing the row does not say is
- * assumed: tool calling, image input and streaming stay off unless its capabilities turn them on (images always
- * do, as for every Gateway model), and caps are the row's own.
+ * `available` for this caller over a protocol this client speaks, listed under `catalogModelId`. A model configured
+ * on the same provider with the same alias wins; another provider's configuration never hides this account's row.
+ * A catalog without `availability` adds nothing. Nothing the row does not say is assumed: tool calling, image input
+ * and streaming stay off unless its capabilities turn them on (images always do, as for every Gateway model), and
+ * caps are the row's own.
  */
 export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[]): ResolvedModel[] {
     if (provider.type !== 'ezil-gateway' || !catalog) return [];
-    const taken = new Set(configured.flatMap(model => [model.id.toLowerCase(), ...model.provider.type === 'ezil-gateway' ? [model.model.toLowerCase()] : []]));
+    const taken = new Set(configured.filter(model => model.provider.type === 'ezil-gateway' && model.providerName === provider.name).map(model => model.model.toLowerCase()));
     const models: ResolvedModel[] = [];
     for (const entry of catalog.data) {
         const protocol = selectableProtocol(entry);
         if (!protocol || !CATALOG_ALIAS.test(entry.id) || taken.has(entry.id)) continue;
         taken.add(entry.id);
         models.push({
-            id: entry.id, name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
+            id: catalogModelId(provider, entry.id), name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
             ...protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {},
             family: entry.id, version: '1',
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
