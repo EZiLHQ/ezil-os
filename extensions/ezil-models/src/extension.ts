@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
-import { forgetGatewayModels } from './gateway';
+import { forgetGatewayModels, gatewayModels } from './gateway';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
 import type { Usage } from './types';
@@ -217,7 +217,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             usage.record(model, used, elapsedMs);
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
         },
-        requestFinished: model => { if (model.provider.type === 'ezil-gateway') void aiStatus.refresh(); },
+        requestFinished: model => { if (model.provider.type === 'ezil-gateway') { void aiStatus.refresh(); provider.refreshIfCatalogChanged(); } },
     });
     context.subscriptions.push(output, store, provider, aiStatus);
     context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));
@@ -257,7 +257,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 : vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`)
             : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
-    const showCredits = () => aiStatus.show();
+    const showCredits = () => {
+        // The panel just opened: read the model list fresh too (contract §1), and re-list if it changed. A failed read
+        // keeps the last catalog: unknown is not unavailable.
+        const gateway = store.models().find(model => model.provider.type === 'ezil-gateway')?.provider;
+        if (gateway) void gatewayModels(gateway, fetch, Date.now(), undefined, true).then(() => provider.refreshIfCatalogChanged());
+        return aiStatus.show();
+    };
     const showUsage = () => { log(`[usage report]\n${usage.report()}`); output.show(); };
     const manage = async () => {
         type Item = vscode.QuickPickItem & { action?: () => void | Promise<void> };

@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
-import { buildGatewayBody, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -80,7 +80,14 @@ export type GatewayOptions = {
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
 
-export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[] };
+/** Closed in `ezil.gateway.models.v1` (Gateway docs/CATALOG-CONSUMER-CONTRACT.md §2); an unknown value is ignored. */
+export const AVAILABILITY_STATES = ['available', 'unavailable', 'unknown'] as const;
+export const AVAILABILITY_REASONS = ['model_disabled', 'no_active_pricing', 'gateway_paused', 'no_route', 'route_not_ready', 'not_allowed_for_caller', 'catalog_unavailable'] as const;
+export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; reasons: (typeof AVAILABILITY_REASONS[number])[] };
+/** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
+export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean };
+export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
+    availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[] };
 export type GatewayGrant = { remaining_micro: number; live: boolean };
 export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
@@ -92,6 +99,9 @@ function providerIdentity(provider: ResolvedProvider): string {
 }
 
 const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: number; models: GatewayModels }>();
+
+/** Refusals that mean the catalog this client listed is out of date (contract §1): read it again, and re-list. */
+export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable'];
 
 /** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
 export function forgetGatewayModels(baseUrl?: string): void {
@@ -118,8 +128,33 @@ async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof
 }
 
 const KNOWN_PROTOCOLS: readonly GatewayProtocol[] = ['anthropic-messages', 'openai-responses'];
+/** The Gateway's own alias rule (src/catalog.ts MODEL_ALIAS); a catalog-only row is listed under this id. */
+const CATALOG_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+// Shown as plain text in the picker and the status panel: no control or bidirectional-override characters.
+const DISPLAY_NAME = /^[^\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]{1,64}$/u;
 
-function asModels(json: unknown): GatewayModels | undefined {
+const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+function availabilityOf(value: unknown): GatewayAvailability | undefined {
+    if (!record(value) || !AVAILABILITY_STATES.includes(value.state as GatewayAvailability['state'])) return undefined;
+    const reasons = Array.isArray(value.reasons) ? value.reasons.filter((reason): reason is GatewayAvailability['reasons'][number] =>
+        AVAILABILITY_REASONS.includes(reason as GatewayAvailability['reasons'][number])) : [];
+    return { state: value.state as GatewayAvailability['state'], reasons: [...new Set(reasons)] };
+}
+
+function capabilitiesOf(value: unknown): GatewayCapabilities | undefined {
+    if (!record(value)) return undefined;
+    const capabilities: GatewayCapabilities = {};
+    for (const key of ['tool_calling', 'image_input', 'streaming'] as const) if (typeof value[key] === 'boolean') capabilities[key] = value[key];
+    return capabilities;
+}
+
+/**
+ * `GET /v1/models`, reduced to the fields this client reads; everything else in a row (pricing, upstream model) is
+ * dropped here. A malformed core field rejects the catalog as before. A new field's unknown or malformed value is
+ * ignored for that row, never a reason to distrust the whole catalog.
+ */
+export function parseGatewayModels(json: unknown): GatewayModels | undefined {
     if (typeof json !== 'object' || json === null || !Array.isArray((json as GatewayModels).data)) return undefined;
     const raw = json as Record<string, unknown>;
     if (raw.data === undefined || !Array.isArray(raw.data) || raw.data.some(entry => typeof entry !== 'object' || entry === null
@@ -129,8 +164,17 @@ function asModels(json: unknown): GatewayModels | undefined {
         || (entry.protocols !== undefined && (!Array.isArray(entry.protocols) || entry.protocols.some((protocol: unknown) => typeof protocol !== 'string'))))) return undefined;
     // A protocol this client does not speak is dropped from its row, never a reason to distrust the whole catalog:
     // a row left with no known protocol is selectable by nobody here (gatewayModelAvailable).
-    const data = (raw.data as GatewayModel[]).map(entry => entry.protocols === undefined ? entry
-        : { ...entry, protocols: entry.protocols.filter(protocol => KNOWN_PROTOCOLS.includes(protocol)) });
+    const data = (raw.data as Record<string, unknown>[]).map(entry => {
+        const row: GatewayModel = { id: entry.id as string, enabled: entry.enabled as boolean,
+            max_input_tokens: entry.max_input_tokens as number, max_output_tokens: entry.max_output_tokens as number };
+        if (entry.protocols !== undefined) row.protocols = (entry.protocols as GatewayProtocol[]).filter(protocol => KNOWN_PROTOCOLS.includes(protocol));
+        const availability = availabilityOf(entry.availability);
+        if (availability) row.availability = availability;
+        if (typeof entry.name === 'string' && DISPLAY_NAME.test(entry.name.trim())) row.name = entry.name.trim();
+        const capabilities = capabilitiesOf(entry.capabilities);
+        if (capabilities) row.capabilities = capabilities;
+        return row;
+    });
     return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
 }
 
@@ -138,33 +182,88 @@ function asModels(json: unknown): GatewayModels | undefined {
 export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayModels | undefined): boolean {
     if (model.provider.type !== 'ezil-gateway') return true;
     const entry = catalog?.data.find(entry => entry.id === model.model);
-    if (entry?.enabled === false) return false;
+    if (entry?.enabled === false || entry?.availability?.state === 'unavailable') return false;
     const protocol = model.gatewayProtocol ?? 'anthropic-messages';
     if (protocol === 'openai-responses') return !catalog?.killswitch && entry?.enabled === true && entry.protocols?.includes(protocol) === true;
     return entry?.protocols === undefined || entry.protocols.includes(protocol);
 }
 
-/** Apply validated catalog caps without mutating config; callers still apply wire clamps/reserves. */
+/**
+ * Apply validated catalog caps and capabilities without mutating config; callers still apply wire clamps/reserves.
+ * The catalog can only take a capability away: a row saying `streaming: false` sends JSON from the first request.
+ */
 export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
     const entry = catalog?.data.find(entry => entry.id === model.model);
     if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    const capabilities = entry.capabilities;
     return { ...model, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
-        maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens) };
+        maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
+        capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
+            imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
+        stream: capabilities?.streaming === false ? false : model.stream };
+}
+
+/** Contract §2 rule 1: available for this caller, over a protocol this client speaks (Messages first). */
+function selectableProtocol(entry: GatewayModel): GatewayProtocol | undefined {
+    if (entry.enabled !== true || entry.availability?.state !== 'available') return undefined;
+    return KNOWN_PROTOCOLS.find(protocol => entry.protocols?.includes(protocol));
+}
+
+/**
+ * The models a Gateway catalog adds to the configured ones (founder request 920): each row the Gateway marks
+ * `available` for this caller over a protocol this client speaks, listed by its alias. A configured model with the
+ * same alias or picker id wins, and a catalog without `availability` adds nothing. Nothing the row does not say is
+ * assumed: tool calling, image input and streaming stay off unless its capabilities turn them on (images always
+ * do, as for every Gateway model), and caps are the row's own.
+ */
+export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[]): ResolvedModel[] {
+    if (provider.type !== 'ezil-gateway' || !catalog) return [];
+    const taken = new Set(configured.flatMap(model => [model.id.toLowerCase(), ...model.provider.type === 'ezil-gateway' ? [model.model.toLowerCase()] : []]));
+    const models: ResolvedModel[] = [];
+    for (const entry of catalog.data) {
+        const protocol = selectableProtocol(entry);
+        if (!protocol || !CATALOG_ALIAS.test(entry.id) || taken.has(entry.id)) continue;
+        taken.add(entry.id);
+        models.push({
+            id: entry.id, name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
+            ...protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {},
+            family: entry.id, version: '1',
+            maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
+            capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
+            cache: { enabled: false, ttl: '5m' }, default: false, roles: [], forcedToolChoice: false,
+            stream: entry.capabilities?.streaming === true && entry.id !== KIMI, toolReserve: DEFAULT_TOOL_RESERVE,
+        });
+    }
+    return models;
 }
 
 /** `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. */
-export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(), signal?: AbortSignal): Promise<GatewayModels | undefined> {
+export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(), signal?: AbortSignal,
+    /** Read now even within the five minutes (a panel opening); a failed read keeps the last catalog. */ fresh = false): Promise<GatewayModels | undefined> {
     const key = providerIdentity(provider);
     const cached = modelsCache.get(key);
-    if (cached && now - cached.at < MODELS_TTL_MS) return cached.models;
+    if (!fresh && cached && now - cached.at < MODELS_TTL_MS) return cached.models;
     try {
         const { status, json } = await getJson(provider, '/models', doFetch, signal);
-        const models = status === 200 ? asModels(json) : undefined;
+        const models = status === 200 ? parseGatewayModels(json) : undefined;
         if (models) modelsCache.set(key, { baseUrl: provider.baseUrl, at: now, models });
         return models;
     } catch {
         return undefined;
     }
+}
+
+/** How long a catalog that can no longer be read still lists the rows it had (only for its own base URL + token). */
+export const CATALOG_STALE_MS = 30 * 60_000;
+
+/**
+ * The last catalog read for this base URL + token, up to `CATALOG_STALE_MS` old, without a request. A failed read is
+ * "unknown", never "unavailable": the rows already listed stay selectable and the request decides. Cleared, like
+ * the cache, after an availability or limit refusal; never shared with another token.
+ */
+export function knownGatewayModels(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
+    const cached = modelsCache.get(providerIdentity(provider));
+    return cached && now - cached.at < CATALOG_STALE_MS ? cached.models : undefined;
 }
 
 export async function gatewayBalance(provider: ResolvedProvider, doFetch: typeof fetch, signal?: AbortSignal): Promise<GatewayBalance | undefined> {
@@ -579,7 +678,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     retried = true;
                     waitMs = retryDelay(retryAfter, 60, now()) * 1000;
                 } else {
-                    if (['killswitch', 'model_disabled', 'model_not_found', 'max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
+                    if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
                     const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
                     throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
                 }

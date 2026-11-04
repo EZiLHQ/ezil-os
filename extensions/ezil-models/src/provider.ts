@@ -2,10 +2,10 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
-import { GatewayError, gatewayModelAvailable, gatewayModels, withGatewayModelLimits } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
-import { redact, type ResolvedModel } from './config';
+import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
 import type { ChatRequest, Message, Part, Role, Tool, Usage } from './types';
 
@@ -122,9 +122,17 @@ function aiCreditsLink(): vscode.Uri | undefined {
     return undefined;
 }
 
+/** A catalog as listed, for noticing that a later read changed it (ids, availability, caps and capabilities). */
+function catalogSignature(catalog: GatewayModels | undefined): string {
+    return catalog ? JSON.stringify(catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])) : 'unread';
+}
+
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
     private lastCreditWarningAt = -Infinity;
+    /** Per configured Gateway provider: the catalog the picker was last given. */
+    private listedCatalogs = new Map<ResolvedProvider, string>();
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
@@ -132,25 +140,64 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     refresh(): void { this.changed.fire(); }
     dispose(): void { this.changed.dispose(); }
 
+    /**
+     * Re-list when a catalog read since the last listing changed what the picker shows (after a request, or when the
+     * status panel opens). Reads only the cache: never a request of its own.
+     */
+    refreshIfCatalogChanged(): void {
+        for (const [provider, listed] of this.listedCatalogs) {
+            const known = knownGatewayModels(provider);
+            if (known && catalogSignature(known) !== listed) { this.refresh(); return; }
+        }
+    }
+
+    private gatewayProviders(): ResolvedProvider[] {
+        return [...new Set(this.host.models().filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
+    }
+
     async provideLanguageModelChatInformation(_options: vscode.PrepareLanguageModelChatModelOptions, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
         if (token.isCancellationRequested) return [];
         const controller = new AbortController();
         const cancel = token.onCancellationRequested(() => controller.abort());
         try {
             const models = this.host.models();
-            const providers = [...new Set(models.filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
+            const providers = this.gatewayProviders();
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
-            return models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider)))
+            // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models come
+            // from this read, or the last one for the same base URL and token while this one fails.
+            const listed = providers.flatMap(provider => gatewayCatalogModels(provider, catalog.get(provider) ?? knownGatewayModels(provider), models));
+            this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(catalog.get(provider))]));
+            return [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
         } finally { cancel.dispose(); }
     }
 
-    private resolve(model: vscode.LanguageModelChatInformation): ResolvedModel {
-        const found = this.host.models().find(candidate => candidate.id === model.id);
+    /**
+     * A configured model, or a catalog-only one from this provider's catalog: read as for the picker (the five-minute
+     * cache, else a request, else the last read), or for `known` (token counts) the cache first.
+     */
+    private async resolve(model: vscode.LanguageModelChatInformation, signal?: AbortSignal, known = false): Promise<ResolvedModel> {
+        const models = this.host.models();
+        const found = models.find(candidate => candidate.id === model.id);
         if (found) return found;
+        let unread = false;
+        for (const provider of this.gatewayProviders()) {
+            signal?.throwIfAborted();
+            const read = () => gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
+            const catalog = known ? knownGatewayModels(provider) ?? await read() : await read() ?? knownGatewayModels(provider);
+            unread ||= !catalog;
+            const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
+            if (listed) return listed;
+        }
         const error = this.host.configError();
-        throw new ProviderError(error ? `EZiL Models: the config could not be loaded. ${error}` : `EZiL Models: model "${model.id}" is no longer in the config file. Pick another model.`);
+        if (error) throw new ProviderError(`EZiL Models: the config could not be loaded. ${error}`);
+        // Never another model in its place (contract §2 rule 3). Unknown is not unavailable.
+        if (unread) throw new GatewayError('EZiL AI: Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged. Try again.', undefined, 'catalog_unavailable', undefined, undefined, 'local');
+        if (/^[a-z0-9][a-z0-9._-]{0,63}$/.test(model.id) && this.gatewayProviders().length) {
+            throw new GatewayError('EZiL AI: This model is not available right now. Pick another model. Nothing was sent or charged.', undefined, 'model_unavailable', undefined, undefined, 'local');
+        }
+        throw new ProviderError(`EZiL Models: model "${model.id}" is no longer in the config file. Pick another model.`);
     }
 
     async provideLanguageModelChatResponse(
@@ -160,15 +207,24 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
     ): Promise<void> {
-        let resolved = this.resolve(model);
+        const controller = new AbortController();
+        const cancellation = token.onCancellationRequested(() => controller.abort());
+        if (token.isCancellationRequested) controller.abort();
+        let resolved: ResolvedModel;
+        try {
+            resolved = await this.resolve(model, controller.signal);
+        } catch (error) {
+            cancellation.dispose();
+            if (controller.signal.aborted) return;
+            if (!(error instanceof GatewayError)) throw error;
+            if (error.code === 'model_unavailable') this.refresh();
+            throw new Error(`EZiL Models: ${error.message}`);
+        }
         if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
             resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway'
                 && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
         }
         const request = toNeutralRequest(messages, options);
-        const controller = new AbortController();
-        const cancellation = token.onCancellationRequested(() => controller.abort());
-        if (token.isCancellationRequested) controller.abort();
         const started = Date.now();
         const Thinking = thinkingCtor();
         let emittedText = false;
@@ -182,6 +238,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
                 resolved = withGatewayModelLimits(resolved, catalog);
+                // A picker entry from before the catalog took tool calling away: refuse, never send tools it cannot use.
+                if (request.tools.length && !resolved.capabilities.toolCalling) {
+                    throw new GatewayError(`EZiL AI: ${resolved.name} cannot use tools, so it cannot run this request. Pick a model with tool support. Nothing was sent or charged.`,
+                        undefined, 'model_capability', undefined, undefined, 'local');
+                }
             }
             const events = chat(resolved, request, {
                 signal: controller.signal,
@@ -242,6 +303,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
                 }).catch(() => {});
             }
+            // The picker still shows what the refusal says is gone or changed: list again from a fresh catalog.
+            if (error instanceof GatewayError && [...CATALOG_REFUSALS, 'model_capability'].includes(error.code ?? '')) this.refresh();
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
@@ -251,7 +314,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
-        const resolved = this.resolve(_model);
+        const resolved = await this.resolve(_model, undefined, true);
         if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol);
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));
