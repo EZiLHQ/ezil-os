@@ -30,8 +30,8 @@ export const TRIAL_SKU = 'standard_monthly_v3' as const;
 export const TRIAL_METADATA_KEY = 'ezil_trial' as const;
 /** A quote older than this must be re-quoted before checkout, so the disclosed end stays close to one month. */
 export const TRIAL_QUOTE_TTL_SECONDS = 30 * 60;
-/** Checkout sessions for a trial expire after this (Stripe's minimum is 30 minutes; its default 24 h would let a fixed end drift). */
-export const TRIAL_CHECKOUT_TTL_SECONDS = 60 * 60;
+/** Immutable quote-based expiry: even the last fresh 30-minute quote leaves 90 minutes for Stripe (minimum 30 minutes). */
+export const TRIAL_CHECKOUT_TTL_SECONDS = 2 * 60 * 60;
 
 export type TrialStatus = 'quoted' | 'checkout' | 'trialing' | 'converted' | 'canceled' | 'ended' | 'payment_failed';
 export const UNBOUND_TRIAL_STATUSES: readonly TrialStatus[] = ['quoted', 'checkout'];
