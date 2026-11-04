@@ -84,7 +84,7 @@ const row = (over: Record<string, unknown> = {}) =>
         lease_until: new Date(NOW.getTime() + 3_600_000), ...over,
     });
 
-function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[]; meter?: ComputeMeter } = {}) {
+function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean; usage?: Record<string, unknown>[]; meter?: ComputeMeter; paidCompute?: () => Promise<boolean> } = {}) {
     // The database clock is the scenario clock: usage rows are dated by it.
     const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }], usage: opts.usage }, { clock: () => NOW });
     const read: string[] = [];
@@ -111,6 +111,7 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     const provider = createAwsEc2Provider({
         db: fake.db, env: () => env(), now: () => NOW, newId: () => crypto.randomUUID(), starter, tierFor: async () => 'free',
         randomBytes: () => Buffer.from(NONCE_BYTES), executions, meter: opts.meter, ...(opts.noTunnels ? {} : { tunnels }),
+        ...(opts.paidCompute ? { paidCompute: opts.paidCompute } : {}),
     });
     const status = () => provider.status(ctx, { userId: U1, computerId: C1 });
     const enroll = () => {
@@ -736,6 +737,39 @@ describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps
         expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
         expect(s.usage).toEqual([expect.objectContaining({ instance_id: I_NEW, stopped_at: NOW })]);
         expect(await s.provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, error: 'user_hours_cap' });
+    });
+});
+
+// Paid compute policy v1 (founder e713d157): the caller's verified paid plan lifts the PER-PERSON monthly cap only.
+describe('paid compute policy v1: the per-person monthly hour cap', () => {
+    const startedLongAgo = (): Exec => ({ status: 'SUCCEEDED', output: receiptOf(), startDate: new Date(NOW.getTime() - 101 * 3_600_000) });
+    it('a verified paid owner past the 100 h per-person cap keeps running: no stop is started', async () => {
+        const s = setup([row()], startedLongAgo, { paidCompute: async () => true });
+        await s.status();
+        expect((await s.enroll()).status).toBe(200);
+        expect(await s.status()).toMatchObject({ placementState: 'RUNNING' });
+        expect(s.starts.filter(start => start.intent.operation === 'stop')).toEqual([]);
+        expect(s.placements[0]).toMatchObject({ state: 'RUNNING', last_error: 'enroll_succeeded' });
+        // The hours are still recorded: the usage row stays open on the ledger.
+        expect(s.usage).toEqual([expect.objectContaining({ instance_id: I_NEW, stopped_at: null })]);
+    });
+    it.each([['not paid', async (): Promise<boolean> => false], ['unreadable', async (): Promise<boolean> => { throw new Error('billing down'); }]] as const)(
+        'an owner whose plan is %s is still stopped at the per-person cap (fail closed)', async (_name, paidCompute) => {
+            const s = setup([row()], startedLongAgo, { paidCompute });
+            await s.status();
+            expect((await s.enroll()).status).toBe(200);
+            expect(await s.status()).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
+            expect(s.placements[0]).toMatchObject({ last_error: 'user_hours_cap' });
+        });
+    it('sessionLimitFor: the exemption lifts only user_hours_cap; the fleet cap and the lease still bind', async () => {
+        const { db } = createFakePlacementDb({ placements: [row({ state: 'RUNNING' })] });
+        const placement = (await readPlacement(db, C1)).record!;
+        const usage = monthUsageFromRows([{ computerId: C1, userId: U1, instanceType: 'm6i.large',
+            startedAt: new Date(NOW.getTime() - 200 * 3_600_000), stoppedAt: null, egressBytes: null }], NOW);
+        const policy = { now: NOW, caps: { userMonthlyHours: 75, globalMonthlyHours: 10_000 }, enforceLeaseExpiry: false };
+        expect(sessionLimitFor(placement, policy, usage)).toBe('user_hours_cap');
+        expect(sessionLimitFor(placement, policy, usage, true)).toBeNull();
+        expect(sessionLimitFor(placement, { ...policy, caps: { userMonthlyHours: 75, globalMonthlyHours: 150 } }, usage, true)).toBe('global_hours_cap');
     });
 });
 

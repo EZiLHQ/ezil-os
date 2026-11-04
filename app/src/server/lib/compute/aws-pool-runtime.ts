@@ -6,6 +6,7 @@ import { buildLifecycleWork, readLifecycleDeployments } from './aws-intent';
 import { lockPoolClaimPlacement, savePoolEnrollmentNonce, readPoolMigrationReservations, type Placement, type PlacementDb, type PlacementExecutor } from './placement';
 import { instanceVcpu } from './aws-config';
 import { admissionDryRun } from './admission';
+import { paidUserHoursExemption } from './paid-compute-policy';
 import * as poolModule from './ready-pool';
 import type { PoolClaimDeps } from './aws-pool-claim';
 import { PoolCapacityPressure, poolGuard } from './aws-pool-errors';
@@ -38,7 +39,9 @@ export type SwitchCapacity = { ok: true; wait: boolean } | { ok: false; reason: 
  * enough of it is a capacity wait (`wait: true`), anything else refuses before the stop.
  */
 export async function preflightSwitchCapacity(db: PlacementExecutor, p: Placement, targetType: string, env: Env, now: Date): Promise<SwitchCapacity> {
-    const decision = await admissionDryRun(db, { userId: p.ownerUserId, placement: p, instanceType: targetType, env, now });
+    // Paid compute policy v1: a verified paid owner is not refused by the per-person monthly hour cap.
+    const userHoursExempt = await paidUserHoursExemption()(p.ownerUserId);
+    const decision = await admissionDryRun(db, { userId: p.ownerUserId, placement: p, instanceType: targetType, env, now, userHoursExempt });
     if (!decision.admit) return { ok: false, reason: decision.reason };
     if (!p.region || !p.zoneId || !poolModule.POOL_TYPES.includes(targetType as poolModule.PoolClass['instanceType'])) return { ok: true, wait: false };
     const demand = await poolModule.readPoolDemand(db, { region: p.region, zoneId: p.zoneId, instanceType: targetType as poolModule.PoolClass['instanceType'] }, now);

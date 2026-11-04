@@ -38,6 +38,26 @@ check('render uses server grants, decimal storage and Billing deep links', () =>
     // Round 6 review (R1-10): above the trial grant (120 of 73) the note would not explain the balance, so it is not said.
     assert.doesNotMatch(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' } } }), /one-time trial credits/);
 });
+// Paid compute policy v1 (founder e713d157): paid Usage is storage-first; computer time is recorded but not metered.
+check('paid compute policy v1: Standard and Premium show storage first, no computer-time bar, banner, reset or vCPU conversion', () => {
+    const order = html => [...html.matchAll(/data-usage="(storage|ai|compute)"/g)].map(match => match[1]);
+    const paid = sku => ({ ...summary, plan: { ...summary.plan, sku, name: sku === 'premium_monthly_v3' ? 'Premium' : 'Standard' },
+        fairUse: { ...summary.fairUse, status: 'ok', policy: 'unmetered' },
+        computer: { ...summary.computer, machineChoice: [{ size: 'std-2', vcpu: 2, memoryGiB: 8, weight: 1 }, { size: 'cmp-8', vcpu: 8, memoryGiB: 32, weight: 4 }] } });
+    // Far past the old grant: the server's period still says 0 left, and nothing shows it.
+    const spent = { ...sample, period: { ...sample.period, usedStandardSeconds: 2_000_000, remainingStandardSeconds: 0, remainingHoursAtCurrent: 0 } };
+    for (const sku of ['standard_monthly_v3', 'premium_monthly_v3']) {
+        const html = usageHtml(spent, paid(sku));
+        assert.deepEqual(order(html), ['storage', 'ai'], sku);
+        assert.doesNotMatch(html, /Computer time|used up|Paused until|Usage resets|hours? left|vCPU counts|How computer time works|unlimited/i, sku);
+        assert.match(html, /903 MB left/, sku);
+    }
+    // Free, and an older server without the policy, keep the allowance meter and its reset date; Free never reads unmetered.
+    const free = usageHtml(sample, { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, fairUse: { ...summary.fairUse, policy: 'unmetered' } });
+    assert.deepEqual(order(free), ['compute', 'ai', 'storage']);
+    assert.match(free, /Usage resets/);
+    assert.deepEqual(order(usageHtml(sample, summary)), ['compute', 'ai', 'storage']);
+});
 check('render keeps null sources honest and escapes plan names', () => {
     assert.match(usageHtml(null, summary), /Not measured yet/);
     assert.match(usageHtml(sample, null), /Plan unavailable/);

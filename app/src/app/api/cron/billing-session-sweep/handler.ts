@@ -6,7 +6,7 @@ import type { PlacementExecutor } from '@/server/lib/compute/placement';
 import type { BillingDeps, StoredComputeEpoch } from '@/server/billing/ports';
 import type { HeldCandidate } from '@/server/billing/store';
 import { drainAiCreditOutbox } from '@/server/billing/ai-credit-outbox';
-import { billingMeteringActive, loadComputeBillingState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
+import { billingMeteringActive, loadComputeBillingState, paidComputeUnmeteredState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import type { PolicyStopReason, StopOutcome } from '@/server/lib/compute/stop-policy';
 
@@ -183,6 +183,8 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             // Round 6 R2-3: a paid plan (no session cap) whose new period's grant is still on its way is not out of
             // allowance; GRANT_PENDING_SECONDS bounds the wait (compute-access.ts).
             if (state.grantPending) continue;
+            // Paid compute policy v1: a paid Standard/Premium session is never closed or stopped for hours.
+            if (paidComputeUnmeteredState(state)) continue;
             const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
             const storedDeadline = state.sessionMaxSeconds === null && state.summary.version === 3
                 ? state.summary.computer.activeDeadline : epoch.deadlineAt;

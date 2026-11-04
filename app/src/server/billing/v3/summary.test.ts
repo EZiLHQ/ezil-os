@@ -48,12 +48,13 @@ describe('v3 summary', () => {
         expect(summary.catalog.packs).toEqual([]);
         expect(buildSummaryV3({ ...input(), stripeAvailable: false }).actions.topup).toBe(false);
     });
-    it.each([[100, 400, 'near'], [125, 500, 'paused']] as const)(
-        '%s hours at cmp-8 uses %s standard-hours and is %s', (hours, standardHours, status) => {
+    // Paid compute policy v1 (founder e713d157): paid time is still recorded at its weight, but never near or paused.
+    it.each([[100, 400], [125, 500], [200, 800]] as const)(
+        '%s hours at cmp-8 records %s standard-hours and Premium stays unmetered', (hours, standardHours) => {
             const args = input('premium_monthly_v3');
             args.epochs = sessions(hours, 'cmp-8');
             expect(usedSecondsInWindow(args.epochs, { start: start.toISOString(), end: end.toISOString() }, now)).toBe(standardHours * 3600);
-            expect(buildSummaryV3(args).fairUse.status).toBe(status);
+            expect(buildSummaryV3(args).fairUse).toEqual({ status: 'ok', resetsAt: '2026-11-10T00:00:00Z', policy: 'unmetered' });
         });
     it('one hour at cmp-8 is four standard-hours and verifies stored weights', () => {
         const window = { start: start.toISOString(), end: end.toISOString() };
@@ -67,12 +68,13 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([{ ...e, deadlineAt: null }], window, now)).toBe(14400);
         expect(usedSecondsInWindow([e], { ...window, end: '2026-10-19T11:15:00Z' }, now)).toBe(3600);
     });
-    it('bounds the active deadline by the running weight, even after a preference change', () => {
+    it('a paid running session has no hours deadline, even with its grant nearly used (paid compute policy v1)', () => {
         const args = input('premium_monthly_v3');
         args.sizePreference = 'std-2';
         args.epochs = [epoch({ size: 'cmp-8', weight: 4 })];
         args.grants = [{ ...args.grants[0]!, amount: BigInt(14400 + 241) }];
-        expect(buildSummaryV3(args).computer.activeDeadline).toBe('2026-10-19T12:01:00Z');
+        expect(buildSummaryV3(args).computer.activeDeadline).toBeNull();
+        expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
     });
     it.each([['std-2', 2, 8], ['cmp-4', 4, 16], ['cmp-8', 8, 32]] as const)(
         'reports selected Premium %s and all choices', (size, vcpu, memoryGiB) => {
@@ -111,12 +113,12 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
             { start: start.toISOString(), end: end.toISOString() }, now)).toBe(14400);
         const args = input('premium_monthly_v3'); args.epochs = [epoch()]; args.sizePreference = 'cmp-4';
-        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: null, opening: 'standard', activeDeadline: '2026-10-29T21:00:00Z' });
+        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: null, opening: 'standard', activeDeadline: null });
     });
-    it.each([[0.8, 'near'], [1, 'paused']] as const)('reports %s usage as %s', (ratio, status) => {
+    it.each([0.8, 1, 2])('Standard at %s of its 40 hours is recorded but never near or paused (paid compute policy v1)', ratio => {
         const args = input('standard_monthly_v3');
         args.epochs = sessions(40 * ratio, 'std-2');
-        expect(buildSummaryV3(args).fairUse.status).toBe(status);
+        expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
     });
     it('ignores grants for other subscriptions and stops after a refund reversal', () => {
         const args = input('standard_monthly_v3');
@@ -143,21 +145,27 @@ describe('v3 summary', () => {
     });
 });
 
-describe('paid fair-use exhaustion deadlines', () => {
+describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
-        '%s / %s stays anchored after a missed stop and ignores the retired session deadline', (sku, size, weight) => {
+        '%s / %s has no hours deadline, before or long after the old exhaustion point, and ignores a retired session deadline', (sku, size, weight) => {
             const args = input(sku);
             args.grants[0]!.amount = BigInt(144000);
             const readyAt = '2026-10-19T00:00:00Z';
             args.epochs = [epoch({ id: 'prior', size: 'std-2', weight: 1, readyAt: '2026-10-18T00:00:00Z', endedAt: '2026-10-18T01:00:00Z' }),
                 epoch({ size, weight, readyAt, deadlineAt: '2026-10-19T02:00:00Z' })];
-            const deadline = new Date(Date.parse(readyAt) + (144000 - 3600) / weight * 1000).toISOString().replace('.000Z', 'Z');
-            for (const current of [new Date(readyAt), new Date(Date.parse(deadline) + 3600000)]) {
+            const oldExhaustion = Date.parse(readyAt) + (144000 - 3600) / weight * 1000;
+            for (const current of [new Date(readyAt), new Date(oldExhaustion + 3600000)]) {
                 args.now = current;
-                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: deadline });
+                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: null });
+                expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
             }
         });
+    it('a paid plan with no grant for this period (no receipt), or a refunded one, is not unmetered', () => {
+        const args = input('standard_monthly_v3');
+        args.grants = [{ ...args.grants[0]!, subscriptionId: 'other' }];
+        expect(buildSummaryV3(args).fairUse).toEqual({ status: 'paused', resetsAt: '2026-11-10T00:00:00Z' });
+    });
 });
 
 describe('round 3 AI credit buckets (D2/D4)', () => {

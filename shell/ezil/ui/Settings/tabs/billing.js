@@ -7,7 +7,7 @@ import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
-    accountCredits, accountDetailsHtml, staleCreditsCopy } from '../billing-format.js';
+    accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -275,6 +275,8 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
  * Never "standard-hour" or "compute hours" (scanCopy).
  */
 export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
+    // Paid compute policy v1: no hours meter for a paid plan (a hidden placeholder keeps the refresh target).
+    if ( paidComputeUnmetered({ plan, fairUse }) ) return '<div data-role="meter-time" hidden></div>';
     // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
     // Round 6 (R1-06): Free (also held on AWS) says the month's allowance, "About 5 of 8 hours left this month";
@@ -527,9 +529,13 @@ function currentPlanV3 (summary, banner) {
 }
 
 function usageCardV3 (summary, usage, options) {
+    const unmetered = paidComputeUnmetered(summary);
     return `<section class="ezil-billing-section" data-role="billing-usage" aria-labelledby="billing-usage-heading">
-        <div class="ezil-billing-section-head"><h3 id="billing-usage-heading">This period</h3><span class="ezil-billing-note">Resets ${encode(dateLabel(summary.fairUse.resetsAt, true))}</span></div>
-        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${timeV3Html(summary, usage)}${aiMeterV3(summary, options)}${storageMeterV3(summary)}</div></section>`;
+        <div class="ezil-billing-section-head"><h3 id="billing-usage-heading">${unmetered ? 'Usage' : 'This period'}</h3>${unmetered ? '' : `<span class="ezil-billing-note">Resets ${encode(dateLabel(summary.fairUse.resetsAt, true))}</span>`}</div>
+        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${unmetered
+            // Paid compute policy v1: storage first, then AI credits; computer time is recorded but not metered here.
+            ? `${storageMeterV3(summary)}${aiMeterV3(summary, options)}${timeV3Html(summary, usage)}`
+            : `${timeV3Html(summary, usage)}${aiMeterV3(summary, options)}${storageMeterV3(summary)}`}</div></section>`;
 }
 
 function offerCardV3 (summary, offer) {

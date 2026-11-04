@@ -1,7 +1,7 @@
 // Authenticated observations. Durations and balances never advance on the client.
 import trpc from '../trpc.js';
 import session from '../../../session.js';
-import { accountCredits, accountDetailsHtml, creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText, staleCreditsCopy } from '../billing-format.js';
+import { accountCredits, accountDetailsHtml, creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText, paidComputeUnmetered, staleCreditsCopy } from '../billing-format.js';
 
 const states = new WeakMap();
 let active = null;
@@ -60,7 +60,9 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     const timeState = timePercent === null ? 'unavailable'
         : summary?.fairUse?.status === 'paused' || remainingSeconds === 0 ? 'danger'
         : summary?.fairUse?.status === 'near' ? 'warn' : 'ok';
-    const paused = summary?.fairUse?.status === 'paused' || timeState === 'danger';
+    // Paid compute policy v1: a paid plan has no computer-hours cutoff, so nothing here pauses it or counts its hours down.
+    const unmetered = paidComputeUnmetered(summary);
+    const paused = !unmetered && (summary?.fairUse?.status === 'paused' || timeState === 'danger');
     const primary = plan?.status === 'past_due'
         ? actions.portal === true ? billingLink('Fix payment', 'usage-payment', true) : ''
         : plan?.sku === 'free_v3' && actions.checkout === true ? billingLink('Upgrade', 'usage-upgrade', true, '&amp;upgrade=pro')
@@ -205,24 +207,24 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
         : current.state === 'stale' || stale ? `${measuringLine(current.elapsedSeconds)}${ends}`
         : `This session: ${duration(current.elapsedSeconds)} · running${ends}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
+    const storageMeter = meter('storage', 'Storage', storageValue, storagePercent, `${diskBytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState);
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
     ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
     <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : summaryLoading ? 'Checking your plan…' : 'Plan unavailable'}</h4>
-        ${validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
+        ${!unmetered && validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
-        ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
+        ${unmetered ? storageMeter : meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
         ${meter('ai', 'AI credits', aiValue, aiPercent, aiText, aiNote, aiState, aiAction)}
-        ${meter('storage', 'Storage', storageValue, storagePercent,
-            `${diskBytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState)}
+        ${unmetered ? '' : storageMeter}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">
-        <details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
+        ${unmetered ? '' : `<details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
             ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
-            ${usageLoading ? '' : `<p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p>`}</details>
+            ${usageLoading ? '' : `<p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p>`}</details>`}
         <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Storage is the disk on your computer; some space is used by the system. A used figure appears once it is measured.</p></details>
         <details data-usage-detail="session"><summary>Session details</summary><dl>${usageLoading ? '' : `${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}`}</dl></details>
     </div>`;

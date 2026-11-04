@@ -66,6 +66,7 @@ import {
     createProviderReverseStore, forwardMoveBusy, ReverseMoveConflictError, reverseMovesTablePresent, type ComputeReverseMove,
 } from '@/server/lib/compute/provider-reverse-store';
 import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementReader, type EntitlementRecord } from '@/server/lib/compute/tier';
+import { paidComputeUnmetered } from '@/server/lib/compute/paid-compute-policy';
 
 export type RoutedComputer =
     | { kind: 'cloudflare'; provider: CloudflareComputeProvider }
@@ -110,6 +111,8 @@ export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | und
         ...aws,
         entitlement: typeof entitlement === 'function' ? undefined : entitlement,
         tierFor: async () => tierForEntitlement(typeof entitlement === 'function' ? await entitlement() : entitlement, plusPlanIds(env)),
+        // Paid compute policy v1: the same resolved entitlement decides the per-person hour-cap exemption.
+        paidCompute: async () => paidComputeUnmetered(typeof entitlement === 'function' ? await entitlement() : entitlement),
     };
 }
 

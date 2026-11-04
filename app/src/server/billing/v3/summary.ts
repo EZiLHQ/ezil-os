@@ -8,6 +8,7 @@ import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf, HOLD_SIZE } from './admission';
+import { UNMETERED_PAID_PLAN_IDS } from '../../lib/compute/paid-compute-policy';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
 import {
     CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
@@ -397,22 +398,27 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         : standing.standing === 'files_on_aws' ? SIZES[HOLD_SIZE]
         : SIZES[input.sizePreference !== null && rated.offer.machineChoice.includes(input.sizePreference)
             ? input.sizePreference : rated.offer.size];
+    // Paid compute policy v1: a paid-access Standard/Premium computer with this period's grant (as compute-access.ts
+    // paidComputeUnmeteredState) has no hours cutoff, so no fair-use pause or deadline.
+    const unmetered = !legacy && UNMETERED_PAID_PLAN_IDS.includes(rated.sku) && allowance > 0;
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
     // Recompute uncapped deadlines from period usage before this epoch. Old paid
     // epochs may still carry a 2/6-hour session deadline; it is no longer a limit.
     const priorUsage = latest && rated.sessionMaxSeconds === null ? usedSecondsInWindow(
         input.epochs.filter(epoch => epoch.id !== latest.id), rated.window, new Date(latest.readyAt), bounds) : 0;
-    const fairDeadline = latest && rated.sessionMaxSeconds === null
+    const fairDeadline = unmetered ? Infinity : latest && rated.sessionMaxSeconds === null
         ? allowance <= priorUsage ? epochSeconds(input.now)
             : Math.max(epochSeconds(latest.readyAt, 'ceil'), epochSeconds(rated.window.start))
                 + Math.floor((allowance - priorUsage) / latest.weight)
         : latest ? epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight) : Infinity;
-    const activeDeadline = legacy ? legacy.compute.session.activeDeadline : latest ? isoSeconds(Math.min(
+    const activeBound = latest ? Math.min(
         epochSeconds(latest.readyAt, 'ceil') + (rated.sessionMaxSeconds ?? Infinity),
         rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
-    )) : null;
+    ) : Infinity;
+    // Paid compute policy v1: an unmetered paid session with no session cap has no deadline at all.
+    const activeDeadline = legacy ? legacy.compute.session.activeDeadline : Number.isFinite(activeBound) ? isoSeconds(activeBound) : null;
     const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     const enrollment = input.enrollment?.state ?? 'enrolled';
@@ -442,7 +448,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
                 account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
-        fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
+        fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,
+            ...(unmetered ? { policy: 'unmetered' as const } : {}) },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         // No sample yet: usedBytes null with 'unavailable', never a measured-looking '0'.
         storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },

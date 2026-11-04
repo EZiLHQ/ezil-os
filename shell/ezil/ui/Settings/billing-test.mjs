@@ -934,6 +934,25 @@ try {
     has('[data-role="meter-time"] [role="meter"]', false);
     pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
 
+    // Paid compute policy v1 (founder e713d157): the server's `policy: 'unmetered'` means no hours row, no reset, storage first.
+    const usageBefore = getUsage;
+    for ( const tier of ['standard', 'premium'] ) {
+        summary = summaryV3(tier); summary.fairUse = { ...summary.fairUse, status: 'ok', policy: 'unmetered' };
+        summary.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 0,
+            allowanceStandardSeconds: 144000, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 0 } });
+        await refresh(); audit();
+        const meters = qa('[data-role="billing-meters"] > :not([hidden])').map(el => el.dataset.role);
+        assert.deepEqual(meters, ['meter-storage', 'meter-ai'], tier);
+        assert.equal(q('[data-role="meter-time"]').hidden, true, tier);
+        const card = q('[data-role="billing-usage"]').textContent;
+        assert.doesNotMatch(card, /Resets|h left|hours left|Computer time|used up|vCPU counts|unlimited/i, tier);
+        assert.doesNotMatch(text(), /Computer time is used up/, tier);
+        contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Usage');
+    }
+    getUsage = usageBefore;
+    pass('paid compute policy v1: Standard and Premium Billing usage is storage-first with no computer-hours row or reset');
+
     // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
     {
         const M = credits => { const [whole, fraction = ''] = String(credits).split('.'); return (BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'))).toString(); };

@@ -145,7 +145,8 @@
     },
     "fairUse": {
       "status": "ok",
-      "resetsAt": "2026-11-21T08:04:45Z"
+      "resetsAt": "2026-11-21T08:04:45Z",
+      "policy": "unmetered"
     },
     "storage": {
       "usedBytes": null,
@@ -435,7 +436,8 @@
     },
     "fairUse": {
       "status": "ok",
-      "resetsAt": "2026-11-21T08:04:45Z"
+      "resetsAt": "2026-11-21T08:04:45Z",
+      "policy": "unmetered"
     },
     "storage": {
       "usedBytes": null,
@@ -629,7 +631,8 @@
     },
     "fairUse": {
       "status": "ok",
-      "resetsAt": "2026-11-21T08:04:45Z"
+      "resetsAt": "2026-11-21T08:04:45Z",
+      "policy": "unmetered"
     },
     "storage": {
       "usedBytes": null,

@@ -13,6 +13,7 @@ import { CATALOG_V2, SESSION_MAX_SECONDS, type ComputeEpoch, type AdmitDecision,
 import { admitStart } from './rating';
 import { buildSummaryV2, summaryMeters } from './summary';
 import { epochSeconds, isoSeconds } from './time';
+import { UNMETERED_PAID_PLAN_IDS } from '../../lib/compute/paid-compute-policy';
 
 export interface ComputeBillingState {
     planSku: PlanSku | PlanSkuV3;
@@ -48,6 +49,17 @@ export interface ComputeBillingState {
 
 /** Round 6 R2-3: how long after a paid period starts a missing compute grant reads as not landed yet, never as used up. */
 export const GRANT_PENDING_SECONDS = 10 * 60;
+
+/**
+ * Paid compute policy v1 (`lib/compute/paid-compute-policy.ts`): a v3 Standard/Premium state with paid access (active,
+ * the Standard trial, or the payment grace) has no computer-hours cutoff. It still needs this period's compute grant
+ * (the paid-period receipt, as the entitlement reader's 'active' does): a plan row without one is not proof of payment.
+ * Free, a paid plan past its grace (it runs as Free here), and any payment issue keep the allowance.
+ */
+export function paidComputeUnmeteredState(state: Pick<ComputeBillingState, 'v3' | 'planSku' | 'planActive' | 'paymentIssue' | 'provider' | 'allowanceStdSeconds'>): boolean {
+    return !!state.v3 && UNMETERED_PAID_PLAN_IDS.includes(state.planSku) && state.planActive && !state.paymentIssue
+        && state.provider === 'aws' && state.allowanceStdSeconds > 0;
+}
 
 export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' | 'enforcementEnabled'>): boolean {
     return config.tabEnabled || config.enforcementEnabled;
@@ -167,8 +179,9 @@ function decideStart(state: ComputeBillingState, computerId: string, size: SizeC
             size: size === 'free-cf' && state.provider === 'aws' ? 'std-2' : size,
             planActive: state.v3.sku === 'free_v3' || state.planActive,
             paymentIssue: state.v3.sku === 'free_v3' ? size !== 'free-cf' && state.paymentIssue : state.paymentIssue,
-            // Prorated receipts/reversals reserve the ungranted portion of the guardrail.
-            usedSeconds: state.usedStdSeconds + Math.max(0, ceiling - state.allowanceStdSeconds),
+            // Prorated receipts/reversals reserve the ungranted portion of the guardrail. Paid compute policy v1: a paid
+            // Standard/Premium start is never refused for hours (runtime is still recorded by its epoch).
+            usedSeconds: paidComputeUnmeteredState(state) ? 0 : state.usedStdSeconds + Math.max(0, ceiling - state.allowanceStdSeconds),
             runningComputers: state.openEpochs.filter(epoch => epoch.computerId !== computerId).length,
             poolHostAvailable: false, now: isoSeconds(epochSeconds(now)) });
     }
@@ -193,8 +206,10 @@ export async function openComputeEpochAtReady({ deps, userId, computerId, size, 
     try {
         const state = await loadComputeBillingState(deps, userId, readyAt);
         const decision = decideStart(state, computerId, size, readyAt);
-        // Anchor to readiness, not a preview request or a copied admission deadline.
-        const deadlineAt = new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
+        // Anchor to readiness, not a preview request or a copied admission deadline. Paid compute policy v1: an
+        // unmetered paid session has no hours deadline at all (idle sleep and lifecycle limits are separate).
+        const deadlineAt = decision.admit && paidComputeUnmeteredState(state) ? null
+            : new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
         const opened = await deps.store.openEpoch({
             userId, computerId, subscriptionId: state.subscriptionId, size, readyAt, deadlineAt, overheadSeconds,
             ...(state.sessionMaxSeconds === null ? { sessionMaxSeconds: null } : {}),

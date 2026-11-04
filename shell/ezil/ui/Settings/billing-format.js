@@ -257,6 +257,17 @@ export function heldClosedText (vcpu) {
  * a calendar-month allowance) says the month's allowance instead of the size: "About 5 of 8 hours left
  * this month" (R1-06).
  */
+/**
+ * Paid compute policy v1 (server: app/src/server/lib/compute/paid-compute-policy.ts): the server says so with
+ * `fairUse.policy: 'unmetered'` for a paid-access Standard or Premium plan, which has no computer-hours cutoff. Usage
+ * and Billing then show no hours left, no monthly time reset and no vCPU time conversion. Without that field (Free, a
+ * paid plan past its grace, an older server) the allowance applies and is shown as before.
+ */
+export function paidComputeUnmetered (summary) {
+    const sku = summary?.plan?.sku;
+    return summary?.fairUse?.policy === 'unmetered' && (sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3');
+}
+
 export function hoursLeftLines (period, machineChoice = [], { monthly = false } = {}) {
     if ( ! period || ! Number.isSafeInteger(period.remainingHoursAtCurrent) || period.remainingHoursAtCurrent < 0 ) return null;
     const vcpuOf = size => machineChoice.find(m => m.size === size)?.vcpu ?? { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8, 'free-cf': 2 }[size];

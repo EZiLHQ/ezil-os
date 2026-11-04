@@ -310,11 +310,12 @@ describe('billing session sweep', () => {
 });
 
 describe('v3 session deadlines', () => {
-    it('stops cmp-8 after one actual hour consumes four standard-hours', async () => {
+    // Paid compute policy v1 (founder e713d157): a paid session is never stopped or closed for hours.
+    it('a Premium cmp-8 session is not stopped once it passes four, or forty, standard-hours', async () => {
         const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 14400 });
-        expect(await f.run(3599)).toMatchObject({ stopped: 0 });
-        expect(await f.run(3600)).toMatchObject({ stopped: 1, closed: 1 });
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'allowance_exhausted' });
+        for (const seconds of [3599, 3600, 36_000]) expect(await f.run(seconds)).toMatchObject({ stopped: 0, closed: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]).toMatchObject({ endedAt: null, endReason: null });
     });
 
     it.each([[null, 3600]] as const)
@@ -439,19 +440,21 @@ describe('round 6 R1-04: a paid-era session still open after the drop to Free en
 describe('paid sessions have no time cap', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
-        '%s / %s ignores 2h and 6h, stopping exactly at fair-use exhaustion', async (sku, size, weight) => {
-            const allowance = 144000, deadline = allowance / weight;
+        '%s / %s ignores 2h and 6h, and is not stopped at or long past the old fair-use exhaustion', async (sku, size, weight) => {
+            const allowance = 144000, oldExhaustion = allowance / weight;
             const f = fixture([epoch({ size, weight, deadlineAt: iso(sku === 'standard_monthly_v3' ? 7200 : 21600) })], { sku, allowance });
-            for (const seconds of [7200, 21600, deadline - 1]) expect(await f.run(seconds)).toMatchObject({ stopped: 0 });
-            expect(await f.run(deadline)).toMatchObject({ stopped: 1, closed: 1 });
-            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
-            expect(f.epochs[0]).toMatchObject({ endedAt: iso(deadline), endReason: 'allowance_exhausted' });
+            for (const seconds of [7200, 21600, oldExhaustion - 1, oldExhaustion, oldExhaustion * 3]) {
+                expect(await f.run(seconds)).toMatchObject({ stopped: 0, closed: 0, shadow: 0 });
+            }
+            expect(f.stop).not.toHaveBeenCalled();
+            expect(f.epochs[0]).toMatchObject({ endedAt: null, endReason: null });
         });
-    it('a late failed provider stop still closes at fair-use exhaustion', async () => {
+    it('records a paid session past its grant without ever attempting a stop (no forced-stop path left)', async () => {
         const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 144000 });
         f.stop.mockRejectedValue(new Error('missed stop'));
-        await f.run(144000);
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(36000), endReason: 'allowance_exhausted' });
+        expect(await f.run(144000)).toMatchObject({ stopped: 0, stopFailed: 0, closed: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]).toMatchObject({ endedAt: null });
     });
     it.each(['standard_monthly_v3', 'premium_monthly_v3'])('does not retry the retired session cap for %s', async sku => {
         const f = fixture([epoch({ endedAt: iso(7200), endReason: 'session_max' })], { sku });

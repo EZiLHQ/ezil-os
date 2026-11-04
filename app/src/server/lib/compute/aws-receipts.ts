@@ -57,6 +57,7 @@ import {
     type PlacementState,
     type UsageEffect,
 } from './placement';
+import { paidUserHoursExemption, type UserHoursExemption } from './paid-compute-policy';
 import { usageFor, utcMonthStart, type MonthUsage } from './usage';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
@@ -696,14 +697,19 @@ export interface SessionLimitPolicy {
      * ROOT-FLEET-LEASE-INCIDENT-118; terminal/load/flush holds keep the guest up). Weighted hour caps still bind.
      * The owner's own status/ensure/heartbeat keep the default. */
     enforceLeaseExpiry?: boolean;
+    /**
+     * Paid compute policy v1 (`paid-compute-policy.ts`): owners exempt from the per-person monthly hour cap. Consulted
+     * only when that cap would stop the computer; the default reads billing per owner and fails closed.
+     */
+    userHoursExempt?: UserHoursExemption;
 }
 
-export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: MonthUsage | null): SessionLimit | null {
+export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: MonthUsage | null, userHoursExempt = false): SessionLimit | null {
     if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
     if (policy.enforceLeaseExpiry !== false && (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime())) return 'lease_expired';
     if (policy.caps && usage) {
         const totals = usageFor(usage, p.ownerUserId);
-        if (totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
+        if (!userHoursExempt && totals.user.weightedSeconds >= policy.caps.userMonthlyHours * 3_600) return 'user_hours_cap';
         if (totals.global.weightedSeconds >= policy.caps.globalMonthlyHours * 3_600) return 'global_hours_cap';
     }
     return null;
@@ -730,7 +736,11 @@ export async function enforceSessionLimits(
 ): Promise<SessionLimit | null> {
     if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
     const usage = policy.caps ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : null;
-    const limit = sessionLimitFor(p, policy, usage);
+    let limit = sessionLimitFor(p, policy, usage);
+    // Paid compute policy v1: a verified paid owner is not stopped by the per-person cap (the fleet cap still binds).
+    if (limit === 'user_hours_cap' && await (policy.userHoursExempt ?? paidUserHoursExemption())(p.ownerUserId)) {
+        limit = sessionLimitFor(p, policy, usage, true);
+    }
     if (!limit) return null;
     return (await startStopAsReconciler(deps, p, deployment, limit)) ? limit : null;
 }

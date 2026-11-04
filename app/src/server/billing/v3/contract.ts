@@ -386,7 +386,11 @@ export interface BillingSummaryV3 {
          */
         account?: AiAccountV3;
     };
-    fairUse: { status: FairUseStatus; resetsAt: string };
+    /**
+     * `policy` (additive, paid compute policy v1): 'unmetered' for a paid-access Standard/Premium plan, whose computer
+     * time is recorded but never cut off, so clients show no hours left, reset or pause for it. Absent: the allowance applies.
+     */
+    fairUse: { status: FairUseStatus; resetsAt: string; policy?: 'unmetered' };
     /** `usedBytes` is null (state `unavailable`) until a computer has been measured: never an unmeasured "0". */
     storage: { usedBytes: string | null; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: {
