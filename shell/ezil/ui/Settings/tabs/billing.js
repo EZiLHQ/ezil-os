@@ -493,7 +493,7 @@ function planPrimaryV3 (summary) {
 
 /** Beside the balance: the same top-up dialog every entry opens (secondary; the page keeps one primary). */
 function topupMeterAction (summary) {
-    return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup" aria-label="Add AI credits">Add credits</button>' : '';
+    return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup">Add credits</button>' : '';
 }
 
 function yourComputerV3 (summary) {

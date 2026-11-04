@@ -15,7 +15,11 @@ export function parseBillingDeepLink (search) {
         : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
     params.delete('settings');
     params.delete('upgrade');
-    if ( params.get('section') === 'ai-credits' ) params.delete('section');
+    if ( params.get('section') === 'ai-credits' ) {
+        params.delete('section');
+        // The recovery hint travels with the section (Billing reads both before the address bar is cleaned).
+        if ( params.get('reason') === 'insufficient_credits' ) params.delete('reason');
+    }
     const remaining = params.toString();
     return { initialTab: 'billing', openUpgrade, search: remaining ? `?${remaining}` : '' };
 }
