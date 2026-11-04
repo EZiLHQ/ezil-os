@@ -153,7 +153,8 @@ describe('Checkout return payment and plan confirmation', () => {
             summary = () => ({ ...matching, plan: { ...matching.plan, trial } });
             await tick(2000);
             // The first charge in the viewer's zone: 03:00 UTC on 28 Feb is 27 Feb in Los Angeles.
-            expect(text()).toMatch(/^Your free month has started\. First charge \$20\.00 on Feb 27, 2027 unless you cancel\./);
+            // A date, never a minute: Stripe collects the first charge about an hour after the end.
+            expect(text()).toMatch(/^Your free month has started\. First charge \$20\.00 from Feb 27, 2027 unless you cancel\./);
             expect(text()).not.toMatch(/payment received|\bpaid\b|Your plan is active|No payment is required/i);
             // An ending trial (cancelled at once) has started too, with no charge to announce.
             summary = () => ({ ...matching, plan: { ...matching.plan, status: 'cancels', trial: { ...trial, state: 'ending', firstChargeAt: null } } });

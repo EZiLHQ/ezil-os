@@ -6,13 +6,16 @@ const checking = 'Checking your payment…';
 const unconfirmed = 'Payment confirmation is pending. Your plan updates after payment is confirmed.';
 type View = { sessionId: string; message: string; canCheckAgain: boolean };
 
-/** " First charge $20.00 on Feb 27, 2027 unless you cancel." from the server's `plan.trial`, in the viewer's zone; '' when unreadable. */
+/**
+ * " First charge $20.00 from Feb 27, 2027 unless you cancel." from the server's `plan.trial`, in the viewer's zone; ''
+ * when unreadable. A date, never a minute: Stripe collects the first charge about an hour after the trial end.
+ */
 function firstCharge(trial: { state?: unknown; firstChargeAt?: unknown; amountCents?: unknown }): string {
     const at = typeof trial.firstChargeAt === 'string' ? Date.parse(trial.firstChargeAt) : NaN;
     const cents = trial.amountCents;
     if (trial.state !== 'trialing' || !Number.isFinite(at) || typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents <= 0) return '';
     const day = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric' }).format(new Date(at));
-    return ` First charge $${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')} on ${day} unless you cancel.`;
+    return ` First charge $${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')} from ${day} unless you cancel.`;
 }
 
 /** Checkout is a receipt only; the webhook remains responsible for applying the plan. */
