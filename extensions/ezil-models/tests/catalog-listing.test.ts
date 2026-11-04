@@ -246,6 +246,7 @@ describe('catalog failure: unknown, never unavailable', () => {
             expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'synthetic-chat-a']);
             await send(g.provider, selected);
             expect(g.posts.map(post => [post.body.model, post.body.stream])).toEqual([['synthetic-chat-a', false]]);
+            expect(g.changes()).toBe(0); // an outage does not re-list (and re-read) after every request
             now.mockReturnValue(2_000_000 + CATALOG_STALE_MS);
             expect(ids(await list(g.provider))).toEqual([QWEN, KIMI]);
             await expect(send(g.provider, selected)).rejects.toThrow('Could not load the model list');

@@ -166,8 +166,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (token.isCancellationRequested) return [];
             // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models come
             // from this read, or the last one for the same base URL and token while this one fails.
-            const listed = providers.flatMap(provider => gatewayCatalogModels(provider, catalog.get(provider) ?? knownGatewayModels(provider), models));
-            this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(catalog.get(provider))]));
+            const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayModels(provider)]));
+            const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
+            // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
+            this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
             return [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
         } finally { cancel.dispose(); }
