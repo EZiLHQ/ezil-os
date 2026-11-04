@@ -82,11 +82,10 @@ const sendPrompt = async text => {
   }
   return false;
 };
-// One line under the chat view's input (workbench.css `chat-notice`), whatever the chat shows.
+// The chat header's info button (patch-copilot-chat.sh `chat-header`) carries it, whatever the chat shows.
 const noticeShown = () => page.evaluate(text => {
-  const part = document.querySelector('.part.auxiliarybar .chat-viewpane .interactive-session > .interactive-input-part');
-  const after = part && getComputedStyle(part, '::after');
-  return Boolean(part?.offsetHeight) && after.display !== 'none' && after.content.includes(text) && part.getBoundingClientRect().bottom <= innerHeight;
+  const help = document.querySelector('.part.auxiliarybar .chat-viewpane .chat-view-title-container .ezil-chat-help');
+  return Boolean(help?.offsetHeight) && (help.getAttribute('aria-label') ?? '').includes(text) && help.title.includes(text) && help.getBoundingClientRect().bottom <= innerHeight;
 }, NOTICE);
 const until = async (predicate, label, ms = T) => {
   const started = Date.now();
@@ -169,7 +168,7 @@ try {
     // list over an empty chat is what leads back to it.
     const sessionsList = aux.locator('.agent-sessions-container').first();
     check('an empty chat shows the Sessions list', await until(async () => sessionsList.isVisible().catch(() => false), 'Sessions list', 30_000));
-    check('the EZiL notice shows under the chat input', await noticeShown());
+    check('the EZiL notice shows in the chat header', await noticeShown());
     // Without the list there is no filter button; carry on, so a build without the list fails on the report itself.
     await aux.locator('.agent-sessions-toolbar .codicon-filter').first().click({ timeout: 10_000 }).catch(() => {});
     await page.locator('.monaco-menu .action-item').first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
