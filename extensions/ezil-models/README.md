@@ -174,7 +174,9 @@ auth context.
   configured capability away.
   - `streaming: false` sends JSON from the first request, never a stream
     followed by a JSON resend.
-  - A tools request to a model without tool calling is refused before sending.
+  - Tools offered to a model without tool calling are left out, as Copilot
+    0.69 does for its own endpoints without tool calls. Earlier tool calls go
+    as text.
   - Kimi K3 is always JSON.
 - **Unknown is not unavailable.**
   - When a read fails, the configured models stay listed.

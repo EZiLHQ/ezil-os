@@ -55,7 +55,7 @@ const token = () => ({ isCancellationRequested: false, onCancellationRequested: 
 const list = (provider: InstanceType<typeof EZiLModelsProvider>) => provider.provideLanguageModelChatInformation({} as never, token() as never);
 const message = (role: number, content: unknown[]) => ({ role, content });
 const READ_FILE = { name: 'read_file', description: 'Read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } } } };
-function send(provider: InstanceType<typeof EZiLModelsProvider>, info: { id: string }, messages: unknown[] = [message(1, [new TextPart('q')])], tools: unknown[] = []) {
+function send(provider: InstanceType<typeof EZiLModelsProvider>, info: { id: string; capabilities?: object }, messages: unknown[] = [message(1, [new TextPart('q')])], tools: unknown[] = []) {
     return provider.provideLanguageModelChatResponse(info as never, messages as never, { tools, modelOptions: {} } as never, { report: () => {} }, token() as never);
 }
 const ids = (infos: { id: string }[]) => infos.map(info => info.id);
@@ -126,16 +126,24 @@ describe('capabilities: never more than the row says', () => {
         expect((g.posts[0]!.body.tools as { name: string }[]).map(tool => tool.name)).toEqual(['read_file']);
     });
 
-    test('the catalog lowers a configured model: Qwen without streaming goes as JSON, and a tools request without tool calling is refused unsent', async () => {
+    test('the catalog lowers a configured model: Qwen without streaming goes as JSON, and without tool calling never gets tools', async () => {
         const config = load();
         const g = gateway(config, () => Response.json(v1([row(QWEN, 'available', { capabilities: { streaming: false, tool_calling: false } })])));
         const infos = await list(g.provider);
         expect(infos[0]).toMatchObject({ id: QWEN, capabilities: { toolCalling: false, imageInput: false } });
         await send(g.provider, infos[0]!);
         expect(g.posts.map(post => [post.body.model, post.body.stream, post.accept])).toEqual([[QWEN, false, 'application/json']]);
-        await expect(send(g.provider, infos[0]!, undefined, [READ_FILE])).rejects.toThrow('cannot use tools, so it cannot run this request. Pick a model with tool support. Nothing was sent or charged.');
-        expect(g.posts).toHaveLength(1);
-        expect(g.changes()).toBe(1); // the picker hears it again
+        // Tools offered anyway (Ask mode, or an entry from before the change) are left out, as Copilot does for its own
+        // endpoints without tool calls; an earlier tool call goes as text, its result too.
+        const history = [message(1, [new TextPart('Read a.ts')]), message(2, [new ToolCallPart('call_1', 'read_file', { path: 'a.ts' })]),
+            message(1, [new ToolResultPart('call_1', [new TextPart('export const a = 1;')])])];
+        await send(g.provider, infos[0]!, history, [READ_FILE]);
+        expect(g.posts[1]!.body.tools).toBeUndefined();
+        expect(JSON.stringify(g.posts[1]!.body.messages)).not.toMatch(/"tool_use"|"tool_result"/);
+        expect(JSON.stringify(g.posts[1]!.body.messages)).toContain('export const a = 1;');
+        expect(g.changes()).toBe(0); // the picker already says so
+        await send(g.provider, { ...infos[0]!, capabilities: { toolCalling: true, imageInput: false } }, undefined, [READ_FILE]);
+        expect([g.posts.length, g.posts[2]!.body.tools, g.changes()]).toEqual([3, undefined, 1]); // an outdated entry is listed again
         expect(config.models.find(model => model.model === QWEN)).toMatchObject({ stream: true, capabilities: { toolCalling: true } }); // config untouched
     });
 

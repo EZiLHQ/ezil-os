@@ -240,10 +240,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
                 resolved = withGatewayModelLimits(resolved, catalog);
-                // A picker entry from before the catalog took tool calling away: refuse, never send tools it cannot use.
+                // Never send tools to a model without tool calling: leave them out, as Copilot 0.69 does for its own
+                // endpoints without tool calls (interceptBody), and earlier tool calls go as text. A picker entry from
+                // before the catalog took tool calling away is listed again.
                 if (request.tools.length && !resolved.capabilities.toolCalling) {
-                    throw new GatewayError(`EZiL AI: ${resolved.name} cannot use tools, so it cannot run this request. Pick a model with tool support. Nothing was sent or charged.`,
-                        undefined, 'model_capability', undefined, undefined, 'local');
+                    request.tools = [];
+                    if ((model.capabilities as { toolCalling?: unknown } | undefined)?.toolCalling) this.refresh();
                 }
             }
             const events = chat(resolved, request, {
@@ -306,7 +308,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }).catch(() => {});
             }
             // The picker still shows what the refusal says is gone or changed: list again from a fresh catalog.
-            if (error instanceof GatewayError && [...CATALOG_REFUSALS, 'model_capability'].includes(error.code ?? '')) this.refresh();
+            if (error instanceof GatewayError && CATALOG_REFUSALS.includes(error.code ?? '')) this.refresh();
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
