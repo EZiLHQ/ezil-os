@@ -383,15 +383,15 @@ export function open_feedback_dialog (_opts) {
                     aria-describedby="ezil-feedback-diagnostics-help"> Include diagnostics (recommended)</label>
                 <p id="ezil-feedback-diagnostics-help" class="ezil-feedback-muted ezil-feedback-help">Included unless
                     you untick it: the EZiL OS version, browser and system type, screen size,
-                    ${extended ? 'the app you were using, ' : ''}your computer's status, connection quality and recent error
-                    codes from this tab. Never your files, what you type in apps, links, cookies or sign-in.
-                    <span data-role="diagnostics-note"></span></p>
+                    ${extended ? 'the app you were using, ' : ''}your computer's status, connection quality and recent
+                    recognised EZiL OS events from this tab. Never your files, what you type in apps, console text,
+                    links, cookies or sign-in. <span data-role="diagnostics-note" aria-live="polite"></span></p>
                 ${extended ? `<label class="ezil-feedback-consent"><input type="checkbox" name="logs"
                     aria-describedby="ezil-feedback-logs-help"> Include recent activity log</label>
-                <p id="ezil-feedback-logs-help" class="ezil-feedback-muted ezil-feedback-help">Up to ${LOG_MAX_LINES} lines
-                    from the last 15 minutes in this tab, which keeps them only until it reloads. Links, file names
-                    and paths (with the rest of that line), addresses, ids and anything that looks like a password or
-                    token are removed. <span data-role="logs-note" aria-live="polite"></span></p>` : ''}
+                <p id="ezil-feedback-logs-help" class="ezil-feedback-muted ezil-feedback-help">Up to ${LOG_MAX_LINES} recorded
+                    events from the last 15 minutes in this tab, with their times: what happened and where in EZiL OS.
+                    Only recognised event names and codes are sent; console messages and anything else are left out.
+                    <span data-role="logs-note" aria-live="polite"></span></p>` : ''}
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
                 <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
                     <div class="ezil-feedback-actions">
@@ -429,6 +429,8 @@ export function open_feedback_dialog (_opts) {
     /** Read once when "Include recent activity log" is ticked; what the preview shows is what is sent. */
     let logs = null;
     let logsFailed = false;
+    /** Recorded events in the window that the closed vocabulary left out. */
+    let logsOmitted = 0;
     let serialized = '';
     let sending = false;
     let sent = false;
@@ -498,11 +500,16 @@ export function open_feedback_dialog (_opts) {
         // Collecting must never stop a report: a reader that throws leaves its part out and says so.
         let diag = null;
         let diagnosticsFailed = false;
+        const counts = { omitted: 0 };
         if ( diagnostics.checked ) {
-            try { diag = build_diagnostics({ extended }); } catch { diagnosticsFailed = true; }
+            try { diag = build_diagnostics({ extended, counts }); } catch { diagnosticsFailed = true; }
         }
         const lines = logsConsent?.checked && logs?.length ? logs : null;
         if ( lines ) diag = { ...diag, logs: lines };
+        // Unrecognised events are left out and counted; the count is in the body
+        // only for a server that accepts it (an older one's schema is strict).
+        const omitted = (diag ? counts.omitted : 0) + (logsConsent?.checked ? logsOmitted : 0);
+        if ( extended && omitted && diag ) diag = { ...diag, omitted };
         const image = screenshotConsent?.checked ? screenshot : null;
         const payload = { v: 1, clientRequestId, category: form.elements.category.value,
             description: description.value, computerId, diagnostics: diag, screenshot: image };
@@ -530,15 +537,18 @@ export function open_feedback_dialog (_opts) {
         preview.textContent = serialized;
         const diagnosticsNote = dialog.querySelector('[data-role="diagnostics-note"]');
         diagnosticsNote.textContent = diagnosticsFailed
-            ? "Diagnostics couldn't be collected in this tab, so this report will be sent without them." : '';
+            ? "Diagnostics couldn't be collected in this tab, so this report will be sent without them."
+            : diag && counts.omitted ? `${counts.omitted} unrecognised ${counts.omitted === 1 ? 'event was' : 'events were'} left out.` : '';
         const logsNote = dialog.querySelector('[data-role="logs-note"]');
         if ( logsNote ) {
             const count = payload.diagnostics?.logs?.length ?? 0;
             logsNote.textContent = ! logsConsent.checked ? ''
                 : logsFailed ? "The activity log couldn't be read in this tab, so this report will be sent without it."
-                    : ! logs?.length ? 'Nothing was recorded in this tab in the last 15 minutes.'
-                        : `${count} ${count === 1 ? 'line' : 'lines'} will be included.`
-                            + (left_out ? ` ${left_out} older ${left_out === 1 ? 'line was' : 'lines were'} left out to keep the report small.` : '');
+                    : ! logs?.length ? (logsOmitted ? `None of the ${logsOmitted} recorded ${logsOmitted === 1 ? 'event is' : 'events are'} recognised, so none will be included.`
+                        : 'Nothing was recorded in this tab in the last 15 minutes.')
+                        : `${count} ${count === 1 ? 'event' : 'events'} will be included.`
+                            + (left_out ? ` ${left_out} older ${left_out === 1 ? 'one was' : 'ones were'} left out to keep the report small.` : '')
+                            + (logsOmitted ? ` ${logsOmitted} unrecognised ${logsOmitted === 1 ? 'event was' : 'events were'} left out.` : '');
         }
         submit.disabled = capturing || ! description.value.trim() || description.value.length > 4000;
     }
@@ -546,8 +556,10 @@ export function open_feedback_dialog (_opts) {
     function read_logs () {
         logs = null;
         logsFailed = false;
+        logsOmitted = 0;
         if ( ! logsConsent?.checked ) return;
-        try { logs = build_recent_logs(); } catch { logsFailed = true; }
+        const counts = { omitted: 0 };
+        try { logs = build_recent_logs({ counts }); logsOmitted = counts.omitted; } catch { logsFailed = true; }
     }
 
     function clear_screenshot () {

@@ -248,8 +248,8 @@ try {
             }
             const logs = JSON.parse(await preview()).diagnostics.logs ?? [];
             const note = await page.locator('[data-role="logs-note"]').textContent();
-            assert.match(note, logs.length ? new RegExp(`^${logs.length} lines? will be included\\.`) : /^Nothing was recorded/);
-            assert.ok(logs.every(line => line.text.length <= 200), 'bounded lines');
+            assert.match(note, logs.length ? new RegExp(`^${logs.length} events? will be included\\.`) : /^(Nothing was recorded|None of the)/);
+            assert.ok(logs.every(line => Object.keys(line).join() === 't,eventClass,site,code,outcome'), 'structured events only, no text');
             assert.doesNotMatch(JSON.stringify(logs), /https?:|os-fixture\.test|fixture@example|33333333-3333|11111111-1111/, 'no links, addresses or ids');
             await tabTo('submit');
             const shown = await preview();

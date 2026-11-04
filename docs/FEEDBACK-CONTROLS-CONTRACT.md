@@ -2,8 +2,11 @@
 
 **v2 (founder request 88e642df, 3 Nov 2026), Feedback only.** Diagnostics are included
 by default and the form says what they contain; the user can untick them. A
-"Recent activity log" (this tab's console ring and recorded events, redacted, last
-15 minutes, at most 60 lines of 200 characters) can be added by ticking it. The
+"Recent activity log" (this tab's recorded events with their times, last 15 minutes,
+at most 60) can be added by ticking it. Every telemetry event in a report, by default
+or in the log, is reduced to a CLOSED vocabulary
+(`app/src/server/feedback/event-vocabulary.js`), on the shell and again on the server:
+console text, event `detail` and error messages are never part of a report. The
 report records the app it is about by its address name (Settings only when it is the
 only app open). Every request names the account its tab was booted for, and the server
 refuses a report for another account (409). Both new fields live inside
@@ -126,9 +129,11 @@ full-bleed window, Code's included. A 16px
 glyph on a 20px disc, low emphasis; hit target 24×24 on a fine pointer, 44×44 under
 `pointer: coarse`. z-index above every app window (phone/tablet windows are `9999999
 !important`), below context menus, the upgrade sheet and the dialog's top layer.
-`shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics({ extended } = {}) → Diagnostics` (§3 shape
-only; `extended` adds `app`), and v2 `build_recent_logs({ now } = {}) → Array<{t, source, text}>`, called
-only when the user ticks "Include recent activity log", once per tick. A collector that throws leaves its
+`shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics({ extended, counts } = {}) → Diagnostics` (§3
+shape only; `extended` adds `app`), and v2 `build_recent_logs({ now, counts } = {}) →
+Array<{t, eventClass, site, code, outcome}>`, called only when the user ticks "Include recent activity
+log", once per tick. Both project events with `event-vocabulary.js` (`projectEvent`, `projectLogLine`)
+and report what they left out in `counts.omitted`. A collector that throws leaves its
 part out with a visible note; it never blocks Send. The form drops the oldest log lines, then the oldest
 `recentEvents`, until the body is within 32 KiB (the screenshot's data excepted), never the description.
 Teardown, history navigation and page exit close the form and any nested editor,
@@ -165,11 +170,16 @@ Diagnostics (strict, every field optional):
   // v2, sent only when desktopState.ui.feedbackLogs is true:
   app ≤32,                      // address name (`browser`, `code`…) from data-app: the front non-Settings app window,
                                 // else a minimised one, else `settings`
-  logs {t: UTC ISO instant, source 'console'|'event', text ≤200}[≤60] }   // only when ticked
+  logs {t: UTC ISO instant, eventClass, site, code, outcome 'ok'|'error'|'skipped'}[≤60],  // only when ticked
+  omitted int }                 // events the closed vocabulary left out (shell + server)
 ```
-Every string, `app` and each log `text` included, is re-redacted on ingest (`redact.ts`
-`sanitizeDiagnostics`: credentials, emails, UUIDs, URLs, absolute paths); the server does not rely
-on the shell's own scrub. A v1 body is accepted unchanged. A v2 body sent to a v1 server is a 400 (the
+On ingest (`redact.ts` `sanitizeDiagnostics`), FAIL CLOSED and independent of the shell:
+`recentEvents` and `logs` keep only events whose (eventClass, site) pair is in `event-vocabulary.js`
+(EVENT_SITES, from the shell's actual `capture()` emitters; a jsdom drift test fails on a new literal
+emitter that is not listed), with a code from EVENT_CODES or else `other`; `app`, `os` and
+`browser.family` keep only their closed lists; `appCommit`, `phases` and `stream.state` (sent by no
+shell) are dropped; `shellVersion`, `computerStatus` and `traceId` stay bounded text through
+`diagnosticString`. Dropped events are added to `omitted`. A v1 body is accepted unchanged. A v2 body sent to a v1 server is a 400 (the
 schema is strict); the flag above prevents that, and a body queued before a rollback falls back to
 the draft like any other definitive refusal (§4a).
 v2 header on POST, GET and DELETE: `X-EZiL-Account: <__EZIL_BOOT__.user.id>`, the account the tab was
@@ -215,14 +225,10 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, headers, clipboard, keystrokes,
-another tab, an app's iframe content, file or folder paths; no continuous recording. The `log.js` ring
-is read only for the v2 "Recent activity log", only when that box is ticked. Event lines carry only
-their structured fields (`eventClass site code outcome`; never `detail`). Console lines get the log's own
-stricter scrub, in the shell (`diagnostics.js` `console_line`) and again on the server (`redact.ts`
-`logLine`): links are masked; a secret-named key keeps its name, not its value (JSON, `k=v`, `k: v`); a
-header-shaped secret (Authorization, Cookie) runs to the end of the line; the line STOPS at the first
-remaining token containing `/` or `\` (relative, absolute, UNC, Windows path: a path with spaces has no
-knowable end); file names by extension and dotfiles are masked; then telemetry's `redact()` and the secret
-scan. Shared telemetry semantics are unchanged (FB-R1 review, 3 Nov 2026). v2: diagnostics are ticked by
+another tab, an app's iframe content, file or folder paths, the `log.js` console ring, event `detail`,
+error messages. Each tab does keep, locally and only until it reloads, a short ring of its own console
+lines and recorded events (`log.js`, `telemetry.recentEvents()`); nothing from it leaves the device
+unless the user sends a report, and then only events in the closed vocabulary (re-review
+88e642df-feedback-closed-projection-v1, 3 Nov 2026; shared telemetry is unchanged). v2: diagnostics are ticked by
 default and described next to the box; the log and screenshot boxes default OFF; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.

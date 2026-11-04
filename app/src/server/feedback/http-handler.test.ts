@@ -156,16 +156,23 @@ describe('feedback HTTP boundary', () => {
         expect(h.statements.some((s) => s.sql.startsWith('insert') || s.sql.includes('count(*)'))).toBe(false);
     });
 
-    it('accepts v2 diagnostics (the app in front, a recent log) and stores only the re-redacted copy', async () => {
+    it('accepts v2 diagnostics and stores only the closed projection (forged event fields never stored)', async () => {
         const h = harness();
-        const diagnostics = { shellVersion: '1', app: 'browser', recentEvents: [{ eventClass: 'api_failure', site: 'shell.start', code: 'x' }],
-            logs: [{ t: '2026-10-15T11:59:00.000Z', source: 'console', text: 'error GET https://private-host.example.test/a?token=1 for bob@example.com' }] };
+        const known = { eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'capacity_unavailable' };
+        const diagnostics = { shellVersion: '1', app: 'browser',
+            recentEvents: [known, { ...known, site: 'sports/sports-mobile-main/next.config.ts' }, { ...known, code: 'bob_example_com_private' }],
+            logs: [{ t: '2026-10-15T11:59:00.000Z', ...known, outcome: 'error' }, { t: '2026-10-15T11:59:01.000Z', ...known, site: '%2Fhome%2Falice', outcome: 'ok' }] };
         expect((await handleFeedbackRequest(request({ ...VALID, diagnostics }), h.deps)).status).toBe(201);
         const insert = h.statements.find((s) => s.sql.startsWith('insert into "ezil_feedback_reports"'))!;
-        const stored = JSON.stringify(insert.params);
-        expect(stored).toContain('browser');
-        expect(stored).toContain('<url>');
-        expect(stored).not.toMatch(/private-host|bob@example|token=1/);
+        expect(JSON.stringify(insert.params)).not.toMatch(/sports|next\.config|bob_example|alice|%2F/);
+        const stored = JSON.parse(insert.params.find((p): p is string => typeof p === 'string' && p.includes('recentEvents'))!);
+        expect(stored).toMatchObject({ app: 'browser', omitted: 2, recentEvents: [known, { ...known, code: 'other' }],
+            logs: [{ t: '2026-10-15T11:59:00.000Z', ...known, outcome: 'error' }] });
+    });
+
+    it('a feedback body that omits optional diagnostics entirely is still stored', async () => {
+        const h = harness();
+        expect((await handleFeedbackRequest(request({ ...VALID, diagnostics: null, screenshot: null }), h.deps)).status).toBe(201);
     });
 
     it('still accepts a v1 body: no app, no logs, diagnostics off or null', async () => {

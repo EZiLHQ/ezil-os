@@ -1,5 +1,6 @@
 import { sanitizeErrorMessage } from '@/server/telemetry/sanitize';
-import { FEEDBACK_LOG_LIMITS, type FeedbackDiagnostics } from './types';
+import { APP_NAMES, BROWSER_FAMILIES, OS_FAMILIES, oneOf, projectEvent, projectLogLine } from './event-vocabulary.js';
+import type { FeedbackDiagnostics } from './types';
 
 const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 
@@ -39,53 +40,46 @@ function diagnosticString(value: string, max: number): string {
         .slice(0, max);
 }
 
-// The activity log's stricter rules (FB-R1 review, 3 Nov 2026), in step with
-// `shell/ezil/ui/feedback/diagnostics.js` `console_line`. A log line is free
-// console text, so it gets more than diagnosticString: telemetry's sanitizer
-// keeps relative and UNC paths, quoted JSON secrets and a spaced path's tail.
-const SECRET_KEY = /(["']?)\b(pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth|session(?:[-_]?id)?|credentials?|signature|sig)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi;
-const SECRET_HEADER = /\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=].*$/gi;
-const FILE_NAME = /\b[\w@+-]+(?:\.[\w@+-]+)*\.(?:[cm]?[jt]sx?|json[c5]?|map|py|ipynb|rb|go|rs|java|kts?|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|ps1|bat|sql|mdx?|txt|rtf|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|lock|xml|html?|s?css|less|vue|svelte|astro|png|jpe?g|gif|webp|svg|pdf|docx?|xlsx?|pptx?|zip|t?gz|tar|7z|rar|key|pem|crt|p12|db|sqlite)\b/gi;
-const DOTFILE = /(^|[^\w.])\.[A-Za-z][\w.-]*/g;
-
-/** Links first; a secret key keeps its name only; the line stops at the first path; then file names. */
-export function logLine(value: string): string {
-    let s = value
-        .replace(/\b(?:https?|wss?|ftp|file):\/\/[^\s'"<>)\]]+/gi, '<url>')
-        .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
-        .replace(SECRET_HEADER, '$1: [redacted]')
-        .replace(SECRET_KEY, '$1$2$1$3[redacted]');
-    const path = s.search(/[^\s]*[\\/]/);
-    if (path !== -1) s = `${s.slice(0, path)}<path…>`;
-    return diagnosticString(s.replace(FILE_NAME, '<file>').replace(DOTFILE, '$1<file>'), FEEDBACK_LOG_LIMITS.lineChars);
-}
-
+/**
+ * Fail closed (re-review 88e642df-feedback-closed-projection-v1): every field a
+ * shell computes from a closed list is checked against that list here, and
+ * telemetry events (`recentEvents`, `logs`) keep only the closed vocabulary in
+ * `event-vocabulary.js`, whatever the client sent. Fields no shell produces
+ * (`appCommit`, `phases`, `stream.state`) are dropped. Left as bounded text,
+ * through diagnosticString: `shellVersion` (≤64), `computerStatus` (≤32, the
+ * desktop window's own status copy) and `traceId` (≤64, a generated id).
+ */
 export function sanitizeDiagnostics(input: FeedbackDiagnostics | null | undefined): FeedbackDiagnostics | null {
     if (!input) return null;
     const out: FeedbackDiagnostics = {};
     if (input.shellVersion !== undefined) out.shellVersion = diagnosticString(input.shellVersion, 64);
-    if (input.app !== undefined) out.app = diagnosticString(input.app, 32);
-    if (input.appCommit !== undefined) out.appCommit = diagnosticString(input.appCommit, 64);
-    if (input.browser) out.browser = { family: diagnosticString(input.browser.family, 32), major: input.browser.major };
-    if (input.os !== undefined) out.os = diagnosticString(input.os, 32);
+    const app = oneOf(APP_NAMES, input.app);
+    if (app) out.app = app;
+    const family = oneOf(BROWSER_FAMILIES, input.browser?.family);
+    if (family && input.browser) out.browser = { family, major: input.browser.major };
+    const os = oneOf(OS_FAMILIES, input.os);
+    if (os) out.os = os;
     if (input.deviceClass !== undefined) out.deviceClass = input.deviceClass;
     if (input.viewport) out.viewport = { ...input.viewport };
     if (input.fullscreen !== undefined) out.fullscreen = input.fullscreen;
     if (input.fullbleed !== undefined) out.fullbleed = input.fullbleed;
     if (input.computerStatus !== undefined) out.computerStatus = diagnosticString(input.computerStatus, 32);
     if (input.traceId !== undefined) out.traceId = diagnosticString(input.traceId, 64);
-    if (input.phases) out.phases = input.phases.map((phase) => diagnosticString(phase, 40));
-    if (input.recentEvents) out.recentEvents = input.recentEvents.map((event) => ({
-        eventClass: diagnosticString(event.eventClass, 40),
-        site: diagnosticString(event.site, 80),
-        code: diagnosticString(event.code, 80),
-    }));
-    if (input.stream) {
-        out.stream = { ...input.stream };
-        if (input.stream.state !== undefined) out.stream.state = diagnosticString(input.stream.state, 24);
+    let dropped = 0;
+    if (input.recentEvents) {
+        out.recentEvents = input.recentEvents.map(projectEvent).filter((event) => event !== null);
+        dropped += input.recentEvents.length - out.recentEvents.length;
     }
-    // The shell scrubs each line before sending; this is the boundary that has to hold,
-    // for every line whatever its claimed `source`.
-    if (input.logs) out.logs = input.logs.map((line) => ({ t: line.t, source: line.source, text: logLine(line.text) }));
+    if (input.stream) {
+        out.stream = {};
+        if (input.stream.kbps !== undefined) out.stream.kbps = input.stream.kbps;
+        if (input.stream.rttMs !== undefined) out.stream.rttMs = input.stream.rttMs;
+    }
+    if (input.logs) {
+        out.logs = input.logs.map(projectLogLine).filter((line) => line !== null);
+        dropped += input.logs.length - out.logs.length;
+    }
+    const omitted = (input.omitted ?? 0) + dropped;
+    if (omitted) out.omitted = Math.min(1_000_000_000, omitted);
     return out;
 }

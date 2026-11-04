@@ -76,6 +76,7 @@ const telemetry = await import('../../telemetry.js');
 const { beginTrace, ambientTraceRef } = await import('../../trace.js');
 const { default: log } = await import('../../log.js');
 const { feedbackSubmitSchema, diagnosticsSchema } = await import('../../../../app/src/server/feedback/types.ts');
+const { EVENT_SITES, EVENT_CODES, EVENT_CLASSES, OUTCOMES } = await import('../../../../app/src/server/feedback/event-vocabulary.js');
 log.debug('LOG_SECRET');
 // Seed the real ring, then make any attempted read fail immediately.
 assert.ok(log.ringBuffer().some(entry => entry.msg.includes('LOG_SECRET')));
@@ -144,10 +145,14 @@ try {
         diagnosticsSchema.parse(data);
         assert.equal(data.traceId, trace.id);
         assert.equal(ambientTraceRef(), trace, 'diagnostics must not end a trace');
-        assert.equal(data.recentEvents.length, 50);
-        assert.equal(data.recentEvents[0].site.length, 80);
-        assert.deepEqual(Object.keys(data.recentEvents[0]), ['eventClass', 'site', 'code']);
-        assert.doesNotMatch(JSON.stringify(data), /SECRET|example\.test|auth-token|detail|outcome/);
+        // The 60 seeded events use a site no shell emitter has: all are left out (closed projection).
+        const counts = {};
+        const projected = build_diagnostics({ counts });
+        assert.deepEqual(projected.recentEvents, []);
+        assert.equal(counts.omitted, 50);
+        telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'capacity_unavailable', detail: 'DETAIL_SECRET' });
+        assert.deepEqual(build_diagnostics().recentEvents.at(-1), { eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'capacity_unavailable' });
+        assert.doesNotMatch(JSON.stringify(build_diagnostics()), /SECRET|example\.test|auth-token|detail|outcome/);
         assert.equal(calls.length, 0);
     });
     await check('diagnostics clamp values and read only rendered stream measurements', () => {
@@ -752,7 +757,8 @@ try {
         const help = document.getElementById(box.getAttribute('aria-describedby'));
         assert.match(help.textContent, /Included unless\s+you untick it/);
         assert.match(help.textContent, /the app you were using/);
-        assert.match(help.textContent, /Never your files, what you type in apps, links, cookies or sign-in\./);
+        assert.match(help.textContent, /Never your files, what you type in apps, console text,\s+links, cookies or sign-in\./);
+        assert.match(help.textContent, /recognised EZiL OS events/);
         const win = (app, z) => {
             const el = document.createElement('div');
             el.className = 'window'; el.setAttribute('data-app', app); el.style.zIndex = String(z);
@@ -779,7 +785,7 @@ try {
         for ( const el of windows ) el.remove();
         setDescription('Default diagnostics...');
         assert.equal(payload().diagnostics.app, undefined, 'no app window: no app');
-        assert.ok(Object.keys(payload().diagnostics).every(key => [...V1_DIAGNOSTICS, 'app'].includes(key)));
+        assert.ok(Object.keys(payload().diagnostics).every(key => [...V1_DIAGNOSTICS, 'app', 'omitted'].includes(key)));
         change('diagnostics', false);
         assert.equal(payload().diagnostics, null);
         change('diagnostics', true);
@@ -803,50 +809,38 @@ try {
             Object.defineProperty(globalThis, 'ezil', { configurable: true, writable: true, value: realEzil });
         }
     });
-    await check('v2: the recent log is read only when ticked, once, from this tab\'s last 15 minutes, redacted and bounded', async () => {
+    await check('v2: closed projection — the console is never read; only recognised events, codes and times are sent', async () => {
         let reads = 0;
         log.ringBuffer = () => { reads++; return readRing(); };
-        const realNow = Date.now;
-        Date.now = () => realNow() - 20 * 60 * 1000;
-        log.debug('OLD_LINE from twenty minutes ago');
-        Date.now = realNow;
-        log.debug('GET https://os.example.test/api/shell/start?token=abc failed for 550e8400-e29b-41d4-a716-446655440000');
-        log.debug(['Authorization: Bearer ', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('') + ' cookie: __Host-ezil-os-auth=COOKIEVALUE');
-        log.debug('opened /home/alice/workspace/secret-project/main.ts');
-        log.debug(`mail ${'carol'}@example.com jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature`);
-        log.debug({ nested: 'y'.repeat(600) });
-        // FB-R1 (independent review, 22:12Z): what telemetry's redact() alone let through.
-        log.debug('opened sports/sports-mobile-main/next.config.ts');
-        log.debug(String.raw`\\fileserver\private\candidate.txt opened`);
-        log.debug({ password: 'synthetic-short-secret', status: 'failed' });
-        log.debug('open /home/alice/workspace/my project failed');
-        log.debug('loaded next.config.ts and .env.local');
+        // FB-R1 / FB-Q1-Q3 shapes, as console text and as event fields a buggy emitter could pass.
+        const hostile = ['opened sports/sports-mobile-main/next.config.ts', String.raw`\\fileserver\private\candidate.txt`,
+            '{"password":"synthetic-short-secret","status":"failed"}', 'open /home/alice/workspace/my project failed',
+            'sports%2Fsports-mobile-main%2Fnext.config.ts', 'home∕alice∕workspace', 'Authorization: Bearer abc123\nnext line ok'];
+        for ( const text of hostile ) {
+            log.debug(text);
+            telemetry.capture({ eventClass: 'api_failure', site: text, code: 'capacity_unavailable' });
+            telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: text });
+        }
+        telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: 'desktop_restarted', outcome: 'ok' });
         open(); setDescription('With logs');
-        assert.equal(form().elements.logs.checked, false);
-        assert.equal(reads, 0, 'unticked: the console ring is never read');
-        assert.equal(payload().diagnostics.logs, undefined);
         change('logs', true);
-        assert.equal(reads, 1, 'read once, when ticked');
-        setDescription('With logs.');
-        assert.equal(reads, 1, 'typing does not read it again');
+        assert.equal(reads, 0, 'the console ring is never read, ticked or not');
         const lines = payload().diagnostics.logs;
-        assert.ok(lines.length > 5 && lines.length <= 60, `${lines.length} lines`);
-        assert.ok(lines.every(line => Object.keys(line).join() === 't,source,text' && ['console', 'event'].includes(line.source)
-            && line.text.length <= 200 && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(line.t)));
+        assert.ok(lines.length > 0 && lines.length <= 60);
+        for ( const line of lines ) {
+            assert.deepEqual(Object.keys(line), ['t', 'eventClass', 'site', 'code', 'outcome']);
+            assert.match(line.t, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+            assert.ok(Object.hasOwn(EVENT_SITES, line.site) && EVENT_SITES[line.site].includes(line.eventClass), line.site);
+            assert.ok(EVENT_CODES.has(line.code) || line.code === 'other', line.code);
+        }
         assert.deepEqual(lines.map(line => line.t), lines.map(line => line.t).toSorted(), 'oldest first');
-        const text = JSON.stringify(lines);
-        assert.doesNotMatch(text, /OLD_LINE|os\.example\.test|token=abc|550e8400|abcdefghijklmnopqrstuvwxyz0123456789|COOKIEVALUE|alice|secret-project|carol@|eyJhbGci|EVENT_SECRET|example\.test/);
-        assert.doesNotMatch(text, /sports|fileserver|candidate|synthetic-short-secret|workspace|project failed|next\.config|\.env/, 'FB-R1 probes');
-        assert.match(text, /debug opened <path…>"/, 'a relative path ends the line');
-        assert.match(text, /\{\\"password\\":\[redacted\],\\"status\\":\\"failed\\"\}/, 'a secret key keeps its name, never its value');
-        assert.match(text, /debug open <path…>"/, 'nothing after a spaced path survives');
-        assert.match(text, /debug loaded <file> and <file>/);
-        assert.ok(lines.filter(line => line.source === 'event').every(line => ! /redacted/.test(line.text)), 'event detail is never included');
-        // telemetry's redact() turns `…?token=abc` into `<url>]` (the server's twin does too).
-        assert.match(text, /debug GET <url>\]? failed for <uuid>/);
-        assert.match(text, /debug \[redacted-header\]"/, "a header-shaped secret runs to the end of the line");
-        assert.ok(lines.some(line => line.source === 'event' && line.text.startsWith('api_failure <opaque> failure')));
-        assert.equal(note('logs-note'), `${lines.length} lines will be included.`);
+        assert.deepEqual(lines.at(-1), { t: lines.at(-1).t, eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: 'desktop_restarted', outcome: 'ok' });
+        assert.ok(lines.some(line => line.code === 'other'), 'an unlisted code is named `other`, never passed through');
+        const body = current().querySelector('pre').textContent;
+        assert.doesNotMatch(body, /sports|fileserver|candidate|synthetic-short-secret|alice|workspace|%2F|∕|abc123|Authorization|LOG_SECRET|EVENT_SECRET|DETAIL_SECRET/);
+        assert.ok(payload().diagnostics.omitted > 0, 'the body says how many were left out');
+        assert.match(note('logs-note'), /^\d+ events? will be included\. \d+ unrecognised events? (was|were) left out\.$/);
+        assert.match(note('diagnostics-note'), /^\d+ unrecognised events? (was|were) left out\.$/);
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
         send(); await until(() => status().includes(reportId));
         assert.deepEqual(JSON.parse(calls.at(-1).body).diagnostics.logs, lines, 'what was previewed is what was sent');
@@ -854,30 +848,57 @@ try {
         open();
         assert.equal(form().elements.logs.checked, false, 'never remembered');
         close();
-    });
-    await check('v2: size — a 4,000-character multibyte or escape-heavy description plus a full log stays within 32 KiB', async () => {
         log.ringBuffer = readRing;
-        for ( let i = 0; i < 70; i++ ) log.debug(`${i} ${'漢'.repeat(220)}`);
+    });
+    await check('v2: drift — every literal telemetry emitter in the shell is in the closed vocabulary; classes and outcomes match telemetry', async () => {
+        const { readdirSync, statSync } = await import('node:fs');
+        const root = new URL('../../', import.meta.url);
+        const files = [];
+        const walk = dir => { for ( const name of readdirSync(dir) ) {
+            const url = new URL(name, dir);
+            if ( statSync(url).isDirectory() ) { if ( name !== 'node_modules' ) walk(new URL(`${name}/`, dir)); }
+            else if ( name.endsWith('.js') && ! /test/.test(name) ) files.push(url);
+        } };
+        walk(root);
+        let pairs = 0;
+        for ( const file of files ) {
+            const source = readFileSync(file, 'utf8');
+            for ( const m of source.matchAll(/\bcapture\(\s*\{([^{}]*)\}/g) ) {
+                const field = name => m[1].match(new RegExp(`\\b${name}\\s*:\\s*'([^']*)'`))?.[1];
+                const [eventClass, site, code] = ['eventClass', 'site', 'code'].map(field);
+                if ( eventClass && site ) {
+                    pairs++;
+                    assert.ok(EVENT_SITES[site]?.includes(eventClass), `${file.pathname.split('/shell/')[1]}: ${eventClass} @ ${site} is not in event-vocabulary.js`);
+                }
+                if ( code ) assert.ok(EVENT_CODES.has(code.toLowerCase().replace(/[^a-z0-9_]+/g, '_')), `${file.pathname.split('/shell/')[1]}: code ${code} is not in event-vocabulary.js`);
+            }
+        }
+        assert.ok(pairs >= 30, `${pairs} literal emitters checked`);
+        const telemetryTypes = await import('../../../../app/src/server/telemetry/types.ts');
+        assert.deepEqual([...EVENT_CLASSES], [...telemetryTypes.EVENT_CLASSES]);
+        assert.deepEqual([...OUTCOMES], [...telemetryTypes.OUTCOMES]);
+    });
+    await check('v2: size — a 4,000-character escape-heavy description plus a full log stays within 32 KiB, description intact', async () => {
+        for ( let i = 0; i < 70; i++ ) telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#reconnect', code: 'relay_runtime_changed' });
         open(); setDescription('漢'.repeat(4000)); change('logs', true);
         const kib = () => Buffer.byteLength(current().querySelector('pre').textContent, 'utf8');
         assert.ok(kib() <= 32 * 1024, `${kib()} bytes`);
-        const kept = payload().diagnostics.logs;
-        assert.ok(kept.length > 0 && kept.length < 60, `${kept.length} lines kept`);
-        assert.match(kept.at(-1).text, /^debug 69 /, 'the newest lines are the ones kept');
-        assert.match(note('logs-note'), new RegExp(`^${kept.length} lines will be included\\. \\d+ older lines were left out to keep the report small\\.$`));
-        // Six bytes per escaped control character: then the oldest error codes go too, never the description.
+        // Six bytes per escaped control character: the oldest log events go first, then the oldest error codes.
         setDescription('\u0001'.repeat(4000));
         assert.ok(kib() <= 32 * 1024, `${kib()} bytes`);
         assert.equal(payload().description.length, 4000);
-        assert.ok((payload().diagnostics.recentEvents?.length ?? 0) < 50, 'older error codes were dropped to fit');
+        assert.match(note('logs-note'), /older ones? (was|were) left out to keep the report small/);
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
         send(); await until(() => status().includes(reportId));
         assert.ok(Buffer.byteLength(calls.at(-1).body, 'utf8') <= 32 * 1024);
         close();
     });
     await check('v2: an unreadable log leaves only the log out, says so, and the report still sends', async () => {
-        log.ringBuffer = () => { throw new Error('ring unavailable'); };
-        open(); setDescription('Ring unavailable'); change('logs', true);
+        const toISOString = Date.prototype.toISOString;
+        Date.prototype.toISOString = () => { throw new Error('clock unavailable'); };
+        try {
+            open(); setDescription('Log unavailable'); change('logs', true);
+        } finally { Date.prototype.toISOString = toISOString; }
         assert.match(note('logs-note'), /couldn't be read in this tab, so this report will be sent without it/);
         assert.equal(payload().diagnostics.logs, undefined);
         diagnosticsSchema.parse(payload().diagnostics);
@@ -885,7 +906,6 @@ try {
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
         send(); await until(() => status().includes(reportId));
         close();
-        log.ringBuffer = readRing;
     });
     await check('v2: an older server (no ui.feedbackLogs) gets only v1 keys and no log option', async () => {
         window.__EZIL_BOOT__.desktopState.ui.feedbackLogs = false;

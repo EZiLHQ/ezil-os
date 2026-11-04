@@ -1,21 +1,21 @@
 // diagnostics.js — EZiL-authored. Feedback's small, explicit allowlist.
-// No general-purpose state dump: even telemetry's redacted detail is excluded.
-// The one exception is `build_recent_logs`, which the user ticks separately
-// ("Recent activity log"); every line it returns is redacted and bounded.
+// No general-purpose state dump. Telemetry events are reduced to the CLOSED
+// vocabulary in `app/src/server/feedback/event-vocabulary.js` (known class and
+// site, listed code, else left out or `other`); no console text, event detail
+// or error message is ever part of a report. The server applies the same
+// projection again (`redact.ts`), whatever the shell sent.
 import { ambientCorrelationId } from '../../trace.js';
-import { recentEvents, redact } from '../../telemetry.js';
-import log from '../../log.js';
+import { recentEvents } from '../../telemetry.js';
 import { routeName } from '../../app-link.js';
-import { scan } from './secret-scan.js';
+import { projectEvent, projectLogLine } from '../../../../app/src/server/feedback/event-vocabulary.js';
 
 const integer = value => Math.min(1_000_000_000, Math.max(0, Math.round(value)));
 
 /** Registry ids (`apps/registry.js` APPS) a report may name; anything else is left out. */
 export const APP_IDS = Object.freeze(['desktop', 'code', 'settings', 'app-store', 'preview', 'secure-browser']);
-/** The recent-log bounds: this tab's last 15 minutes, at most 60 lines of 200 characters. */
+/** The activity-log bounds: this tab's last 15 minutes, at most 60 events. */
 export const LOG_WINDOW_MS = 15 * 60 * 1000;
 export const LOG_MAX_LINES = 60;
-export const LOG_LINE_MAX = 200;
 
 function visible (el) {
     for ( let node = el; node; node = node.parentElement ) {
@@ -79,11 +79,13 @@ function front_app () {
 }
 
 /**
- * @param {{ extended?: boolean }} [options] `extended` adds the fields only a
- *   server that sets `desktopState.ui.feedbackLogs` accepts (today: `app`).
+ * @param {{ extended?: boolean, counts?: { omitted?: number } }} [options]
+ *   `extended` adds the fields only a server that sets
+ *   `desktopState.ui.feedbackLogs` accepts (today: `app`). `counts.omitted`
+ *   receives how many recorded events were left out as unrecognised.
  * @returns {object} Matches diagnosticsSchema; absent information is omitted.
  */
-export function build_diagnostics ({ extended = false } = {}) {
+export function build_diagnostics ({ extended = false, counts = {} } = {}) {
     const result = {};
     const version = globalThis.ezil?.version;
     if ( typeof version === 'string' || typeof version === 'number' ) result.shellVersion = String(version).slice(0, 64);
@@ -110,9 +112,9 @@ export function build_diagnostics ({ extended = false } = {}) {
     if ( typeof traceId === 'string' ) result.traceId = traceId.slice(0, 64);
     // trace.js exposes no non-mutating breadcrumb snapshot. Calling end() here
     // would finish the user's app-open; omit phases until a read API exists.
-    result.recentEvents = recentEvents().slice(-50)
-        .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'))
-        .map(event => ({ eventClass: event.eventClass.slice(0, 40), site: event.site.slice(0, 80), code: event.code.slice(0, 80) }));
+    const events = recentEvents().slice(-50);
+    result.recentEvents = events.map(projectEvent).filter(Boolean);
+    counts.omitted = events.length - result.recentEvents.length;
 
     // The stream controllers keep vitals private. Read ONLY the two numeric
     // measurements Settings already renders, without requesting new samples.
@@ -129,76 +131,22 @@ export function build_diagnostics ({ extended = false } = {}) {
     return result;
 }
 
-// ── The activity log's own, stricter scrub (FB-R1 review, 3 Nov 2026) ──────
-// A console line is free text, so this is deliberately harsher than
-// telemetry's `redact()` (which stays as it is for its own callers). The
-// server applies the same rules again (`app/src/server/feedback/redact.ts`
-// `logLine`); keep the two in step.
-/** Keys whose value is never kept: `"password":"…"`, `token=…`, `api_key: …`. */
-const SECRET_KEY = /(["']?)\b(pass(?:word|wd)?|pwd|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|auth|session(?:[-_]?id)?|credentials?|signature|sig)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi;
-/** Header-shaped secrets run to the end of the line (`Authorization: Bearer x`). */
-const SECRET_HEADER = /\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=].*$/gi;
-/** A file name by its extension (`next.config.ts`, `candidate.txt`). */
-const FILE_NAME = /\b[\w@+-]+(?:\.[\w@+-]+)*\.(?:[cm]?[jt]sx?|json[c5]?|map|py|ipynb|rb|go|rs|java|kts?|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|ps1|bat|sql|mdx?|txt|rtf|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|lock|xml|html?|s?css|less|vue|svelte|astro|png|jpe?g|gif|webp|svg|pdf|docx?|xlsx?|pptx?|zip|t?gz|tar|7z|rar|key|pem|crt|p12|db|sqlite)\b/gi;
-/** A dotfile (`.env`, `.npmrc`). A capture group, not a lookbehind: Safari < 16.4 cannot parse one. */
-const DOTFILE = /(^|[^\w.])\.[A-Za-z][\w.-]*/g;
-
 /**
- * A console line for the activity log. Links go first (their slashes are not
- * paths); then a secret-named key keeps its name but not its value; then the
- * line STOPS at the first remaining token with `/` or `\` (relative, absolute,
- * UNC or Windows path), because nothing can tell where a path with spaces
- * ends; then file names; then `scrub()`.
+ * The "Recent activity log" a user may add to a report: this tab's recorded
+ * events (`telemetry.recentEvents()`) from the last `LOG_WINDOW_MS`, with
+ * their time and outcome, reduced to the closed vocabulary, oldest first, at
+ * most `LOG_MAX_LINES`. The console ring is not read: its text is free-form.
+ * Throws when the events cannot be read; the form reports that and sends without.
+ * @param {{ now?: number, counts?: { omitted?: number } }} [options]
+ * @returns {Array<{ t: string, eventClass: string, site: string, code: string, outcome: string }>}
  */
-function console_line (text) {
-    let s = String(text)
-        .replace(/\b(?:https?|wss?|ftp|file):\/\/[^\s'"<>)\]]+/gi, '<url>')
-        .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
-        .replace(SECRET_HEADER, '$1: [redacted]')
-        .replace(SECRET_KEY, '$1$2$1$3[redacted]');
-    const path = s.search(/[^\s]*[\\/]/);
-    if ( path !== -1 ) s = `${s.slice(0, path)}<path…>`;
-    return scrub(s.replace(FILE_NAME, '<file>').replace(DOTFILE, '$1<file>'));
-}
-
-/**
- * One log line made safe to send: telemetry's `redact()` (links, paths, ids,
- * addresses, header and token shapes; 200 characters), then every match the
- * form's own secret scan still finds (emails, JWTs, keys) is replaced too.
- */
-function scrub (text) {
-    let s = redact(text) ?? '';
-    for ( const match of scan(s).reverse() ) {
-        const rest = s.slice(match.index);
-        const length = rest.match(/^[^\s'"<>,;)]+/)?.[0].length ?? 0;
-        if ( length ) s = `${s.slice(0, match.index)}[redacted]${rest.slice(length)}`;
-    }
-    return s.slice(0, LOG_LINE_MAX);
-}
-
-/**
- * The "Recent activity log" a user may add to a report: this tab's console
- * ring (`log.js`) and recorded events (`telemetry.recentEvents()`), from the
- * last `LOG_WINDOW_MS`, oldest first, at most `LOG_MAX_LINES`. Both rings live
- * only in this page; nothing from another tab, an app's iframe or the server.
- * Throws when a ring cannot be read; the form reports that and sends without.
- * @returns {Array<{ t: string, source: 'console'|'event', text: string }>}
- */
-export function build_recent_logs ({ now = Date.now() } = {}) {
+export function build_recent_logs ({ now = Date.now(), counts = {} } = {}) {
     const since = now - LOG_WINDOW_MS;
-    const lines = [];
-    const add = (t, source, safe) => {
-        if ( ! Number.isFinite(t) || t < since || t > now + 1000 ) return;
-        if ( safe ) lines.push({ at: t, line: { t: new Date(t).toISOString(), source, text: safe } });
-    };
-    for ( const entry of log.ringBuffer() ) {
-        add(entry?.t, 'console', console_line(`${entry?.level ?? ''} ${entry?.msg ?? ''}`.trim()));
-    }
-    // Events: their structured, hand-written fields only. `detail` is free text and stays out.
-    for ( const event of recentEvents() ) {
-        add(event?.t, 'event', scrub([event?.eventClass, event?.site, event?.code, event?.outcome]
-            .filter(part => typeof part === 'string' && part).join(' ')));
-    }
-    lines.sort((a, b) => a.at - b.at);
-    return lines.slice(-LOG_MAX_LINES).map(item => item.line);
+    const recent = recentEvents().filter(event => Number.isFinite(event?.t) && event.t >= since && event.t <= now + 1000);
+    const lines = recent
+        .map(event => projectLogLine({ ...event, t: new Date(event.t).toISOString() }))
+        .filter(Boolean)
+        .sort((a, b) => a.t.localeCompare(b.t));
+    counts.omitted = recent.length - lines.length;
+    return lines.slice(-LOG_MAX_LINES);
 }

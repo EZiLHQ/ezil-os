@@ -91,7 +91,8 @@ describe('feedback ingest SQL and persisted values', () => {
             description: 'alice@example.com [redacted:aws-key]', redaction_count: 1, has_screenshot: false,
             shell_version: '[redacted:email]', deploy_sha: null,
         });
-        expect(JSON.parse(String(reports[0]!.diagnostics))).toEqual({ shellVersion: '[redacted:email]', appCommit: '[redacted:jwt]' });
+        // appCommit is dropped on ingest: no shell sends it (closed projection, redact.ts).
+        expect(JSON.parse(String(reports[0]!.diagnostics))).toEqual({ shellVersion: '[redacted:email]' });
     });
 
     it('stores the server-stamped deploy SHA on the report row', async () => {

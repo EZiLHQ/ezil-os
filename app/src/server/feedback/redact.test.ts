@@ -43,34 +43,28 @@ describe('description secret redaction', () => {
     });
 });
 
-describe('diagnostics sanitization', () => {
-    it('sanitizes every string field and preserves typed numeric/boolean fields', () => {
+describe('diagnostics: fail-closed projection (re-review 88e642df-feedback-closed-projection-v1)', () => {
+    const t = '2026-11-03T21:30:00.000Z';
+    const known = { eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'capacity_unavailable' };
+
+    it('keeps closed fields only from their lists, bounds the free ones, and drops fields no shell sends', () => {
         const input: FeedbackDiagnostics = {
-            shellVersion: 'alice@example.com', appCommit: 'eyJabc.def.ghi',
+            shellVersion: 'alice@example.com', appCommit: 'eyJabc.def.ghi', app: 'browser',
             browser: { family: 'bob@example.com', major: 130 }, os: 'bob@example.com',
             deviceClass: 'desktop', viewport: { w: 1920, h: 1080, dpr: 2 }, fullscreen: false, fullbleed: true,
             computerStatus: 'bob@example.com', traceId: 'id:550e8400-e29b-41d4-a716-446655440000',
-            phases: ['bob@example.com'], recentEvents: [{ eventClass: 'bob@example.com', site: 'eyJabc.def.ghi', code: 'https://example.test/private?token=abc' }],
+            phases: ['bob@example.com'], recentEvents: [known],
             stream: { state: 'bob@example.com', kbps: 1200, rttMs: 40 },
         };
         const result = sanitizeDiagnostics(input)!;
         expect(result).toEqual({
-            shellVersion: '[redacted:email]', appCommit: '[redacted:jwt]',
-            browser: { family: '[redacted:email]', major: 130 }, os: '[redacted:email]',
+            shellVersion: '[redacted:email]', app: 'browser',
             deviceClass: 'desktop', viewport: input.viewport, fullscreen: false, fullbleed: true,
-            computerStatus: '[redacted:email]', traceId: 'id:[redacted:uuid]', phases: ['[redacted:email]'],
-            recentEvents: [{ eventClass: '[redacted:email]', site: '[redacted:jwt]', code: '<url>]' }],
-            stream: { state: '[redacted:email]', kbps: 1200, rttMs: 40 },
+            computerStatus: '[redacted:email]', traceId: 'id:[redacted:uuid]',
+            recentEvents: [known], stream: { kbps: 1200, rttMs: 40 },
         });
+        expect(sanitizeDiagnostics({ browser: { family: 'Firefox', major: 140 }, os: 'macOS' })).toEqual({ browser: { family: 'Firefox', major: 140 }, os: 'macOS' });
         expect(input.shellVersion).toBe('alice@example.com');
-        expect(diagnosticsSchema.safeParse(result).success).toBe(true);
-    });
-
-    it('masks UUIDs embedded in text and retains schema bounds after replacements expand', () => {
-        const result = sanitizeDiagnostics({ traceId: 'prefix 550e8400-e29b-41d4-a716-446655440000 suffix', stream: { state: 'a@b.co c@d.co e@f.co' } });
-        expect(result?.traceId).toBe('prefix [redacted:uuid] suffix');
-        expect(result?.stream?.state?.length).toBeLessThanOrEqual(24);
-        expect(JSON.stringify(result)).not.toContain('@');
         expect(diagnosticsSchema.safeParse(result).success).toBe(true);
     });
 
@@ -80,69 +74,48 @@ describe('diagnostics sanitization', () => {
         expect(sanitizeDiagnostics({})).toEqual({});
         expect(sanitizeDiagnostics({ stream: {} })).toEqual({ stream: {} });
     });
-});
 
-describe('v2 diagnostics: the app in front and the recent activity log', () => {
-    const t = '2026-11-03T21:30:00.000Z';
+    // The reviewer's cases, as schema-valid values in the fields a forged or buggy client controls.
+    const hostile = [
+        'opened sports/sports-mobile-main/next.config.ts', 'sports/sports-mobile-main/next.config.ts',
+        String.raw`\\fileserver\private\candidate.txt`, '{"password":"synthetic-short-secret","status":"failed"}',
+        'open /home/alice/workspace/my project failed', 'sports%2Fsports-mobile-main%2Fnext.config.ts',
+        '%2Fhome%2Falice%2Fworkspace', 'home∕alice∕workspace', 'Authorization: Bearer abc123\nnext line ok',
+        'carol@example.com', 'AKIAIOSFODNN7EXAMPLEAKIAIOSFODNN7EXAMPLE', 'plain words the user typed',
+    ];
 
-    it('redacts every log line on the server even when the shell sent it raw', () => {
-        // The shell scrubs first; this proves the server does not depend on it.
-        const raw = [
-            'error GET https://os.example.test/api/shell/start?token=abc failed',
-            fake('Authorization: Bearer ', 'abcdefghijklmnopqrstuvwxyz0123456789'),
-            'cookie: __Host-ezil-os-auth=top-secret-cookie',
-            `opened /home/alice/workspace/secret-project/src/main.ts for 550e8400-e29b-41d4-a716-446655440000`,
-            'mailed carol@example.com about eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature',
-            fake('key=', 'AKIA', '1234567890ABCDEF'),
-        ];
-        const result = sanitizeDiagnostics({ app: 'dave@example.com', logs: raw.map((text) => ({ t, source: 'console', text })) })!;
-        const sent = JSON.stringify(result);
-        for (const leaked of ['os.example.test', 'abcdefghijklmnopqrstuvwxyz0123456789', 'top-secret-cookie', 'alice',
-            'secret-project', '550e8400', 'carol@', 'eyJhbGci', 'AKIA1234567890ABCDEF', 'dave@']) {
-            expect(sent).not.toContain(leaked);
-        }
-        expect(result.app).toBe('[redacted:email]');
-        expect(result.logs).toHaveLength(raw.length);
-        expect(result.logs!.every((line) => line.t === t && line.source === 'console')).toBe(true);
+    it.each(hostile)('an unknown site or code %j never reaches storage (recentEvents)', (value) => {
+        const result = sanitizeDiagnostics({ recentEvents: [
+            { ...known, site: value }, { ...known, code: value }, { ...known, eventClass: value }, known,
+        ] })!;
+        expect(result.recentEvents).toEqual([{ ...known, code: 'other' }, known]);
+        expect(result.omitted).toBe(2);
+        expect(JSON.stringify(result)).not.toContain(value.slice(0, 12));
         expect(diagnosticsSchema.safeParse(result).success).toBe(true);
     });
 
-    // FB-R1 (independent review, 22:12Z): telemetry's sanitizer alone kept these. Raw input, server only.
-    it.each([
-        ['opened sports/sports-mobile-main/next.config.ts', 'opened <path…>', ['sports', 'next.config']],
-        [String.raw`\\fileserver\private\candidate.txt opened`, '<path…>', ['fileserver', 'private', 'candidate']],
-        ['{"password":"synthetic-short-secret","status":"failed"}', '{"password":[redacted],"status":"failed"}', ['synthetic-short-secret']],
-        ['open /home/alice/workspace/my project failed', 'open <path…>', ['alice', 'workspace', 'project']],
-        [String.raw`saved C:\Users\bob\Documents\plan final.docx`, 'saved <path…>', ['bob', 'Documents', 'plan', 'final']],
-        ['loaded next.config.ts and .env.local', 'loaded <file> and <file>', ['next.config', '.env', 'local']],
-        ['Authorization: Bearer abc123 then more', 'Authorization=[redacted]', ['abc123', 'more']],
-        ['retry token=short1 api_key: k2 session_id=s3 done', 'retry token=[redacted] api_key=[redacted] session_id=[redacted] done', ['short1', 'k2', 's3']],
-        ['GET https://private.example.test/a/b?x=1 failed', 'GET <url> failed', ['private.example', '/a/b']],
-    ])('a raw log line %j is scrubbed by the server alone', (raw, expected, leaks) => {
-        for (const source of ['console', 'event'] as const) {
-            const text = sanitizeDiagnostics({ logs: [{ t, source, text: raw }] })!.logs![0].text;
-            expect(text).toBe(expected);
-            for (const leak of leaks) expect(text).not.toContain(leak);
-        }
+    it.each(hostile)('a log line carrying %j is projected or dropped, whatever it claims', (value) => {
+        const line = { t, ...known, outcome: 'error' as const };
+        const result = sanitizeDiagnostics({ logs: [
+            { ...line, site: value }, { ...line, code: value }, { ...line, t: value }, line,
+        ] })!;
+        expect(result.logs).toEqual([{ ...line, code: 'other' }, line]);
+        expect(result.omitted).toBe(2);
+        expect(JSON.stringify(result)).not.toContain(value.slice(0, 12));
     });
 
-    it('keeps an ordinary app name and log line readable', () => {
-        const result = sanitizeDiagnostics({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });
-        expect(result).toEqual({ app: 'browser', logs: [{ t, source: 'event', text: 'api_failure shell.start start_failed failure' }] });
+    it('rejects the retired free-text log shape at the schema', () => {
+        expect(diagnosticsSchema.safeParse({ logs: [{ t, source: 'console', text: 'GET /api failed' }] }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: Array(61).fill({ t, ...known, outcome: 'ok' }) }).success).toBe(false);
+        expect(diagnosticsSchema.safeParse({ logs: [{ t, ...known, outcome: 'maybe' }] }).success).toBe(false);
     });
 
-    it('bounds the log: at most 60 lines of 200 characters, closed sources, UTC instants only', () => {
-        const line = { t, source: 'console' as const, text: 'x'.repeat(200) };
-        expect(diagnosticsSchema.safeParse({ logs: Array(60).fill(line) }).success).toBe(true);
-        expect(diagnosticsSchema.safeParse({ logs: Array(61).fill(line) }).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, text: 'x'.repeat(201) }] }).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, source: 'network' }] }).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, t: 'Mon Nov 03 2026 22:30 GMT+0100' }] }).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ logs: [{ ...line, url: 'https://example.test/' }] }).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ app: 'x'.repeat(33) }).success).toBe(false);
-        // A redaction that lengthens a line still fits the bound it is stored under.
-        const expanded = sanitizeDiagnostics({ logs: [{ t, source: 'console', text: 'a@b.co '.repeat(28) }] })!;
-        expect(expanded.logs![0].text.length).toBeLessThanOrEqual(200);
-        expect(diagnosticsSchema.safeParse(expanded).success).toBe(true);
+    it('adds its own drops to the client\'s omission count', () => {
+        expect(sanitizeDiagnostics({ omitted: 3, recentEvents: [{ ...known, site: 'x' }] })!.omitted).toBe(4);
+        expect(sanitizeDiagnostics({ recentEvents: [known] })!.omitted).toBeUndefined();
+    });
+
+    it('an unknown app, browser or OS is left out rather than stored as text', () => {
+        expect(sanitizeDiagnostics({ app: 'sports/next.config.ts', browser: { family: 'x/y', major: 1 }, os: 'C:\\Users' })).toEqual({});
     });
 });

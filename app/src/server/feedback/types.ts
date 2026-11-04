@@ -25,8 +25,8 @@ export const FEEDBACK_LIMITS = Object.freeze({
 
 export const FEEDBACK_RETENTION_DAYS = Object.freeze({ attachments: 30, reports: 180, accessLog: 365 });
 
-/** "Recent activity log" (contract §3, v2): the shell's tab-local console and event rings. */
-export const FEEDBACK_LOG_LIMITS = Object.freeze({ lines: 60, lineChars: 200 });
+/** "Recent activity log" (contract §3, v2): the shell's tab-local recorded events, closed vocabulary only. */
+export const FEEDBACK_LOG_LIMITS = Object.freeze({ lines: 60 });
 
 const short = (max: number) => z.string().max(max);
 const int = z.number().int().min(0).max(1_000_000_000);
@@ -35,7 +35,7 @@ const isoInstant = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d
 export const diagnosticsSchema = z
     .object({
         shellVersion: short(64),
-        /** v2: the app in front, by its address name (`browser`, `code`); never a URL or folder. */
+        /** v2: the app the report is about, by its address name (`browser`, `code`); projected on ingest. */
         app: short(32),
         appCommit: short(64),
         browser: z.object({ family: short(32), major: int }).strict(),
@@ -49,10 +49,12 @@ export const diagnosticsSchema = z
         phases: z.array(short(40)).max(24),
         recentEvents: z.array(z.object({ eventClass: short(40), site: short(80), code: short(80) }).strict()).max(50),
         stream: z.object({ state: short(24).optional(), kbps: int.optional(), rttMs: int.optional() }).strict(),
-        /** v2, sent only when the user ticks it; re-redacted on ingest (`redact.ts`). */
+        /** v2, only when the user ticks it: recorded events with their time; projected again on ingest (`redact.ts`). */
         logs: z.array(z.object({
-            t: isoInstant, source: z.enum(['console', 'event']), text: short(FEEDBACK_LOG_LIMITS.lineChars),
+            t: isoInstant, eventClass: short(40), site: short(80), code: short(80), outcome: z.enum(['ok', 'error', 'skipped']),
         }).strict()).max(FEEDBACK_LOG_LIMITS.lines),
+        /** v2: how many recorded events the closed vocabulary left out. */
+        omitted: int,
     })
     .partial()
     .strict();
