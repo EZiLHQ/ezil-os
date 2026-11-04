@@ -815,7 +815,10 @@ for ( const paymentStatus of ['paid', 'no_payment_required', 'unpaid', null] ) {
             : paymentStatus === 'unpaid' ? /Bank payments can take a few days\. Your AI credits update after payment is confirmed/
             : /Your AI credits update after payment is confirmed/);
         await h.tick(60000);
-        assert.match(h.text(), /Check Settings → Billing for updates/);
+        if ( paymentStatus === 'paid' ) {
+            assert.match(h.text(), /Payment received, but we couldn't confirm your AI credits yet\. You don't need to pay again\./);
+            assert.doesNotMatch(h.text(), /Adding your AI credits|credits added/);
+        } else assert.match(h.text(), /Check Settings → Billing for updates/);
         assert.equal(h.q('[data-role="upgrade-success"]'), null);
         h.click('[data-action="return-to-billing"]');
         assert.equal(h.count('billing.createTopupCheckout'), 1);
@@ -854,6 +857,31 @@ test('AI pack success never shows another person\'s balance', async h => {
     assert.ok(h.q('[data-role="upgrade-success"]'));
     assert.equal(h.q('[data-role="topup-new-balance"]').textContent, 'Check your AI credits in Billing.');
     assert.doesNotMatch(h.text(), /999/);
+});
+
+test('AI pack: paid but not credited by the 60 s deadline promises no credits and says not to pay again', async h => {
+    // A webhook can park a paid top-up before any receipt exists (QA M1); the server still reports processing.
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => ({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing', credits: null });
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    assert.match(h.text(), /Payment received\. Adding your AI credits…/, 'before the deadline the receipt may still be delivered');
+    await h.tick(59999);
+    assert.match(h.text(), /Adding your AI credits…/);
+    await h.tick(1);
+    const copy = h.q('[data-role="checkout-state"] p').textContent;
+    assert.equal(copy, "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.");
+    assert.doesNotMatch(h.text(), /Adding your AI credits|credits added|couldn't be added automatically/, 'no promise and no inferred review outcome');
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.equal(h.q('[data-action="retry"]'), null, 'never offers another payment');
+    assert.equal(h.timers.size, 0, 'polling stops at the deadline');
+    const reads = h.count('billing.topupStatus');
+    await h.tick(60000);
+    assert.equal(h.count('billing.topupStatus'), reads);
+    assert.equal(h.count('billing.summary'), 0);
+    h.click('[data-action="return-to-billing"]');
+    assert.equal(h.done, 1);
+    assert.equal(h.count('billing.createTopupCheckout'), 1);
 });
 
 test('AI pack: a delivery that needs review says so and never claims credits or asks to pay again', async h => {
