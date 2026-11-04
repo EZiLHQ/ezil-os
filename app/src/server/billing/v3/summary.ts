@@ -352,7 +352,10 @@ now: Date): BillingSummaryV3['plan']['trial'] | undefined {
     if (sub.status === 'past_due' || sub.status === 'unpaid' || (paymentIssue && now >= sub.trialEnd)) {
         return { ...base, state: 'payment_failed', firstChargeAt: endsAt };
     }
-    if (sub.status !== 'trialing' || now >= sub.trialEnd) return undefined;
+    // Ended but not paid yet (standing.ts ends trial access at the exact end): say so, never "active".
+    if (now >= sub.trialEnd) return sub.status === 'active' || sub.status === 'trialing'
+        ? { ...base, state: 'payment_pending', firstChargeAt: endsAt } : undefined;
+    if (sub.status !== 'trialing') return undefined;
     return sub.cancelAtPeriodEnd ? { ...base, state: 'ending', firstChargeAt: null } : { ...base, state: 'trialing', firstChargeAt: endsAt };
 }
 

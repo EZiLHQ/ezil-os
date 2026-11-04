@@ -638,7 +638,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 if (!decision.eligible) throw trialError('trial_unavailable');
                 const row = facts.own;
                 if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
-                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)) throw trialError('trial_quote_stale');
+                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
+                    // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
+                    || row.authSubject !== facts.authSubject || row.emailNormalized !== facts.emailNormalized) throw trialError('trial_quote_stale');
                 trial = { row, store };
             }
 

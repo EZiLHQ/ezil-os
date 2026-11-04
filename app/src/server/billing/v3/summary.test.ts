@@ -757,6 +757,18 @@ describe('Standard trial summary', () => {
         expect(summary.computer.standing).toBe('free');
     });
 
+    it('payment_pending: the trial ended and the first charge is not collected yet; Standard waits, never shown as active', () => {
+        const args = { ...trialInput({ status: 'active', currentPeriodStart: trialEnd, currentPeriodEnd: new Date('2026-12-10T00:00:00Z') }),
+            now: new Date('2026-11-10T00:30:00Z') };
+        const summary = buildSummaryV3(args);
+        expect(summary.plan.trial).toMatchObject({ state: 'payment_pending', endsAt: '2026-11-10T00:00:00Z', firstChargeAt: '2026-11-10T00:00:00Z' });
+        expect(summary.computer.standing).toBe('free');
+        expect(summary.fairUse.policy).toBeUndefined();
+        // One second before the end it is still the trial.
+        expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).plan.trial?.state).toBe('trialing');
+        expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).computer.standing).toBe('paid');
+    });
+
     it('a converted trial (first paid period granted) is ordinary Standard', () => {
         expect(buildSummaryV3(trialInput({ status: 'active', firstPaidAt: trialEnd })).plan.trial).toBeUndefined();
     });

@@ -2617,10 +2617,12 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
         };
         return { store, stripe, deps, setNow: (date: Date) => { current = date; }, renew };
     }
+    // The delivery's clock is the trial's own (5 s after it started), so no future-period rule can pass a test by accident.
     const createInvoice = (id = 'in_local') => ({ ...event('invoice.paid', { id, customer: 'cus_payload', billing_reason: 'subscription_create',
-        parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } }), id: `evt_${id}` });
+        parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } }), id: `evt_${id}`,
+        created: trialStart.getTime() / 1000 + 5 });
     const cycleInvoice = () => ({ ...createInvoice('in_cycle'), created: (trialEnd.getTime() + 3_600_000) / 1000 });
-    const subscriptionEvent = (type = 'customer.subscription.updated', created = now.getTime() / 1000) =>
+    const subscriptionEvent = (type = 'customer.subscription.updated', created = trialStart.getTime() / 1000 + 5) =>
         ({ ...event(type, { id: 'sub_local' }), id: `evt_${type}_${created}`, created });
     const trialGrants = (store: TrialStore) => [...store.grants.values()].filter(grant => grant.kind === 'trial_period');
     const planGrants = (store: TrialStore) => [...store.grants.values()].filter(grant => grant.kind === 'plan_period');
@@ -2634,15 +2636,22 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
     });
 
     it('our own trial\'s $0 create invoice grants the trial once, under its own kind, source and AI root', async () => {
-        const { store, deps } = trialFixture();
+        const { store, stripe, deps } = trialFixture();
+        // The RED fixture's monetary facts, explicit: Stripe reports $0 total and $0 paid for a trial's create invoice.
+        expect(stripe.invoice).toMatchObject({ total: 0, amountPaid: 0, billingReason: 'subscription_create', status: 'paid' });
+        // A legitimate starter grant and a purchase stay as they are; the trial adds exactly one 200-credit root.
+        store.outbox.set('ezil-os:v1:free-once:user_local:grant', { eventKey: 'ezil-os:v1:free-once:user_local:grant', userId: 'user_local',
+            kind: 'ai_grant', payload: { entitlementId: 'ezil-os:v1:free-once:user_local', credits: 100 } });
         expect(await processStripeEvent(createInvoice(), deps)).toBe('applied');
         expect(await processStripeEvent({ ...createInvoice(), id: 'evt_replay' }, deps)).toBe('applied');
         expect(await processStripeEvent(subscriptionEvent('customer.subscription.created'), deps)).toBe('applied');
         expect(planGrants(store)).toEqual([]);
         expect(trialGrants(store)).toEqual([expect.objectContaining({ userId: 'user_local', subscriptionId: 'sub_local',
             meter: 'compute_std_seconds', amount: BigInt(144000), periodStart: trialStart, periodEnd: trialEnd, sourceType: 'trial', sourceId: 'sub_local' })]);
-        expect([...store.outbox.values()]).toEqual([expect.objectContaining({ eventKey: `${ROOT}:grant`, kind: 'ai_grant',
-            payload: expect.objectContaining({ entitlementId: ROOT, credits: 200, expiresAt: trialEnd.toISOString(), invoiceId: null }) })]);
+        expect([...store.outbox.values()].filter(item => item.eventKey !== 'ezil-os:v1:free-once:user_local:grant')).toEqual([
+            expect.objectContaining({ eventKey: `${ROOT}:grant`, kind: 'ai_grant',
+                payload: expect.objectContaining({ entitlementId: ROOT, credits: 200, expiresAt: trialEnd.toISOString(), invoiceId: null }) })]);
+        expect(store.outbox.get('ezil-os:v1:free-once:user_local:grant')!.payload.credits).toBe(100);
         expect(store.trials.get(TRIAL_ID)).toMatchObject({ status: 'trialing', stripeSubscriptionId: 'sub_local', trialStart });
         expect(store.subscriptions.get('sub_local')).toMatchObject({ status: 'trialing', trialStart, trialEnd });
         expect(store.paidAt.size).toBe(0);
@@ -2665,6 +2674,14 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
         }],
         ['a positive total but a $0 base line', (f: ReturnType<typeof trialFixture>) => { f.stripe.invoice.total = 2000; }],
         ['an unreadable total', (f: ReturnType<typeof trialFixture>) => { f.stripe.invoice.total = NaN; }],
+        ['a coupon: a positive $20 line with total and amount_paid 0', (f: ReturnType<typeof trialFixture>) => {
+            f.stripe.subscription = { ...f.stripe.subscription, status: 'active', trialId: null };
+            f.stripe.invoice.lines = [{ ...f.stripe.invoice.lines[0]!, amount: 2000 }];
+        }],
+        ['a coupon on a cycle invoice: positive line, total and amount_paid 0', (f: ReturnType<typeof trialFixture>) => {
+            f.stripe.invoice.billingReason = 'subscription_cycle';
+            f.stripe.invoice.lines = [{ ...f.stripe.invoice.lines[0]!, amount: 2000 }];
+        }],
     ])('fails closed on %s: review, no grant, no credits', async (_name, mutate) => {
         const f = trialFixture();
         mutate(f);

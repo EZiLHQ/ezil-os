@@ -436,7 +436,8 @@ export const billingTrials = pgTable(
     'ezil_billing_trials',
     {
         id: uuid('id').primaryKey().defaultRandom(),
-        userId: uuid('user_id').notNull(),
+        /** Null once the account is deleted: the row stays as the person's tombstone claim (0021). */
+        userId: uuid('user_id'),
         authSubject: text('auth_subject').notNull(),
         emailNormalized: text('email_normalized').notNull(),
         sku: text('sku').notNull(),
@@ -469,7 +470,7 @@ export const billingTrials = pgTable(
             name: 'ezil_billing_trials_user_id_fkey',
             columns: [table.userId],
             foreignColumns: [authUsers.id],
-        }).onDelete('cascade').onUpdate('cascade'),
+        }).onDelete('set null').onUpdate('cascade'),
     ],
 ).enableRLS();
 

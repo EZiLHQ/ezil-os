@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-    addCalendarMonthUtc, authSubjectFor, normalizeEmail, parseTrialEntitlement, quoteFresh, trialEligibility, trialEntitlement,
+    addCalendarMonthUtc, authSubjectFor, mailboxDomains, normalizeEmail, parseTrialEntitlement, quoteFresh, trialEligibility, trialEntitlement,
     trialTerms, TRIAL_QUOTE_TTL_SECONDS, type TrialFacts, type TrialRow,
 } from './trial';
 
@@ -53,13 +53,31 @@ describe('one calendar month (UTC, month-end clamped, whole seconds)', () => {
 describe('the person key', () => {
     it.each([
         ['  Alice@Example.COM ', 'alice@example.com'],
-        ['alice+trial2@example.com', 'alice@example.com'],
         ['A.l.i.c.e+x@gmail.com', 'alice@gmail.com'],
         ['alice@googlemail.com', 'alice@gmail.com'],
+        ['alice+work@outlook.com', 'alice@outlook.com'],
+        ['a.lice+x@hotmail.com', 'a.lice@hotmail.com'],
+        ['alice+tag@fastmail.com', 'alice@fastmail.com'],
+        ['alice+tag@proton.me', 'alice@proton.me'],
+        // A custom domain keeps its whole local part: a+b@ may be another person's mailbox there.
+        ['alice+trial2@example.com', 'alice+trial2@example.com'],
         ['a.lice@example.com', 'a.lice@example.com'],
+        ['sales+eu@company.io', 'sales+eu@company.io'],
     ])('%s → %s', (email, key) => expect(normalizeEmail(email)).toBe(key));
 
-    it.each([null, undefined, '', 'nobody', 'a@b', 'a b@example.com', '+tag@example.com', 'two@@example.com'])('refuses %s', email => {
+    it('the same Gmail mailbox is one person; distinct custom-domain mailboxes stay distinct', () => {
+        expect(normalizeEmail('new+alias@gmail.com')).toBe(normalizeEmail('n.e.w@googlemail.com'));
+        expect(normalizeEmail('team+a@acme.dev')).not.toBe(normalizeEmail('team+b@acme.dev'));
+        expect(normalizeEmail('team@acme.dev')).not.toBe(normalizeEmail('team+b@acme.dev'));
+    });
+
+    it('lists the domains whose mailbox rule can reach the same key', () => {
+        expect(mailboxDomains('gmail.com').sort()).toEqual(['gmail.com', 'googlemail.com']);
+        expect(mailboxDomains('googlemail.com').sort()).toEqual(['gmail.com', 'googlemail.com']);
+        expect(mailboxDomains('example.com')).toEqual(['example.com']);
+    });
+
+    it.each([null, undefined, '', 'nobody', 'a@b', 'a b@example.com', '+tag@gmail.com', 'two@@example.com'])('refuses %s', email => {
         expect(normalizeEmail(email as string | null)).toBeNull();
     });
 

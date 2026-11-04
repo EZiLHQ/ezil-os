@@ -5,9 +5,11 @@
 -- One trial per verified person: the account (user_id), its sign-in subject and its normalized verified
 -- email are each unique. A row is claimed when the server quotes the trial end it will disclose, and it is
 -- never released to another account (an abandoned checkout keeps the claim for the same account only).
+-- Deleting an account keeps its row as a tombstone (user_id set null), so a trial that started still claims
+-- its subject and email when the person signs up again; only a never-started quote may then be reclaimed.
 CREATE TABLE "ezil_billing_trials" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-	"user_id" uuid NOT NULL,
+	"user_id" uuid,
 	"auth_subject" text NOT NULL,
 	"email_normalized" text NOT NULL,
 	"sku" text NOT NULL,
@@ -36,7 +38,7 @@ CREATE TABLE "ezil_billing_trials" (
 );
 --> statement-breakpoint
 ALTER TABLE "ezil_billing_trials" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
-ALTER TABLE "ezil_billing_trials" ADD CONSTRAINT "ezil_billing_trials_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE cascade ON UPDATE cascade;--> statement-breakpoint
+ALTER TABLE "ezil_billing_trials" ADD CONSTRAINT "ezil_billing_trials_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE set null ON UPDATE cascade;--> statement-breakpoint
 CREATE POLICY "Service role full access billing trials"
     ON "ezil_billing_trials" FOR ALL USING (auth.role() = 'service_role');
 --> statement-breakpoint

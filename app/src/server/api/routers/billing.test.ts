@@ -1975,3 +1975,144 @@ describe('trial checkout retries', () => {
         expect(f.stripe.createCheckoutSession.mock.calls[1]?.[0]).toEqual(f.stripe.createCheckoutSession.mock.calls[0]?.[0]);
     });
 });
+
+describe('Standard trial router', () => {
+    const quotedAt = new Date('2026-10-11T12:00:00Z');
+    const trialEnd = new Date('2026-11-11T12:00:00Z');
+    type Own = { id: string; userId: string | null; authSubject: string; emailNormalized: string; sku: string; policyVersion: number;
+        status: 'quoted' | 'checkout' | 'trialing' | 'converted' | 'canceled' | 'ended' | 'payment_failed'; quotedAt: Date; trialEnd: Date;
+        checkoutSessionId: string | null; stripeCustomerId: string | null; stripeSubscriptionId: string | null; trialStart: Date | null };
+    function trialFixture(facts: { emailNormalized?: string | null; emailVerified?: boolean; authSubject?: string; own?: Own | null;
+        claimedElsewhere?: boolean; paidBefore?: boolean } = {}) {
+        const f = fixture();
+        const state = { facts: { emailNormalized: 'fixture@example.org', emailVerified: true, authSubject: `supabase:${userId}`, own: null as Own | null,
+            claimedElsewhere: false, paidBefore: false, ...facts } };
+        const trial = {
+            trialFacts: vi.fn(async () => state.facts),
+            claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string }) => {
+                const own: Own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, sku, policyVersion: 1, status: 'quoted', checkoutSessionId: null,
+                    stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, ...input };
+                state.facts.own = own;
+                return { status: 'quoted' as const, trial: own, supersededCheckoutSessionId: null };
+            }),
+            attachTrialCheckout: vi.fn(async () => 'attached' as const),
+            trialById: vi.fn(), bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        };
+        Object.assign(f.store, trial);
+        return { ...f, trial, state };
+    }
+    const quoted = (patch: Partial<Own> = {}): Own => ({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: `supabase:${userId}`,
+        emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt, trialEnd, checkoutSessionId: null,
+        stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, ...patch });
+
+    it('quoteTrial fixes the exact end one calendar month after the server clock, $0 today and $20 then', async () => {
+        const f = trialFixture();
+        await expect(f.caller.quoteTrial()).resolves.toEqual({ sku, todayCents: 0, trialEndsAt: '2026-11-11T12:00:00Z',
+            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z' });
+        expect(f.trial.claimTrialQuote).toHaveBeenCalledWith({ userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org',
+            quotedAt, trialEnd });
+    });
+
+    it.each([
+        ['an unverified email', { emailVerified: false }],
+        ['no email', { emailNormalized: null }],
+        ['a trial already started', { own: quoted({ status: 'trialing', stripeSubscriptionId: 'sub_x' }) }],
+        ['another account holding this person', { claimedElsewhere: true }],
+        ['an earlier paid plan', { paidBefore: true }],
+    ])('quoteTrial refuses %s before any claim or Stripe call', async (_name, facts) => {
+        const f = trialFixture(facts);
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+        expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('quoteTrial refuses a paid subscriber and checkout refuses a trial for Premium', async () => {
+        const f = trialFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+        const g = trialFixture({ own: quoted() });
+        await expect(g.caller.createCheckout({ sku: 'premium_monthly_v3', trial: { trialEndsAt: trialEnd.toISOString() } }))
+            .rejects.toMatchObject({ message: 'trial_unavailable' });
+        expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('a trial checkout sends the stored quote: its end, a 1 h expiry from the quote, the trial id, one key per quote', async () => {
+        const f = trialFixture({ own: quoted() });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: '2026-11-11T12:00:00Z' } })).resolves.toMatchObject({ sessionId: session.id });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku,
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T13:00:00Z') },
+            idempotencyKey: `trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}` }));
+        expect(f.trial.attachTrialCheckout).toHaveBeenCalledWith({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, quotedAt,
+            checkoutSessionId: session.id, customerId: 'cus_fixture' });
+    });
+
+    it.each([
+        ['an end the caller was not quoted', quoted(), '2026-11-11T12:00:01Z'],
+        ['a quote older than 30 minutes', quoted({ quotedAt: new Date('2026-10-11T11:29:59Z') }), '2026-11-11T12:00:00Z'],
+        ['no quote at all', null, '2026-11-11T12:00:00Z'],
+        // R3: the verified identity changed after the quote (old@ quoted, new@ verified now): re-quote first.
+        ['a quote claiming an earlier verified email', quoted({ emailNormalized: 'old@gmail.com' }), '2026-11-11T12:00:00Z'],
+        ['a quote claiming an earlier sign-in subject', quoted({ authSubject: 'auth0:old-subject' }), '2026-11-11T12:00:00Z'],
+    ])('a trial checkout refuses %s as trial_quote_stale, before Stripe', async (_name, own, trialEndsAt) => {
+        const f = trialFixture({ own });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('R3: a re-quote after the email changed claims the CURRENT identity, and checkout then succeeds', async () => {
+        const f = trialFixture({ own: quoted({ emailNormalized: 'old@gmail.com' }), emailNormalized: 'new@gmail.com' });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        const quote = await f.caller.quoteTrial();
+        expect(f.trial.claimTrialQuote).toHaveBeenCalledWith(expect.objectContaining({ emailNormalized: 'new@gmail.com' }));
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt } })).resolves.toMatchObject({ sessionId: session.id });
+    });
+
+    it('a superseded attach expires the session it opened and refuses', async () => {
+        const f = trialFixture({ own: quoted() });
+        f.trial.attachTrialCheckout.mockResolvedValue('stale' as never);
+        const expire = vi.fn(async () => 'expired' as const);
+        Object.assign(f.stripe, { expireCheckoutSession: expire });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(expire).toHaveBeenCalledWith(session.id);
+    });
+
+    it('a re-quote retires the previous open checkout first, and refuses while a completed one is starting the trial', async () => {
+        const f = trialFixture({ own: quoted({ status: 'checkout', checkoutSessionId: 'cs_old' }) });
+        const expire = vi.fn(async () => 'expired' as const);
+        Object.assign(f.stripe, { expireCheckoutSession: expire });
+        await f.caller.quoteTrial();
+        expect(expire).toHaveBeenCalledWith('cs_old');
+        const g = trialFixture({ own: quoted({ status: 'checkout', checkoutSessionId: 'cs_done' }) });
+        Object.assign(g.stripe, { expireCheckoutSession: vi.fn(async () => 'complete' as const) });
+        await expect(g.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_checkout_complete' });
+        expect(g.trial.claimTrialQuote).not.toHaveBeenCalled();
+    });
+
+    it('a trialing Standard subscription is never upgraded to Premium (local row or Stripe status)', async () => {
+        const f = trialFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'trialing', currentPeriodEnd: new Date('2026-11-20T00:00:00Z'),
+            trialStart: new Date('2026-09-20T00:00:00Z'), trialEnd: new Date('2026-11-20T00:00:00Z'), firstPaidAt: null })]);
+        f.store.stripeCustomerFor.mockResolvedValue('cus_fixture');
+        await domainFailure(() => f.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+        await domainFailure(() => f.caller.confirmUpgrade(confirmInput), 'upgrade_not_allowed');
+        expect(f.stripe.previewUpgrade).not.toHaveBeenCalled();
+        expect(f.stripe.confirmUpgrade).not.toHaveBeenCalled();
+        const g = trialFixture();
+        g.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+        g.store.stripeCustomerFor.mockResolvedValue('cus_fixture');
+        g.stripe.retrieveSubscription.mockResolvedValue({ ...await g.stripe.retrieveSubscription('sub_fixture'), status: 'trialing' });
+        await domainFailure(() => g.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+    });
+
+    it('summary offers the trial to an eligible Free viewer with the server-computed end, and says why not otherwise', async () => {
+        const f = trialFixture();
+        await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: true, sku, endsAt: '2026-11-11T12:00:00Z',
+            amountCents: 2000, currency: 'usd' } });
+        f.state.facts.paidBefore = true;
+        await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: false, reason: 'paid_before' } });
+        f.trial.trialFacts.mockRejectedValue(new Error('relation "ezil_billing_trials" does not exist'));
+        const summary = await f.caller.summary();
+        expect(summary).toMatchObject({ enabled: true });
+        expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
+    });
+});

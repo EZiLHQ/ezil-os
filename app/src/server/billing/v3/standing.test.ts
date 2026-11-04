@@ -124,8 +124,9 @@ describe('Standard trial: a trial that never paid has no renewal grace', () => {
     });
 
     it('the first failed charge after a never-paid trial drops paid access at once; files stay where they are', () => {
+        // Trial access ended at the exact trial end, before the charge failed (R1): that is when Free began.
         expect(standing([trial()], [issue(failedAt)])).toEqual({ standing: 'files_on_aws', graceEndsAt: null, planEndsAt: null,
-            filesOn: 'aws', heldSince: '2026-10-18T13:00:00Z' });
+            filesOn: 'aws', heldSince: '2026-10-18T12:00:00Z' });
         expect(standing([trial()], [], 'cloudflare')).toEqual({ standing: 'free', graceEndsAt: null, planEndsAt: null, filesOn: 'cloudflare', heldSince: null });
         expect(paidAccess(standing([trial()], [issue(failedAt)]).standing)).toBe(false);
     });
