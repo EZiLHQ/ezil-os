@@ -46,6 +46,20 @@ describe('v3 public plans', () => {
         expect(html.match(/<h1\b/g)).toHaveLength(1);
     });
 
+    it.each([false, true])('Standard trial: only the Standard card offers the free month, with no date (%s)', focus => {
+        const articles = cards(render(focus));
+        const trialLine = 'Try one month free — $0 today, then $20/month unless you cancel';
+        expect(CATALOG_V3.standard_monthly_v3.priceCents).toBe(2000);
+        expect(articles[1]).toContain(trialLine);
+        expect(articles[1]).toContain('data-testid="plan-standard-trial"');
+        // A paragraph, not a bullet or a second link: the card keeps one CTA and its catalog bullets.
+        expect(articles[1]).toMatch(/<p [^>]*data-testid="plan-standard-trial"[^>]*>Try one month free/);
+        for (const index of [0, 2]) expect(articles[index]).not.toMatch(/free month|one month free|\$0 today|trial/i);
+        // Unauthenticated: never a date (the exact end is shown in Settings → Billing before checkout).
+        expect(articles[1]).not.toMatch(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\b|\d{4}-\d{2}-\d{2}/);
+        expect(getPricingContent().plans.map(plan => plan.trialNote)).toEqual([null, trialLine, null]);
+    });
+
     it('carries each paid plan through login to the billing deep link', () => {
         for (const plan of getPricingContent().plans) {
             const card = cards(render()).find(card => card.includes(`plan-${plan.id}`))!;

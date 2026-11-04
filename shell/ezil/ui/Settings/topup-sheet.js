@@ -4,7 +4,7 @@
 // (`billing.quoteTopup`) before payment; payment and fulfilment stay with
 // upgrade-sheet.js, which shows credits only once the server confirms them.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, errorCopy, creditsLabel, microOf, staleCreditsCopy } from './billing-format.js';
+import { dollars, errorCopy, creditsLabel, microOf, staleCreditsCopy, trialOfferOf } from './billing-format.js';
 
 const MICRO = 1000000n;
 const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -101,6 +101,8 @@ export function topupUpgrade (summary) {
     const held = summary.computer?.standing === 'files_on_aws';
     if ( (plan?.sku === 'free_v3' || held) && actions?.checkout === true && offer('standard_monthly_v3') ) {
         const standard = offer('standard_monthly_v3');
+        // Standard trial: the same free month the Billing tab offers this viewer ($0 today; the sheet confirms the date).
+        if ( trialOfferOf(summary) ) return { action: 'trial', sku: standard.sku, label: 'Start your free month', note: credits(standard) };
         return { action: 'checkout', sku: standard.sku, label: `Upgrade to ${standard.name}`, note: credits(standard) };
     }
     if ( plan?.sku === 'standard_monthly_v3' && actions?.upgrade === true && offer('premium_monthly_v3') ) {

@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, trialMomentLabel } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -54,11 +54,24 @@ export async function defaultLoadStripe (publishableKey, { signal } = {}) {
     return Stripe(publishableKey);
 }
 
-/** The shell client returns an envelope; injected clients may return wire data. */
+/** The shell client returns an envelope; injected clients may return wire data. The server's code rides on `code`. */
 function unwrap (result) {
-    if ( result?.ok === false ) throw new Error(errorCopy(result.message));
+    if ( result?.ok === false ) throw Object.assign(new Error(errorCopy(result.message)), { code: result.message });
     return result?.ok === true ? result.data : result;
 }
+
+/**
+ * A `billing.quoteTrial` reply the sheet may disclose: Standard, $0 today, one readable end that is also the first
+ * charge, a positive amount. Anything else is refused rather than shown, so no guessed date reaches the person.
+ */
+function trialQuote (data) {
+    const ok = data && typeof data === 'object' && data.sku === TRIAL_SKU && data.todayCents === 0 && data.currency === 'usd'
+        && data.interval === 'month' && Number.isSafeInteger(data.amountCents) && data.amountCents > 0
+        && typeof data.trialEndsAt === 'string' && Number.isFinite(Date.parse(data.trialEndsAt))
+        && Date.parse(data.firstChargeAt ?? '') === Date.parse(data.trialEndsAt);
+    return ok ? { trialEndsAt: data.trialEndsAt, firstChargeAt: data.firstChargeAt, amountCents: data.amountCents } : null;
+}
+const TRIAL_ERRORS = new Set(['trial_unavailable', 'trial_quote_stale', 'trial_checkout_complete']);
 
 /**
  * One sheet per document also means one checkout on a double click. Closing
@@ -112,7 +125,12 @@ function isStripeModalFrame (iframe) {
     } catch { return false; }
 }
 
-export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now }) {
+/**
+ * `trial: true` (Standard only) is the free month: the sheet first asks `billing.quoteTrial` for the exact end, shows
+ * it in the viewer's zone with what is charged and when, and only on Continue opens `billing.createCheckout({ sku,
+ * trial: { trialEndsAt } })` with that same end. Payment then runs exactly as the Standard checkout does ($0 today).
+ */
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, timeZone }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -133,11 +151,16 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     let creditedCredits = null;
     const timers = new Set();
     const v3 = sku.endsWith('_v3');
+    const trialMode = ! pack && trial === true && sku === TRIAL_SKU;
+    /** The disclosed quote (`trialQuote`); null until `billing.quoteTrial` answers. Checkout echoes its end exactly. */
+    let quote = null;
     const name = pack ? 'AI credits' : v3 ? offer.name : planName(offer.family);
-    const price = dollars(pack ? pack.totalCents : offer.priceCents, { compact: true });
+    const price = trialMode ? '$0' : dollars(pack ? pack.totalCents : offer.priceCents, { compact: true });
     const allowance = pack ? `${pack.aiCredits.toLocaleString('en-US')} AI credits`
         : v3 ? 'Usage included' : `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
-    const title = pack ? 'Add AI credits' : `Subscribe to ${name}`;
+    const title = pack ? 'Add AI credits' : trialMode ? 'Start your free month' : `Subscribe to ${name}`;
+    const trialAmount = () => dollars(quote?.amountCents ?? offer.priceCents);
+    const trialMoment = (full = false) => quote ? trialMomentLabel(quote.trialEndsAt, { timeZone, full }) : null;
     const paymentUpdate = pack ? 'Your AI credits update after payment is confirmed.' : 'Your plan updates after payment is confirmed.';
     const frame = openSheetFrame({
         container, title, role: 'upgrade-sheet', onClose,
@@ -167,12 +190,13 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         <div class="ezil-upgrade-columns">
             <details class="ezil-upgrade-summary" open>
                 <summary><span id="ezil-upgrade-title"></span><span class="ezil-upgrade-compact-title" hidden></span></summary>
-                <p class="ezil-upgrade-price"><span data-role="price"></span>${pack ? '' : ' <span>/month</span>'}</p>
-                <p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>
+                <p class="ezil-upgrade-price"><span data-role="price"></span>${pack ? '' : trialMode ? ' <span>today</span>' : ' <span>/month</span>'}</p>
+                ${trialMode ? '<p class="ezil-upgrade-caption" data-role="trial-then"></p>'
+                    : '<p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>'}
                 <ul class="ezil-upgrade-allowances"></ul>
                 <hr>
-                <div class="ezil-upgrade-total"><strong>Due today</strong><span>Total shown in the payment form</span></div>
-                <p class="ezil-upgrade-caption">${pack ? 'One-time payment. ' + paymentUpdate : 'Renews monthly until you cancel in Settings → Billing.'}</p>
+                <div class="ezil-upgrade-total"><strong>Due today</strong><span>${trialMode ? '$0.00' : 'Total shown in the payment form'}</span></div>
+                <p class="ezil-upgrade-caption"${trialMode ? ' data-role="trial-renews"' : ''}>${pack ? 'One-time payment. ' + paymentUpdate : trialMode ? '' : 'Renews monthly until you cancel in Settings → Billing.'}</p>
                 <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
             </details>
             <section class="ezil-upgrade-payment" aria-label="Secure payment">
@@ -181,7 +205,9 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             </section>
         </div>`;
     dialog.querySelector('#ezil-upgrade-title').textContent = title;
-    dialog.querySelector('.ezil-upgrade-compact-title').textContent = `${name} · ${price}${pack ? '' : '/month'} · before applicable tax`;
+    dialog.querySelector('.ezil-upgrade-compact-title').textContent = trialMode
+        ? `${name} · $0 today, then ${dollars(offer.priceCents, { compact: true })}/month · before applicable tax`
+        : `${name} · ${price}${pack ? '' : '/month'} · before applicable tax`;
     dialog.querySelector('[data-role="price"]').textContent = price;
     let lines;
     if ( pack ) lines = [allowance, ...(Number.isFinite(pack.discountPercent) && pack.discountPercent > 0 ? [`Includes ${pack.discountPercent}% off`] : [])];
@@ -195,15 +221,23 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         heading.textContent = 'What happens next';
         const list = doc.createElement('dl');
         const credits = Number.isSafeInteger(offer.aiCredits?.amount) && offer.aiCredits.amount > 0 ? offer.aiCredits.amount.toLocaleString('en-US') : null;
-        for ( const [term, detail] of [
+        const computer = (offer.machineChoice ?? []).length > 1 ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.';
+        // Standard trial: nothing is paid today; the first charge is the quoted end (filled in by renderTrialTerms).
+        for ( const [term, detail, role] of trialMode ? [
+            ['Today', `$0. Your free month of ${offer.name} starts once you add a payment method.`],
+            ['First charge', '', 'trial-first-charge'],
+            ['Cancel', '', 'trial-cancel-by'],
+            ['Your computer', computer],
+        ] : [
             ['Today', credits ? `${offer.name} starts after payment and ${credits} AI credits are added.` : `${offer.name} starts after payment.`],
-            ['Your computer', (offer.machineChoice ?? []).length > 1 ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.'],
+            ['Your computer', computer],
             ['Renews', 'Every month until you cancel in Settings → Billing.'],
         ] ) {
             const row = doc.createElement('div');
             const dt = doc.createElement('dt'), dd = doc.createElement('dd');
             dt.textContent = term;
             dd.textContent = detail;
+            if ( role ) dd.dataset.role = role;
             row.append(dt, dd);
             list.append(row);
         }
@@ -264,9 +298,77 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     function returnToBilling () {
         try { onDone?.(); } finally { close(); }
     }
+    /** The quote's dates in the summary column (viewer's zone). Before a quote, only what is already certain. */
+    function renderTrialTerms () {
+        if ( ! trialMode ) return;
+        const amount = trialAmount();
+        const set = (role, text) => { const node = dialog.querySelector(`[data-role="${role}"]`); if ( node ) node.textContent = text; };
+        set('trial-then', quote ? `Then ${amount}/month from ${trialDayLabel(quote.trialEndsAt, { timeZone })} · USD · before applicable tax`
+            : `Then ${amount}/month · USD · before applicable tax`);
+        // A date, never a minute: Stripe collects the first charge about an hour after the end shown beside the form.
+        set('trial-first-charge', quote ? `${amount} from ${trialDayLabel(quote.trialEndsAt, { timeZone })}, then every month until you cancel.` : 'Shown before you continue.');
+        set('trial-cancel-by', quote ? `Cancel before ${trialDayLabel(quote.trialEndsAt, { timeZone })} in Settings → Billing and you pay nothing.`
+            : 'Cancel before your free month ends and you pay nothing.');
+        set('trial-renews', `A payment method is required. ${amount} is charged monthly from the end of your free month unless you cancel.`);
+    }
+    /** The confirmation step: the exact quoted end in the viewer's zone, what is charged from then, and Continue. */
+    function showTrialConfirm (changed = false) {
+        const hadFocus = state.contains(doc.activeElement);
+        state.replaceChildren();
+        const box = doc.createElement('div');
+        box.dataset.role = 'trial-confirm';
+        const line = (text, role) => {
+            const p = doc.createElement('p');
+            if ( text ) p.textContent = text;
+            p.dataset.role = role;
+            box.append(p);
+            return p;
+        };
+        if ( changed ) line(errorCopy('trial_quote_stale'), 'trial-changed');
+        const ends = line('', 'trial-ends');
+        const time = doc.createElement('time');
+        time.dateTime = quote.trialEndsAt;
+        time.textContent = trialMoment(true);
+        ends.append('Your free month ends on ', time, '.');
+        line(`A payment method is required. ${trialAmount()} is charged monthly from that date unless you cancel.`, 'trial-charge');
+        line('Cancel any time before then in Settings → Billing and you pay nothing.', 'trial-cancel');
+        const button = doc.createElement('button');
+        button.type = 'button';
+        button.textContent = 'Continue';
+        button.dataset.action = 'trial-continue';
+        button.addEventListener('click', () => { if ( ! closed && ! busy ) void create(); });
+        box.append(button);
+        state.append(box);
+        if ( hadFocus || changed ) button.focus();
+    }
+    /** `billing.quoteTrial`: claim this person's trial and fix the end shown above. `changed`: the last one went stale. */
+    async function requote (changed = false) {
+        if ( closed || busy ) return;
+        busy = true;
+        show(changed ? 'Checking the new date for your free month…' : 'Checking your free month…');
+        let next = null, failure = null;
+        try {
+            next = trialQuote(unwrap(await trpc.mutate('billing.quoteTrial')));
+            if ( ! next ) failure = new Error(errorCopy('unavailable'));
+        } catch (error) { failure = error; }
+        finally { busy = false; }
+        if ( closed ) return;
+        if ( next ) {
+            quote = next;
+            renderTrialTerms();
+            showTrialConfirm(changed);
+            return;
+        }
+        // Not this person's to start (or already starting): back to Billing, which re-reads the offer.
+        if ( failure?.code === 'trial_unavailable' || failure?.code === 'trial_checkout_complete' ) show(failure.message, 'Back to Billing', returnToBilling, 'return-to-billing');
+        else show(failure?.message || errorCopy('unavailable'), 'Retry', () => { void requote(changed); });
+    }
     function showConfirmation (timeout = false) {
         const waiting = pack ? 'Adding your AI credits…' : 'Waiting for your plan to update.';
-        const message = paymentStatus === 'paid' ? `Payment received. ${waiting}`
+        // Standard trial: $0 today is not a payment; never "payment received" or "paid" for a free month.
+        const message = trialMode && paymentStatus === 'no_payment_required' ? `Your free month is starting. ${waiting}`
+            : trialMode && paymentStatus === null ? 'Confirmation is pending. Your free month starts once it is confirmed.'
+            : paymentStatus === 'paid' ? `Payment received. ${waiting}`
             : paymentStatus === 'no_payment_required' ? `No payment is required. ${waiting}`
             : paymentStatus === 'unpaid' ? `Your payment is processing. Bank payments can take a few days. ${paymentUpdate}`
             : `${PAYMENT_PENDING_COPY} ${paymentUpdate}`;
@@ -281,14 +383,14 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         finished = true;
         clearTimers();
         if ( sessionCompleted ) showConfirmation(true);
-        else show('We could not confirm your payment yet. Check Settings → Billing in a moment.', 'Back to Billing', returnToBilling, 'return-to-billing');
+        else show(`We could not confirm your ${trialMode ? 'free month' : 'payment'} yet. Check Settings → Billing in a moment.`, 'Back to Billing', returnToBilling, 'return-to-billing');
     }
     function success (summary = null) {
         finished = true;
         clearTimers();
         mount.hidden = true;
         const credits = creditedCredits ?? pack?.aiCredits;
-        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : `You're on ${name}`, 'Done', returnToBilling);
+        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : trialMode ? `Your free month of ${name} has started` : `You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -298,7 +400,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         const allowances = doc.createElement('p');
         // The refreshed balance is the server's, for the signed-in person only; otherwise point to Billing.
         const view = pack && summary?.version === 3 ? accountCredits(summary.ai?.account, { userId }) : null;
-        allowances.textContent = pack ? view && ! view.stale ? `Your balance is now ${view.left} credits.` : 'Check your AI credits in Billing.' : allowance;
+        allowances.textContent = pack ? view && ! view.stale ? `Your balance is now ${view.left} credits.` : 'Check your AI credits in Billing.'
+            : trialMode && quote ? `First charge ${trialAmount()} from ${trialDayLabel(quote.trialEndsAt, { timeZone })} unless you cancel before then.` : allowance;
         if ( pack ) allowances.dataset.role = 'topup-new-balance';
         state.querySelector('button').before(allowances);
         state.querySelector('button').focus();
@@ -351,7 +454,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 if ( result.status === 'expired' ) {
                     finished = true;
                     clearTimers();
-                    show('This checkout has expired. Close the sheet and try again.');
+                    show(trialMode ? 'This checkout expired, so nothing was charged. Close this and start your free month again.' : 'This checkout has expired. Close the sheet and try again.');
                     return;
                 }
                 if ( result.status === 'complete' ) {
@@ -391,7 +494,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         polling = true;
         stopWatching();
         // onComplete starts verification; it does not confirm receipt of funds.
-        if ( completed ) { confirming = true; mount.hidden = true; show('Confirming your payment…'); }
+        if ( completed ) { confirming = true; mount.hidden = true; show(trialMode ? 'Confirming your free month…' : 'Confirming your payment…'); }
         deadline = now() + CONFIRM_DEADLINE_MS;
         later(timedOut, CONFIRM_DEADLINE_MS);
         void poll();
@@ -431,11 +534,16 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     }
     async function create () {
         if ( closed || busy ) return;
+        // Standard trial: no checkout before the person has seen the exact end; Continue comes back here.
+        if ( trialMode && ! quote ) { await requote(); return; }
         busy = true;
         show('Preparing your checkout…');
+        let stale = false;
         try {
-            // A quoted top-up sends exactly what was quoted (a preset or a custom amount, pinned to its total).
-            session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout', pack?.checkout ?? { sku }));
+            // A quoted top-up sends exactly what was quoted (a preset or a custom amount, pinned to its total); a trial
+            // echoes exactly the end it disclosed.
+            session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout',
+                pack?.checkout ?? (trialMode ? { sku, trial: { trialEndsAt: quote.trialEndsAt } } : { sku })));
             if ( closed ) return;
             if ( pack ) session = { ...session, mode: 'embedded' };
             if ( session.mode === 'redirect' ) {
@@ -448,11 +556,18 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 throw new Error('Could not open the secure checkout. Try again.');
             }
         } catch (error) {
-            if ( ! closed ) show(error?.message || 'Could not open billing. Try again.', 'Retry', () => { void create(); });
             session = null;
+            // Standard trial: a stale quote is re-quoted and its NEW end shown before anything else; a refused or
+            // already-starting trial goes back to Billing, never to a paid checkout.
+            if ( trialMode && error?.code === 'trial_quote_stale' ) stale = true;
+            else if ( closed ) { /* Nothing to show. */ }
+            else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing');
+            else show(error?.message || 'Could not open billing. Try again.', 'Retry', () => { void create(); });
         } finally { busy = false; }
+        if ( stale && ! closed ) { quote = null; renderTrialTerms(); void requote(true); return; }
         if ( ! closed && session?.mode === 'embedded' ) void embed();
     }
+    renderTrialTerms();
     focusFirst();
     void create();
     return frame.handle;

@@ -57,6 +57,10 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
             price: dollars(offer.priceCents),
             interval: offer.interval ? `/${offer.interval}` : '',
             billingNote: offer.interval ? 'Usage included · billed monthly' : 'No card needed',
+            // Standard trial (Standard only, never Premium). No date: this page is unauthenticated; Settings → Billing
+            // shows the exact end, which is the first charge, before checkout.
+            trialNote: offer.tier === 'standard' && offer.interval
+                ? `Try one month free — $0 today, then ${dollars(offer.priceCents)}/${offer.interval} unless you cancel` : null,
             highlighted: offer.highlighted,
             badge: offer.badge,
             includes: index ? `Everything in ${offers[index - 1].name}, plus:` : 'Included with Free:',

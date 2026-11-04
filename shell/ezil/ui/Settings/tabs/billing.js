@@ -8,7 +8,8 @@ import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOvera
 import { openConfirmSheet } from '../sheet-frame.js';
 import { openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
-    accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered } from '../billing-format.js';
+    accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
+    trialDayLabel, trialMomentLabel } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -428,6 +429,13 @@ function storageMeterV3 ({ computer }) {
         tone: percent === 0 ? 'danger' : percent <= 20 ? 'warn' : 'ok', notes: [`${diskText(usedBytes)} used of your ${gb} GB disk`] });
 }
 
+/**
+ * The free month is over and its first payment is being collected (or failed). A cancel now ends the plan only after
+ * the period that first payment buys, so "Cancel plan" (with its "stays active until" copy) is not offered here; the
+ * payment portal is.
+ */
+const afterTrial = summary => ['payment_pending', 'payment_failed'].includes(planTrialOf(summary)?.state);
+
 /** The one state banner, or null. It carries the page's only primary in its state. */
 function bannerV3 (summary) {
     const { plan, actions, fairUse } = summary;
@@ -437,6 +445,30 @@ function bannerV3 (summary) {
     if ( plan.paymentIssue === 'requires_action' ) {
         return banner('payment-banner', 'warn', 'Your bank needs you to confirm a payment.', '',
             '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-invoice" data-kind="subscription">Confirm payment</button>');
+    }
+    // Standard trial: these states ride on past_due / cancels, so they come before the paid-plan copy. A trial that
+    // never paid has no grace (graceEndsAt is null): never "keep your plan" or a grace date here.
+    const trial = planTrialOf(summary);
+    if ( trial?.state === 'payment_failed' ) {
+        const amount = trialAmount(summary, trial);
+        return banner('payment-banner', 'danger', `Your free month ended and the ${amount ? `${amount} ` : ''}payment didn't go through.`,
+            'Standard is paused until a payment succeeds; your files are kept.',
+            actions.portal ? actionHtml('portal', 'Update payment method', true) : '', true);
+    }
+    if ( trial?.state === 'payment_pending' ) {
+        // Stripe collects the first charge about an hour after the end. Nothing has failed: no alarm, no primary.
+        const amount = trialAmount(summary, trial);
+        return { primary: false, html: `<aside class="ezil-billing-banner is-warn" data-role="trial-payment-pending" role="status">
+        <div><p class="ezil-billing-banner-title">Your free month has ended.</p>${paragraph(`We're collecting your first ${amount ? `${amount} ` : ''}payment; Standard resumes as soon as it goes through. Your files are kept.`)}</div>${actions.portal
+            ? actionHtml('portal', 'Update payment method') : ''}</aside>` };
+    }
+    if ( trial?.state === 'ending' ) {
+        const amount = trialAmount(summary, trial);
+        const day = trialDayLabel(trial.endsAt);
+        const resume = actions.cancel === true;
+        return { primary: resume, html: `<aside class="ezil-billing-banner is-warn" data-role="trial-ending" role="status">
+        <div><p class="ezil-billing-banner-title">${encode(`Your free month ends on ${day}.`)}</p>${paragraph("You won't be charged. Standard stays available until then.")}${resume && amount
+            ? paragraph(`If you resume, ${amount} is charged from ${day}, then every month until you cancel.`, 'ezil-billing-note') : ''}</div>${resume ? actionHtml('resume', 'Resume plan', true) : ''}</aside>` };
     }
     // ADV-3: the server reports every incomplete subscription as payment_failed (summary.ts); the plan
     // never started, so the ask is to finish that payment, not to keep a plan.
@@ -469,10 +501,12 @@ function bannerV3 (summary) {
     return null;
 }
 
-/** The plan's upgrade CTA: Free → Standard (checkout), Standard → Premium (upgrade). */
+/** The plan's upgrade CTA: Free → Standard (the free month when the server offers it, else checkout), Standard → Premium (upgrade). */
 function upgradeCta (summary, primary) {
     const { plan, actions } = summary;
-    if ( (plan.sku === 'free_v3' || standingOf(summary) === 'files_on_aws') && actions.checkout && offerFor(summary, 'standard_monthly_v3') ) return actionHtml('checkout', 'Upgrade to Standard', primary, 'standard_monthly_v3');
+    if ( (plan.sku === 'free_v3' || standingOf(summary) === 'files_on_aws') && actions.checkout && offerFor(summary, 'standard_monthly_v3') ) {
+        return trialOfferOf(summary) ? actionHtml('trial', 'Start your free month', primary, TRIAL_SKU) : actionHtml('checkout', 'Upgrade to Standard', primary, 'standard_monthly_v3');
+    }
     if ( plan.sku === 'standard_monthly_v3' && actions.upgrade ) return actionHtml('upgrade', 'Upgrade to Premium', primary);
     return '';
 }
@@ -529,12 +563,26 @@ function currentPlanV3 (summary, banner) {
         : plan.sku === 'free_v3' ? 'Free · no card on file'
         : plan.renewal && ['active', 'upgrade_pending'].includes(plan.status) ? `Renews on ${dateLabel(plan.renewal.at, true)} for ${dollars(plan.renewal.amountCents, { compact: true })}.` : '';
     const primary = banner?.primary ? '' : planPrimaryV3(summary);
-    return `<section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3" aria-label="Current plan">
+    // Standard trial: the free month replaces the price and renewal lines, in the viewer's zone. The first charge is a
+    // DATE ("from <date>"): Stripe collects it about an hour after the end, and `plan.renewal.at` (that collection) is
+    // never shown as a second charge. After the end the trial is waiting for (or missed) its first payment: never active.
+    const trial = planTrialOf(summary);
+    const after = trial?.state === 'payment_failed' || trial?.state === 'payment_pending';
+    const live = trial && ! after;
+    const amount = trial ? trialAmount(summary, trial) : null;
+    const trialLines = ! trial ? '' : after ? price ? paragraph(price, 'ezil-billing-plan-price') : ''
+        : `<p class="ezil-billing-plan-price" data-role="trial-until">Free until <time datetime="${encode(trial.endsAt)}">${encode(trialMomentLabel(trial.endsAt))}</time></p>${trial.state === 'trialing'
+            ? `${amount ? paragraph(`First charge ${amount} from ${trialDayLabel(trial.firstChargeAt ?? trial.endsAt)}.`, 'ezil-billing-status') : ''}${paragraph('Cancel before then and you pay nothing.', 'ezil-billing-status')}`
+            : paragraph("Cancelled · you won't be charged.", 'ezil-billing-status')}`;
+    const pill = trial?.state === 'payment_failed' ? 'Paused' : trial?.state === 'payment_pending' ? 'Payment pending' : live && trial.state === 'trialing' ? 'Free trial' : status;
+    // `payment_pending` rides on status active: its chip carries its own state so it is never painted as Active.
+    const chip = trial?.state === 'payment_pending' ? 'payment_pending' : plan.status;
+    return `<section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3"${trial ? ` data-trial="${encode(trial.state)}"` : ''} aria-label="Current plan">
         <div class="ezil-billing-plan-grid"><div>
-            <div class="ezil-billing-plan-heading"><h4>${encode(plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(plan.status)}">${encode(status)}</span></div>
-            ${price ? paragraph(price, 'ezil-billing-plan-price') : ''}${renewal ? paragraph(renewal, 'ezil-billing-status') : ''}
+            <div class="ezil-billing-plan-heading"><h4>${encode(live ? `Free trial · ${plan.name}` : plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(chip)}">${encode(pill)}</span></div>
+            ${trial ? trialLines : `${price ? paragraph(price, 'ezil-billing-plan-price') : ''}${renewal ? paragraph(renewal, 'ezil-billing-status') : ''}`}
             ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`, 'ezil-billing-status') : ''}
-            ${standing === 'files_on_aws' ? `<p role="status" data-role="files-held">${encode(standingCopy('files_on_aws', summary))}</p>` : ''}
+            ${standing === 'files_on_aws' && ! after ? `<p role="status" data-role="files-held">${encode(standingCopy('files_on_aws', summary))}</p>` : ''}
         </div><div class="ezil-billing-actions" data-role="plan-actions">${primary}</div></div>
         ${yourComputerV3(summary)}</section>`;
 }
@@ -570,17 +618,28 @@ function offerCardV3 (summary, offer) {
     const storage = Number.isSafeInteger(offer.storageGiB) && offer.storageGiB > 0
         ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : keepsOwn ? ' for new computers' : ''}` : 'Files saved between sessions';
     const credits = offer.aiCredits?.amount ? `${whole(offer.aiCredits.amount)} AI credits ${offer.aiCredits.per === 'once' ? 'to start' : 'every month'}` : '';
+    // Standard trial (Standard only, never Premium): offered from Free when the server says this viewer is eligible.
+    // The date is the server's preview of the end if a trial started now; the confirmation shows the exact quote.
+    const fromFree = currentRank === 0 && ! current && actions.checkout;
+    const trial = fromFree && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
+    const trialDay = trial ? trialDayLabel(trial.endsAt) : '';
+    const trialHtml = trial ? `<div class="ezil-billing-offer-trial" data-role="trial-offer"><p><strong>$0 today</strong></p>
+        ${paragraph(`${dollars(trial.amountCents, { compact: true })}/month from ${trialDay}`, 'ezil-billing-note')}
+        ${paragraph(`Cancel any time before ${trialDay} and you pay nothing.`, 'ezil-billing-note')}</div>` : '';
+    const ineligible = fromFree && offer.sku === TRIAL_SKU ? trialIneligibleCopy(summary) : '';
     let cta = '';
     if ( current ) cta = '<span class="ezil-billing-current" data-role="current-plan">Current plan</span>';
     else if ( plan.scheduledChange?.toSku === offer.sku ) cta = paragraph(`Starts ${dateLabel(plan.scheduledChange.effectiveAt, true)}`, 'ezil-billing-note');
     else if ( currentRank !== undefined && rank > currentRank ) {
-        if ( actions.checkout && currentRank === 0 ) cta = actionHtml('checkout', `Choose ${offer.name}`, false, offer.sku);
+        if ( trial ) cta = actionHtml('trial', 'Start your free month', false, offer.sku);
+        else if ( actions.checkout && currentRank === 0 ) cta = actionHtml('checkout', `Choose ${offer.name}`, false, offer.sku)
+            + (ineligible ? `<p class="ezil-billing-note" data-role="trial-ineligible">${encode(ineligible)}</p>` : '');
         else if ( actions.upgrade && ! plan.pendingUpgrade && offer.sku === 'premium_monthly_v3' ) cta = actionHtml('upgrade', 'Upgrade');
     } else if ( currentRank !== undefined && rank < currentRank && rank > 0 && actions.downgrade ) cta = linkAction('downgrade', `Switch to ${offer.name}`);
     return `<article class="ezil-billing-card ezil-billing-offer${current ? ' is-current' : ''}" data-role="plan-offer" data-sku="${encode(offer.sku)}"${current ? ' data-current' : ''}>
         <h4>${encode(offer.name)}</h4>
         <p class="ezil-billing-offer-price"><strong>${encode(dollars(offer.priceCents, { compact: true }))}</strong><span>${offer.priceCents ? ' / month' : ''}</span></p>
-        ${paragraph(offer.tagline, 'ezil-billing-note')}
+        ${trialHtml}${paragraph(offer.tagline, 'ezil-billing-note')}
         <ul class="ezil-billing-offer-configs">${configs}</ul>
         <ul class="ezil-billing-offer-facts"><li>${encode(storage)}</li>${credits ? `<li>${encode(credits)}</li>` : ''}</ul>
         <div class="ezil-billing-offer-cta">${cta}</div></article>`;
@@ -625,7 +684,8 @@ export function summaryV3Html (summary, usage = null, options = {}) {
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3 tabindex="-1">Invoices</h3>
             <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>
         <div class="ezil-billing-v3-footer"><p class="ezil-billing-note">Prices before tax.</p>
-            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending' ? linkAction('cancel', 'Cancel plan') : ''}</div>`;
+            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending' && ! afterTrial(summary)
+                ? linkAction('cancel', planTrialOf(summary)?.state === 'trialing' ? 'Cancel free month' : 'Cancel plan') : ''}</div>`;
 }
 
 function summaryHtml (summary) {
@@ -744,7 +804,10 @@ async function load ($win, state) {
     if ( state.summary && ! state.autoOpened ) {
         state.autoOpened = true;
         const sku = state.openUpgrade;
-        if ( topup ) { /* The deep link's section was the top-up request above. */ } else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
+        // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
+        // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
+        if ( topup ) { /* The deep link's section was the top-up request above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
             if ( state.summary.version === 3 ) openSheet($win, state, 'choose');
@@ -786,12 +849,16 @@ function actionStatus ($win, copy) { $win.find('[data-role="billing-action-statu
  * `topup-checkout` is that dialog's hand-off: the payment sheet for the server's quote (`intent.pack`).
  */
 function openSheet ($win, state, action, sku, intent = null) {
+    // The Standard trial is the Standard checkout sheet in its trial mode: it quotes, confirms the exact end, then pays $0.
+    if ( action === 'trial' ) return trialOfferOf(state.summary) ? openSheet($win, state, 'checkout', TRIAL_SKU, { trial: true }) : false;
     const flag = action === 'choose' ? 'checkout' : action === 'topup-checkout' ? 'topup' : action;
     if ( state.pending || state.sheet || state.closed || state.summary?.actions[flag] !== true ) return false;
     const summary = state.summary;
     const offer = action === 'checkout' ? offerFor(summary, sku) : null;
     const pack = action === 'topup-checkout' ? intent?.pack : null;
+    const trial = action === 'checkout' && intent?.trial === true;
     if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return false;
+    if ( trial && (sku !== TRIAL_SKU || ! trialOfferOf(summary)) ) return false;
     if ( action === 'topup' && ! topupOffer(summary) ) return false;
     if ( action === 'topup-checkout' && (summary.version !== 3 || ! pack) ) return false;
     const container = $win.find('.window-body').get(0);
@@ -811,14 +878,16 @@ function openSheet ($win, state, action, sku, intent = null) {
             window.dispatchEvent(new CustomEvent('ezil:computer-switch-request', { detail: { size } }));
             $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
         };
-        const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => openSheet($win, state, 'checkout', params.sku) };
+        // The plan picker and the session-end sheet hand back `{ sku, trial }`; a trial request opens the trial mode.
+        const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => params?.trial === true ? openSheet($win, state, 'trial')
+            : openSheet($win, state, 'checkout', params.sku) };
         token.handle = action === 'topup' ? sheetOpeners.topup({ ...options, summary, userId: state.userId, lastAccount: state.lastAccount,
             preselect: sku, reason: intent?.reason ?? null,
             checkout: params => openSheet($win, state, 'topup-checkout', null, params),
             upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
             : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, userId: state.userId,
                 onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
-            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes })
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, ...(trial ? { trial: true } : {}) })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -949,7 +1018,7 @@ export default {
             } else if ( action === 'computer-tab' ) $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
             // Every Add credits control (Premium's primary, the balance, the card) opens the same dialog.
             else if ( action === 'open-topup' || action === 'topup' ) openSheet($win, state, 'topup', this.dataset.sku);
-            else if ( ['checkout', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
+            else if ( ['checkout', 'trial', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {

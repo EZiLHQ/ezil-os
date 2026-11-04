@@ -94,6 +94,7 @@ export default function MarketingHome({ focusPlans = false }: { focusPlans?: boo
                                 <p className={styles.tagline}>{plan.tagline}</p>
                                 <p className={styles.price}>{plan.price}<span>{plan.interval}</span></p>
                                 <p className={styles.caption}>{plan.billingNote}</p>
+                                {plan.trialNote && <p data-testid={`plan-${plan.id}-trial`} className={styles.trial}>{plan.trialNote}</p>}
                                 <a data-testid={plan.id === 'free' ? undefined : `cta-get-${plan.id}`} className={plan.highlighted ? styles.primary : styles.outline} href={plan.cta.href}>{plan.cta.label}</a>
                                 <p className={styles.includes}>{plan.includes}</p>
                                 <ul className={styles.bullets}>
