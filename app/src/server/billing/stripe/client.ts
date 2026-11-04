@@ -38,6 +38,24 @@ function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T)
     cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
+function trialMetadata(trial: { trialId: string; trialEnd: Date }): Record<string, string> {
+    return { [TRIAL_METADATA_KEY]: trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
+        ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)) };
+}
+
+/**
+ * The subscription half of a trial checkout (Checkout `subscription_data`; the same names are /v1/subscriptions
+ * parameters, which the signed lifecycle suite reuses because a headless run cannot complete Checkout): the quoted
+ * end as `trial_end`, a missing payment method cancels at the end, and the trial row id in metadata.
+ */
+export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date }) {
+    return {
+        metadata: { sku, ezil_catalog: sku.endsWith('_v3') ? 'v3' : 'v2', ...trialMetadata(trial) },
+        trial_end: Math.floor(trial.trialEnd.getTime() / 1000),
+        trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+    };
+}
+
 /** The trial end as checkout copy: an unambiguous UTC date and time (Checkout also shows it in the payer's locale). */
 function trialEndText(at: Date): string {
     const day = at.toLocaleDateString('en-US', { timeZone: 'UTC', day: 'numeric', month: 'long', year: 'numeric' });
@@ -566,16 +584,11 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                     // method always collected, and a trial without one cancelled rather than left unpaid.
                     if (input.sku !== 'standard_monthly_v3' || price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
                         || price.currency !== 'usd' || !price.recurring) throw new BillingProviderError('invalid_trial_price');
-                    const trialMeta = { [TRIAL_METADATA_KEY]: input.trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
-                        ezil_trial_end: String(Math.floor(input.trial.trialEnd.getTime() / 1000)) };
-                    fields.metadata = { ...metadata, ...trialMeta };
+                    const subscriptionData = trialSubscriptionData(input.sku, input.trial);
+                    fields.metadata = { ...metadata, ...trialMetadata(input.trial) };
                     fields.payment_method_collection = 'always';
                     fields.expires_at = Math.floor(input.trial.expiresAt.getTime() / 1000);
-                    fields.subscription_data = {
-                        metadata: { ...(fields.subscription_data as { metadata: Record<string, string> }).metadata, ...trialMeta },
-                        trial_end: Math.floor(input.trial.trialEnd.getTime() / 1000),
-                        trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
-                    };
+                    fields.subscription_data = subscriptionData;
                     fields.custom_text = { submit: { message: `No charge today. Your free month ends ${trialEndText(input.trial.trialEnd)}; `
                         + 'then $20.00 a month until you cancel. Cancel before then and you pay nothing.' } };
                 }
