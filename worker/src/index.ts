@@ -80,6 +80,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
+import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
@@ -616,8 +617,8 @@ import {
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
   parseRepoOpenRequest,
+  repoOpenRemotesFor,
   repoOpenStatus,
-  repoOpenWhenRunning,
   ownSessionExec,
   REPO_OPEN_MAX_BODY_BYTES,
   REPO_OPEN_UNMOUNTED_ROOT,
@@ -625,6 +626,16 @@ import {
   type RepoOpenRequest,
   type RepoOpenRoot,
 } from './repo-open';
+import {
+  parseRepoGrantRequest,
+  repoGrantStatus,
+  repoGrantSubject,
+  repoGrantWhenRunning,
+  repoOpenThenGrant,
+  REPO_GRANT_MAX_BODY_BYTES,
+  type RepoGrantAnswer,
+  type RepoGrantRequest,
+} from './repo-grant';
 import {
   aiProxyBaseUrl,
   aiProxyDisabled,
@@ -808,6 +819,7 @@ const PUBLIC_ERROR_CODES = [
   'relay_login_failed', 'relay_logout_failed', 'relay_metadata_invalid', 'relay_negotiation_busy',
   'relay_refresh_failed', 'relay_refresh_unconfirmed', 'relay_runtime_changed',
   'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed',
+  'repo_grant_conflict', 'repo_grant_failed', 'repo_grant_not_open', 'repo_grant_unsupported_remote',
   'repo_open_auth_failed', 'repo_open_busy', 'repo_open_failed', 'repo_open_folder_conflict',
   'repo_open_git_failed', 'repo_open_git_missing', 'repo_open_invalid_request', 'repo_open_not_found',
   'repo_open_ref_not_found', 'repo_open_timeout', 'repo_open_token_expired', 'repo_open_unreachable',
@@ -983,7 +995,9 @@ interface EzilWorkspacePersistRpc {
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
   /** `POST /sandbox/:name/repo-open` (`./repo-open.ts`). A running computer only; never starts one. */
-  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer>;
+  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer>;
+  /** `POST /sandbox/:name/repo-grant` (`./repo-grant.ts`): refresh push access only. A running computer only. */
+  repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -2717,13 +2731,21 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * in a shell session of its own (`ownSessionExec`), so a slow clone holds up
    * neither viewer traffic nor the probes in the default session.
    */
-  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer> {
-    return repoOpenWhenRunning({
+  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer> {
+    // An EZiL Git open with a scope also installs push access for `grantSubject` (`./repo-grant.ts`).
+    return repoOpenThenGrant(this.repoOpenDeps(), request, root, grantSubject);
+  }
+  /** `POST /sandbox/:name/repo-grant`: rewrite this repository's /run grant only; never fetches or touches the folder. */
+  async repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer> {
+    return repoGrantWhenRunning(this.repoOpenDeps(), request, root, subject);
+  }
+  private repoOpenDeps() {
+    return {
       running: () => this.withRuntimeMutation(async () =>
         this.containerIsRunning() && !(await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY))),
       touch: () => this.renewActivityTimeout(),
       exec: ownSessionExec(this),
-    }, request, root);
+    };
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -4936,9 +4958,10 @@ async function handlePreview(
           surface: awsPreviewSurface(body.surface),
           ensureConfig: async (record) => ensureAwsDesktopConfig(await desktop(record)),
           codeAnswers: async (record) => !!zone && awsCodeServerAnswers(record, zone, awsFetch, Date.now),
-          // Per-tab folder continuity (Code only, aws-origin.ts). The host walk (`resolveFolder`) is e1cd418a's
-          // `code-folder-resolve.ts`; until it is wired, a resolvable ask answers `unverified`.
+          // Per-tab folder continuity (Code only, aws-origin.ts): the host edge's no-follow walk
+          // (`code-folder-resolve.ts`); an agent without the op answers `unverified`.
           codeFolder: body.codeFolder,
+          ...(zone ? { resolveFolder: awsCodeFolderResolver(zone, awsFetch, Date.now) } : {}),
           nowMs: Date.now,
         });
         if (answer.status !== 200) {
@@ -5139,11 +5162,12 @@ async function handlePreview(
     // See `codePreviewFolderParams`'s doc comment above for the full "empty
     // file tree" mechanism/contract this closes.
     // Per-tab folder continuity (`./code-folder.ts`): the tab's hint, stripped of THIS computer's root (the mount,
-    // else the container's own fallback root) and walked on the computer with no symlink followed. The in-container
-    // walk is e1cd418a's `code-folder-resolve.ts` (single writer of Worker path resolution); until it is wired a
-    // resolvable ask answers `unverified` and today's default opens. Only `restored` adds a folder.
+    // else the container's own fallback root) and walked in the container with no symlink followed
+    // (`./code-folder-resolve.ts`, e1cd418a: one exec, the whole resolve bounded, a code back, never a path).
+    // Only `restored` adds a folder; any other outcome opens today's default.
     const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;
-    const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot);
+    const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,
+      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));
     let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));
     if (codeFolder.folder && codePreviewUrl && !fitsCodeFolderUrl(codePreviewUrl)) {
       // The shell's frame confirmation caps the URL: a deep folder opens today's default with a visible notice.
@@ -5403,7 +5427,8 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   }
   const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
   if (!read.ok) return read.response;
-  const parsed = parseRepoOpenRequest(read.body);
+  // os-staging also accepts git-qa.ezil.work (ordinary Builder-created projects, repo-open.ts `repoOpenRemotesFor`).
+  const parsed = parseRepoOpenRequest(read.body, Date.now(), repoOpenRemotesFor(env));
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoOpenStatus(parsed.error));
   const root = repoOpenRoot(env);
   if (!root) {
@@ -5411,12 +5436,47 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   }
   let answer: RepoOpenAnswer;
   try {
-    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root);
+    // The subject binds this computer's push access for the repository to the v2 claims' user (`./repo-grant.ts`).
+    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root, await repoGrantSubject(v2.userId));
   } catch {
     answer = { ok: false, error: 'repo_open_failed' };
   }
   if (!answer.ok) return json({ ok: false, error: answer.error }, repoOpenStatus(answer.error));
   return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status });
+}
+
+/**
+ * POST /sandbox/:name/repo-grant — refresh push access for a repository an open placed (`./repo-grant.ts`,
+ * docs/contracts/os-builder-project-open-v1.md §7). v2 ONLY, like repo-open (the body carries a Git grant);
+ * Cloudflare computers only; a stopped computer is refused, never started. It rewrites the computer's /run
+ * grant and nothing else: no fetch, no clone, nothing in the person's folder but its fixed credential-helper
+ * lines. Answers `{ ok, expiresAt }`; neither the grant nor anything the script printed is in it or the logs.
+ */
+async function handleRepoGrant(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  const v2 = verifiedV2Claims.get(request);
+  if (!v2) {
+    const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
+    return json({ ok: false, error }, 401);
+  }
+  if (v2.provider !== 'cloudflare') {
+    return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
+  }
+  const read = await readProjectFilesBody(request, REPO_GRANT_MAX_BODY_BYTES);
+  if (!read.ok) return read.response;
+  const parsed = parseRepoGrantRequest(read.body, Date.now(), repoOpenRemotesFor(env));
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoGrantStatus(parsed.error));
+  const root = repoOpenRoot(env);
+  if (!root) {
+    return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
+  }
+  let answer: RepoGrantAnswer;
+  try {
+    answer = await openSandbox(env, sandboxName).repoGrant(parsed.request, root, await repoGrantSubject(v2.userId));
+  } catch {
+    answer = { ok: false, error: 'repo_grant_failed' };
+  }
+  if (!answer.ok) return json({ ok: false, error: answer.error }, repoGrantStatus(answer.error));
+  return json({ ok: true, expiresAt: answer.expiresAt });
 }
 
 /**
@@ -7857,6 +7917,12 @@ export default {
       // Clone or fetch one project repository into a running computer's
       // workspace. v2-signed only; see `handleRepoOpen` / `./repo-open.ts`.
       return handleRepoOpen(request, env, decodeURIComponent(repoOpenMatch[1]));
+    }
+
+    const repoGrantMatch = path.match(/^\/sandbox\/([^/]+)\/repo-grant$/);
+    if (method === 'POST' && repoGrantMatch) {
+      // Refresh push access for a repository repo-open placed. v2-signed only; see `handleRepoGrant` / `./repo-grant.ts`.
+      return handleRepoGrant(request, env, decodeURIComponent(repoGrantMatch[1]));
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);

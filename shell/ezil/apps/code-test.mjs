@@ -1480,6 +1480,79 @@ await settle(4);
     await closeCode();
     store.removeItem(FOLDER_KEY);
 
+    // 10. Founder 547ed35a: a repository opened from its address (`/app/code?repo=<https URL>`).
+    {
+        const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+        const GH2 = 'https://github.com/EZiLHQ/ezil-works.git';
+        const ID = '3d2c1b0a-9f8e-8d7c-a6b5-a4f3e2d1c0b9';
+        const ID2 = '4e3d2c1b-0a9f-8e8d-b7c6-b5a4f3e2d1c0';
+        const byUrl = (id, name) => () => ({ payload: { ok: true, expiresAt: Date.now() + 300_000,
+            codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=u${++seq}&folder=/workspace/projects/${id}`,
+            repository: { name, id } } });
+        await closeCode();
+        codeMintAnswer = byUrl(ID, 'EZiLHQ/ezil-os');
+        let from = calls.length;
+        await launch({ project: { repoUrl: GH } });
+        await settle(20);
+        let w = codeWin();
+        push('10a 🔴 an address mints once with { computerId, intent:"open", repository:{url} } and nothing else',
+            mints(from).length === 1 && JSON.stringify(mints(from)[0].body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', repository: { url: GH } }),
+            JSON.stringify(mints(from).map(m => m.body)));
+        push('10a the iframe opens the folder the server named for it (…/projects/<repository.id>) and the window is titled after it',
+            frameSrc(w)?.endsWith(`folder=/workspace/projects/${ID}`) && headTitle(w) === 'EZiLHQ/ezil-os', `${frameSrc(w)} | ${headTitle(w)}`);
+        // Reopening the same address (a reload, Back/Forward, a retried link) re-mints nothing; another address does.
+        from = calls.length;
+        await launch({ project: { repoUrl: GH } });
+        await settle(8);
+        push('10b 🔴 the same address again re-mints nothing (no second clone, no second window)', mints(from).length === 0 && codeWin() === w, `${mints(from).length}`);
+        codeMintAnswer = byUrl(ID2, 'EZiLHQ/ezil-works');
+        await launch({ project: { repoUrl: GH2 } });
+        await waitFor(() => mints(from).length >= 1 && frameSrc(w)?.endsWith(ID2), 3000);
+        await settle(6);
+        push('10b another address re-mints once for it, in the same window, and never keeps the previous folder',
+            mints(from).length === 1 && mints(from)[0].body.repository?.url === GH2 && frameSrc(w)?.endsWith(`/projects/${ID2}`) && codeWin() === w,
+            `${mints(from).length} ${frameSrc(w)}`);
+        await closeCode();
+        // A server answer that does not open the repository it named is refused, never shown as the person's files.
+        for ( const [name, answer] of [
+            ['no repository.id', () => ({ payload: { ok: true, expiresAt: Date.now() + 300_000, codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=x${++seq}&folder=/workspace/projects/${ID}`, repository: { name: 'x' } } })],
+            ['another folder', byUrl(ID, 'x')().payload && (() => ({ payload: { ok: true, expiresAt: Date.now() + 300_000, codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=x${++seq}&folder=/workspace`, repository: { name: 'x', id: ID } } }))],
+        ] ) {
+            codeMintAnswer = answer;
+            await launch({ project: { repoUrl: GH } });
+            await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+            w = codeWin();
+            push(`10c 🔴 ${name}: refused with the failure copy, the editor never shown`,
+                spinnerKind(w) === 'failed' && spinnerTitle(w) === "Couldn't open this project's repository" && frameSrc(w) === 'about:blank',
+                `${spinnerKind(w)} "${spinnerTitle(w)}" src=${frameSrc(w)}`);
+            await closeCode();
+        }
+        // The founder's exact message for a repository that is not there; asked once, no silent retry, no generic Code.
+        for ( const [code, words] of [['repo_not_found', "This repository doesn't exist."], ['repo_url_invalid', "This isn't a repository address Code can open"],
+            ['repo_url_unsupported', 'Open this repository from its project'], ['repo_url_unavailable', "Couldn't reach this repository"]] ) {
+            codeMintAnswer = () => ({ status: code === 'repo_not_found' ? 404 : 409, payload: { error: { code, message: 'x' } } });
+            from = calls.length;
+            const submitted = submits.length;
+            await launch({ project: { repoUrl: GH } });
+            await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+            await tick(2000); // past session.js RETRY_DELAY_MS: a silent re-ask would have landed
+            w = codeWin();
+            const once = code === 'repo_url_unavailable' ? mints(from).length <= 2 : mints(from).length === 1; // transient: its one retry is allowed
+            push(`10d 🔴 ${code}: "${words}", no editor, no generic Code, no sign-in round trip`,
+                spinnerKind(w) === 'failed' && spinnerTitle(w) === words && once && frameSrc(w) === 'about:blank' && submits.length === submitted,
+                `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
+            await closeCode();
+        }
+        // An address that is not one (a project-shaped object, an http URL) is not an address: plain Code, no repository asked.
+        codeMintAnswer = null;
+        from = calls.length;
+        await launch({ project: { repoUrl: 'http://github.com/a/b.git' } });
+        await settle(20);
+        push('10e an invalid address object opens plain Code with today\'s body', JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+            JSON.stringify(mints(from)[0]?.body));
+        await closeCode();
+    }
+
     codeMintAnswer = null;
     store.removeItem(GUARD_KEY);
     window.HTMLFormElement.prototype.submit = realSubmit;

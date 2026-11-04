@@ -163,6 +163,13 @@ const PROJECT_REFUSALS = {
     project_not_authorized: 'project_not_authorized',
     IDENTITY_REFRESH_REQUIRED: 'identity_refresh_required',
     repo_open_unsupported_provider: 'repo_open_unsupported_provider',
+    // A repository opened from its address (`/app/code?repo=<https URL>`, founder 547ed35a).
+    repo_not_found: 'repo_not_found',
+    repo_url_invalid: 'repo_url_invalid',
+    repo_url_unsupported: 'repo_url_unsupported',
+    repo_url_moved: 'repo_url_moved',
+    repo_url_empty: 'repo_url_empty',
+    repo_url_unavailable: 'repo_url_unavailable',
 };
 const PROJECT_FAILURE_COPY = {
     project_not_authorized: {
@@ -181,11 +188,44 @@ const PROJECT_FAILURE_COPY = {
         title: "Couldn't open this project's repository",
         body: 'Something went wrong while getting the repository onto your computer. Try again in a moment.',
     },
+    // The founder's exact words for a repository that is not there (a private one reads the same: nothing is revealed).
+    repo_not_found: {
+        title: "This repository doesn't exist.",
+        body: 'Check the address. A repository opened from a link must be public on GitHub.',
+    },
+    repo_url_invalid: {
+        title: "This isn't a repository address Code can open",
+        body: 'Use a GitHub repository address, like https://github.com/owner/name.',
+    },
+    repo_url_unsupported: {
+        title: 'Open this repository from its project',
+        body: 'EZiL Git repositories open from their project in Universe for now.',
+    },
+    repo_url_moved: {
+        title: 'This repository has moved',
+        body: 'Open it from its new address.',
+    },
+    repo_url_empty: {
+        title: 'This repository has no files yet',
+        body: 'Add a first commit, then open it again.',
+    },
+    repo_url_unavailable: {
+        title: "Couldn't reach this repository",
+        body: 'Something went wrong while checking the repository. Try again in a moment.',
+    },
 };
+/** A repository address as `../app-link.js` accepts it: https only; the server decides what it may name. */
+const REPO_URL = /^https:\/\/[^\s?#@\\%]{1,500}$/;
 
-/** `ctx.project` as Code uses it, or null for anything a project link could not have produced. */
+/**
+ * `ctx.project` as Code uses it, or null for anything a project link could not have produced: a project's two ids, or
+ * (founder 547ed35a) `{repoUrl}`, a repository opened from its address.
+ */
 function projectOf (value) {
     if ( ! value || typeof value !== 'object' ) return null;
+    if ( Object.hasOwn(value, 'repoUrl') ) {
+        return typeof value.repoUrl === 'string' && REPO_URL.test(value.repoUrl) && ! Object.hasOwn(value, 'projectId') ? { repoUrl: value.repoUrl } : null;
+    }
     const { projectId, repoId, path } = value;
     if ( typeof projectId !== 'string' || ! PROJECT_UUID.test(projectId) ) return null;
     if ( typeof repoId !== 'string' || ! PROJECT_UUID.test(repoId) ) return null;
@@ -223,10 +263,13 @@ function repositoryNameOf (data) {
  * the first (`worker/src/preview-bridge.ts`), so a second could not be the one
  * code-server opens.
  */
-function opensRepository (url, project) {
+function opensRepository (url, project, data) {
+    // A repository opened from its address has no id in the link: the server names it (`repository.id`, a UUID).
+    const id = project.repoUrl ? data?.repository?.id : project.repoId;
+    if ( typeof id !== 'string' || ! PROJECT_UUID.test(id) ) return false;
     try {
         const folders = new URL(url).searchParams.getAll('folder');
-        return folders.length === 1 && folders[0].endsWith(`/projects/${project.repoId}`);
+        return folders.length === 1 && folders[0].endsWith(`/projects/${id}`);
     } catch {
         return false;
     }
@@ -234,7 +277,7 @@ function opensRepository (url, project) {
 
 /** This project's `/app/code` URL, plus the page's `computer` (`../app-history.js` PAGE_KEYS) when it has one. */
 function projectReturnUrl (project) {
-    const params = [['project', project.projectId], ['repo', project.repoId]];
+    const params = project.repoUrl ? [['repo', project.repoUrl]] : [['project', project.projectId], ['repo', project.repoId]];
     if ( project.path ) params.push(['path', project.path]);
     try {
         const computers = new URLSearchParams(window.location.search).getAll('computer');
@@ -254,6 +297,8 @@ function projectReturnUrl (project) {
  * the relative `returnUrl` the login route accepts.
  */
 function refreshIdentityOnce (project) {
+    // A repository opened from its address asks for no EZiL ID (nothing is granted for it): never leave the tab for one.
+    if ( project.repoUrl ) return false;
     try {
         const seen = JSON.parse(sessionStorage.getItem(IDENTITY_REFRESH_KEY) ?? 'null');
         if ( seen && seen.projectId === project.projectId && seen.repoId === project.repoId
@@ -400,9 +445,10 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
             // Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): opening Code is a real open of the computer, and
             // only an ask that says so may start moving a held computer's files. An older server ignores the field.
             // Lane O2: the project rides along only when there is one, as its two ids and nothing else.
-            body: JSON.stringify(project
-                ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
-                : { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),
+            // A repository address rides as `{url}` and nothing else; the server decides what it names.
+            body: JSON.stringify(project?.repoUrl ? { computerId, intent: 'open', repository: { url: project.repoUrl } }
+                : project ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
+                    : { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),
             signal: mintSignal(cancel),
         });
     } catch ( err ) {
@@ -461,7 +507,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
         });
         return { ok: false, errorCode: 'unknown' };
     }
-    if ( project && ! opensRepository(data.codePreviewUrl, project) ) {
+    if ( project && ! opensRepository(data.codePreviewUrl, project, data) ) {
         // A server that ignored the project (or answered for another one) would open the person's own files under the
         // project's name. Refused, never shown.
         console.error(`[${PHASE}] the project mint returned a URL that does not open the repository`);
@@ -1248,7 +1294,8 @@ export async function openCodeWindow (ctx = {}) {
         if ( view === 'full' || view === 'window' ) set_view(view);
         const next = nativeSurface ? null : projectOf(relaunch_ctx?.project);
         if ( ! next ) return;
-        const same = project && project.projectId === next.projectId && project.repoId === next.repoId;
+        const same = project && (project.repoUrl || next.repoUrl ? project.repoUrl === next.repoUrl
+            : project.projectId === next.projectId && project.repoId === next.repoId);
         project = next;
         if ( same ) return;
         set_title(title);

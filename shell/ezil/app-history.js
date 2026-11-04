@@ -68,6 +68,8 @@ export function appUrl (id, params = {}) {
 export function linkParams (link) {
     if ( ! link ) return {};
     if ( link.id === 'settings' ) return link.initialTab ? { tab: link.initialTab } : {};
+    // A repository address (founder 547ed35a) is written back as `repo` alone, so history, reload and relaunch keep it.
+    if ( link.id === 'code' && link.project?.repoUrl ) return { repo: link.project.repoUrl };
     if ( link.id === 'code' && link.project ) {
         return { project: link.project.projectId, repo: link.project.repoId, path: link.project.path };
     }

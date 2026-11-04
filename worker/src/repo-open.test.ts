@@ -210,7 +210,8 @@ describe('repoOpenCommand', () => {
     // Besides the presence check, the only lines that use the token are the network fetch's, inside net().
     const tokenLines = REPO_OPEN_SCRIPT.split('\n').filter((l) => l.includes('$tok'));
     expect(tokenLines).toEqual([
-      '  [ -n "$tok" ] || fail repo_open_invalid_request',
+      // A token for every credentialed remote, none at all for an anonymous (public github.com) one.
+      '  if [ "$auth" = none ]; then [ -z "$tok" ] || fail repo_open_invalid_request; else [ -n "$tok" ] || fail repo_open_invalid_request; fi',
       '      GIT_CONFIG_VALUE_9="Authorization: Bearer $tok" timeout -k 5 "$s" "$@"',
       '      EZIL_REPO_OPEN_TOKEN=$tok timeout -k 5 "$s" "$@"',
     ]);

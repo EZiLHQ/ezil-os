@@ -4,8 +4,10 @@
 // the older query alias `/os?app=<id>` / `/os?settings=<tab>` (app-history.js
 // rewrites the alias to the path form). See docs/APP-ROUTES.md.
 // Project parameters are PARSED here and nothing more: no arbitrary URL is
-// used as an iframe target, and a repo URL, ref, folder, account id or token
-// in the URL is never read.
+// used as an iframe target, and a ref, folder, account id or token in the URL
+// is never read. A repository ADDRESS (`/app/code?repo=<URL-encoded https
+// URL>`, founder 547ed35a) is read as navigation intent only: shape-checked
+// here, canonicalised and authorised by the server, never fetched or framed.
 export const ALIASES = Object.freeze({ browser: 'desktop' });
 export const SECTIONS = new Set(['account', 'usage', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
 // Every key this parser reads. A repeated one makes the whole link ambiguous.
@@ -14,6 +16,8 @@ const APP_PATH = /^\/app\/([a-z0-9-]+)$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 const PATH_MAX_BYTES = 255;
+/** A repository address: https, no whitespace, query, fragment, userinfo, backslash or escape (the server decides the rest). */
+const REPO_URL = /^https:\/\/[^\s?#@\\%]{1,500}$/;
 // `ALIASES` read backwards: the address an app is written at, where it is not
 // its registry id. The Browser's id stays `desktop` (DOM and wire plumbing),
 // but the address bar, and so every link copied from it, says `/app/browser`.
@@ -77,12 +81,19 @@ export function pathProblem (value, raw = value) {
  * Code's project parameters. Both ids are required and must be lowercase
  * canonical UUIDs; anything else drops the project (Code still opens) and
  * says why. An invalid `path` drops only the path.
+ *
+ * Or (founder 547ed35a) `repo` alone as a repository address: `{repoUrl}`.
+ * Beside a `project` an address is ambiguous (`repo_invalid`); an address that
+ * is not plain https is `repo_url_invalid`. Its `path` is not read.
  */
 function parseProject (params, search) {
     const projectId = params.get('project');
     const repoId = params.get('repo');
     if ( projectId === null && repoId === null ) {
         return params.has('path') ? { projectRejected: 'project_missing' } : {};
+    }
+    if ( projectId === null && /^[a-z][a-z0-9+.-]*:/i.test(repoId) ) {
+        return REPO_URL.test(repoId) ? { project: { repoUrl: repoId } } : { projectRejected: 'repo_url_invalid' };
     }
     if ( projectId === null || repoId === null ) {
         return { projectRejected: projectId === null ? 'project_missing' : 'repo_missing' };

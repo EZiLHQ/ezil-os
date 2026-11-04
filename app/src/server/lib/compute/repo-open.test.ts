@@ -42,6 +42,14 @@ describe('requestRepoOpen', () => {
         const odd = run(() => Response.json({ ok: true, folder: `/workspace/projects/${REPO}`, head: 'not-a-sha' }));
         expect(await odd.result).toEqual({ ok: true, folder: `/workspace/projects/${REPO}` });
     });
+    it('passes the grant scope inside git when given (os-builder-project-open-v1 §7), and sends no scope key otherwise', async () => {
+        const bodies: Record<string, unknown>[] = [];
+        const fetcher = (async (_u: URL, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return Response.json({ ok: true, folder: `/workspace/projects/${REPO}` }); }) as unknown as typeof fetch;
+        await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, { ...request, git: { ...request.git, scope: 'write' } }, { fetch: fetcher });
+        await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, request, { fetch: fetcher });
+        expect(bodies.map(b => b.git)).toEqual([{ token: TOKEN, expiresAt: request.git.expiresAt, scope: 'write' }, { token: TOKEN, expiresAt: request.git.expiresAt }]);
+    });
+
     it('sends timeoutMs in the signed body, after the grant, and gives up with the caller\'s deadline', async () => {
         const deadline = new AbortController();
         const { fetcher, result } = run(() => Response.json({ folder: `/workspace/projects/${REPO}` }), cloudflare, 'secret', {}, deadline.signal);

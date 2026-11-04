@@ -53,6 +53,21 @@ same(parseAppLink(`/app/code?project={${P}}&repo=${R}`, apps), { id: 'code', pro
 for (const dup of [`/app/code?${pr}&project=${P}`, `/app/code?${pr}&repo=${R}`, `/app/code?${pr}&path=a&path=b`, `/os?app=code&${pr}&path=a&path=a`]) {
     same(parseAppLink(dup, apps), null, `duplicate key rejects the whole link: ${dup}`);
 }
+// Founder 547ed35a: a repository by its address, `/app/code?repo=<URL-encoded https URL>` (navigation intent only).
+{
+    const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}`, apps), { id: 'code', project: { repoUrl: GH } }, 'the founder\'s acceptance link');
+    same(parseAppLink(`/os?app=code&repo=${encodeURIComponent(GH)}`, apps), { id: 'code', project: { repoUrl: GH } }, 'the alias too');
+    same(parseAppLink(`/app/code?repo=${GH}`, apps), { id: 'code', project: { repoUrl: GH } }, 'unencoded slashes read the same');
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}&path=src`, apps), { id: 'code', project: { repoUrl: GH } }, 'path is not read with an address');
+    same(parseAppLink(`/app/code?project=${P}&repo=${encodeURIComponent(GH)}`, apps), { id: 'code', projectRejected: 'repo_invalid' }, 'an address beside a project is ambiguous');
+    for (const bad of ['http://github.com/a/b.git', 'https://u:p@github.com/a/b.git', 'https://github.com/a/b.git?x=1', 'https://github.com/a/b.git#x',
+        'https://github.com/a/b c.git', 'https://github.com/a%2Fb.git', 'https://github.com\\a\\b.git', 'javascript:alert(1)', 'file:///etc/passwd',
+        'ssh://git@github.com/a/b.git', `https://${'a'.repeat(510)}`]) {
+        same(parseAppLink(`/app/code?repo=${encodeURIComponent(bad)}`, apps), { id: 'code', projectRejected: 'repo_url_invalid' }, `refused: ${bad}`);
+    }
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}&repo=${encodeURIComponent(GH)}`, apps), null, 'a repeated repo rejects the whole link');
+}
 // An invalid path is dropped (the project is not) and the reason is kept.
 for (const [raw, reason] of [['', 'empty'], ['a%2Fb', 'encoded_separator'], ['a%2fb', 'encoded_separator'], ['a%5Cb', 'encoded_separator'],
     ['%2Fabs', 'encoded_separator'], ['/abs', 'absolute'], ['a\\b', 'backslash'], ['a/../b', 'dot_segment'], ['./a', 'dot_segment'],

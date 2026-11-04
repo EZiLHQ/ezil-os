@@ -84,7 +84,7 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', intent, project, codeFolder } = (body ?? {}) as {
+        const { computerId = '', intent, project, repository, codeFolder } = (body ?? {}) as {
             computerId?: string;
             /**
              * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` on the r9 shell's Code mint. Forwarded
@@ -93,6 +93,8 @@ export async function POST(req: Request) {
             intent?: unknown;
             /** `/app/code?project=&repo=` as `shell/ezil/app-link.js` parsed it. Its `path` is not read (deferred). */
             project?: unknown;
+            /** `/app/code?repo=<https URL>` (founder 547ed35a): `{url}`, navigation intent only; see `openRepositoryUrl`. */
+            repository?: unknown;
             /**
              * Per-tab folder continuity, own files only: `{v:1, path}` the tab's editor last reported. Forwarded
              * VERBATIM to the procedure (which checks it, `z.unknown()`: never a 400); never with a project, whose
@@ -101,8 +103,15 @@ export async function POST(req: Request) {
             codeFolder?: unknown;
         };
 
-        if (project !== undefined && project !== null) {
+        const hasProject = project !== undefined && project !== null;
+        const hasRepository = repository !== undefined && repository !== null;
+        // One target per open: a project and a repository address together is a malformed link, never a guess.
+        if (hasProject && hasRepository) return shellRefusal(400, 'repo_url_invalid', "This link names two repositories. Open one at a time.");
+        if (hasProject) {
             return await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
+        }
+        if (hasRepository) {
+            return await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal });
         }
 
         const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}) });
@@ -193,7 +202,8 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
         return openTimedOut();
     }
 
-    const grant = await projectGrantOrRefusal(identity, ids, 'code-preview-url', deadline);
+    // 1.1.0: the label of the computer being opened (its owner was checked above by `computer.get`).
+    const grant = await projectGrantOrRefusal(identity, ids, 'code-preview-url', deadline, computerId);
     if (grant instanceof Response) return grant;
 
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
@@ -208,7 +218,7 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
         { userId: ctx.user.id, computerId }, {
             repositoryId: grant.binding.repositoryId, canonicalURL: grant.binding.canonicalURL, ref: grant.binding.ref,
-            git: { token: grant.git.token, expiresAt: grant.git.expiresAt }, timeoutMs,
+            git: { token: grant.git.token, expiresAt: grant.git.expiresAt, scope: grant.git.scope }, timeoutMs,
         }, { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
@@ -221,3 +231,73 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
     // `url` is §2's field; `codePreviewUrl` is what every shell already reads. Same value.
     return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name } });
 }
+
+const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a repository address EZiL OS can open.");
+
+/**
+ * Open a repository from its address (`/app/code?repo=<URL-encoded https URL>`, founder 547ed35a), on the caller's
+ * own selected computer, with its own provider and plan rules. In this order, each step only after the one before:
+ *
+ *  1. the address is one canonical public github.com repository (`parseRepositoryUrl`), else `repo_url_invalid`
+ *     (400) or, for EZiL Git's own hosts, `repo_url_unsupported` (409), before anything is read;
+ *  2. the computer is the caller's own (`computer.get`: NOT_FOUND otherwise);
+ *  3. it is a Cloudflare computer (AWS: `repo_open_unsupported_provider`, 409; os-builder-project-open-v1 §8);
+ *  4. the repository exists publicly and has a default branch: one anonymous read (`resolvePublicGitHub`); a missing
+ *     or private one is "This repository doesn't exist." (404), before the computer is woken for it;
+ *  5. Code is minted exactly as without a repository (the same wake loop, Free policy and billing gates);
+ *  6. the Worker fetches it anonymously into `<root>/projects/<id>` (`repositoryIdFor`: the same folder on every
+ *     reopen, which then fetches only and keeps uncommitted work) and only that folder goes into the URL.
+ *
+ * No credential is sent anywhere: EZiL ID grants nothing on GitHub, and a private repository is not opened this way.
+ */
+async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: {
+    computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal;
+}) {
+    const { computerId, intent, startedAt } = request;
+    const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/works/repo-url');
+    const raw = typeof request.repository === 'object' && request.repository !== null && !Array.isArray(request.repository)
+        && Object.keys(request.repository).length === 1 ? (request.repository as { url?: unknown }).url : undefined;
+    const parsed = parseRepositoryUrl(raw);
+    if (!parsed.ok) {
+        return parsed.reason === 'unsupported_host'
+            ? shellRefusal(409, 'repo_url_unsupported', 'Open this EZiL Git repository from its project in Universe for now.')
+            : repoUrlInvalid();
+    }
+    const left = () => startedAt + PROJECT_OPEN_BUDGET_MS - Date.now();
+    const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
+
+    await caller.computer.get({ id: computerId });
+    if (isAws(await target(ctx, computerId))) return unsupportedProvider();
+
+    const resolved = await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline });
+    if (!resolved.ok) {
+        console.warn('[shell] code-preview-url repository refused', { code: resolved.reason });
+        if (resolved.reason === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");
+        if (resolved.reason === 'moved') return shellRefusal(409, 'repo_url_moved', 'This repository has moved. Open it from its new address.');
+        if (resolved.reason === 'empty') return shellRefusal(409, 'repo_url_empty', 'This repository has no files yet.');
+        return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
+    }
+
+    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
+    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
+    // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
+    const controls = await target(ctx, computerId);
+    if (isAws(controls)) return unsupportedProvider();
+    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
+    if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
+        console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
+        return openTimedOut();
+    }
+    const repositoryId = repositoryIdFor(parsed.canonicalURL);
+    const config = resolveCloudflareGuacamoleConfig();
+    const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
+        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref: resolved.ref, git: null, timeoutMs },
+        { correlationId: newCorrelationId(), signal: deadline });
+    if (!opened.ok) {
+        if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
+        return shellRefusal(502, 'repo_open_failed', "This repository's files could not be opened. Try again.");
+    }
+    const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
+    return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId } });
+}
+

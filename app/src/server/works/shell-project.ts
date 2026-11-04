@@ -50,12 +50,12 @@ export async function projectRepoConfiguredOrRefusal(route: string): Promise<Res
  * provider down, an off-contract answer) `project_repo_unavailable` (503). Logged by fixed code only.
  */
 export async function projectGrantOrRefusal(
-    identity: RetainedIdentity, ids: { projectId: string; repoId: string }, route: string, signal?: AbortSignal,
+    identity: RetainedIdentity, ids: { projectId: string; repoId: string }, route: string, signal?: AbortSignal, computerId?: string,
 ): Promise<ProjectRepoGrant | Response> {
     const { openProjectRepository, ProjectRepoError } = await import('./project-repo');
     try {
-        return await openProjectRepository({ userIdToken: identity.token, projectId: ids.projectId, repositoryId: ids.repoId, identityExpiresAt: identity.expiresAt },
-            signal ? { signal } : {});
+        return await openProjectRepository({ userIdToken: identity.token, projectId: ids.projectId, repositoryId: ids.repoId, identityExpiresAt: identity.expiresAt,
+            ...(computerId ? { computerId } : {}) }, signal ? { signal } : {});
     } catch (err) {
         const code = err instanceof ProjectRepoError ? err.code : 'unavailable';
         console.warn(`[shell] ${route} project refused`, { code });

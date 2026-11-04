@@ -2,7 +2,7 @@
  * OS server → Worker: put one project repository into the user's own Cloudflare computer (os-map-design §2).
  *
  *   signed v2 (body digest) POST /sandbox/<name>/repo-open
- *     {repositoryId, canonicalURL, ref, git:{token, expiresAt}, timeoutMs}  →  {folder:"<root>/projects/<repositoryId>", head}
+ *     {repositoryId, canonicalURL, ref, git:{token, expiresAt, scope?}, timeoutMs}  →  {folder:"<root>/projects/<repositoryId>", head}
  *
  * The Worker clones or fetches with the token handed to git through its environment only (a Bearer header for a
  * Cloudflare Artifacts remote, a one-shot Basic credential helper for EZiL Git), never argv, a URL or `.git/config`,
@@ -25,7 +25,11 @@ export interface RepoOpenRequest {
     repositoryId: string;
     canonicalURL: string;
     ref: string;
-    git: { token: string; expiresAt: string };
+    /**
+     * `scope`: Universe's grant scope, so an EZiL Git open installs push access (os-builder-project-open-v1 §7).
+     * `null`: an anonymous open of a public github.com repository (a direct repository URL): no grant is sent at all.
+     */
+    git: { token: string; expiresAt: string; scope?: 'read' | 'write' } | null;
     /** The Worker's whole bound for this open, ms (`worker/src/repo-open.ts` REPO_OPEN_MIN/EXEC_TIMEOUT_MS). */
     timeoutMs: number;
 }
@@ -81,7 +85,8 @@ export async function requestRepoOpen(
         // Fixed key order: the Worker re-reads exactly these fields from exactly this string.
         const body = JSON.stringify({
             repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
-            git: { token: request.git.token, expiresAt: request.git.expiresAt }, timeoutMs: request.timeoutMs,
+            ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
+            timeoutMs: request.timeoutMs,
         });
         // A Cloudflare computer's v2 claims, as `compute/cloudflare.ts` `authOf` mints them: no generation or lease,
         // and no store claim.

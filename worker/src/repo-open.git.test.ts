@@ -156,7 +156,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
    * `/proc/<pid>/environ` of the shell.
    */
   const exec = (token: string): RepoOpenExec => async (command, options) => {
-    expect(command).not.toContain(token);
+    if (token) expect(command).not.toContain(token);
     expect(Object.keys(options.env)).toEqual([REPO_OPEN_TOKEN_ENV]);
     const shimmed = `${bin}:${IMAGE ? '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' : process.env.PATH!}`;
     const envFor = { PATH: shimmed, HOME: home, GIT_SSL_CAINFO: cert, GIT_TRACE: trace, EZIL_IT_ARGV_LOG: argvLog,
@@ -168,7 +168,7 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
       ? ['docker', 'exec', '-i', '-e', `PATH=${shimmed}`,
         ...Object.keys(envFor).filter((k) => k !== 'PATH').flatMap((k) => ['-e', k]), container, 'bash', '--norc']
       : ['bash', '--norc'];
-    for (const arg of argv) expect(arg).not.toContain(token);
+    if (token) for (const arg of argv) expect(arg).not.toContain(token);
     const exports = Object.entries(options.env).map(([k, v]) => `  export ${k}='${v.replace(/'/g, `'\\''`)}'\n`).join('');
     const proc = Bun.spawn(argv, {
       env: IMAGE ? { ...envFor, PATH: process.env.PATH! } : envFor,
@@ -306,11 +306,13 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
         const u = new URL(req.url);
         seen.push({ url: req.url, auth: req.headers.get('authorization'), leak: req.headers.get('x-leak') });
         const isBearer = u.pathname.startsWith('/bearer/');
-        if (req.headers.get('authorization') !== (isBearer ? BEARER : BASIC)) {
+        // `/public/`: a public repository (github.com's anonymous read), served to anyone and to no credential.
+        const isPublic = u.pathname.startsWith('/public/');
+        if (!isPublic && req.headers.get('authorization') !== (isBearer ? BEARER : BASIC)) {
           return new Response('authentication required', { status: 401, headers: { 'www-authenticate': 'Basic realm="ezil-it"' } });
         }
         // `/slow/` (Basic): the same repositories, each answer a second late, so a fetch stays in flight.
-        let path = isBearer ? u.pathname.slice('/bearer'.length) : u.pathname;
+        let path = isBearer ? u.pathname.slice('/bearer'.length) : isPublic ? u.pathname.slice('/public'.length) : u.pathname;
         if (path.startsWith('/slow/')) {
           path = path.slice('/slow'.length);
           await Bun.sleep(1000);
@@ -400,6 +402,35 @@ describe.skipIf(!AVAILABLE)(`repo-open script against real git${IMAGE ? ` in ${I
     expect(existsSync(join(home, '.git-credentials'))).toBe(false);
     expect(printed.join('\n')).not.toContain(TOKEN);
     expect(filesContaining(dir, TOKEN).filter((p) => !p.startsWith(join(dir, 'upstream')))).toEqual([]);
+  });
+
+  // Founder 547ed35a: a public github.com repository opened from a direct URL is fetched with NO credential at all.
+  it('🔴 an anonymous (public) open clones with no credential sent, configured or written; a reopen keeps uncommitted work', async () => {
+    const ANON = '00000000-0000-4000-8000-0000000000ab';
+    const publicUrl = `${base}/public/acme/site.git`;
+    const mark = seen.length;
+    const answer = await open({ repositoryId: ANON, canonicalURL: publicUrl, auth: 'none', token: '', expiresAt: '' });
+    expect(answer).toMatchObject({ ok: true, folder: folderOf(ANON), status: 'cloned' });
+    const folder = repoOf(ANON);
+    expect(git(folder, 'config', '--local', '--get', 'remote.origin.url')).toBe(publicUrl);
+    expect(readFileSync(join(folder, '.git', 'config'), 'utf8')).not.toMatch(/credential|helper|extraheader|authorization/i);
+    // The server saw the anonymous read only: no Authorization header of any kind.
+    expect(seen.slice(mark).every((s) => s.auth === null)).toBe(true);
+    expect(seen.slice(mark).length).toBeGreaterThan(0);
+    // Reopen: fetch only; an uncommitted edit and an untracked file survive.
+    writeFileSync(join(folder, 'README.md'), '# site\nlocal edit\n');
+    writeFileSync(join(folder, 'mine.txt'), 'untracked\n');
+    expect(await open({ repositoryId: ANON, canonicalURL: publicUrl, auth: 'none', token: '', expiresAt: '' })).toMatchObject({ ok: true, status: 'fetched' });
+    expect(readFileSync(join(folder, 'README.md'), 'utf8')).toBe('# site\nlocal edit\n');
+    expect(readFileSync(join(folder, 'mine.txt'), 'utf8')).toBe('untracked\n');
+  });
+
+  it('🔴 an anonymous open of a repository that needs credentials fails as auth, never prompting or sending one', async () => {
+    const mark = seen.length;
+    const answer = await open({ repositoryId: '00000000-0000-4000-8000-0000000000ac', canonicalURL: url, auth: 'none', token: '', expiresAt: '' });
+    expect(answer).toEqual({ ok: false, error: 'repo_open_auth_failed' });
+    expect(seen.slice(mark).every((s) => s.auth === null)).toBe(true);
+    expect(existsSync(folderOf('00000000-0000-4000-8000-0000000000ac'))).toBe(false);
   });
 
   it('🔴 a second open fetches only: an uncommitted edit and HEAD survive, the remote-tracking ref moves', async () => {
