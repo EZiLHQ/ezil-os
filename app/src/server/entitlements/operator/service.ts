@@ -22,6 +22,8 @@ export type IdentityCheck = 'ok' | 'identity_not_found' | 'ambiguous_identity';
 /** What Stripe gives this account now (Stripe-only standing; never written by this source). */
 export interface StripeView {
     paidAccess: boolean;
+    /** Actual compute funding; standing alone still owns conflict/precedence when false. */
+    computeActive: boolean;
     /** The paid plan's SKU while `paidAccess`, else null. */
     productRef: string | null;
     /** The newest subscription's Stripe status verbatim; null = the account never had a Stripe subscription. */
@@ -38,7 +40,7 @@ export interface CommandStore {
     /** Compare-and-set on the revision; false when it moved (nothing written). */
     updateAssignment(ref: string, expectedRevision: number, next: Pick<OperatorEntitlementRow, 'revision' | 'sku' | 'endsAt' | 'endedAt'>): Promise<boolean>;
     /** Closes a live grant whose end already passed (ended_at = its end), so a new one can be assigned. */
-    closeLapsed(ref: string, endedAt: Date): Promise<void>;
+    closeLapsed(ref: string, now: Date): Promise<void>;
     insertEvent(event: { id: string; commandId: string; payloadSha256: string; action: Command['action']; assignmentRef: string; revision: number;
         userId: string; operatorVia: string; operatorActor: string; senderKid: string; reason: string; result: Result }): Promise<void>;
 }
@@ -53,7 +55,8 @@ export interface OperatorEntitlementDeps {
 
 /** The access OS admission resolves: Stripe paid access wins, else the operator grant in effect, else none. */
 export function effectiveAccess(stripe: StripeView, rows: readonly OperatorEntitlementRow[], now: Date): EffectiveAccess {
-    if (stripe.paidAccess) return { state: 'active', product_ref: stripe.productRef, via: 'stripe' };
+    if (stripe.paidAccess) return stripe.computeActive
+        ? { state: 'active', product_ref: stripe.productRef, via: 'stripe' } : NO_ACCESS;
     const grant = operatorGrantInEffect(rows, now);
     return grant ? { state: 'active', product_ref: grant.sku, via: 'operator' } : NO_ACCESS;
 }
@@ -127,16 +130,18 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
         if (command.action === 'assign') {
             const sku = product();
             if (typeof sku !== 'string') return sku;
-            const startsAt = command.starts_at === null ? now : new Date(command.starts_at);
-            if (Math.abs(startsAt.getTime() - now.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'starts_at must be now: scheduled and back-dated assignments are not supported.');
+            const requestedStart = command.starts_at === null ? now : new Date(command.starts_at);
+            if (Math.abs(requestedStart.getTime() - now.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'starts_at must be now: scheduled and back-dated assignments are not supported.');
+            // Tolerance accepts sender clock skew, never scheduling: validity begins at the server's now.
+            const startsAt = now;
             const endsAt = endOf(command.validity!);
             if (endsAt !== null && endsAt.getTime() <= now.getTime()) return refuse('invalid_command', 'ends_at must be in the future.');
             if (endsAt !== null && endsAt.getTime() <= startsAt.getTime()) return refuse('invalid_command', 'ends_at must be after starts_at.');
             if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
             const current = rows.find(live);
-            if (current && inEffect(current, now)) return refuse('invalid_command', 'An operator assignment is already in effect for this account; change or end it.');
+            if (current && (current.endsAt === null || current.endsAt.getTime() > now.getTime())) return refuse('invalid_command', 'An operator assignment is already in effect for this account; change or end it.');
             // A live grant that lapsed by its own end date is closed at that date before the new one starts.
-            if (current) await store.closeLapsed(current.ref, current.endsAt ?? now);
+            if (current) await store.closeLapsed(current.ref, now);
             const row: OperatorEntitlementRow = { ref: `osg-${deps.newId()}`, revision: 1, userId, accountPublicId: command.target.account_public_id,
                 sku, startsAt, endsAt, endedAt: null };
             return write(row, async () => { await store.insertAssignment(row); return true; });

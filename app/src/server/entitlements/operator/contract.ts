@@ -153,7 +153,7 @@ const isoMs = (d: Date) => d.toISOString();
 
 /** The contract view of a stored assignment at `now` (individual: never scheduled, never pending). */
 export function assignmentView(row: OperatorEntitlementRow, now: Date): Assignment {
-    const ended = (row.endedAt !== null && row.endedAt.getTime() <= now.getTime()) || (row.endsAt !== null && row.endsAt.getTime() <= now.getTime());
+    const ended = row.endedAt !== null || (row.endsAt !== null && row.endsAt.getTime() <= now.getTime());
     // An operator `end` closes the validity at that moment, so the view's end is the earlier of the two.
     const end = row.endedAt !== null && (row.endsAt === null || row.endedAt < row.endsAt) ? row.endedAt : row.endsAt;
     return { ref: row.ref, revision: row.revision, producer: PRODUCER, scope: SCOPE, product_ref: row.sku,

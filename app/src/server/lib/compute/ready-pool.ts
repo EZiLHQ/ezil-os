@@ -1,6 +1,7 @@
 /** Single-use warm hosts. Callers own admission, lifecycle execution and transactions. */
 import { sql } from 'drizzle-orm';
 import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
+import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
 import { RUNNING_CLASS_STATES, type Placement, type PlacementExecutor } from './placement';
 import { AWS_REGION_PATTERN, INSTANCE_VCPU, instanceVcpu, readAwsRegions } from './aws-config';
 
@@ -230,58 +231,11 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
     return { target, provision: Math.min(2, Math.max(0, target - d.spares)), retire, fail };
 }
 
-/** The paid-pool eligibility CTEs (effective subscription per user, then eligible), shared by demand planning and
- * capacity-demand reauthorization. `user` narrows to one subject. Ends inside the WITH list (caller continues it).
- * `operator` (0019 applied): product entitlements v1 operator grants in effect are eligible too, as the paid plan they
- * assign, unless Stripe still covers the user (Stripe wins; a past_due period conservatively counts as covered). */
+/** Shared effective source, standing and receipt funding for pool eligibility and demand. */
 function eligibleCtes(at: string, user?: string, operator = false) {
-    const only = user ? sql` AND s.user_id = ${user}::uuid` : sql``;
-    const operatorBranch = !operator ? sql`` : sql`
-            UNION ALL
-            SELECT o.user_id, o.sku, 'active' AS status, NULL::text AS stripe_subscription_id, o.starts_at AS current_period_start,
-                COALESCE(o.ends_at, 'infinity'::timestamptz) AS current_period_end,
-                CASE WHEN o.sku = 'standard_monthly_v3' THEN 'm6i.large'
-                    WHEN pref.size = 'cmp-4' THEN 'm6i.xlarge'
-                    WHEN pref.size = 'cmp-8' THEN 'm6i.2xlarge' ELSE 'm6i.large' END AS instance_type
-            FROM public.ezil_operator_entitlements o
-            JOIN auth.users u ON u.id = o.user_id
-            LEFT JOIN public.ezil_billing_size_preferences pref ON pref.user_id = o.user_id
-            WHERE o.ended_at IS NULL AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)
-                ${user ? sql`AND o.user_id = ${user}::uuid` : sql``}
-                AND o.sku IN ('standard_monthly_v3', 'premium_monthly_v3')
-                AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
-                AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_subscriptions paid WHERE paid.user_id = o.user_id
-                    AND paid.status IN ('active', 'trialing', 'past_due') AND paid.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
-                        'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1')
-                    AND paid.current_period_start <= ${at}::timestamptz AND paid.current_period_end > ${at}::timestamptz)`;
-    return sql`
-        effective AS (
-            SELECT DISTINCT ON (s.user_id) s.user_id, s.sku, s.status, s.stripe_subscription_id, s.current_period_start, s.current_period_end,
-                CASE WHEN s.sku = 'standard_monthly_v3' THEN 'm6i.large'
-                    WHEN pref.size = 'cmp-4' THEN 'm6i.xlarge'
-                    WHEN pref.size = 'cmp-8' THEN 'm6i.2xlarge' ELSE 'm6i.large' END AS instance_type
-            FROM public.ezil_billing_subscriptions s
-            JOIN auth.users u ON u.id = s.user_id
-            LEFT JOIN public.ezil_billing_size_preferences pref ON pref.user_id = s.user_id
-            WHERE s.status IN ('active','trialing')${only} AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3',
-                'standard_monthly_v2','compute_monthly_v2','pro_monthly_v1')
-                AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
-                AND s.current_period_start <= ${at}::timestamptz AND s.current_period_end > ${at}::timestamptz
-            ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, s.stripe_subscription_id COLLATE "C"
-        ), eligible AS (
-            SELECT s.* FROM effective s WHERE s.status = 'active' AND s.sku IN ('standard_monthly_v3','premium_monthly_v3')
-                AND COALESCE((SELECT sum(g.amount) FROM public.ezil_billing_grants g
-                    WHERE g.user_id = s.user_id AND g.subscription_id = s.stripe_subscription_id
-                        AND g.meter = 'compute_std_seconds' AND g.period_start < s.current_period_end
-                        AND g.period_end > s.current_period_start AND g.period_start <= ${at}::timestamptz
-                        AND g.period_end > ${at}::timestamptz), 0) > 0
-                AND NOT EXISTS (SELECT 1 FROM public.ezil_billing_payment_issues issue
-                    WHERE issue.user_id = s.user_id AND issue.subscription_id = s.stripe_subscription_id
-                        AND issue.invoice_kind = 'subscription' AND issue.resolved_at IS NULL AND issue.issue <> 'voided')${operatorBranch}
-        )`;
+    return paidComputeAccessCtes(at, operator, user);
 }
-/** Capacity-demand reauthorization: the owner's paid-pool eligibility right now (active v3 period, compute grant, no
- * open payment issue, live auth user) and the instance type their CURRENT plan/size selection resolves to — the same
+/** Capacity-demand reauthorization: the owner's paid-pool eligibility right now (v3 paid standing and receipt funding, including renewal grace; live auth user) and the instance type their CURRENT plan/size selection resolves to — the same
  * predicate and mapping pool planning uses. null when not eligible. */
 export async function readPaidPoolEligibility(db: PlacementExecutor, userId: string, now: Date): Promise<{ instanceType: string } | null> {
     const at = now.toISOString();

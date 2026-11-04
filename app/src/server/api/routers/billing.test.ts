@@ -334,6 +334,39 @@ describe('billing router', () => {
         await checkoutControl(f);
     });
 
+    it('operator Premium can select its machine; Stripe-only mutations stay unavailable', async () => {
+        const f = fixture();
+        const row = { ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId,
+            accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'premium_monthly_v3' as const,
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        (f.store as BillingStore).operatorEntitlementsFor = vi.fn(async () => [row]);
+        await expect(f.caller.selectMachine({ size: 'cmp-8' })).resolves.toEqual({ size: 'cmp-8', effective: 'next_open' });
+        expect(f.store.setSizePreference).toHaveBeenCalledWith(userId, 'cmp-8');
+        await expect(f.caller.cancelAtPeriodEnd({ cancel: true })).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.setCancelAtPeriodEnd).not.toHaveBeenCalled();
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        await expect(f.caller.selectMachine({ size: 'cmp-4' })).rejects.toMatchObject({ message: 'size_not_allowed' });
+        f.store.subscriptionsFor.mockResolvedValue([]);
+        row.sku = 'standard_monthly_v3' as typeof row.sku;
+        await expect(f.caller.selectMachine({ size: 'cmp-4' })).rejects.toMatchObject({ message: 'size_not_allowed' });
+    });
+
+    it('operator-effective access has no Stripe management action despite historical customer and invoices', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'canceled' })]);
+        (f.store as BillingStore).operatorEntitlementsFor = vi.fn(async () => [{
+            ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId,
+            accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'standard_monthly_v3' as const,
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null,
+        }]);
+        expect(await f.caller.summary()).toMatchObject({ plan: { access: { source: 'operator' } }, actions: { portal: false } });
+        await expect(f.caller.portal()).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.createPortalSession).not.toHaveBeenCalled();
+        expect(f.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        await expect(f.caller.history()).resolves.toEqual(history);
+    });
+
     it('refuses another checkout for a v2 Standard subscription', async () => {
         const f = fixture();
         f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' })]);

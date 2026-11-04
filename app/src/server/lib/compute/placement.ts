@@ -44,6 +44,7 @@
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
 import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
+import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
@@ -1988,25 +1989,18 @@ export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date,
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
     if (!count) return [];
     const at = now.toISOString();
-    const owners = await operatorBranchEnabled(db) ? sql`(SELECT user_id, sku, status, current_period_start, current_period_end
-            FROM public.ezil_billing_subscriptions
-        UNION ALL SELECT user_id, sku, 'active', starts_at, COALESCE(ends_at, 'infinity'::timestamptz) FROM public.ezil_operator_entitlements
-            WHERE ended_at IS NULL)` : sql`public.ezil_billing_subscriptions`;
-    const result = await db.execute(sql`SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id,
-        c.id::text AS computer_id, s.sku
-        FROM ${owners} s
+    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await operatorBranchEnabled(db))}
+        SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id, c.id::text AS computer_id, s.sku
+        FROM eligible s
         JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
         LEFT JOIN public.ezil_computer_placements p ON p.computer_id = c.id
-        WHERE s.sku IN ('standard_monthly_v3', 'premium_monthly_v3') AND s.status = 'active'
-          AND s.current_period_start <= ${at}::timestamptz
-          AND s.current_period_end > ${at}::timestamptz
-          AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
+        WHERE (p.computer_id IS NULL OR p.provider = 'cloudflare')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations done WHERE done.computer_id = c.id
             AND done.state = 'committed' AND done.last_error = 'fresh_provision')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations m WHERE m.user_id = s.user_id
             AND (m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
               OR m.updated_at >= ${new Date(now.getTime() - 600_000).toISOString()}::timestamptz))
-        ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, c.slot, c.id LIMIT ${count}`);
+        ORDER BY s.user_id, c.slot, c.id LIMIT ${count}`);
     const rows: Record<string, unknown>[] = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
     return rows.map(row => ({ userId: String(row.user_id), computerId: String(row.computer_id),
         toSize: row.sku === 'standard_monthly_v3' ? 'standard' : 'premium' }));

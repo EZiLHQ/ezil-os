@@ -35,7 +35,7 @@ export const isOperatorSku = (sku: string): sku is OperatorSku => (OPERATOR_SKUS
 export function operatorGrantInEffect(rows: readonly OperatorEntitlementRow[] | null | undefined, now: Date): OperatorEntitlementRow | null {
     const at = now.getTime();
     return (rows ?? []).filter(row => isOperatorSku(row.sku) && row.startsAt.getTime() <= at
-        && (row.endsAt === null || row.endsAt.getTime() > at) && (row.endedAt === null || row.endedAt.getTime() > at))
+        && (row.endsAt === null || row.endsAt.getTime() > at) && row.endedAt === null)
         .sort((a, b) => b.startsAt.getTime() - a.startsAt.getTime() || (a.ref < b.ref ? -1 : 1))[0] ?? null;
 }
 

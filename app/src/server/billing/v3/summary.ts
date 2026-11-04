@@ -2,7 +2,6 @@ import type { StripeAiPack } from '../stripe/packs';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
 import { latestStorageTotal, storageState } from '../meters';
-import type { GrantRow } from '../ports';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
@@ -14,6 +13,8 @@ import {
     CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
 } from './contract';
 import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
+import { fairUseAllowance, renewalGrantPending } from './funding';
+export { fairUseAllowance, renewalGrantPending, GRANT_PENDING_SECONDS } from './funding';
 import type { OperatorEntitlementRow } from './operator-access';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
@@ -45,39 +46,6 @@ export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineA
         endedAt: isoSeconds(Math.min(epochSeconds(epoch.endedAt ?? iso(now)), epochSeconds(now),
             bounds.sessionMaxSeconds === null || epoch.deadlineAt == null ? Infinity : epochSeconds(epoch.deadlineAt))),
     })), window, now: iso(now) }).stdSeconds;
-}
-
-/** Paid receipts and reversals keep the same subscription/period isolation as v2. */
-export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
-    if (plan.sku === 'legacy') throw new TypeError('Legacy allowances use v2 rating');
-    if (plan.sku === 'free_v3') return plan.legacyFree ? plan.offer.legacyFairUseSeconds! : plan.offer.fairUseSeconds;
-    // Product entitlements v1: an operator grant has no Stripe receipt; the plan's own fair use stands (paid compute
-    // policy v1 leaves it unmetered, so it is never a cutoff).
-    if (plan.operator) return plan.offer.fairUseSeconds;
-    const start = new Date(plan.window.start), end = new Date(plan.window.end);
-    const rows = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
-        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
-    // Round 4 D17: an unpaid renewal has no receipt yet. In grace the paid computer stays usable on the plan's
-    // fair use; any receipt or reversal (a refund, D19) for the period still wins.
-    if (options.grace && rows.length === 0) return plan.offer.fairUseSeconds;
-    const amount = rows.reduce((sum, grant) => sum + grant.amount, BigInt(0));
-    return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
-}
-
-/** Round 6 R2-3: how long after a paid period starts a missing compute grant reads as not landed yet, never as used up. */
-export const GRANT_PENDING_SECONDS = 10 * 60;
-
-/**
- * Round 6 R2-3: a paid AWS plan with paid access (not its grace, which has an allowance of its own) whose current period
- * has no compute grant row yet, within GRANT_PENDING_SECONDS of the period start (Stripe reports the period before its
- * invoice receipt is processed). A refund or revoke row is a real zero, not a grant still to come. One definition for
- * the start gate (compute-access.ts) and the summary (paid compute policy v1), so neither shows a renewal as used up.
- */
-export function renewalGrantPending(plan: ResolvedPlanV3, standing: ComputeStandingV3, grants: readonly GrantRow[], now: Date): boolean {
-    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.operator || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
-    const start = Date.parse(plan.window.start);
-    return !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId)
-        && now.getTime() >= start && now.getTime() - start < GRANT_PENDING_SECONDS * 1000;
 }
 
 /**
@@ -486,7 +454,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             upgrade: enabled && !operator && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
-            portal: enabled && input.hasCustomer,
+            portal: enabled && !operator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),

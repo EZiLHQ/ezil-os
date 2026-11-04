@@ -4,7 +4,6 @@
  * import it. Cached: "yes" for the life of the process, "no" for a minute (the app can deploy before the migration).
  */
 import { sql, type SQL } from 'drizzle-orm';
-import { SENDER_KEYS_ENV } from './signature';
 
 let installed: { value: boolean; at: number } | null = null;
 
@@ -16,13 +15,8 @@ export async function operatorEntitlementsInstalled(db: { execute(query: SQL): P
     return installed.value;
 }
 
-/**
- * Whether compute SQL includes operator grants: only once the ezil-os source is configured (its sender keys set; the
- * release applies 0019 first) and the table exists. Unconfigured (every test and every deployment without the
- * source) answers false with no query, so the SQL is exactly what it was before.
- */
-export async function operatorBranchEnabled(db: { execute(query: SQL): Promise<unknown> }, env: Record<string, string | undefined> = process.env): Promise<boolean> {
-    if (!env[SENDER_KEYS_ENV]?.trim()) return false;
+/** Stored licenses depend on the installed schema, independently of command transport key rotation/removal. */
+export async function operatorBranchEnabled(db: { execute(query: SQL): Promise<unknown> }): Promise<boolean> {
     try {
         return await operatorEntitlementsInstalled(db);
     } catch {

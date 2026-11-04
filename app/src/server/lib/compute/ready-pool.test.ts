@@ -16,6 +16,7 @@ const claim = { computerId: 'computer', generation: 3, leaseEpoch: 4, fence: 'fe
 function capture(result: unknown = [raw]) {
     const queries: { sql: string; params: unknown[] }[] = [];
     const db: PlacementExecutor = { execute: async q => { const compiled = new PgDialect().sqlToQuery(q);
+        if (compiled.sql.includes('to_regclass')) return [{ present: false }];
         queries.push({ sql: compiled.sql.replace(/\s+/g, ' ').trim(), params: compiled.params }); return result; } };
     return { db, queries };
 }
@@ -277,7 +278,7 @@ describe('readPoolDemand', () => {
         const { db, queries } = capture([aggregate]); await readPoolDemand(db, c, NOW);
         expect(queries).toHaveLength(1);
         for (const fragment of ['public.ezil_billing_compute_epochs', 'public.ezil_billing_subscriptions', 'public.ezil_computer_placements',
-            'public.ezil_compute_pool_hosts', 'DISTINCT ON (s.user_id)', "status = 'active'", 'current_period_start <=', 'current_period_end >',
+            'public.ezil_compute_pool_hosts', 'DISTINCT ON (s.user_id)', "s.status IN ('active', 'trialing')", 's.covers', 'funding.amount > 0', 'current_period_start <=', 'current_period_end >',
             'current_period_end DESC', "state NOT IN ('RETIRED', 'PURGE_ELIGIBLE')", "provider = 'aws-ec2'", 'region =', 'zone_id =', 'instance_type =',
             'e.size =', 'count(DISTINCT e.id)', 's.user_id = e.user_id', 'p.owner_user_id = e.user_id',
             "s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')", 'e.ready_at >', 'e.ready_at <=', "interval '15 minutes'",

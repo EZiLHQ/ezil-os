@@ -9,7 +9,7 @@ const T0 = new Date('2026-11-04T12:00:00.000Z');
 const later = (ms: number) => new Date(T0.getTime() + ms);
 const DAY = 86_400_000;
 const REVISION = sourceCatalog().catalog_revision;
-const NO_STRIPE: StripeView = { paidAccess: false, productRef: null, state: null, checkoutOpen: false };
+const NO_STRIPE: StripeView = { paidAccess: false, computeActive: false, productRef: null, state: null, checkoutOpen: false };
 let ids = 0;
 const id = (n = ++ids) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
@@ -34,7 +34,7 @@ function harness(options: { identity?: IdentityCheck; stripe?: StripeView } = {}
             Object.assign(row, next); state.writes++;
             return true;
         },
-        async closeLapsed(ref, endedAt) { const row = rows.find(r => r.ref === ref && r.endedAt === null); if (row) { row.endedAt = endedAt; state.writes++; } },
+        async closeLapsed(ref, now) { const row = rows.find(r => r.ref === ref && r.endedAt === null); if (row && row.endsAt && row.endsAt <= now) { row.endedAt = row.endsAt; state.writes++; } },
         async insertEvent(event) {
             if (events.has(event.commandId)) throw new Error('duplicate command_id');
             events.set(event.commandId, { payloadSha256: event.payloadSha256, result: structuredClone(event.result), senderKid: event.senderKid,
@@ -158,13 +158,13 @@ describe('ezil-os commands: assign, change, end', () => {
         expect(h.state.writes).toBe(0);
     });
 
-    it('a start within ±300 s is kept as sent', async () => {
+    it('a start within ±300 s is normalized to server now', async () => {
         const h = harness();
-        expect(await run(h, command({ starts_at: later(-299_000).toISOString() }))).toMatchObject({ assignment: { starts_at: later(-299_000).toISOString() } });
+        expect(await run(h, command({ starts_at: later(-299_000).toISOString() }))).toMatchObject({ assignment: { starts_at: T0.toISOString() } });
     });
 
     it.each([['identity_not_found'], ['ambiguous_identity']] as const)('%s refuses before anything is read or written', async identity => {
-        const h = harness({ identity, stripe: { paidAccess: true, productRef: 'premium_monthly_v3', state: 'active', checkoutOpen: false } });
+        const h = harness({ identity, stripe: { paidAccess: true, computeActive: true, productRef: 'premium_monthly_v3', state: 'active', checkoutOpen: false } });
         const result = await run(h, command());
         expect(result).toMatchObject({ outcome: 'refused', refusal: { code: identity }, effective_access: { state: 'none' } });
         expect(h.state.writes).toBe(0);
@@ -173,7 +173,7 @@ describe('ezil-os commands: assign, change, end', () => {
 });
 
 describe('ezil-os commands never replace Stripe', () => {
-    const paid: StripeView = { paidAccess: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
+    const paid: StripeView = { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
     it('paid access refuses an assign with paid_subscription_conflict and reports via stripe; nothing written', async () => {
         const h = harness({ stripe: paid });
         expect(await run(h, command())).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' },

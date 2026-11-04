@@ -9,6 +9,8 @@ import { isOperatorSku, type OperatorEntitlementRow } from '@/server/billing/v3/
 import type { BillingDeps } from '@/server/billing/ports';
 import { planFromSubscriptions } from '@/server/billing/v3/catalog';
 import { deriveStanding, paidAccess } from '@/server/billing/v3/standing';
+import { fairUseAllowance } from '@/server/billing/v3/funding';
+import { buildSummaryV2, summaryMeters } from '@/server/billing/v2/summary';
 import type { Result } from './contract';
 import type { CommandStore, IdentityCheck, OperatorEntitlementDeps, StoredEvent, StripeView } from './service';
 
@@ -77,14 +79,26 @@ export async function verifyIdentity(db: Executor, osUserId: string, accountPubl
 }
 
 /** What Stripe gives the account now (Stripe-only standing; this source never writes Stripe state). */
-export async function stripeView(billing: Pick<BillingDeps, 'store'>, userId: string, now: Date): Promise<StripeView> {
+export async function stripeView(billing: Pick<BillingDeps, 'store' | 'config'>, userId: string, now: Date): Promise<StripeView> {
     const [subscriptions, paymentIssues] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.openPaymentIssues(userId)]);
     const { standing } = deriveStanding({ subscriptions, paymentIssues, placementProvider: null, now });
     const plan = planFromSubscriptions({ subs: subscriptions, now, userCreatedAt: null });
     const selected = subscriptions.find(sub => sub.stripeSubscriptionId === plan.subscriptionId);
     const newest = selected ?? [...subscriptions].sort((a, b) => (b.currentPeriodEnd?.getTime() ?? 0) - (a.currentPeriodEnd?.getTime() ?? 0))[0];
     const paid = paidAccess(standing);
-    return { paidAccess: paid, productRef: paid && selected ? selected.sku : null, state: newest ? newest.status : null,
+    let computeActive = false;
+    if (paid) {
+        const grants = await billing.store.grantsForPeriod(userId, { start: new Date(plan.window.start), end: new Date(plan.window.end) }, summaryMeters(plan.family));
+        if (plan.sku === 'legacy') {
+            const summary = buildSummaryV2({ config: billing.config, now, userCreatedAt: null, subs: subscriptions, epochs: [], grants,
+                consent: null, planChanges: [], paymentIssues, storage: [], sizePreference: null, hasCustomer: false });
+            computeActive = plan.planActive && summary.plan.paymentIssue === null && summary.compute.allowanceStdSeconds > 0;
+        } else {
+            // Same active funding calculation as billingV2EntitlementReader. A pending receipt is not active yet.
+            computeActive = (plan.planActive || standing === 'grace') && fairUseAllowance(plan, grants, { grace: standing === 'grace' }) > 0;
+        }
+    }
+    return { paidAccess: paid, computeActive, productRef: paid && selected ? selected.sku : null, state: newest ? newest.status : null,
         checkoutOpen: subscriptions.some(sub => sub.status === 'incomplete') };
 }
 
@@ -112,9 +126,9 @@ function commandStore(tx: Executor): CommandStore {
                 WHERE ref = ${ref} AND revision = ${expectedRevision} AND ended_at IS NULL RETURNING ref`));
             return rows.length === 1;
         },
-        async closeLapsed(ref, endedAt) {
-            await tx.execute(sql`UPDATE public.ezil_operator_entitlements SET ended_at = GREATEST(starts_at, ${endedAt.toISOString()}::timestamptz), updated_at = now()
-                WHERE ref = ${ref} AND ended_at IS NULL`);
+        async closeLapsed(ref, now) {
+            await tx.execute(sql`UPDATE public.ezil_operator_entitlements SET ended_at = ends_at, updated_at = now()
+                WHERE ref = ${ref} AND ended_at IS NULL AND ends_at IS NOT NULL AND ends_at <= ${now.toISOString()}::timestamptz`);
         },
         async insertEvent(event) {
             await tx.execute(sql`INSERT INTO public.ezil_operator_entitlement_events (id, command_id, payload_sha256, action, assignment_ref, revision,
@@ -126,7 +140,7 @@ function commandStore(tx: Executor): CommandStore {
 }
 
 /** Production wiring: one transaction per command, the command id and then the account serialized by advisory locks. */
-export function createOperatorEntitlementDeps(db: TransactionalExecutor, billing: Pick<BillingDeps, 'store'>, clock: () => Date = () => new Date()): OperatorEntitlementDeps {
+export function createOperatorEntitlementDeps(db: TransactionalExecutor, billing: Pick<BillingDeps, 'store' | 'config'>, clock: () => Date = () => new Date()): OperatorEntitlementDeps {
     return {
         now: clock,
         newId: () => randomUUID(),

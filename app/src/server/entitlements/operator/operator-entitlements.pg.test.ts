@@ -71,7 +71,7 @@ describe.skipIf(!PG)('product entitlements v1 on PostgreSQL: source command → 
                 current_period_start timestamptz, current_period_end timestamptz);
             CREATE TABLE ${schema}.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE ${schema}.ezil_billing_grants (user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
-            CREATE TABLE ${schema}.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text);
+            CREATE TABLE ${schema}.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text, stripe_event_created timestamptz);
             CREATE TABLE ${schema}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, slot int NOT NULL DEFAULT 1, deleted_at timestamptz);
             CREATE TABLE ${schema}.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text);
             CREATE TABLE ${schema}.ezil_compute_migrations (computer_id uuid, user_id uuid, state text, last_error text, updated_at timestamptz);`);
@@ -164,10 +164,10 @@ describe.skipIf(!PG)('product entitlements v1 on PostgreSQL: source command → 
         expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlements`)).toEqual([{ n: 0 }]);
     });
 
-    it('a paid Stripe subscription refuses the assign before any write, and wins in every reader', async () => {
+    it('an unfunded Stripe subscription still refuses the assign without claiming active compute access', async () => {
         subs = [{ stripeSubscriptionId: 'sub_paid', sku: 'premium_monthly_v3', status: 'active', currentPeriodStart: new Date('2026-10-20T00:00:00Z'),
             currentPeriodEnd: new Date('2026-11-20T00:00:00Z'), cancelAtPeriodEnd: false }];
-        expect(await send(command())).toMatchObject({ refusal: { code: 'paid_subscription_conflict' }, effective_access: { via: 'stripe', product_ref: 'premium_monthly_v3' } });
+        expect(await send(command())).toMatchObject({ refusal: { code: 'paid_subscription_conflict' }, effective_access: { state: 'none', via: null, product_ref: null } });
         expect(await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_operator_entitlements`)).toEqual([{ n: 0 }]);
     });
 
@@ -193,11 +193,11 @@ describe.skipIf(!PG)('product entitlements v1 on PostgreSQL: source command → 
         expect(applied.assignment!.ref).toMatch(/^osg-/);
     });
 
-    it('without the source configured the compute SQL is unchanged and ignores grants (the release applies 0019 first)', async () => {
+    it('removing command sender keys leaves stored license access intact in compute SQL', async () => {
         await send(command());
         vi.stubEnv(SENDER_KEYS_ENV, '');
         resetOperatorEntitlementsInstalled();
-        expect(await readPaidPoolEligibility(db, LINKED, NOW)).toBeNull();
-        expect(await paidCloudflareCandidates(db, NOW)).toEqual([]);
+        expect(await readPaidPoolEligibility(db, LINKED, NOW)).toEqual({ instanceType: 'm6i.large' });
+        expect(await paidCloudflareCandidates(db, NOW)).toEqual([{ userId: LINKED, computerId: uuid(101), toSize: 'standard' }]);
     });
 });

@@ -17,7 +17,7 @@ import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
-import { deriveStanding } from '@/server/billing/v3/standing';
+import { deriveStanding, operatorAccessFor } from '@/server/billing/v3/standing';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -65,6 +65,16 @@ async function currentPlan(deps: BillingDeps, userId: string) {
     ]);
     const plan = planFromSubscriptions({ subs, now: deps.now(), userCreatedAt });
     return { plan, subs, userCreatedAt, changes: changes.filter(change => change.subscriptionId === plan.subscriptionId) };
+}
+
+/** Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above. */
+async function currentEffectivePlan(deps: BillingDeps, userId: string) {
+    const [current, grants, paymentIssues] = await Promise.all([
+        currentPlan(deps, userId), deps.store.operatorEntitlementsFor?.(userId) ?? [], deps.store.openPaymentIssues(userId),
+    ]);
+    const now = deps.now();
+    const operator = operatorAccessFor({ subscriptions: current.subs, paymentIssues, grants, now });
+    return planFromSubscriptions({ subs: current.subs, now, userCreatedAt: current.userCreatedAt, operator });
 }
 
 function paidSubscription(plan: { subscriptionId: string | null; planActive: boolean }): string {
@@ -750,7 +760,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             { message: 'size_not_allowed' },
         ) })).mutation(async ({ ctx, input }): Promise<SelectMachineOutputV3> => {
             const deps = getDeps();
-            const { plan } = await currentPlan(deps, ctx.user.id);
+            const plan = await currentEffectivePlan(deps, ctx.user.id);
             if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
                 || !plan.offer.machineChoice.includes(input.size)) {
                 throw billingError('size_not_allowed', 'BAD_REQUEST');
@@ -802,9 +812,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         portal: protectedProcedure.mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
+            const plan = await currentEffectivePlan(deps, ctx.user.id);
+            if (plan.operator) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
-            const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.subscriptionId) await ownedSubscription(deps, stripe, ctx.user.id, plan.subscriptionId);
             return stripeCall(() => stripe.createPortalSession({ customerId, returnUrl: `${billingReturnOrigin(ctx.headers)}/os` }));
         }),
