@@ -107,3 +107,39 @@ describe('deriveStanding (D16-D19)', () => {
         expect((['paid', 'grace', 'plan_ending', 'files_on_aws', 'free'] as const).map(paidAccess)).toEqual([true, true, true, false, false]);
     });
 });
+
+describe('Standard trial: a trial that never paid has no renewal grace', () => {
+    const trialStart = new Date('2026-09-18T12:00:00Z');
+    const trialEnd = new Date('2026-10-18T12:00:00Z');
+    const failedAt = new Date('2026-10-18T13:00:00Z');
+    const trial = (overrides: Partial<SubscriptionRow> = {}) => sub({ status: 'past_due', currentPeriodStart: trialEnd, currentPeriodEnd: new Date('2026-11-18T12:00:00Z'),
+        trialStart, trialEnd, firstPaidAt: null, ...overrides });
+
+    it('trialing is paid access (the same Standard admission), cancelled trialing is plan_ending until the trial end', () => {
+        const trialing = sub({ status: 'trialing', currentPeriodStart: new Date('2026-10-10T00:00:00Z'), currentPeriodEnd: new Date('2026-11-10T00:00:00Z'),
+            trialStart: new Date('2026-10-10T00:00:00Z'), trialEnd: new Date('2026-11-10T00:00:00Z'), firstPaidAt: null });
+        expect(standing([trialing])).toMatchObject({ standing: 'paid', graceEndsAt: null });
+        expect(standing([{ ...trialing, cancelAtPeriodEnd: true }])).toMatchObject({ standing: 'plan_ending', planEndsAt: '2026-11-10T00:00:00Z' });
+        expect(standing([{ ...trialing, cancelAtPeriodEnd: true }], [], 'aws-ec2', new Date('2026-11-10T00:00:00Z')).standing).toBe('files_on_aws');
+    });
+
+    it('the first failed charge after a never-paid trial drops paid access at once; files stay where they are', () => {
+        expect(standing([trial()], [issue(failedAt)])).toEqual({ standing: 'files_on_aws', graceEndsAt: null, planEndsAt: null,
+            filesOn: 'aws', heldSince: '2026-10-18T13:00:00Z' });
+        expect(standing([trial()], [], 'cloudflare')).toEqual({ standing: 'free', graceEndsAt: null, planEndsAt: null, filesOn: 'cloudflare', heldSince: null });
+        expect(paidAccess(standing([trial()], [issue(failedAt)]).standing)).toBe(false);
+    });
+
+    it('a previously paid renewal keeps the existing seven-day grace exactly', () => {
+        const paid = trial({ firstPaidAt: new Date('2026-09-18T12:00:00Z') });
+        expect(standing([paid], [issue(failedAt)])).toMatchObject({ standing: 'grace', graceEndsAt: '2026-10-25T13:00:00Z' });
+        const legacy = sub({ status: 'past_due' });
+        expect(standing([legacy], [issue(daysBefore(1))])).toMatchObject({ standing: 'grace' });
+        expect(new Date(standing([paid], [issue(failedAt)]).graceEndsAt!).getTime() - failedAt.getTime()).toBe(PAYMENT_GRACE_SECONDS * 1000);
+    });
+
+    it('a late successful payment (issue resolved, status active, first_paid_at set) restores paid access', () => {
+        const restored = trial({ status: 'active', firstPaidAt: new Date('2026-10-19T09:00:00Z') });
+        expect(standing([restored], [issue(failedAt, { resolvedAt: new Date('2026-10-19T09:00:00Z') })])).toMatchObject({ standing: 'paid' });
+    });
+});

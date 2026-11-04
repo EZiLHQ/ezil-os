@@ -708,3 +708,76 @@ describe('product entitlements v1: the summary of an operator-assigned plan', ()
     });
 });
 
+
+describe('Standard trial summary', () => {
+    const trialStart = new Date('2026-10-10T00:00:00Z'), trialEnd = new Date('2026-11-10T00:00:00Z');
+    const ROOT = `ezil-os:v1:standard_monthly_v3:sub:${trialStart.toISOString()}:trial`;
+    function trialInput(patch: Partial<Input['subs'][number]> = {}): Input {
+        const args = input('standard_monthly_v3');
+        args.subs = [{ ...args.subs[0]!, status: 'trialing', trialStart, trialEnd, firstPaidAt: null, ...patch }];
+        args.grants = [{ ...args.grants[0]!, kind: 'trial_period', sourceType: 'trial', sourceId: 'sub', periodStart: trialStart, periodEnd: trialEnd }];
+        args.renewal = { at: '2026-11-10T00:00:00Z', amountCents: 2000 };
+        return args;
+    }
+
+    it('trialing: Standard access, $20 first charge at the trial end, no upgrade offer, same computer and disk', () => {
+        const summary = buildSummaryV3(trialInput());
+        expect(summary.plan.trial).toEqual({ state: 'trialing', startedAt: '2026-10-10T00:00:00Z', endsAt: '2026-11-10T00:00:00Z',
+            firstChargeAt: '2026-11-10T00:00:00Z', amountCents: 2000, currency: 'usd' });
+        expect(summary.plan).toMatchObject({ sku: 'standard_monthly_v3', status: 'active', renewal: { at: '2026-11-10T00:00:00Z', amountCents: 2000 } });
+        expect(summary.actions).toMatchObject({ upgrade: false, cancel: true });
+        expect(summary.computer).toMatchObject({ standing: 'paid', size: 'std-2', vcpu: 2, memoryGiB: 8 });
+        expect(summary.fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(summary.ai.grant).toEqual({ amount: 200, per: 'period' });
+        // Parity: a paid Standard period shows the same computer, sessions and credits; only the plan's trial block differs.
+        const paid = buildSummaryV3(input('standard_monthly_v3'));
+        expect(paid.plan.trial).toBeUndefined();
+        expect({ ...paid.computer, activeDeadline: null }).toEqual({ ...summary.computer, activeDeadline: null });
+        expect(paid.ai.grant).toEqual(summary.ai.grant);
+        expect(paid.actions.upgrade).toBe(true);
+    });
+
+    it('ending: a cancelled trial keeps Standard until the trial end with no charge, then is plain Free', () => {
+        const summary = buildSummaryV3(trialInput({ cancelAtPeriodEnd: true }));
+        expect(summary.plan.trial).toMatchObject({ state: 'ending', endsAt: '2026-11-10T00:00:00Z', firstChargeAt: null });
+        expect(summary.plan).toMatchObject({ status: 'cancels', renewal: null, planEndsAt: '2026-11-10T00:00:00Z' });
+        const after = buildSummaryV3({ ...trialInput({ cancelAtPeriodEnd: true, status: 'canceled' }), now: new Date('2026-11-10T00:00:01Z') });
+        expect(after.plan.trial).toBeUndefined();
+        expect(after.plan.sku).toBe('free_v3');
+    });
+
+    it('payment_failed: no grace, Standard access ended, the payment issue is shown', () => {
+        const args = { ...trialInput({ status: 'past_due', currentPeriodStart: trialEnd, currentPeriodEnd: new Date('2026-12-10T00:00:00Z') }),
+            now: new Date('2026-11-10T02:00:00Z') };
+        args.paymentIssues = [{ stripeInvoiceId: 'in_cycle', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed',
+            hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-11-10T01:00:00Z'), resolvedAt: null, updatedAt: new Date('2026-11-10T01:00:00Z') }];
+        const summary = buildSummaryV3(args);
+        expect(summary.plan.trial).toMatchObject({ state: 'payment_failed', endsAt: '2026-11-10T00:00:00Z' });
+        expect(summary.plan).toMatchObject({ status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: null });
+        expect(summary.computer.standing).toBe('free');
+    });
+
+    it('a converted trial (first paid period granted) is ordinary Standard', () => {
+        expect(buildSummaryV3(trialInput({ status: 'active', firstPaidAt: trialEnd })).plan.trial).toBeUndefined();
+    });
+
+    it('the trial root counts as this period\'s plan credits, never as an earlier period\'s', () => {
+        const args = trialInput();
+        args.ai = { receipts: [{ entitlementId: ROOT, credits: 200, expiresAt: trialEnd.toISOString(), deliveredAt: start, failed: false }] as never,
+            gatewayGrants: [{ creditsMicro: '200000000', remainingMicro: '150000000', expiresAt: trialEnd.toISOString(), live: true, source: 'os' }] as never,
+            balanceMicro: '150000000' };
+        const summary = buildSummaryV3(args);
+        expect(summary.ai.included).toEqual({ granted: 200, remaining: 150, periodEnd: '2026-11-10T00:00:00Z' });
+        expect(summary.ai.previous).toBeNull();
+        expect(summary.ai.pendingFromRenewal).toBeNull();
+    });
+
+    it('the offer is passed through only for a Free viewer with checkout available', () => {
+        const offer = { eligible: true as const, sku: 'standard_monthly_v3' as const, endsAt: '2026-11-19T12:00:00Z', amountCents: 2000, currency: 'usd' as const };
+        expect(buildSummaryV3({ ...input(), trialOffer: offer }).trialOffer).toEqual(offer);
+        expect(buildSummaryV3({ ...input(), trialOffer: { eligible: false, reason: 'trial_used' } }).trialOffer).toEqual({ eligible: false, reason: 'trial_used' });
+        expect('trialOffer' in buildSummaryV3({ ...input('standard_monthly_v3'), trialOffer: offer })).toBe(false);
+        expect('trialOffer' in buildSummaryV3({ ...input(), stripeAvailable: false, trialOffer: offer })).toBe(false);
+        expect('trialOffer' in buildSummaryV3(input())).toBe(false);
+    });
+});

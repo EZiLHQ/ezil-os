@@ -220,7 +220,12 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         await store.markSubscriptionPaid(subscription.id, eventCreated);
                         if (subscription.trialId) {
                             const trial = await store.trialById(subscription.trialId);
-                            if (trial && trial.userId === userId && trial.stripeSubscriptionId === subscription.id) {
+                            // A first charge processed before any trial delivery still records whose trial it was.
+                            const bound = trial && trial.userId === userId && (trial.stripeSubscriptionId === subscription.id
+                                || (trial.stripeSubscriptionId === null && subscription.trialStart && await store.bindTrialSubscription({
+                                    trialId: trial.id, userId, customerId: subscription.customer, subscriptionId: subscription.id,
+                                    trialStart: subscription.trialStart }) === 'bound'));
+                            if (trial && bound) {
                                 await store.setTrialStatus({ trialId: trial.id, subscriptionId: subscription.id, status: 'converted',
                                     from: ['trialing', 'payment_failed', 'ended'] });
                             }
