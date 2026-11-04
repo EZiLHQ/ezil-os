@@ -163,8 +163,11 @@ auth context.
   - The models configured here, hiding any the catalog disables or marks
     `unavailable`.
   - Each other catalog row that the Gateway marks `availability.state:
-    "available"` for this caller over a protocol this client speaks
-    (`ezil.gateway.models.v1`; Messages before Responses).
+    "available"` for this caller, sent over the row's first protocol, the
+    route its capabilities describe. Its first protocol must be one this
+    client speaks, or it gets no capabilities. Availability, capabilities and
+    names are read only when `contract` is `ezil.gateway.models.v1`; any
+    other response is the legacy shape.
   - **One account per entry.** A catalog-only model's picker id is
     `<provider name>/<alias>`, such as `ezil/some-alias`. Neither part can
     contain `/`, so the id names exactly one configured Gateway provider (one
@@ -192,12 +195,17 @@ auth context.
 - **Unknown is not unavailable.**
   - When a read fails, the configured models stay listed.
   - The catalog-only rows last read for the same base URL and token stay
-    listed for up to 30 minutes, and the request decides.
-  - A catalog-only model that cannot be checked is not sent.
+    listed for up to 30 minutes, but only listed: a catalog-only model is
+    sent only after a read that succeeds now, or within the five-minute
+    cache. Until then it is refused ("cannot be checked right now. Nothing
+    was sent or charged."). Configured models still go, and the request
+    decides.
   - Another model is never sent in place of the selected one.
 - **When it lists again.**
   - After an availability refusal (`killswitch`, `model_disabled`,
-    `model_not_found`, `no_provider_route`), which also clears the cache.
+    `model_not_found`, `no_provider_route`, `model_unavailable`) or a
+    caller-scoped one (`no_entitlement`, `model_not_allowed`). Each also
+    clears the cache.
   - After a request whose catalog read changed the list.
   - When Show AI Status opens.
 - **Protocols.** A protocol it does not speak drops out of that row, never out

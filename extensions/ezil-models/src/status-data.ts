@@ -228,7 +228,7 @@ function limitsLines(limits: EffectiveLimits): string[] {
 const REASON_TEXT: Record<GatewayAvailability['reasons'][number], string> = {
     model_disabled: 'Not enabled on this Gateway.', no_active_pricing: 'Not enabled on this Gateway.', gateway_paused: 'Paused.',
     no_route: 'Not available right now.', route_not_ready: 'Not available right now.',
-    not_allowed_for_caller: 'Not included for this access.', catalog_unavailable: 'Availability unknown — retry.',
+    not_allowed_for_caller: 'Not included for this access.', entitlement_required: 'Needs an active plan.', catalog_unavailable: 'Availability unknown — retry.',
 };
 
 /** Unknown is never "unavailable"; an available row this editor cannot call says so instead of "Available". */

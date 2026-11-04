@@ -243,22 +243,25 @@ describe('catalog failure: unknown, never unavailable', () => {
         });
     }
 
-    test('a failed re-read keeps the rows last listed for this token for 30 minutes, and the request decides', async () => {
+    test('a failed re-read keeps listing the rows last read for this token for 30 minutes, but none is sent unchecked; configured models still go', async () => {
         const now = spyOn(Date, 'now').mockReturnValue(2_000_000);
         try {
             let readable = true;
             const g = gateway(load(), () => readable ? Response.json(v1([row('synthetic-chat-a', 'available')])) : Response.json({}, { status: 500 }));
-            const selected = (await list(g.provider))[2]!;
+            const [qwen, , selected] = await list(g.provider);
             readable = false;
             now.mockReturnValue(2_000_000 + 6 * 60_000);
             expect(ids(await list(g.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-chat-a']);
-            await send(g.provider, selected);
-            expect(g.posts.map(post => [post.body.model, post.body.stream])).toEqual([['synthetic-chat-a', false]]);
+            // Contract §4: the last catalog lists only. The row cannot be checked, so it is not sent; Qwen goes and the request decides.
+            await expect(send(g.provider, selected!)).rejects.toThrow('Could not load the model list, so this model cannot be checked right now. Nothing was sent or charged.');
+            await send(g.provider, qwen!);
+            expect(g.posts.map(post => post.body.model)).toEqual([QWEN]);
             expect(g.changes()).toBe(0); // an outage does not re-list (and re-read) after every request
             now.mockReturnValue(2_000_000 + CATALOG_STALE_MS);
             expect(ids(await list(g.provider))).toEqual([QWEN, KIMI]);
-            await expect(send(g.provider, selected)).rejects.toThrow('Could not load the model list');
-            expect(g.posts).toHaveLength(1);
+            readable = true; // once a read checks it again, it is sent
+            await send(g.provider, selected!);
+            expect(g.posts.map(post => [post.body.model, post.body.stream])).toEqual([[QWEN, true], ['synthetic-chat-a', false]]);
         } finally { now.mockRestore(); }
     });
 });
@@ -275,11 +278,13 @@ describe('isolation: each token reads and keeps its own catalog', () => {
             expect(ids(await list(a.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-a-only']);
             expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-b-only']);
             expect([a.gets, b.gets]).toEqual([['token-a'], ['token-b']]);
+            // B's own catalog answers for B: A's row is not in it, so it is not available to B.
+            await expect(send(b.provider, { id: 'ezil/synthetic-a-only' })).rejects.toThrow('This model is not available right now');
             readable = false;
             now.mockReturnValue(3_000_000 + 6 * 60_000);
             expect(ids(await list(b.provider))).toEqual([QWEN, KIMI, 'ezil/synthetic-b-only']);
-            // B's own last catalog answers for B: A's row is not in it, so it is not available to B.
-            await expect(send(b.provider, { id: 'ezil/synthetic-a-only' })).rejects.toThrow('This model is not available right now');
+            // Nor from any last catalog: nothing unchecked is sent.
+            await expect(send(b.provider, { id: 'ezil/synthetic-a-only' })).rejects.toThrow('Could not load the model list');
             expect([...a.posts, ...b.posts]).toHaveLength(0);
             expect([a.gets, b.gets]).toEqual([['token-a'], ['token-b', 'token-b', 'token-b']]);
         } finally { now.mockRestore(); }
@@ -357,6 +362,138 @@ describe('two Gateway accounts in one config: a catalog row is always sent with 
     });
 });
 
+describe('the frozen v1 contract as the Gateway serves it (CATALOG-3 1af1db9)', () => {
+    // c3's five served responses (EZiL-AI-Gateway.handoffs/920-catalog-v1/models-responses.json, sha256 816cb92d…), verbatim.
+    const SERVED = JSON.parse(readFileSync(`${import.meta.dir}/fixtures/gateway-catalog-v1-served.json`, 'utf8')) as Record<string, Row>;
+    const ROUTED = ['ezil/claude-haiku-5-5', 'ezil/claude-sonnet-5-5', 'ezil/ezil-code', 'ezil/ezil-fast'];
+    const expected: Record<string, string[]> = { member_no_paywall: [QWEN, KIMI, ...ROUTED], member_paywall_no_plan: [],
+        member_paywall_with_plan: [QWEN, KIMI, ...ROUTED], operator: [QWEN, KIMI, ...ROUTED], member_allowed_models_qwen_only: [QWEN] };
+    const withoutContract = (body: Row, contract?: string) => { const { contract: _, ...rest } = body; return contract ? { ...rest, contract } : rest; };
+
+    test('each caller view lists exactly the rows it marks available; names only from the row, prices never', async () => {
+        expect(Object.keys(SERVED).sort()).toEqual(Object.keys(expected).sort());
+        for (const [view, body] of Object.entries(SERVED)) {
+            forgetGatewayModels();
+            const infos = await list(gateway(load(), () => Response.json(body)).provider);
+            expect([view, ids(infos)]).toEqual([view, expected[view]!]);
+            expect(JSON.stringify(infos)).not.toMatch(/pricing|markup|usd_micro|upstream/);
+        }
+        forgetGatewayModels();
+        const infos = await list(gateway(load(), () => Response.json(SERVED.member_no_paywall)).provider);
+        expect(infos.slice(2).map(info => [info.name, info.capabilities.toolCalling])).toEqual([
+            ['claude-haiku-5-5', true], ['Claude Sonnet 5.5', true], ['ezil-code', true], ['ezil-fast', true]]);
+    });
+
+    test('served rows: Sonnet streams with tools over Messages; Kimi goes as JSON; no images anywhere', async () => {
+        const g = gateway(load(), () => Response.json(SERVED.member_no_paywall));
+        const infos = await list(g.provider);
+        expect(infos.every(info => info.capabilities.imageInput === false)).toBe(true);
+        await send(g.provider, infos.find(info => info.id === 'ezil/claude-sonnet-5-5')!, undefined, [READ_FILE]);
+        await send(g.provider, infos.find(info => info.id === KIMI)!, undefined, [READ_FILE]);
+        expect(g.posts.map(post => [new URL(post.url).pathname, post.body.model, post.body.stream, (post.body.tools as unknown[] | undefined)?.length])).toEqual([
+            ['/ai/v1/messages', 'claude-sonnet-5-5', true, 1], ['/ai/v1/messages', KIMI, false, 1]]);
+    });
+
+    test('without the v1 contract (absent or another value) the same rows are the legacy shape: availability, capabilities and names are ignored', async () => {
+        for (const contract of [undefined, 'ezil.gateway.models.v2']) {
+            forgetGatewayModels();
+            expect(ids(await list(gateway(load(), () => Response.json(withoutContract(SERVED.member_no_paywall!, contract))).provider))).toEqual([QWEN, KIMI]);
+            forgetGatewayModels();
+            expect(ids(await list(gateway(load(), () => Response.json(withoutContract(SERVED.member_paywall_no_plan!, contract))).provider))).toEqual([QWEN, KIMI]);
+            forgetGatewayModels();
+            const g = gateway(load(), () => Response.json(withoutContract(v1([row(QWEN, 'available', { capabilities: { streaming: false, tool_calling: false } })]), contract)));
+            const qwen = (await list(g.provider))[0]!;
+            expect(qwen.capabilities.toolCalling).toBe(true);
+            await send(g.provider, qwen);
+            expect(g.posts.map(post => post.body.stream)).toEqual([true]);
+        }
+    });
+
+    for (const [code, status, says] of [['no_entitlement', 402, 'AI access is not included for this account: it needs an active plan'],
+        ['model_not_allowed', 403, 'This model is not included for your access. Pick another model']] as const) {
+        test(`a ${code} refusal says so (not credits, not membership), re-reads the catalog at once and re-lists; another refusal does not`, async () => {
+            let refusal: [string, number] = [code, status];
+            const g = gateway(load(), () => Response.json(v1([row('synthetic-chat-a', 'available')])),
+                () => Response.json({ error: { code: refusal[0], message: 'synthetic', request_id: 'req_synthetic' } }, { status: refusal[1] }));
+            const selected = (await list(g.provider))[2]!;
+            await expect(send(g.provider, selected)).rejects.toThrow(`EZiL Models: EZiL AI: ${says} (request req_synthetic)`);
+            expect(g.changes()).toBe(1);
+            await list(g.provider);
+            expect(g.gets).toHaveLength(2); // within the five minutes: the refusal forgot the cache
+            refusal = ['invalid_request', 400];
+            await expect(send(g.provider, selected)).rejects.toThrow();
+            await list(g.provider);
+            expect([g.changes(), g.gets.length]).toEqual([1, 2]);
+        });
+    }
+
+    test('when every routed attempt fails, the last attempt\'s code says what happened; one request, no fallback of our own', async () => {
+        for (const [code, status, says] of [['upstream_error', 502, 'The model provider returned an error'], ['upstream_unavailable', 502, 'The model provider could not be reached'],
+            ['upstream_timeout', 504, 'The model provider did not answer in time'], ['model_unavailable', 503, 'This model is temporarily unavailable']] as const) {
+            forgetGatewayModels();
+            const g = gateway(load(), () => Response.json(v1([row('synthetic-chat-a', 'available')])),
+                () => Response.json({ error: { code, message: 'synthetic', request_id: 'req_synthetic', details: { attempts: 2 } } }, { status }));
+            await expect(send(g.provider, (await list(g.provider))[2]!)).rejects.toThrow(`EZiL Models: EZiL AI: ${says} (request req_synthetic)`);
+            expect(g.posts.map(post => post.body.model)).toEqual(['synthetic-chat-a']);
+        }
+    });
+
+    test('a GPT-shaped row (Responses only, tools and streaming; c3 Q1) streams over Responses, returns its tool call, and keeps tool pairs across a switch from Qwen', async () => {
+        const call = { type: 'function_call', id: 'fc_1', call_id: 'call_9', name: 'read_file', arguments: '{"path":"b.ts"}', status: 'completed' };
+        const frame = (type: string, fields: Row) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+        const wire = [frame('response.created', { response: { object: 'response', id: 'resp_1', status: 'in_progress', output: [] } }),
+            frame('response.output_item.added', { output_index: 0, item: { ...call, status: 'in_progress', arguments: '' } }),
+            frame('response.function_call_arguments.delta', { item_id: 'fc_1', output_index: 0, delta: call.arguments }),
+            frame('response.function_call_arguments.done', { item_id: 'fc_1', output_index: 0, arguments: call.arguments }),
+            frame('response.output_item.done', { output_index: 0, item: call }),
+            frame('response.completed', { response: { object: 'response', id: 'resp_1', status: 'completed', output: [call],
+                usage: { input_tokens: 100, output_tokens: 12, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } })].join('');
+        const g = gateway(load(), () => Response.json(v1([row('synthetic-gpt-shaped', 'available', { protocols: ['openai-responses'],
+            capabilities: { tool_calling: true, image_input: false, streaming: true }, name: 'Synthetic GPT Shaped' })])),
+            body => body.input ? new Response(wire, { headers: { 'content-type': 'text/event-stream' } }) : defaultAnswer(body));
+        const infos = await list(g.provider);
+        const gpt = infos.find(info => info.id === 'ezil/synthetic-gpt-shaped')!;
+        expect([gpt.name, gpt.capabilities]).toEqual(['Synthetic GPT Shaped', { toolCalling: true, imageInput: false }]);
+        const history = [
+            message(1, [new TextPart('Read a.ts')]),
+            message(2, [new ThinkingPart('private prior reasoning', 'th_1', { signature: 'sig' }), new TextPart('Reading it.'), new ToolCallPart('call_1', 'read_file', { path: 'a.ts' })]),
+            message(1, [new ToolResultPart('call_1', [new TextPart('export const a = 1;')])]),
+            message(1, [new TextPart('Now b.ts')]),
+        ];
+        const parts: unknown[] = [];
+        await g.provider.provideLanguageModelChatResponse(gpt as never, history as never, { tools: [READ_FILE], modelOptions: {} } as never,
+            { report: part => parts.push(part) }, token() as never);
+        expect(parts).toEqual([new ToolCallPart('call_9', 'read_file', { path: 'b.ts' })]);
+        await send(g.provider, infos[0]!, history, [READ_FILE]); // and back to Qwen
+        const [gptPost, qwenPost] = g.posts;
+        expect([new URL(gptPost!.url).pathname, gptPost!.body.model, gptPost!.body.stream, gptPost!.accept]).toEqual(['/ai/v1/responses', 'synthetic-gpt-shaped', true, 'text/event-stream']);
+        expect((gptPost!.body.tools as { name: string }[]).map(tool => tool.name)).toEqual(['read_file']);
+        const input = gptPost!.body.input as { type?: string; call_id?: string }[];
+        expect(input.filter(item => item.type === 'function_call' || item.type === 'function_call_output').map(item => [item.type, item.call_id]))
+            .toEqual([['function_call', 'call_1'], ['function_call_output', 'call_1']]);
+        expect(JSON.stringify(gptPost!.body)).not.toContain('private prior reasoning');
+        const turns = qwenPost!.body.messages as { content: { type: string; tool_use_id?: string }[] }[];
+        expect([qwenPost!.body.model, turns[1]!.content.map(block => block.type), turns[2]!.content[0]!.tool_use_id]).toEqual([QWEN, ['text', 'tool_use'], 'call_1']);
+    });
+
+    test('a row is sent over its FIRST protocol, with that route\'s capabilities; an unspoken first protocol leaves it none', async () => {
+        const g = gateway(load(), () => Response.json(v1([
+            row('synthetic-responses-first', 'available', { protocols: ['openai-responses', 'anthropic-messages'], capabilities: { tool_calling: false, streaming: false } }),
+            row('synthetic-messages-first', 'available', { protocols: ['anthropic-messages', 'openai-responses'], capabilities: { tool_calling: true, streaming: true } }),
+            row('synthetic-future-first', 'available', { protocols: ['openai-chat-v9', 'anthropic-messages'], capabilities: { tool_calling: true, streaming: true } }),
+        ])), body => body.input ? Response.json({
+            object: 'response', id: 'resp_1', status: 'completed', usage: { input_tokens: 10, output_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+            output: [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'hi', annotations: [] }] }] }) : defaultAnswer(body));
+        const infos = (await list(g.provider)).slice(2);
+        expect(infos.map(info => [info.id, info.capabilities.toolCalling])).toEqual([
+            ['ezil/synthetic-responses-first', false], ['ezil/synthetic-messages-first', true], ['ezil/synthetic-future-first', false]]);
+        for (const info of infos) await send(g.provider, info);
+        expect(g.posts.map(post => [new URL(post.url).pathname, post.body.model, post.body.stream])).toEqual([
+            ['/ai/v1/responses', 'synthetic-responses-first', false], ['/ai/v1/messages', 'synthetic-messages-first', true],
+            ['/ai/v1/messages', 'synthetic-future-first', false]]);
+    });
+});
+
 describe('Show AI Status: each row\'s availability, in the contract\'s words', () => {
     const status = (models: unknown) => readAIStatus(load().models[0]!.provider, (async (url: string) => {
         const path = new URL(url).pathname;
@@ -376,6 +513,17 @@ describe('Show AI Status: each row\'s availability, in the contract\'s words', (
             'synthetic-key-excluded: Not included for this access.', 'synthetic-no-route: Not available right now.',
             'synthetic-unknown: Availability unknown — retry.', 'synthetic-future: Not supported in this editor.']);
         expect(view.lines.join('\n')).not.toMatch(/synthetic-upstream|synthetic-pricing/);
+    });
+
+    test('a paywall without a plan reads "Needs an active plan." on every row; without the contract the same rows show no model lines', async () => {
+        const served = JSON.parse(readFileSync(`${import.meta.dir}/fixtures/gateway-catalog-v1-served.json`, 'utf8')).member_paywall_no_plan as Row;
+        const view = await status(served);
+        const at = view.lines.indexOf('Models (the request still decides)');
+        expect(view.lines.slice(at + 1, at + 7)).toEqual(['claude-haiku-5-5', 'Claude Sonnet 5.5', 'ezil-code', 'ezil-fast', 'Qwen3 Coder Next', 'Kimi K3']
+            .map(label => `${label}: Needs an active plan.`));
+        forgetGatewayModels();
+        const { contract: _, ...legacyShape } = served;
+        expect((await status(legacyShape)).lines.some(line => line.startsWith('Models'))).toBe(false);
     });
 
     test('the deployed shape states no per-row availability, so no model lines are shown', async () => {

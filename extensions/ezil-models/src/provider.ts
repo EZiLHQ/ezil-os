@@ -165,8 +165,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const providers = this.gatewayProviders();
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
-            // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models come
-            // from this read, or the last one for the same base URL and token while this one fails.
+            // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models are listed
+            // from this read, or the last one for the same base URL and token while this one fails (sent only once checked).
             const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayModels(provider)]));
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
@@ -178,9 +178,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
 
     /**
      * A configured model, or a catalog-only one. A catalog-only id names exactly one configured Gateway provider (one
-     * account): only that provider's catalog is read, as for the picker (the five-minute cache, else a request, else
-     * the last read; for `known`, token counts, the cache first), and only its credential is ever used. Anything that
-     * does not resolve to that one provider fails closed, never to another provider's model of the same alias.
+     * account): only that provider's catalog is read (the five-minute cache, else a request), and only its credential
+     * is ever used. A catalog that cannot be read now is not checked: the last read only lists (contract §4), so the
+     * model is not sent. Token counts (`known`), which send nothing, take the last read first. Anything that does not
+     * resolve to that one provider fails closed, never to another provider's model of the same alias.
      */
     private async resolve(model: vscode.LanguageModelChatInformation, signal?: AbortSignal, known = false): Promise<ResolvedModel> {
         const models = this.host.models();
@@ -193,7 +194,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const provider = named[0]!;
             signal?.throwIfAborted();
             const read = () => gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
-            catalog = known ? knownGatewayModels(provider) ?? await read() : await read() ?? knownGatewayModels(provider);
+            catalog = known ? knownGatewayModels(provider) ?? await read() : await read();
             const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
             if (listed) return listed;
         }

@@ -80,9 +80,12 @@ export type GatewayOptions = {
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
 
+/** The catalog contract whose per-row fields (availability, capabilities, name) this client reads; any other is the legacy shape. */
+export const CATALOG_CONTRACT = 'ezil.gateway.models.v1';
 /** Closed in `ezil.gateway.models.v1` (Gateway docs/CATALOG-CONSUMER-CONTRACT.md §2); an unknown value is ignored. */
 export const AVAILABILITY_STATES = ['available', 'unavailable', 'unknown'] as const;
-export const AVAILABILITY_REASONS = ['model_disabled', 'no_active_pricing', 'gateway_paused', 'no_route', 'route_not_ready', 'not_allowed_for_caller', 'catalog_unavailable'] as const;
+export const AVAILABILITY_REASONS = ['model_disabled', 'no_active_pricing', 'gateway_paused', 'no_route', 'route_not_ready', 'not_allowed_for_caller',
+    'entitlement_required', 'catalog_unavailable'] as const;
 export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; reasons: (typeof AVAILABILITY_REASONS[number])[] };
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
 export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean };
@@ -100,8 +103,9 @@ function providerIdentity(provider: ResolvedProvider): string {
 
 const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: number; models: GatewayModels }>();
 
-/** Refusals that mean the catalog this client listed is out of date (contract §1): read it again, and re-list. */
-export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable'];
+/** Refusals that mean the catalog this client listed is out of date (contract §4 freshness): read it again, and re-list. */
+export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable',
+    'no_entitlement', 'model_not_allowed'];
 
 /** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
 export function forgetGatewayModels(baseUrl?: string): void {
@@ -152,7 +156,9 @@ function capabilitiesOf(value: unknown): GatewayCapabilities | undefined {
 /**
  * `GET /v1/models`, reduced to the fields this client reads; everything else in a row (pricing, upstream model) is
  * dropped here. A malformed core field rejects the catalog as before. A new field's unknown or malformed value is
- * ignored for that row, never a reason to distrust the whole catalog.
+ * ignored for that row, never a reason to distrust the whole catalog. Availability, capabilities and name are read only
+ * under `CATALOG_CONTRACT`; capabilities describe the route of the row's first protocol, so they are dropped when that
+ * protocol is one this client does not speak.
  */
 export function parseGatewayModels(json: unknown): GatewayModels | undefined {
     if (typeof json !== 'object' || json === null || !Array.isArray((json as GatewayModels).data)) return undefined;
@@ -164,15 +170,18 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         || (entry.protocols !== undefined && (!Array.isArray(entry.protocols) || entry.protocols.some((protocol: unknown) => typeof protocol !== 'string'))))) return undefined;
     // A protocol this client does not speak is dropped from its row, never a reason to distrust the whole catalog:
     // a row left with no known protocol is selectable by nobody here (gatewayModelAvailable).
+    const v1 = raw.contract === CATALOG_CONTRACT;
     const data = (raw.data as Record<string, unknown>[]).map(entry => {
         const row: GatewayModel = { id: entry.id as string, enabled: entry.enabled as boolean,
             max_input_tokens: entry.max_input_tokens as number, max_output_tokens: entry.max_output_tokens as number };
-        if (entry.protocols !== undefined) row.protocols = (entry.protocols as GatewayProtocol[]).filter(protocol => KNOWN_PROTOCOLS.includes(protocol));
+        const protocols = entry.protocols as GatewayProtocol[] | undefined;
+        if (protocols !== undefined) row.protocols = protocols.filter(protocol => KNOWN_PROTOCOLS.includes(protocol));
+        if (!v1) return row;
         const availability = availabilityOf(entry.availability);
         if (availability) row.availability = availability;
         if (typeof entry.name === 'string' && DISPLAY_NAME.test(entry.name.trim())) row.name = entry.name.trim();
         const capabilities = capabilitiesOf(entry.capabilities);
-        if (capabilities) row.capabilities = capabilities;
+        if (capabilities && protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.capabilities = capabilities;
         return row;
     });
     return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
@@ -203,10 +212,13 @@ export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayMod
         stream: capabilities?.streaming === false ? false : model.stream };
 }
 
-/** Contract §2 rule 1: available for this caller, over a protocol this client speaks (Messages first). */
+/**
+ * Contract §2 rules 1 and 7: available for this caller, over the row's first protocol this client speaks. That is the
+ * route its capabilities describe (when its first protocol is one this client does not speak, it has none).
+ */
 function selectableProtocol(entry: GatewayModel): GatewayProtocol | undefined {
     if (entry.enabled !== true || entry.availability?.state !== 'available') return undefined;
-    return KNOWN_PROTOCOLS.find(protocol => entry.protocols?.includes(protocol));
+    return entry.protocols?.[0];
 }
 
 /**
@@ -274,8 +286,9 @@ export const CATALOG_STALE_MS = 30 * 60_000;
 
 /**
  * The last catalog read for this base URL + token, up to `CATALOG_STALE_MS` old, without a request. A failed read is
- * "unknown", never "unavailable": the rows already listed stay selectable and the request decides. Cleared, like
- * the cache, after an availability or limit refusal; never shared with another token.
+ * "unknown", never "unavailable": the rows already listed stay listed (contract §4: listing only), but a catalog-only
+ * model is never sent on it unchecked; configured models still go and the request decides. Cleared, like the cache,
+ * after an availability or limit refusal; never shared with another token.
  */
 export function knownGatewayModels(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
     const cached = modelsCache.get(providerIdentity(provider));
@@ -418,8 +431,13 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             return make(`Internal EZiL Models bug (${code}); please report it`);
         case 'killswitch': return make(body.pause === 'reconciliation' ? 'AI is paused while usage is reconciled' : 'AI is paused by operations');
         case 'paused': case 'pause': case 'global_cap_reached': return make('AI is temporarily paused');
-        case 'no_provider_route': case 'model_disabled': case 'model_not_found': return make('This model is temporarily unavailable');
+        case 'no_provider_route': case 'model_disabled': case 'model_not_found': case 'model_unavailable': return make('This model is temporarily unavailable');
+        // Caller-scoped (catalog reasons entitlement_required and not_allowed_for_caller): neither is about credits.
+        case 'no_entitlement': return make('AI access is not included for this account: it needs an active plan');
+        case 'model_not_allowed': return make('This model is not included for your access. Pick another model');
         case 'upstream_timeout': return make('The model provider did not answer in time');
+        case 'upstream_unavailable': return make('The model provider could not be reached');
+        case 'upstream_error': return make('The model provider returned an error');
         case 'idempotency_replay': return make('already processed');
         case 'rate_limited': return make('Too many requests; try again later');
         case 'concurrency_limit': return make('Wait for the current response to finish');
