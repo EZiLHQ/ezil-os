@@ -241,7 +241,9 @@ const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a
  *  1. the address is one canonical public github.com repository (`parseRepositoryUrl`), else `repo_url_invalid`
  *     (400) or, for EZiL Git's own hosts, `repo_url_unsupported` (409), before anything is read;
  *  2. the computer is the caller's own (`computer.get`: NOT_FOUND otherwise);
- *  3. it is a Cloudflare computer (AWS: `repo_open_unsupported_provider`, 409; os-builder-project-open-v1 §8);
+ *  3. (no provider gate: a public repository opens on a Cloudflare computer in its container, and on an AWS one
+ *     through the host relay on os-staging — universe-repo-open-v1 §13 class `public`; a host/AMI without the
+ *     repo-open op fails closed to `repo_open_unsupported_provider` at the Worker, 409);
  *  4. the repository exists publicly and has a default branch: one anonymous read (`resolvePublicGitHub`); a missing
  *     or private one is "This repository doesn't exist." (404), before the computer is woken for it;
  *  5. Code is minted exactly as without a repository (the same wake loop, Free policy and billing gates);
@@ -273,7 +275,6 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
 
     await caller.computer.get({ id: computerId });
-    if (isAws(await target(ctx, computerId))) return unsupportedProvider();
 
     const resolved = await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline });
     if (!resolved.ok) {
@@ -286,9 +287,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
 
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
-    // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
+    // Re-read after the mint so the open uses the computer's current controls: a Cloudflare computer opens the
+    // repository in its container, an AWS one through the host relay (universe-repo-open-v1 §13, class `public`).
+    // No provider is refused here any more; a host/AMI without the repo-open op fails closed to
+    // `repo_open_unsupported_provider` at the Worker, handled below exactly as a Cloudflare refusal.
     const controls = await target(ctx, computerId);
-    if (isAws(controls)) return unsupportedProvider();
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
         console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });

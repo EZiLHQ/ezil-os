@@ -69,7 +69,12 @@ export async function requestRepoOpen(
     request: RepoOpenRequest,
     deps: { fetch?: typeof fetch; now?: () => number; correlationId?: string; signal?: AbortSignal } = {},
 ): Promise<RepoOpenResult> {
-    if (target.auth.kind === 'v2' && target.auth.claims.provider === 'aws-ec2') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
+    // AWS computers serve ONLY the anonymous public-github open (git === null): the host repo-open op clones
+    // github.com with no credential (universe-repo-open-v1 §13, class `public`). A grant-bearing open (a Builder
+    // project; os-builder-project-open-v1 §8 is still blocked on AWS) is refused here, before the token is minted.
+    if (target.auth.kind === 'v2' && target.auth.claims.provider === 'aws-ec2' && request.git !== null) {
+        return { ok: false, errorCode: 'repo_open_unsupported_provider' };
+    }
     const failed = (status: number | null, code: unknown) => {
         console.warn('[repo-open] worker refused', {
             correlationId: deps.correlationId ?? null, status, error: typeof code === 'string' && LOG_CODE.test(code) ? code : 'other',

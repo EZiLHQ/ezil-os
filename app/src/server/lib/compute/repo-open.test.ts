@@ -71,10 +71,20 @@ describe('requestRepoOpen', () => {
         expect(await result).toEqual({ ok: false, errorCode: 'repo_open_failed' });
         expect(warn.mock.calls).toContainEqual(['[repo-open] worker refused', expect.objectContaining({ error: 'aborted' })]);
     });
-    it('never sends an AWS computer\'s request', async () => {
-        const { fetcher, result } = run(() => Response.json({}), aws);
+    it('never sends an AWS computer\'s GRANT-bearing (project) request (os-builder-project-open-v1 §8 still blocked)', async () => {
+        const { fetcher, result } = run(() => Response.json({}), aws);   // the default request carries a git grant
         expect(await result).toEqual({ ok: false, errorCode: 'repo_open_unsupported_provider' });
         expect(fetcher).not.toHaveBeenCalled();
+    });
+    it('sends an AWS computer\'s anonymous (git:null) public open to the Worker, with the aws-ec2 claims for its dispatch', async () => {
+        const { fetcher, result } = run(() => Response.json({ folder: `/workspace/projects/${REPO}` }), aws, 'secret',
+            { git: null, canonicalURL: 'https://github.com/ezilhq/ezil-os.git' });
+        expect(await result).toEqual({ ok: true, folder: `/workspace/projects/${REPO}` });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        // No git object in the body; the signed v2 token still carries provider aws-ec2, so the Worker relays it.
+        expect(JSON.parse(String(fetcher.mock.calls[0][1].body))).toStrictEqual({ repositoryId: REPO, canonicalURL: 'https://github.com/ezilhq/ezil-os.git', ref: 'refs/heads/main', timeoutMs: 60_000 });
+        const claims = JSON.parse(Buffer.from((fetcher.mock.calls[0][1].headers as Record<string, string>)['x-ezil-auth'].split('.')[1]!, 'base64url').toString());
+        expect(claims.provider).toBe('aws-ec2');
     });
     it('refuses without a signing secret and never sends unsigned', async () => {
         const { fetcher, result } = run(() => Response.json({}), cloudflare, ' ');
