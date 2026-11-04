@@ -237,6 +237,9 @@ await check('Billing: Add AI credits is one card and one balance control into th
     assert.equal(topup.querySelectorAll('[data-action="topup"]').length, 1, 'one entry, not one checkout per pack');
     const meter = el.querySelector('#ai-credits [data-action="topup"]');
     assert.ok(meter, 'Add credits beside the balance');
+    // WCAG 2.5.3: the accessible name is the visible label (no aria-label that a speech user would not say).
+    assert.equal(meter.getAttribute('aria-label'), null);
+    assert.equal(clean(meter), 'Add credits');
     for ( const button of [...topup.querySelectorAll('button'), meter] ) assert.ok(! button.classList.contains('ezil-settings-btn-primary'));
     const none = billingState('premium'); none.actions.topup = false;
     assert.equal(fragment(summaryV3Html(none)).querySelector('[data-role="ai-topup"]'), null);

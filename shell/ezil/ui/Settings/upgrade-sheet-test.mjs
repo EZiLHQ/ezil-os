@@ -765,6 +765,9 @@ test('AI credits deep-link cleanup preserves unrelated query parameters', async 
     assert.deepEqual(parse('?settings=billing&section=ai-credits&view=files&view=recent'), {
         initialTab: 'billing', openUpgrade: false, search: '?view=files&view=recent',
     });
+    assert.equal(parse('?settings=billing&section=ai-credits&reason=insufficient_credits&view=files').search, '?view=files');
+    assert.equal(parse('?settings=billing&section=ai-credits&reason=other').search, '?reason=other', 'only the recovery hint goes');
+    assert.equal(parse('?settings=billing&reason=insufficient_credits').search, '?reason=insufficient_credits', 'not without its section');
     assert.equal(parse('?settings=billing&section=unknown').search, '?section=unknown');
     assert.equal(parse('?settings=account&section=ai-credits'), null);
 });
