@@ -322,6 +322,16 @@ describe('compactRequest', () => {
         const text = new TextDecoder().decode(built.bytes);
         for (const i of [0, 1, 2]) expect(text).toMatch(new RegExp(`Tool read_file \\{\\} → result ${i} r`));
     });
+    test('even the tightest plans keep the latest call and its result, shortened, as a pair', () => {
+        const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Read everything.')),
+            ...Array.from({ length: 5 }, (_, i) => [msg('assistant', call(`r${i}`)), msg('user', result(`r${i}`, [txt(`file ${i} ${'f'.repeat(200_000)}`)]))]).flat()]), tools: [tool] };
+        const model = { ...gw(), maxInputTokens: 6000 };
+        const { built } = compactRequest(request, first(request, model), build(model));
+        const body = (built as ReturnType<typeof buildGatewayBody>).body;
+        expectPairedMessages(body);
+        expect(body.messages.at(-2)!.content).toContainEqual({ type: 'tool_use', id: 'r4', name: 'read_file', input: {} });
+        expect(wire(body.messages.at(-1))).toMatch(/"tool_use_id":"r4".*file 4 f+\\n\[… \d+ characters left out by EZiL/);
+    });
     test('the latest step is kept verbatim, whatever is folded before it (review LOW-6)', () => {
         const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Fix it.')),
             ...Array.from({ length: 60 }, (_, i) => [msg('assistant', txt(`step ${i}`), call(`s${i}`)), msg('user', result(`s${i}`, [txt(`out ${i} ${'o'.repeat(3000)}`)]))]).flat()]), tools: [tool] };
