@@ -1529,7 +1529,8 @@ await settle(4);
         }
         // The founder's exact message for a repository that is not there; asked once, no silent retry, no generic Code.
         for ( const [code, words] of [['repo_not_found', "This repository doesn't exist."], ['repo_url_invalid', "This isn't a repository address Code can open"],
-            ['repo_url_unsupported', 'Open this repository from its project'], ['repo_url_unavailable', "Couldn't reach this repository"]] ) {
+            ['repo_url_unsupported', 'Open this repository from its project'], ['repo_url_not_enabled', "Code can't open repository addresses here yet"],
+            ['repo_url_unavailable', "Couldn't reach this repository"]] ) {
             codeMintAnswer = () => ({ status: code === 'repo_not_found' ? 404 : 409, payload: { error: { code, message: 'x' } } });
             from = calls.length;
             const submitted = submits.length;

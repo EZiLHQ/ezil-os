@@ -263,6 +263,12 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             ? shellRefusal(409, 'repo_url_unsupported', 'Open this EZiL Git repository from its project in Universe for now.')
             : repoUrlInvalid();
     }
+    // The Worker fetches a public github.com repository only on os-staging (`repoOpenRemotesFor`); any other
+    // deployment would wake the computer for an open it then refuses. Refused first, with nothing read or woken.
+    const { stagingGitQaAccepted } = await import('@/server/works/project-repo');
+    if (!stagingGitQaAccepted()) {
+        return shellRefusal(409, 'repo_url_not_enabled', "Opening a repository from its address isn't available here yet.");
+    }
     const left = () => startedAt + PROJECT_OPEN_BUDGET_MS - Date.now();
     const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
 

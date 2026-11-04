@@ -101,6 +101,7 @@ beforeEach(() => {
         github: () => new Response(advertisement('refs/heads/main'), { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } }) });
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', UNIVERSE);
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', SECRET);
+    vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work'); // os-staging: the Worker opens public github.com
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init: RequestInit = {}) => {
         const url = new URL(String(input));
         s.requests.push({ url, init });
@@ -196,6 +197,18 @@ describe('opening a repository from its address in Code', () => {
         expect(response.status).toBe(409);
         expect((await response.json()).error.code).toBe('repo_url_unsupported');
         expect(s.order).toEqual([]);
+    });
+
+    it('outside os-staging (any other funding origin, or none) it is repo_url_not_enabled (409) with nothing read or woken', async () => {
+        for (const funding of ['https://ai.ezil.work', '']) {
+            vi.stubEnv('BILLING_FUNDING_URL', funding);
+            s.order = []; s.requests = [];
+            const response = await openUrl();
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe('repo_url_not_enabled');
+            expect(s.order).toEqual([]);
+            expect(s.requests).toEqual([]);
+        }
     });
 
     it("another person's computer is NOT_FOUND, and GitHub, the mint and the Worker are never reached", async () => {

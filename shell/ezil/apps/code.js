@@ -167,6 +167,7 @@ const PROJECT_REFUSALS = {
     repo_not_found: 'repo_not_found',
     repo_url_invalid: 'repo_url_invalid',
     repo_url_unsupported: 'repo_url_unsupported',
+    repo_url_not_enabled: 'repo_url_not_enabled',
     repo_url_moved: 'repo_url_moved',
     repo_url_empty: 'repo_url_empty',
     repo_url_unavailable: 'repo_url_unavailable',
@@ -200,6 +201,10 @@ const PROJECT_FAILURE_COPY = {
     repo_url_unsupported: {
         title: 'Open this repository from its project',
         body: 'EZiL Git repositories open from their project in Universe for now.',
+    },
+    repo_url_not_enabled: {
+        title: "Code can't open repository addresses here yet",
+        body: 'Opening a repository from its address is on EZiL OS staging only for now. Code still opens your own files from the dock.',
     },
     repo_url_moved: {
         title: 'This repository has moved',
