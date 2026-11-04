@@ -438,6 +438,44 @@ describe('the frozen v1 contract as the Gateway serves it (CATALOG-3 1af1db9)', 
         }
     });
 
+    test('a GPT-shaped row (Responses only, tools and streaming; c3 Q1) streams over Responses, returns its tool call, and keeps tool pairs across a switch from Qwen', async () => {
+        const call = { type: 'function_call', id: 'fc_1', call_id: 'call_9', name: 'read_file', arguments: '{"path":"b.ts"}', status: 'completed' };
+        const frame = (type: string, fields: Row) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+        const wire = [frame('response.created', { response: { object: 'response', id: 'resp_1', status: 'in_progress', output: [] } }),
+            frame('response.output_item.added', { output_index: 0, item: { ...call, status: 'in_progress', arguments: '' } }),
+            frame('response.function_call_arguments.delta', { item_id: 'fc_1', output_index: 0, delta: call.arguments }),
+            frame('response.function_call_arguments.done', { item_id: 'fc_1', output_index: 0, arguments: call.arguments }),
+            frame('response.output_item.done', { output_index: 0, item: call }),
+            frame('response.completed', { response: { object: 'response', id: 'resp_1', status: 'completed', output: [call],
+                usage: { input_tokens: 100, output_tokens: 12, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } })].join('');
+        const g = gateway(load(), () => Response.json(v1([row('synthetic-gpt-shaped', 'available', { protocols: ['openai-responses'],
+            capabilities: { tool_calling: true, image_input: false, streaming: true }, name: 'Synthetic GPT Shaped' })])),
+            body => body.input ? new Response(wire, { headers: { 'content-type': 'text/event-stream' } }) : defaultAnswer(body));
+        const infos = await list(g.provider);
+        const gpt = infos.find(info => info.id === 'ezil/synthetic-gpt-shaped')!;
+        expect([gpt.name, gpt.capabilities]).toEqual(['Synthetic GPT Shaped', { toolCalling: true, imageInput: false }]);
+        const history = [
+            message(1, [new TextPart('Read a.ts')]),
+            message(2, [new ThinkingPart('private prior reasoning', 'th_1', { signature: 'sig' }), new TextPart('Reading it.'), new ToolCallPart('call_1', 'read_file', { path: 'a.ts' })]),
+            message(1, [new ToolResultPart('call_1', [new TextPart('export const a = 1;')])]),
+            message(1, [new TextPart('Now b.ts')]),
+        ];
+        const parts: unknown[] = [];
+        await g.provider.provideLanguageModelChatResponse(gpt as never, history as never, { tools: [READ_FILE], modelOptions: {} } as never,
+            { report: part => parts.push(part) }, token() as never);
+        expect(parts).toEqual([new ToolCallPart('call_9', 'read_file', { path: 'b.ts' })]);
+        await send(g.provider, infos[0]!, history, [READ_FILE]); // and back to Qwen
+        const [gptPost, qwenPost] = g.posts;
+        expect([new URL(gptPost!.url).pathname, gptPost!.body.model, gptPost!.body.stream, gptPost!.accept]).toEqual(['/ai/v1/responses', 'synthetic-gpt-shaped', true, 'text/event-stream']);
+        expect((gptPost!.body.tools as { name: string }[]).map(tool => tool.name)).toEqual(['read_file']);
+        const input = gptPost!.body.input as { type?: string; call_id?: string }[];
+        expect(input.filter(item => item.type === 'function_call' || item.type === 'function_call_output').map(item => [item.type, item.call_id]))
+            .toEqual([['function_call', 'call_1'], ['function_call_output', 'call_1']]);
+        expect(JSON.stringify(gptPost!.body)).not.toContain('private prior reasoning');
+        const turns = qwenPost!.body.messages as { content: { type: string; tool_use_id?: string }[] }[];
+        expect([qwenPost!.body.model, turns[1]!.content.map(block => block.type), turns[2]!.content[0]!.tool_use_id]).toEqual([QWEN, ['text', 'tool_use'], 'call_1']);
+    });
+
     test('a row is sent over its FIRST protocol, with that route\'s capabilities; an unspoken first protocol leaves it none', async () => {
         const g = gateway(load(), () => Response.json(v1([
             row('synthetic-responses-first', 'available', { protocols: ['openai-responses', 'anthropic-messages'], capabilities: { tool_calling: false, streaming: false } }),
