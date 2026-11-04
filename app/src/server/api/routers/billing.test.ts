@@ -2059,11 +2059,11 @@ describe('Standard trial router', () => {
         expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
 
-    it('a trial checkout sends the stored quote: its end, a 1 h expiry from the quote, the trial id, one key per quote', async () => {
+    it('a trial checkout sends the stored quote: its end, a 2 h expiry from the quote, the trial id, one key per quote', async () => {
         const f = trialFixture({ own: quoted() });
         await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: '2026-11-11T12:00:00Z' } })).resolves.toMatchObject({ sessionId: session.id });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku,
-            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T13:00:00Z') },
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z') },
             idempotencyKey: `trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}` }));
         expect(f.trial.attachTrialCheckout).toHaveBeenCalledWith({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, quotedAt,
             checkoutSessionId: session.id, customerId: 'cus_fixture' });
