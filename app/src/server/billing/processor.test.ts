@@ -2550,3 +2550,30 @@ describe('legacy restore refusal', () => {
         expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
     });
 });
+
+describe('Standard trial: a $0 invoice is never paid proof', () => {
+    const trialStart = new Date('2026-11-05T10:00:00.000Z');
+    const trialEnd = new Date('2026-12-05T10:00:00.000Z');
+    function trialFixture() {
+        const f = fixture();
+        f.stripe.subscription = { ...f.stripe.subscription, sku: 'standard_monthly_v3', status: 'trialing',
+            currentPeriodStart: trialStart, currentPeriodEnd: trialEnd,
+            items: [{ id: 'si_trial', priceId: 'price_v3', lookupKey: 'ezil_standard_monthly_v3' }] };
+        f.stripe.invoice = { ...f.stripe.invoice, billingReason: 'subscription_create', periodStart: trialStart, periodEnd: trialEnd,
+            lines: [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: 0,
+                periodStart: trialStart, periodEnd: trialEnd }] };
+        return f;
+    }
+    function createInvoice() {
+        return event('invoice.paid', { id: 'in_local', customer: 'cus_payload', billing_reason: 'subscription_create',
+            parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } });
+    }
+
+    it('RED: a $0 subscription_create invoice on a trialing Standard subscription mints no plan_period grant or plan credits', async () => {
+        const { store, deps } = trialFixture();
+        await processStripeEvent(createInvoice(), deps);
+        expect([...store.grants.values()].filter(grant => grant.kind === 'plan_period')).toEqual([]);
+        expect([...store.outbox.values()].filter(item => item.payload.entitlementId
+            === `ezil-os:v1:standard_monthly_v3:sub_local:${trialStart.toISOString()}`)).toEqual([]);
+    });
+});
