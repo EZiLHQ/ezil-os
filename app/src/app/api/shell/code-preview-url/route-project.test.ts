@@ -145,7 +145,9 @@ describe('opening a project in Code', () => {
         expect(url.toString()).toBe(`${UNIVERSE}/internal/project-repositories/open`);
         expect(init).toMatchObject({ method: 'POST', redirect: 'error', cache: 'no-store' });
         expect(init.headers).toEqual({ 'content-type': 'application/json' });
-        expect(JSON.parse(String(init.body))).toStrictEqual({ userIdToken: ID_TOKEN, projectId: PROJECT, repositoryId: REPO });
+        // os-builder-project-open-v1 1.1.0: the label of the computer being opened, computed here (never from the browser).
+        const label = createHash('sha256').update(`ezil-os/computer-label/v1|${COMPUTER}`).digest('hex').slice(0, 16);
+        expect(JSON.parse(String(init.body))).toStrictEqual({ userIdToken: ID_TOKEN, projectId: PROJECT, repositoryId: REPO, computerLabel: label });
     });
 
     it('hands the grant to the Worker in a v2-signed body (digest of the exact bytes), with no query string', async () => {
@@ -155,7 +157,8 @@ describe('opening a project in Code', () => {
         expect(url.search).toBe('');
         const body = String(init.body);
         expect(JSON.parse(body)).toStrictEqual({ repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main',
-            git: { token: GIT_TOKEN, expiresAt: expect.any(String) }, timeoutMs: 130_000 });
+            // §7: Universe's scope rides with the grant, so an EZiL Git open installs push access.
+            git: { token: GIT_TOKEN, expiresAt: expect.any(String), scope: 'write' }, timeoutMs: 130_000 });
         expect(init.signal).toBeInstanceOf(AbortSignal);
         const auth = (init.headers as Record<string, string>)['x-ezil-auth'];
         const [v, claims64, sig] = auth.split('.');

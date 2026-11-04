@@ -193,7 +193,8 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
         return openTimedOut();
     }
 
-    const grant = await projectGrantOrRefusal(identity, ids, 'code-preview-url', deadline);
+    // 1.1.0: the label of the computer being opened (its owner was checked above by `computer.get`).
+    const grant = await projectGrantOrRefusal(identity, ids, 'code-preview-url', deadline, computerId);
     if (grant instanceof Response) return grant;
 
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
@@ -208,7 +209,7 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
         { userId: ctx.user.id, computerId }, {
             repositoryId: grant.binding.repositoryId, canonicalURL: grant.binding.canonicalURL, ref: grant.binding.ref,
-            git: { token: grant.git.token, expiresAt: grant.git.expiresAt }, timeoutMs,
+            git: { token: grant.git.token, expiresAt: grant.git.expiresAt, scope: grant.git.scope }, timeoutMs,
         }, { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();

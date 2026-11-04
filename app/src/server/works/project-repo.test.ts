@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
 
-import { openProjectRepository, projectRepoOrigin, ProjectRepoError, repositoryDisplayName } from './project-repo';
+import { computerLabel, openProjectRepository, projectRepoOrigin, ProjectRepoError, repositoryDisplayName, stagingGitQaAccepted } from './project-repo';
 
 const PROJECT = '3333abcd-3333-4333-8333-33333333cdef';
 const REPO = '44444444-4444-4444-8444-44444444abcd';
@@ -172,3 +172,52 @@ describe('repositoryDisplayName', () => {
         expect(repositoryDisplayName('https://github.com/acme/site.git')).toBeNull();
     });
 });
+
+// os-builder-project-open-v1 §4 and 1.1.0 (founder 45b2f73b): staging Works provisions an ordinary Builder project's
+// repository on git-qa.ezil.work, and Universe 1.1.0 needs the label of the computer being opened.
+describe('os-builder-project-open-v1: the staging Git host and the computer label', () => {
+    const STAGING = { ...env, BILLING_FUNDING_URL: 'https://ai-staging.ezil.work/v1/billing/fund' };
+    const PRODUCTION = { ...env, BILLING_FUNDING_URL: 'https://ai.ezil.work/v1/billing/fund' };
+    const openWith = (canonicalURL: string, deployEnv: Record<string, string>, extra: Partial<typeof input> & { computerId?: string } = {}) => {
+        const bodies: Record<string, unknown>[] = [];
+        const result = openProjectRepository({ ...input, ...extra }, { env: deployEnv, now: () => NOW, fetch: (async (_u: URL, i: RequestInit) => {
+            bodies.push(JSON.parse(String(i.body)));
+            return Response.json(answer(withBinding({ canonicalURL })));
+        }) as unknown as typeof fetch });
+        return { result, bodies };
+    };
+    it('the staging gate is exactly the ai-staging funding origin (as aiEnrollmentConfigured)', () => {
+        expect(stagingGitQaAccepted(STAGING)).toBe(true);
+        for (const fundingUrl of [undefined, 'https://ai.ezil.work/x', 'https://ai-staging.ezil.work.evil.com/x', 'http://ai-staging.ezil.work/x', 'not a url']) {
+            expect(stagingGitQaAccepted({ ...env, ...(fundingUrl ? { BILLING_FUNDING_URL: fundingUrl } : {}) })).toBe(false);
+        }
+    });
+    // The contract's osApp vectors (os-builder-project-open-v1.vectors.json).
+    it.each(['https://git-qa.ezil.work/acme-qa/site.git', 'https://github.ezil.work/acme/site.git'])('staging accepts %s and names it', async url => {
+        const { result } = openWith(url, STAGING);
+        await expect(result).resolves.toMatchObject({ binding: { canonicalURL: url } });
+        expect(repositoryDisplayName(url)).toBe(url.includes('git-qa') ? 'acme-qa/site' : 'acme/site');
+    });
+    it.each(['https://git-staging.ezil.work/acme-qa/site.git', 'https://git-qa.ezil.work.evil.com/acme-qa/site.git',
+        'https://git-qa.ezil.work:8443/acme-qa/site.git', 'http://git-qa.ezil.work/acme-qa/site.git'])('staging refuses %s', async url => {
+        expect(await code(openWith(url, STAGING).result)).toBe('unavailable');
+    });
+    it('production refuses the staging host and still accepts github.ezil.work', async () => {
+        expect(await code(openWith('https://git-qa.ezil.work/acme-qa/site.git', PRODUCTION).result)).toBe('unavailable');
+        expect(await code(openWith('https://git-qa.ezil.work/acme-qa/site.git', env).result)).toBe('unavailable');
+        await expect(openWith('https://github.ezil.work/acme/site.git', PRODUCTION).result).resolves.toMatchObject({ role: 'builder' });
+    });
+    it('1.1.0: the open carries computerLabel = first 16 hex of sha256("ezil-os/computer-label/v1|" + computerId), and only then', async () => {
+        const computerId = '00000000-0000-4000-8000-000000000101';
+        const withComputer = openWith(ARTIFACTS, env, { computerId });
+        await withComputer.result;
+        expect(computerLabel(computerId)).toMatch(/^[0-9a-f]{16}$/);
+        expect(computerLabel(computerId)).toBe('d545053c8f1f54fa'); // computed independently (node crypto) for this id
+        expect(withComputer.bodies).toEqual([{ userIdToken: 'id-token', projectId: PROJECT, repositoryId: REPO, computerLabel: computerLabel(computerId) }]);
+        expect(computerLabel('00000000-0000-4000-8000-000000000102')).not.toBe(computerLabel(computerId));
+        const withoutComputer = openWith(ARTIFACTS, env);
+        await withoutComputer.result;
+        expect(withoutComputer.bodies).toEqual([{ userIdToken: 'id-token', projectId: PROJECT, repositoryId: REPO }]);
+    });
+});
+
