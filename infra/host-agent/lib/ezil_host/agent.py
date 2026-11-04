@@ -61,7 +61,7 @@ import subprocess
 import threading
 import time
 
-from . import canary, desktop, export, guard, storage, terminal_work, tunnel
+from . import canary, desktop, export, guard, repo_open, storage, terminal_work, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -150,6 +150,7 @@ class Agent:
         self._load_restart_requests()
         self.export_thread = None             # the one reverse-move export job (export.Job)
         self.storage_stop = threading.Event()  # ends the periodic storage sampler (storage.Sampler)
+        self.repo_open = repo_open.Runner(self)   # repo-open on AWS (contract §13, Phase B; repo_open.py)
 
     # ---------------------------------------------------------------- control
     def handle(self, raw):
@@ -198,6 +199,17 @@ class Agent:
             if (set(msg) != export.MESSAGE_KEYS or not export.valid_id(msg.get("moveId"))
                     or not export.valid_id(msg.get("importGeneration"))):
                 return {"ok": False, "error": "export_invalid"}
+        elif op == "repo_open":
+            # Closed field set; every relayed field re-validated (repo_open.parse_relay). Never echoed.
+            try:
+                if set(msg) != repo_open.MESSAGE_KEYS:
+                    raise ValueError("repo_open_invalid")
+                repo_open_job = repo_open.parse_relay(msg.get("request"), int(now * 1000))
+            except ValueError:
+                return {"ok": False, "error": "repo_open_invalid"}
+        elif op == "repo_open_status":
+            if set(msg) != repo_open.STATUS_MESSAGE_KEYS or not repo_open.valid_job_id(msg.get("jobId")):
+                return {"ok": False, "error": "repo_open_invalid"}
         elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
@@ -215,6 +227,10 @@ class Agent:
                 return self._accept_restart(msg["requestId"], now)
             if op == "export":
                 return self._accept_export(msg["moveId"], msg["importGeneration"], now)
+            if op == "repo_open":
+                return self.repo_open.start(*repo_open_job)
+            if op == "repo_open_status":
+                return self.repo_open.status(msg["jobId"])
             if op == "stop":
                 self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
