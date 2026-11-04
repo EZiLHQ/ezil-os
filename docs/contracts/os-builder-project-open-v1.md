@@ -1,13 +1,14 @@
 # OS ↔ Universe ↔ Works: opening an ordinary Builder-created project — v1 (proposed)
 
 Status: **proposed** 2026-11-03 by e1cd418a (request `journey-32d-20261103-repo-open-resolver-v1`). Local only; nothing staged or deployed.
+**1.1.0-proposed** (2026-11-03, request `88e642df-project-grant-contract-closure-v1`, with universe-repo-open-v1 1.0.5): the Builder open's grant now comes from Works **os-grant with class `project`** (≤ 300 s issued, ≤ 330 s accepted), not clone-token. The open body adds `computerLabel`, and §3 W-2(a) is withdrawn.
 Vectors: `os-builder-project-open-v1.vectors.json` (the exact cases; this text explains them).
 
 | Section | Owner | State |
 |---|---|---|
 | §1 Link on the Builder board | Universe slot4 | proposal |
 | §2 Universe open: the builder branch | Universe slot4 | proposal |
-| §3 Works clone-token fields | Works slot5 | ask (W-1..W-3) |
+| §3 Works grant (1.1.0: os-grant class project; W-1 on clone-token unchanged) | Works slot5 | ask (W-1; W-2/W-3 = universe-repo-open-v1 1.0.5 §6.2 QA + §6.5) |
 | §4 OS app accepts git-qa on staging | OS app (open-project; cb1d14e6 integrates) | patch proposal |
 | §5 OS Worker accepts git-qa on os-staging | e1cd418a | implemented on `feat/repo-open-resolver-20261103` |
 | §6 Per-tab restore and the reveal path | editor lead f179c8a4 (shell/app), e1cd418a (Worker walk), cb1d14e6 (AWS host op bake) | Worker walk implemented |
@@ -32,14 +33,14 @@ The route, the body `{userIdToken, projectId, repositoryId}`, identity verificat
   - Owner only: role `builder` for `builder_projects.user_id`.
   - Every other case is 403 `project_repo_not_authorized`, the same answer as a project that does not exist, so the answer reveals nothing about existence. That covers a wrong user, an unknown id, a mismatched repository, a project not ready, and an inactive account.
   - The rate limit and the append-only open audit apply as for hired projects.
-- **Grant.** Universe calls Works `clone-token` for `works_repository_ref` and checks the answer exactly (vectors `universeOpen.grant`).
+- **Grant (1.1.0).** Universe calls Works `POST /v1/builder/selfserve-repositories/<repository_id>/os-grant` on api-staging, with the person's own OS-audience token it already verified as bearer (never logged or kept) and body `{computerLabel, class:'project'}`. It checks the answer exactly (vectors `universeOpen.grant`, universe-repo-open-v1 `works.osGrantProjectResponse`): `class` is `'project'` and `expiresAt` is at most `min(now + 300 s, token exp) + 30 s`. `binding.ref` is `'refs/heads/' + defaultBranch`. The OS app sends `computerLabel` (COMPUTER_LABEL of the computer being opened, computed on the server) in the open body; the hired branch ignores it.
   - It never substitutes a ref. The OS opens a repository whose binding branch is missing upstream as an empty clone, so a guessed `refs/heads/main` would hide an existing repository's code without any error.
   - A Works answer without `defaultRef` or `scope`, or for another `cloneUrl`, is 502 `project_repo_upstream_unavailable`.
 
 ## 3. Works (asks)
-- **W-1.** The `clone-token` answer adds `scope` and `defaultRef`. Works already knows both: `authority.scope`, and the default ref recorded at provisioning from Artifacts' `default_branch`.
-- **W-2 (slot5 decides).** Accept the OS EZiL ID audience on `clone-token`, so Universe forwards the person's own verified token and Works binds the grant to that same issuer and subject. The alternative is a Universe service credential plus an asserted subject. Either way, the grant is refused for any other account.
-- **W-3.** The grant stays route-scoped and at most 5 minutes, as today.
+- **W-1.** The `clone-token` answer adds `scope` and `defaultRef`. Works already knows both: `authority.scope`, and the default ref recorded at provisioning from Artifacts' `default_branch`. (1.1.0: still read by Universe's link rule; no longer the open's grant.)
+- **W-2 (1.1.0, decided).** ~~Accept the OS EZiL ID audience on `clone-token`~~ is WITHDRAWN: universe-repo-open-v1 §6.4 step 2 refuses an OS-client token on every non-os route, and allowing it would make that token usable for the 60-minute web clone. Instead, the existing os-grant route on api-staging (universe-repo-open-v1 1.0.5: the §6.2 QA row, whose osClient is the effective OS pin) issues class `project` grants, bound to the token's account (ownership), the computerLabel (session) and the repository (route path).
+- **W-3 (1.1.0).** The open grant is route-scoped and issued for at most 300 s (`min(now + 300 s, bearer exp)`), accepted up to 330 s. clone-token's web-clone grant stays 60 minutes and is never an open grant.
 
 ## 4. OS app (patch proposal)
 `app/src/server/works/project-repo.ts` also accepts `https://git-qa.ezil.work/<ns>/<name>.git`, only under the app's existing staging gate (the billing funding origin is exactly `https://ai-staging.ezil.work`, as `aiEnrollmentConfigured`). Nothing else changes. AWS computers are still refused with `repo_open_unsupported_provider`; that is an external blocker for founder step 5 if the test computer is on AWS.
