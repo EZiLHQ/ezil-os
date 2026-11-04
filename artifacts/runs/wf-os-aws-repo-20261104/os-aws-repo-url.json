@@ -1,0 +1,9 @@
+{
+  "taskId": "os-aws-repo-url",
+  "runId": "wf-os-aws-repo-20261104",
+  "status": "blocked",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "LANDED on feat/os-aws-repo-url-20261104: (a) merge 96ae45d3 of reviewed u2 lineage (21 files, 0 conflicts); (b) app layer b5980932 = AWS ?repo= public open (route.ts drop pre/post-mint isAws in openRepositoryUrl; compute/repo-open.ts refuse aws-ec2 only when git!==null). TESTS: app/ vitest 93 pass / 0 fail across 3 files (compute repo-open 29, route-repository 24, route-project 40). MUTATION M1: drop `&& request.git !== null` -> 1 RED (public test refused) / 28 green; restored -> 29 green (sha 12c89c19). project opens stay refused on AWS (route-project 40 green). BLOCKED/HANDOFF (scope exceeds one narrow row; see report): worker (repo-open-u2 public body + aws-repo-open relay/jobAnswer/old-AMI-map + index dispatch), host (repo_open.py public + gate), kernel (ezil-repo-open.mjs public class modeled on project, byte-identical x2 + REPO_OPEN_ASSETS re-pin + README sha + ezil-repo-open-test.mjs), contract (universe-repo-open-v1 + vectors + os-builder §8), and consuming-repo vector re-copy (Works/Universe/CLI, not editable here) + lead ratification. VERIFIED FACTS in report.",
+  "startedAt": "2026-11-04T20:40:00Z",
+  "updatedAt": "2026-11-04T21:10:00Z"
+}
