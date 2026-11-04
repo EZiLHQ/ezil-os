@@ -131,7 +131,7 @@ const session = {
 const expectedSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: 'user_fixture',
     mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_pack_10_v1',
-    amountTotal: null, currency: null, metadataCredits: null,
+    amountTotal: null, currency: null, metadataCredits: null, trialId: null,
 };
 const charge = {
     id: 'ch_fixture', customer: 'cus_fixture', invoice: 'in_fixture', payment_intent: 'pi_fixture',

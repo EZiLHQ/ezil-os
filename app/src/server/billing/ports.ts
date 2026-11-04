@@ -336,6 +336,8 @@ export interface StripeCheckoutSession {
     amountTotal?: number | null;
     currency?: string | null;
     metadataCredits?: string | null;
+    /** `metadata.ezil_trial` of our own trial checkout (the trial row id); null otherwise. */
+    trialId?: string | null;
 }
 
 export interface StripeCharge {

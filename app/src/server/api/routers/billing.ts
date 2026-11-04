@@ -615,7 +615,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
          * Standard trial: claim this person's trial and fix the exact end (the first $20 charge) that the confirmation
          * discloses. Eligibility is decided here from server facts; the client only echoes the end back to checkout.
          */
-        quoteTrial: protectedProcedure.mutation(async ({ ctx }) => {
+        quoteTrial: protectedProcedure.input(z.object({}).strict().optional()).mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const store = deps.store;
@@ -975,7 +975,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         }),
 
         checkoutStatus: protectedProcedure.input(z.object({ sessionId: z.string() }))
-            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null; sku: string | null }> => {
+            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null; sku: string | null;
+                /** A Standard free-month checkout ($0 today): /billing/return must never call it a payment. */
+                trial: boolean }> => {
                 const deps = getDeps();
                 const stripe = configuredStripe(deps);
                 if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw billingError('not_subscribed', 'BAD_REQUEST');
@@ -986,7 +988,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 const paymentStatus = session.paymentStatus === 'paid' || session.paymentStatus === 'unpaid'
                     || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
                 const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
-                return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
+                return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku,
+                    trial: session.mode === 'subscription' && typeof session.trialId === 'string' && session.trialId !== '' };
             }),
 
         /**

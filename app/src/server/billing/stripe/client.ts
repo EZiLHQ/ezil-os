@@ -774,6 +774,7 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 amountTotal: session.amount_total ?? null,
                 currency: session.currency ?? null,
                 metadataCredits: session.metadata?.sku === CUSTOM_TOPUP_SKU ? session.metadata?.credits ?? null : session.metadata?.ezil_credits ?? null,
+                trialId: (session.metadata as Record<string, string | undefined> | null | undefined)?.[TRIAL_METADATA_KEY] ?? null,
             };
         },
 
