@@ -28,11 +28,11 @@ describe('parseRepositoryUrl: one canonical public github.com repository, or a r
         'https://github.com\\a\\b.git', 'https://github.com/a/b.git.git', 'https://github.com.evil.com/a/b.git', 'https://evil.com/github.com/a/b.git',
         'https://github.com./a/b.git', 'https://xn--github-cxa.com/a/b.git', 'https://github.com/a/b\u0000', 'https://github.com/ä/b',
         'file:///etc/passwd', 'ssh://git@github.com/a/b.git', 'git@github.com:a/b.git', 'javascript:alert(1)', '', 7, null, { url: 'x' },
-        `https://github.com/a/${'b'.repeat(600)}`,
+        `https://github.com/a/${'b'.repeat(600)}`, 'https://git.ezil.work/acme/site.git', 'https://git-staging.ezil.work/acme-qa/site.git',
     ])('refuses %j as invalid', raw => {
         expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
     });
-    it.each(['https://github.ezil.work/acme/site.git', 'https://git-qa.ezil.work/acme-qa/site.git', 'https://git.ezil.work/acme/site.git'])(
+    it.each(['https://github.ezil.work/acme/site.git', 'https://git-qa.ezil.work/acme-qa/site.git'])(
         'recognises EZiL Git %s and refuses it for now (needs a Works grant by address)', raw => {
             expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'unsupported_host' });
         });
