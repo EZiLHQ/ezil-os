@@ -2,7 +2,7 @@
 import type { GrantRow } from '../ports';
 import type { ResolvedPlanV3 } from './catalog';
 import type { ComputeStandingV3 } from './contract';
-import { paidAccess } from './standing';
+import { neverPaidTrial, paidAccess } from './standing';
 
 /** Paid receipts and reversals keep the same subscription/period isolation as v2. */
 export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
@@ -31,7 +31,8 @@ export const GRANT_PENDING_SECONDS = 10 * 60;
  * the start gate (compute-access.ts) and the summary (paid compute policy v1), so neither shows a renewal as used up.
  */
 export function renewalGrantPending(plan: ResolvedPlanV3, standing: ComputeStandingV3, grants: readonly GrantRow[], now: Date): boolean {
-    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.operator || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
+    if (plan.sku === 'legacy' || plan.sku === 'free_v3' || plan.operator || neverPaidTrial(plan)
+        || plan.offer.provider !== 'aws' || !paidAccess(standing) || standing === 'grace') return false;
     const start = Date.parse(plan.window.start);
     return !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId)
         && now.getTime() >= start && now.getTime() - start < GRANT_PENDING_SECONDS * 1000;
