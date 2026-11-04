@@ -30,11 +30,15 @@ export interface SubscriptionUpsert {
     cancelAtPeriodEnd: boolean;
     /** `created` of the Stripe event that produced this state; older states never overwrite newer ones. */
     stripeEventCreated: Date;
+    /** 0021: Stripe's trial window as read with this state; omitted by writers that predate the trial. */
+    trialStart?: Date | null;
+    trialEnd?: Date | null;
 }
 
 export type GrantMeter = 'workspace_seconds' | 'ai_usd_micro' | typeof GRANT_METER_COMPUTE;
-export type GrantKind = 'pro_period' | 'topup' | GrantKindV2;
-export type GrantSource = 'invoice' | 'payment_intent' | 'refund' | 'dispute';
+/** `trial_period` (0021): the Standard trial's own grant, sourced from the subscription, never an invoice. */
+export type GrantKind = 'pro_period' | 'topup' | 'trial_period' | GrantKindV2;
+export type GrantSource = 'invoice' | 'payment_intent' | 'refund' | 'dispute' | 'trial';
 
 export interface GrantInsert {
     userId: string;
@@ -282,6 +286,13 @@ export interface StripeSubscription {
     pendingUpdateExpiresAt: Date | null;
     /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
+    /** Stripe's trial window (null without a trial). Optional for adapters that predate the trial. */
+    trialStart?: Date | null;
+    trialEnd?: Date | null;
+    /** `metadata.ezil_trial` written by our own trial checkout: the trial row id, never an owner. */
+    trialId?: string | null;
+    /** When the subscription ended (canceled / incomplete_expired); null while it lives. */
+    endedAt?: Date | null;
 }
 
 export interface StripeInvoice {
@@ -292,6 +303,12 @@ export interface StripeInvoice {
     billingReason: string | null;
     metadataKind: string | null;
     hostedInvoiceUrl: string | null;
+    /**
+     * Stripe's `total` and `amount_paid` in the invoice currency's minor unit. A period grant needs a
+     * positive total: a $0 invoice (a trial, a 100% coupon) is never proof that a period was paid.
+     */
+    total: number;
+    amountPaid: number;
     lines: {
         id: string;
         lookupKey: string | null;
@@ -354,6 +371,11 @@ export interface CheckoutRequest {
     successUrl: string;
     cancelUrl: string;
     idempotencyKey: string;
+    /**
+     * Standard trial (0021): the server-quoted trial end (the first charge) and the trial row id. Set only by the
+     * router after its eligibility check; the session then collects a payment method with no charge today.
+     */
+    trial?: { trialId: string; trialEnd: Date; expiresAt: Date };
 }
 
 export interface CheckoutSessionCreated {
@@ -436,6 +458,8 @@ export interface StripeApi extends StripePackApi {
     retrieveInvoicePaymentState(invoiceId: string): Promise<StripeInvoicePaymentState>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
+    /** Expire an open Checkout Session (a superseded trial checkout). 'complete' when it already finished. */
+    expireCheckoutSession?(id: string): Promise<'expired' | 'complete' | 'gone'>;
 }
 
 export interface StripePrice {

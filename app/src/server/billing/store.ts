@@ -15,7 +15,9 @@ import {
     billingOutbox,
     billingStorageSamples,
     billingSubscriptions,
+    billingTrials,
     billingUsageIntervals,
+    type BillingTrialRow,
 } from '@/server/db/schema/billing';
 import { computers } from '@/server/db/schema/computers';
 import {
@@ -27,6 +29,7 @@ import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
 import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
+import { authSubjectFor, normalizeEmail, UNBOUND_TRIAL_STATUSES, TRIAL_POLICY_VERSION, TRIAL_SKU, type TrialRow, type TrialStore } from './v3/trial';
 
 type Database = typeof import('@/server/db').db;
 
@@ -53,8 +56,124 @@ function computeEpoch(row: BillingComputeEpochRow): StoredComputeEpoch {
  * application's database or require its environment. Conflict guards live in
  * SQL so concurrent deliveries obey the same rules as sequential retries.
  */
+function trialRow(row: BillingTrialRow): TrialRow {
+    return { id: row.id, userId: row.userId, authSubject: row.authSubject, emailNormalized: row.emailNormalized, sku: row.sku,
+        policyVersion: row.policyVersion, status: row.status, quotedAt: row.quotedAt, trialEnd: row.trialEnd,
+        checkoutSessionId: row.checkoutSessionId, stripeCustomerId: row.stripeCustomerId,
+        stripeSubscriptionId: row.stripeSubscriptionId, trialStart: row.trialStart };
+}
+
+/** Postgres unique_violation: a concurrent claim by another account (email or subject) or a second quote. */
+const uniqueViolation = (error: unknown) => (error as { code?: string; cause?: { code?: string } })?.code === '23505'
+    || (error as { cause?: { code?: string } })?.cause?.code === '23505';
+
+const PAID_GRANT_KINDS = ['plan_period', 'upgrade_prorated', 'pro_period'] as const;
+const PAID_SUBSCRIPTION_SKUS = ['standard_monthly_v3', 'premium_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const;
+
 export function createBillingStore(db: Database): BillingStore {
-    const store: BillingStore & AiTopupReceiptStore & AiReversalStore = {
+    const store: BillingStore & AiTopupReceiptStore & AiReversalStore & TrialStore = {
+        /** Server facts only: auth.users (email, its confirmation, the linked Auth0 subject) and the billing tables. */
+        async trialFacts(userId) {
+            const [user] = await db.execute<{ email: string | null; confirmed: boolean; auth0_sub: string | null }>(sql`
+                select email, email_confirmed_at is not null as confirmed, raw_app_meta_data->>'auth0_sub' as auth0_sub
+                from auth.users where id = ${userId}::uuid and deleted_at is null`);
+            const emailNormalized = normalizeEmail(user?.email ?? null);
+            const authSubject = authSubjectFor(userId, user?.auth0_sub);
+            const rows = await db.select().from(billingTrials).where(or(eq(billingTrials.userId, userId),
+                eq(billingTrials.authSubject, authSubject), ...(emailNormalized ? [eq(billingTrials.emailNormalized, emailNormalized)] : [])));
+            const own = rows.find(row => row.userId === userId);
+            // Every account whose verified email is the same person: same domain first, then the same normalized key.
+            const domain = emailNormalized?.split('@')[1] ?? null;
+            const sameDomain = domain === null ? [] : await db.execute<{ id: string; email: string | null }>(sql`
+                select id::text as id, email from auth.users
+                where lower(split_part(email, '@', 2)) in (${domain}, ${domain === 'gmail.com' ? 'googlemail.com' : domain})`);
+            const people = [...new Set([userId, ...[...sameDomain].filter(row => normalizeEmail(row.email) === emailNormalized).map(row => row.id)])];
+            const [paid] = await db.execute<{ paid: boolean }>(sql`
+                select exists (
+                    select 1 from public.ezil_billing_grants g where g.user_id = any(${`{${people.join(',')}}`}::uuid[])
+                        and g.kind in (${sql.join(PAID_GRANT_KINDS.map(kind => sql`${kind}`), sql`, `)}) and g.amount > 0
+                ) or exists (
+                    -- A live or once-live paid subscription that is not a trial (legacy rows predate first_paid_at).
+                    select 1 from public.ezil_billing_subscriptions s where s.user_id = any(${`{${people.join(',')}}`}::uuid[])
+                        and s.sku in (${sql.join(PAID_SUBSCRIPTION_SKUS.map(sku => sql`${sku}`), sql`, `)})
+                        and s.status not in ('incomplete', 'incomplete_expired') and (s.trial_end is null or s.first_paid_at is not null)
+                ) as paid`);
+            return {
+                emailNormalized, emailVerified: user?.confirmed === true, authSubject,
+                own: own ? trialRow(own) : null,
+                claimedElsewhere: rows.some(row => row.userId !== userId),
+                paidBefore: paid?.paid === true,
+            };
+        },
+
+        async trialById(trialId) {
+            if (!/^[0-9a-f-]{36}$/.test(trialId)) return null;
+            const [row] = await db.select().from(billingTrials).where(eq(billingTrials.id, trialId)).limit(1);
+            return row ? trialRow(row) : null;
+        },
+
+        async claimTrialQuote(input) {
+            try {
+                return await db.transaction(async tx => {
+                    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:trial:${input.userId}`}, 0))`);
+                    const [existing] = await tx.select().from(billingTrials).where(eq(billingTrials.userId, input.userId)).for('update');
+                    if (existing && !UNBOUND_TRIAL_STATUSES.includes(existing.status)) return { status: 'refused' as const, reason: 'trial_used' as const };
+                    if (existing) {
+                        const [row] = await tx.update(billingTrials).set({ quotedAt: input.quotedAt, trialEnd: input.trialEnd, status: 'quoted',
+                            checkoutSessionId: null, policyVersion: TRIAL_POLICY_VERSION, updatedAt: sql`now()` })
+                            .where(and(eq(billingTrials.id, existing.id), isNull(billingTrials.stripeSubscriptionId))).returning();
+                        if (!row) return { status: 'refused' as const, reason: 'trial_used' as const };
+                        return { status: 'quoted' as const, trial: trialRow(row), supersededCheckoutSessionId: existing.checkoutSessionId };
+                    }
+                    const [row] = await tx.insert(billingTrials).values({ userId: input.userId, authSubject: input.authSubject,
+                        emailNormalized: input.emailNormalized, sku: TRIAL_SKU, policyVersion: TRIAL_POLICY_VERSION, status: 'quoted',
+                        quotedAt: input.quotedAt, trialEnd: input.trialEnd }).returning();
+                    return { status: 'quoted' as const, trial: trialRow(row!), supersededCheckoutSessionId: null };
+                });
+            } catch (error) {
+                // Another account holds this person's email or subject: the unique constraint decides a concurrent race.
+                if (uniqueViolation(error)) return { status: 'refused', reason: 'trial_used' };
+                throw error;
+            }
+        },
+
+        async attachTrialCheckout(input) {
+            const rows = await db.update(billingTrials).set({ status: 'checkout', checkoutSessionId: input.checkoutSessionId,
+                stripeCustomerId: input.customerId, updatedAt: sql`now()` }).where(and(eq(billingTrials.id, input.trialId),
+                eq(billingTrials.userId, input.userId), eq(billingTrials.quotedAt, input.quotedAt), isNull(billingTrials.stripeSubscriptionId),
+                or(isNull(billingTrials.stripeCustomerId), eq(billingTrials.stripeCustomerId, input.customerId))))
+                .returning({ id: billingTrials.id });
+            return rows.length > 0 ? 'attached' : 'stale';
+        },
+
+        async bindTrialSubscription(input) {
+            const rows = await db.update(billingTrials).set({ stripeSubscriptionId: input.subscriptionId, trialStart: input.trialStart,
+                stripeCustomerId: input.customerId, status: sql`case when ${billingTrials.status} in ('quoted', 'checkout') then 'trialing' else ${billingTrials.status} end`,
+                updatedAt: sql`now()` }).where(and(eq(billingTrials.id, input.trialId), eq(billingTrials.userId, input.userId),
+                or(isNull(billingTrials.stripeSubscriptionId), eq(billingTrials.stripeSubscriptionId, input.subscriptionId)),
+                or(isNull(billingTrials.stripeCustomerId), eq(billingTrials.stripeCustomerId, input.customerId))))
+                .returning({ id: billingTrials.id });
+            if (rows.length > 0) return 'bound';
+            const [row] = await db.select({ id: billingTrials.id }).from(billingTrials).where(eq(billingTrials.id, input.trialId)).limit(1);
+            return row ? 'conflict' : 'missing';
+        },
+
+        async setTrialStatus(input) {
+            await db.update(billingTrials).set({ status: input.status, updatedAt: sql`now()` }).where(and(
+                eq(billingTrials.id, input.trialId), eq(billingTrials.stripeSubscriptionId, input.subscriptionId),
+                inArray(billingTrials.status, [...input.from])));
+        },
+
+        async markSubscriptionPaid(subscriptionId, at) {
+            await db.update(billingSubscriptions).set({ firstPaidAt: sql`coalesce(${billingSubscriptions.firstPaidAt}, ${at.toISOString()}::timestamptz)` })
+                .where(eq(billingSubscriptions.stripeSubscriptionId, subscriptionId));
+        },
+
+        async outboxByEventKey(eventKey) {
+            const [row] = await db.select().from(billingOutbox).where(eq(billingOutbox.eventKey, eventKey)).limit(1);
+            return row ? { eventKey: row.eventKey, userId: row.userId, kind: row.kind, payload: row.payload as Record<string, unknown> } : null;
+        },
+
         async grantsForPeriod(userId, window, meters) {
             if (meters.length === 0) return [];
             const rows = await db.select().from(billingGrants).where(and(
@@ -383,6 +502,9 @@ export function createBillingStore(db: Database): BillingStore {
                 currentPeriodStart: billingSubscriptions.currentPeriodStart,
                 currentPeriodEnd: billingSubscriptions.currentPeriodEnd,
                 cancelAtPeriodEnd: billingSubscriptions.cancelAtPeriodEnd,
+                trialStart: billingSubscriptions.trialStart,
+                trialEnd: billingSubscriptions.trialEnd,
+                firstPaidAt: billingSubscriptions.firstPaidAt,
             }).from(billingSubscriptions).where(eq(billingSubscriptions.userId, userId));
         },
 
@@ -461,7 +583,8 @@ export function createBillingStore(db: Database): BillingStore {
         async upsertSubscription(row) {
             const written = await db.insert(billingSubscriptions).values(row).onConflictDoUpdate({
                 target: billingSubscriptions.stripeSubscriptionId,
-                // Ownership is fixed by the first insert, even when a newer event arrives.
+                // Ownership is fixed by the first insert, even when a newer event arrives. first_paid_at is never
+                // written here: only the first positive paid period sets it (markSubscriptionPaid).
                 set: {
                     status: sql`excluded.status`,
                     sku: sql`excluded.sku`,
@@ -469,6 +592,8 @@ export function createBillingStore(db: Database): BillingStore {
                     currentPeriodEnd: sql`excluded.current_period_end`,
                     cancelAtPeriodEnd: sql`excluded.cancel_at_period_end`,
                     stripeEventCreated: sql`excluded.stripe_event_created`,
+                    ...(row.trialStart !== undefined ? { trialStart: sql`excluded.trial_start` } : {}),
+                    ...(row.trialEnd !== undefined ? { trialEnd: sql`excluded.trial_end` } : {}),
                     updatedAt: sql`now()`,
                 },
                 setWhere: sql`${billingSubscriptions.userId} = excluded.user_id

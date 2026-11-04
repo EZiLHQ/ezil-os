@@ -7,6 +7,7 @@ import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offer
 import { readStripePacks, resetStripePackCachesForTests } from './packs';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
+import { TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
@@ -37,8 +38,16 @@ function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T)
     cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
+/** The trial end as checkout copy: an unambiguous UTC date and time (Checkout also shows it in the payer's locale). */
+function trialEndText(at: Date): string {
+    const day = at.toLocaleDateString('en-US', { timeZone: 'UTC', day: 'numeric', month: 'long', year: 'numeric' });
+    const time = at.toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false });
+    return `on ${day} at ${time} UTC`;
+}
+
 export class BillingProviderError extends Error {
-    constructor(public readonly code: 'price_not_found' | 'portal_configuration_missing' | 'preview_expired' | 'invalid_subscription_state') {
+    constructor(public readonly code: 'price_not_found' | 'portal_configuration_missing' | 'preview_expired' | 'invalid_subscription_state'
+        | 'invalid_trial_price') {
         super(code);
         this.name = 'BillingProviderError';
     }
@@ -82,6 +91,9 @@ interface SubscriptionResponse {
     cancel_at?: number | null;
     pending_update?: { expires_at?: number | null } | null;
     metadata?: Metadata | null;
+    trial_start?: number | null;
+    trial_end?: number | null;
+    ended_at?: number | null;
 }
 
 interface InvoiceLine {
@@ -105,6 +117,8 @@ export interface InvoiceResponse {
     customer: StripeReference;
     status: string;
     amount_due?: number;
+    total?: number;
+    amount_paid?: number;
     period_end?: number | null;
     next_payment_attempt?: number | null;
     currency?: string;
@@ -547,6 +561,24 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 fields.mode = 'subscription';
                 fields.line_items = [{ quantity: 1, price: price.id }];
                 fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: input.sku.endsWith('_v3') ? 'v3' : 'v2' } };
+                if (input.trial) {
+                    // Standard trial: $0 today, the quoted end as Stripe's trial end (never a fixed day count), a payment
+                    // method always collected, and a trial without one cancelled rather than left unpaid.
+                    if (input.sku !== 'standard_monthly_v3' || price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
+                        || price.currency !== 'usd' || !price.recurring) throw new BillingProviderError('invalid_trial_price');
+                    const trialMeta = { [TRIAL_METADATA_KEY]: input.trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
+                        ezil_trial_end: String(Math.floor(input.trial.trialEnd.getTime() / 1000)) };
+                    fields.metadata = { ...metadata, ...trialMeta };
+                    fields.payment_method_collection = 'always';
+                    fields.expires_at = Math.floor(input.trial.expiresAt.getTime() / 1000);
+                    fields.subscription_data = {
+                        metadata: { ...(fields.subscription_data as { metadata: Record<string, string> }).metadata, ...trialMeta },
+                        trial_end: Math.floor(input.trial.trialEnd.getTime() / 1000),
+                        trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+                    };
+                    fields.custom_text = { submit: { message: `No charge today. Your free month ends ${trialEndText(input.trial.trialEnd)}; `
+                        + 'then $20.00 a month until you cancel. Cancel before then and you pay nothing.' } };
+                }
             } else if (input.sku === PRO_PLAN.sku) {
                 fields.mode = 'subscription';
                 fields.line_items = [{
@@ -631,6 +663,7 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const offer = sku ? offerBySku(sku) : undefined;
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
             const periodEnd = item?.current_period_end ?? subscription.current_period_end;
+            const trialId = (subscription.metadata as Record<string, string | undefined> | null | undefined)?.[TRIAL_METADATA_KEY];
             // Round 6 (R4-04): a cancel scheduled as a date (`cancel_at`, e.g. the Dashboard's custom date) at or
             // before the period end ends the plan, so it is a cancel at period end (plan_ending), not a renewal.
             // A cancel_at earlier than the period end still shows the period end as the end date (no stored column;
@@ -649,6 +682,10 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 defaultPaymentMethod: referenceId(subscription.default_payment_method),
                 scheduleId: referenceId(subscription.schedule),
                 latestInvoiceId: referenceId(subscription.latest_invoice),
+                trialStart: date(subscription.trial_start),
+                trialEnd: date(subscription.trial_end),
+                trialId: typeof trialId === 'string' && /^[0-9a-f-]{36}$/.test(trialId) ? trialId : null,
+                endedAt: date(subscription.ended_at),
             };
         },
 
@@ -693,6 +730,9 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 billingReason: invoice.billing_reason ?? null,
                 metadataKind: invoice.metadata?.kind ?? null,
                 hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
+                // Missing amounts read as NaN, which no positive-amount rule accepts.
+                total: typeof invoice.total === 'number' && Number.isSafeInteger(invoice.total) ? invoice.total : NaN,
+                amountPaid: typeof invoice.amount_paid === 'number' && Number.isSafeInteger(invoice.amount_paid) ? invoice.amount_paid : NaN,
                 lines: lines.map(item => ({
                     id: item.id,
                     lookupKey: lookupKeys.get(referenceId(priceFor(item)) ?? '') ?? null,
@@ -722,6 +762,17 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 currency: session.currency ?? null,
                 metadataCredits: session.metadata?.sku === CUSTOM_TOPUP_SKU ? session.metadata?.credits ?? null : session.metadata?.ezil_credits ?? null,
             };
+        },
+
+        async expireCheckoutSession(id) {
+            try {
+                const session = await request<{ status?: string }>(`/checkout/sessions/${encodeURIComponent(id)}/expire`, {});
+                return session.status === 'complete' ? 'complete' : 'expired';
+            } catch (error) {
+                if (!(error instanceof StripeRequestError) || (error.status !== 400 && error.status !== 404)) throw error;
+                const session = await request<{ status?: string }>(`/checkout/sessions/${encodeURIComponent(id)}`).catch(() => null);
+                return session?.status === 'complete' ? 'complete' : session?.status === 'expired' ? 'expired' : 'gone';
+            }
         },
 
         async retrieveCharge(id) {

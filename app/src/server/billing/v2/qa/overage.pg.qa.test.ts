@@ -171,7 +171,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa overage (Postgres)',
             const failedAt = new Date(AFTER_CLOSE.getTime() + H);
             stripe.invoices.set('in_overage_1', {
                 id: 'in_overage_1', customer: a.customerId, status: 'open', subscriptionId: null, billingReason: 'manual',
-                metadataKind: 'overage', hostedInvoiceUrl: null, lines: [], periodStart: null, periodEnd: null,
+                metadataKind: 'overage', hostedInvoiceUrl: null, total: 0, amountPaid: 0, lines: [], periodStart: null, periodEnd: null,
             });
             const outcome = await processStripeEvent(invoicePaidEvent(stripe.invoices.get('in_overage_1')!, failedAt, 'invoice.payment_failed'), { store, stripe: stripe.api, now: () => failedAt });
             expect(outcome).toBe('applied');

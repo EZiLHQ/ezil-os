@@ -17,6 +17,11 @@ export interface SubscriptionRow {
     currentPeriodStart: Date | null;
     currentPeriodEnd: Date | null;
     cancelAtPeriodEnd: boolean;
+    /** 0021: Stripe's trial window (null or omitted without a trial). */
+    trialStart?: Date | null;
+    trialEnd?: Date | null;
+    /** 0021: the first positive paid period's grant time; null while a trial has never paid. */
+    firstPaidAt?: Date | null;
 }
 
 export interface IntervalRow {

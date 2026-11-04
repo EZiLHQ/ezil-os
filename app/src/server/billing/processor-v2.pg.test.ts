@@ -51,6 +51,7 @@ function invoice(sub: StripeSubscription, overrides: Partial<StripeInvoice> = {}
     return {
         id: `in_${randomUUID()}`, customer: sub.customer, status: 'paid', subscriptionId: sub.id,
         billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: 'https://invoice.example/fixture',
+        total: CATALOG_V2[sub.sku as SellableSku]?.priceCents ?? 2_000, amountPaid: CATALOG_V2[sub.sku as SellableSku]?.priceCents ?? 2_000,
         periodStart: sub.currentPeriodStart, periodEnd: sub.currentPeriodEnd,
         // The base line is deliberately not first. Only the lookup key chooses it.
         lines: [line(sub, 'standard_monthly_v2', { lookupKey: null, amount: 10 }), line(sub, sub.sku as SellableSku)],

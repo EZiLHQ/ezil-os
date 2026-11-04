@@ -304,7 +304,23 @@ export interface BillingSummaryV3 {
          * payment: no renewal, checkout, upgrade, downgrade or cancel through Stripe, and no included AI credits.
          */
         access?: { source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean };
+        /**
+         * Standard trial (additive, present only for a trial that has not converted): `trialing` = $0 so far, the first
+         * charge of `amountCents` on `firstChargeAt` (= `endsAt`) unless cancelled; `ending` = cancelled, Standard until
+         * `endsAt` and no charge; `payment_failed` = the trial ended and its first charge did not go through, so Standard
+         * access has ended (files kept) until a payment succeeds. Never a paid period.
+         */
+        trial?: { state: 'trialing' | 'ending' | 'payment_failed'; startedAt: string | null; endsAt: string;
+            firstChargeAt: string | null; amountCents: number; currency: 'usd' };
     };
+    /**
+     * Standard trial offer (additive; only while checkout is available and the viewer is on Free). `eligible` carries
+     * the server's preview of the end if a trial started now; the exact end is quoted by `billing.quoteTrial` and
+     * disclosed before checkout. `eligible: false` names why (a trial used, an earlier paid plan, an unverified email).
+     */
+    trialOffer?: { eligible: true; sku: 'standard_monthly_v3'; endsAt: string; amountCents: number; currency: 'usd' }
+        | { eligible: false; reason: 'not_free' | 'operator_plan' | 'no_email' | 'email_unverified' | 'trial_used' | 'paid_before' }
+        | null;
     computer: {
         /** The size the next session opens with (the chosen size on Premium). */
         size: SizeCode;
@@ -481,7 +497,7 @@ export interface PublicOfferV3 {
  *  Input/output shapes otherwise as v2 (PreviewUpgradeOutput etc. with toSku widened). No overage, no selectSize. */
 export const ROUTER_V3_PROCEDURES = [
     'summary', 'createCheckout', 'createTopupCheckout', 'previewUpgrade', 'confirmUpgrade', 'scheduleDowngrade', 'cancelAtPeriodEnd',
-    'history', 'portal', 'checkoutStatus',
+    'history', 'portal', 'checkoutStatus', 'quoteTrial',
 ] as const;
 
 // ── Machine choice (Premium) ─────────────────────────────────────────────────

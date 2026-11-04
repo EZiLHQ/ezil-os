@@ -10,9 +10,10 @@ import { stripePackCredits, stripePackSku } from './stripe/packs';
 import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
 import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
 import { CATALOG_V3 } from './v3/contract';
-import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiUpgradeEntitlement, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
+import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiUpgradeEntitlement, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
 import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
+import { hasTrials, TRIAL_SKU, trialEntitlement } from './v3/trial';
 
 function subscriptionRow(subscription: StripeSubscription, userId: string, created: number) {
     return {
@@ -24,7 +25,70 @@ function subscriptionRow(subscription: StripeSubscription, userId: string, creat
         currentPeriodEnd: subscription.currentPeriodEnd,
         cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
         stripeEventCreated: new Date(created * 1000),
+        trialStart: subscription.trialStart ?? null,
+        trialEnd: subscription.trialEnd ?? null,
     };
+}
+
+const seconds = (date: Date) => Math.floor(date.getTime() / 1000);
+
+/**
+ * Standard trial (v3/trial.ts). Stripe's subscription state is re-read on every delivery; the trial row only proves
+ * that OUR server quoted this trial to this account, with this end. Never a payment: the grant has its own kind and
+ * source, and its AI root expires at the trial end. Statuses after the trial converge on the newest provider state.
+ */
+async function applyTrial(subscription: StripeSubscription, userId: string, event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
+    const { store } = deps;
+    if (!subscription.trialId) return 'applied';
+    if (!hasTrials(store)) return 'failed:trial_store_unavailable';
+    if (subscription.sku !== TRIAL_SKU) return 'review:trial_sku';
+    const trial = await store.trialById(subscription.trialId);
+    if (!trial || trial.userId !== userId) return 'review:trial_unknown';
+    if (trial.stripeCustomerId !== null && trial.stripeCustomerId !== subscription.customer) return 'review:trial_customer_mismatch';
+    if (trial.stripeSubscriptionId !== null && trial.stripeSubscriptionId !== subscription.id) return 'review:trial_conflict';
+    const { trialStart, trialEnd } = subscription;
+    if (subscription.status === 'trialing') {
+        // What the person agreed to is what Stripe charges on: the quoted end is Stripe's trial end, to the second.
+        if (!trialStart || !trialEnd || trialEnd <= trialStart) return 'review:trial_invalid_period';
+        if (trial.stripeSubscriptionId === null) {
+            if (seconds(trialEnd) !== seconds(trial.trialEnd)) return 'review:trial_terms_mismatch';
+            const bound = await store.bindTrialSubscription({ trialId: trial.id, userId, customerId: subscription.customer,
+                subscriptionId: subscription.id, trialStart });
+            if (bound !== 'bound') return `review:trial_${bound}`;
+        }
+        // A replay after the trial ended mints nothing: Stripe would no longer say trialing, and the clock agrees.
+        if (deps.now() >= trialEnd) return 'applied';
+        await store.insertGrant({
+            userId, subscriptionId: subscription.id, meter: GRANT_METER_COMPUTE, kind: 'trial_period',
+            amount: BigInt(CATALOG_V3[TRIAL_SKU].fairUseSeconds), periodStart: trialStart, periodEnd: trialEnd,
+            sourceType: 'trial', sourceId: subscription.id,
+        });
+        // The person index (one trial grant per user and meter) can refuse a second subscription's grant: never fund it.
+        const own = await store.grantsBySource('trial', subscription.id);
+        if (!own.some(grant => grant.kind === 'trial_period' && grant.userId === userId)) return 'review:trial_already_granted';
+        schedulePaidMigration(userId, TRIAL_SKU, event.type);
+        // Queued on replay too; the event key keeps it to one row.
+        await store.enqueueOutbox(aiCreditOutboxItem(userId, trialEntitlement({ subscriptionId: subscription.id, trialStart, trialEnd }), 'grant', null));
+        return 'applied';
+    }
+    if (trial.stripeSubscriptionId === null || trial.status === 'converted') return 'applied';
+    const ended = subscription.status === 'canceled' || subscription.status === 'incomplete_expired' || subscription.endedAt != null;
+    const failed = subscription.status === 'past_due' || subscription.status === 'unpaid';
+    if (!ended && !failed) return 'applied';
+    // A trial that ends without a payment keeps no trial-funded AI credits: revoke the trial root while it is still
+    // live (an immediate cancel, or an end moved earlier). At its own end it has already expired. Nothing else is touched.
+    if (trial.trialStart) {
+        const root = trialEntitlement({ subscriptionId: subscription.id, trialStart: trial.trialStart, trialEnd: trial.trialEnd });
+        const receipt = await store.outboxByEventKey(`${root.entitlementId}:grant`);
+        if (receipt && receipt.userId === userId && receipt.kind === 'ai_grant'
+            && Date.parse(String(receipt.payload.expiresAt)) > deps.now().getTime()) {
+            await store.enqueueOutbox(aiCreditRevokeItem({ ...receipt, kind: 'ai_grant' }));
+        }
+    }
+    const endedEarly = ended && (subscription.endedAt ?? deps.now()) < trial.trialEnd;
+    await store.setTrialStatus({ trialId: trial.id, subscriptionId: subscription.id,
+        status: failed ? 'payment_failed' : endedEarly ? 'canceled' : 'ended', from: ['trialing', 'payment_failed'] });
+    return 'applied';
 }
 
 /** Keep expiry stable across retries, including deliveries delayed for days. */
@@ -102,6 +166,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
 
             if (grant.kind === 'period') {
                 if (offer.sku === PRO_PLAN.sku) {
+                    if (!(invoice.total > 0)) return 'review:zero_amount_invoice';
                     const { periodStart, periodEnd } = invoice;
                     if (!validPeriod(periodStart, periodEnd)) return 'review:invalid_period';
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
@@ -134,6 +199,14 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     if (bases.length === 0) return 'review:no_base_line';
                     if (bases.length > 1) return 'review:ambiguous_base_line';
                     const { base, offer: invoicedOffer } = bases[0];
+                    // A $0 invoice is never paid proof. Only our own trial's create invoice continues, as a trial.
+                    if (!(invoice.total > 0) || !(base.amount > 0)) {
+                        if (invoice.billingReason !== 'subscription_create' || invoice.total !== 0 || invoicedOffer.sku !== TRIAL_SKU
+                            || !subscription.trialId) return 'review:zero_amount_invoice';
+                        const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
+                        if (result === 'conflict') return 'review:customer_mismatch';
+                        return applyTrial(subscription, userId, event, deps);
+                    }
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                     if (result === 'conflict') return 'review:customer_mismatch';
                     await store.resolvePaymentIssue(invoice.id, eventCreated);
@@ -142,6 +215,17 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                         amount: BigInt(invoicedOffer.allowanceStdSeconds), periodStart: base.periodStart, periodEnd: base.periodEnd,
                         sourceType: 'invoice', sourceId: invoice.id,
                     }, invoicedOffer.sku);
+                    // The first positive paid period ends "never paid" (no renewal grace before it); a trial converts.
+                    if (hasTrials(store)) {
+                        await store.markSubscriptionPaid(subscription.id, eventCreated);
+                        if (subscription.trialId) {
+                            const trial = await store.trialById(subscription.trialId);
+                            if (trial && trial.userId === userId && trial.stripeSubscriptionId === subscription.id) {
+                                await store.setTrialStatus({ trialId: trial.id, subscriptionId: subscription.id, status: 'converted',
+                                    from: ['trialing', 'payment_failed', 'ended'] });
+                            }
+                        }
+                    }
                     if (invoicedOffer.sku === 'standard_monthly_v3' || invoicedOffer.sku === 'premium_monthly_v3') {
                         await store.enqueueOutbox(aiCreditOutboxItem(userId, aiCreditEntitlement({
                             userId, sku: invoicedOffer.sku, subscriptionId: subscription.id,
@@ -197,6 +281,9 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
             if (userId === null) return 'unattributed:customer';
             const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
             if (result === 'conflict') return 'review:customer_mismatch';
+            // The trial follows Stripe's current state on every subscription delivery, stale or not (it is re-read).
+            const trialOutcome = subscription.trialId ? await applyTrial(subscription, userId, event, deps) : 'applied';
+            if (trialOutcome !== 'applied') return trialOutcome;
             if (result === 'applied') {
                 const changes = await store.openPlanChanges(userId);
                 const downgrade = changes.find(change => change.subscriptionId === subscription.id

@@ -115,11 +115,12 @@ const expectedSubscription = {
     id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
     currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
     pendingUpdateExpiresAt: null, defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
+    trialStart: null, trialEnd: null, trialId: null, endedAt: null,
 };
-const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
+const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20, total: 2000, amount_paid: 2000 };
 const expectedInvoice = {
     id: 'in_fixture', customer: 'cus_fixture', status: 'paid', subscriptionId: 'sub_fixture',
-    billingReason: null, metadataKind: null, hostedInvoiceUrl: null,
+    billingReason: null, metadataKind: null, hostedInvoiceUrl: null, total: 2000, amountPaid: 2000,
     periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
 };
 const session = {

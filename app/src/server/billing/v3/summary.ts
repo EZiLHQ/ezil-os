@@ -10,7 +10,7 @@ import { fairUseStatusOf, HOLD_SIZE } from './admission';
 import { UNMETERED_PAID_PLAN_IDS } from '../../lib/compute/paid-compute-policy';
 import { planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
 import {
-    CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
+    CATALOG_V3, CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
 } from './contract';
 import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
 import { fairUseAllowance, renewalGrantPending } from './funding';
@@ -21,6 +21,8 @@ import {
 } from '../../lib/compute/provider-reverse';
 import { REVERSE_MOVE_HOLDING, type ComputeReverseMove } from '../../lib/compute/provider-reverse-store';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
+import { parseTrialEntitlement, TRIAL_SKU } from './trial';
+import { neverPaidTrial } from './standing';
 import { aiMicroBalanceState, type AiGatewayGrant, type AiOpenHold } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
 import { creditNumber } from '../ai-read';
@@ -72,6 +74,10 @@ function receiptBucket(entitlementId: string, plan: ResolvedPlanV3): { bucket: A
     const inWindow = (at: number) => plan.subscriptionId !== null && at >= start && at < end;
     const upgrade = parseAiUpgradeEntitlement(entitlementId);
     if (upgrade) return { bucket: upgrade.subscriptionId === plan.subscriptionId && inWindow(upgrade.effectiveAt.getTime()) ? 'included' : 'previous' };
+    // The trial's own root funds the trial window as that period's plan credits (it is the period during the trial).
+    const trial = parseTrialEntitlement(entitlementId);
+    if (trial) return trial.subscriptionId === plan.subscriptionId && inWindow(trial.trialStart.getTime())
+        ? { bucket: 'included', planPeriodSku: TRIAL_SKU } : { bucket: 'previous' };
     const period = PERIOD_ROOT.exec(entitlementId);
     return period && period[2] === plan.subscriptionId && inWindow(Date.parse(period[3]!))
         ? { bucket: 'included', planPeriodSku: period[1] } : { bucket: 'previous' };
@@ -330,6 +336,26 @@ export function reverseMoveFields(input: ReverseMoveSummaryInput | undefined, st
     };
 }
 
+/**
+ * Standard trial status for the plan's subscription, from stored Stripe state only. Converted trials (a positive paid
+ * period granted) show nothing: they are ordinary Standard. The first charge's amount is Stripe's renewal preview when
+ * it reads, else the catalog price the checkout was refused without.
+ */
+export function trialBlock(sub: (Parameters<typeof neverPaidTrial>[0] & { status: string; cancelAtPeriodEnd: boolean;
+    trialStart?: Date | null }) | undefined, sku: string, paymentIssue: boolean, renewal: BillingSummaryV3['plan']['renewal'] | null,
+now: Date): BillingSummaryV3['plan']['trial'] | undefined {
+    if (!sub || sku !== TRIAL_SKU || !neverPaidTrial(sub) || !sub.trialEnd || !Number.isFinite(sub.trialEnd.getTime())) return undefined;
+    const endsAt = iso(sub.trialEnd);
+    const startedAt = sub.trialStart && Number.isFinite(sub.trialStart.getTime()) ? iso(sub.trialStart) : null;
+    const amountCents = renewal?.amountCents ?? CATALOG_V3[TRIAL_SKU].priceCents;
+    const base = { startedAt, endsAt, amountCents, currency: 'usd' as const };
+    if (sub.status === 'past_due' || sub.status === 'unpaid' || (paymentIssue && now >= sub.trialEnd)) {
+        return { ...base, state: 'payment_failed', firstChargeAt: endsAt };
+    }
+    if (sub.status !== 'trialing' || now >= sub.trialEnd) return undefined;
+    return sub.cancelAtPeriodEnd ? { ...base, state: 'ending', firstChargeAt: null } : { ...base, state: 'trialing', firstChargeAt: endsAt };
+}
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
@@ -359,6 +385,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     reverseMove?: ReverseMoveSummaryInput;
     /** Product entitlements v1: the account's operator assignments; omitted = none (Stripe or Free, as before). */
     operatorGrants?: readonly OperatorEntitlementRow[];
+    /** Standard trial: the router's eligibility for this viewer (server facts); omitted = no offer key. */
+    trialOffer?: BillingSummaryV3['trialOffer'];
 }): BillingSummaryV3 {
     const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
     const plan = planFromSubscriptions({ ...input, operator });
@@ -413,6 +441,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const activeDeadline = legacy ? legacy.compute.session.activeDeadline : Number.isFinite(activeBound) ? isoSeconds(activeBound) : null;
     const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
+    const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
+        paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
         enabled: true, version: 3,
@@ -423,7 +453,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt,
         // Product entitlements v1: assigned by an EZiL operator, not paid (no renewal, no Stripe actions); key absent otherwise.
         ...(operator ? { access: { source: 'operator' as const, ref: operator.ref, endsAt: operator.endsAt === null ? null : iso(operator.endsAt),
-            untilRevoked: operator.endsAt === null } } : {}) },
+            untilRevoked: operator.endsAt === null } } : {}),
+        ...(trial ? { trial } : {}) },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
             opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
             machineChoice: (rated.sku === 'legacy' ? [size.code] : rated.offer.machineChoice).map(code => ({
@@ -451,12 +482,14 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
-            upgrade: enabled && !operator && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            // A trial is not upgraded: its $0 proration would turn a free Standard month into a free Premium one.
+            upgrade: enabled && !operator && !trial && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: enabled && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             cancel: enabled && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
             portal: enabled && !operator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
+        ...(input.trialOffer !== undefined && enabled && plan.family === 'free' ? { trialOffer: input.trialOffer } : {}),
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),

@@ -435,7 +435,7 @@ test('reverse moves production apply and baseline refuse before connecting', () 
 test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
     const file = 'app/drizzle/0019_operator_entitlements.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-2), file);
+    assert.equal(EXPLICIT_FILES.at(-3), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     // New tables only: no existing (Stripe, billing or compute) table is altered or written.
     assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
@@ -468,7 +468,7 @@ test('operator entitlements production apply and baseline refuse before connecti
 test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
     const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.at(-2), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
     assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
@@ -482,6 +482,43 @@ test('operator refusal receipts follow immutable 0019 and are a production snaps
 test('operator refusal receipts production apply and baseline refuse before connecting', () => {
     for (const mode of [['apply', '--yes'], ['baseline', '0020_operator_refusal_receipts.sql', '--yes'],
         ['baseline', './app/drizzle/0020_operator_refusal_receipts.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+// Standard trial (request standard-trial-01b28d18): one new table, three nullable subscription columns, two widened
+// grant CHECKs and a partial unique index. Additive, staging-only, a production snapshot only.
+test('the Standard trial follows 0020, stays additive and is a production snapshot only', () => {
+    const file = 'app/drizzle/0021_standard_trial.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
+    for (const constraint of ['user_unique', 'subject_unique', 'email_unique', 'checkout_unique', 'subscription_unique', 'bound_chk']) {
+        assert.match(sql, new RegExp(`CONSTRAINT "ezil_billing_trials_${constraint}"`));
+    }
+    assert.match(sql, /ALTER TABLE "ezil_billing_trials" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing trials"\s+ON "ezil_billing_trials" FOR ALL USING \(auth\.role\(\) = 'service_role'\);/);
+    for (const column of ['trial_start', 'trial_end', 'first_paid_at']) {
+        assert.match(sql, new RegExp(`ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "${column}" timestamp with time zone;`));
+    }
+    assert.match(sql, /'upgrade_prorated', 'trial_period'\)\);/);
+    assert.match(sql, /'dispute', 'trial'\)\);/);
+    assert.match(sql, /CREATE UNIQUE INDEX "ezil_billing_grants_trial_once_uidx" ON "ezil_billing_grants" USING btree \("user_id","meter"\) WHERE "ezil_billing_grants"\."kind" = 'trial_period';/);
+    // Nothing is dropped except the two CHECKs it re-adds wider; no data is written.
+    assert.deepEqual([...sql.matchAll(/DROP CONSTRAINT "([^"]+)"/g)].map(match => match[1]),
+        ['ezil_billing_grants_kind_chk', 'ezil_billing_grants_source_type_chk']);
+    assert.doesNotMatch(sql, /DROP (?:TABLE|COLUMN|INDEX)|INSERT INTO|UPDATE "|UPDATE public|DELETE FROM|TRUNCATE|GRANT |DISABLE ROW LEVEL SECURITY/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('Standard trial production apply and baseline refuse before connecting', () => {
+    for (const mode of [['baseline', '0021_standard_trial.sql', '--yes'], ['baseline', './app/drizzle/0021_standard_trial.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);

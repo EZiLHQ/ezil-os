@@ -308,7 +308,7 @@ class MemoryStripe implements StripeApi {
     };
     invoice: StripeInvoice = {
         id: 'in_local', customer: 'cus_local', status: 'paid', subscriptionId: 'sub_local', periodStart, periodEnd,
-        billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, lines: [],
+        billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, total: 2000, amountPaid: 2000, lines: [],
     };
     session: StripeCheckoutSession = {
         id: 'cs_local', customer: 'cus_local', clientReferenceId: 'user_local',

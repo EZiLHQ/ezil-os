@@ -19,7 +19,10 @@ import { BillingProviderError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
-import { deriveStanding, operatorAccessFor } from '@/server/billing/v3/standing';
+import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/billing/v3/standing';
+import {
+    hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type TrialFacts, type TrialStore,
+} from '@/server/billing/v3/trial';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -94,16 +97,57 @@ async function ownedSubscription(deps: BillingDeps, stripe: StripeApi, userId: s
 
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
     if (toSku !== 'premium_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
-    const { plan, changes } = await currentPlan(deps, userId);
+    const { plan, changes, subs } = await currentPlan(deps, userId);
     const subscriptionId = paidSubscription(plan);
     if (plan.sku !== 'standard_monthly_v3' || plan.status !== 'active') {
         throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     }
+    // A Standard trial is never upgraded: the $0 proration would make the free month a free Premium month.
+    const row = subs.find(sub => sub.stripeSubscriptionId === subscriptionId);
+    if (row && neverPaidTrial(row)) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     if (changes.some(change => change.kind === 'upgrade')) throw billingError('upgrade_pending', 'CONFLICT');
     if (changes.some(change => change.kind === 'downgrade')) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     const subscription = await ownedSubscription(deps, stripe, userId, subscriptionId, 'upgrade_not_allowed');
-    if (subscription.scheduleId !== null) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+    if (subscription.scheduleId !== null || subscription.status === 'trialing') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     return { plan, subscriptionId };
+}
+
+/** Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`). */
+function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete'): TRPCError {
+    return new TRPCError({ code: code === 'trial_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
+}
+
+/** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
+async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
+    decision: ReturnType<typeof trialEligibility> }> {
+    const [facts, grants] = await Promise.all([store.trialFacts(userId), deps.store.operatorEntitlementsFor?.(userId) ?? []]);
+    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
+}
+
+async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
+    if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
+    try {
+        const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
+        if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        const terms = trialTerms(deps.now());
+        return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd' };
+    } catch {
+        // Billing stays readable without the trial tables (0021 not applied yet): no offer, never a guessed one.
+        console.error('Billing trial offer unavailable');
+        return null;
+    }
+}
+
+/**
+ * A superseded trial checkout must not finish after a re-quote: expire it first. A session that already completed
+ * means the trial is starting; the quote is kept so the subscription binds to exactly what was disclosed.
+ */
+async function retireTrialCheckout(stripe: StripeApi, sessionId: string | null): Promise<void> {
+    if (!sessionId) return;
+    const state = stripe.expireCheckoutSession ? await stripeCall(() => stripe.expireCheckoutSession!(sessionId))
+        : (await stripeCall(() => stripe.retrieveCheckoutSession(sessionId))).status;
+    if (state === 'complete') throw trialError('trial_checkout_complete');
+    if (state === 'open') throw trialError('trial_quote_stale');
 }
 
 /**
@@ -528,6 +572,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
                 operatorGrants,
+                trialOffer: await trialOfferFor(deps, ctx.user.id, plan.family),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -551,7 +596,30 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             return readAiLimits({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
         }),
 
-        createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+        /**
+         * Standard trial: claim this person's trial and fix the exact end (the first $20 charge) that the confirmation
+         * discloses. Eligibility is decided here from server facts; the client only echoes the end back to checkout.
+         */
+        quoteTrial: protectedProcedure.mutation(async ({ ctx }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            const store = deps.store;
+            if (!hasTrials(store)) throw trialError('trial_unavailable');
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+            if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
+            const terms = trialTerms(deps.now());
+            const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
+                emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd });
+            if (claim.status === 'refused') throw trialError('trial_unavailable');
+            return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
+                firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
+                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60) };
+        }),
+
+        createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']),
+            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }) }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const { plan } = await currentPlan(deps, ctx.user.id);
@@ -560,6 +628,18 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             // over it (the operator ends it first), refused before Stripe is called.
             if (operatorGrantInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
                 throw billingError('already_subscribed', 'CONFLICT');
+            }
+            // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
+            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore } | null = null;
+            if (input.trial) {
+                const store = deps.store;
+                if (input.sku !== TRIAL_SKU || !hasTrials(store)) throw trialError('trial_unavailable');
+                const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+                if (!decision.eligible) throw trialError('trial_unavailable');
+                const row = facts.own;
+                if (!row || row.status !== 'quoted' || !quoteFresh(row, deps.now())
+                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)) throw trialError('trial_quote_stale');
+                trial = { row, store };
             }
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
@@ -587,8 +667,20 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 returnUrl,
                 successUrl: returnUrl,
                 cancelUrl: `${origin}/os`,
-                idempotencyKey: `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
+                // One Stripe session per trial quote: a double click or second tab gets the same session back.
+                idempotencyKey: trial ? `trial-checkout:${trial.row.id}:${epochSeconds(trial.row.quotedAt)}`
+                    : `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
+                ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
+                    expiresAt: new Date((epochSeconds(deps.now()) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
             }));
+            if (trial) {
+                const attached = await trial.store.attachTrialCheckout({ trialId: trial.row.id, userId: ctx.user.id,
+                    quotedAt: trial.row.quotedAt, checkoutSessionId: session.id, customerId });
+                if (attached !== 'attached') {
+                    await stripe.expireCheckoutSession?.(session.id).catch(() => 'gone');
+                    throw trialError('trial_quote_stale');
+                }
+            }
             if (publishableKey) {
                 if (!session.clientSecret) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
                 return { mode: 'embedded', sessionId: session.id, clientSecret: session.clientSecret, publishableKey };

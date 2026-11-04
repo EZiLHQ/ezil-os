@@ -80,6 +80,11 @@
       "path": "app/drizzle/0020_operator_refusal_receipts.sql",
       "sha256": "c2b3dedaf9a53d5e449a59ebe1d8a3f0f9b863ed7d2c81c79d3d9bd1ce6b7951",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0021_standard_trial.sql",
+      "sha256": "d344dbf9ea28640ff1d494c3f0b828f08ea5b3fb8dce56ccbf9b670b47f059cf",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {
