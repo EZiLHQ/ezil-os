@@ -97,6 +97,8 @@ const topupStatus = result => {
     };
 };
 const TOPUP_REVIEW_COPY = "Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.";
+// Paid, not credited by the deadline: the webhook may have parked it before any receipt, so promise nothing.
+const TOPUP_TIMEOUT_COPY = "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.";
 
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
 // modal frames in body portals. Validate their URL only; never inspect their DOM.
@@ -268,7 +270,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             : paymentStatus === 'no_payment_required' ? `No payment is required. ${waiting}`
             : paymentStatus === 'unpaid' ? `Your payment is processing. Bank payments can take a few days. ${paymentUpdate}`
             : `${PAYMENT_PENDING_COPY} ${paymentUpdate}`;
-        const copy = timeout ? `${message} Check Settings → Billing for updates.` : message;
+        const copy = timeout && pack && paymentStatus === 'paid' && fulfillment !== 'credited' ? TOPUP_TIMEOUT_COPY
+            : timeout ? `${message} Check Settings → Billing for updates.` : message;
         if ( confirmationCopy === copy ) return;
         confirmationCopy = copy;
         show(copy, 'Back to Billing', returnToBilling, 'return-to-billing');
