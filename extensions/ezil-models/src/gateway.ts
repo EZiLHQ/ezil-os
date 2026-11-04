@@ -600,6 +600,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
     let requestId: string | undefined;
     let hold: string | null = null;
+    // The Gateway's exact response cache (opt-in set by EZiL OS, never by this extension): HIT or MISS, as evidence only.
+    let cache: string | undefined;
     let status: number | undefined;
     let stopReason: string | undefined;
     let errorCode: string | undefined;
@@ -690,6 +692,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 resendOf = undefined;
                 status = response.status;
                 hold = response.headers.get('x-ezil-hold-micro');
+                const cached = response.headers.get('x-ezil-cache');
+                cache = cached === 'HIT' || cached === 'MISS' ? cached : undefined;
                 requestId = response.headers.get('x-ezil-request-id') ?? undefined;
                 if (response.ok) {
                     options.signal.throwIfAborted();
@@ -800,6 +804,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : failureOrigin ?? null,
             ...(!cancelled && localCounts ? { body_bytes: localCounts.bodyBytes, limit_bytes: localCounts.limitBytes, messages: localCounts.messages,
                 max_blocks: localCounts.maxBlocks, tools: localCounts.tools, tool_bytes: localCounts.toolBytes } : {}),
+            ...(cache ? { cache } : {}),
             ...(compaction ? { compacted: { cause: compaction.cause, from_bytes: compaction.fromBytes, to_bytes: compaction.toBytes,
                 limit_bytes: compaction.limitBytes, folded: compaction.folded, shortened: compaction.shortened } } : {}),
             ...(cancelled ? { notice: `cancelled; may still be charged (request ${requestId ?? 'unknown'})` } : {}) }));

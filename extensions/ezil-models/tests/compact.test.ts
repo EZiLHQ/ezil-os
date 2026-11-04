@@ -214,6 +214,19 @@ describe('one bounded compact-and-retry after a definitive size refusal', () => 
     });
 });
 
+describe('exact response cache evidence', () => {
+    test('the metadata line records the Gateway\'s HIT or MISS, never any other value; the request carries no cache header', async () => {
+        for (const [header, logged] of [['HIT', 'HIT'], ['MISS', 'MISS'], ['hit; drop table', undefined], [null, undefined]] as const) {
+            const s = server(() => { const response = kimiJson(); if (header) response.headers.set('x-ezil-cache', header); return response; });
+            const seen: Headers[] = [];
+            const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => { seen.push(new Headers(init.headers)); return s.fetch(input, init); }) as typeof globalThis.fetch;
+            const { logs } = await run(gw(KIMI), ask(), fetch);
+            expect(JSON.parse(logs.at(-1)!).cache).toBe(logged);
+            expect([...seen[0]!.keys()].filter(key => key.startsWith('x-ezil-cache'))).toEqual([]);
+        }
+    });
+});
+
 describe('compactRequest', () => {
     const build = (model: ResolvedModel) => (request: ChatRequest, scale: number) => buildGatewayBody({ ...model, maxInputTokens: Math.floor(model.maxInputTokens * scale) }, request);
     const first = (request: ChatRequest, model = gw()) => { try { buildGatewayBody(model, request); } catch (error) { return error as LocalRequestError; } throw new Error('fits'); };
