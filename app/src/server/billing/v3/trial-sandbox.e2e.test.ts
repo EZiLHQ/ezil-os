@@ -500,8 +500,9 @@ async function advanceClock(s: Scenario, frozenTime: number): Promise<void> {
     }, { timeoutMs: 10 * 60_000, label: 'Stripe test clock ready' });
 }
 function emailFor(s: Scenario, label: string): string {
-    // Distinct base addresses: a `+tag` is stripped by normalization, so `+` is used only for the same-person cases.
-    return `trial-${runTag}-s${s.n}-${label}@example.test`;
+    // Gmail, whose documented mailbox rule (dots, `+tag`) makes the `+` same-person cases one person; a custom domain
+    // keeps `a+b@` distinct (E2). DB-only identities: the Stripe customers carry no email, so nothing is ever sent.
+    return `trial-${runTag}-s${s.n}-${label}@gmail.com`;
 }
 /** An auth.users row with a confirmed email (DB only: no Stripe customer). */
 async function createUser(s: Scenario, email: string): Promise<Tenant> {
