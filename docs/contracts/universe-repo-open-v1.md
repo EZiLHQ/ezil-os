@@ -300,12 +300,13 @@ Declared inside `selfserveRepositoriesV0Routes`, so manifest.ts is unchanged; mo
 - **201:** the legacy keys plus `class:'project'`, with `cloneUrl` on QA's gitHost (git-qa.ezil.work).
 - **Consumers** accept exactly those keys, `class === 'project'`, the route's project host, the requested repository, and `expiresAt` in (now, now + PROJECT_GRANT_ACCEPT_MAX_MS]: 300 s plus 30 s documented skew. The 60-minute web-clone grant (clone-token) and the 15-minute legacy grant both fail. A legacy consumer refuses a `class` key.
 - **Caller.** Universe's Builder open (os-builder-project-open-v1 §2) forwards the person's own OS-audience EZiL ID token, which it already verifies, never logging or keeping it, with `computerLabel` from the OS's open request. The OS-audience token stays refused on clone-token (§6.4 step 2); that is why the grant is here and not on clone-token.
+- **computerLabel is not authorization.** It only partitions the session (§6.6) and so what os-sessions/revoke can target. Account authority is the bearer's sub (`ownedByRepositoryId`); computer authority is the OS Worker's v2 claims plus its `.bind` check at install. Works cannot and does not check the computer.
 - **Issuance refusal.** The expiry used is the one the token verifier verified, carried to the route, never a body field. The verifier's legacy tolerance of up to 60 s past `exp` does not reach issuance: `exp <= now` is 401 `identity_token_invalid` before any session row or grant is written (`works.osGrantProjectExpiry`).
 - **Lifecycle.** Renewal is scheduled from the returned `expiresAt`, not a fixed timer (`projectGrantRenewal`):
   - less than 60 s left: not installed; reauthenticate once, then ask again;
   - at most 120 s left (the bearer limited it): installed; reauthenticate once before the next ask, so there is no refresh loop;
   - otherwise: installed and renewed 120 s before expiry.
-  One renewal is in flight at a time. A revoked session is never extended or revived; the next grant comes from a new session row. An expired grant is `grant_expired` at the gateway; os-sessions/revoke (§6.7) revokes the label's session and so every grant of either class (`grant_revoked` / `session_revoked`).
+  One renewal is in flight at a time. A revoked session is never extended or revived; the next grant comes from a new session row. An expired grant is `grant_expired` at the gateway; os-sessions/revoke (§6.7) revokes the label's session and so every grant of either class (`grant_revoked` / `session_revoked`). **Limit on the Builder path:** nothing calls os-sessions/revoke there (the OS never calls the QA origin, and Universe has no revoke relay), so after sign-out an installed project grant stays usable on the owner's own computer until its expiry, at most 300 s. The next renewal fails.
 
 ### 6.6 OS session row (no schema change)
 In ONE transaction, mirroring `webCloneSession` (cli-auth.ts:278-297):
