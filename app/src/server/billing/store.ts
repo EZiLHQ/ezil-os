@@ -29,7 +29,9 @@ import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
 import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
-import { authSubjectFor, normalizeEmail, UNBOUND_TRIAL_STATUSES, TRIAL_POLICY_VERSION, TRIAL_SKU, type TrialRow, type TrialStore } from './v3/trial';
+import {
+    authSubjectFor, mailboxDomains, normalizeEmail, UNBOUND_TRIAL_STATUSES, TRIAL_POLICY_VERSION, TRIAL_SKU, type TrialRow, type TrialStore,
+} from './v3/trial';
 
 type Database = typeof import('@/server/db').db;
 
@@ -79,15 +81,19 @@ export function createBillingStore(db: Database): BillingStore {
                 from auth.users where id = ${userId}::uuid and deleted_at is null`);
             const emailNormalized = normalizeEmail(user?.email ?? null);
             const authSubject = authSubjectFor(userId, user?.auth0_sub);
-            const rows = await db.select().from(billingTrials).where(or(eq(billingTrials.userId, userId),
-                eq(billingTrials.authSubject, authSubject), ...(emailNormalized ? [eq(billingTrials.emailNormalized, emailNormalized)] : [])));
-            const own = rows.find(row => row.userId === userId);
-            // Every account whose verified email is the same person: same domain first, then the same normalized key.
-            const domain = emailNormalized?.split('@')[1] ?? null;
-            const sameDomain = domain === null ? [] : await db.execute<{ id: string; email: string | null }>(sql`
+            // Every account whose CURRENT verified email is the same person: candidate domains, then the same key.
+            const domains = emailNormalized === null ? [] : mailboxDomains(emailNormalized.split('@')[1]!);
+            const sameDomain = domains.length === 0 ? [] : await db.execute<{ id: string; email: string | null }>(sql`
                 select id::text as id, email from auth.users
-                where lower(split_part(email, '@', 2)) in (${domain}, ${domain === 'gmail.com' ? 'googlemail.com' : domain})`);
+                where deleted_at is null and lower(split_part(email, '@', 2)) in (${sql.join(domains.map(domain => sql`${domain}`), sql`, `)})`);
             const people = [...new Set([userId, ...[...sameDomain].filter(row => normalizeEmail(row.email) === emailNormalized).map(row => row.id)])];
+            const others = people.filter(id => id !== userId);
+            const rows = await db.select().from(billingTrials).where(or(eq(billingTrials.userId, userId),
+                eq(billingTrials.authSubject, authSubject), ...(emailNormalized ? [eq(billingTrials.emailNormalized, emailNormalized)] : []),
+                ...(others.length ? [inArray(billingTrials.userId, others)] : [])));
+            const own = rows.find(row => row.userId === userId);
+            // A deleted account's never-started quote is reclaimable; its started trial (a tombstone) still claims.
+            const reclaimable = (row: BillingTrialRow) => row.userId === null && UNBOUND_TRIAL_STATUSES.includes(row.status);
             const [paid] = await db.execute<{ paid: boolean }>(sql`
                 select exists (
                     select 1 from public.ezil_billing_grants g where g.user_id = any(${`{${people.join(',')}}`}::uuid[])
@@ -101,7 +107,7 @@ export function createBillingStore(db: Database): BillingStore {
             return {
                 emailNormalized, emailVerified: user?.confirmed === true, authSubject,
                 own: own ? trialRow(own) : null,
-                claimedElsewhere: rows.some(row => row.userId !== userId),
+                claimedElsewhere: rows.some(row => row.userId !== userId && !reclaimable(row)),
                 paidBefore: paid?.paid === true,
             };
         },
@@ -115,11 +121,20 @@ export function createBillingStore(db: Database): BillingStore {
         async claimTrialQuote(input) {
             try {
                 return await db.transaction(async tx => {
-                    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:trial:${input.userId}`}, 0))`);
+                    // One lock per key in a fixed order: same-account, same-subject and same-email claims serialize.
+                    for (const key of [`user:${input.userId}`, `subject:${input.authSubject}`, `email:${input.emailNormalized}`].sort()) {
+                        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:trial:${key}`}, 0))`);
+                    }
                     const [existing] = await tx.select().from(billingTrials).where(eq(billingTrials.userId, input.userId)).for('update');
                     if (existing && !UNBOUND_TRIAL_STATUSES.includes(existing.status)) return { status: 'refused' as const, reason: 'trial_used' as const };
+                    // A deleted account's never-started quote on this subject or email gives way; a started one never does.
+                    await tx.delete(billingTrials).where(and(isNull(billingTrials.userId), isNull(billingTrials.stripeSubscriptionId),
+                        inArray(billingTrials.status, [...UNBOUND_TRIAL_STATUSES]),
+                        or(eq(billingTrials.authSubject, input.authSubject), eq(billingTrials.emailNormalized, input.emailNormalized))));
                     if (existing) {
+                        // The claim follows the current verified identity; the unique keys refuse one another account holds.
                         const [row] = await tx.update(billingTrials).set({ quotedAt: input.quotedAt, trialEnd: input.trialEnd, status: 'quoted',
+                            authSubject: input.authSubject, emailNormalized: input.emailNormalized,
                             checkoutSessionId: null, policyVersion: TRIAL_POLICY_VERSION, updatedAt: sql`now()` })
                             .where(and(eq(billingTrials.id, existing.id), isNull(billingTrials.stripeSubscriptionId))).returning();
                         if (!row) return { status: 'refused' as const, reason: 'trial_used' as const };

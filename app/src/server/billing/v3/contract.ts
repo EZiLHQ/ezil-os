@@ -307,10 +307,11 @@ export interface BillingSummaryV3 {
         /**
          * Standard trial (additive, present only for a trial that has not converted): `trialing` = $0 so far, the first
          * charge of `amountCents` on `firstChargeAt` (= `endsAt`) unless cancelled; `ending` = cancelled, Standard until
-         * `endsAt` and no charge; `payment_failed` = the trial ended and its first charge did not go through, so Standard
-         * access has ended (files kept) until a payment succeeds. Never a paid period.
+         * `endsAt` and no charge; `payment_pending` = the trial ended and Stripe has not collected the first charge yet
+         * (it tries about an hour after the end), so Standard waits for that payment; `payment_failed` = the first charge
+         * did not go through, so Standard access has ended (files kept) until a payment succeeds. Never a paid period.
          */
-        trial?: { state: 'trialing' | 'ending' | 'payment_failed'; startedAt: string | null; endsAt: string;
+        trial?: { state: 'trialing' | 'ending' | 'payment_pending' | 'payment_failed'; startedAt: string | null; endsAt: string;
             firstChargeAt: string | null; amountCents: number; currency: 'usd' };
     };
     /**

@@ -48,8 +48,9 @@ export function paidComputeAccessCtes(at: string, operator: boolean, userId?: st
             ) issue ON true
         ), stripe_standing AS (
             SELECT s.*, CASE WHEN s.status IN ('unpaid', 'incomplete') THEN false
-                -- standing.ts neverPaidTrial: a trial that never paid has no renewal grace.
-                WHEN s.in_dunning AND s.trial_end IS NOT NULL AND s.first_paid_at IS NULL THEN false
+                -- standing.ts neverPaidTrial: neither a new active period nor dunning proves the first payment.
+                WHEN s.trial_end IS NOT NULL AND s.first_paid_at IS NULL
+                    AND (s.in_dunning OR date_trunc('second', ${at}::timestamptz) >= date_trunc('second', s.trial_end)) THEN false
                 WHEN s.in_dunning THEN date_trunc('second', ${at}::timestamptz) < s.grace_end
                 ELSE s.period_active END AS covers
             FROM stripe_grace s

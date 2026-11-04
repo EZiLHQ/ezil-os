@@ -697,6 +697,21 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher).toHaveBeenCalledTimes(4); // Price ids persist across retrievals.
     });
 
+    it.each([
+        ['missing', {}],
+        ['strings', { total: '2000', amount_paid: '2000' }],
+        ['fractions', { total: 19.5, amount_paid: 19.5 }],
+        ['null', { total: null, amount_paid: null }],
+    ])('reads %s invoice amounts as NaN, which no positive-amount rule accepts', async (_name, amounts) => {
+        const { client } = fixture({ ...invoice, total: undefined, amount_paid: undefined, ...amounts });
+        const mapped = await client.retrieveInvoice('in_fixture');
+        expect(Number.isNaN(mapped.total) && Number.isNaN(mapped.amountPaid)).toBe(true);
+    });
+    it('reads an explicit $0 trial invoice as 0 total and 0 paid', async () => {
+        const { client } = fixture({ ...invoice, total: 0, amount_paid: 0, billing_reason: 'subscription_create' });
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject({ total: 0, amountPaid: 0, billingReason: 'subscription_create' });
+    });
+
     it('uses expanded modern and legacy Price lookup keys without extra fetches', async () => {
         const { client, fetcher } = fixture({ ...invoice, subscription: 'sub_fixture', lines: { data: [
             line('il_modern', { id: 'price_standard', lookup_key: standardKey }),

@@ -15,6 +15,7 @@ import { createStripeClient } from './stripe/client';
 import type { StripeEventLike } from './stripe/events';
 import { CATALOG_V2, OVERAGE_PRICE_LOOKUP_KEY, OVERAGE_TERMS_VERSION } from './v2/contract';
 import { upgradeGrantStdSeconds } from './v2/rating';
+import type { TrialRow as TrialRowShape, TrialStore as TrialStoreApi } from './v3/trial';
 
 const now = new Date('2026-10-11T12:00:00.000Z');
 const periodStart = new Date('2026-10-01T00:00:00.000Z');
@@ -2554,26 +2555,285 @@ describe('legacy restore refusal', () => {
 describe('Standard trial: a $0 invoice is never paid proof', () => {
     const trialStart = new Date('2026-11-05T10:00:00.000Z');
     const trialEnd = new Date('2026-12-05T10:00:00.000Z');
-    function trialFixture() {
-        const f = fixture();
-        f.stripe.subscription = { ...f.stripe.subscription, sku: 'standard_monthly_v3', status: 'trialing',
-            currentPeriodStart: trialStart, currentPeriodEnd: trialEnd,
-            items: [{ id: 'si_trial', priceId: 'price_v3', lookupKey: 'ezil_standard_monthly_v3' }] };
-        f.stripe.invoice = { ...f.stripe.invoice, billingReason: 'subscription_create', periodStart: trialStart, periodEnd: trialEnd,
-            lines: [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: 0,
-                periodStart: trialStart, periodEnd: trialEnd }] };
-        return f;
-    }
-    function createInvoice() {
-        return event('invoice.paid', { id: 'in_local', customer: 'cus_payload', billing_reason: 'subscription_create',
-            parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } });
+    const nextEnd = new Date('2027-01-05T10:00:00.000Z');
+    const TRIAL_ID = '6f2a9b8e-1c3d-4e5f-8a9b-0c1d2e3f4a5b';
+    const ROOT = `ezil-os:v1:standard_monthly_v3:sub_local:${trialStart.toISOString()}:trial`;
+    const PERIOD_ROOT = `ezil-os:v1:standard_monthly_v3:sub_local:${trialEnd.toISOString()}`;
+
+    /** The memory store plus the trial port, with the database's one-trial-grant-per-person index. */
+    class TrialStore extends MemoryStore implements TrialStoreApi {
+        trials = new Map<string, TrialRowShape>();
+        paidAt = new Map<string, Date>();
+        statusWrites: string[] = [];
+        async trialFacts(): Promise<never> { throw new Error('Unused in the processor'); }
+        async claimTrialQuote(): Promise<never> { throw new Error('Unused in the processor'); }
+        async attachTrialCheckout(): Promise<never> { throw new Error('Unused in the processor'); }
+        async trialById(id: string) { return this.trials.get(id) ?? null; }
+        async bindTrialSubscription(input: { trialId: string; userId: string; customerId: string; subscriptionId: string; trialStart: Date }) {
+            const row = this.trials.get(input.trialId);
+            if (!row) return 'missing' as const;
+            if (row.userId !== input.userId || (row.stripeSubscriptionId !== null && row.stripeSubscriptionId !== input.subscriptionId)
+                || (row.stripeCustomerId !== null && row.stripeCustomerId !== input.customerId)) return 'conflict' as const;
+            Object.assign(row, { stripeSubscriptionId: input.subscriptionId, stripeCustomerId: input.customerId, trialStart: input.trialStart,
+                status: row.status === 'quoted' || row.status === 'checkout' ? 'trialing' : row.status });
+            return 'bound' as const;
+        }
+        async setTrialStatus(input: { trialId: string; subscriptionId: string; status: TrialRowShape['status']; from: readonly TrialRowShape['status'][] }) {
+            const row = this.trials.get(input.trialId);
+            if (row && row.stripeSubscriptionId === input.subscriptionId && input.from.includes(row.status)) {
+                row.status = input.status;
+                this.statusWrites.push(input.status);
+            }
+        }
+        async markSubscriptionPaid(subscriptionId: string, at: Date) { if (!this.paidAt.has(subscriptionId)) this.paidAt.set(subscriptionId, at); }
+        async outboxByEventKey(key: string) { return this.outbox.get(key) ?? null; }
+        override async insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'> {
+            if (grant.kind === 'trial_period' && [...this.grants.values()].some(row => row.kind === 'trial_period'
+                && row.userId === grant.userId && row.meter === grant.meter)) return 'duplicate';
+            return super.insertGrant(grant);
+        }
     }
 
+    function trialFixture(clock = new Date('2026-11-05T10:00:05.000Z')) {
+        const store = new TrialStore();
+        const stripe = new MemoryStripe();
+        let current = clock;
+        const deps: ProcessorDeps = { store, stripe, now: () => new Date(current) };
+        store.trials.set(TRIAL_ID, { id: TRIAL_ID, userId: 'user_local', authSubject: 'supabase:user_local', emailNormalized: 'a@x.io',
+            sku: 'standard_monthly_v3', policyVersion: 1, status: 'checkout', quotedAt: new Date('2026-11-05T09:59:00.000Z'), trialEnd,
+            checkoutSessionId: 'cs_trial', stripeCustomerId: 'cus_local', stripeSubscriptionId: null, trialStart: null });
+        stripe.subscription = { ...stripe.subscription, sku: 'standard_monthly_v3', status: 'trialing',
+            currentPeriodStart: trialStart, currentPeriodEnd: trialEnd, trialStart, trialEnd, trialId: TRIAL_ID, endedAt: null,
+            items: [{ id: 'si_trial', priceId: 'price_v3', lookupKey: 'ezil_standard_monthly_v3' }] };
+        stripe.invoice = { ...stripe.invoice, billingReason: 'subscription_create', total: 0, amountPaid: 0, periodStart: trialStart, periodEnd: trialEnd,
+            lines: [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3', amount: 0,
+                periodStart: trialStart, periodEnd: trialEnd }] };
+        const renew = () => {
+            current = new Date(trialEnd.getTime() + 3_600_000);
+            stripe.subscription = { ...stripe.subscription, status: 'active', currentPeriodStart: trialEnd, currentPeriodEnd: nextEnd };
+            stripe.invoice = { ...stripe.invoice, id: 'in_cycle', billingReason: 'subscription_cycle', total: 2000, amountPaid: 2000,
+                periodStart: trialEnd, periodEnd: nextEnd, lines: [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3',
+                    amount: 2000, periodStart: trialEnd, periodEnd: nextEnd }] };
+        };
+        return { store, stripe, deps, setNow: (date: Date) => { current = date; }, renew };
+    }
+    // The delivery's clock is the trial's own (5 s after it started), so no future-period rule can pass a test by accident.
+    const createInvoice = (id = 'in_local') => ({ ...event('invoice.paid', { id, customer: 'cus_payload', billing_reason: 'subscription_create',
+        parent: { subscription_details: { subscription: 'sub_payload' } }, lines: { data: [] } }), id: `evt_${id}`,
+        created: trialStart.getTime() / 1000 + 5 });
+    const cycleInvoice = () => ({ ...createInvoice('in_cycle'), created: (trialEnd.getTime() + 3_600_000) / 1000 });
+    const subscriptionEvent = (type = 'customer.subscription.updated', created = trialStart.getTime() / 1000 + 5) =>
+        ({ ...event(type, { id: 'sub_local' }), id: `evt_${type}_${created}`, created });
+    const trialGrants = (store: TrialStore) => [...store.grants.values()].filter(grant => grant.kind === 'trial_period');
+    const planGrants = (store: TrialStore) => [...store.grants.values()].filter(grant => grant.kind === 'plan_period');
+
     it('RED: a $0 subscription_create invoice on a trialing Standard subscription mints no plan_period grant or plan credits', async () => {
+        const { store, stripe, deps } = trialFixture();
+        stripe.subscription.trialId = null;
+        expect(await processStripeEvent(createInvoice(), deps)).toBe('review:zero_amount_invoice');
+        expect(planGrants(store)).toEqual([]);
+        expect(store.outbox.size).toBe(0);
+    });
+
+    it('our own trial\'s $0 create invoice grants the trial once, under its own kind, source and AI root', async () => {
+        const { store, stripe, deps } = trialFixture();
+        // The RED fixture's monetary facts, explicit: Stripe reports $0 total and $0 paid for a trial's create invoice.
+        expect(stripe.invoice).toMatchObject({ total: 0, amountPaid: 0, billingReason: 'subscription_create', status: 'paid' });
+        // A legitimate starter grant and a purchase stay as they are; the trial adds exactly one 200-credit root.
+        store.outbox.set('ezil-os:v1:free-once:user_local:grant', { eventKey: 'ezil-os:v1:free-once:user_local:grant', userId: 'user_local',
+            kind: 'ai_grant', payload: { entitlementId: 'ezil-os:v1:free-once:user_local', credits: 100 } });
+        expect(await processStripeEvent(createInvoice(), deps)).toBe('applied');
+        expect(await processStripeEvent({ ...createInvoice(), id: 'evt_replay' }, deps)).toBe('applied');
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.created'), deps)).toBe('applied');
+        expect(planGrants(store)).toEqual([]);
+        expect(trialGrants(store)).toEqual([expect.objectContaining({ userId: 'user_local', subscriptionId: 'sub_local',
+            meter: 'compute_std_seconds', amount: BigInt(144000), periodStart: trialStart, periodEnd: trialEnd, sourceType: 'trial', sourceId: 'sub_local' })]);
+        expect([...store.outbox.values()].filter(item => item.eventKey !== 'ezil-os:v1:free-once:user_local:grant')).toEqual([
+            expect.objectContaining({ eventKey: `${ROOT}:grant`, kind: 'ai_grant',
+                payload: expect.objectContaining({ entitlementId: ROOT, credits: 200, expiresAt: trialEnd.toISOString(), invoiceId: null }) })]);
+        expect(store.outbox.get('ezil-os:v1:free-once:user_local:grant')!.payload.credits).toBe(100);
+        expect(store.trials.get(TRIAL_ID)).toMatchObject({ status: 'trialing', stripeSubscriptionId: 'sub_local', trialStart });
+        expect(store.subscriptions.get('sub_local')).toMatchObject({ status: 'trialing', trialStart, trialEnd });
+        expect(store.paidAt.size).toBe(0);
+    });
+
+    it('the subscription event alone starts the trial; the later $0 invoice adds nothing', async () => {
         const { store, deps } = trialFixture();
-        await processStripeEvent(createInvoice(), deps);
-        expect([...store.grants.values()].filter(grant => grant.kind === 'plan_period')).toEqual([]);
-        expect([...store.outbox.values()].filter(item => item.payload.entitlementId
-            === `ezil-os:v1:standard_monthly_v3:sub_local:${trialStart.toISOString()}`)).toEqual([]);
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.created'), deps)).toBe('applied');
+        expect(await processStripeEvent(createInvoice(), deps)).toBe('applied');
+        expect(trialGrants(store)).toHaveLength(1);
+        expect(store.outbox.size).toBe(1);
+    });
+
+    it.each([
+        ['a $0 cycle invoice (100% coupon)', (f: ReturnType<typeof trialFixture>) => { f.stripe.invoice.billingReason = 'subscription_cycle'; }],
+        ['a $0 create invoice without our trial', (f: ReturnType<typeof trialFixture>) => { f.stripe.subscription.trialId = null; }],
+        ['a $0 Premium create invoice', (f: ReturnType<typeof trialFixture>) => {
+            f.stripe.subscription.sku = 'premium_monthly_v3';
+            f.stripe.invoice.lines = [{ ...f.stripe.invoice.lines[0]!, lookupKey: 'ezil_premium_monthly_v3' }];
+        }],
+        ['a positive total but a $0 base line', (f: ReturnType<typeof trialFixture>) => { f.stripe.invoice.total = 2000; }],
+        ['an unreadable total', (f: ReturnType<typeof trialFixture>) => { f.stripe.invoice.total = NaN; }],
+        ['a coupon: a positive $20 line with total and amount_paid 0', (f: ReturnType<typeof trialFixture>) => {
+            f.stripe.subscription = { ...f.stripe.subscription, status: 'active', trialId: null };
+            f.stripe.invoice.lines = [{ ...f.stripe.invoice.lines[0]!, amount: 2000 }];
+        }],
+        ['a coupon on a cycle invoice: positive line, total and amount_paid 0', (f: ReturnType<typeof trialFixture>) => {
+            f.stripe.invoice.billingReason = 'subscription_cycle';
+            f.stripe.invoice.lines = [{ ...f.stripe.invoice.lines[0]!, amount: 2000 }];
+        }],
+    ])('fails closed on %s: review, no grant, no credits', async (_name, mutate) => {
+        const f = trialFixture();
+        mutate(f);
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('review:zero_amount_invoice');
+        expect([...f.store.grants.values()]).toEqual([]);
+        expect(f.store.outbox.size).toBe(0);
+    });
+
+    it('a $0 Pro invoice is never a paid Pro period either', async () => {
+        const f = fixture();
+        f.stripe.invoice.total = 0;
+        expect(await processStripeEvent(invoice(), f.deps)).toBe('review:zero_amount_invoice');
+        expect(f.store.grants.size).toBe(0);
+    });
+
+    it('binds only when Stripe\'s trial end is the disclosed end, to the second', async () => {
+        const f = trialFixture();
+        f.stripe.subscription.trialEnd = new Date(trialEnd.getTime() + 1000);
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('review:trial_terms_mismatch');
+        expect([...f.store.grants.values()]).toEqual([]);
+        expect(f.store.trials.get(TRIAL_ID)!.stripeSubscriptionId).toBeNull();
+    });
+
+    it('a second subscription cannot reuse a bound trial, another account\'s trial id, or a foreign customer', async () => {
+        const f = trialFixture();
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('applied');
+        f.stripe.subscription = { ...f.stripe.subscription, id: 'sub_second' };
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.created'), f.deps)).toBe('review:trial_conflict');
+        expect(trialGrants(f.store)).toHaveLength(1);
+        const g = trialFixture();
+        g.store.trials.get(TRIAL_ID)!.userId = 'user_other';
+        expect(await processStripeEvent(createInvoice(), g.deps)).toBe('review:trial_unknown');
+        const h = trialFixture();
+        h.store.trials.get(TRIAL_ID)!.stripeCustomerId = 'cus_other';
+        expect(await processStripeEvent(createInvoice(), h.deps)).toBe('review:trial_customer_mismatch');
+        expect([...g.store.grants.values(), ...h.store.grants.values()]).toEqual([]);
+    });
+
+    it('the person index refuses a second trial grant even if a row were bound twice', async () => {
+        const f = trialFixture();
+        await f.store.insertGrant({ userId: 'user_local', subscriptionId: 'sub_old', meter: 'compute_std_seconds', kind: 'trial_period',
+            amount: BigInt(144000), periodStart: trialStart, periodEnd: trialEnd, sourceType: 'trial', sourceId: 'sub_old' });
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('review:trial_already_granted');
+        expect(f.store.outbox.size).toBe(0);
+    });
+
+    it('a replay after the trial ended mints nothing, even if it still reads trialing', async () => {
+        const f = trialFixture(new Date(trialEnd.getTime()));
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('applied');
+        expect([...f.store.grants.values()]).toEqual([]);
+        expect(f.store.outbox.size).toBe(0);
+    });
+
+    it('a successful $20 first charge grants the next period once, converts the trial and marks it paid; trial rows stay', async () => {
+        const f = trialFixture();
+        await processStripeEvent(createInvoice(), f.deps);
+        f.renew();
+        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('applied');
+        expect(await processStripeEvent({ ...cycleInvoice(), id: 'evt_cycle_replay' }, f.deps)).toBe('applied');
+        expect(planGrants(f.store)).toEqual([expect.objectContaining({ amount: BigInt(144000), periodStart: trialEnd, periodEnd: nextEnd,
+            sourceType: 'invoice', sourceId: 'in_cycle' })]);
+        expect(trialGrants(f.store)).toHaveLength(1);
+        expect([...f.store.outbox.keys()].sort()).toEqual([`${PERIOD_ROOT}:grant`, `${ROOT}:grant`].sort());
+        expect(f.store.paidAt.get('sub_local')).toEqual(new Date(cycleInvoice().created * 1000));
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('converted');
+    });
+
+    it('out of order: the $0 create and an older subscription event after conversion mint no trial and keep the newer state', async () => {
+        const f = trialFixture();
+        const create = structuredClone(f.stripe.invoice);
+        f.renew();
+        const cycle = f.stripe.invoice;
+        f.stripe.retrieveInvoice = async (id: string) => (id === 'in_local' ? create : cycle);
+        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('applied');
+        expect(f.store.trials.get(TRIAL_ID)).toMatchObject({ status: 'converted', stripeSubscriptionId: 'sub_local' });
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('applied');
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.created', now.getTime() / 1000), f.deps)).toBe('applied');
+        expect(trialGrants(f.store)).toEqual([]);
+        expect(planGrants(f.store)).toHaveLength(1);
+        expect(f.store.outbox.size).toBe(1);
+        expect(f.store.subscriptions.get('sub_local')).toMatchObject({ status: 'active', currentPeriodStart: trialEnd, currentPeriodEnd: nextEnd });
+    });
+
+    it('an immediate cancel during the trial revokes only the still-live trial root and records the trial as used', async () => {
+        const f = trialFixture();
+        await processStripeEvent(createInvoice(), f.deps);
+        f.store.outbox.set('ezil-os:v1:topup:ai_pack_10_v1:pi_unrelated:grant', { eventKey: 'ezil-os:v1:topup:ai_pack_10_v1:pi_unrelated:grant',
+            userId: 'user_local', kind: 'ai_grant', payload: { entitlementId: 'ezil-os:v1:topup:ai_pack_10_v1:pi_unrelated', credits: 100 } });
+        f.setNow(new Date('2026-11-10T10:00:00.000Z'));
+        f.stripe.subscription = { ...f.stripe.subscription, status: 'canceled', endedAt: new Date('2026-11-10T10:00:00.000Z') };
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.deleted', Date.parse('2026-11-10T10:00:00Z') / 1000), f.deps)).toBe('applied');
+        expect(await processStripeEvent({ ...subscriptionEvent('customer.subscription.deleted', Date.parse('2026-11-10T10:00:00Z') / 1000), id: 'evt_again' }, f.deps)).toBe('applied');
+        const revokes = [...f.store.outbox.values()].filter(item => item.kind === 'ai_revoke');
+        expect(revokes).toEqual([expect.objectContaining({ eventKey: `${ROOT}:revoke`, userId: 'user_local',
+            payload: expect.objectContaining({ entitlementId: ROOT, action: 'revoke', credits: 200 }) })]);
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('canceled');
+        expect(planGrants(f.store)).toEqual([]);
+    });
+
+    it('a cancel at period end keeps the trial until its end, then ends it with no invoice, no paid grant and no revoke', async () => {
+        const f = trialFixture();
+        await processStripeEvent(createInvoice(), f.deps);
+        f.stripe.subscription.cancelAtPeriodEnd = true;
+        expect(await processStripeEvent(subscriptionEvent(), f.deps)).toBe('applied');
+        expect(f.store.subscriptions.get('sub_local')).toMatchObject({ status: 'trialing', cancelAtPeriodEnd: true });
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('trialing');
+        f.setNow(new Date(trialEnd.getTime() + 1000));
+        f.stripe.subscription = { ...f.stripe.subscription, status: 'canceled', endedAt: trialEnd };
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.deleted', trialEnd.getTime() / 1000 + 1), f.deps)).toBe('applied');
+        expect([...f.store.outbox.values()].filter(item => item.kind === 'ai_revoke')).toEqual([]);
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('ended');
+        expect(planGrants(f.store)).toEqual([]);
+    });
+
+    it('a failed first charge records the issue, marks the trial payment_failed, and a later success converts without a re-grant', async () => {
+        const f = trialFixture();
+        await processStripeEvent(createInvoice(), f.deps);
+        f.setNow(new Date(trialEnd.getTime() + 60_000));
+        f.stripe.subscription = { ...f.stripe.subscription, status: 'past_due', currentPeriodStart: trialEnd, currentPeriodEnd: nextEnd };
+        f.stripe.invoice = { ...f.stripe.invoice, id: 'in_cycle', status: 'open', billingReason: 'subscription_cycle', total: 2000, amountPaid: 0 };
+        const failed = { ...event('invoice.payment_failed', { id: 'in_cycle', customer: 'cus_payload',
+            parent: { subscription_details: { subscription: 'sub_local' } } }), id: 'evt_failed', created: trialEnd.getTime() / 1000 + 60 };
+        expect(await processStripeEvent(failed, f.deps)).toBe('applied');
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('payment_failed');
+        expect(f.store.issues.get('in_cycle')).toMatchObject({ issue: 'payment_failed', invoiceKind: 'subscription', resolvedAt: null });
+        // The trial root already expired at the trial end: nothing to revoke.
+        expect([...f.store.outbox.values()].filter(item => item.kind === 'ai_revoke')).toEqual([]);
+        f.renew();
+        f.stripe.invoice.status = 'paid';
+        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('applied');
+        expect(f.store.issues.get('in_cycle')!.resolvedAt).not.toBeNull();
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('converted');
+        expect(trialGrants(f.store)).toHaveLength(1);
+        expect(planGrants(f.store)).toHaveLength(1);
+    });
+
+    it('a trial ended early without payment revokes the still-live trial root', async () => {
+        const f = trialFixture();
+        await processStripeEvent(createInvoice(), f.deps);
+        const early = new Date('2026-11-20T10:00:00.000Z');
+        f.setNow(early);
+        f.stripe.subscription = { ...f.stripe.subscription, status: 'past_due', trialEnd: early, currentPeriodStart: early, currentPeriodEnd: nextEnd };
+        expect(await processStripeEvent(subscriptionEvent('customer.subscription.updated', early.getTime() / 1000), f.deps)).toBe('applied');
+        expect(f.store.outbox.get(`${ROOT}:revoke`)).toMatchObject({ kind: 'ai_revoke' });
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('payment_failed');
+    });
+
+    it('without the trial store a trial delivery retries instead of granting', async () => {
+        const f = trialFixture();
+        const plain = new MemoryStore();
+        const deps: ProcessorDeps = { ...f.deps, store: plain };
+        expect(await processStripeEvent(createInvoice(), deps)).toBe('failed:trial_store_unavailable');
+        expect(plain.grants.size).toBe(0);
     });
 });

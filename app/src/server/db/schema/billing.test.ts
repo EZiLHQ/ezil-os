@@ -247,13 +247,32 @@ function assertBillingV2Migration(sql: string): void {
     }
 }
 
+describe('billing schema and migration 0021 (Standard trial)', () => {
+    it('keeps a deleted account\'s trial row as a tombstone and is service-only', () => {
+        const trials = getTableConfig(billing.billingTrials);
+        expect(trials.enableRLS).toBe(true);
+        const fk = trials.foreignKeys.find(key => key.getName() === 'ezil_billing_trials_user_id_fkey')!;
+        expect(fk.onDelete).toBe('set null');
+        expect(fk.reference().columns[0]!.notNull).toBe(false);
+        expect(trials.uniqueConstraints.map(unique => unique.getName()).sort()).toEqual([
+            'ezil_billing_trials_checkout_unique', 'ezil_billing_trials_email_unique', 'ezil_billing_trials_subject_unique',
+            'ezil_billing_trials_subscription_unique', 'ezil_billing_trials_user_unique']);
+        const sql = readFileSync(new URL('../../../../drizzle/0021_standard_trial.sql', import.meta.url), 'utf8');
+        expect(sql).toContain('REFERENCES "auth"."users"("id") ON DELETE set null ON UPDATE cascade');
+        expect(journal.entries.at(-1)).toMatchObject({ tag: '0021_standard_trial', version: '7', breakpoints: true });
+        const subscriptions = getTableConfig(billing.billingSubscriptions).columns.map(column => [column.name, column.notNull]);
+        expect(subscriptions).toEqual(expect.arrayContaining([['trial_start', false], ['trial_end', false], ['first_paid_at', false]]));
+    });
+});
+
 describe('billing schema and migration 0004', () => {
     it('adds exactly six tables with service-only RLS, cascading ownership and all SQL guards', () => {
         expect(v2Names).toEqual([
             'ezil_billing_compute_epochs', 'ezil_billing_overage_consents', 'ezil_billing_overage_invoices',
             'ezil_billing_payment_issues', 'ezil_billing_plan_changes', 'ezil_billing_size_preferences',
         ]);
-        expect(Object.values(billing).map(table => getTableConfig(table).name).sort()).toEqual([...tableNames, ...v2Names].sort());
+        // 0021 (Standard trial) adds ezil_billing_trials; its own checks are in the 0021 block below.
+        expect(Object.values(billing).map(table => getTableConfig(table).name).sort()).toEqual([...tableNames, ...v2Names, 'ezil_billing_trials'].sort());
         assertBillingV2Migration(migrationV2);
         for (const table of v2Tables) {
             expect(table.enableRLS).toBe(true);

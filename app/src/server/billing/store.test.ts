@@ -161,6 +161,10 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
             currentPeriodStart: row.currentPeriodStart,
             currentPeriodEnd: row.currentPeriodEnd,
             cancelAtPeriodEnd: row.cancelAtPeriodEnd,
+            // 0021: no trial on this subscription, and no paid period recorded by the processor yet.
+            trialStart: null,
+            trialEnd: null,
+            firstPaidAt: null,
         }]);
         expect(await store.upsertSubscription({ ...row, status: 'canceled', stripeEventCreated: instant(9) })).toBe('stale');
         expect((await store.subscriptionsFor(userId))[0].status).toBe('active');

@@ -637,8 +637,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
                 if (!decision.eligible) throw trialError('trial_unavailable');
                 const row = facts.own;
-                if (!row || row.status !== 'quoted' || !quoteFresh(row, deps.now())
-                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)) throw trialError('trial_quote_stale');
+                if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
+                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
+                    // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
+                    || row.authSubject !== facts.authSubject || row.emailNormalized !== facts.emailNormalized) throw trialError('trial_quote_stale');
                 trial = { row, store };
             }
 
@@ -671,7 +673,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 idempotencyKey: trial ? `trial-checkout:${trial.row.id}:${epochSeconds(trial.row.quotedAt)}`
                     : `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
                 ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
-                    expiresAt: new Date((epochSeconds(deps.now()) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
+                    // Stripe idempotency compares every parameter: retries use the persisted quote's expiry too.
+                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
             }));
             if (trial) {
                 const attached = await trial.store.attachTrialCheckout({ trialId: trial.row.id, userId: ctx.user.id,

@@ -10,6 +10,10 @@
  * Identity (explicit): one trial per verified person. The account (Supabase user id), its sign-in subject (the Auth0
  * `sub` when linked) and its normalized verified email are each unique in `ezil_billing_trials`. A trial, or any
  * earlier positive paid Standard/Premium/Pro period for the same account or the same normalized email, refuses.
+ * The claim follows the CURRENT verified identity: a re-quote moves an unstarted claim to it, and checkout refuses a
+ * quote whose subject or email no longer match. Any other account whose current email is the same person blocks too.
+ * A deleted account's row stays as a tombstone (user_id null): a started trial still claims its subject and email;
+ * a never-started quote of a deleted account may be reclaimed.
  *
  * Abandoned checkout (explicit): a quote claims the person's trial row for this account only. Expired or abandoned
  * checkouts never consume it: the same account may re-quote (a new end) and open a new checkout, which expires the
@@ -34,7 +38,8 @@ export const UNBOUND_TRIAL_STATUSES: readonly TrialStatus[] = ['quoted', 'checko
 
 export interface TrialRow {
     id: string;
-    userId: string;
+    /** Null once the account was deleted (a tombstone claim). */
+    userId: string | null;
     authSubject: string;
     emailNormalized: string;
     sku: string;
@@ -80,11 +85,33 @@ export function quoteFresh(row: Pick<TrialRow, 'quotedAt'>, now: Date): boolean 
     return age >= 0 && age <= TRIAL_QUOTE_TTL_SECONDS * 1000;
 }
 
-const GMAIL = new Set(['gmail.com', 'googlemail.com']);
+/**
+ * Mailbox rules only where the provider documents them: Gmail ignores dots and a `+tag` (googlemail.com is the same
+ * mailbox); Microsoft consumer Outlook, Fastmail and Proton deliver `+tag` to the same mailbox. Every other domain
+ * keeps its whole local part, because a custom domain's `a+b@` may be a different person's mailbox.
+ */
+const MAILBOX_RULES: Readonly<Record<string, { domain: string; dots: boolean; plus: boolean }>> = Object.freeze({
+    'gmail.com': { domain: 'gmail.com', dots: true, plus: true },
+    'googlemail.com': { domain: 'gmail.com', dots: true, plus: true },
+    'outlook.com': { domain: 'outlook.com', dots: false, plus: true },
+    'hotmail.com': { domain: 'hotmail.com', dots: false, plus: true },
+    'live.com': { domain: 'live.com', dots: false, plus: true },
+    'msn.com': { domain: 'msn.com', dots: false, plus: true },
+    'fastmail.com': { domain: 'fastmail.com', dots: false, plus: true },
+    'proton.me': { domain: 'proton.me', dots: false, plus: true },
+    'protonmail.com': { domain: 'protonmail.com', dots: false, plus: true },
+    'pm.me': { domain: 'pm.me', dots: false, plus: true },
+});
+
+/** The domains whose mailbox rule can map another spelling onto `domain` (for the same-person account lookup). */
+export function mailboxDomains(domain: string): string[] {
+    const canonical = MAILBOX_RULES[domain]?.domain ?? domain;
+    return [...new Set([canonical, ...Object.entries(MAILBOX_RULES).filter(([, rule]) => rule.domain === canonical).map(([name]) => name)])];
+}
 
 /**
- * The person key of a verified email: trimmed and lower-cased, a `+tag` removed from the local part, and for Gmail
- * the dots removed and googlemail.com read as gmail.com. null for anything that is not one plain address.
+ * The person key of a verified email: trimmed and lower-cased, plus the provider's documented mailbox rule above.
+ * null for anything that is not one plain address.
  */
 export function normalizeEmail(email: string | null | undefined): string | null {
     if (typeof email !== 'string') return null;
@@ -92,8 +119,12 @@ export function normalizeEmail(email: string | null | undefined): string | null 
     const match = /^([^\s@]+)@([^\s@]+\.[^\s@]+)$/.exec(value);
     if (!match) return null;
     let [, local, domain] = match as unknown as [string, string, string];
-    local = local.split('+')[0]!;
-    if (GMAIL.has(domain)) { local = local.replace(/\./g, ''); domain = 'gmail.com'; }
+    const rule = MAILBOX_RULES[domain];
+    if (rule) {
+        if (rule.plus) local = local.split('+')[0]!;
+        if (rule.dots) local = local.replace(/\./g, '');
+        domain = rule.domain;
+    }
     return local ? `${local}@${domain}` : null;
 }
 
@@ -135,7 +166,10 @@ export interface TrialFacts {
     authSubject: string;
     /** The caller's own trial row, if any. */
     own: TrialRow | null;
-    /** A trial row of ANOTHER account with the same normalized email or sign-in subject. */
+    /**
+     * Another claim on this person: a trial row of another account (or a started trial's tombstone) with the same
+     * normalized email or sign-in subject, or any trial row of another account whose CURRENT email is this person.
+     */
     claimedElsewhere: boolean;
     /** A positive paid Standard/Premium/Pro period (or a live legacy paid subscription) for this account or this email. */
     paidBefore: boolean;
