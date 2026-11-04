@@ -52,7 +52,7 @@ All values live in the vectors (`constants`, `timeouts`, `regex`). The table nam
 | WORKS_QA_ORIGIN | `https://api-staging.ezil.work`: the Works behind git-qa.ezil.work, where Builder repositories live. Selects the QA row (§6.2); the OS app never calls it (still on STAGING_FORBIDDEN_HOSTS) | 1.0.5 |
 | WORKS_OS_GRANT_CLASSES | `{STAGING: null, QA: 'project'}`: the one os-grant class each mounted row issues (§6.5) | 1.0.5 |
 | PROJECT_GRANT_TTL_MS / PROJECT_GRANT_SKEW_MS / PROJECT_GRANT_ACCEPT_MAX_MS | 300 000 / 30 000 / 330 000 (= `workerRequest.projectGrantMaxMs`) | 1.0.5 |
-| PROJECT_REFRESH_EVERY_MS | 240 000: a project grant is re-minted at least this often while the project is open | 1.0.5 |
+| PROJECT_GRANT_MIN_INSTALL_MS / PROJECT_RENEW_LEAD_MS | 60 000 / 120 000: a project grant with less than the first left is not installed; renewal starts when the second is left (vectors `projectGrantRenewal`) | 1.0.5 |
 | GIT_STAGING_HOST | `git-preview.ezil.work` [D-NAMES] | new |
 | GIT_ASSESSMENT_HOST | `git-qa.ezil.work`: the git host of request class `assessment` (staging Works issues assessment grants there) [1.0.3] | new |
 | REPO_OPEN_CLASS_GIT_HOSTS | closed table `personal` → GIT_STAGING_HOST, `assessment` → GIT_ASSESSMENT_HOST; a body or request without `class` is `personal` (REPO_OPEN_CLASS_DEFAULT) [1.0.3] | new |
@@ -300,7 +300,12 @@ Declared inside `selfserveRepositoriesV0Routes`, so manifest.ts is unchanged; mo
 - **201:** the legacy keys plus `class:'project'`, with `cloneUrl` on QA's gitHost (git-qa.ezil.work).
 - **Consumers** accept exactly those keys, `class === 'project'`, the route's project host, the requested repository, and `expiresAt` in (now, now + PROJECT_GRANT_ACCEPT_MAX_MS]: 300 s plus 30 s documented skew. The 60-minute web-clone grant (clone-token) and the 15-minute legacy grant both fail. A legacy consumer refuses a `class` key.
 - **Caller.** Universe's Builder open (os-builder-project-open-v1 §2) forwards the person's own OS-audience EZiL ID token, which it already verifies, never logging or keeping it, with `computerLabel` from the OS's open request. The OS-audience token stays refused on clone-token (§6.4 step 2); that is why the grant is here and not on clone-token.
-- **Lifecycle.** Re-minted at least every PROJECT_REFRESH_EVERY_MS while the project is open (os-builder §7). An expired grant is `grant_expired` at the gateway; os-sessions/revoke (§6.7) revokes the label's session and so every grant of either class (`grant_revoked` / `session_revoked`).
+- **Issuance refusal.** The expiry used is the one the token verifier verified, carried to the route, never a body field. The verifier's legacy tolerance of up to 60 s past `exp` does not reach issuance: `exp <= now` is 401 `identity_token_invalid` before any session row or grant is written (`works.osGrantProjectExpiry`).
+- **Lifecycle.** Renewal is scheduled from the returned `expiresAt`, not a fixed timer (`projectGrantRenewal`):
+  - less than 60 s left: not installed; reauthenticate once, then ask again;
+  - at most 120 s left (the bearer limited it): installed; reauthenticate once before the next ask, so there is no refresh loop;
+  - otherwise: installed and renewed 120 s before expiry.
+  One renewal is in flight at a time. A revoked session is never extended or revived; the next grant comes from a new session row. An expired grant is `grant_expired` at the gateway; os-sessions/revoke (§6.7) revokes the label's session and so every grant of either class (`grant_revoked` / `session_revoked`).
 
 ### 6.6 OS session row (no schema change)
 In ONE transaction, mirroring `webCloneSession` (cli-auth.ts:278-297):
@@ -794,7 +799,7 @@ Closes the project-grant contradiction (request `88e642df-project-grant-contract
 1. **Producer.** The existing os-grant route issues class `project` on a new QA row: body `{computerLabel, class:'project'}`, `expiresAt = min(now + 300 s, bearer exp)`, the answer adds `class:'project'` (§6.5). No new route, no schema change.
 2. **Deployment row.** `works.selection` maps api-staging to the new QA row instead of DEFAULT (§6.2): DEFAULT's clients plus the effective OS pin, gitHost git-qa.ezil.work, os-grant class `project` only. Production (DEFAULT) is unchanged.
 3. **Consumers.** Accept ≤ 330 s with the class echoed (`works.osGrantProjectResponse`); legacy consumers refuse a class key. Universe's Builder open calls os-grant instead of clone-token. os-builder-project-open-v1 §3 W-2(a) (the OS-audience token on clone-token) is withdrawn, because §6.4 step 2 refuses it there.
-4. **Timeouts.** `PROJECT_GRANT_TTL_MS` 300 000, `PROJECT_GRANT_SKEW_MS` 30 000, `PROJECT_GRANT_ACCEPT_MAX_MS` 330 000 (= `projectGrantMaxMs`), `PROJECT_REFRESH_EVERY_MS` 240 000, with a new strict chain, an equality and a lessThan (refresh + helper floor < TTL).
+4. **Timeouts and lifecycle.** `PROJECT_GRANT_TTL_MS` 300 000, `PROJECT_GRANT_SKEW_MS` 30 000, `PROJECT_GRANT_ACCEPT_MAX_MS` 330 000 (= `projectGrantMaxMs`), `PROJECT_GRANT_MIN_INSTALL_MS` 60 000 (= the Worker's repo-grant floor), `PROJECT_RENEW_LEAD_MS` 120 000, with a new strict chain, an equality and a lessThan. Issuance refuses `exp <= now` (`works.osGrantProjectExpiry`), and renewal follows the returned expiry (`projectGrantRenewal`), per root's 23:29Z review.
 5. **Text:** §1, §6.2, §6.5, §6.8, §13.
 6. **Bump.** `contractVersion` is 1.0.5; both README pins, the kernel test's vectors pin, the relay and module test pins, and the H1 host patch's version line are updated in the same change. Kernel bytes are unchanged (sha256 1362a691…). Re-seeding the copies in EZiL-Works, universe-2.0 and EZiL CLI is a consumer step (§18); the gateway extract changes only in `contractVersion` and `sourceVectorsSha256`.
 

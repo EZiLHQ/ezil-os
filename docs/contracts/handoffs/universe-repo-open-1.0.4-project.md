@@ -6,7 +6,7 @@ Journey `journey-9aae-20261103-repo-aws-local-v1` (founder request 9aae). This i
 
 | Piece | File | Pin |
 |---|---|---|
-| Contract 1.0.4, now 1.0.5 (project grant, branch `feat/u2-project-grant-20261103`) | `docs/contracts/universe-repo-open-v1.{md,vectors.json,check.mjs}`, README | 1.0.5: vectors `c48c3f18…`, gateway extract `34e6d5b2…` (1.0.4 was `4ede80c6…` / `4920f98d…`) |
+| Contract 1.0.4, now 1.0.5 (project grant, branch `feat/u2-project-grant-20261103`) | `docs/contracts/universe-repo-open-v1.{md,vectors.json,check.mjs}`, README | 1.0.5: vectors `bc64aa62…`, gateway extract `6c400a8a…` (1.0.4 was `4ede80c6…` / `4920f98d…`) |
 | Kernel, class `project` | `worker/src/repo-open-assets/ezil-repo-open.mjs` and the byte-identical host copy `infra/host-agent/lib/ezil_host/repo_open_assets/ezil-repo-open.mjs` | kernel `1362a691…` (pinned in `repo_open.py` REPO_OPEN_ASSETS, the only line changed in that file) |
 | Worker relay gate | `worker/src/aws-repo-open.ts`, `worker/src/repo-open-u2.ts` | both inert; nothing imports them |
 | Tests | `ezil-repo-open-test.mjs` (T-2PUSH-K, reopen including a switched branch, crossovers, request rules, grant cleanup), `aws-repo-open.test.ts`, `repo-open-u2.test.ts` | |
@@ -68,7 +68,7 @@ if (v2.provider === 'aws-ec2') {
 | D2 | f6a67dd0 | The `computerFree` source: the assessment policy DO answers "not bound to an assessment attempt" for this computer. Absent means unsupported. | open |
 | D3 | Works (slot5) | W2/W3, now exact (1.0.5 §6.2 QA row and §6.5 class `project`): os-grant on api-staging, body `{computerLabel, class:'project'}`, `expiresAt = min(now + 300 s, bearer exp)`, answer + `class:'project'`; the same session, ownership and scope as the legacy grant. W1 (`scope`, `defaultRef` on clone-token) is 2469e704, reviewed separately. | W2/W3 T1–T5 open with Works |
 | D4 | cb1d14e6 (app) | Lift the open-project `isAws` refusal only after D1–D3 and H2, sending the class `project` body. | blocked on D1–D3 |
-| D5 | Universe, Works, EZiL CLI | Re-seed the vectors copy (1.0.5, `c48c3f18…`) and the CLI gateway extract (`34e6d5b2…`) as a consumer step. The earlier `092d76d1…`/`085a783a…` here were stale. | open |
+| D5 | Universe, Works, EZiL CLI | Re-seed the vectors copy (1.0.5, `bc64aa62…`) and the CLI gateway extract (`6c400a8a…`) as a consumer step. The earlier `092d76d1…`/`085a783a…` here were stale. | open |
 
 ## Owner, attempt and subject fences (where each lives)
 

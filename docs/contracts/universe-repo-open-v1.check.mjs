@@ -449,12 +449,33 @@ for (const m of V.works.osGrantResponse.invalidMutations) ok(!osGrantResponseVal
     // Neither shape passes the other's consumer.
     ok(!osGrantResponseValid(materialise(P.base), ctx), 'a legacy consumer refuses the project answer');
     ok(!osGrantProjectResponseValid(materialise(V.works.osGrantResponse.base), pctx), 'a project consumer refuses the legacy answer');
-    const projectExpiry = (issuedAt, bearerExp) => Math.min(issuedAt + T.PROJECT_GRANT_TTL_MS, bearerExp);
+    // Issuance: a verified bearer exp at or before now is refused before any row is written; otherwise min(TTL, exp).
+    const projectIssue = (issuedAt, bearerExp) => (bearerExp <= issuedAt
+        ? { status: 401, error: 'identity_token_invalid', sessionWritten: false, grantWritten: false }
+        : { expiresAt: Math.min(issuedAt + T.PROJECT_GRANT_TTL_MS, bearerExp) });
     for (const c of V.works.osGrantProjectExpiry.cases) {
-        eq(projectExpiry(NOW, NOW + c.bearerExpSeconds * 1000), NOW + c.expectSeconds * 1000, `project expiry, bearer exp +${c.bearerExpSeconds}s`);
-        ok(c.expectSeconds * 1000 <= T.PROJECT_GRANT_TTL_MS, `project expiry +${c.expectSeconds}s is never beyond the issue window`);
+        const got = projectIssue(NOW, NOW + c.bearerExpSeconds * 1000);
+        if (c.expect) eq(got, c.expect, `project issuance refused, bearer exp ${c.bearerExpSeconds}s`);
+        else {
+            eq(got, { expiresAt: NOW + c.expectSeconds * 1000 }, `project expiry, bearer exp +${c.bearerExpSeconds}s`);
+            ok(c.expectSeconds > 0 && c.expectSeconds * 1000 <= T.PROJECT_GRANT_TTL_MS, `project expiry +${c.expectSeconds}s is positive and within the issue window`);
+        }
     }
-    ok(V.works.osGrantProjectExpiry.cases.some((c) => c.bearerExpSeconds * 1000 < T.PROJECT_GRANT_TTL_MS), 'expiry cases include a bearer expiring first');
+    const cases = V.works.osGrantProjectExpiry.cases;
+    ok(cases.some((c) => !c.expect && c.bearerExpSeconds * 1000 < T.PROJECT_GRANT_TTL_MS), 'expiry cases include a bearer expiring first');
+    ok(cases.some((c) => c.expect && c.bearerExpSeconds === 0) && cases.some((c) => c.expect && c.bearerExpSeconds < 0 && c.bearerExpSeconds >= -60), 'issuance cases include exp = now and exp inside the legacy 60 s tolerance');
+    // Renewal from the returned expiry (root 23:29Z): no fixed timer, no immediate loop on a bearer-limited grant.
+    const renewal = (remainingMs) => ({
+        install: remainingMs >= T.PROJECT_GRANT_MIN_INSTALL_MS,
+        next: remainingMs > T.PROJECT_RENEW_LEAD_MS ? 'renew' : 'reauth-then-renew',
+        renewAfterSeconds: remainingMs > T.PROJECT_RENEW_LEAD_MS ? (remainingMs - T.PROJECT_RENEW_LEAD_MS) / 1000 : 0,
+    });
+    for (const c of V.works.projectGrantRenewal.cases) eq(renewal(c.remainingSeconds * 1000), c.expect, `renewal with ${c.remainingSeconds}s left`);
+    for (const ms of [T.PROJECT_GRANT_TTL_MS, T.PROJECT_GRANT_ACCEPT_MAX_MS]) {
+        const r = renewal(ms);
+        ok(r.next === 'renew' && ms - r.renewAfterSeconds * 1000 >= T.PROJECT_GRANT_MIN_INSTALL_MS + T.HELPER_MIN_REMAINING_MS, 'a full grant renews while the old one still outlives the helper floor and an install');
+    }
+    ok(/never from a fixed timer/.test(V.works.projectGrantRenewal.rule) && /At most one renewal in flight/.test(V.works.projectGrantRenewal.rule) && /never extended or revived/.test(V.works.projectGrantRenewal.rule), 'projectGrantRenewal names expiry-based, single-flight, no revival');
     ok(/min\(issuedAt \+ PROJECT_GRANT_TTL_MS, the bearer's exp\)/.test(V.works.osGrantProjectRule) && /webClone false/.test(V.works.osGrantProjectRule), 'osGrantProjectRule names the expiry and webClone false');
 }
 
@@ -648,7 +669,7 @@ for (const [left, right] of T.lessThan) ok(evalT(left) < evalT(right), `timeouts
 ok(T.WAKE_DELAYS_MS.every((d, i, a) => i === 0 || a[i - 1] <= d) && T.WAKE_DELAYS_MS.at(-1) === T.WAKE_REPEAT_DELAY_MS, 'wake delays');
 ok(T.GRANT_TTL_MS === 15 * 60_000, 'grant TTL is the Works GIT_GRANT_MAX_MS (15 min)');
 ok(T.PROJECT_GRANT_TTL_MS === 5 * 60_000 && T.PROJECT_GRANT_SKEW_MS === 30_000, '1.0.5: project grant issued for 5 min, 30 s documented skew');
-ok(T.PROJECT_REFRESH_EVERY_MS === 4 * 60_000, '1.0.5: project grants are re-minted every 4 min (os-builder §7)');
+ok(T.PROJECT_GRANT_MIN_INSTALL_MS === 60_000 && T.PROJECT_RENEW_LEAD_MS === 120_000, '1.0.5: install floor = the Worker repo-grant floor (60 s); renewal lead 120 s');
 ok(T.SIGNOUT_BUDGET_MS === 3000, 'signout budget');
 
 // ── repository budget (tar bytes) ────────────────────────────────────────────

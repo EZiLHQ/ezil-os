@@ -124,7 +124,8 @@
     "PROJECT_GRANT_TTL_MS": 300000,
     "PROJECT_GRANT_SKEW_MS": 30000,
     "PROJECT_GRANT_ACCEPT_MAX_MS": 330000,
-    "PROJECT_REFRESH_EVERY_MS": 240000,
+    "PROJECT_GRANT_MIN_INSTALL_MS": 60000,
+    "PROJECT_RENEW_LEAD_MS": 120000,
     "OS_ACCEPT_EXPIRY_SLACK_MS": 60000,
     "WORKER_ACCEPT_EXPIRY_MAX_MS": 960000,
     "HELPER_MIN_REMAINING_MS": 30000,
@@ -146,7 +147,7 @@
       ["HELPER_MIN_REMAINING_MS", "REFRESH_LEAD_MS", "VISIBILITY_REFRESH_BELOW_MS", "GRANT_TTL_MS", "OS_SESSION_MIN_REMAINING_MS", "OS_SESSION_TTL_MS"],
       ["REMINT_AFTER_MS", "BOOTSTRAP_TTL_MS"],
       ["AWS_RELAY_POLL_MS", "WORKER_DEADLINE_MS"],
-      ["HELPER_MIN_REMAINING_MS", "PROJECT_REFRESH_EVERY_MS", "PROJECT_GRANT_TTL_MS", "PROJECT_GRANT_ACCEPT_MAX_MS", "GRANT_TTL_MS"]
+      ["HELPER_MIN_REMAINING_MS", "PROJECT_GRANT_MIN_INSTALL_MS", "PROJECT_RENEW_LEAD_MS", "PROJECT_GRANT_TTL_MS", "PROJECT_GRANT_ACCEPT_MAX_MS", "GRANT_TTL_MS"]
     ],
     "equalities": [
       ["PREPARE_WINDOW_MS", "WORKER_DEADLINE_MS - PREPARE_RESERVE_MS"],
@@ -156,7 +157,7 @@
     ],
     "lessThan": [
       ["OS_TO_WORKER_FETCH_MS + OS_TO_WORKS_FETCH_MS", "ROUTE_MAX_DURATION_MS"],
-      ["PROJECT_REFRESH_EVERY_MS + HELPER_MIN_REMAINING_MS", "PROJECT_GRANT_TTL_MS"]
+      ["PROJECT_GRANT_MIN_INSTALL_MS + HELPER_MIN_REMAINING_MS", "PROJECT_RENEW_LEAD_MS"]
     ]
   },
   "predicates": {
@@ -601,13 +602,27 @@
     },
     "osGrantProjectRule": "1.0.5 (Works W2/W3 T3). On the QA row, POST /v1/builder/selfserve-repositories/:repositoryRef/os-grant with body {computerLabel, class: 'project'} issues the project grant: authentication, ref, ownership (ownedByRepositoryId), preconditions (osGrantPreconditions), the session row (osSession: one per account and computerLabel, the same row any class uses) and scope (authority.scope) exactly as the legacy grant; webClone false; routePath exactly <handle>/<name>.git. Only the expiry differs: expiresAt = min(issuedAt + PROJECT_GRANT_TTL_MS, the bearer's exp), never later (osGrantProjectExpiry), which fits git_grants_expiry_chk unchanged (no schema change). The answer is the legacy keys plus class: 'project' (osGrantProjectResponse), cloneUrl on the row's gitHost. os-sessions/revoke revokes the label's session and so every grant of either class (works.osRevokeRequest, gitAuthorize grant_revoked / session_revoked); an expired grant is grant_expired. The gateway does not know the class and needs none: the expiry and the route path carry it. The 60-minute web-clone grant (clone-token, webClone true) is unchanged and is never a project grant: every project consumer refuses expiresAt beyond PROJECT_GRANT_ACCEPT_MAX_MS and a missing or other class.",
     "osGrantProjectExpiry": {
-      "rule": "expiresAt = min(issuedAt + PROJECT_GRANT_TTL_MS, bearerExp). A bearer that has expired is refused by authentication (401) before this runs.",
+      "rule": "expiresAt = min(issuedAt + PROJECT_GRANT_TTL_MS, bearerExp). bearerExp is the exp the token verifier itself verified, carried through the /v1 middleware to this route, never read from the body. The verifier's legacy clock tolerance (up to 60 s past exp) does not reach issuance: bearerExp <= issuedAt is 401 identity_token_invalid BEFORE any session row or grant is written, so no grant is ever non-positive. Other routes keep their verification unchanged.",
       "cases": [
         { "bearerExpSeconds": 3600, "expectSeconds": 300 },
         { "bearerExpSeconds": 301, "expectSeconds": 300 },
         { "bearerExpSeconds": 300, "expectSeconds": 300 },
         { "bearerExpSeconds": 120, "expectSeconds": 120 },
-        { "bearerExpSeconds": 1, "expectSeconds": 1 }
+        { "bearerExpSeconds": 1, "expectSeconds": 1 },
+        { "bearerExpSeconds": 0, "expect": { "status": 401, "error": "identity_token_invalid", "sessionWritten": false, "grantWritten": false } },
+        { "bearerExpSeconds": -30, "expect": { "status": 401, "error": "identity_token_invalid", "sessionWritten": false, "grantWritten": false }, "note": "inside the verifier's legacy 60 s tolerance: accepted by authentication, refused by issuance" }
+      ]
+    },
+    "projectGrantRenewal": {
+      "rule": "Consumer (the OS app/shell, through Universe open and the Worker repo-grant route). Renewal is scheduled from the expiresAt actually returned, never from a fixed timer and never from the legacy REFRESH_LEAD_MS rule. With remaining = expiresAt - now on receipt: (a) remaining < PROJECT_GRANT_MIN_INSTALL_MS: not installed (the Worker refuses it too); reauthenticate the EZiL ID (silent, prompt=none) once, then ask again; (b) remaining <= PROJECT_RENEW_LEAD_MS: installed, but the bearer limited it, so the next renewal first reauthenticates once, then asks (asking again at once would return the same short grant, so there is no loop); (c) otherwise installed and renewed at expiresAt - PROJECT_RENEW_LEAD_MS. At most one renewal in flight per (computer, repository). A failed reauthentication or a 401/403 stops renewal and shows sign in again, leaving the folder, uncommitted work and HEAD untouched. A revoked session is never extended or revived: the next grant comes from a new session row (osSession).",
+      "cases": [
+        { "remainingSeconds": 300, "expect": { "install": true, "next": "renew", "renewAfterSeconds": 180 } },
+        { "remainingSeconds": 330, "expect": { "install": true, "next": "renew", "renewAfterSeconds": 210 } },
+        { "remainingSeconds": 121, "expect": { "install": true, "next": "renew", "renewAfterSeconds": 1 } },
+        { "remainingSeconds": 120, "expect": { "install": true, "next": "reauth-then-renew", "renewAfterSeconds": 0 } },
+        { "remainingSeconds": 60, "expect": { "install": true, "next": "reauth-then-renew", "renewAfterSeconds": 0 } },
+        { "remainingSeconds": 59, "expect": { "install": false, "next": "reauth-then-renew", "renewAfterSeconds": 0 } },
+        { "remainingSeconds": 1, "expect": { "install": false, "next": "reauth-then-renew", "renewAfterSeconds": 0 } }
       ]
     },
     "osGrantProjectResponse": {
