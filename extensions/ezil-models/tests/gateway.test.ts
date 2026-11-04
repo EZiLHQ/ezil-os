@@ -175,6 +175,16 @@ describe('gateway transport', () => {
 });
 
 describe('gateway errors and credits', () => {
+    test('only a credit refusal tells the person to add credits; limits, auth and outages keep their own copy', () => {
+        for (const body of [{ code: 'insufficient_credits' }, { code: 'insufficient_credits', no_live_grant: true }, { code: 'no_live_grant' }]) {
+            expect(describeGatewayError('qwen', 402, null, body, null).message).toMatch(/Add credits/);
+        }
+        for (const [status, body] of [[429, { code: 'rate_limited' }], [429, { code: 'tpm_limited' }], [429, { code: 'window_budget_reached' }],
+            [401, { code: 'unauthorized', reason: 'token_expired' }], [403, { code: 'not_a_member' }], [503, { code: 'paused' }],
+            [502, { code: 'os_ai_unavailable' }], [504, { code: 'upstream_timeout' }]] as const) {
+            expect(describeGatewayError('qwen', status, null, body, null).message).not.toMatch(/add credits/i);
+        }
+    });
     test('window exhaustion uses the full Retry-After seconds or HTTP date in local time', () => {
         const now = Date.parse('2026-10-22T12:05:00Z');
         const reset = new Date(now + 7200000);

@@ -308,10 +308,24 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(showCreditWarning).toHaveBeenCalledTimes(1);
             expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining(text), 'Add credits');
             expect(openExternal).toHaveBeenCalledTimes(1);
-            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits');
+            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits&reason=insufficient_credits');
             expect(showRetryError).not.toHaveBeenCalled();
             expect(h.host.usage).toHaveLength(0); expect(h.requestFinished).toHaveBeenCalledTimes(1);
         });
+        // Only a credit refusal offers Add credits: buying credits fixes none of these, so none of them may suggest it.
+        // (rate_limited and tpm_limited retry through the transport first; their copy is pinned in gateway.test.ts.)
+        for (const [status, code, extra] of [[429, 'window_budget_reached', {}],
+            [401, 'unauthorized', { reason: 'token_expired' }], [403, 'not_a_member', {}], [503, 'paused', {}], [502, 'os_ai_unavailable', { origin: 'os_proxy' }],
+            [504, 'upstream_timeout', {}], [500, 'internal_error', {}]] as const) {
+            test(`${code} (HTTP ${status}) never offers Add credits`, async () => {
+                const host = gatewayHost((async () => Response.json({ error: { code, ...extra } }, { status })) as unknown as typeof fetch);
+                const provider = new EZiLModelsProvider(host);
+                await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+                    { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow();
+                expect(showCreditWarning).not.toHaveBeenCalled();
+                expect(openExternal).not.toHaveBeenCalled();
+            });
+        }
         for (const value of [undefined, '', 'not a URL', '/ai/v1', 'http://os.invalid/ai/v1', 'javascript:alert(1)', 'file:///ai/v1']) {
             test(`no button without a usable HTTPS environment origin: ${value}`, async () => {
                 if (value === undefined) delete process.env.EZIL_AI_BASE_URL;
