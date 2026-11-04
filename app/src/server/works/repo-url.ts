@@ -27,10 +27,11 @@ const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 /** A plain repository name: no leading dot, no `..`, at most 100. */
 const NAME = /^(?!\.)(?![A-Za-z0-9._-]*\.\.)[A-Za-z0-9._-]{1,100}$/;
 /**
- * EZiL Git's hosts as service configuration names them (production `github.ezil.work`, staging Works
- * `git-qa.ezil.work`; os-builder-project-open-v1 §4): recognised, refused until Works can grant by address.
+ * Every host the EZiL Git gateway serves (EZiL CLI `apps/git-gateway`): production `github.ezil.work` and
+ * `git.ezil.work`, `git-staging.ezil.work` (staging gateway code, production Works) and `git-qa.ezil.work`
+ * (staging Works; os-builder-project-open-v1 §4). Recognised, refused until Works can grant by address.
  */
-const EZIL_GIT_HOSTS = new Set(['github.ezil.work', 'git-qa.ezil.work']);
+const EZIL_GIT_HOSTS = new Set(['github.ezil.work', 'git.ezil.work', 'git-staging.ezil.work', 'git-qa.ezil.work']);
 
 /** One canonical public github.com repository, or a refusal. Never throws. */
 export function parseRepositoryUrl(raw: unknown): ParsedRepositoryUrl {
