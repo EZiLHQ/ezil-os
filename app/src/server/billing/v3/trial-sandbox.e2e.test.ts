@@ -19,7 +19,9 @@
  * - The v3 Standard price (`ezil_standard_monthly_v3`) must already exist in the sandbox; the suite never creates one.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -433,11 +435,27 @@ const FORBIDDEN_REPORT_PATTERNS = [
     /\b(?:sk|rk|pk)_(?:test|live)_[A-Za-z0-9]/, /whsec_[A-Za-z0-9]/, /_secret_[A-Za-z0-9]/, /@example\.test/i,
     /postgres(?:ql)?:\/\//, /checkout\.stripe\.com/,
 ];
+/** Exactly which code, schema and tools produced this report (review: a report must prove its head). */
+function provenance() {
+    const repo = fileURLToPath(new URL('../../../../../', import.meta.url));
+    const git = (...args: string[]) => { try { return execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim(); } catch { return null; } };
+    const dirty = (git('status', '--porcelain', '--', 'app', 'shell', '.github') ?? '').split('\n').filter(Boolean).length;
+    let migration: string | null = null;
+    try { migration = createHash('sha256').update(readFileSync(`${repo}app/drizzle/0021_standard_trial.sql`)).digest('hex'); } catch { /* recorded as null */ }
+    let stripeCli: string | null = null;
+    try { stripeCli = execFileSync('/root/ezil-tools/stripe-sandbox/bin/stripe', ['--version'], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as NodeJS.ProcessEnv }).trim(); } catch { /* recorded as null */ }
+    let db: { host: string; port: string } | null = null;
+    try { const url = new URL(databaseUrl); db = { host: url.hostname, port: url.port }; } catch { /* recorded as null */ }
+    return { sourceSha: git('rev-parse', 'HEAD'), trackedChanges: dirty, migration0021Sha256: migration, stripeCli,
+        stripeApiVersion: '2026-09-30.endive (product pin)', node: process.version, disposableDb: db };
+}
+const PROVENANCE = provenance();
+
 function writeReport(finishedAt: string | null = null): Promise<void> {
     // Serialize writes so concurrent scenarios cannot replace a newer report with an older snapshot.
     const work = reportWrites.catch(() => {}).then(async () => {
         const json = JSON.stringify({
-            runId, request: REQUEST, account: EXPECTED_ACCOUNT, livemode: false, startedAt, finishedAt,
+            runId, request: REQUEST, account: EXPECTED_ACCOUNT, livemode: false, startedAt, finishedAt, provenance: PROVENANCE,
             harness: {
                 wrapper: 'stripe-sandbox.mjs e2e (stripe listen --forward-to the local receiver)',
                 signatureClock: 'wall time (Stripe signs with wall time; tolerance 300 s)',
