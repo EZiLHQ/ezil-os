@@ -35,6 +35,7 @@ import {
   settleCodeFolder,
   type CodeFolderOutcome,
 } from './code-folder';
+import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -334,6 +335,25 @@ export interface AwsBrowserDeps {
   lookup: (sandboxId: string) => Promise<AwsTunnelRecord | null>;
   fetch: FetchLike;
   nowMs: () => number;
+  /**
+   * The EZiL OS shell origins Code's folder bridge may report to (`./code-folder-bridge.ts`); the bridge goes into
+   * code-server's workbench document only. Empty or absent: nothing is injected.
+   */
+  codeShellOrigins?: readonly string[];
+}
+
+/**
+ * Code's workbench document with the folder bridge in it, the same document as on a Cloudflare computer
+ * (`preview-bridge.ts` `handlePreviewProxy`). Any other answer (a redirect, an error, another type) is returned
+ * untouched; so is the document when no origin is configured or code-server's page has no nonce to carry.
+ */
+async function withCodeFolderBridge(res: Response, origins: readonly string[]): Promise<Response> {
+  if (origins.length === 0 || !isHtmlDocument(res.status, res.headers.get('content-type'))) return res;
+  const html = await res.text();
+  const headers = new Headers(res.headers);
+  // The body changed: its old length no longer holds (the runtime encodes it again from Content-Encoding).
+  headers.delete('content-length');
+  return new Response(injectCodeFolderBridge(html, origins), { status: res.status, statusText: res.statusText, headers });
 }
 
 /**
@@ -421,7 +441,11 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       }
     }
   }
-  return proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
+  const answered = await proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
+  if (port === CODE_PREVIEW_PORT && isWorkbenchDocumentRequest(request.method, url.pathname, request.headers.get('upgrade'))) {
+    return withCodeFolderBridge(answered, deps.codeShellOrigins ?? []);
+  }
+  return answered;
 }
 
 /** Which window asks for the preview: the streamed desktop, Code (code-server) or the hosted app. */

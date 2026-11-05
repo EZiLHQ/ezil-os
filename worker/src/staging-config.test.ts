@@ -60,11 +60,17 @@ describe('staging Worker resources and routes', () => {
       AWS_ROUTING_ENABLED: 'on',
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
+      // Code's folder bridge reports to the staging shell only (src/code-folder-bridge.ts).
+      CODE_SHELL_ORIGINS: 'https://os-staging.ezil.work',
     });
   });
 
   it('routes AWS computers on staging only, through its own zone', () => {
     expect((config as { vars?: Record<string, string> }).vars?.AWS_ROUTING_ENABLED).toBeUndefined();
+  });
+
+  it('injects Code\'s folder bridge on staging only: production configures no shell origin', () => {
+    expect((config as { vars?: Record<string, string> }).vars?.CODE_SHELL_ORIGINS).toBeUndefined();
   });
 
   it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {
