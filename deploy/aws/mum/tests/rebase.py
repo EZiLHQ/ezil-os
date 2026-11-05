@@ -641,6 +641,47 @@ class ComputerTests(unittest.TestCase):
         COMPUTER.operate('recover', None, self.job, self.journal, True, self.secret, sender)
         self.assertTrue(all(v['computerId'] is None and v['jobId'] == self.job for v in calls))
 
+    def test_retirement_hint_only_on_plan_prepare_exact_and_omitted_by_default(self):
+        hint = self.source()
+        self.assertNotIn('sourceRetirementExecutionArn', COMPUTER.request('plan', self.computer, None))
+        for operation in ('plan', 'prepare'):
+            sent = COMPUTER.request(operation, self.computer, None, hint)
+            self.assertEqual(list(sent), ['schemaVersion', 'operation', 'computerId', 'jobId', 'sourceRetirementExecutionArn'])
+            self.assertEqual(sent['sourceRetirementExecutionArn'], hint)
+        for operation, job in (('launch', self.job), ('verify', None), ('recover', self.job)):
+            with self.assertRaises(ValueError):
+                COMPUTER.request(operation, self.computer if operation != 'recover' else None, job, hint)
+        other = hint.replace(':ezil-', ':other-', 1) if ':ezil-' in hint else hint.replace(':execution:', ':execution:x', 1)
+        for bad in ('', 'arn:aws:states:ap-south-1:452630323510:execution:ezil-mum-lifecycle:' + self.job, hint + 'x', other,
+                    hint.replace('ap-south-1', 'us-east-1', 1)):
+            with self.assertRaises(ValueError):
+                COMPUTER.request('prepare', self.computer, None, bad)
+
+    def test_retirement_hint_survives_journal_resume_and_lost_prepare_reconciliation(self):
+        hint = self.source()
+        def lost(*_): raise TimeoutError()
+        with self.assertRaises(TimeoutError):
+            COMPUTER.operate('prepare', self.computer, None, self.journal, True, self.secret, lost, retirement=hint)
+        self.assertEqual(manifest.read(self.journal)['pending']['sourceRetirementExecutionArn'], hint)
+        calls = []
+        def found(sent, _):
+            calls.append(sent.copy()); return 200, self.reply(sent)
+        COMPUTER.operate('prepare', self.computer, None, self.journal, True, self.secret, found, retirement=hint)
+        self.assertEqual([(v['operation'], v.get('sourceRetirementExecutionArn')) for v in calls], [('plan', hint), ('prepare', hint)])
+        self.assertEqual(calls[1]['jobId'], self.job)
+        tampered = manifest.read(self.journal); tampered['pending'] = dict(calls[1], sourceRetirementExecutionArn='x')
+        self.journal.write_text(json.dumps(tampered))
+        with self.assertRaises(ValueError):
+            COMPUTER.operate('verify', self.computer, None, self.journal, True, self.secret, found)
+
+    def test_retirement_hint_cli_only_for_plan_prepare(self):
+        for argv in (['launch', '--computer', self.computer, '--job', self.job], ['reconcile-replacement', '--computer', self.computer,
+                     '--job', self.job, '--source-execution-arn', self.source()]):
+            with patch.object(sys, 'argv', ['rebase_computer.py', *argv, '--source-retirement-execution-arn', self.source()]), \
+                    patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection, self.assertRaises(ValueError):
+                COMPUTER.main()
+            connection.assert_not_called()
+
     def source(self, job='33333333-3333-4333-8333-333333333333'):
         return COMPUTER.json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-' + job
 

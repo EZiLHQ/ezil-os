@@ -5,16 +5,23 @@ import { COUNTER, DIGEST, HASH, INSTANCE, SNAP, TIME, UUID, VOL, strictJson } fr
 import { EnvelopeSchema } from './contract.js';
 
 export const REBASE_PREPARATION_TIMEOUT_SECONDS = 7200;
+/** App DESIGN R: a STOPPED computer's released warm-pool host. Last key, omitted when absent (app RebasePreparationSchema):
+ * existing documents stay byte-identical, and a helper without this field refuses such a document (strict). */
+export const ReleasedPoolHostSchema = z.object({ poolHostId: UUID, lifecycleDigest: HASH,
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const PreparationDocumentSchema = z.object({
     schemaVersion: z.literal(1), jobId: UUID, computerId: UUID, sourceInstanceId: INSTANCE,
     sourceVolumeId: VOL, fsUuid: UUID, sourceGeneration: COUNTER, sourceLeaseEpoch: COUNTER,
     sourceFenceToken: UUID, fromDigest: DIGEST, toDigest: DIGEST, volumeGiB: z.number().int().min(1).max(16384),
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: TIME,
+    releasedPoolHost: ReleasedPoolHostSchema.optional(),
 }).strict().superRefine((i, ctx) => {
     const d = i.deployment, s = i.sourceDeployment;
     if (i.fromDigest !== s.lowerImageDigest || i.fromDigest !== d.previousLowerImageDigest || i.toDigest !== d.lowerImageDigest
         || i.fromDigest === i.toDigest || i.volumeGiB < d.storage.dataMinGiB || i.volumeGiB > d.storage.dataMaxGiB
-        || (['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k]))
+        || (['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k])
+        || (i.releasedPoolHost && !i.releasedPoolHost.releaseExecutionArn.startsWith(
+            d.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-'))))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
 });
 export type PreparationDocument = z.infer<typeof PreparationDocumentSchema>;
