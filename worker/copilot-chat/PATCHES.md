@@ -9,7 +9,7 @@ gates alone). If a code-server bump moves a string, the Docker build fails
 with the offending anchor printed; re-derive it from the new bundle (grep the
 source tree at the matching `microsoft/vscode` tag — the anchors are the
 compiled form of the files named below) and update both the script and this
-table. Only the documented strings, network call sites, visibility filters and the chat history index (Part 3) change: no command id, setting key, contribution point,
+table. Only the documented strings, network call sites, visibility filters, the chat history index (Part 3) and the chat view layout (one menu placement, DOM placement, CSS) change: no command id, setting key, contribution point,
 `product.json` field or LICENSE file is changed. The original work stays
 MIT, Copyright (c) Microsoft Corporation; each patched `.js` gets a one-line
 "Modified at build time by EZiL" notice (see `ATTRIBUTIONS.md`).
@@ -64,11 +64,47 @@ element equal. Resolve indices from the pinned `out/nls.keys.json`; they move be
 
 Gates: every anchor 0, every replacement at its count, `By continuing with {0} Copilot` 0, both files parse (`.js` evaluated in a VM, `.json` parsed) and are identical element-wise.
 
-### EZiL notice under the chat input — `out/vs/code/browser/workbench/workbench.css`
+### Compact chat layout — `workbench.js` (`chat-header`, `attach-execute`) and `workbench.css` (`chat-layout`)
 
-| id | source | anchor | replacement | count | why |
-|---|---|---|---|---|---|
-| `chat-notice` | `vs/workbench/contrib/chat/browser/widget/media/chatViewWelcome.css` `.interactive-session.chat-view-getting-started-disabled { … }` (nested) | `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}`, left as it is (gated once) | appended to the end of the file, top level: `.chat-viewpane .interactive-session>.interactive-input-part::after{content:"AI responses may be inaccurate. Review changes before applying them.";…}` | 1 | `chatWidget.ts` adds `chat-view-getting-started-disabled` whenever `sentiment.completed \|\| hasByokModels` — always, with the `ezil` group present — and the upstream rule hides the welcome's message, disclaimer and tips; with the Sessions list on (Part 3), an empty chat shows that list instead of the welcome anyway. The notice therefore leaves the welcome: one muted line under the chat view's input, in every chat state (empty, running, finished), counted in the input part's height so the Sessions list and transcript lay out above it. Only the chat view (`.chat-viewpane`), not inline or editor chats. Appended, not placed beside the upstream rule: that rule sits in a nested block, so a neighbour would be nested too and match nothing (measured in the image e2e). Gates: the upstream rule once, the notice rule once, and at brace depth 0. |
+Upstream, the bottom of the chat view stacked: the "Chat history" title row (over an empty chat,
+where the Sessions list fills the top), a getting-started tip, the composer (input over a row with
+Add Context, Agent, model, Configure Tools and Send), a Local + permissions + context-usage row, and,
+from the previous build of this script, a notice line (`chat-notice`, two lines on a ~400 px panel).
+Measured in the image (mock gateway, chat panel 818 / 400 CSS px): 191 / 225 px of an empty chat and
+130 / 146 px under a conversation. After: 56 px (one-row composer) in every state, with a 30 px header
+(54 px when it wraps to two rows below ~600 px).
+
+Where each control is now (same nodes, same listeners, same accessible names):
+
+- **Header (the chat title row, always on top):** Go Back, the chat title / "Chat history" (opens the
+  session picker), mode (Agent), model, Configure Tools, Local, the permission level (label kept: the
+  row wraps instead of hiding it), context usage, an info button for the notice, the Sessions-sidebar
+  toggle. Tab order follows that order.
+- **Composer:** input, Add Context, Send (Stop while answering); attachment chips keep their own row
+  above. Auto-grow is upstream's: up to 250 px of editor (`vmn`), then the editor scrolls (measured on a
+  794 px and a 454 px chat pane: 11 lines, then a scrollbar).
+- **Notice:** the info button's accessible name and tooltip are "AI responses may be inaccurate. Review
+  changes before applying them."; Enter/Space/click opens EZiL AI status (`ezil-models.showStatus`),
+  which lists the same sentence (and, if that command is missing, a notification shows it). The AI
+  status dashboard (`ai-dashboard`) and `terms` strings still carry it too.
+- **Tip:** hidden in the chat view. `chat.tips.enabled` would be the setting, but it is
+  application-scoped (`scope:1`): set in Machine settings it had no effect (measured), and enforcing
+  it in user settings would rewrite a user-owned file. Attachments, the working set, todo list,
+  confirmations and other notices above the input are unchanged.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `chat-header` | workbench.js `ChatViewPane.createControls` (`vs/workbench/contrib/chat/browser/widgetHosts/viewPane/chatViewPane.ts`): `createControls(e){let t=this.createSessionsControl(e),i=this.welcomeController=this._register(this.instantiationService.createInstance(P3e,e,this,"panel")),n=this.createChatControl(e);this.registerControlsListeners(t,n,i),this.updateSessionsControlVisibility()}` | Same, then `try{this._ezilChatHeader(e)}catch(f){this.logService.error(…)}` and a new method `_ezilChatHeader(e)` (exact text: `R_CHAT_HEADER` in the script). It needs the title row, the input part, its editor cell, toolbar row, primary toolbar and secondary toolbar, else returns without changing anything. It creates `div.interactive-session.ezil-chat-header` (the class keeps upstream's `.interactive-session …` picker styles matching; CSS gives it `display:contents`) that stops `click`/gesture-tap from reaching the title row (whose click focuses the input), wraps the primary toolbar (`inputToolbarElement`) in a `div.chat-input-toolbars` (so `.chat-input-toolbars>.chat-input-toolbar` rules match), appends the secondary toolbar (`secondaryToolbarContainer`: Local, permissions, context usage, status) and a `button.ezil-chat-help.codicon-info`, and inserts it before the title's actions toolbar. The title container then moves before `.voice-agent-controls-wrapper` (top of `.chat-viewpane`, in stacked and side-by-side orientations); the view's layout already subtracts the title's measured height (`ChatViewTitleControl` ResizeObserver), so a wrapped header relayouts the chat. The pane gets `ezil-compact-chat`, which every layout rule requires. A ResizeObserver on the composer's editor cell and toolbar row measures the cell (`clientWidth` minus its padding) against the Monaco editor's laid-out width and corrects `inputPart.setInputEditorTrailingSpace(…)` by the difference, so the editor is exactly as wide as its cell beside Add Context and Send (the input part's own estimate assumes 10 px of inner padding; measured 10 px too wide when given the toolbar width alone). Only the chat view: editor-hosted, quick and inline chats keep upstream layout. Anchor 0, replacement 1. |
+| `header-names` | `createChatTitleControl(e){this.titleControl=`, `this.titleContainer=t.root,`, `get inputPart(){return this.inputPartDisposable.value}`, `get inputToolbarElement(){return this.inputActionsToolbar.getElement()}`, `get inputContainerElement(){return this.inputContainer}`, `this.secondaryToolbarContainer=r.secondaryToolbar;`, `setInputEditorTrailingSpace(e){let t=Math.max(0,e);`, the default input layout `Ze(".chat-input-container@inputContainer",[…attachments…,…editor…,Ze(".chat-input-toolbars@inputToolbars")])`, `this.chatEntitlementService=M;this.commandService=N;`, `this.logService=v;this.notificationService=b;` | Checked, never patched: each occurs once, so the names `_ezilChatHeader` uses mean what it expects. |
+| `attach-execute` | workbench.js Add Context (`workbench.action.chat.attachContext`) menu entry for the chat view: `{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(J.lockedToCodingAgent.negate(),J.agentSupportsAttachments)),id:O.ChatInput,group:"navigation",order:-1}` | Same with `id:O.ChatExecute`: the button renders beside Send (the execute toolbar already renders this action; quick chat registers it there), so it stays in the composer when the ChatInput toolbar moves to the header. Applies to location `panel`, i.e. also the chat editor, where it now sits beside Send; its keybinding (Ctrl+/) is unchanged. Anchor 0, replacement 1. |
+| `chat-layout` | workbench.css: `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}` left as it is (gated once: the welcome disclaimer stays hidden whenever BYOK models exist, so it is not where the notice lives) | Appended to the end of the file, top level (a rule next to the nested upstream one would be nested too), exact text `R_CSS_LAYOUT`: the header row wraps (`flex-wrap`, title label `flex:1 1 96px`), the moved toolbars shrink instead of stretching, the info button looks like a toolbar icon with a focus ring; the composer's `.chat-input-container` is a two-column grid (editor, then the Add Context/Send row bottom-aligned; attachments span both); `min-width:0!important` on that row because the moved responsive toolbar keeps writing its own minimum width onto the container it was created in; the tip is hidden. All rules but the tip's require `.chat-viewpane.ezil-compact-chat`. Gates: upstream rule once, layout block once and at brace depth 0, the previous notice rule (`.interactive-input-part::after{content:"AI responses may be inaccurate.`) 0. |
+
+Offline test (patches a copy, runs `--verify`, checks the CSS and the menu entry, executes
+`_ezilChatHeader` and `createControls` against a DOM double, rejects a moved anchor):
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-layout-patch.test.cjs
+```
 
 ### Accounts menu — `out/vs/code/browser/workbench/workbench.js`
 
@@ -102,8 +138,8 @@ output channel are diagnostics, not UI. Settings that carry part of the
 result (Machine layer, both launchers): `github.copilot.chat.backgroundAgent.enabled`
 / `cloudAgent.enabled: false` (extension's GitHub-only session types),
 `chat.viewSessions.enabled: true` with `chat.viewSessions.orientation: "stacked"`
-(Part 3: the in-view Sessions list over an empty chat; the notice moved under
-the input, `chat-notice` above).
+(Part 3: the in-view Sessions list over an empty chat, under the chat header,
+`chat-header` above).
 
 ## Part 3 — EZiL Chat history
 
@@ -221,7 +257,8 @@ on activation, config change, completed usage, click and every 60 seconds.
 Preserved notices: Copilot `LICENSE.txt` (MIT and Microsoft copyright), the
 Microsoft JS copyright headers, existing build modification notices, all other
 license/attribution and third-party notice files, and the AI accuracy/review
-notice in the welcome screen and replacement dashboard/status popover. Neither
+notice in the welcome strings, the chat header's info button (`chat-header`) and the
+replacement dashboard/status popover. Neither
 `product.json` nor publisher/extension identity changes. Original GitHub sign-in
 legal dialogs remain intact; they are not shown by the EZiL status surface.
 
