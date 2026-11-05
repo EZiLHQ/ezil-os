@@ -73,6 +73,7 @@ import {
 } from './hmac';
 import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
 import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
+import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
@@ -881,6 +882,10 @@ export async function handlePreviewBootstrap(
  * immediately and silently (it just never connects). This is a known, narrow
  * landmine: keep this check target-based, never port-based or content-type
  * heuristic-based, so it can't regress if the ports are ever renumbered.
+ *
+ * `codeShellOrigins` (code target only): the EZiL OS shell origins the Code folder bridge may report to
+ * (`./code-folder-bridge.ts`). The bridge goes into code-server's workbench document (a GET of `/`) and nothing
+ * else; none configured, nothing is injected.
  */
 export async function handlePreviewProxy(
   request: Request,
@@ -890,6 +895,7 @@ export async function handlePreviewProxy(
   appPath: string,
   port: number = APP_PREVIEW_PORT,
   target: BridgeTarget = 'app',
+  codeShellOrigins: readonly string[] = [],
 ): Promise<Response> {
   const url = new URL(request.url);
   const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
@@ -942,7 +948,10 @@ export async function handlePreviewProxy(
 
   if (contentType.includes('text/html')) {
     const bodyText = await upstream.text();
-    const injected = target === 'code' ? bodyText : injectRuntimeShim(bodyText);
+    const workbench = target === 'code' && isHtmlDocument(upstream.status, contentType)
+      && isWorkbenchDocumentRequest(request.method, targetPath, request.headers.get('upgrade'));
+    const injected = target === 'code' ? (workbench ? injectCodeFolderBridge(bodyText, codeShellOrigins) : bodyText)
+      : injectRuntimeShim(bodyText);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }

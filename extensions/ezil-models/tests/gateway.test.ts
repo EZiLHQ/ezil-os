@@ -215,7 +215,7 @@ describe('gateway errors and credits', () => {
     for (const [status, code, text] of [
         [402, 'insufficient_credits', 'credits'], [402, 'no_live_grant', 'no AI credits left'], [401, 'no_ezil_role', 'Your EZiL account has no AI access yet'],
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS: This computer’s AI connection was refused'],
-        [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and your conversation history is kept.'],
+        [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and the conversation is kept. Shorten your last message'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
     ] as const) test(`maps ${code}, always preserving request ID`, () => {
@@ -343,10 +343,12 @@ describe('local refusals and error origin', () => {
         const { bodyBytes } = error.counts!;
         expect(error.counts).toEqual({ bodyBytes, limitBytes: 130_016, messages: 1, maxBlocks: 1, tools: 1, toolBytes });
         expect(bodyBytes).toBeGreaterThan(130_016);
-        expect(error.message).toBe(`EZiL Models: This conversation is too large to send to ${KIMI}: ${bodyBytes.toLocaleString('en-US')} bytes, including ${toolBytes} bytes of tool definitions; `
-            + 'the limit is 130,016 bytes. Nothing was sent or charged, and your conversation history is kept. You can start a new chat. (local_input_too_large)');
-        // Never promises that /compact works (on Kimi it runs the same failing summary request).
-        expect(error.message).not.toMatch(/compact|invalid/i);
+        // The one message is the current request: compaction keeps it whole and had nothing else to compact, so it
+        // does not claim to have compacted anything; the message is what to shorten.
+        expect(error.message).toBe(`EZiL Models: This request is too large for ${KIMI}: ${bodyBytes.toLocaleString('en-US')} bytes `
+            + `(${toolBytes} of them tool definitions), over the 130,016-byte limit. Nothing was sent or charged, and the conversation is kept. `
+            + 'Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
+        expect(error.message).not.toMatch(/invalid|new chat/i);
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null, latency_ms: 0,
             usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
@@ -367,11 +369,12 @@ describe('local refusals and error origin', () => {
     test('OS proxy refusals say EZiL OS; relayed Gateway refusals say EZiL AI and show their numbers', () => {
         const proxy = describeGatewayError(KIMI, 413, null, parseErrorBody(JSON.stringify({ error: { code: 'body_too_large', message: 'x', source: 'ezil-os-proxy' } })), null);
         expect([proxy.origin, proxy.code]).toEqual(['os_proxy', 'body_too_large']);
-        expect(proxy.message).toBe('EZiL OS: This request is larger than the 160 KiB EZiL OS forwards. Nothing was sent to EZiL AI or charged, and your conversation history is kept. You can start a new chat');
+        expect(proxy.message).toBe('EZiL OS: This request is larger than the 160 KiB EZiL OS forwards. Nothing was sent to EZiL AI or charged, and the conversation is kept. '
+            + 'Shorten your last message or its attachments, or pick a model with a larger input limit');
         const gateway = describeGatewayError(KIMI, 413, null, { code: 'input_too_large', input_bound_tokens: 140_000, max_input_tokens: 131_072, request_id: 'r1' }, null);
         expect(gateway.origin).toBe('gateway');
         expect(gateway.message).toBe(`EZiL AI: This conversation is too large for ${KIMI} (input bound 140000 > 131072 tokens). EZiL AI refused it before the model ran, so it was not charged, `
-            + 'and your conversation history is kept. You can start a new chat (request r1)');
+            + 'and the conversation is kept. Shorten your last message or its attachments, or pick a model with a larger input limit (request r1)');
         expect(describeGatewayError(KIMI, 413, null, { code: 'body_too_large' }, null).message).toStartWith('EZiL AI: This conversation is too large');
         // Proxy codes are os_-prefixed and never relayed from the Gateway, with or without the source marker.
         for (const code of ['os_session_missing', 'os_ai_unavailable', 'os_proxy_unauthorized', 'os_completion_timeout']) {

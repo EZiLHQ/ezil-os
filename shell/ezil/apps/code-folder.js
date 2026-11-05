@@ -2,8 +2,10 @@
 //
 // What it does, and nothing more:
 //   1. Keeps ONE record per (user, computer, project?, repo?) in THIS TAB's
-//      sessionStorage: the folder the bound editor last reported. Never a URL
-//      key, so no link can choose a folder; never shared with another tab.
+//      sessionStorage: the folder the bound editor last reported. The record is
+//      never a URL key and never shared with another tab. (Since folder-url-sync
+//      the ADDRESS may name a folder too, `/app/code?folder=`, which the mint asks
+//      for before this record; either way the server's walk decides what opens.)
 //   2. Gives the mint the record of an own-files tab (`folderAskFor`). A project
 //      tab asks nothing: the server fixes its root to the repository folder
 //      (r32; a project's `path` is reveal-only).
@@ -22,8 +24,15 @@
 // The editor's report is a HINT. Authority is the next mint's server-side
 // resolution: the Worker strips the computer's own root and walks the rest on
 // the computer with no symlink followed (worker/src/code-folder.ts). The editor
-// side is a build-time patch (worker/code-folder-bridge/patch-folder-bridge.sh);
-// an editor without it never reports, so this module then does nothing at all.
+// side is injected by the Worker into code-server's workbench document, on both
+// computers (worker/src/code-folder-bridge.ts); an editor without it never
+// reports, so this module then does nothing at all.
+//
+// Folder URL sync (folder-url-sync, 2026-11-05): the window also hears every
+// report (`onRoot`), and the editor's own folder switches before they happen
+// (`ezil.code.open` → `onOpen`, then `ezil.code.go` back), so the Code window
+// can keep `/app/code?folder=` on the address bar and give each switch its own
+// history entry (docs/APP-ROUTES.md §5 "Code's folder").
 //
 // Why sessionStorage and not history.state: Code is single-instance per tab,
 // the folder belongs to the window rather than to a history entry,
@@ -245,17 +254,33 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  * with the URL of that document (`editorDocumentUrl`, null if the editor did not
  * say its document path).
  *
- * 🔴 F2 IS OPEN, and nothing here may tear the editor down by itself. Chrome
- * keeps a frame's document per joint history entry, so after an in-frame Open
- * Folder, Back to a shell entry pushed while Code was open reloads the editor at
- * the mint's first folder (measured, Chromium 151). Reloading the editor's own
- * document in a fresh frame (remove + re-insert) avoids that, but removing a live
- * frame skips its `beforeunload`, i.e. code-server's "pending backups" veto, and
- * can lose unsaved edits (independent review, 3 Nov 2026). No shell code may do
+ * Folder URL sync:
+ *   - `onRoot(root, {mintDriven, fallback})` hears every report that counts, with
+ *     what the editor shows: `{kind: 'folder', path, base?}`, `{kind: 'empty', base?}`
+ *     or `{kind: 'unsupported'}` (a workspace, another scheme, a path the grammar
+ *     refuses). `fallback` is the mint-driven report that is NOT the asked folder
+ *     (the notice is shown; the address should keep what was asked).
+ *   - `onOpen(next)` hears the editor's own folder switch BEFORE it happens
+ *     (`ezil.code.open`, same `next` shapes), once the first document has
+ *     reported; this module then answers `ezil.code.go` so the editor replaces its
+ *     document. A request before that, or with a malformed id, is not answered:
+ *     the editor switches by itself after its own fallback delay.
+ *   - `onLeaving()` hears that the editor's document is about to be navigated away
+ *     (`ezil.code.leaving`, its beforeunload): a navigation is under way, so the
+ *     window must not start one of its own.
+ *
+ * 🔴 Nothing here may tear the editor down by itself. Chrome keeps a frame's
+ * document per joint history entry; F2 (Back after an in-frame Open Folder
+ * reloaded the editor at the mint's first folder) is closed by folder-url-sync
+ * WITHOUT any teardown: each switch made in Code gets its own entry before the
+ * editor replaces its document in it (`onOpen` / `ezil.code.go`), so the
+ * browser's own per-entry reload is the right folder. Removing a live frame
+ * would skip its `beforeunload`, i.e. code-server's "pending backups" veto, and
+ * can lose unsaved edits (independent review, 3 Nov 2026); no shell code may do
  * that until the editor can confirm its backups are durable and editing has
  * stopped. A delay or a generic ready message is not that confirmation.
  */
-export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, continued = false }) {
+export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, onRoot, onOpen, onLeaving, continued = false }) {
     bridges.get(iframe)?.detach();
     let origin, mintId;
     try {
@@ -276,12 +301,35 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
         nonce = token();
         try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce }, origin); } catch { /* gone */ }
     };
+    // What a report or an open request says the editor shows (or will): a plain folder, the empty window, or
+    // anything Code cannot name in an address (a workspace, another scheme, a path the grammar refuses).
+    const rootOf = (d) => {
+        const base = typeof d.base === 'string' ? { base: d.base } : {};
+        if ( d.kind === 'folder' ) {
+            const path = plainFolderPath(d.path);
+            return path ? { kind: 'folder', path, ...base } : { kind: 'unsupported' };
+        }
+        if ( d.kind === 'empty' ) return { kind: 'empty', ...base };
+        return d.kind === 'workspace' || d.kind === 'foreign' ? { kind: 'unsupported' } : null;
+    };
+    const heard = (root, how) => { if ( root ) { try { onRoot?.(root, how); } catch { /* the window's own fault, never the bridge's */ } } };
     const onMessage = (ev) => {
         if ( ev.source !== iframe.contentWindow || ev.origin !== origin ) return;
         if ( ! live() ) { detach(); return; }
         const d = ev.data;
         if ( ! d || typeof d !== 'object' || d.v !== 1 ) return;
         if ( d.type === 'ezil.code.ready' ) { hello(); return; }
+        if ( d.type === 'ezil.code.leaving' ) { try { onLeaving?.(); } catch { /* as above */ } return; }
+        if ( d.type === 'ezil.code.open' ) {
+            // The editor is about to switch folder in this frame. Only a document this binding has heard from may
+            // ask (a stale one of an earlier mint is about to be replaced anyway): the window adds the entry, then
+            // the editor is told to go.
+            const next = rootOf(d);
+            if ( ! firstSeen || ! TOKEN_RE.test(d.id ?? '') || ! next ) return;
+            try { onOpen?.(next); } catch { /* the editor still switches */ }
+            try { iframe.contentWindow?.postMessage({ type: 'ezil.code.go', v: 1, id: d.id }, origin); } catch { /* gone */ }
+            return;
+        }
         if ( d.type !== 'ezil.code.folder' || ! TOKEN_RE.test(d.nonce ?? '') || d.nonce !== nonce ) return;
         nonce = null; // one report per hello
         const mintDriven = mintId !== null && d.mint === mintId;
@@ -302,11 +350,12 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
                 fallbackShown = true;
                 notice?.fallback?.(fallbackCode(mint.outcome), mint.asked);
             }
+            heard(rootOf(d), { mintDriven, fallback: true });
             return;
         }
         if ( d.kind === 'folder' ) {
             const path = plainFolderPath(d.path);
-            if ( ! path ) { putFolderRecord(bind, { kind: 'unsupported', reason: 'path' }); return; }
+            if ( ! path ) { putFolderRecord(bind, { kind: 'unsupported', reason: 'path' }); heard({ kind: 'unsupported' }, { mintDriven, fallback: false }); return; }
             if ( mintDriven && bind.project ) {
                 // r32: a project reopens at its repository folder; a child opened by hand is not reopened as the
                 // root (the repository's own config stays inert). Say so once, then follow what is on screen.
@@ -321,6 +370,7 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
         } else if ( d.kind === 'workspace' || d.kind === 'foreign' ) {
             if ( ! mintDriven ) putFolderRecord(bind, { kind: 'unsupported', reason: d.kind });
         }
+        heard(rootOf(d), { mintDriven, fallback: false });
     };
     // A user-driven document that changed what the frame shows: the shell may reload it in a fresh frame (F2).
     const changed = (mintDriven, key, report) => {
@@ -355,6 +405,10 @@ const COPY = {
     not_reopened: (n) => `Code didn't reopen “${n}” this time, so it opened its usual folder. Nothing was deleted.`,
     unsupported: () => 'Code reopens single folders only; your workspace is still in File > Open Recent.',
     child: (n) => `This project reopened at its folder. “${n}” isn't reopened automatically, so the repository's own settings stay off. Open it from File > Open Recent.`,
+    // A link's own `folder` the address-bar parser refused (`../app-link.js` parseFolder): nothing was asked for.
+    link_invalid: () => "This link's folder isn't a folder Code can open, so Code opened its usual folder.",
+    // A folder beside a project or repository: the repository opens at its own folder (docs/APP-ROUTES.md §2).
+    with_repository: () => "A folder inside a repository can't be opened from a link yet, so the repository opened at its own folder. Open the folder from the Explorer.",
 };
 COPY.invalid = COPY.unsupported;
 // Not `unverified`: the server cannot check folders yet (no resolver wired), so a re-mint gets the same answer.

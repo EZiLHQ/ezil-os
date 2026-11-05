@@ -69,7 +69,7 @@ function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
   const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
@@ -77,6 +77,13 @@ function scriptedContent(body, folder) {
     return [{ type: 'tool_use', id, name, input }];
   };
   if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
+  // A long answer (about 24 KB) per turn, so a few turns outgrow the input bound; its middle carries a per-turn marker
+  // that a compacted request no longer needs to repeat, while the saved chat keeps it.
+  if (userText.includes('EZIL_E2E_LONG')) {
+    const turn = /turn (\d+)/.exec(userText)?.[1] ?? '0';
+    const filler = 'The quick brown fox jumps over the lazy dog. '.repeat(260);
+    return [{ type: 'text', text: `EZiL Chat: long answer for turn ${turn}. ${filler}EZIL_LONG_BODY_${turn} ${filler}EZIL_LONG_OK_${turn}` }];
+  }
   if (userText.includes('EZIL_E2E_SLOW')) return [{ type: 'text', text: 'EZiL Chat: slow reply.', slow: true }];
   if (userText.includes('EZIL_E2E_UNDO')) {
     if (!done('ezil_undo')) return call('ezil_undo', 'replace_string_in_file', { filePath: join(folder, 'existing.txt'), oldString: 'after\n', newString: 'undo candidate\n' });
