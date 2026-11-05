@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "enabled": false,
+  "release_ref": null,
+  "delivery_role_arn": null,
+  "account": "452630323510",
+  "region": "ap-south-1",
+  "app_origin": "https://os-staging.ezil.work",
+  "instance_id": "i-014810524754b9ed0",
+  "instance_name": "ezil-os-billing-staging-host",
+  "instance_environment": "billing-staging",
+  "vpc_id": "vpc-0f6bc19fdfd4209aa",
+  "artifact_bucket": "ezil-main-preview-artifacts-452630323510-aps1",
+  "artifact_prefix": "os-staging/images/",
+  "worker_name": "ezil-os-worker-staging",
+  "lease_role_arn": "arn:aws:iam::452630323510:role/ezil-os-staging-lease"
+}
