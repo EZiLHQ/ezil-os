@@ -22,7 +22,8 @@ class El {
   get classList() { const el = this; return { add: c => { if (!el.className.split(' ').includes(c)) el.className = (el.className + ' ' + c).trim(); }, contains: c => el.className.split(' ').includes(c) }; }
   detach() { if (this.parentElement) { const s = this.parentElement.children; s.splice(s.indexOf(this), 1); this.parentElement = null; } }
   append(...nodes) { for (const n of nodes) { n.detach(); n.parentElement = this; this.children.push(n); } }
-  insertBefore(n, ref) { n.detach(); n.parentElement = this; const i = ref ? this.children.indexOf(ref) : -1; if (i < 0) this.children.push(n); else this.children.splice(i, 0, n); }
+  // Like the DOM: a reference node that is not a direct child throws (NotFoundError) before anything moves.
+  insertBefore(n, ref) { if (ref && !this.children.includes(ref)) throw new Error('NotFoundError'); n.detach(); n.parentElement = this; const i = ref ? this.children.indexOf(ref) : -1; if (i < 0) this.children.push(n); else this.children.splice(i, 0, n); }
   matches(sel) { return this.className.split(' ').includes(sel.replace(/^\./, '')); }
   querySelector(sel) { for (const c of this.children) { if (c.matches(sel)) return c; const d = c.querySelector(sel); if (d) return d; } return null; }
   addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
@@ -132,6 +133,17 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.deepEqual(f.pane.children.map(c => c.className), ['voice-agent-controls-wrapper']);
       assert(!f.pane.classList.contains('ezil-compact-chat'));
       assert.deepEqual(f.toolbars.children, [f.primary, f.execute]);
+    });
+
+    await t.test('a title row whose actions toolbar is nested deeper fails before any control moves (review MEDIUM-1)', () => {
+      const f = fixture();
+      const nested = new El('chat-view-title-actions-wrapper', f.doc);
+      f.inner.append(nested); nested.append(f.actions);
+      assert.throws(() => header.call(f.view, f.wrapper), /NotFoundError/);
+      // Mode/model/tools and Local/permissions stay where upstream put them: nothing is half-moved or lost.
+      assert.deepEqual(f.toolbars.children, [f.primary, f.execute]);
+      assert.equal(f.secondary.parentElement.className, 'interactive-input-part');
+      assert.deepEqual(f.inner.children.map(c => c.className), ['chat-view-title-navigation-toolbar', 'chat-view-title-actions-wrapper']);
     });
 
     await t.test('createControls still builds the view and contains a header failure', () => {

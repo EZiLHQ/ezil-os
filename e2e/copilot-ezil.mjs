@@ -177,7 +177,7 @@ try {
     const box = help?.getBoundingClientRect();
     return { shown: Boolean(help?.offsetHeight) && (help.getAttribute('aria-label') ?? '').includes(text) && help.title.includes(text) && box.bottom <= innerHeight, disclaimer: document.querySelector('.part.auxiliarybar .chat-welcome-view-disclaimer')?.textContent ?? '' };
   }, NOTICE);
-  check('chat panel shows the EZiL notice in its header (no GitHub Terms / Privacy Statement anywhere)', notice.shown && !/terms|privacy|github|copilot/i.test(notice.disclaimer), JSON.stringify({ shown: notice.shown, disclaimer: notice.disclaimer.slice(0, 120) }));
+  check('the AI notice is on the chat header\'s info control: its accessible name and tooltip (no GitHub Terms / Privacy Statement anywhere)', notice.shown && !/terms|privacy|github|copilot/i.test(notice.disclaimer), JSON.stringify({ shown: notice.shown, disclaimer: notice.disclaimer.slice(0, 120) }));
   await aux.screenshot({ path: join(OUT, 'welcome.png') }).catch(() => {});
   const brandingBoot = await visibleBranding();
   check('no visible "Copilot" / "GitHub" text anywhere in the workbench after boot', brandingBoot.length === 0, JSON.stringify(brandingBoot.slice(0, 4)));

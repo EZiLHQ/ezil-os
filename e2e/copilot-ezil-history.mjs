@@ -117,7 +117,7 @@ try {
     const shown = await until(async () => (await title.isVisible().catch(() => false)), '"Chat history" title', 30_000);
     const label = shown ? clean(await title.innerText()) : '';
     check('an empty chat shows the "Chat history" title', /chat history/i.test(label), JSON.stringify(label));
-    check('the EZiL notice still shows on the empty chat', await noticeShown());
+    check('the AI notice is still on the header info control (accessible name and tooltip) on the empty chat', await noticeShown());
     await page.screenshot({ path: join(OUT, 'history-empty-chat.png') });
     await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();
     await page.locator('.quick-input-widget').waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
@@ -168,7 +168,7 @@ try {
     // list over an empty chat is what leads back to it.
     const sessionsList = aux.locator('.agent-sessions-container').first();
     check('an empty chat shows the Sessions list', await until(async () => sessionsList.isVisible().catch(() => false), 'Sessions list', 30_000));
-    check('the EZiL notice shows in the chat header', await noticeShown());
+    check('the AI notice is on the chat header info control (accessible name and tooltip)', await noticeShown());
     // Without the list there is no filter button; carry on, so a build without the list fails on the report itself.
     await aux.locator('.agent-sessions-toolbar .codicon-filter').first().click({ timeout: 10_000 }).catch(() => {});
     await page.locator('.monaco-menu .action-item').first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
