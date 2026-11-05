@@ -143,7 +143,8 @@ try {
   let auxVisible = false;
   try { await aux.waitFor({ state: 'visible', timeout: T }); auxVisible = true; } catch { /* asserted */ }
   check('secondary sidebar is visible by default', auxVisible);
-  const chatWidget = aux.locator('.interactive-session, .chat-widget').first();
+  // The chat header's wrapper also carries `interactive-session` (for upstream picker styles): pin the chat widget.
+  const chatWidget = aux.locator('.chat-controls-container > .interactive-session, .chat-widget').first();
   let chatVisible = false;
   try { await chatWidget.waitFor({ state: 'visible', timeout: T }); chatVisible = true; } catch { /* asserted */ }
   const auxTitle = clean(await aux.locator('.composite.title, .title-label').first().innerText().catch(() => ''));

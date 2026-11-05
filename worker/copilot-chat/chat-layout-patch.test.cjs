@@ -32,19 +32,22 @@ class El {
 }
 function fixture({ withSecondary = true, commandFails = false } = {}) {
   const observers = [];
-  const doc = { createElement: tag => Object.assign(new El('', doc), { tagName: tag.toUpperCase() }), defaultView: { ResizeObserver: class { constructor(cb) { this.cb = cb; this.observed = []; this.disconnected = false; observers.push(this); } observe(e) { this.observed.push(e); } disconnect() { this.disconnected = true; } } } };
+  const doc = { createElement: tag => Object.assign(new El('', doc), { tagName: tag.toUpperCase() }), defaultView: { getComputedStyle: e => ({ paddingLeft: e.padL ?? '0px', paddingRight: '0px' }), ResizeObserver: class { constructor(cb) { this.cb = cb; this.observed = []; this.disconnected = false; observers.push(this); } observe(e) { this.observed.push(e); } disconnect() { this.disconnected = true; } } } };
   const mk = cls => new El(cls, doc);
   const pane = mk('pane-body chat-viewpane'), wrapper = mk('voice-agent-controls-wrapper'), sessions = mk('agent-sessions-container'), controls = mk('chat-controls-container');
   pane.append(wrapper); wrapper.append(sessions, controls);
   const title = mk('chat-view-title-container visible'), inner = mk('chat-view-title-inner'), nav = mk('chat-view-title-navigation-toolbar'), actions = mk('chat-view-title-actions-toolbar');
   title.append(inner); inner.append(nav, actions);
-  const session = mk('interactive-session'), part = mk('interactive-input-part'), inputContainer = mk('chat-input-container'), editor = mk('chat-editor-container'), toolbars = mk('chat-input-toolbars');
+  const session = mk('interactive-session'), part = mk('interactive-input-part'), inputContainer = mk('chat-input-container'), editor = mk('chat-editor-container'), monaco = mk('monaco-editor'), toolbars = mk('chat-input-toolbars');
+  editor.append(monaco); editor.clientWidth = 721; editor.padL = '4px';
   const primary = mk('monaco-toolbar chat-input-toolbar'), execute = mk('monaco-toolbar chat-execute-toolbar'), secondary = mk('chat-secondary-toolbar');
   controls.append(title, session); session.append(part); part.append(inputContainer); inputContainer.append(editor, toolbars); toolbars.append(primary, execute);
   if (withSecondary) part.append(secondary);
   toolbars.offsetWidth = 48;
+  // The input part lays the editor out at its own width estimate (779 px here) minus the trailing space.
+  monaco.offsetWidth = 779;
   const calls = { commands: [], info: [], trailing: [], errors: [], registered: [] };
-  const inputPart = { inputContainerElement: inputContainer, inputToolbarElement: primary, secondaryToolbarContainer: withSecondary ? secondary : undefined, setInputEditorTrailingSpace: px => calls.trailing.push(px) };
+  const inputPart = { inputContainerElement: inputContainer, inputToolbarElement: primary, secondaryToolbarContainer: withSecondary ? secondary : undefined, setInputEditorTrailingSpace: px => { calls.trailing.push(px); monaco.offsetWidth = 779 - px; } };
   const view = {
     titleControl: { titleContainer: title }, _widget: { inputPart },
     commandService: { executeCommand: id => { calls.commands.push(id); return commandFails ? Promise.reject(new Error('command not found')) : Promise.resolve(); } },
@@ -52,7 +55,7 @@ function fixture({ withSecondary = true, commandFails = false } = {}) {
     logService: { error: (m, e) => calls.errors.push([m, String(e)]) },
     _register: d => (calls.registered.push(d), d),
   };
-  return { doc, pane, wrapper, sessions, controls, title, inner, nav, actions, primary, execute, secondary, toolbars, view, calls, observers };
+  return { doc, pane, wrapper, sessions, controls, title, inner, nav, actions, primary, execute, secondary, toolbars, editor, monaco, view, calls, observers };
 }
 
 test('compact chat layout: CSS, Add Context move, header method', { skip: !source && 'set COPILOT_TEST_ROOT to local pristine bundle' }, async t => {
@@ -108,8 +111,10 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       const enter = help.dispatch('keydown', { key: 'Enter' }); assert(enter.prevented && enter.stopped);
       help.dispatch('keydown', { key: ' ' }); help.dispatch('keydown', { key: 'a' });
       assert.deepEqual(f.calls.commands, ['ezil-models.showStatus', 'ezil-models.showStatus', 'ezil-models.showStatus']);
-      assert.equal(f.observers.length, 1); assert.deepEqual(f.observers[0].observed, [f.toolbars]);
-      f.observers[0].cb(); assert.deepEqual(f.calls.trailing, [52]);
+      assert.equal(f.observers.length, 1); assert.deepEqual(f.observers[0].observed, [f.editor, f.toolbars]);
+      // The editor gets exactly its grid cell (721 px minus 4 px padding): trailing 779 - 717 = 62, then stable.
+      f.observers[0].cb(); f.observers[0].cb(); assert.deepEqual(f.calls.trailing, [62]); assert.equal(f.monaco.offsetWidth, 717);
+      f.editor.clientWidth = 701; f.observers[0].cb(); assert.deepEqual(f.calls.trailing, [62, 82]); assert.equal(f.monaco.offsetWidth, 697);
       f.calls.registered.forEach(d => d.dispose()); assert(f.observers[0].disconnected);
     });
 
