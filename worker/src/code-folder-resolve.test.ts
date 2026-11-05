@@ -6,7 +6,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import gw from './aws-gateway.vectors.json';
@@ -24,6 +24,7 @@ import {
   AWS_CODE_FOLDER_CONTROL_PATH,
   CODE_FOLDER_REL_ENV,
   CODE_FOLDER_RESOLVE_BOUND_MS,
+  CODE_FOLDER_RESOLVE_COMMAND,
   CODE_FOLDER_RESOLVE_SCRIPT,
   CODE_FOLDER_RESOLVE_TIMEOUT_MS,
   CODE_FOLDER_ROOT_ENV,
@@ -80,7 +81,9 @@ describe('cloudflareCodeFolderResolver: one bounded exec of the constant script'
     const rel = "my folder/$(touch pwned)/`id`/a'b\"c";
     expect(await cloudflareCodeFolderResolver(exec, '/workspace')(rel)).toBe('restored');
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.command).toBe(CODE_FOLDER_RESOLVE_SCRIPT);
+    // The constant script, inside a subshell: never run in the SDK's shared session shell itself.
+    expect(calls[0]!.command).toBe(CODE_FOLDER_RESOLVE_COMMAND);
+    expect(CODE_FOLDER_RESOLVE_COMMAND).toBe(`(\n${CODE_FOLDER_RESOLVE_SCRIPT}\n)`);
     expect(calls[0]!.command.includes('pwned')).toBe(false);
     expect(calls[0]!.options).toEqual({
       env: { [CODE_FOLDER_ROOT_ENV]: '/workspace', [CODE_FOLDER_REL_ENV]: rel },
@@ -231,6 +234,86 @@ describe('the walk script in real shells', () => {
     // the planner's refusals never reach the walk
     expect(await settleCodeFolder({ v: 1, path: `${dir}/outside` }, root, resolve)).toEqual({ outcome: 'outside' });
     expect(await settleCodeFolder({ v: 1, path: `${root}/projects/00000000-0000-4000-8000-000000000000/repository` }, root, resolve)).toEqual({ outcome: 'not_allowed' });
+  });
+
+  /**
+   * The Sandbox SDK's session, as its container server (0.12.1, `/container-server` in the desktop image) runs
+   * it: ONE persistent `bash --norc` reading commands on stdin. A foreground exec exports its env for that
+   * command only and runs the command inside `{ …; EXIT_CODE=$? }` IN THAT SHELL, then writes the exit code to a
+   * file. The desktop stack runs in the same session as a background job whose output a labeler reads through a
+   * FIFO (`startProcess`). Every exec of a walk here goes through the real `cloudflareCodeFolderResolver` call.
+   */
+  const sdkSession = () => {
+    const sdir = mkdtempSync(join(tmpdir(), 'ezil-sdk-session-'));
+    const shell = Bun.spawn(['bash', '--norc'], { cwd: root, stdin: 'pipe', stdout: 'ignore', stderr: 'ignore', env: { PATH: process.env.PATH! } });
+    const send = (text: string) => { shell.stdin.write(`${text}\n`); shell.stdin.flush(); };
+    const alive = () => shell.exitCode === null && !shell.killed;
+    const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+    let n = 0;
+    const exec: RepoOpenExec = async (command, options) => {
+      const id = ++n;
+      const out = join(sdir, `${id}.out`);
+      const code = join(sdir, `${id}.exit`);
+      const env = Object.entries(options.env ?? {});
+      send(['{', ...env.map(([k, v]) => `  export ${k}=${q(String(v))}`), '  {', command, '  EXIT_CODE=$?', `  } < /dev/null > ${q(out)} 2> /dev/null`,
+        ...env.map(([k]) => `  unset ${k}`), `  echo "$EXIT_CODE" > ${q(`${code}.tmp`)}; mv ${q(`${code}.tmp`)} ${q(code)}`, '}'].join('\n'));
+      for (const deadline = Date.now() + 5_000; Date.now() < deadline; await Bun.sleep(10)) {
+        if (existsSync(code)) return { exitCode: Number(readFileSync(code, 'utf8').trim()), stdout: readFileSync(out, 'utf8') };
+        if (!alive()) throw new Error('SESSION_TERMINATED: the session shell exited');
+      }
+      throw new Error('exec timed out');
+    };
+    // The desktop stack's stand-in: a background job in the session that logs constantly, read by a labeler.
+    const pipe = join(sdir, 'desktop.pipe');
+    send(`mkfifo ${q(pipe)}; (while IFS= read -r l; do :; done < ${q(pipe)}) & { while :; do echo desk; sleep 0.05; done; } > ${q(pipe)} & echo $! > ${q(join(sdir, 'desktop.pid'))}`);
+    const desktop = async () => {
+      for (let i = 0; i < 200 && !existsSync(join(sdir, 'desktop.pid')); i++) await Bun.sleep(10);
+      const pid = Number(readFileSync(join(sdir, 'desktop.pid'), 'utf8').trim());
+      try { process.kill(pid, 0); return pid; } catch { return 0; }
+    };
+    const close = async () => {
+      const pid = await desktop().catch(() => 0);
+      if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+      shell.kill('SIGKILL');
+      rmSync(sdir, { recursive: true, force: true });
+    };
+    return { exec, alive, desktop, close, pid: shell.pid };
+  };
+
+  it('in a real persistent SDK-style session, every outcome leaves the session shell, its state and the desktop running', async () => {
+    const s = sdkSession();
+    try {
+      const desktopPid = await s.desktop();
+      expect(desktopPid).toBeGreaterThan(0);
+      const resolve = cloudflareCodeFolderResolver(s.exec, root);
+      expect(await resolve('a/b')).toBe('restored');
+      expect(await resolve('nope')).toBe('missing');
+      expect(await resolve('link/b')).toBe('symlink');
+      expect(await resolve('a/file.txt')).toBe('not_directory');
+      expect(await cloudflareCodeFolderResolver(s.exec, 'relative/root')('a')).toBe('error');
+      expect(await resolve('x*')).toBe('missing'); // a glob is still literal (set -f, inside the subshell)
+      // The same shell, unchanged: no `set -f`, default IFS, no positional parameters, and it still runs commands.
+      expect(s.alive()).toBe(true);
+      const state = await s.exec('printf "%s|%s|%s" "$-" "$#" "$IFS" | od -An -c | tr -s " "', { env: {} });
+      expect(state.exitCode).toBe(0);
+      expect(state.stdout).not.toMatch(/f/);
+      expect(state.stdout).toContain('| 0 |');
+      expect(state.stdout).toContain('\\t \\n');
+      expect(await s.desktop()).toBe(desktopPid);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('control: the bare script in that session ends the session shell (what the subshell prevents)', async () => {
+    const s = sdkSession();
+    try {
+      await expect(s.exec(CODE_FOLDER_RESOLVE_SCRIPT, { env: { [CODE_FOLDER_ROOT_ENV]: root, [CODE_FOLDER_REL_ENV]: 'nope' } }))
+        .rejects.toThrow('SESSION_TERMINATED');
+      expect(s.alive()).toBe(false);
+    } finally {
+      await s.close();
+    }
   });
 });
 

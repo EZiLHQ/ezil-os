@@ -94,7 +94,16 @@ export function codeFolderWalkOutcome(exitCode: number, stdout: string | undefin
 export const CODE_FOLDER_RESOLVE_BOUND_MS = CODE_FOLDER_RESOLVE_TIMEOUT_MS + 1_000;
 
 /**
- * The Cloudflare resolver for `settleCodeFolder`: one exec of the constant script with the root and
+ * What the Cloudflare exec runs: the walk inside a subshell. The Sandbox SDK runs a foreground exec in the
+ * session's OWN shell (its persistent `bash --norc`, inside `{ …; EXIT_CODE=$? }`), so the script's `exit`
+ * (every `say`) ended that shared shell, and the desktop stack started in the same session died with it: live
+ * 2026-11-05, every later Code mint on that computer failed with relay_refresh_failed. The subshell also keeps
+ * the walk's `set -f`, IFS and positional parameters out of the session. The SDK's per-command env is inherited.
+ */
+export const CODE_FOLDER_RESOLVE_COMMAND = `(\n${CODE_FOLDER_RESOLVE_SCRIPT}\n)`;
+
+/**
+ * The Cloudflare resolver for `settleCodeFolder`: one exec of the constant command with the root and
  * `rel` in its env, the exec bounded by CODE_FOLDER_RESOLVE_TIMEOUT_MS and the whole call by
  * `boundMs`. Never throws (a refused, failed or late exec is `error`); stderr is never read.
  */
@@ -104,7 +113,7 @@ export function cloudflareCodeFolderResolver(exec: RepoOpenExec, root: string, b
     const late = new Promise<CodeFolderOutcome>((resolve) => { timer = setTimeout(() => resolve('error'), boundMs); });
     const walked = (async (): Promise<CodeFolderOutcome> => {
       try {
-        const result = await exec(CODE_FOLDER_RESOLVE_SCRIPT, {
+        const result = await exec(CODE_FOLDER_RESOLVE_COMMAND, {
           env: { [CODE_FOLDER_ROOT_ENV]: root, [CODE_FOLDER_REL_ENV]: rel },
           timeout: CODE_FOLDER_RESOLVE_TIMEOUT_MS,
           origin: 'internal',
