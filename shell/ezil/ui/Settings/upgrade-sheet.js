@@ -203,7 +203,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
             </details>
             <section class="ezil-upgrade-payment" aria-label="Secure payment">
-                ${trialMode ? '<div class="ezil-upgrade-trial-terms" data-role="trial-terms" aria-live="polite" hidden></div>' : ''}
+                ${trialMode ? '<div class="ezil-upgrade-trial-terms" data-role="trial-terms" aria-live="polite"></div>' : ''}
                 <div data-role="checkout-state" role="status" aria-live="polite"></div>
                 <div id="ezil-embedded-checkout"></div>
             </section>
@@ -315,13 +315,13 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             : `Then ${amount}/month · USD · before applicable tax`);
         // A date, never a minute: Stripe collects the first charge about an hour after the end shown beside the form.
         set('trial-first-charge', quote ? `${amount} from ${trialDayLabel(quote.trialEndsAt, { timeZone })}, then every month until you cancel.`
-            : 'The date is shown with the payment form.');
+            : 'The exact date is shown before you add a payment method.');
         set('trial-cancel-by', quote ? `Cancel before ${trialDayLabel(quote.trialEndsAt, { timeZone })} in Settings → Billing and you pay nothing.`
             : 'Cancel before your free month ends and you pay nothing.');
         set('trial-renews', `A payment method is required. ${amount} is charged monthly from the end of your free month unless you cancel.`);
+        // The live region is in the page (empty) from the start, so a screen reader announces the date when it arrives.
         const terms = dialog.querySelector('[data-role="trial-terms"]');
         terms.replaceChildren();
-        terms.hidden = ! quote;
         if ( ! quote ) return;
         const line = (text, role) => {
             const p = doc.createElement('p');
@@ -573,7 +573,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             quote = null;
             renderTrialTerms();
             // Once on its own; a second stale answer waits for the person, so a quote that keeps changing never loops.
-            if ( requotedStale ) show(errorCopy('trial_quote_stale'), 'Retry', () => { void requote(true); });
+            if ( requotedStale ) show("Your free month's end date changed again. Try again to see the new date.", 'Retry', () => { void requote(true); });
             else { requotedStale = true; void requote(true); }
             return;
         }
