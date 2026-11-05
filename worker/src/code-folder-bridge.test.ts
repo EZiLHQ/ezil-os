@@ -49,14 +49,25 @@ describe('parseShellOrigins', () => {
 });
 
 describe('injectCodeFolderBridge', () => {
-  it('adds one script first in <head>, with the page\'s own nonce, and nothing else changes', () => {
+  it('adds one script right after the head\'s <meta charset>, with the page\'s own nonce, and nothing else changes', () => {
     const out = injectCodeFolderBridge(WORKBENCH, [SHELL]);
     const tag = `<script nonce="0f3c1e9a-8b7d-4c2e-9f10-3a5b6c7d8e9f" ${BRIDGE_MARKER}="1">`;
-    expect(out.indexOf(tag)).toBeGreaterThan(out.indexOf('<head>'));
-    expect(out.indexOf(tag)).toBeLessThan(out.indexOf("performance.mark('code/didStartRenderer')"));
+    const meta = '<meta charset="utf-8" />';
+    expect(out.indexOf(tag)).toBe(out.indexOf(meta) + meta.length + 1);
+    // The charset declaration stays where code-server put it, inside the first 1024 bytes (review N2).
+    expect(out.indexOf(meta)).toBe(WORKBENCH.indexOf(meta));
+    expect(out.indexOf(meta)).toBeLessThan(1024);
+    expect(out.indexOf(tag)).toBeLessThan(out.indexOf('globalThis._VSCODE_FILE_ROOT'));
     expect(out.split(BRIDGE_MARKER).length - 1).toBe(1);
     expect(out.replace(/\n<script nonce="[^"]*" data-ezil-folder-bridge="1">[\s\S]*?<\/script>/, '')).toBe(WORKBENCH);
     expect(out).toContain(JSON.stringify([SHELL]));
+  });
+  it('without a <meta charset> in the head, the script goes first in <head>', () => {
+    for (const html of [WORKBENCH.replace('<meta charset="utf-8" />', ''), WORKBENCH.replace('<meta charset="utf-8" />', '').replace('</head>', '</head><meta charset="utf-8">')]) {
+      const out = injectCodeFolderBridge(html, [SHELL]);
+      expect(out.indexOf(BRIDGE_MARKER)).toBeGreaterThan(out.indexOf('<head>'));
+      expect(out.indexOf(BRIDGE_MARKER)).toBeLessThan(out.indexOf("performance.mark('code/didStartRenderer')"));
+    }
   });
   it('is idempotent and inert without origins, without a usable nonce or without a <head>', () => {
     const once = injectCodeFolderBridge(WORKBENCH, [SHELL]);
@@ -164,7 +175,11 @@ describe('the bridge script', () => {
   it('ignores a hello from another window, another origin, a bad nonce or another version', () => {
     const b = run();
     b.posted.length = 0;
-    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE }, { source: {} });
+    // Another window that COULD be answered: a reply to it would land in `stranger` (review N1: an object without
+    // postMessage would only make the reply throw, which hid a missing source check).
+    const stranger: Posted[] = [];
+    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE }, { source: { postMessage: (m: Record<string, unknown>, o: string) => stranger.push({ m, o }) } });
+    expect(stranger).toEqual([]);
     b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE }, { origin: 'https://evil.example' });
     b.message({ type: 'ezil.code.hello', v: 1, nonce: 'short' });
     b.message({ type: 'ezil.code.hello', v: 2, nonce: NONCE });
@@ -184,6 +199,8 @@ describe('the bridge script', () => {
     b.message({ type: 'ezil.code.go', v: 1, id: 'CCCCCCCCCCCCCCCCCCCCCC' }); // not its id
     expect(b.replaced).toEqual([]);
     b.message({ type: 'ezil.code.go', v: 1, id: open.m.id }, { origin: 'https://evil.example' });
+    expect(b.replaced).toEqual([]);
+    b.message({ type: 'ezil.code.go', v: 1, id: open.m.id }, { source: { postMessage: () => {} } }); // not the parent (review N1)
     expect(b.replaced).toEqual([]);
     b.message({ type: 'ezil.code.go', v: 1, id: open.m.id });
     expect(b.replaced).toEqual([`${EDITOR}/?folder=/workspace/b`]);

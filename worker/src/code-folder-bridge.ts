@@ -89,9 +89,13 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
 }
 
 /**
- * `html` with the bridge as its first script, carrying the document's own CSP nonce (the first
- * `<script nonce="…">`'s). Unchanged when: no origins (no bridge configured), no nonce to carry (it could not run
- * under code-server's CSP anyway), no `<head>`, or the document already has one.
+ * `html` with the bridge inserted right after the head's `<meta charset>` (else first in `<head>`), carrying the
+ * document's own CSP nonce (the first `<script nonce="…">`'s). After the charset declaration, not before it: the
+ * script is about 2 KB, and code-server sends `text/html` without a charset, so a declaration pushed past the first
+ * 1024 bytes would leave the encoding to each browser's prescan (review N2). It still runs before every workbench
+ * script that matters (those are modules at the end of the document). Unchanged when: no origins (no bridge
+ * configured), no nonce to carry (it could not run under code-server's CSP anyway), no `<head>`, or the document
+ * already has one.
  */
 export function injectCodeFolderBridge(html: string, origins: readonly string[]): string {
   if (origins.length === 0 || html.includes(BRIDGE_MARKER)) return html;
@@ -102,7 +106,10 @@ export function injectCodeFolderBridge(html: string, origins: readonly string[])
   const script = codeFolderBridgeScript(origins);
   // Defense in depth: the script is a constant plus validated origins, so it can never close its own tag.
   if (/<\/|<!--/.test(script)) return html;
-  const at = head.index + head[0].length;
+  const headStart = head.index + head[0].length;
+  const headEnd = html.indexOf('</head>', headStart);
+  const charset = /<meta\s+charset\s*=\s*["']?[A-Za-z0-9_-]+["']?\s*\/?>/i.exec(html.slice(headStart, headEnd < 0 ? undefined : headEnd));
+  const at = charset ? headStart + charset.index + charset[0].length : headStart;
   return `${html.slice(0, at)}\n<script nonce="${nonce}" ${BRIDGE_MARKER}="1">${script}</script>${html.slice(at)}`;
 }
 
