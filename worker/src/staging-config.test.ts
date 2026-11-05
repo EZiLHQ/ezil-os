@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { appPortFor, codePortFor, portFor } from './desktop-mode';
 import { AWS_BROWSER_ROUTE_TOKEN } from './aws-origin';
+import { codeShellOriginsFor } from './code-folder-bridge';
 
 interface WorkerConfig {
   name: string;
@@ -60,8 +61,6 @@ describe('staging Worker resources and routes', () => {
       AWS_ROUTING_ENABLED: 'on',
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
-      // Code's folder bridge reports to the staging shell only (src/code-folder-bridge.ts).
-      CODE_SHELL_ORIGINS: 'https://os-staging.ezil.work',
     });
   });
 
@@ -69,8 +68,12 @@ describe('staging Worker resources and routes', () => {
     expect((config as { vars?: Record<string, string> }).vars?.AWS_ROUTING_ENABLED).toBeUndefined();
   });
 
-  it('injects Code\'s folder bridge on staging only: production configures no shell origin', () => {
-    expect((config as { vars?: Record<string, string> }).vars?.CODE_SHELL_ORIGINS).toBeUndefined();
+  it('injects Code\'s folder bridge on staging only, chosen by the existing preview zone, with no setting of its own', () => {
+    // Staging's own zone selects the staging shell; production leaves the zone unset (ezil.org), so no bridge.
+    expect(codeShellOriginsFor(staging.vars.SANDBOX_PREVIEW_ZONE_ROOT)).toEqual(['https://os-staging.ezil.work']);
+    expect(config.vars.SANDBOX_PREVIEW_ZONE_ROOT).toBeUndefined();
+    expect(codeShellOriginsFor(config.vars.SANDBOX_PREVIEW_ZONE_ROOT)).toEqual([]);
+    expect(readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8')).not.toMatch(/SHELL_ORIGIN/);
   });
 
   it('keeps the EZiL Chat AI proxy off in production until it is switched on deliberately', () => {

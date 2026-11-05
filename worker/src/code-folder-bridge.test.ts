@@ -4,6 +4,7 @@ import { runInNewContext } from 'node:vm';
 import { handleAwsBrowserHost, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import {
   BRIDGE_MARKER,
+  codeShellOriginsFor,
   codeFolderBridgeScript,
   GO_FALLBACK_MS,
   injectCodeFolderBridge,
@@ -44,6 +45,18 @@ describe('parseShellOrigins', () => {
       'https://*.ezil.work', 'https://user@os.ezil.work', 'https://OS.ezil.work', 'os-staging.ezil.work', `${SHELL},*`, `${SHELL},javascript:alert(1)`,
       'https://localhost', ['a', 'b', 'c', 'd', 'e'].map((h) => `https://${h}.ezil.work`).join(',')]) {
       expect(parseShellOrigins(bad as string | undefined)).toEqual([]);
+    }
+  });
+});
+
+describe('codeShellOriginsFor (no setting of its own: the existing preview zone picks the realm)', () => {
+  it('staging\'s zone has the staging shell, read the way resolvePreviewZoneRoot reads it', () => {
+    expect(codeShellOriginsFor('ezil.work')).toEqual([SHELL]);
+    expect(codeShellOriginsFor(' EZIL.WORK ')).toEqual([SHELL]);
+  });
+  it('production (unset, or its own ezil.org) and anything else: no origins, so no bridge', () => {
+    for (const zone of [undefined, '', 'ezil.org', 'evil.work', 'os-staging.ezil.work', 'constructor', '__proto__', 'toString']) {
+      expect(codeShellOriginsFor(zone)).toEqual([]);
     }
   });
 });

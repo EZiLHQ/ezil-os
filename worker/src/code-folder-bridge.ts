@@ -8,8 +8,8 @@
  * patch-folder-bridge.sh on the folder lane, was never merged, so nothing reported a folder until now).
  *
  * What the editor tells the shell (shell/ezil/apps/code-folder.js), and to whom:
- *   - only when framed, only to an origin in `CODE_SHELL_ORIGINS` (this Worker's own config; unset = no bridge at
- *     all, which is production today), never with a `*` target;
+ *   - only when framed, only to the OS shell that frames this realm's editors (`codeShellOriginsFor`: staging's
+ *     preview zone has the staging shell; production's has none, so no bridge at all), never with a `*` target;
  *   - `ezil.code.ready` {v:1} once at load, so the shell says hello;
  *   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, base?} only in answer to a hello whose source is
  *     window.parent, whose origin is allowed and whose nonce is 22 base64url characters. `kind` is `folder` (a path
@@ -37,8 +37,13 @@
  * bridge leaves the editor exactly as code-server built it.
  */
 
-/** Var name: the EZiL OS shell origins allowed to receive reports, comma separated. Unset/invalid: no bridge. */
-export const CODE_SHELL_ORIGINS_VAR = 'CODE_SHELL_ORIGINS';
+/**
+ * The EZiL OS shell that frames each realm's editors, keyed by the realm's preview zone: the Worker's existing
+ * `SANDBOX_PREVIEW_ZONE_ROOT`, which only ever names production's `ezil.org` (unset) or staging's own `ezil.work`
+ * (`resolvePreviewZoneRoot` in `./index.ts`). Compiled in, not configured: the bridge adds no setting of its own.
+ * Production has no entry, so its editors get no bridge at all.
+ */
+const SHELL_ORIGINS_BY_PREVIEW_ZONE: Readonly<Record<string, string>> = { 'ezil.work': 'https://os-staging.ezil.work' };
 /** At most this many origins (staging has one). */
 export const CODE_SHELL_ORIGINS_MAX = 4;
 /** How long the editor waits for the shell's `ezil.code.go` before it switches folder by itself. */
@@ -51,7 +56,7 @@ const ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](
 const NONCE_RE = /^[A-Za-z0-9+/=_-]{8,128}$/;
 
 /**
- * `CODE_SHELL_ORIGINS` → the allowed shell origins. Plain `https://<host>` only (no port, path, userinfo or
+ * A comma-separated origin list → the allowed shell origins. Plain `https://<host>` only (no port, path, userinfo or
  * wildcard), lowercase, at most CODE_SHELL_ORIGINS_MAX. Any malformed entry voids the whole list (no bridge), so a
  * typo never silently narrows or widens who hears the editor.
  */
@@ -63,7 +68,17 @@ export function parseShellOrigins(value: string | undefined | null): string[] {
   return [...new Set(list)];
 }
 
-/** The bridge, as one script body. `origins` must come from `parseShellOrigins`. */
+/**
+ * The shell origins for this Worker's realm, from its `SANDBOX_PREVIEW_ZONE_ROOT` (read the way
+ * `resolvePreviewZoneRoot` reads it). Unset (production) or any zone without a shell: none, so no bridge.
+ */
+export function codeShellOriginsFor(previewZoneRoot: string | undefined): string[] {
+  if (typeof previewZoneRoot !== 'string') return [];
+  const zone = previewZoneRoot.trim().toLowerCase();
+  return Object.hasOwn(SHELL_ORIGINS_BY_PREVIEW_ZONE, zone) ? parseShellOrigins(SHELL_ORIGINS_BY_PREVIEW_ZONE[zone]) : [];
+}
+
+/** The bridge, as one script body. `origins` must come from `codeShellOriginsFor`. */
 export function codeFolderBridgeScript(origins: readonly string[]): string {
   const O = JSON.stringify(origins);
   // Kept to plain ES2020 and one closure; no global names are added.

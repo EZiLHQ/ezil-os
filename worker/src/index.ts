@@ -80,7 +80,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
-import { parseShellOrigins } from './code-folder-bridge';
+import { codeShellOriginsFor } from './code-folder-bridge';
 import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
@@ -127,11 +127,6 @@ interface Env extends SandboxEnv {
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
   AWS_ROUTING_ENABLED?: string;
-  /**
-   * The EZiL OS shell origins Code's folder bridge may report to (`./code-folder-bridge.ts`), comma separated
-   * `https://<host>`. Unset or malformed: no bridge is injected (an editor that reports nothing, as before).
-   */
-  CODE_SHELL_ORIGINS?: string;
   /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
   AWS_ORIGIN_ZONE?: string;
   AWS_ORIGIN_ZONE_ALLOWLIST?: string;
@@ -7038,7 +7033,7 @@ async function handleCodeBridge(
   }
   return handlePreviewProxy(request, { containerFetch: (upstream, init, targetPort) =>
     sandbox.runningContainerFetch(String(upstream), init as RequestInit, targetPort) }, sandboxId, secrets, codePath, port, 'code',
-    parseShellOrigins(env.CODE_SHELL_ORIGINS));
+    codeShellOriginsFor(env.SANDBOX_PREVIEW_ZONE_ROOT));
 }
 
 /**
@@ -7796,7 +7791,7 @@ export default {
         lookup: (sid) => (registry ? lookupAwsTunnelForBrowser(registry, sid) : Promise.resolve(null)),
         fetch: (input, init) => fetch(input, init),
         nowMs: Date.now,
-        codeShellOrigins: parseShellOrigins(env.CODE_SHELL_ORIGINS),
+        codeShellOrigins: codeShellOriginsFor(env.SANDBOX_PREVIEW_ZONE_ROOT),
       });
       if (awsBrowser) return awsBrowser;
     }

@@ -353,9 +353,6 @@ SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
 SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 SANDBOX_NEKO_ICE_POLICY = "relay"
-# Code's folder bridge (src/code-folder-bridge.ts) reports the editor's folder to this shell only. Staging only:
-# production sets nothing, so no editor there reports anything.
-CODE_SHELL_ORIGINS = "https://os-staging.ezil.work"
 
 # Bind to this staging Worker's own namespace, never a production script_name.
 [[env.staging.durable_objects.bindings]]
