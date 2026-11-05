@@ -146,7 +146,9 @@ cb1's current integration/release ownership is respected. PR266's
 `85270caa…` → `7fcc76d4…` delta has no `.github` or `deploy/aws/os-staging` changes,
 and the S worktree had no dirt in those paths at port preparation. Main and S have
 older shared-tooling differences; this patch was adapted to S's actual script
-contracts, not copied over them. Existing product/infra/host code is untouched.
+contracts, not copied over them. Existing product/infra/host code is untouched. The user subsequently assigned
+the unowned tools CI citation repair to this lane: one line-range constant in
+`tools/triage.ts`; all 228 semantic tools tests pass unchanged.
 Any later main/staging reconciliation remains cb1-owned and must retain main's
 production safeguards and all reviewed S bytes without merging unrelated stacks.
 

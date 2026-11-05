@@ -39,6 +39,32 @@ infra job `127368417652`, independently shows the same two failures on image
 infra source. PR266's pool-demand fixtures, stale CI-comment citation and DCO belong
 to that separate source/base; they did not fail PR267's app/tools/DCO checks.
 
+## Scoped baseline recovery and independent inputs
+
+After a fresh ownership check and the user's 17:22Z instruction, this lane owns
+one additional CI-only fix: `tools/triage.ts` now cites lines 370–380, the complete
+current private-package paragraph, instead of stale 364–374. All semantic tests
+remain unchanged, including exact paragraph boundaries and required phrases.
+The tools suite improves from 227/1 to **228/0**; focused triage improves from
+63/1 to 64/0. No classifier, permission or triage-publishing behavior changes.
+
+The first S-based implementation `df1fe821` passed infrastructure CI job
+`127406783028` in run `42073317530`: **72 host checks passed, zero failed** on
+Ubuntu 24.04. App results match S exactly: 69 failures, 9,938 passes, 568 skips;
+the complete set of failing names is identical. The separate, reviewed pool
+fix is [PR268](https://github.com/EZiLHQ/ezil-os/pull/268), exact head
+`44e88480ea2cf53ea2fea4a11a1333515fb487d7` on S. Its GitHub app job
+`127404321776` / run `42072619942` passes. This lane does not copy or integrate
+that file; cb1 owns composition of the two independent inputs.
+
+S shell job `127368417500` fails overlay-paint 42/43: the Code iframe contains
+`about:blank?code-frame=1&ezil_mint=…`, versus the test's expected URL. Main-based
+PR267 shell job `127387638939` passes that suite 43/43 on the **same Ubuntu
+26.04 family**. Their application/shell sources differ; this is not evidence of
+a runner-only defect. No shell runner pin or UI/feature patch is made. cb1 and
+the existing folder/editor owner must reconcile the test with the reviewed
+minting behavior and then provide exact-source browser acceptance.
+
 ## Required-check proposal versus ruleset 22265548
 
 The active [ruleset](https://github.com/EZiLHQ/ezil-os/rules/22265548) applies to
