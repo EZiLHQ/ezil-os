@@ -59,7 +59,19 @@ export function createPreparationHelper(settings: Settings, deps: Dependencies) 
             const rows = await deps.instances([i.sourceInstanceId]), source = rows[0]?.instance;
             if (rows.length > 1 || (source && (rows[0]!.owner !== d.accountId || source.InstanceId !== i.sourceInstanceId)))
                 throw new Error('source_identity_mismatch');
-            if (source) {
+            if (i.releasedPoolHost) {
+                // App DESIGN R: the app proved this host's release and termination. Never stop or terminate here: the
+                // host is gone or a terminated claim of exactly this allocation, and an attachment is a writer, never waited out.
+                const ns = i.sourceDeployment.namespace;
+                if (source && (source.State?.Name !== 'terminated' || source.ImageId !== i.sourceDeployment.amiId
+                    || !tagged(source.Tags, { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': ns, 'ezil:namespace': ns,
+                        'ezil:computer': i.computerId, 'ezil:generation': String(i.sourceGeneration), 'ezil:fence': i.sourceFenceToken,
+                        'ezil:pool-host': i.releasedPoolHost.poolHostId })
+                    || source.Tags?.some(t => ['ezil:computer-id', 'ezil:fence-token', 'ezil:pool'].includes(t.Key ?? ''))
+                    || (source.Placement?.AvailabilityZoneId !== undefined && source.Placement.AvailabilityZoneId !== d.zoneId)))
+                    throw new Error('source_identity_mismatch');
+                if (v.State !== 'available' || v.Attachments.length) throw new Error('writer_not_fenced');
+            } else if (source) {
                 const { 'ezil:backup': ignored, ...tags } = preparationSourceTags(i);
                 if (!tagged(source.Tags, tags) || source.Tags?.some(t => t.Key === 'ezil:pool')
                     || source.ImageId !== i.sourceDeployment.amiId

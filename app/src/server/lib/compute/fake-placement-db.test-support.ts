@@ -74,6 +74,8 @@ export interface FakeSeed {
     computers?: { id: string; user_id: string; deleted_at?: Date | null; created_at?: Date }[];
     /** ezil_compute_capacity_demands rows (capacity-demand.ts). */
     demands?: Row[];
+    /** ezil_compute_pool_hosts rows, read only by the image store's released-pool evidence read. */
+    poolHosts?: Row[];
 }
 
 export interface FakeOptions {
@@ -128,6 +130,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
     const usage: Row[] = (seed.usage ?? []).map((r) => ({ ...r }));
     const computers = seed.computers ?? [];
     const demands: Row[] = (seed.demands ?? []).map(r => ({ ...r }));
+    const poolHosts: Row[] = (seed.poolHosts ?? []).map(r => ({ ...r }));
     const statements: Statement[] = [];
     const locks = new Map<string, Mutex>();
     let txSeq = 0;
@@ -173,6 +176,16 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         if (text.startsWith('SELECT user_id::text AS user_id FROM public.ezil_computers'))
             return { rows: computers.filter(c => c.id === params[0] && c.deleted_at == null).map(c => ({ user_id: c.user_id })) };
         if (text.startsWith('SELECT id FROM public.ezil_compute_pool_hosts')) return { rows: [] };
+        if (text.startsWith('/* image:released-pool-host */')) {
+            // aws-rebase-store releasedPoolRow: bound identity in statement order; its literal predicates are pinned on PostgreSQL.
+            const [computer, instance, region, zone, generation, epoch, fence, serial] = params;
+            return { rows: poolHosts.filter(h => uuidEq(h.leased_computer_id, computer) && h.instance_id === instance && h.region === region
+                && h.zone_id === zone && Number(h.claim_generation) === generation && Number(h.claim_lease_epoch) === epoch && h.claim_fence === fence
+                && h.claim_volume_serial === serial && h.state === 'retired' && h.dispatch_status === 'settled'
+                && h.lifecycle_job_id != null && h.lifecycle_digest != null && h.lifecycle_input != null).slice(0, 2)
+                .map(h => ({ id: h.id, generation: String(h.generation), region: h.region, zone_id: h.zone_id, instance_type: h.instance_type,
+                    instance_id: h.instance_id, lifecycle_job_id: h.lifecycle_job_id, lifecycle_digest: h.lifecycle_digest, lifecycle_input: h.lifecycle_input })) };
+        }
         if (text.startsWith('SELECT lower_image_digest')) return { rows: placements.filter(r => r.computer_id === params[0]
             && r.generation === params[1] && r.lease_epoch === params[2] && r.enroll_consumed_hash === params[3]
             && r.image_upgrade_job_id == null).map(r => ({ lower_image_digest: r.lower_image_digest })) };
@@ -541,5 +554,5 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         },
     };
 
-    return { db, placements, imageJobs, usage, demands, statements, runningExcluded: RUNNING_EXCLUDED };
+    return { db, placements, imageJobs, usage, demands, poolHosts, statements, runningExcluded: RUNNING_EXCLUDED };
 }

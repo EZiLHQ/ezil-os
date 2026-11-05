@@ -338,9 +338,30 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
         if (rows.length !== 1) throw new ImageJobConflictError();
         return parseImageJobRow(rows[0]!);
     };
+    /** DESIGN R / I7: the retired claim row of exactly this allocation (computer, instance, zone, generation, epoch, fence,
+     * volume serial) whose own provision dispatch settled. Locked; a lookup hint only, never provider evidence. */
+    const releasedPoolRow = async (tx: PlacementExecutor, p: ImagePlacement): Promise<Record<string, unknown> | null> => {
+        if (!p.instanceId || !p.volumeId || !p.fenceToken || !p.region || !p.zoneId) return null;
+        const rows = rowsOf(await tx.execute(sql`/* image:released-pool-host */ SELECT id::text AS id, generation, region, zone_id, instance_type,
+            instance_id, lifecycle_job_id::text AS lifecycle_job_id, lifecycle_digest, lifecycle_input FROM public.ezil_compute_pool_hosts
+            WHERE leased_computer_id = ${p.computerId}::uuid AND instance_id = ${p.instanceId} AND region = ${p.region} AND zone_id = ${p.zoneId}
+              AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch} AND claim_fence = ${p.fenceToken}
+              AND claim_volume_serial = ${p.volumeId.replace('-', '')} AND state = 'retired' AND dispatch_status = 'settled'
+              AND lifecycle_job_id IS NOT NULL AND lifecycle_digest IS NOT NULL AND lifecycle_input IS NOT NULL LIMIT 2 FOR UPDATE`));
+        const row = rows[0];
+        if (rows.length > 1) throw new ImageJobConflictError();
+        return row ? { ...row, generation: Number(row.generation) } : null;
+    };
     const time = (j: ImageJob, now: Date) => new Date(Math.max(now.getTime(), Date.parse(j.updatedAt) + 1)).toISOString();
     const store = {
         read: (jobId: string) => read(db, jobId),
+        /** The placement and its released-pool row under the admission lock. Read-only. */
+        async releasedPoolHost(computerId: string) {
+            return withAdmission(db, async (tx, lock) => {
+                const placement = await lockImagePlacement(tx, lock, RebaseUuid.parse(computerId));
+                return { placement, row: placement ? await releasedPoolRow(tx, placement) : null };
+            });
+        },
         async inspect(computerId: string) {
             return withAdmission(db, async (tx, lock) => {
                 const placement = await lockImagePlacement(tx, lock, RebaseUuid.parse(computerId));
@@ -411,6 +432,12 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                 const pool = rowsOf(await tx.execute(sql`SELECT id FROM public.ezil_compute_pool_hosts
                     WHERE leased_computer_id = ${j.computerId}::uuid AND state = 'leased' LIMIT 2 FOR UPDATE`));
                 if (pool.length) throw new ImageJobConflictError();
+                // R4: a released-pool source is re-read under this same lock: still that retired row, still STOPPED.
+                const released = prep.intent.releasedPoolHost;
+                if (released) {
+                    const row = await releasedPoolRow(tx, p);
+                    if (p.state !== 'STOPPED' || row?.id !== released.poolHostId || row.lifecycle_digest !== released.lifecycleDigest) throw new ImageJobConflictError();
+                }
                 const inserted = rowsOf(await tx.execute(sql`INSERT INTO public.ezil_computer_image_jobs (${columnNames})
                     VALUES (${sql.join(columns.map(([key, , type]) => valueSql(j, key, type)), sql`, `)}) RETURNING ${columnNames}`));
                 if (inserted.length !== 1) throw new ImageJobConflictError();
@@ -580,7 +607,9 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
         async transferRecovered(expected: ImageJob, evidence: { execution: Execution; host: Ec2EnrollmentView | null; volume: Ec2VolumeView | null }, childId: string, now: Date) {
             const r = verifyImageLaunch(expected, evidence.execution, evidence.host, evidence.volume, 'rebind');
             if (expected.phase !== 'rebind_pending' || expected.hostEvidence?.instanceId !== r.instanceId || !expected.hostEvidence.ebsRestore) throw new ImageJobConflictError();
-            const preparation = buildRebasePreparation({ ...JSON.parse(expected.preparationDocument), jobId: childId,
+            // The child's source is the live rebind host, never the parent's released pool host.
+            const { releasedPoolHost: _released, ...parent } = JSON.parse(expected.preparationDocument);
+            const preparation = buildRebasePreparation({ ...parent, jobId: childId,
                 sourceInstanceId: r.instanceId, sourceVolumeId: r.volumeId, sourceGeneration: r.generation, sourceLeaseEpoch: r.leaseEpoch,
                 sourceFenceToken: r.fenceToken, createdAt: now.toISOString() });
             const child = newReservedImageJob({ preparation, ownerUserId: expected.ownerUserId, sourceRelease: expected.sourceRelease,
