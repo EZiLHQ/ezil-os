@@ -2700,7 +2700,7 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
         expect(await processStripeEvent(createInvoice(), f.deps)).toBe('applied');
         f.renew();
         f.stripe.invoice = { ...f.stripe.invoice, total: 2000, amountPaid: amountPaid as number };
-        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('review:unpaid_amount');
+        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('review:zero_amount_invoice');
         expect(planGrants(f.store)).toEqual([]);
         expect(f.store.paidAt.size).toBe(0);
         expect(f.store.trials.get(TRIAL_ID)!.status).toBe('trialing');
@@ -2724,7 +2724,7 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
     it('a Pro invoice with a positive total but amount_paid 0 is not a paid Pro period', async () => {
         const f = fixture();
         f.stripe.invoice.amountPaid = 0;
-        expect(await processStripeEvent(invoice(), f.deps)).toBe('review:unpaid_amount');
+        expect(await processStripeEvent(invoice(), f.deps)).toBe('review:zero_amount_invoice');
         expect(f.store.grants.size).toBe(0);
     });
 

@@ -172,7 +172,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                 if (offer.sku === PRO_PLAN.sku) {
                     if (!(invoice.total > 0)) return 'review:zero_amount_invoice';
                     // Paid proof is Stripe's amount_paid itself: missing, malformed or zero never falls back to total.
-                    if (!(invoice.amountPaid > 0)) return 'review:unpaid_amount';
+                    if (!(invoice.amountPaid > 0)) return 'review:zero_amount_invoice';
                     const { periodStart, periodEnd } = invoice;
                     if (!validPeriod(periodStart, periodEnd)) return 'review:invalid_period';
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
@@ -215,7 +215,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                     }
                     // A paid period needs Stripe's amount_paid > 0 (the OS paid-proof policy): a positive total or line alone,
                     // a balance-covered or malformed amount, goes to review with no grant, no first_paid_at, no conversion.
-                    if (!(invoice.amountPaid > 0)) return 'review:unpaid_amount';
+                    if (!(invoice.amountPaid > 0)) return 'review:zero_amount_invoice';
                     const result = await store.upsertSubscription(subscriptionRow(subscription, userId, event.created));
                     if (result === 'conflict') return 'review:customer_mismatch';
                     await store.resolvePaymentIssue(invoice.id, eventCreated);
