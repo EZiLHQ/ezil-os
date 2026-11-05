@@ -2691,6 +2691,43 @@ describe('Standard trial: a $0 invoice is never paid proof', () => {
         expect(f.store.outbox.size).toBe(0);
     });
 
+    it.each([
+        ['amount_paid 0 (balance-covered or unpaid)', 0],
+        ['amount_paid unreadable (NaN)', NaN],
+        ['amount_paid missing', undefined],
+    ])('after a valid trial, a first cycle invoice with total and base $20 but %s is review: no grant, no first_paid_at, no conversion', async (_name, amountPaid) => {
+        const f = trialFixture();
+        expect(await processStripeEvent(createInvoice(), f.deps)).toBe('applied');
+        f.renew();
+        f.stripe.invoice = { ...f.stripe.invoice, total: 2000, amountPaid: amountPaid as number };
+        expect(await processStripeEvent(cycleInvoice(), f.deps)).toBe('review:unpaid_amount');
+        expect(planGrants(f.store)).toEqual([]);
+        expect(f.store.paidAt.size).toBe(0);
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('trialing');
+        expect([...f.store.outbox.keys()]).toEqual([`${ROOT}:grant`]);
+        // The positive control: Stripe's own amount_paid 2000 converts exactly once.
+        f.stripe.invoice = { ...f.stripe.invoice, amountPaid: 2000 };
+        expect(await processStripeEvent({ ...cycleInvoice(), id: 'evt_cycle_paid' }, f.deps)).toBe('applied');
+        expect(planGrants(f.store)).toHaveLength(1);
+        expect(f.store.trials.get(TRIAL_ID)!.status).toBe('converted');
+    });
+
+    it('a trial create invoice must read amount_paid exactly 0: unreadable or positive amounts go to review', async () => {
+        for (const amountPaid of [NaN, 5]) {
+            const f = trialFixture();
+            f.stripe.invoice.amountPaid = amountPaid;
+            expect(await processStripeEvent(createInvoice(), f.deps)).toBe('review:zero_amount_invoice');
+            expect([...f.store.grants.values()]).toEqual([]);
+        }
+    });
+
+    it('a Pro invoice with a positive total but amount_paid 0 is not a paid Pro period', async () => {
+        const f = fixture();
+        f.stripe.invoice.amountPaid = 0;
+        expect(await processStripeEvent(invoice(), f.deps)).toBe('review:unpaid_amount');
+        expect(f.store.grants.size).toBe(0);
+    });
+
     it('a $0 Pro invoice is never a paid Pro period either', async () => {
         const f = fixture();
         f.stripe.invoice.total = 0;
