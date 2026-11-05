@@ -150,7 +150,7 @@ export default async function LoginPage({
                     </form>
                 )}
 
-                <LoginForm returnUrl={returnUrl} startWithEmail={params[METHOD_PARAM] === 'email'} />
+                <LoginForm returnUrl={returnUrl} startWithEmail={params[METHOD_PARAM] === 'email'} ezilId={useAuth0} />
             </section>
 
             <footer className="ezil-lock-footer">

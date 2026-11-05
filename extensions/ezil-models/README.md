@@ -85,13 +85,53 @@ margin for counting differences.
 
 The exact request is bounded before dispatch: `body bytes + 1056 <= 131072`, at
 most 1024 messages and 1024 blocks in one message (Responses: the escaped bound
-above, 512 items, 256 KiB). A request over a bound is refused on the computer
-with `local_input_too_large`, `local_too_many_messages` or
-`local_too_many_blocks`: nothing is sent or charged, the conversation history
-is kept, and the message gives the sizes (body bytes including tool-definition
-bytes, and the limit). A chat reaches it when compaction does not run or does
-not land in time (above). Any other failure before sending is
-`local_build_error` (the exception's class name only).
+above, 512 items, 256 KiB). Copilot's own compaction often does not run before a
+chat reaches that bound: in Ask mode, with few tools, with a large tool output,
+or with Kimi's slow summaries (above).
+
+### Automatic compaction (`src/compact.ts`)
+
+A request over a bound is compacted on the computer and sent, in the same chat.
+Only the copy that is sent changes. Copilot's saved conversation is not touched, so
+switching to a model with a larger limit sends more of it again. The compaction is
+deterministic and makes no model call.
+
+What is kept verbatim:
+- every system message;
+- the current user message;
+- the latest assistant step with its tool results.
+
+What is shortened or folded, in order, until the request fits 80% of the limit:
+1. Older tool outputs are shortened to head and tail, then older replies.
+2. The oldest messages are folded into one marked note. The note keeps every
+   earlier user message (the `<userRequest>` text first) and a one-line record of
+   each reply and tool call.
+3. Only after that is the latest tool output cut below 32 KB.
+
+A cut never separates a tool call from its result. Every shortening is marked in
+the text the model reads. The title bar of the chat view shows "Conversation
+compacted to fit the model" (`ezil-models.compactionInfo`) while the turn runs
+and for 10 seconds after, with a progress bar on the view. Nothing is added to
+the chat, because a note there would be saved and sent back on every later turn.
+
+If only the current request is too large, it is refused with
+`local_input_too_large`, `local_too_many_messages` or `local_too_many_blocks`.
+Nothing is sent or charged, the conversation is kept, and the message gives the
+sizes (body bytes, tool-definition bytes and the limit) and says what to do:
+shorten the last message or its attachments, or pick a model with a larger
+limit. Any other failure before sending is `local_build_error` (the exception's
+class name only).
+
+A 413 size refusal (`input_too_large` from EZiL AI, or `body_too_large` from EZiL
+OS) arrives before any model has run. The request is then compacted once more,
+under the limit the refusal reports, and sent again with a new Idempotency-Key.
+That happens once at most, and only when compaction changed the body. A second
+refusal is final. Timeouts, interrupted streams and other refusals are never
+re-sent.
+
+A failed request reaches Copilot as its message alone, without a stack.
+Copilot prints an error's stack under "Reason:", which showed extension frames to
+users.
 
 Calls share a FIFO admission queue per base URL and Bearer auth context, the same
 identity used by the model catalog cache. `GATEWAY_MAX_IN_FLIGHT = 2` is coupled

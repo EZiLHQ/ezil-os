@@ -4,14 +4,23 @@
 // the older query alias `/os?app=<id>` / `/os?settings=<tab>` (app-history.js
 // rewrites the alias to the path form). See docs/APP-ROUTES.md.
 // Project parameters are PARSED here and nothing more: no arbitrary URL is
-// used as an iframe target, and a ref, folder, account id or token in the URL
-// is never read. A repository ADDRESS (`/app/code?repo=<URL-encoded https
-// URL>`, founder 547ed35a) is read as navigation intent only: shape-checked
-// here, canonicalised and authorised by the server, never fetched or framed.
+// used as an iframe target, and a ref, account id or token in the URL is never
+// read. A repository ADDRESS (`/app/code?repo=<URL-encoded https URL>`,
+// founder 547ed35a) is read as navigation intent only: shape-checked here,
+// canonicalised and authorised by the server, never fetched or framed.
+// Code's FOLDER (`/app/code?folder=<path>`, folder-url-sync 2026-11-05) is read
+// as navigation intent only too: normalised lexically here, then walked on the
+// computer by the server before anything opens (worker/src/code-folder.ts). A
+// folder the walk refuses never opens because a URL named it.
 export const ALIASES = Object.freeze({ browser: 'desktop' });
 export const SECTIONS = new Set(['account', 'usage', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
 // Every key this parser reads. A repeated one makes the whole link ambiguous.
-const KEYS = ['app', 'settings', 'tab', 'project', 'repo', 'path'];
+const KEYS = ['app', 'settings', 'tab', 'project', 'repo', 'path', 'folder'];
+/** What a relative `folder` is relative to: the workspace root of every computer (Cloudflare mount, AWS). */
+export const FOLDER_ROOT = '/workspace';
+const FOLDER_MAX_BYTES = 2048;
+const FOLDER_MAX_SEGMENTS = 64;
+const FOLDER_MAX_SEGMENT_BYTES = 255;
 const APP_PATH = /^\/app\/([a-z0-9-]+)$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
@@ -77,6 +86,60 @@ export function pathProblem (value, raw = value) {
     return null;
 }
 
+/** No lone surrogate (the same check the Worker makes; `isWellFormed` is newer than this bundle's target). */
+function wellFormed (s) {
+    for ( let i = 0; i < s.length; i += 1 ) {
+        const c = s.charCodeAt(i);
+        if ( c >= 0xd800 && c <= 0xdbff ) {
+            const n = s.charCodeAt(i + 1);
+            if ( ! (n >= 0xdc00 && n <= 0xdfff) ) return false;
+            i += 1;
+        } else if ( c >= 0xdc00 && c <= 0xdfff ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * A `folder` value → `{folder}` (a plain absolute path) or `{folderRejected}`.
+ *
+ * Absolute (`/workspace/a`) or relative to FOLDER_ROOT (`a`, `./a`). `.`, empty
+ * segments and a trailing `/` go; `..` is resolved lexically, so a parent that
+ * lands back inside is accepted (`/workspace/a/../b`) and one that climbs above
+ * `/` (or, for a relative value, above FOLDER_ROOT) is `outside`. Spaces and
+ * any well-formed Unicode stay as they are (no NFC: a file name is bytes). The
+ * server still decides whether that folder exists, is a real directory with no
+ * link on the way, and is the person's own (`outside`, `not_allowed`).
+ */
+export function parseFolder (value) {
+    if ( typeof value !== 'string' || value === '' ) return { folderRejected: 'empty' };
+    if ( ! wellFormed(value) ) return { folderRejected: 'invalid' };
+    for ( let i = 0; i < value.length; i += 1 ) {
+        const code = value.charCodeAt(i);
+        if ( code < 0x20 || code === 0x7f ) return { folderRejected: 'control' };
+        if ( code === 0x5c ) return { folderRejected: 'backslash' };
+    }
+    if ( new TextEncoder().encode(value).length > FOLDER_MAX_BYTES ) return { folderRejected: 'too_long' };
+    const absolute = value.startsWith('/');
+    const floor = absolute ? 0 : FOLDER_ROOT.split('/').length - 1;
+    const segments = absolute ? [] : FOLDER_ROOT.slice(1).split('/');
+    for ( const segment of value.split('/') ) {
+        if ( segment === '' || segment === '.' ) continue;
+        if ( segment === '..' ) {
+            if ( segments.length <= floor ) return { folderRejected: 'outside' };
+            segments.pop();
+            continue;
+        }
+        if ( new TextEncoder().encode(segment).length > FOLDER_MAX_SEGMENT_BYTES ) return { folderRejected: 'too_long' };
+        segments.push(segment);
+    }
+    if ( segments.length > FOLDER_MAX_SEGMENTS ) return { folderRejected: 'too_long' };
+    const folder = `/${segments.join('/')}`;
+    if ( new TextEncoder().encode(folder).length > FOLDER_MAX_BYTES ) return { folderRejected: 'too_long' };
+    return { folder };
+}
+
 /**
  * Code's project parameters. Both ids are required and must be lowercase
  * canonical UUIDs; anything else drops the project (Code still opens) and
@@ -108,6 +171,20 @@ function parseProject (params, search) {
 }
 
 /**
+ * Code's own parameters: its project (above) and its `folder`. A folder beside
+ * a project or repository must stay inside that checkout, which only the
+ * server can check on the computer; until it can, the folder is dropped
+ * (`with_repository`) and the repository opens at its own folder. A local
+ * folder link never names a project, so it never reaches Works or repo-open.
+ */
+function parseCode (params, search) {
+    const project = parseProject(params, search);
+    if ( ! params.has('folder') ) return project;
+    if ( project.project ) return { ...project, folderRejected: 'with_repository' };
+    return { ...project, ...parseFolder(params.get('folder')) };
+}
+
+/**
  * The query string with `/app/settings`'s `tab` spelled the alias way
  * (`settings=<tab>`), for readers that only know the alias
  * (`parseBillingDeepLink`). Any other location's query is returned as is.
@@ -127,7 +204,7 @@ export function settingsAliasSearch (location) {
  * @param {{id: string}[]} apps  The apps this boot may open (`registry.resolve()`).
  * @returns {{id: string, initialTab?: string, project?: {projectId: string,
  *   repoId: string, path?: string}, projectRejected?: string,
- *   pathRejected?: string}|null}
+ *   pathRejected?: string, folder?: string, folderRejected?: string}|null}
  */
 export function parseAppLink (location, apps) {
     const { pathname, search } = split(location);
@@ -156,6 +233,6 @@ export function parseAppLink (location, apps) {
     return {
         id,
         ...(id === 'settings' && SECTIONS.has(section) ? { initialTab: section } : {}),
-        ...(id === 'code' ? parseProject(params, search) : {}),
+        ...(id === 'code' ? parseCode(params, search) : {}),
     };
 }

@@ -42,8 +42,12 @@ const pr = `project=${P}&repo=${R}`;
 same(parseAppLink(`/app/code?${pr}&path=src/main.ts`, apps), { id: 'code', project: { projectId: P, repoId: R, path: 'src/main.ts' } });
 same(parseAppLink(`/os?app=code&${pr}&path=a.b/c-d_e`, apps), { id: 'code', project: { projectId: P, repoId: R, path: 'a.b/c-d_e' } }, 'the alias parses projects too');
 same(parseAppLink(`/app/code?${pr}`, apps), { id: 'code', project: { projectId: P, repoId: R } });
+same(parseAppLink(`/app/code?${pr}&url=https://evil.example&ref=main&user=u&account=a&token=t`, apps),
+    { id: 'code', project: { projectId: P, repoId: R } }, 'nothing but project/repo/path (and folder, below) is read');
+// folder-url-sync: a folder beside a project is dropped, never sent as an own-files ask (the server cannot yet
+// confine it to the checkout); the project still opens.
 same(parseAppLink(`/app/code?${pr}&url=https://evil.example&ref=main&folder=x&user=u&account=a&token=t`, apps),
-    { id: 'code', project: { projectId: P, repoId: R } }, 'nothing but project/repo/path is read');
+    { id: 'code', project: { projectId: P, repoId: R }, folderRejected: 'with_repository' }, 'a folder beside a project is refused');
 same(parseAppLink(`/app/code?project=${P.toUpperCase()}&repo=${R}`, apps), { id: 'code', projectRejected: 'project_invalid' });
 same(parseAppLink(`/app/code?project=${P}&repo=${R.toUpperCase()}`, apps), { id: 'code', projectRejected: 'repo_invalid' });
 same(parseAppLink(`/app/code?project=${P}`, apps), { id: 'code', projectRejected: 'repo_missing' });
@@ -77,6 +81,31 @@ for (const [raw, reason] of [['', 'empty'], ['a%2Fb', 'encoded_separator'], ['a%
 }
 same(parseAppLink(`/app/code?${pr}&path=${'a'.repeat(255)}`, apps).project.path.length, 255, '255 bytes is the limit, not over it');
 same(pathProblem('src/x.ts'), null);
+// folder-url-sync: Code's own folder, `/app/code?folder=<path>` (absolute, or relative to /workspace; normalised
+// lexically; the server walks it before anything opens).
+{
+    const folder = (raw) => parseAppLink(`/app/code?folder=${raw}`, apps);
+    for (const [raw, want] of [
+        ['/workspace/a', '/workspace/a'], ['%2Fworkspace%2Fa', '/workspace/a'], ['%2fworkspace%2fa', '/workspace/a'],
+        ['a', '/workspace/a'], ['a/b', '/workspace/a/b'], ['./a/./b/', '/workspace/a/b'], ['a/../b', '/workspace/b'],
+        ['/workspace/a/../b', '/workspace/b'], ['//workspace///a//', '/workspace/a'], ['/workspace/', '/workspace'],
+        ['.', '/workspace'], ['/workspace/..', '/'], ['/', '/'],
+        ['/workspace/my%20site/%E6%97%A5%E6%9C%AC', '/workspace/my site/日本'], ['/workspace/a+b', '/workspace/a b'], ['/workspace/a%2Bb', '/workspace/a+b'],
+        ['/workspace/projects/my-site', '/workspace/projects/my-site'], [`/workspace/${'é'.repeat(127)}`, `/workspace/${'é'.repeat(127)}`],
+    ]) same(folder(raw), { id: 'code', folder: want }, `folder=${raw}`);
+    for (const [raw, reason] of [
+        ['', 'empty'], ['..', 'outside'], ['../etc', 'outside'], ['a/../../etc', 'outside'], ['/..', 'outside'], ['/workspace/../../etc', 'outside'],
+        ['%00', 'control'], ['/workspace/a%0Ab', 'control'], ['/workspace/%7F', 'control'], ['/workspace/a%5Cb', 'backslash'],
+        [`/workspace/${'a'.repeat(256)}`, 'too_long'], [`/${Array(65).fill('d').join('/')}`, 'too_long'],
+        [`/${`${'b'.repeat(200)}/`.repeat(10)}${'c'.repeat(38)}`, 'too_long'],
+    ]) same(folder(raw), { id: 'code', folderRejected: reason }, `folder=${raw} refused`);
+    same(parseAppLink('/os?app=code&folder=/workspace/a', apps), { id: 'code', folder: '/workspace/a' }, 'the alias reads folder too');
+    same(parseAppLink('/app/code?folder=/workspace/a&folder=/workspace/b', apps), null, 'a repeated folder rejects the whole link');
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent('https://github.com/a/b.git')}&folder=web`, apps),
+        { id: 'code', project: { repoUrl: 'https://github.com/a/b.git' }, folderRejected: 'with_repository' }, 'a folder beside a repository address is refused');
+    same(parseAppLink('/app/settings?tab=billing&folder=/workspace/a', apps), { id: 'settings', initialTab: 'billing' }, 'only Code reads folder');
+    same(parseAppLink('/app/code?folder=/workspace/a&ref=main&token=t', apps), { id: 'code', folder: '/workspace/a' }, 'a ref or token beside it is never read');
+}
 same(settingsAliasSearch('/app/settings?tab=billing&upgrade=pro'), '?upgrade=pro&settings=billing');
 same(settingsAliasSearch('/os?settings=billing'), '?settings=billing');
 same(settingsAliasSearch('/app/code?tab=billing'), '?tab=billing');

@@ -258,6 +258,55 @@ F.load(); reportB(null, 'folder', '/workspace/d', '/'); eq(follows, [{ url: DOC(
 F.load(); reportB(mintOf(url), 'folder', '/workspace/a', '/'); eq(M.folderAskFor(bind), { v: 1, path: '/workspace/d' }, 'continued: an earlier mint\'s document is dropped');
 M.detachFolderBridge(F);
 
+// 19 folder-url-sync: every counted report reaches onRoot (with the fallback flag), the editor's own switch is
+//    asked for (ezil.code.open) and answered (ezil.code.go) only once this binding has heard from it, and leaving
+//    is heard.
+{
+    M.forgetFolder(bind);
+    const roots = []; const opens = []; let leaving = 0;
+    const attachSync = (t, asked, answer) => {
+        const u = M.tagFolderMint(minted(t), { asked, answer }); F.src = u;
+        M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onRoot: (r, how) => roots.push([r, how]), onOpen: (n) => opens.push(n), onLeaving: () => { leaving += 1; } });
+        return u;
+    };
+    const ID = 'D'.repeat(22);
+    url = attachSync('s1', { v: 1, path: '/workspace/a' }, { v: 1, outcome: 'restored' });
+    fire({ type: 'ezil.code.open', v: 1, id: ID, kind: 'folder', path: '/workspace/b' });
+    eq([opens.length, F.sent.filter(s => s.m.type === 'ezil.code.go').length], [0, 0], 'open before the first document reported: not answered');
+    F.load(); reportB(mintOf(url), 'folder', '/workspace/a', '/preview/');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/a', base: '/preview/' }, { mintDriven: true, fallback: false }], 'the asked folder on screen: onRoot, no fallback');
+    fire({ type: 'ezil.code.open', v: 1, id: ID, kind: 'folder', path: '/workspace/b' });
+    eq(opens.at(-1), { kind: 'folder', path: '/workspace/b' }, 'the switch is heard before it happens');
+    eq(F.sent.at(-1), { m: { type: 'ezil.code.go', v: 1, id: ID }, o: ORIGIN }, 'then answered with go, to the editor origin only');
+    for ( const [d, ev, what] of [
+        [{ type: 'ezil.code.open', v: 1, id: 'short', kind: 'folder', path: '/workspace/b' }, {}, 'a malformed id'],
+        [{ type: 'ezil.code.open', v: 1, id: ID, kind: 'folder', path: '/workspace/b' }, { origin: 'https://evil.example' }, 'another origin'],
+        [{ type: 'ezil.code.open', v: 1, id: ID, kind: 'folder', path: '/workspace/b' }, { source: {} }, 'another window'],
+        [{ type: 'ezil.code.open', v: 2, id: ID, kind: 'folder', path: '/workspace/b' }, {}, 'another version'],
+        [{ type: 'ezil.code.open', v: 1, id: ID, kind: 'mystery' }, {}, 'an unknown kind'],
+    ] ) {
+        const n = opens.length, s = F.sent.length;
+        fire(d, ev);
+        eq([opens.length, F.sent.length], [n, s], `open refused: ${what}`);
+    }
+    fire({ type: 'ezil.code.open', v: 1, id: ID, kind: 'workspace' }); eq(opens.at(-1), { kind: 'unsupported' }, 'a workspace switch: unsupported');
+    fire({ type: 'ezil.code.open', v: 1, id: ID, kind: 'empty' }); eq(opens.at(-1), { kind: 'empty' }, 'Close Folder: empty');
+    fire({ type: 'ezil.code.open', v: 1, id: ID, kind: 'folder', path: '/workspace/../etc' }); eq(opens.at(-1), { kind: 'unsupported' }, 'a path the grammar refuses: unsupported');
+    fire({ type: 'ezil.code.leaving', v: 1 }); eq(leaving, 1, 'leaving is heard');
+    fire({ type: 'ezil.code.leaving', v: 1 }, { origin: 'https://evil.example' }); eq(leaving, 1, 'leaving from another origin is not');
+    F.load(); reportB(null, 'folder', '/workspace/b', '/preview/');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/b', base: '/preview/' }, { mintDriven: false, fallback: false }], 'the new document: onRoot, user-driven');
+    F.load(); reportB(null, 'workspace', null, '/preview/');
+    eq(roots.at(-1), [{ kind: 'unsupported' }, { mintDriven: false, fallback: false }], 'a workspace document: unsupported');
+    M.detachFolderBridge(F);
+    url = attachSync('s2', { v: 1, path: '/workspace/nope' }, { v: 1, outcome: 'missing' });
+    F.load(); reportB(mintOf(url), 'folder', '/workspace', '/');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace', base: '/' }, { mintDriven: true, fallback: true }], 'the default instead of the asked folder: onRoot with fallback');
+    eq(notices.at(-1), ['missing', '/workspace/nope'], 'and the notice, as before');
+    M.detachFolderBridge(F);
+    M.forgetFolder(bind);
+}
+
 // ── the notice band: text only, actions per outcome ─────────────────────────
 globalThis.document = { createElement: (t) => ({ t, children: [], attrs: {}, listeners: {}, className: '', textContent: '',
     appendChild (c) { this.children.push(c); }, setAttribute (k, v) { this.attrs[k] = v; }, addEventListener (k, f) { this.listeners[k] = f; },
@@ -288,6 +337,13 @@ ok(/didn't reopen “\/workspace\/sub”/.test(body.children.at(-1).children[0].
 // container recreates on start); "Nothing was deleted" is what is known.
 for ( const code of ['missing', 'not_directory', 'unverified', 'not_reopened', 'outside', 'symlink', 'child'] ) {
     if ( code === 'child' ) nb.projectChild('/workspace/projects/x/repository/web'); else nb.fallback(code, '/workspace/sub');
+    ok(! /unsaved|come back/i.test(body.children.at(-1).children[0].textContent), `${code}: no recovery promise`);
+}
+// folder-url-sync: a link's own folder the parser refused, and one beside a repository: said, Dismiss only.
+for ( const code of ['link_invalid', 'with_repository'] ) {
+    nb.fallback(code, null);
+    eq(body.children.at(-1).attrs['data-outcome'], code, `${code}: its own outcome`);
+    eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Dismiss'], `${code}: Dismiss only`);
     ok(! /unsaved|come back/i.test(body.children.at(-1).children[0].textContent), `${code}: no recovery promise`);
 }
 nb.close(); ok(body.children.at(-1).removed, 'close');
