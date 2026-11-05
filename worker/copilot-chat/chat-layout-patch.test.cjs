@@ -177,6 +177,8 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       };
       assert.deepEqual(open(SW({}), 97), { above: false, list: 132 }, 'header picker in a chat with turns: below, every row');
       assert.deepEqual(open(SW({}), 97, false), { above: false, list: 132 }, 'header picker in an empty chat: below, every row');
+      // SW alone picks the side, as upstream: the agent-host mode/permissions popup passes its own anchorPosition 1.
+      assert.deepEqual(open(SW({ anchorPosition: 1, useFullHeight: true }), 97), { above: false, list: 132 }, 'a caller\'s anchorPosition does not pin a header picker above');
       assert.deepEqual(open(SW({}), 779), { above: true, list: 132 }, 'composer picker: still above');
       assert.deepEqual(open(SW({}), 300), { above: true, list: 132 }, 'mid-window picker that fits above: above');
       assert.deepEqual(open({ ...SW({}), anchorPosition: 0 }, 300), { above: false, list: 132 }, 'dialog picker at the same place: still forced below');

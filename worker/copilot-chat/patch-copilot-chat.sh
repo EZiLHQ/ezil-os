@@ -134,9 +134,10 @@ R_ATTACH='{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(
 # takes its list options from SW, which forces anchorPosition 1: always above the button, the list
 # capped to the space above it. From the header that leaves one row in a chat with turns. The upstream
 # preferredAnchorPosition 1 (the chat input pills use it) opens above when the list fits and flips below
-# when it does not; a picker in a dialog still passes anchorPosition 0, which wins.
+# when it does not. SW still overrides a caller's anchorPosition (the agent-host mode/permissions popup
+# passes 1), so it alone picks the side; a picker in a dialog sets anchorPosition 0 after it, which wins.
 A_PICKER_FLIP='function SW(s){return{...Vio(s),anchorPosition:1}}'
-R_PICKER_FLIP='function SW(s){return{...Vio(s),preferredAnchorPosition:1}}'
+R_PICKER_FLIP='function SW(s){return{...Vio(s),anchorPosition:void 0,preferredAnchorPosition:1}}'
 # Names the flip relies on (checked, never patched): the widget reads both options; the dialog override.
 P_PICKER_OPTIONS='this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,'
 P_PICKER_DIALOG='G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)'
