@@ -908,6 +908,14 @@ describe('Gateway refusal identity', () => {
     const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
     expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', available_micro: 42, no_live_grant: true } });
   });
+  it('passes the affordable-output hint of an insufficient-credits refusal, and only as a safe whole number', async () => {
+    for (const [value, kept] of [[512, true], [0, true], [-1, false], [1.5, false], ['512', false], [Number.MAX_SAFE_INTEGER + 2, false]] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', available_micro: 42, hold_micro: 80, max_affordable_output_tokens: value,
+        floor_hold_micro: 7, account_id: USER_JWT } }, { status: 402 }));
+      const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
+      expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', available_micro: 42, hold_micro: 80, ...(kept ? { max_affordable_output_tokens: value } : {}) } });
+    }
+  });
 });
 
 describe('production timeout budgets with fake timers', () => {

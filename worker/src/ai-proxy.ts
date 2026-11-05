@@ -567,7 +567,8 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
   if (typeof raw.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(raw.request_id)) error.request_id = raw.request_id;
   if (raw.pause === 'operations' || raw.pause === 'reconciliation') error.pause = raw.pause;
   if (typeof raw.no_live_grant === 'boolean') error.no_live_grant = raw.no_live_grant;
-  for (const field of ['available_micro', 'hold_micro', 'input_bound_tokens', 'max_input_tokens']) {
+  // max_affordable_output_tokens: the 402's "a shorter reply would fit" hint, read by the ezil-models extension.
+  for (const field of ['available_micro', 'hold_micro', 'max_affordable_output_tokens', 'input_bound_tokens', 'max_input_tokens']) {
     if (Number.isSafeInteger(raw[field]) && (raw[field] as number) >= 0) error[field] = raw[field];
   }
   return error;

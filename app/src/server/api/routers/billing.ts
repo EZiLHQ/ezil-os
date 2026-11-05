@@ -3,7 +3,9 @@ import { sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
-import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP, CUSTOM_TOPUP_SKU, customTopupPack } from '@/server/billing/catalog';
+import { hasAiTopupReceipts, type AiTopupReceiptStore } from '@/server/billing/ai-credits';
+import type { CatalogPack } from '@/server/billing/types';
 import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
 import { readAiUsage } from '@/server/billing/ai-usage';
@@ -92,6 +94,34 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     if (subscription.scheduleId !== null) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     return { plan, subscriptionId };
 }
+
+/**
+ * One preset SKU or one whole-dollar custom amount (the catalog's bounds), never both. `expected*` pins the
+ * quote the person saw: a catalog that changed since (a coupon ended, a pack repriced) refuses with
+ * `quote_changed` instead of charging a different total.
+ */
+const topupExpected = { expectedTotalCents: z.number().int().min(0).optional(), expectedCredits: z.number().int().min(1).optional() };
+const topupInput = z.union([
+    z.object({ sku: z.string(), ...topupExpected }).strict(),
+    z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100), ...topupExpected }).strict(),
+]);
+type TopupInput = z.infer<typeof topupInput>;
+
+/** The offered pack for a top-up input, from the same Stripe catalog checkout uses; custom amounts from the fixed tariff. */
+async function topupPackFor(stripe: StripeApi, input: TopupInput): Promise<CatalogPack & { aiCredits: number }> {
+    const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
+    if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+    if ((input.expectedTotalCents !== undefined && input.expectedTotalCents !== pack.totalCents)
+        || (input.expectedCredits !== undefined && input.expectedCredits !== pack.aiCredits)) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'quote_changed' });
+    }
+    return pack;
+}
+
+/** A Checkout session our top-up created: a payment for an offered pack or the custom SKU. */
+const topupSku = (sku: string | null) => sku === CUSTOM_TOPUP_SKU || (typeof sku === 'string' && /^ai_pack_[A-Za-z0-9_]+$/.test(sku));
+
+export type TopupFulfillment = 'awaiting_payment' | 'processing' | 'credited' | 'review';
 
 /** Stored receipts split the Gateway balance by bucket; unreadable receipts fall back to the total. */
 async function aiReceipts(deps: BillingDeps, userId: string) {
@@ -548,10 +578,23 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             return { mode: 'redirect', sessionId: session.id, url: session.url };
         }),
 
-        createTopupCheckout: protectedProcedure.input(z.union([
-            z.object({ sku: z.string() }).strict(),
-            z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100) }).strict(),
-        ])).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
+        /**
+         * The authoritative price of a top-up before checkout: the offered pack's credits, discount and total, or
+         * a custom amount's credits at the fixed tariff (no discount). Same gates and validation as checkout; reads only.
+         */
+        quoteTopup: protectedProcedure.input(topupInput).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            if (!deps.config.stripePublishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+            }
+            const pack = await topupPackFor(stripe, input);
+            return { sku: pack.sku, custom: pack.sku === CUSTOM_TOPUP_SKU, aiCredits: pack.aiCredits, creditCents: pack.creditCents,
+                discountPercent: pack.discountPercent, totalCents: pack.totalCents, currency: 'usd' as const };
+        }),
+
+        createTopupCheckout: protectedProcedure.input(topupInput).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const publishableKey = deps.config.stripePublishableKey;
@@ -560,8 +603,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
                 throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
             }
-            const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
-            if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+            const pack = await topupPackFor(stripe, input);
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) {
@@ -813,6 +855,43 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
                 const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
                 return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
+            }),
+
+        /**
+         * A top-up's fulfilment, for the person who paid: payment alone is never "credited". `credited` means the
+         * receipt this payment wrote (processor `topup_paid`, keyed by its payment intent) was delivered to the
+         * Gateway; `processing` covers a webhook not processed yet and a delivery still queued or retrying; `review`
+         * a delivery that failed and waits for an operator. Another person's session, or a session that is not a
+         * top-up, is NOT_FOUND. Nothing identifying (customer, payment intent, event) leaves the server.
+         */
+        topupStatus: protectedProcedure.input(z.object({ sessionId: z.string() }).strict())
+            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null;
+                fulfillment: TopupFulfillment; credits: number | null }> => {
+                const deps = getDeps();
+                const stripe = configuredStripe(deps);
+                if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_checkout' });
+                const session = await stripeCall(() => stripe.retrieveCheckoutSession(input.sessionId));
+                if (session.clientReferenceId !== ctx.user.id || session.mode !== 'payment' || !topupSku(session.sku)) {
+                    throw new TRPCError({ code: 'NOT_FOUND', message: 'unknown_checkout' });
+                }
+                const paymentStatus = session.paymentStatus === 'paid' || session.paymentStatus === 'unpaid'
+                    || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
+                const status = session.status === 'open' ? 'pending' : session.status;
+                if (session.status !== 'complete' || paymentStatus !== 'paid') return { status, paymentStatus, fulfillment: 'awaiting_payment', credits: null };
+                if (!session.paymentIntentId || !hasAiTopupReceipts(deps.store)) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                const store = deps.store;
+                let receipt: Awaited<ReturnType<AiTopupReceiptStore['aiTopupReceipt']>> = null;
+                try {
+                    receipt = await store.aiTopupReceipt(ctx.user.id, session.paymentIntentId);
+                } catch {
+                    // An unreadable receipt is not a failed payment: keep waiting.
+                    console.warn('[billing.topup] receipt unavailable');
+                }
+                if (!receipt || receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                const delivery = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
+                const credits = receipt.payload.credits;
+                if (delivery === 'done') return { status, paymentStatus, fulfillment: 'credited', credits: Number.isSafeInteger(credits) ? credits as number : null };
+                return { status, paymentStatus, fulfillment: delivery === 'failed' ? 'review' : 'processing', credits: null };
             }),
 
         /**

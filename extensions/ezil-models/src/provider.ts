@@ -117,7 +117,8 @@ export function isUtilityRequest(options: Record<string, unknown>): boolean {
 function aiCreditsLink(): vscode.Uri | undefined {
     try {
         const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
-        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&section=ai-credits`);
+        // `reason` makes the OS open its Add AI credits dialog as exhaustion recovery (with an upgrade when one exists).
+        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&section=ai-credits&reason=insufficient_credits`);
     } catch { /* no usable OS origin */ }
     return undefined;
 }
