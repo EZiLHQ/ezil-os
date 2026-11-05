@@ -101,7 +101,10 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 //     Restore window and Close live in the notch's expanded tray (gate G3,
 //     2026-10-31; until then a top bar carried its own title and buttons).
 //   - The shell never calls a history API from here. Each change of view is
-//     announced as `ezil:app-view-changed` for the router to record.
+//     announced as `ezil:app-view-changed` for the router to record, and the
+//     folder the editor shows as `ezil:app-params-changed` (folder-url-sync:
+//     `/app/code?folder=`, a push for each switch made in Code; see the
+//     "Folder URL sync" block in `openCodeWindow` and docs/APP-ROUTES.md §5).
 //   - When the shell sees the computer go away (a restart/switch transition,
 //     or the return-from-away check finding it stopped) the frame is covered
 //     by an OS state — "Reconnecting…" or "Computer stopped" — instead of
@@ -136,7 +139,7 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
-import { attachFolderBridge, createFolderNotice, detachFolderBridge, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
+import { attachFolderBridge, createFolderNotice, detachFolderBridge, editorDocumentUrl, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
@@ -146,6 +149,20 @@ import { appUrl } from '../app-history.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
+/**
+ * Folder URL sync: how long a Back/Forward waits for the browser to start restoring the editor's own document
+ * (the editor says `ezil.code.leaving` at once when it does) before the window moves the editor itself, and how
+ * long it then waits for the editor to arrive before the address follows the editor instead.
+ */
+export const ROUTE_SETTLE_MS = 800;
+export const ROUTE_WATCHDOG_MS = 8_000;
+/**
+ * How long after the editor says it is leaving (its beforeunload) a new document may take to report before the
+ * window takes the leave as refused: the person answered "Stay" to the editor's unsaved-work veto. Chromium then
+ * keeps the editor but still moves the address (measured), so the address follows the editor back. A document
+ * that was only slow reports later and moves the address again.
+ */
+export const LEAVING_SETTLE_MS = 3_000;
 
 /** A project link's ids, as `../app-link.js` accepts them: lowercase canonical UUIDs. */
 const PROJECT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -347,6 +364,10 @@ function forgetIdentityRefresh () {
 export const VIEW_STORAGE_KEY = 'ezil-os:view.code';
 /** Window event announcing a change of view; the router records it (contract item 5). */
 export const VIEW_EVENT = 'ezil:app-view-changed';
+/** Window event announcing the folder the editor shows, as Code parameters (folder-url-sync); the router writes it. */
+export const PARAMS_EVENT = 'ezil:app-params-changed';
+/** Window event asking the router to undo the Back/Forward the editor refused to follow (folder-url-sync). */
+export const UNDO_EVENT = 'ezil:app-history-undo';
 /** How often the "Computer stopped" state asks the cheap status probe whether the computer is back. */
 const STOPPED_POLL_MS = 10_000;
 /** How often "Reconnecting…" checks that its transition watch has not given up (the watch polls every 5s). */
@@ -402,10 +423,12 @@ const CODE_UNREACHABLE_COPY = {
  * @param {AbortSignal} [signal]
  * @param {{projectId: string, repoId: string}|null} [project] Asked for in the
  *   body when given (lane O2); without it the body is unchanged.
- * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null}
+ * @param {string|null} [folder] The folder the address bar names (folder-url-sync): an own-files mint asks for it
+ *   instead of the tab's record. Never with a project (whose folder the server fixes).
+ * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null, repositoryFolder?: string|null}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, signal, project = null) {
+async function mintCodePreviewUrl (computerId, signal, project = null, folder = null) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -421,7 +444,7 @@ async function mintCodePreviewUrl (computerId, signal, project = null) {
     // asking after its window closed (Stop closes it first) and re-provisioned the
     // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
     // Stop also reaches it through `session.cancelComputerOpens`.
-    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project), { signal });
+    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project, folder), { signal });
 }
 
 /** The request's signal: its timeout and, when given, the loop's cancel. */
@@ -432,14 +455,16 @@ function mintSignal (cancel) {
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId, cancel, project) {
+async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = null) {
     const started = await session.ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
-    // Per-tab folder continuity: an own-files tab asks for the folder its editor last reported (`./code-folder.js`).
+    // Per-tab folder continuity: an own-files tab asks for the folder the address bar names (folder-url-sync),
+    // else the one its editor last reported (`./code-folder.js`). Either way the server walks it before it opens.
     // A project tab never asks (r32: the server fixes its root), so the project body below is unchanged.
-    const folder_ask = folderAskFor({ userId: session.payload()?.user?.id, computerId, project });
+    const folder_ask = ! project && typeof folder === 'string' && folder !== '' ? { v: 1, path: folder }
+        : folderAskFor({ userId: session.payload()?.user?.id, computerId, project });
 
     let res;
     try {
@@ -524,7 +549,10 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project) {
     // The iframe gets the minted URL plus `ezil_mint=<id>`: it rides into this mint's FIRST editor document only, which
     // is how the window tells this mint's editor from one the person navigated to (`./code-folder.js`).
     const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder });
-    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data) } : {}) };
+    // A project's folder as the server fixed it (opensRepository checked it): the window keeps it out of the address
+    // bar, which names a folder only when it is not the one the project link opens anyway.
+    const repositoryFolder = project ? new URL(data.codePreviewUrl).searchParams.get('folder') : null;
+    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data), repositoryFolder } : {}) };
 }
 
 /**
@@ -633,6 +661,111 @@ export async function openCodeWindow (ctx = {}) {
     let stop_confirmation = () => {};
     /** Per-tab folder continuity: this window's notice band (`./code-folder.js`), replaced at each bind. */
     let folder_notice = null;
+
+    // ── Folder URL sync (folder-url-sync, 2026-11-05; docs/APP-ROUTES.md §5 "Code's folder") ──────────────
+    // The address bar names the folder the editor shows (`/app/code?folder=<path>`), each folder switch made in
+    // Code gets its own history entry, and Back/Forward bring the folder back with the address. A folder named
+    // by an address is only ever opened through a mint (the server walks it); the window navigates its editor
+    // directly only to a folder that editor has already shown.
+    /** The folder this window wants: an own-files link's, then whatever its editor shows. A mint asks for it. */
+    let wanted_folder = nativeSurface || typeof ctx.folder !== 'string' ? null : ctx.folder;
+    /** A link `folder` the address-bar parser refused (`../app-link.js` parseFolder), said once at the first bind. */
+    let link_folder_problem = nativeSurface || ! ctx.folderRejected ? null
+        : ctx.folderRejected === 'with_repository' ? 'with_repository' : 'link_invalid';
+    /** The folder the server opened this window's project at (its mint URL's `folder`), never named in the address. */
+    let repository_folder = null;
+    /** What the editor shows, from its last report: `{kind: 'folder', path, base?}`, `{kind: 'empty'}`, `{kind: 'unsupported'}`. */
+    let editor_root = null;
+    /** Every folder this window's editor has shown (walked by a mint, or opened by the person in Code). */
+    const opened_roots = new Set();
+    /** A navigation of the editor is under way (its own switch, or the browser restoring it): start none. */
+    let editor_moving = false;
+    let route_timer = null;
+    let leaving_timer = null;
+    const inside = (path, root) => typeof root === 'string' && (path === root || path.startsWith(`${root}/`));
+    /** The Code parameters for what the editor shows: the project's own keys, and `folder` unless it is the project's own. */
+    const params_for = (root) => {
+        const own = project?.repoUrl ? { repo: project.repoUrl }
+            : project ? { project: project.projectId, repo: project.repoId, ...(project.path ? { path: project.path } : {}) } : {};
+        if ( root?.kind !== 'folder' ) return own;
+        // Outside the project's checkout the person is in their own files.
+        if ( project && repository_folder && ! inside(root.path, repository_folder) ) return { folder: root.path };
+        return root.path === repository_folder ? own : { ...own, folder: root.path };
+    };
+    /** Say what the editor shows to the address bar (`../app-history.js` owns it): 'push' adds an entry, 'replace' rewrites this one. */
+    const announce_root = (mode, root) => {
+        if ( disposed || nativeSurface ) return;
+        window.dispatchEvent(new CustomEvent(PARAMS_EVENT, { detail: { appId: 'code', params: params_for(root), mode } }));
+    };
+    const on_root = (root, { fallback }) => {
+        editor_root = root;
+        editor_moving = false;
+        clearTimeout(leaving_timer); leaving_timer = null;
+        if ( root.kind === 'folder' ) opened_roots.add(root.path);
+        // A mint that asked for a folder and opened another: the notice says so, and the address keeps the asked
+        // folder, so a reload or Try again asks the server for it again.
+        if ( fallback ) return;
+        if ( ! project ) wanted_folder = root.kind === 'folder' ? root.path : null;
+        announce_root('replace', root);
+    };
+    // The editor is about to switch folder itself: its entry first, then the editor replaces its document in it.
+    const on_open = (next) => {
+        editor_moving = true;
+        clearTimeout(route_timer); route_timer = null;
+        if ( ! project ) wanted_folder = next.kind === 'folder' ? next.path : null;
+        announce_root('push', next);
+    };
+    const on_leaving = () => {
+        editor_moving = true;
+        clearTimeout(route_timer); route_timer = null;
+        clearTimeout(leaving_timer);
+        // No new document reported in time: the leave was refused ("Stay" on the unsaved-work veto), so the editor
+        // still shows what it showed. A Back/Forward that asked for it is undone (`../app-history.js`); anything
+        // else, the address goes back to saying what the editor shows.
+        leaving_timer = setTimeout(() => {
+            leaving_timer = null;
+            if ( disposed || ! editor_moving ) return;
+            editor_moving = false;
+            const detail = { appId: 'code', handled: false };
+            window.dispatchEvent(new CustomEvent(UNDO_EVENT, { detail }));
+            if ( ! detail.handled && editor_root ) announce_root('replace', editor_root);
+        }, LEAVING_SETTLE_MS);
+    };
+    /**
+     * A Back/Forward landed on an entry naming `folder`. The browser restores the editor's own document for every
+     * entry a switch in Code was filed under (`on_open`), so first give it a moment to start (`ezil.code.leaving`).
+     * Only if the editor does not move, and only to a folder it has already shown, navigate it there in place, so
+     * its own beforeunload (code-server's unsaved-work veto) still runs. Anything else is never opened from an
+     * address: the address follows the editor instead.
+     */
+    const follow_route = (folder) => {
+        clearTimeout(route_timer); route_timer = null;
+        if ( disposed || nativeSurface || typeof folder !== 'string' ) return;
+        if ( editor_root?.kind === 'folder' && editor_root.path === folder ) return;
+        route_timer = setTimeout(() => {
+            route_timer = null;
+            if ( disposed || editor_moving || (editor_root?.kind === 'folder' && editor_root.path === folder) ) return;
+            const target = opened_roots.has(folder) && editor_root?.base
+                ? editorDocumentUrl(el_iframe.src, { kind: 'folder', path: folder, base: editor_root.base }) : null;
+            if ( target ) {
+                editor_moving = true;
+                try {
+                    el_iframe.contentWindow.location.replace(target);
+                    // A veto the person answered "Stay" to leaves the editor where it was: the address follows it.
+                    route_timer = setTimeout(() => {
+                        route_timer = null;
+                        if ( disposed || ! editor_moving ) return;
+                        editor_moving = false;
+                        if ( editor_root ) announce_root('replace', editor_root);
+                    }, ROUTE_WATCHDOG_MS);
+                    return;
+                } catch {
+                    editor_moving = false;
+                }
+            }
+            if ( editor_root ) announce_root('replace', editor_root);
+        }, ROUTE_SETTLE_MS);
+    };
     /**
      * Round 6 (R3-1/R3-2): this attempt's last computer.progress answer. A hidden tab or a failed poll
      * clears the spinner's live answer, so the mint's give-up decides from this one, never from that alone.
@@ -836,7 +969,7 @@ export async function openCodeWindow (ctx = {}) {
         mint_ctl?.abort();
         mint_ctl = new AbortController();
         const asked = project;
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked));
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -914,6 +1047,7 @@ export async function openCodeWindow (ctx = {}) {
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
         trace.step('mint_ok');
+        repository_folder = asked ? (res.repositoryFolder ?? null) : null;
         if ( asked ) {
             // Lane O2: the repository is open, so a later refresh may happen again; the window is named after it.
             forgetIdentityRefresh();
@@ -994,7 +1128,11 @@ export async function openCodeWindow (ctx = {}) {
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
                     folder_notice?.close();
                     folder_notice = createFolderNotice(el_body, { retry: () => { void start_boot(); }, forget: () => forgetFolder(bind) });
-                    attachFolderBridge({ iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice });
+                    attachFolderBridge({
+                        iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
+                        onRoot: on_root, onOpen: on_open, onLeaving: on_leaving,
+                    });
+                    if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
                 }
                 console.info(`[${PHASE}] code frame confirmed by the server`);
                 // Terminal: a confirmed frame IS the whole verdict for this
@@ -1292,13 +1430,17 @@ export async function openCodeWindow (ctx = {}) {
      * (lane O2): a valid project with other ids than this window's re-mints
      * for it, under the app's name until its repository answers; the same
      * project (a new `path` is kept, not re-minted) or none changes nothing.
-     * Every other key and value is ignored.
+     * `ctx.folder` (folder-url-sync): a route naming a folder the editor does not
+     * show is followed (`follow_route`). Every other key and value is ignored.
      */
     el_window._ezil_relaunch = (relaunch_ctx) => {
         const view = relaunch_ctx?.view;
         if ( view === 'full' || view === 'window' ) set_view(view);
         const next = nativeSurface ? null : projectOf(relaunch_ctx?.project);
-        if ( ! next ) return;
+        if ( ! next ) {
+            if ( relaunch_ctx && typeof relaunch_ctx.folder === 'string' ) follow_route(relaunch_ctx.folder);
+            return;
+        }
         const same = project && (project.repoUrl || next.repoUrl ? project.repoUrl === next.repoUrl
             : project.projectId === next.projectId && project.repoId === next.repoId);
         project = next;
@@ -1334,6 +1476,8 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(transition_guard);
         nativeSurface?.dispose();
         stop_timers();
+        clearTimeout(route_timer); route_timer = null;
+        clearTimeout(leaving_timer); leaving_timer = null;
         detachFolderBridge(el_iframe);
         folder_notice?.close();
         stop_runtime_recheck?.();

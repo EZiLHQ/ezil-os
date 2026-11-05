@@ -1478,6 +1478,26 @@ await settle(4);
         JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
         JSON.stringify(mints(from)[0]?.body));
     await closeCode();
+
+    // folder-url-sync: the address bar's folder (a route's `ctx.folder`) is asked over this tab's record; a project
+    // never asks, whatever the ctx carries.
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record(PAYLOAD.user.id, '/workspace/sports/sports-web') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({ folder: '/workspace/linked site' });
+    await settle(20);
+    push('9d 🔴 a link folder is asked over the stale tab record',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', codeFolder: { v: 1, path: '/workspace/linked site' } }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+    codeMintAnswer = opened('site');
+    from = calls.length;
+    await launch({ project: P1, folder: '/workspace/linked' });
+    await settle(20);
+    push('9e a project never asks for a folder, even one a ctx carries',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', project: P1 }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
     store.removeItem(FOLDER_KEY);
 
     // 10. Founder 547ed35a: a repository opened from its address (`/app/code?repo=<https URL>`).

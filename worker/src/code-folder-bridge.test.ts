@@ -125,7 +125,8 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
     return ev;
   };
   const fire = () => { for (const t of timers.splice(0)) if (!t.cleared) t.fn(); };
-  return { posted, replaced, timers, message, navigate, fire, parent, navListeners };
+  const unload = () => (listeners.beforeunload ?? []).forEach((fn) => fn({}));
+  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners };
 }
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
@@ -216,6 +217,13 @@ describe('the bridge script', () => {
     ];
     for (const [url, over] of others) expect(b.navigate(url, over).prevented).toBe(false);
     expect(b.replaced).toEqual([]);
+  });
+  it('says it is leaving at its beforeunload, to the allowed origins only, and never vetoes', () => {
+    const b = run();
+    b.posted.length = 0;
+    b.unload();
+    expect(b.posted).toEqual([{ m: { type: 'ezil.code.leaving', v: 1 }, o: SHELL }]);
+    expect(codeFolderBridgeScript([SHELL])).not.toMatch(/preventDefault\(\)[^;]*returnValue|returnValue/);
   });
   it('without the Navigation API it still reports, and the editor switches as it always did', () => {
     const b = run({ navigation: false });

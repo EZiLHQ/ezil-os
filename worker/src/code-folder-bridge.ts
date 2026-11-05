@@ -25,7 +25,9 @@
  *     only then does the editor replace its document, inside that new entry. Back/Forward then restore the address
  *     and the editor's folder together, natively, and every switch is a navigation of the live document, so
  *     code-server's own beforeunload (its unsaved-work veto) still runs. No answer in GO_FALLBACK_MS (an older
- *     shell, a closed binding): the editor replaces anyway, as before, minus the push.
+ *     shell, a closed binding): the editor replaces anyway, as before, minus the push;
+ *   - `ezil.code.leaving` {v:1} at the document's beforeunload: a navigation of the editor is under way (the
+ *     browser restoring it for a Back/Forward, or anything else), so the shell starts none of its own.
  * A report is a HINT. The shell writes it into its address bar and its tab record, and the next mint's server walk
  * decides what opens (`./code-folder.ts`, `./code-folder-resolve.ts`): a link can never make Code open a folder that
  * walk refused.
@@ -82,6 +84,7 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
     + `const q=u.searchParams;if(!q.has("folder")&&!q.has("workspace")&&!q.has("ew"))return;`
     + `e.preventDefault();const id=tok();const t=setTimeout(()=>{if(pending.delete(id))location.replace(u.href)},${GO_FALLBACK_MS});`
     + `pending.set(id,{url:u.href,t});tell({type:"ezil.code.open",v:1,id,...what(u.search)})}catch{}})}`
+    + `addEventListener("beforeunload",()=>{try{tell({type:"ezil.code.leaving",v:1})}catch{}});`
     + `tell({type:"ezil.code.ready",v:1})}catch{}})();`;
 }
 
