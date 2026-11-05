@@ -9,7 +9,7 @@ import { signInWithGoogle, signInWithPassword } from './actions';
  * Google handles both new and existing accounts; passwords only sign in. With EZiL ID configured, the page's
  * "Continue with EZiL ID" is the only new-account entry: the Supabase Google button is not offered.
  */
-export function LoginForm({ returnUrl, startWithEmail, ezilId = false }: { returnUrl: string; startWithEmail: boolean; ezilId?: boolean }) {
+export function LoginForm({ returnUrl, startWithEmail, ezilId }: { returnUrl: string; startWithEmail: boolean; ezilId: boolean }) {
     const [pending, setPending] = useState<'google' | 'password' | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [emailOpen, setEmailOpen] = useState(startWithEmail);
