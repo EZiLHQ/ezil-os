@@ -118,7 +118,9 @@ for a separate decision. Never broaden the batch.
    - Exit **2** means pending: run it again after the next sweep.
    - Exit **1** means a mismatch: stop and report.
    - `string-row-outside-allowlist` lines should list only the excluded 2026-11-04 row.
-   - `creditsMicro` should equal `starterCreditsMicroBefore`. Any difference is reported, not
+   - `creditsMicro` should be `100000000`. On 2026-11-05, every delivered, non-revoked 100-credit
+     starter grant has that value. `starterCreditsMicroBefore` also lists `500000000`, which comes
+     from legacy 500-credit starters that were later revoked. Any other value is reported, not
      corrected.
 9. **Clean up.** Remove both `/tmp` files from the container, release the lease and read it back.
    Then have one consenting Free test identity, or the founder's own view, confirm the starter
