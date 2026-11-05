@@ -52,7 +52,7 @@ export default function RefundsPage() {
         kind="refunds"
         title="Refund Policy"
         introduction="How to ask EZiL LLC about a Standard or Premium refund or payment."
-        changeSummary="Applied the 14-day refund window to Standard and Premium with a threshold below 10% of monthly fair use."
+        changeSummary="Stated that plans include EZiL AI credits. The refund window and eligibility are unchanged."
         effective={{ dateTime: '2026-11-05', label: '5 November 2026' }}
         summary={<>
             <p>Request a refund within 14 days of a monthly Standard or Premium charge if less than 10% of the plan’s monthly fair use was used during that paid period. Your statutory consumer rights are not affected.</p>
