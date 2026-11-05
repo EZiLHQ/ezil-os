@@ -130,6 +130,8 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
             ['redriven', { redriveCount: 1 }], ['aliased', { stateMachineAliasArn: 'alias' }], ['without stopDate', { stopDate: undefined }],
             ['another version', { stateMachineVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-lifecycle:99' }],
             ['receipt instance', { output: 'instanceId' }], ['receipt host', { output: 'poolHostId' }], ['receipt state', { output: 'state' }],
+            // The receipt alone still matches the row: only the provider-held input binds this execution to it.
+            ['started with another input', { input: '{"schemaVersion":1}' }],
         ] as const)(`${operation} refuses a provision execution that is %s`, async (_name, patch) => {
             const s = releasedPoolSetup({ shared: true }), e = s.executions.get(s.provisionArn)!;
             const out = JSON.parse(e.output!);
@@ -153,12 +155,15 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
         it.each([
             ['computer', { computerId: OTHER }], ['generation', { targetGeneration: 2 }], ['lease epoch (stale)', { leaseEpoch: 2 }],
             ['fence', { fenceToken: OTHER }], ['instance', { providerInstanceId: 'i-99999999999999999' }], ['volume', { dataVolumeId: 'vol-99999999999999999' }],
-        ] as const)(`${operation} refuses a release of another %s`, async (_name, patch) => {
-            const s = releasedPoolSetup({ shared: true });
-            await refused(s, operation, 'source_identity_mismatch', s.setRelease(patch));
+        ] as const)(`${operation} refuses a release of another %s, even with a receipt naming this allocation`, async (_name, patch) => {
+            const s = releasedPoolSetup({ shared: true }), x = s.source;
+            await refused(s, operation, 'source_identity_mismatch', s.setRelease(patch, { computerId: x.computerId, generation: x.sourceGeneration,
+                leaseEpoch: x.sourceLeaseEpoch, fenceToken: x.sourceFenceToken, instanceId: x.sourceInstanceId, volumeId: x.sourceVolumeId }));
         });
         it.each([
             ['stopped', { state: 'stopped' }], ['lost', { state: 'stopped', instanceLost: true }], ['another volume', { volumeId: 'vol-99999999999999999' }],
+            ['another computer', { computerId: OTHER }], ['another generation', { generation: 2 }], ['another epoch', { leaseEpoch: 2 }],
+            ['another fence', { fenceToken: OTHER }], ['another instance', { instanceId: 'i-99999999999999999' }], ['another digest', { digest: 'f'.repeat(64) }],
         ] as const)(`${operation} refuses a release receipt that is %s`, async (_name, receipt) => {
             const s = releasedPoolSetup({ shared: true }); s.setRelease({}, receipt);
             await refused(s, operation, 'source_identity_mismatch');

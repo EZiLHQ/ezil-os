@@ -608,7 +608,8 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             const r = verifyImageLaunch(expected, evidence.execution, evidence.host, evidence.volume, 'rebind');
             if (expected.phase !== 'rebind_pending' || expected.hostEvidence?.instanceId !== r.instanceId || !expected.hostEvidence.ebsRestore) throw new ImageJobConflictError();
             // The child's source is the live rebind host, never the parent's released pool host.
-            const { releasedPoolHost: _released, ...parent } = JSON.parse(expected.preparationDocument);
+            const parent = JSON.parse(expected.preparationDocument);
+            delete parent.releasedPoolHost;
             const preparation = buildRebasePreparation({ ...parent, jobId: childId,
                 sourceInstanceId: r.instanceId, sourceVolumeId: r.volumeId, sourceGeneration: r.generation, sourceLeaseEpoch: r.leaseEpoch,
                 sourceFenceToken: r.fenceToken, createdAt: now.toISOString() });
