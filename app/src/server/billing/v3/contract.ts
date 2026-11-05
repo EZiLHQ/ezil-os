@@ -124,8 +124,9 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
         highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
-        // Founder 2026-11-05: no Free session length as a number in sales copy (`sessionMaxSeconds` above still applies).
-        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Your files saved between sessions'],
+        // Founder 2026-11-05: no Free session length as a number in sales copy (`sessionMaxSeconds` above still applies), and
+        // no broad saved-storage claim: Free's checkpoint ceiling is not a write quota (task 40f7021e… storage disposition).
+        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer'],
         storageGiB: null,
     },
     standard_monthly_v3: {
@@ -135,7 +136,8 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
-        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
+        // A plan's disk is the size of a NEW volume; an existing disk is kept on a plan change (growsOnSwitch false).
+        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for new computers', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 50,
     },
     premium_monthly_v3: {
@@ -145,7 +147,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for new computers', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 100,
     },
 });

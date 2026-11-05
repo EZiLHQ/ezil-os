@@ -530,8 +530,7 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
         && Number.isFinite(Date.parse(deadline ?? '')) && Date.parse(deadline) > now ? deadline : null;
     // Round 6 (R1-08): the hold's month in numbers ("About 5 of 8 hours left this month"). Founder 2026-11-05: the Free
     // session's length is never shown as a number; the session's end time (`sessionEnds`) still is while it runs.
-    const capHours = Number.isFinite(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
-    const holdLine = held && ! heldClosed && capHours ? monthLeft(usage?.period) : null;
+    const holdLine = held && ! heldClosed ? monthLeft(usage?.period) : null;
     return { computer, data, free, standing, held, heldClosed, move, moving, blocked, offer,
         // §6.3: the pre-move copy's variant; a held-closed computer never gets the "next open" one (it has no Open).
         moveOnOpen: data?.computer?.moveOnOpen === true && ! heldClosed,

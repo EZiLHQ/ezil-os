@@ -399,6 +399,9 @@ check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented h
     const under = computerModel({ computer: me, data: heldData(), prog: running(), now: HELD_NOW,
         usage: { ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } } });
     assert.equal(under.holdLine, 'Less than an hour left this month');
+    // Review F4: the hold's month line does not depend on the session cap it no longer shows.
+    const uncapped = heldData(); delete uncapped.computer.sessionMaxSeconds;
+    assert.equal(computerModel({ computer: me, data: uncapped, prog: running(), usage: heldUsage, now: HELD_NOW }).holdLine, 'About 5 of 8 hours left this month');
 });
 
 check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
