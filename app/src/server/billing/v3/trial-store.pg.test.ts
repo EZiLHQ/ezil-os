@@ -239,6 +239,44 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
         expect(await store.recordTrialIdentities!(claim.status === 'quoted' ? claim.trial.id : undefined)).toBe(0);
     });
 
+    async function paidHistory(userId: string, tag: string) {
+        const subscriptionId = `sub_paid${tag}${run}`;
+        await store.upsertSubscription({ stripeSubscriptionId: subscriptionId, userId, status: 'canceled', sku: 'standard_monthly_v3',
+            currentPeriodStart: at, currentPeriodEnd: new Date('2026-12-05T10:00:00Z'), cancelAtPeriodEnd: false, stripeEventCreated: at });
+        expect(await store.insertGrant({ userId, subscriptionId, meter: 'compute_std_seconds', kind: 'plan_period', amount: BigInt(144000),
+            periodStart: at, periodEnd: new Date('2026-12-05T10:00:00Z'), sourceType: 'invoice', sourceId: `in_paid${tag}${run}` })).toBe('inserted');
+    }
+
+    it('paid history is per verified person: deleting a paid account keeps its email and subject paid_before for a new account', async () => {
+        const a = await account(`ph.${run}@gmail.com`, { auth0: `auth0|ph-${run}` });
+        await paidHistory(a, 'a');
+        expect((await store.trialFacts(a)).paidBefore).toBe(true);
+        await client`delete from auth.users where id = ${a}::uuid`;
+        expect((await client`select count(*)::int as n from auth.users where id = ${a}::uuid`)[0]!.n).toBe(0);
+        // Same verified email (a Gmail alias) with a new sign-in subject; and a new email with the old subject.
+        expect((await store.trialFacts(await account(`p.h.${run}+again@googlemail.com`, { auth0: `auth0|ph-new-${run}` }))).paidBefore).toBe(true);
+        expect((await store.trialFacts(await account(`other.ph.${run}@example.com`, { auth0: `auth0|ph-${run}` }))).paidBefore).toBe(true);
+        // A different person stays eligible.
+        expect((await store.trialFacts(await account(`fresh.ph.${run}@gmail.com`))).paidBefore).toBe(false);
+    });
+
+    it('paid history: an email changed and verified, then deleted, keeps old and new paid_before; unpaid and unverified record nothing', async () => {
+        const a = await account(`phold.${run}@example.com`);
+        await paidHistory(a, 'b');
+        await client`update auth.users set email = ${`phnew.${run}@example.com`}, email_confirmed_at = now() where id = ${a}::uuid`;
+        await client`delete from auth.users where id = ${a}::uuid`;
+        expect((await store.trialFacts(await account(`phold.${run}@example.com`))).paidBefore).toBe(true);
+        expect((await store.trialFacts(await account(`phnew.${run}@example.com`))).paidBefore).toBe(true);
+        const free = await account(`never.paid.${run}@example.com`);
+        await client`delete from auth.users where id = ${free}::uuid`;
+        const unverified = await account(`unv.paid.${run}@example.com`, { verified: false });
+        await paidHistory(unverified, 'c');
+        await client`delete from auth.users where id = ${unverified}::uuid`;
+        expect((await client`select value from public.ezil_billing_paid_identities where kind = 'email' and value like ${`%never.paid.${run}%`}
+            or value like ${`%unv.paid.${run}%`}`)).toEqual([]);
+        expect((await store.trialFacts(await account(`never.paid.${run}@example.com`))).paidBefore).toBe(false);
+    });
+
     it('E2: custom-domain plus addresses are distinct people; the same address is not', async () => {
         const a = await account(`team+a.${run}@acme.dev`);
         const b = await account(`team+b.${run}@acme.dev`);

@@ -70,6 +70,29 @@ CREATE POLICY "Service role full access billing trial identities"
 --> statement-breakpoint
 CREATE INDEX "ezil_billing_trial_identities_value_idx" ON "ezil_billing_trial_identities" USING btree ("kind","value");--> statement-breakpoint
 CREATE INDEX "ezil_billing_trial_identities_domain_idx" ON "ezil_billing_trial_identities" USING btree ("email_domain") WHERE "ezil_billing_trial_identities"."kind" = 'email';--> statement-breakpoint
+-- The known verified identities of a person with POSITIVE PAID Standard/Premium/Pro history (review: "no prior paid" is
+-- per verified person, not per account). Append-only, no user link: kept when the account is deleted so a new account
+-- with the same verified email or sign-in subject still reads paid_before. Only known identities, captured below.
+CREATE TABLE "ezil_billing_paid_identities" (
+	"kind" text NOT NULL,
+	"value" text NOT NULL,
+	"email_domain" text,
+	"first_seen_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "ezil_billing_paid_identities_pkey" PRIMARY KEY("kind","value"),
+	CONSTRAINT "ezil_billing_paid_identities_kind_chk" CHECK ("ezil_billing_paid_identities"."kind" in ('email', 'subject')),
+	CONSTRAINT "ezil_billing_paid_identities_value_chk" CHECK (length("ezil_billing_paid_identities"."value") between 1 and 320),
+	CONSTRAINT "ezil_billing_paid_identities_email_chk" CHECK ("ezil_billing_paid_identities"."kind" = 'subject' or (
+		"ezil_billing_paid_identities"."value" = lower("ezil_billing_paid_identities"."value")
+		and position('@' in "ezil_billing_paid_identities"."value") > 1
+		and "ezil_billing_paid_identities"."email_domain" = split_part("ezil_billing_paid_identities"."value", '@', 2))),
+	CONSTRAINT "ezil_billing_paid_identities_domain_chk" CHECK (("ezil_billing_paid_identities"."kind" = 'email') = ("ezil_billing_paid_identities"."email_domain" is not null))
+);
+--> statement-breakpoint
+ALTER TABLE "ezil_billing_paid_identities" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+CREATE POLICY "Service role full access billing paid identities"
+    ON "ezil_billing_paid_identities" FOR ALL USING (auth.role() = 'service_role');
+--> statement-breakpoint
+CREATE INDEX "ezil_billing_paid_identities_domain_idx" ON "ezil_billing_paid_identities" USING btree ("email_domain") WHERE "ezil_billing_paid_identities"."kind" = 'email';--> statement-breakpoint
 -- Capture at the source (review R4): when a started trial's account changes its email, its email confirmation or its
 -- app metadata (the linked Auth0 subject), and just before the account is deleted (BEFORE DELETE: the trial row still
 -- points at it; the FK then sets user_id null), keep the old and the current verified identities. Identities are the
@@ -97,6 +120,25 @@ BEGIN
         ) v
         WHERE t.user_id = OLD.id AND t.stripe_subscription_id IS NOT NULL
         ON CONFLICT DO NOTHING;
+        -- The same identities for an account with known positive paid history (store.ts PAID_GRANT_KINDS / the
+        -- live-or-once-live non-trial paid subscription rule), while its grants and subscriptions still exist.
+        IF EXISTS (SELECT 1 FROM public.ezil_billing_grants g WHERE g.user_id = OLD.id AND g.amount > 0
+                AND g.kind IN ('plan_period', 'upgrade_prorated', 'pro_period'))
+            OR EXISTS (SELECT 1 FROM public.ezil_billing_subscriptions s WHERE s.user_id = OLD.id
+                AND s.sku IN ('standard_monthly_v3', 'premium_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1')
+                AND s.status NOT IN ('incomplete', 'incomplete_expired') AND (s.trial_end IS NULL OR s.first_paid_at IS NOT NULL)) THEN
+            INSERT INTO public.ezil_billing_paid_identities (kind, value, email_domain)
+            SELECT DISTINCT v.kind, v.value, v.email_domain FROM (
+                SELECT 'subject'::text AS kind, CASE WHEN coalesce(trim(u.raw_app_meta_data->>'auth0_sub'), '') <> ''
+                        THEN 'auth0:' || trim(u.raw_app_meta_data->>'auth0_sub') ELSE 'supabase:' || u.id::text END AS value, NULL::text AS email_domain
+                FROM (SELECT OLD.id, OLD.raw_app_meta_data UNION ALL SELECT NEW.id, NEW.raw_app_meta_data WHERE TG_OP = 'UPDATE') u (id, raw_app_meta_data)
+                UNION ALL
+                SELECT 'email', lower(trim(e.email)), split_part(lower(trim(e.email)), '@', 2)
+                FROM (SELECT OLD.email, OLD.email_confirmed_at UNION ALL SELECT NEW.email, NEW.email_confirmed_at WHERE TG_OP = 'UPDATE') e (email, email_confirmed_at)
+                WHERE e.email_confirmed_at IS NOT NULL AND lower(trim(e.email)) ~ '^[^[:space:]@]+@[^[:space:]@]+$'
+            ) v
+            ON CONFLICT DO NOTHING;
+        END IF;
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'ezil_billing_trial_identity_capture skipped: %', SQLSTATE;
     END;

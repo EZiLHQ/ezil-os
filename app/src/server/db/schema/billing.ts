@@ -508,6 +508,29 @@ export const billingTrialIdentities = pgTable(
     ],
 ).enableRLS();
 
+/**
+ * 0021 (review): the known verified identities (email, sign-in subject) of a person with positive paid history, kept
+ * after the account is deleted (no user link), so "no prior paid plan" holds per verified person.
+ */
+export const billingPaidIdentities = pgTable(
+    'ezil_billing_paid_identities',
+    {
+        kind: text('kind', { enum: ['email', 'subject'] }).notNull(),
+        value: text('value').notNull(),
+        emailDomain: text('email_domain'),
+        firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        primaryKey({ name: 'ezil_billing_paid_identities_pkey', columns: [table.kind, table.value] }),
+        check('ezil_billing_paid_identities_kind_chk', sql`${table.kind} in ('email', 'subject')`),
+        check('ezil_billing_paid_identities_value_chk', sql`length(${table.value}) between 1 and 320`),
+        check('ezil_billing_paid_identities_email_chk', sql`${table.kind} = 'subject' or (${table.value} = lower(${table.value})
+            and position('@' in ${table.value}) > 1 and ${table.emailDomain} = split_part(${table.value}, '@', 2))`),
+        check('ezil_billing_paid_identities_domain_chk', sql`(${table.kind} = 'email') = (${table.emailDomain} is not null)`),
+        index('ezil_billing_paid_identities_domain_idx').on(table.emailDomain).where(sql`${table.kind} = 'email'`),
+    ],
+).enableRLS();
+
 export type BillingComputeEpochRow = typeof billingComputeEpochs.$inferSelect;
 export type BillingOverageConsentRow = typeof billingOverageConsents.$inferSelect;
 export type BillingOverageInvoiceRow = typeof billingOverageInvoices.$inferSelect;

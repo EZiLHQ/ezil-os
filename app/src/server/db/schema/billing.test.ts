@@ -273,7 +273,7 @@ describe('billing schema and migration 0004', () => {
         ]);
         // 0021 (Standard trial) adds ezil_billing_trials; its own checks are in the 0021 block below.
         expect(Object.values(billing).map(table => getTableConfig(table).name).sort())
-            .toEqual([...tableNames, ...v2Names, 'ezil_billing_trials', 'ezil_billing_trial_identities'].sort());
+            .toEqual([...tableNames, ...v2Names, 'ezil_billing_trials', 'ezil_billing_trial_identities', 'ezil_billing_paid_identities'].sort());
         assertBillingV2Migration(migrationV2);
         for (const table of v2Tables) {
             expect(table.enableRLS).toBe(true);

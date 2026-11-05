@@ -15,6 +15,7 @@ import {
     billingOutbox,
     billingStorageSamples,
     billingSubscriptions,
+    billingPaidIdentities,
     billingTrialIdentities,
     billingTrials,
     billingUsageIntervals,
@@ -150,11 +151,18 @@ export function createBillingStore(db: Database): BillingStore {
                         and s.sku in (${sql.join(PAID_SUBSCRIPTION_SKUS.map(sku => sql`${sku}`), sql`, `)})
                         and s.status not in ('incomplete', 'incomplete_expired') and (s.trial_end is null or s.first_paid_at is not null)
                 ) as paid`);
+            // Known paid identities of a person whose paid account is gone (0021 capture hook): same subject or same email.
+            const domains = emailNormalized === null ? [] : mailboxDomains(emailNormalized.split('@')[1]!);
+            const known = await db.select({ kind: billingPaidIdentities.kind, value: billingPaidIdentities.value }).from(billingPaidIdentities)
+                .where(or(and(eq(billingPaidIdentities.kind, 'subject'), eq(billingPaidIdentities.value, authSubject)),
+                    ...(domains.length ? [and(eq(billingPaidIdentities.kind, 'email'), inArray(billingPaidIdentities.emailDomain, domains))] : [])));
+            const paidIdentity = known.some(row => row.kind === 'subject' ? row.value === authSubject
+                : emailNormalized !== null && normalizeEmail(row.value) === emailNormalized);
             return {
                 emailNormalized, emailVerified: user?.confirmed === true, authSubject,
                 own: own ? trialRow(own) : null,
                 claimedElsewhere: claimed,
-                paidBefore: paid?.paid === true,
+                paidBefore: paid?.paid === true || paidIdentity,
             };
         },
 

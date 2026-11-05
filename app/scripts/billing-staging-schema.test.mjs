@@ -521,7 +521,12 @@ test('the Standard trial follows 0020, stays additive and is a production snapsh
     // it runs on auth.users changes and deletions and never writes auth.users itself.
     const hook = /CREATE FUNCTION "public"\."ezil_billing_trial_identity_capture"\(\)[\s\S]*?\$\$([\s\S]*?)\$\$;/.exec(sql);
     assert.ok(hook, 'capture hook function');
-    assert.deepEqual([...hook[1].matchAll(/INSERT INTO ([\w.]+)/g)].map(match => match[1]), ['public.ezil_billing_trial_identities']);
+    assert.deepEqual([...hook[1].matchAll(/INSERT INTO ([\w.]+)/g)].map(match => match[1]),
+        ['public.ezil_billing_trial_identities', 'public.ezil_billing_paid_identities']);
+    // Paid history per verified person: an append-only identity table with no user link.
+    assert.match(sql, /CREATE TABLE "ezil_billing_paid_identities" \(/);
+    assert.match(sql, /ALTER TABLE "ezil_billing_paid_identities" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing paid identities"/);
     assert.match(hook[1], /EXCEPTION WHEN OTHERS THEN\s+RAISE WARNING/);
     assert.match(sql, /SECURITY DEFINER\s+SET search_path = ''/);
     assert.match(sql, /CREATE TRIGGER "ezil_billing_trial_identity_on_change"\s+AFTER UPDATE OF "email", "email_confirmed_at", "raw_app_meta_data" ON "auth"\."users"/);
