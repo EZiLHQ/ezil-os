@@ -184,6 +184,45 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.deepEqual(open({ ...SW({}), anchorPosition: 0 }, 300), { above: false, list: 132 }, 'dialog picker at the same place: still forced below');
     });
 
+    // The bundle's own responsive picker layout (SEt.layout), against a double of the header's picker row: the mode
+    // picker (70 px, 22 compact), the model picker (134 px, 22 compact; the one canShrink item, which can ellipsize down
+    // to 48 px) and the tools picker (22 px), 4 px apart, left to right. A phone's Chat leaves about 146 px for the row.
+    await t.test('the model picker keeps its name in a narrow header; it compacts last (picker-order)', () => {
+      const layoutOf = (bundle) => {
+        const i = bundle.indexOf('layout(){if(this._isLayouting||!this._element.isConnected)return;'), j = bundle.indexOf('}areAllItemsCompact(){', i);
+        assert(i > 0 && j > i, 'SEt.layout found');
+        return new Function('return function(){' + bundle.slice(i + 'layout(){'.length, j) + '}')();
+      };
+      const row = (width, specs) => {
+        const order = [];
+        const items = specs.map(([name, left, full, compact, shrinkTo]) => ({ name, left, full, compact, shrinkTo, isCompact: false, canShrink: shrinkTo !== undefined,
+          setCompact(v) { if (v && !this.isCompact) order.push(name); this.isCompact = v; }, setMinimal() {} }));
+        const used = () => items.reduce((sum, it) => sum + (it.isCompact ? it.compact : it.canShrink ? it.shrinkTo : it.full), 0) + 4 * (items.length - 1);
+        const self = {
+          _isLayouting: false, _element: { isConnected: true, getBoundingClientRect: () => ({ width }) }, _mutationObserver: { disconnect() {} }, _observeMutations() {},
+          _restoreCompactItems: () => true, _delegate: { relayout() {} },
+          _getVisibleItemBounds: () => items.map(item => ({ item, bounds: { left: item.left } })),
+          // Upstream's fit check: every item inside the row; a canShrink item may be narrower than its preferred width.
+          _fitsAvailableWidth: (e) => used() <= e,
+        };
+        return { self, items, order };
+      };
+      const header = [['mode', 0, 70, 22], ['model', 74, 134, 22, 48], ['tools', 212, 22, 22]];
+      const patched = layoutOf(code), pristine = layoutOf(fs.readFileSync(path.join(source, wb), 'utf8'));
+      const phone = row(146, header); patched.call(phone.self);
+      assert.deepEqual(phone.order, ['tools', 'mode'], 'phone: the tools and mode pickers become icons; the model picker is not compacted');
+      assert.equal(phone.items[1].isCompact, false, 'phone: the model picker keeps its (ellipsized) name');
+      const before = row(146, header); pristine.call(before.self);
+      assert.deepEqual(before.order, ['tools', 'model'], 'unpatched: the model picker, right of the mode picker, lost its name first');
+      for (const layout of [patched, pristine]) { const wide = row(300, header); layout.call(wide.self); assert.deepEqual(wide.order, [], 'desktop: everything fits, nothing compacts'); }
+      const tiny = row(60, header); patched.call(tiny.self);
+      assert.deepEqual(tiny.order, ['tools', 'mode', 'model'], 'too narrow even for an ellipsized name: the model picker compacts last');
+      // A row without a canShrink item (the Local/permissions row) compacts right to left, exactly as upstream.
+      const secondary = [['local', 0, 60, 22], ['permissions', 64, 90, 22], ['context', 158, 40, 22]];
+      const a = row(120, secondary), b = row(120, secondary); patched.call(a.self); pristine.call(b.self);
+      assert.deepEqual(a.order, b.order); assert.deepEqual(a.order, ['context', 'permissions']);
+    });
+
     await t.test('patch rejects a moved header anchor', () => {
       fs.copyFileSync(path.join(source, wb), path.join(root, wb));
       fs.copyFileSync(path.join(source, css), path.join(root, css));
