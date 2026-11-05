@@ -44,17 +44,18 @@ export function parseRebaseRelease(raw: unknown, deployment: LifecycleDeployment
     return r;
 }
 
+/** A deployment's full release tuple: the target's identity, and a released pool host's recorded launch (R2). */
+const TUPLE = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn',
+    'lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
 /** Validate registry evidence before deciding whether the source needs an EC2 observation. */
-function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null) {
+export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null) {
     if (lowerImageDigest === null) throw new Error('source_digest_unknown');
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('release_mismatch');
     const { releases, ...rawDeployment } = entry as Record<string, unknown>;
     const deployment = LifecycleDeploymentSchema.parse(rawDeployment);
     const records = z.array(RebaseSourceReleaseSchema).min(1).max(24).parse(releases);
     if (records.some((r, i) => i > 0 && Date.parse(r.createdAt) < Date.parse(records[i - 1]!.createdAt))) throw new Error('release_mismatch');
-    const targetKeys = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn',
-        'lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
-    const targets = records.filter(r => targetKeys.every(k => r[k] === deployment[k]));
+    const targets = records.filter(r => TUPLE.every(k => r[k] === deployment[k]));
     const sources = records.filter(r => r.lowerImageDigest === lowerImageDigest);
     if (targets.length !== 1 || sources.length === 0) throw new Error('release_mismatch');
     const target = RebaseReleaseSchema.parse(targets[0]);
@@ -62,14 +63,12 @@ function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null
     return { sources, target, deployment, repository };
 }
 
-export function rebaseSourceRequiresAmi(entry: unknown, lowerImageDigest: string | null): boolean {
-    return rebaseReleaseCandidates(entry, lowerImageDigest).sources.length > 1;
-}
-
-/** A1/B2: an AMI is provider evidence, never HTTP input; a unique lower needs no observation. */
-export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string) {
+/** A1/B2: an AMI is provider evidence, never HTTP input; a unique lower needs no observation.
+ * R2: a released pool host's proven launch tuple selects its record exactly, never an alias by lower or AMI alone. */
+export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string, provisioned?: LifecycleDeployment) {
     const { sources, target, deployment, repository } = rebaseReleaseCandidates(entry, lowerImageDigest);
-    const matches = sources.length > 1 ? sources.filter(r => r.amiId === observedSourceAmiId) : sources;
+    const matches = provisioned ? sources.filter(r => TUPLE.every(k => r[k] === provisioned[k]))
+        : sources.length > 1 ? sources.filter(r => r.amiId === observedSourceAmiId) : sources;
     if (matches.length !== 1) throw new Error('release_mismatch');
     const source = matches[0]!;
     if (source.accountId !== target.accountId || source.region !== target.region || source.namespace !== target.namespace
