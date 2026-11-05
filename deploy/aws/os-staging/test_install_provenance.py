@@ -14,13 +14,16 @@ HOST = 'i-014810524754b9ed0'
 HOST_PIN = 'vpc-0f6bc19fdfd4209aa\tezil-os-billing-staging-host\tbilling-staging'
 
 class VerifiedInstallTests(SandboxTestCase):
-    def prepare(self, *, source=None, label=None, runtime_sha=None, tag='v1'):
+    def prepare(self, *, source=None, label=None, runtime_sha=None, tag='v1', public_config=None):
         source = source or self.box.sha
         self.box.publish(BUCKET, 'os-staging/images', tag, 'ezil-os-staging', self.box.deploy)
         directory = self.box.s3 / BUCKET / 'os-staging/images'
         config = {'architecture': 'amd64', 'os': 'linux', 'config': {
             'Labels': {'org.opencontainers.image.revision': label or source},
             'Env': ['EZIL_GIT_SHA=' + (runtime_sha or source)]}}
+        if public_config is not None:
+            from public_config import fingerprint
+            config['config']['Labels']['work.ezil.public-config-sha256'] = fingerprint(public_config)
         raw = json.dumps(config).encode()
         image_id = hashlib.sha256(raw).hexdigest()
         archive = io.BytesIO()
@@ -36,6 +39,8 @@ class VerifiedInstallTests(SandboxTestCase):
         (directory / (tag + '.sha256')).write_text(''.join(f'{v}  {k}\n' for k, v in hashes.items()))
         receipt = {'schema': 1, 'source': source, 'environment': 'staging', 'component': 'aws-app',
                    'image': 'ezil-os-staging:' + tag, 'artifacts': hashes}
+        if public_config is not None:
+            receipt['public_config'] = public_config
         path = directory / (tag + '.source.json')
         path.write_text(json.dumps(receipt))
         self.loaded = {'Id': 'sha256:' + image_id, 'Architecture': 'amd64', 'Os': 'linux', 'Config': config['config']}

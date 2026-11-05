@@ -82,6 +82,13 @@ elif name == "docker":
     elif "exec" in args:
         print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
+    if args[-1] == 'http://169.254.169.254/latest/api/token':
+        print('fixture-imds-token')
+        sys.exit(0)
+    if args[-1] == 'http://169.254.169.254/latest/dynamic/instance-identity/document':
+        print(os.environ.get('FAKE_INSTANCE_IDENTITY', json.dumps({'instanceId': 'i-014810524754b9ed0',
+              'accountId': '452630323510', 'region': 'ap-south-1'})))
+        sys.exit(0)
     pathlib.Path(after("--output")).write_text(os.environ.get("FAKE_HEALTH", ""))
     sys.stdout.write(after("--write-out").replace("%{http_code}", os.environ.get("FAKE_STATUS", "200"))
                      .replace("%{remote_ip}", os.environ.get("FAKE_REMOTE_IP", "203.0.113.10")))

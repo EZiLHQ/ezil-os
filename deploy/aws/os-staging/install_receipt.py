@@ -64,6 +64,14 @@ def verify_archive(directory, tag, environment, source, receipt_hash):
         require(digest in (name.removesuffix('.json'), name.removeprefix('blobs/sha256/')),
                 'Docker config digest mismatch')
         image_metadata(config, source)
+        if 'public_config' in receipt:
+            public = receipt['public_config']
+            require(isinstance(public, dict) and set(public) == {'supabase_url', 'anon_key_sha256'} and
+                    isinstance(public.get('supabase_url'), str) and public['supabase_url'] and
+                    re.fullmatch(r'[0-9a-f]{64}', public.get('anon_key_sha256', '')), 'Invalid public config receipt')
+            fingerprint = hashlib.sha256(json.dumps(public, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            require(config.get('config', {}).get('Labels', {}).get('work.ezil.public-config-sha256') == fingerprint,
+                    'Image public configuration differs from sealed receipt')
     return 'sha256:' + digest
 
 

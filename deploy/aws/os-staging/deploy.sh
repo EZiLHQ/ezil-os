@@ -114,7 +114,9 @@ case "$command_name" in
         # Dockerfile-specific ignore applies the allowlist without editing root.
         cp "$build_root/app/Dockerfile" "$temporary/Dockerfile"
         cp "$build_root/app/.dockerignore" "$temporary/Dockerfile.dockerignore"
+        public_config_sha=$(python3 -B -c 'import os,sys; sys.path.insert(0,sys.argv[1]); from public_config import identity,fingerprint; print(fingerprint(identity(os.environ["NEXT_PUBLIC_SUPABASE_URL"],os.environ["NEXT_PUBLIC_SUPABASE_ANON_KEY"])))' "$build_root/deploy/aws/os-staging")
         docker build --platform linux/amd64 --file "$temporary/Dockerfile" \
+            --label "work.ezil.public-config-sha256=$public_config_sha" \
             --build-arg NEXT_PUBLIC_SUPABASE_URL --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY \
             --build-arg NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY --build-arg GIT_SHA \
             --tag "ezil-os-staging:$tag" "$build_root"

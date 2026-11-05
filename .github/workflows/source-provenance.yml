@@ -31,3 +31,21 @@ jobs:
           name: os-source-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/source-provenance.json
           if-no-files-found: error
+      - name: Render fixed installer document for review (no AWS call)
+        run: |
+          python3 -B - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, 'deploy/aws/os-staging')
+          from fixed_document import definition, document_digest
+          path = pathlib.Path(os.environ['RUNNER_TEMP'], 'fixed-installer')
+          path.mkdir()
+          document = definition()
+          (path / 'document.json').write_text(json.dumps(document, indent=2) + '\n')
+          (path / 'receipt.json').write_text(json.dumps({'schema': 1, 'tested_source': os.environ['GITHUB_SHA'],
+              'document_sha256': document_digest(document), 'created_in_aws': False}, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-installer-document-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fixed-installer/
+          if-no-files-found: error

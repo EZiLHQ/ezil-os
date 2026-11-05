@@ -158,68 +158,160 @@ The legacy Vercel alias is not this target. CF desktop digest/editor provenance
 must be pinned independently. Existing AWS users and AMI artifacts do not prove
 CF canary acceptance.
 
-## Specific dependent actions and gates
+## Prepared source graph — still disabled
 
-1. **Source/integration:** cb1 must ACK the exact patch and choose the deliberate
-   release branch/full candidate SHA. No branch has been authorized here.
-   Preserve production safeguards from main and reviewed S bytes across their
-   divergent histories. Re-run exact composed-source checks; review baseline
-   failures without waiving them. Keep DCO authentic.
-2. **Check policy:** obtain approval for the precise ruleset change above and
-   the hosted-continuity replacement/relocation. No policy change is needed to
-   review this source-only PR.
-3. **Delivery authorization proposal:** if no further existing path is found,
-   propose a dedicated role, for example `ezil-os-staging-app-delivery` (a
-   **proposed name, not an existing/approved role**). Trust only the immutable
-   repo subject `repo:EZiLHQ@315435740/ezil-os@1339112799:environment:staging`
-   with audience `sts.amazonaws.com`. Its scoped actions
-   would be S3 PutObject/GetObject on
-   `arn:aws:s3:::ezil-main-preview-artifacts-452630323510-aps1/os-staging/images/*`,
-   EC2 DescribeInstances for target validation (AWS requires resource `*`),
-   SSM SendCommand on the exact staging instance ARN and one approved fixed
-   document ARN, and GetCommandInvocation for command readback (resource `*`
-   where AWS requires it). Region conditions must match ap-south-1. No IAM,
-   SecretsManager, production bucket, lifecycle/rebase or user-computer access.
-   Keep the existing lease role unchanged. Role creation/trust and permission
-   attachment are separate persistent-access actions requiring approval.
-4. **Fixed installer document proposal:** create a reviewed version of an
-   `EZiL-OS-Staging-InstallVerified-v1` SSM document (proposed name) that embeds
-   the audited installer/verifier and pins the host/bucket. Accept only tag,
-   full source SHA and receipt SHA256 with validation; never arbitrary shell
-   or caller-supplied script URLs. Record document version/hash and pin them in
-   the future GitHub job. This is a separate persistent-access action. The
-   current workstation command still uses existing `AWS-RunShellScript`;
-   **do not grant a new GitHub role that general shell authority by default**.
-   The corresponding source adapter and its mocked permission/parameter tests
-   are needed before activation. No document or IAM policy is created here.
-5. **Environment admission:** the staging subject alone does not restrict a
-   source branch. After branch selection, propose an explicit staging GitHub
-   environment branch policy and reviewer gate (including exact authorized
-   reviewer selection). This is another security-setting approval. Do not
-   alter the OIDC subject template: that could break the proven lease path.
-   Existing OIDC provider, CF credentials and host receipt-read permission can
-   be retained; no secret rotation/new static secret is currently indicated.
-6. **Build/delivery source wiring:** add a reviewed caller only after the above
-   values are known. It must verify PR/merge checks and branch head, reserve
-   the authorized build window, build one clean immutable source snapshot,
-   record app/runtime/receipt hashes and image identity, publish with immutable
-   tags, then use the fixed document under the existing shared staging lease.
-   Fail closed on source, target, identity or lease drift. Do not run checkout
-   code with delivery credentials before admission. A finite build window and
-   owner release ACK remain required; none is exercised by this patch.
-7. **Release and acceptance:** obtain cb1's release plan/lease and schema,
-   backup and rollback review. `install-verified` enforces the approved receipt;
-   follow with public app SHA/bundle checks and separately authorized provider
-   acceptance. Keep Worker action `retain` unless separately reviewed. Legacy
-   rollback has no source-receipt enforcement: verify its exact two archive
-   hashes and prior source before using `install PREVIOUS_TAG`. Store exact
-   command/run IDs and all component pins in the receipt; release/read back
-   the lease. Runtime-SHA failure is after app replacement and timer stops. Inspect the SSM
-   command/current container and recorded candidate/previous identities; restore
-   the reviewed app/runtime pair or repair the candidate, verify health/source,
-   then restore the reviewed timer set. No automatic legacy fallback occurs.
+The source-only implementation is in PR269 on frozen S. PR267 remains a draft
+historical main-based proof; it does not repair the operational release branch.
+No current app, Worker, image or host install is changed by either PR.
 
-The checked-in handoff produces review-only argv/environment and requires these
-gates; it never executes them. Setting `enabled=true` alone does not connect a
-pipeline. Until the source caller, delivery document/authorization and live
-acceptance are approved and verified, the task remains **In progress, Ready=false**.
+`staging-release.yml` and `staging-delivery.yml` are reusable-only workflows.
+`pipeline.json` is disabled. Release ref, delivery role, required-check approval,
+environment reviewers, public browser-auth config, and document name/version/hash
+are null. Merely enabling the boolean cannot pass admission. There is no active
+entry caller, no new AWS document, and no delivery-role grant in this patch.
+
+The prepared path is: exact branch source admission → independent staging
+build-window approval → immutable Git archive app/runtime build → sealed GitHub
+artifact → independent installation approval → existing shared lease → exact
+fixed SSM document → installed image/runtime and public health SHA receipt.
+Worker action is retain; it remains independently pinned in the candidate.
+
+`release_admission.py` maps all 13 proposed contexts above to specific jobs:
+worker/app/connectors/shell/tools/computer-infrastructure/ezil-models/container/
+local/cloud-release-contract in `ci.yml`, dco in `dco.yml`, codeql in `codeql.yml`,
+and provenance in `source-provenance.yml`. It verifies the Actions job/check ID,
+repository, workflow path, branch, source SHA, **push event**, successful latest
+run attempt and that job's digest-verified checkout artifact. The artifact must
+match the candidate source/tree, workflow ref, job and run/attempt. A PR synthetic
+merge, a duplicate check name from another workflow, or old-attempt evidence
+cannot stand in for merged branch-SHA CI. This is source admission code, not an
+activated branch-protection gate.
+
+`staging_delivery.py` accepts only the admitted current release entry run/attempt
+and its successful `release / Build approved staging artifact` job. Artifact
+ID/digest, exact name, repository, workflow path, event, source and branch must
+match. The four downloaded files have a strict member set; the real image and
+runtime archives are verified, copied into a private snapshot, and uploaded with
+conditional writes. The checksum completion marker is last. No same-SHA artifact
+from another workflow/run/attempt is accepted and no submitted install is retried.
+
+`public_config.py` requires an explicitly approved Supabase URL/project identity
+and SHA256 of the public anon key before the graph can build. The key itself is
+never written to a receipt. The source receipt carries that identity; a Docker
+label binds its canonical fingerprint to the image config and therefore image
+ID. Delivery compares the receipt against the approved staging config, and the
+installer checks its image-label binding before loading. Legacy receipts without
+this extension remain usable only through the existing operator path; automatic
+delivery requires the new identity. This prevents a correctly sourced staging
+host from silently shipping browser auth aimed at another backend. The Stripe
+publishable build input is retained; this does not establish live Stripe use,
+which follows the separately configured runtime contract.
+
+`fixed_document.py` deterministically renders the audited installer and verifier.
+Its only parameters are tag, full source SHA and receipt SHA256, passed through
+SSM Agent ENV_VAR interpolation with strict patterns. It pins the bucket and
+checks nonsecret IMDSv2 instance/account/region against the exact target above
+before installer mutation. Older agents without ENV_VAR support fail closed.
+Adapter STS/EC2/document checks and IAM restrictions remain separate guards.
+The observation workflow uploads the rendered document plus canonical hash for
+review, and **does not create it in AWS**.
+
+`delivery_permissions.py DOCUMENT_NAME` renders one proposed policy; it never
+creates or attaches it, and has no default approved name. Its statements are:
+
+- S3 PutObject only in the staging image prefix, ap-south-1. No GetObject grant
+  is needed by this delivery adapter; the host already fetches artifacts.
+- EC2 DescribeInstances for target validation; resource `*` as required by AWS.
+- SSM GetDocument/DescribeDocument for the chosen exact document ARN.
+- SSM SendCommand for that exact document and staging instance ARN only.
+- SSM GetCommandInvocation for outcome reads, resource `*` as required by AWS.
+- DynamoDB **GetItem only** on existing
+  `arn:aws:dynamodb:us-east-1:452630323510:table/ezil-ci-staging`, with
+  `dynamodb:LeadingKeys=[shared-staging]`, a matching Null=false condition, and
+  us-east-1 restriction. No PutItem/DeleteItem is added to the delivery role.
+
+The existing lease role acquires/releases separately. Public AWS Service
+Authorization Reference mappings were checked for these named operations and
+array-valued LeadingKeys. Offline tests evaluate the proposed Allow/action/
+resource/condition subset before mocked requests; removing GetItem causes the
+positive path to fail before upload. Tests deny other keys/tables/regions, lease
+writes, other buckets/hosts and AWS-RunShellScript. This is not a live IAM policy
+simulation. No service role is passed to SSM, no replication/ACL/tagging API is
+used, and no extra permission for those variants is proposed.
+
+## Failure state and owner recovery
+
+The adapter records lease expiry and marks cleanup unsafe **before** SendCommand.
+Any submitted-install failure, cancellation, timeout, unknown outcome or health
+SHA mismatch retains the lease without DeleteItem. Automatic cleanup is permitted
+only after verified successful public health/source, or a known pre-submission
+failure. The lease is bounded by its original 2100-second TTL; this is **not an
+indefinite recovery hold**. The >1020-second remaining-time guard covers the
+120-second SSM delivery timeout plus 900-second execution limit. The release
+owner must inspect/recover before normal leasing can resume after expiry.
+
+Runtime-SHA verification runs after Docker Compose replacement and timer stops.
+Failure is mutating: it prints no install success, reports candidate and observed
+previous recovery pins, and leaves the stopped timer set stopped. Inspect the
+recorded SSM command, actual container/image/source and candidate/previous archive
+receipts. The owner must explicitly restore the reviewed app/runtime pair or
+repair the candidate, verify health/source, then restore the reviewed timer set:
+telemetry-maintenance, sandbox-reap, billing-session-sweep, aws-stop-settle,
+pool-replenish and aws-reconcile. Later public-health failure may occur after the
+installer restarted timers; inspect their actual state. Legacy rollback remains
+an explicit owner operation with exact prior hashes/source, never an automatic
+fallback. A lost SendCommand response has uncertain execution; do not retry it.
+
+## Remaining source activation and per-action gates
+
+1. **Owner composition/branch:** cb1 reviews the exact PR269 head and composes
+   the separate pool and shell inputs. S/PR262–266 remain frozen. Prefer one
+   durable `os-staging` or `release/staging` branch from that reviewed candidate.
+   No plain `staging` exists, but `staging/os-core-20261026` occupies its Git ref
+   namespace; preserve it. The question about a staging branch is not permission
+   to create/point one. Main production promotion remains separate.
+2. **Exact-SHA check source path:** current CI and CodeQL push only on main;
+   DCO is PR-only. `activation_source.py --release-ref CHOSEN_FULL_REF --output
+   NEW_EXTERNAL_DIRECTORY` prepares an offline review bundle, without applying
+   it. It adds the chosen branch to CI/CodeQL and DCO push triggers, checkout
+   evidence to every mapped job, and a manual approved release-entry caller.
+   The original DCO script remains byte-exact; only its event SHA inputs extend
+   to push before/after, with an extra nonzero ancestral range guard. Initial
+   branch-creation events fail DCO rather than inventing an approval baseline;
+   a reviewed subsequent merge/push produces genuine branch-SHA evidence. No
+   producer history is rewritten or signed for others. The generator also moves
+   the exact triage paragraph citation to match the expanded workflow, preserving
+   its semantic tests. This closes the source-path deadlock without choosing or
+   activating a ref now. Apply/review the generated source patch only after the
+   branch decision; allow all checks to finish before requesting release.
+3. **Check policy:** approve the exact 13-context proposal and disposition of
+   the nonexistent Hosted continuity gate separately. Preserve all other
+   ruleset22265548 settings and require real release/provider acceptance; offline
+   provenance is not hosted continuity. No ruleset change has been made.
+4. **Delivery identity:** select an actual dedicated delivery-role ARN and
+   approve its creation/trust, then the precise rendered policy attachment as
+   separate persistent-access actions. Trust the existing provider, audience
+   sts.amazonaws.com and immutable subject
+   `repo:EZiLHQ@315435740/ezil-os@1339112799:environment:staging`.
+   Existing provider/lease role/CF credentials are retained. No new static secret,
+   broad shell grant, IAM PassRole or host access expansion is proposed.
+5. **Fixed document:** approve creation of the exact rendered content under a
+   chosen name, then pin numeric version, canonical source hash and service
+   hash readback. Document creation is a separate persistent-access action;
+   it has not happened. Verify target SSM Agent interpolation support read-only
+   before any approved install.
+6. **Environment/public configuration:** approve the chosen staging environment
+   branch policy and exact independent reviewers, then the known public build
+   settings and URL/key fingerprint. The generated caller's variable names are
+   proposed inputs, not existing credential findings. Do not fetch or print key
+   values. Current staging has no reviewer/branch policy, so admission refuses.
+7. **Release/build/acceptance:** obtain cb1's concrete release/schema/backup/
+   recovery plan, finite build window and live component pins. Review artifact
+   IDs/hashes/image/public-config identity before installation approval. Only a
+   separately approved invocation may build/upload/install. Follow with actual
+   AWS app and separately pinned CF Worker/desktop acceptance. AMI artifacts and
+   old AWS users cannot stand in for CF canary acceptance. Record all results and
+   the lease readback. None of these live actions was exercised by this patch.
+
+All preparations remain source-only. The task stays **In progress, Ready=false**
+until the full approved pipeline is connected and its live acceptance is proven.

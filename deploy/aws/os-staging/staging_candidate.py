@@ -24,7 +24,7 @@ PINNED = {
 }
 
 
-def prepare(contract, request):
+def validate_identity(contract, request):
     require(contract.get('schema') == 1 and all(contract.get(k) == v for k, v in PINNED.items()),
             'Wrong staging target contract')
     require(contract.get('enabled') is True, 'Staging delivery is disabled pending activation approval')
@@ -37,7 +37,7 @@ def prepare(contract, request):
     require(all(request.get(k) == v for k, v in PINNED.items()), 'Candidate target differs from staging contract')
     for field in ('source', 'base', 'previous_app_source', 'worker_source'):
         require(re.fullmatch(r'[0-9a-f]{40}', request.get(field, '')), 'Missing exact source: ' + field)
-    for field in ('receipt_sha256', 'previous_app_archive_sha256', 'previous_runtime_archive_sha256', 'worker_bundle_sha256'):
+    for field in ('previous_app_archive_sha256', 'previous_runtime_archive_sha256', 'worker_bundle_sha256'):
         require(re.fullmatch(r'[0-9a-f]{64}', request.get(field, '')), 'Missing immutable receipt: ' + field)
     for field in ('tag', 'previous_app_tag'):
         require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', request.get(field, '')), 'Invalid tag')
@@ -47,6 +47,12 @@ def prepare(contract, request):
     require(request.get('worker_action') == 'retain', 'Worker changes need their separate reviewed release')
     require(request.get('rollback_format') == 'legacy-two-archive' and request.get('rollback_reviewed') is True,
             'Legacy rollback requires explicit reviewed archive pins')
+
+
+def prepare(contract, request):
+    validate_identity(contract, request)
+    require(re.fullmatch(r'[0-9a-f]{64}', request.get('receipt_sha256', '')), 'Missing immutable receipt: receipt_sha256')
+    role = contract['delivery_role_arn']
     return {'schema': 1, 'mode': 'review-only', 'deployment_authorized': False,
             'candidate': request, 'delivery_role_arn': role,
             'required_live_gates': ['exact GitHub checks and branch head', 'cb1 release ACK',

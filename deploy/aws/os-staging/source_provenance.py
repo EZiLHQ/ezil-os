@@ -56,6 +56,10 @@ def digest(path):
 
 def artifact(snapshot_dir, directory, tag, environment):
     receipt = json.loads((snapshot_dir / 'source.json').read_text())
+    if 'NEXT_PUBLIC_SUPABASE_URL' in os.environ or 'NEXT_PUBLIC_SUPABASE_ANON_KEY' in os.environ:
+        from public_config import identity
+        receipt['public_config'] = identity(os.environ.get('NEXT_PUBLIC_SUPABASE_URL'),
+                                            os.environ.get('NEXT_PUBLIC_SUPABASE_ANON_KEY'))
     receipt.update(environment=environment, component='aws-app',
                    image=f'ezil-os-{environment}:{tag}',
                    artifacts={f'{tag}.{suffix}': digest(directory / f'{tag}.{suffix}')
