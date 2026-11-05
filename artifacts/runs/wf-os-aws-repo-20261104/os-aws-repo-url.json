@@ -1,0 +1,9 @@
+{
+  "taskId": "os-aws-repo-url",
+  "runId": "wf-os-aws-repo-20261104",
+  "status": "blocked",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "LANDED on feat/os-aws-repo-url-20261104 (head 97f90fe1): merge 96ae45d3 (u2 lineage, 21 files, 0 conflicts); app b5980932 (+test fix 97f90fe1) = AWS ?repo= public open, git-free only. TESTS RUN: app vitest 98 pass/0 fail (route 5, route-repository 24, route-project 40 [project stays AWS-refused], compute repo-open 29); app `tsc --noEmit` 18 TS2307 = base, 0 new, 0 in my files. worker bun test 584 pass/0 fail (aws-repo-open+repo-open-u2+repo-open 321; public-github+git-qa+route+index 263); worker tsc clean. contract check.mjs 1913 pass exit 0. MUTATIONS: M1 drop `&& request.git!==null` -> 1 RED restored 29 green; M2 re-add pre-mint isAws -> 6 RED restored 24 green. INHERITED RED (NOT mine): host test_repo_open_op 100 pass/2 fail/3 error, files byte-identical to u2 head 24201d8a (git diff empty) -> contractVersion 1.0.3 vs vectors 1.0.5 staleness + test_body_mutations (1.0.5 vectors incl. project the host doesn't implement) + TimingChain flake; hand-off to u2/lead. NOT BUILT (scope, not coupling): worker dispatch/relay public, host public+gate, kernel public class, contract public bump, consuming-repo vector re-copy. SPEC in report.",
+  "startedAt": "2026-11-04T20:40:00Z",
+  "updatedAt": "2026-11-04T21:25:00Z"
+}

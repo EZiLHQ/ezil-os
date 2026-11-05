@@ -1,0 +1,266 @@
+--- a/infra/host-agent/lib/ezil_host/repo_open.py
++++ b/infra/host-agent/lib/ezil_host/repo_open.py
+@@ -17,7 +17,7 @@
+      (64 lowercase hex, 32 random bytes chosen by the Worker); nothing else:
+      ``{jobId, v:1, op:'open'|'refresh', repositoryId, handle, name, gitHost, defaultBranch,
+      path:string|null, grant:{username:'ezil', token, expiresAt, scope}}``, plus (contract 1.0.3)
+-     the one optional key ``class: 'personal'|'assessment'`` (absent = personal). gitHost must be
++     the one optional key ``class: 'personal'|'assessment'|'project'`` (absent = personal). gitHost must be
+      REPO_OPEN_CLASS_GIT_HOSTS[class], a closed table (personal -> git-preview.ezil.work,
+      assessment -> git-qa.ezil.work), refused in both directions; ``class`` reaches the kernel
+      request only when the relay carried it. A class assessment relay carries ``path: null``
+@@ -265,6 +265,14 @@
+ # REPO_OPEN_CLASS_GIT_HOSTS = the kernel's CLASS_GIT_HOSTS). A relay without `class` is personal.
+ REPO_OPEN_CLASS_GIT_HOSTS = {"personal": "git-preview.ezil.work", "assessment": "git-qa.ezil.work"}
+ REPO_OPEN_CLASS_DEFAULT = "personal"
++# Class project (contract 1.0.4, vectors constants REPO_OPEN_PROJECT_GIT_HOSTS, workerRequest.projectRule and
++# projectGrantMaxMs): an ordinary Builder project on the Creator's own computer. The Worker route binds its
++# deployment's one host; this host, like the kernel, cannot know the deployment and accepts either. Its grant is
++# OS-scoped, at most five minutes plus skew. It uses the assessment wrapper W and answers the 7-key open shape.
++REPO_OPEN_PROJECT_GIT_HOSTS = ("github.ezil.work", "git-qa.ezil.work")
++REPO_OPEN_PROJECT_GRANT_MAX_MS = 330_000
++REPO_OPEN_CLASSES = (*REPO_OPEN_CLASS_GIT_HOSTS, "project")
++WRAPPED_CLASSES = ("assessment", "project")
+ REPO_OPEN_GIT_HOSTS = (REPO_OPEN_CLASS_GIT_HOSTS[REPO_OPEN_CLASS_DEFAULT],)   # vectors workerRequest.gitHostAllowList
+ # Class assessment layout (contract 1.0.3 E1-6, vectors constants ASSESSMENT_DIR_TEMPLATE / ASSESSMENT_CLONE_DIR_NAME /
+ # ASSESSMENT_REMOTE_TEMPLATE): the answer's folder is the wrapper W = /workspace/projects/<repositoryId> (the editor
+@@ -432,7 +440,7 @@
+     if "class" not in raw:
+         return REPO_OPEN_CLASS_DEFAULT
+     cls = raw["class"]
+-    return cls if isinstance(cls, str) and cls in REPO_OPEN_CLASS_GIT_HOSTS else None
++    return cls if isinstance(cls, str) and cls in REPO_OPEN_CLASSES else None
+ 
+ 
+ def parse_relay(raw, now_ms):
+@@ -455,11 +463,13 @@
+     ok = (type(b.get("v")) is int and b["v"] == 1 and b.get("op") in ("open", "refresh")
+           and _str(b.get("repositoryId")) and bool(UUID_RE.match(b["repositoryId"]))
+           and _str(b.get("handle")) and bool(HANDLE_RE.match(b["handle"])) and valid_name(b.get("name"))
+-          and b.get("gitHost") == REPO_OPEN_CLASS_GIT_HOSTS[cls] and valid_branch(b.get("defaultBranch"))
+-          and (path is None or (cls != "assessment" and b["op"] == "open" and _str(path) and path_problem(path) is None))
++          and (b.get("gitHost") in REPO_OPEN_PROJECT_GIT_HOSTS if cls == "project"
++               else b.get("gitHost") == REPO_OPEN_CLASS_GIT_HOSTS[cls]) and valid_branch(b.get("defaultBranch"))
++          and (path is None or (cls == REPO_OPEN_CLASS_DEFAULT and b["op"] == "open" and _str(path) and path_problem(path) is None))
+           and g.get("username") == "ezil" and _str(g.get("token")) and bool(GRANT_RE.match(g["token"]))
+           and g.get("scope") in ("write", "read")
+-          and expires is not None and now_ms < expires <= now_ms + WORKER_ACCEPT_EXPIRY_MAX_MS)
++          and expires is not None and now_ms < expires <= now_ms + (
++              REPO_OPEN_PROJECT_GRANT_MAX_MS if cls == "project" else WORKER_ACCEPT_EXPIRY_MAX_MS))
+     if not ok:
+         raise ValueError("repo_open_invalid")
+     body = {k: b[k] for k in BODY_KEYS if k != "grant"}
+@@ -533,7 +543,9 @@
+     E1-6: `folder` is the wrapper W the caller rebuilt (assessment_folder), openFolder is exactly W,
+     pathNotFound is False, and `remote` is exactly the caller's expected URL (assessment_remote);
+     r56: the answer's branch is exactly `branch`, the defaultBranch of the caller's own body (the
+-    kernel checks out exactly defaultBranch for class assessment). Personal ignores `branch`."""
++    kernel checks out exactly defaultBranch for class assessment). Personal ignores `branch`. Class project
++    (contract 1.0.4, kernel.project): exactly OPEN_KEYS (`existing` included: the reopen), openFolder exactly the
++    wrapper W, pathNotFound False; the branch exactly `branch` for a fresh placement, any valid one for `existing`."""
+     if value is None:
+         return refusal("workspace_failed")
+     if value.get("ok") is False:
+@@ -555,6 +567,12 @@
+         # r56: exactly the branch this job's own body asked for.
+         if not _str(branch) or value["branch"] != branch:
+             return refusal("workspace_failed")
++    if cls == "project":
++        # 1.0.4 (kernel.project.branchRule): the 7-key shape at the wrapper W itself, no path; a fresh placement
++        # exactly defaultBranch, an `existing` reopen the folder's current branch (any valid one, checked below).
++        if (value["openFolder"] != folder or value["pathNotFound"] is not False or not _str(branch)
++                or (value["state"] != "existing" and value["branch"] != branch)):
++            return refusal("workspace_failed")
+     of = value.get("openFolder")
+     if (value["ok"] is not True or value["state"] not in OPEN_STATES
+             or value["folder"] != folder or not _str(of) or not (of == folder or of.startswith(folder + "/"))
+@@ -1049,9 +1067,9 @@
+         self.cleanup = None            # the CleanupPending that ended the flight, if any
+         # The folder the answer must name, rebuilt from this job's own validated body: the repository folder
+         # (personal), or the wrapper W plus the expected remote (assessment, E1-6).
+-        if body.get("class") == "assessment":
++        if body.get("class") in WRAPPED_CLASSES:
+             self.folder = assessment_folder(body["repositoryId"])
+-            self.remote = assessment_remote(body["handle"], body["name"])
++            self.remote = assessment_remote(body["handle"], body["name"]) if body["class"] == "assessment" else None
+         else:
+             self.folder = f"{WORKSPACE_ROOT}/repos/{body['handle']}/{body['name']}"
+             self.remote = None
+--- a/infra/host-agent/test/test_repo_open_op.py
++++ b/infra/host-agent/test/test_repo_open_op.py
+@@ -70,6 +70,14 @@
+ OTHER_REPO_ID = V["fixtures"]["otherRepositoryId"]
+ ASSESS_OK = {**OPEN_OK, "folder": ASSESS_W, "openFolder": ASSESS_W, "head": "0123456789abcdef" * 2 + "01234567", "clean": True,
+              "remote": ASSESS_REMOTE}
++# Contract 1.0.4 class project: the wrapper W, the 7-key answer, an OS-scoped grant of at most 330 s.
++PROJECT = {"class": "project", "gitHost": QA_HOST}
++PROJECT_OK = {**OPEN_OK, "folder": ASSESS_W, "openFolder": ASSESS_W, "branch": ASSESS_BRANCH}
++
++
++def project(seconds=300, **over):
++    """Relay overrides of a class project open with a grant `seconds` long."""
++    return {**PROJECT, "grant": {"expiresAt": iso(seconds)}, **over}
+ 
+ 
+ def iso(seconds):
+@@ -111,7 +119,7 @@
+ class Vectors(unittest.TestCase):
+     def test_host_constants_equal_the_vectors(self):
+         c, t = V["constants"], V["timeouts"]
+-        self.assertEqual(V["contractVersion"], "1.0.3")
++        self.assertEqual(V["contractVersion"], "1.0.5")
+         self.assertEqual(list(ro.RUN_DIRS), c["RUN_DIRS"])
+         self.assertEqual(ro.KERNEL_PATH, c["KERNEL_PATH"])
+         self.assertEqual(ro.HELPER_MODULE_PATH, c["HELPER_MODULE_PATH"])
+@@ -123,7 +131,11 @@
+         self.assertEqual(ro.WORKER_REQUEST_MAX_BYTES, c["BODY_LIMITS_BYTES"]["workerRequest"])
+         self.assertEqual(list(ro.REPO_OPEN_GIT_HOSTS), V["workerRequest"]["gitHostAllowList"])
+         self.assertEqual(ro.REPO_OPEN_CLASS_GIT_HOSTS, c["REPO_OPEN_CLASS_GIT_HOSTS"])
+-        self.assertEqual(list(ro.REPO_OPEN_CLASS_GIT_HOSTS), c["REPO_OPEN_CLASSES"])
++        self.assertEqual(list(ro.REPO_OPEN_CLASSES), c["REPO_OPEN_CLASSES"])
++        self.assertEqual(list(ro.REPO_OPEN_PROJECT_GIT_HOSTS), c["REPO_OPEN_PROJECT_GIT_HOSTS"])
++        self.assertEqual(ro.REPO_OPEN_PROJECT_GRANT_MAX_MS, V["workerRequest"]["projectGrantMaxMs"])
++        # 1.0.4: the single-host table covers every class but project, whose host the Worker route binds.
++        self.assertEqual(list(ro.REPO_OPEN_CLASS_GIT_HOSTS), [k for k in c["REPO_OPEN_CLASSES"] if k != "project"])
+         self.assertEqual(ro.REPO_OPEN_CLASS_DEFAULT, c["REPO_OPEN_CLASS_DEFAULT"])
+         self.assertEqual(list(ro.OPTIONAL_BODY_KEYS), V["workerRequest"]["optionalKeys"])
+         self.assertEqual(list(ro.OPTIONAL_BODY_KEYS), V["kernel"]["optionalRequestKeys"])
+@@ -204,6 +216,10 @@
+                 self.assertEqual(parsed["class"], raw["class"])
+         for mutation in V["workerRequest"]["invalidMutations"]:
+             raw = {"jobId": JOB, **apply_mutation(base, mutation)}
++            if mutation.get("layer") == "worker":
++                # 1.0.4: a route-host refusal only the Worker can make; the host accepts either project host.
++                ro.parse_relay(raw, int(time.time() * 1000))
++                continue
+             with self.assertRaises(ValueError, msg=mutation["why"]):
+                 ro.parse_relay(raw, int(time.time() * 1000))
+ 
+@@ -250,6 +266,21 @@
+             with self.assertRaises(ValueError, msg=repr(bad)):
+                 ro.parse_relay(relayed(gitHost=QA_HOST, **{"class": bad}), now)
+ 
++    def test_class_project_hosts_path_and_grant_window(self):
++        """Contract 1.0.4 (workerRequest.projectRule): either project host, path null, a grant of at most 330 s;
++        the body keeps class project; a project body is never personal or assessment and vice versa."""
++        now = int(time.time() * 1000)
++        for host in ro.REPO_OPEN_PROJECT_GIT_HOSTS:
++            _, parsed = ro.parse_relay(relayed(**project(gitHost=host)), now)
++            self.assertEqual((parsed["class"], parsed["gitHost"]), ("project", host))
++            ro.parse_relay(relayed(**project(seconds=320, gitHost=host, op="refresh")), now)
++        for bad in (project(gitHost="git-preview.ezil.work"), project(gitHost="git.ezil.work"), project(path="src"),
++                    project(path=""), project(seconds=331), project(seconds=900), project(seconds=3600),
++                    project(**{"class": "Project"}), {"gitHost": "github.ezil.work"},
++                    {"class": "assessment", "gitHost": "github.ezil.work"}):
++            with self.assertRaises(ValueError, msg=repr(bad)[:80]):
++                ro.parse_relay(relayed(**bad), now)
++
+     def test_the_kernel_asset_carries_the_same_class_table(self):
+         kernel = ro.load_assets()["ezil-repo-open.mjs"].decode()
+         t = V["constants"]["REPO_OPEN_CLASS_GIT_HOSTS"]
+@@ -1170,6 +1201,56 @@
+             self.wait_idle()
+ 
+ 
++class ProjectAnswer(unittest.TestCase):
++    def test_a_project_open_answer_is_the_7_key_shape_at_the_wrapper_with_exactly_defaultBranch(self):
++        failed = ro.refusal("workspace_failed")
++        ok = lambda v, folder=ASSESS_W, branch=ASSESS_BRANCH: ro.open_answer(dict(v), folder, "project", None, branch)
++        for good in (PROJECT_OK, {**PROJECT_OK, "state": "existing"}, {**PROJECT_OK, "state": "initialized_empty", "empty": True},
++                     {**PROJECT_OK, "state": "existing", "branch": "feature"}):
++            self.assertEqual(ok(good), {"status": 200, "body": good})
++        clone = ASSESS_W + "/repository"
++        for bad in ({**PROJECT_OK, "folder": clone, "openFolder": clone}, {**PROJECT_OK, "openFolder": clone},
++                    {**PROJECT_OK, "openFolder": ASSESS_W + "/src"}, {**PROJECT_OK, "pathNotFound": True},
++                    {**PROJECT_OK, "folder": FOLDER, "openFolder": FOLDER}, {**PROJECT_OK, "branch": "trunk"},
++                    ASSESS_OK, {**PROJECT_OK, "extra": 1}, {**PROJECT_OK, "state": "adopted"},
++                    {**PROJECT_OK, "state": "initialized_empty", "empty": True, "branch": "trunk"},
++                    {**PROJECT_OK, "state": "existing", "branch": "x..y"}):
++            self.assertEqual(ok(bad), failed, bad)
++        self.assertEqual(ok(PROJECT_OK, ro.assessment_folder(OTHER_REPO_ID)), failed)
++        self.assertEqual(ok(PROJECT_OK, branch=None), failed)
++        self.assertEqual(ok(PROJECT_OK, branch="trunk"), failed)
++
++
++class ProjectJob(JobBase):
++    """Contract 1.0.4: a class project relay forwards class project to the kernel, answers at W, and a commit
++    timeout stays retryable (workspace_busy: the reopen is idempotent)."""
++
++    def requests(self, fake):
++        return [json.loads(d) for a, d in fake.calls if a[:3] == ["/bin/sh", "-c", ro.WRITE_PROGRAM]
++                and a[4].startswith("/run/ezil/requests/")]
++
++    def test_a_project_open_forwards_class_and_answers_the_wrapper(self):
++        fake = FakeDesktop({"commit": line(PROJECT_OK)})
++        result = self.run_job(fake, **project())
++        self.assertEqual(result, {"status": 200, "body": PROJECT_OK})
++        self.assertEqual(list(result["body"]), V["kernel"]["project"]["resultOpenKeys"])
++        reqs = self.requests(fake)
++        self.assertEqual([r["phase"] for r in reqs], ["prepare", "commit", "release"])
++        for req in reqs:
++            self.assertEqual((req["class"], req["gitHost"], req["path"]), ("project", QA_HOST, None))
++        self.assert_no_secret_anywhere(fake, result)
++
++    def test_a_project_answer_outside_the_wrapper_or_branch_is_failed_and_existing_is_accepted(self):
++        for i, out in enumerate(({**PROJECT_OK, "folder": FOLDER, "openFolder": FOLDER}, ASSESS_OK, {**PROJECT_OK, "branch": "trunk"})):
++            self.assertEqual(self.run_job(FakeDesktop({"commit": line(out)}), f"{i + 1:x}" * 64, **project()), ro.refusal("workspace_failed"), out)
++        existing = {**PROJECT_OK, "state": "existing"}
++        self.assertEqual(self.run_job(FakeDesktop({"commit": line(existing)}), "9" * 64, **project()), {"status": 200, "body": existing})
++
++    def test_the_project_commit_timeout_is_busy(self):
++        self.assertEqual(ro.timeout_codes({"class": "project"}), ro.UNCONFIRMED_ERROR_BY_STEP)
++        self.assertEqual(ro.timeout_codes({"class": "project"})["commit"], "workspace_busy")
++
++
+ class AssessmentJob(JobBase):
+     """Contract 1.0.3: the relay's class reaches the kernel request only when it was sent, the
+     grant names the class's host, and an assessment commit answer is validated as okOpenAssessment."""
+@@ -1906,6 +1987,48 @@
+         self.assertEqual(re.sub(r"/run/ezil/[a-z/]+:|/workspace/\.ezil-staging:|acme__site\.json", "", left.stdout).strip(), "")
+         self.no_token_in_container_except_grant()
+ 
++    def test_project_through_the_real_kernel_reopens_its_own_wrapper_and_adopts_nothing_else(self):
++        """Contract 1.0.4 through the host's exact argv sequence: a W whose clone is bound to this repository
++        AND carries the project marker reopens as existing (no network: this container has none); the same W
++        without the marker, or with it as a symlink, is folder_conflict and untouched; offline, a fresh project
++        reaches for its host (network_unavailable, nothing left)."""
++        b = body()
++        wrapper = ro.assessment_folder(b["repositoryId"])
++        self.addCleanup(self.sh, f"rm -rf {wrapper} /tmp/m /run/ezil/git/grants/acme__proj.json")
++        binding = json.dumps({"v": 1, "repositoryId": b["repositoryId"], "handle": "acme", "name": "proj",
++                              "gitHost": QA_HOST})
++        setup = self.sh(f"set -e; rm -rf {wrapper}; git init -q -b main {wrapper}/repository; cd {wrapper}/repository; "
++                        "git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m mine; "
++                        f"printf '%s\\n' '{binding}' > .git/ezil-repo.json; printf 'project\\n' > .git/ezil-repo-class; "
++                        "echo wip > wip.txt")
++        self.assertEqual(setup.returncode, 0, setup.stderr)
++        head = self.sh(f"git -C {wrapper}/repository rev-parse HEAD").stdout
++        answer = {"ok": True, "state": "existing", "folder": wrapper, "openFolder": wrapper, "pathNotFound": False,
++                  "branch": "main", "empty": False}
++        self.assertEqual(self.run_real("b1" * 32, name="proj", **project()), {"status": 200, "body": answer})
++        self.assertEqual([a[2] for a in self.argvs if a[:2] == ["node", ro.KERNEL_PATH]], ["prepare", "commit", "release"])
++        self.assertEqual(self.sh(f"git -C {wrapper}/repository rev-parse HEAD").stdout, head)
++        self.assertEqual(self.sh(f"cat {wrapper}/repository/wip.txt").stdout, "wip\n")
++        grant = self.sh("cat /run/ezil/git/grants/acme__proj.json")
++        self.assertEqual(json.loads(grant.stdout)["host"], QA_HOST)
++        # the Creator's own branch: the reopen names it and the host accepts it (kernel.project.branchRule)
++        self.assertEqual(self.sh(f"git -C {wrapper}/repository switch -q -c feature").returncode, 0)
++        self.assertEqual(self.run_real("b5" * 32, name="proj", **project()), {"status": 200, "body": {**answer, "branch": "feature"}})
++        # unmarked, or marked through a symlink: folder_conflict, the tree untouched
++        for job, tamper in (("b2" * 32, "rm .git/ezil-repo-class"),
++                            ("b3" * 32, "printf 'project\\n' > /tmp/m; ln -s /tmp/m .git/ezil-repo-class")):
++            self.assertEqual(self.sh(f"set -e; cd {wrapper}/repository; {tamper}").returncode, 0, tamper)
++            before = self.sh(f"cd {wrapper} && find . -printf '%p %s %T@\\n' | sort").stdout
++            self.assertEqual(self.run_real(job, name="proj", **project()), ro.refusal("folder_conflict"), tamper)
++            self.assertEqual(self.sh(f"cd {wrapper} && find . -printf '%p %s %T@\\n' | sort").stdout, before, tamper)
++        self.assertEqual(self.sh(f"rm -rf {wrapper} /tmp/m").returncode, 0)
++        # a fresh project offline: network_unavailable, no wrapper and no grant left
++        self.assertEqual(self.run_real("b4" * 32, name="fresh", **project()), ro.refusal("network_unavailable"))
++        left = self.sh(f"test -e {wrapper} && echo WRAPPER; ls /run/ezil/git/grants")
++        self.assertNotIn("WRAPPER", left.stdout)
++        self.assertNotIn("acme__fresh", left.stdout)
++        self.no_token_in_container_except_grant(allowed=("/run/ezil/git/grants/acme__proj.json",))
++
+     def test_assessment_through_the_real_kernel_refuses_an_existing_folder_and_needs_git_qa(self):
+         """Contract 1.0.3 (E1-6 layout) through the host's exact argv sequence: an assessment never
+         adopts a wrapper /workspace/projects/<repositoryId> that is already there (even one holding a

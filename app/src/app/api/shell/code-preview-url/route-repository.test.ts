@@ -136,13 +136,14 @@ const CANONICAL = 'https://github.com/ezilhq/ezil-os.git';
 const openUrl = (url: unknown = GH) => post({ computerId: COMPUTER, intent: 'open', repository: { url } });
 
 describe('opening a repository from its address in Code', () => {
-    it('ownership, provider, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
+    it('ownership, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
         const { repositoryIdFor } = await import('@/server/works/repo-url');
         const id = repositoryIdFor(CANONICAL);
         s.worker = () => Response.json({ folder: `/workspace/projects/${id}`, head: 'b'.repeat(40) });
         const response = await openUrl();
         expect(response.status).toBe(200);
-        expect(s.order).toEqual(['computer.get', 'target', 'github', 'codePreviewUrl', 'target', 'worker']);
+        // The provider is no longer a gate: controls are read once, after the mint, to carry the open to the Worker.
+        expect(s.order).toEqual(['computer.get', 'github', 'codePreviewUrl', 'target', 'worker']);
         const body = await response.clone().json();
         expect(body.repository).toEqual({ name: 'EZiLHQ/ezil-os', id });
         expect(new URL(body.url).searchParams.getAll('folder')).toEqual([`/workspace/projects/${id}`]);
@@ -218,13 +219,21 @@ describe('opening a repository from its address in Code', () => {
         expect(s.requests).toEqual([]);
     });
 
-    it('an AWS computer is repo_open_unsupported_provider (409) before GitHub or the mint (contract §8: no host op yet)', async () => {
+    it('an AWS computer opens a public repository through the Worker relay: no provider gate; asked anonymously with the aws-ec2 claims', async () => {
+        const { repositoryIdFor } = await import('@/server/works/repo-url');
+        const id = repositoryIdFor(CANONICAL);
         s.aws = [true];
+        s.worker = () => Response.json({ folder: `/workspace/projects/${id}`, head: 'b'.repeat(40) });
         const response = await openUrl();
-        expect(response.status).toBe(409);
-        expect((await response.json()).error.code).toBe('repo_open_unsupported_provider');
-        expect(s.order).toEqual(['computer.get', 'target']);
-        expect(s.requests).toEqual([]);
+        expect(response.status).toBe(200);
+        // No provider refusal before GitHub or the mint; the post-mint controls carry the aws-ec2 identity to the Worker,
+        // which dispatches the anonymous public open to the host relay (universe-repo-open-v1 §13, class `public`).
+        expect(s.order).toEqual(['computer.get', 'github', 'codePreviewUrl', 'target', 'worker']);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body))).toStrictEqual({ repositoryId: id, canonicalURL: CANONICAL, ref: 'refs/heads/main', timeoutMs: 130_000 });
+        const claims = JSON.parse(Buffer.from((worker.init.headers as Record<string, string>)['x-ezil-auth'].split('.')[1]!, 'base64url').toString());
+        expect(claims.provider).toBe('aws-ec2');
+        await expectNoSecrets(response);
     });
 
     it.each([[404], [401], [403]])("GitHub %i: \"This repository doesn't exist.\" (404) and the computer is never woken for it", async status => {
@@ -233,7 +242,7 @@ describe('opening a repository from its address in Code', () => {
         expect(response.status).toBe(404);
         const body = await response.json();
         expect(body.error).toMatchObject({ code: 'repo_not_found', message: "This repository doesn't exist." });
-        expect(s.order).toEqual(['computer.get', 'target', 'github']);
+        expect(s.order).toEqual(['computer.get', 'github']);
     });
 
     it.each([
@@ -266,10 +275,14 @@ describe('opening a repository from its address in Code', () => {
         expect(JSON.stringify(await response.json())).not.toContain('folder=');
     });
 
-    it('a computer that moved to AWS between the mint and the open is refused, never signed for as Cloudflare', async () => {
-        s.aws = [false, true];
+    it('an AWS host/AMI without the repo-open op fails closed: the Worker answers repo_open_unsupported_provider (409), surfaced unchanged', async () => {
+        s.aws = [true];
+        s.worker = () => Response.json({ ok: false, error: 'repo_open_unsupported_provider' }, { status: 409 });
         const response = await openUrl();
         expect(response.status).toBe(409);
-        expect(s.order).toEqual(['computer.get', 'target', 'github', 'codePreviewUrl', 'target']);
+        expect((await response.json()).error.code).toBe('repo_open_unsupported_provider');
+        // The computer is woken and the Worker asked; the actionable refusal (a 1.0.30 AMI edge 404 → workspace_unsupported
+        // → repo_open_unsupported_provider) comes back unchanged, never a folder at the computer's root.
+        expect(s.order).toEqual(['computer.get', 'github', 'codePreviewUrl', 'target', 'worker']);
     });
 });
