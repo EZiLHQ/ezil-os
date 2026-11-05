@@ -856,7 +856,9 @@ try {
         summary = summaryV3(tier); await open();
         contains('[data-role="plan-card"]', summary.plan.name);
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
-        contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === 3600 ? 'Sessions up to 1 hour' : 'Sessions up to 6 hours');
+        // Founder 2026-11-05: Free shows no session length as a number; paid keeps its six hours.
+        if ( tier === 'free' ) assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions up to|\bhours?\b/);
+        else contains('[data-role="your-computer"]', 'Sessions up to 6 hours');
         contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Change configuration ›');
         if ( tier !== 'free' ) {
             contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100} / month`);
@@ -1155,7 +1157,8 @@ try {
         // Round 6 (R1-11): one provider string; the limit is the session line, and nothing to configure under the hold.
         contains('[data-role="your-computer"]', 'AWS (India)');
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /with Free limits|Cloudflare/);
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        // Founder 2026-11-05: the hold says "Free limits" (files-held above), never the Free session length as a number.
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions up to|\bhours?\b/);
         contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Computer details ›');
         contains('[data-role="plan-actions"] .ezil-settings-btn-primary', 'Upgrade to Standard');
         // Round 6: the founder's Billing on 10-30 (Free, held std-2, 763 AI credits of which 663 are from the cancelled Premium period).
@@ -1195,7 +1198,7 @@ try {
         // A held 2 vCPU placement keeps the hold copy.
         summary.computer.awsSize = { size: 'std-2', vcpu: 2, memoryGiB: 8 }; await refresh();
         contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions up to/);
         delete summary.computer.awsSize;
         getUsage = () => failure('unavailable');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
@@ -1216,7 +1219,7 @@ try {
         contains('[data-role="meter-time"]', 'About 7 of 8 hours left this month');
         assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /left at 2 vCPU|Same as/);
         contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions up to/);
         contains('[data-role="billing-usage"]', 'Resets Dec 1, 2026');
         contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
         // Earlier credits on a paid plan (this plan's tail or a cancelled plan's): one label true for both.

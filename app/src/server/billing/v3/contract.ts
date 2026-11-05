@@ -124,7 +124,8 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
         highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
-        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
+        // Founder 2026-11-05: no Free session length as a number in sales copy (`sessionMaxSeconds` above still applies).
+        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Your files saved between sessions'],
         storageGiB: null,
     },
     standard_monthly_v3: {

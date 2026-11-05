@@ -150,6 +150,9 @@ check('Free: the Cloudflare configuration is current, AWS ones locked; no invent
     const html = scan(computerHtml(model, null, []));
     assert.equal(model.cards.find(c => c.size === 'std-2').plan, 'Standard');
     assert.doesNotMatch(text(html), /\d+ GB disk/);
+    // Founder 2026-11-05: the Free card names its provider, never the Free session's length as a number.
+    assert.doesNotMatch(text(html), /\b(1|one)[- ]hours?\b|sessions up to 1\b|Free sessions last/i);
+    assert.match(text(html), /Cloudflare/);
 });
 
 check('a capacity refusal marks that card unavailable with the plan copy', () => {
@@ -370,7 +373,9 @@ check('Round 6 held std-2 Running: current with a Free limits pill, 4/8 vCPU loc
     assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 2);
     assert.doesNotMatch(html, /data-size="free-cf"|data-action="switch-config"|Included in Standard/);
     assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours\./);
-    assert.match(html, /data-role="hold-time">Free sessions last 1 hour · About 5 of 8 hours left this month<\/p>/);
+    // Founder 2026-11-05: the hold's month in numbers, never the Free session's length.
+    assert.match(html, /data-role="hold-time">About 5 of 8 hours left this month<\/p>/);
+    assert.doesNotMatch(html, /Free sessions last|\b(1|one)[- ]hours?\b|sessions up to 1\b/);
     assert.match(text(html), new RegExp(`This session ends at ${clock('2026-10-30T06:42:00Z')} ?\\.`));
     assert.match(html, /<time datetime="2026-10-30T06:42:00Z">/);
     assert.doesNotMatch(text(html), /Pick a size|More sizes come with|restore full use/);
@@ -386,13 +391,14 @@ check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented h
     assert.doesNotMatch(stoppedHtml, /data-role="session-ends"/);
     assert.match(stoppedHtml, /About 5 of 8 hours left this month/);
     const unread = scan(computerHtml(computerModel({ computer: me, data: heldData(), prog: running(), usage: null, now: HELD_NOW }), running(), []));
-    assert.match(unread, /data-role="hold-time">Free sessions last 1 hour<\/p>/);
+    // No usage read: no invented hours and no session length, so no hold line at all.
+    assert.doesNotMatch(unread, /data-role="hold-time"|Free sessions last/);
     const late = computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: Date.parse('2026-10-30T06:42:30Z') });
     assert.equal(late.sessionEnds, null);
     assert.equal(computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: HELD_NOW, stopping: true }).sessionEnds, null);
     const under = computerModel({ computer: me, data: heldData(), prog: running(), now: HELD_NOW,
         usage: { ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } } });
-    assert.equal(under.holdLine, 'Free sessions last 1 hour · Less than an hour left this month');
+    assert.equal(under.holdLine, 'Less than an hour left this month');
 });
 
 check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
@@ -502,7 +508,7 @@ check('Round 4: after grace the plan block may still describe the past_due paid 
         'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
     const dunning = computerModel({ computer: me, data: lapsedRunning, prog: running(), usage: heldUsage, now: HELD_NOW });
     assert.deepEqual(states(dunning), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
-    assert.equal(dunning.holdLine, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+    assert.equal(dunning.holdLine, 'About 5 of 8 hours left this month');
     assert.equal(dunning.sessionEnds, '2026-10-30T06:42:00Z');
     const dunningHtml = scan(computerHtml(dunning, running(), []));
     assert.match(dunningHtml, /data-role="session-ends"/);
@@ -990,7 +996,7 @@ if ( haveBundle ) {
         assert.ok(card('std-2')?.querySelector('[data-role="config-free-limits"]'));
         assert.equal(card('cmp-4')?.dataset.state, 'locked');
         assert.equal(pane()?.querySelector('[data-role="computer-provider"]')?.textContent, 'AWS (India)');
-        assert.equal(pane()?.querySelector('[data-role="hold-time"]')?.textContent, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+        assert.equal(pane()?.querySelector('[data-role="hold-time"]')?.textContent, 'About 5 of 8 hours left this month');
         const read = usageReads().at(-1);
         assert.ok(read, 'billing.usage was read');
         assert.match(decodeURIComponent(read.url), /"computerId":"c-1"/);

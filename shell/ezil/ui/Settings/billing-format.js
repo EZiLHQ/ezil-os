@@ -52,7 +52,7 @@ const ERRORS = {
     stripe_unavailable: 'Payments are unavailable right now. Try again in a few minutes.',
     // Standard trial (billing.quoteTrial / createCheckout({ trial })).
     trial_unavailable: "The free month isn't available for this account.",
-    trial_quote_stale: "Your free month's end date changed. Check the new date before you continue.",
+    trial_quote_stale: "Your free month's end date changed. Check the new date before you start.",
     trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
 };
 

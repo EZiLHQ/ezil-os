@@ -3,7 +3,7 @@ import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // standard-trial-01b28d18-20261105-v1) on the shell's surfaces, from the real modules bundled from source:
 //   - the Billing tab in the server's states (an eligible offer, trialing, ending, payment pending, payment failed)
 //     and ineligible; the first charge is a date, and the renewal preview an hour later is never a second charge;
-//   - the checkout sheet's trial mode: quote → the exact end in the viewer's zone → Continue echoes that end;
+//   - the checkout sheet's trial mode: one activation quotes, shows the exact end above the form, and checkout echoes it;
 //     month-end and leap-day quotes; a stale quote re-quoted; refusals never fall through to a paid checkout;
 //   - the trial variants of the cancel sheet, the plan picker, the session-end sheet and the top-up recovery choice;
 //   - Usage: no new meter, the authoritative balance with plan-labelled credits.
@@ -246,9 +246,12 @@ test('payment_pending: "Your free month has ended. We\'re collecting your first 
         assert.equal(el.querySelector('[data-action="upgrade"], [data-action="trial"], [data-action="checkout"], [data-action="resume"]'), null, standing);
         // Review U2: the server's cancel (actions.cancel) is offered; its sheet says what it does and does not do.
         assert.equal(clean(el.querySelector('.ezil-billing-v3-footer [data-action="cancel"]')), 'Cancel plan', standing);
-        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions.
-        assert.match(clean(el.querySelector('[data-role="your-computer"]')), standing === 'free'
-            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare Sessions up to 1 hour/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\) Sessions up to 1 hour on Free/, standing);
+        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions, and (founder
+        // 2026-11-05) never the Free session's length as a number.
+        const computer = clean(el.querySelector('[data-role="your-computer"]'));
+        assert.match(computer, standing === 'free'
+            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\)/, standing);
+        assert.doesNotMatch(computer, /Sessions up to|\bhours?\b/, standing);
     }
     // No cancel from the server: none offered.
     const noCancel = trialSummaryV3('payment_pending'); noCancel.actions.cancel = false;
@@ -281,19 +284,25 @@ for ( const [label, trialEndsAt, timeZone, expected, day] of [
     ['31 Jan 2027 → 28 Feb (UTC)', '2027-02-28T03:00:00Z', 'UTC', 'Sunday, February 28, 2027 at 3:00 AM Coordinated Universal Time', 'Feb 28, 2027'],
     // Leap year: 31 Jan 2028 → 29 Feb 2028; seconds are never shown and the minute shown is not after the instant.
     ['31 Jan 2028 → 29 Feb (Asia/Tokyo)', '2028-02-29T09:15:42Z', 'Asia/Tokyo', 'Tuesday, February 29, 2028 at 6:15 PM Japan Standard Time (Asia/Tokyo)', 'Feb 29, 2028'],
-] ) test(`confirmation at a month end: ${label} shows the exact quoted end, then Continue echoes it to checkout`, async h => {
+] ) test(`one activation at a month end: ${label} quotes, shows the exact end above the form and opens checkout with it`, async h => {
     h.replies['billing.quoteTrial'] = () => quote(trialEndsAt);
     h.replies['billing.createCheckout'] = () => embedded;
     h.openTrial({ timeZone });
     await settle();
-    assert.equal(h.count('billing.quoteTrial'), 1);
-    assert.equal(h.count('billing.createCheckout'), 0, 'no checkout before the person has seen the end');
-    assert.equal(h.mounted, 0);
-    const confirm = h.q('[data-role="trial-confirm"]');
-    assert.equal(clean(confirm.querySelector('[data-role="trial-ends"]')), `Your free month ends on ${expected}.`);
-    assert.equal(confirm.querySelector('time').getAttribute('datetime'), trialEndsAt);
-    assert.equal(clean(confirm.querySelector('[data-role="trial-charge"]')), 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.');
-    assert.equal(clean(confirm.querySelector('[data-role="trial-cancel"]')), 'Cancel any time before then in Settings → Billing and you pay nothing.');
+    // Like Premium: no second step. The quote comes first and checkout echoes exactly its end.
+    assert.deepEqual(h.calls.map(call => call.method), ['billing.quoteTrial', 'billing.createCheckout']);
+    assert.deepEqual(plain(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input)), [{ sku: 'standard_monthly_v3', trial: { trialEndsAt } }]);
+    assert.equal(h.mounted, 1, 'the same embedded checkout as Standard');
+    assert.equal(h.q('[data-action="trial-continue"], [data-role="trial-confirm"]'), null, 'no Continue step');
+    // The terms stay above the payment form (outside the summary, which folds on a phone, and outside the state line).
+    const terms = h.q('.ezil-upgrade-payment > [data-role="trial-terms"]');
+    assert.ok(terms && ! terms.hidden, 'the terms are shown above the form');
+    assert.ok(terms.compareDocumentPosition(h.q('#ezil-embedded-checkout')) & h.window.Node.DOCUMENT_POSITION_FOLLOWING, 'before the form');
+    assert.equal(clean(terms.querySelector('[data-role="trial-ends"]')), `$0 today. Your free month ends on ${expected}.`);
+    assert.equal(terms.querySelector('time').getAttribute('datetime'), trialEndsAt);
+    assert.equal(clean(terms.querySelector('[data-role="trial-charge"]')), 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.');
+    assert.equal(clean(terms.querySelector('[data-role="trial-cancel"]')), 'Cancel any time before then in Settings → Billing and you pay nothing.');
+    assert.equal(terms.querySelector('[data-role="trial-changed"]'), null);
     assert.equal(clean(h.q('#ezil-upgrade-title')), 'Start your free month');
     assert.match(clean(h.q('.ezil-upgrade-price')), /^\$0 today$/);
     assert.equal(clean(h.q('[data-role="trial-then"]')), `Then $20.00/month from ${day} · USD · before applicable tax`);
@@ -301,13 +310,83 @@ for ( const [label, trialEndsAt, timeZone, expected, day] of [
     assert.equal(clean(h.q('[data-role="trial-first-charge"]')), `$20.00 from ${day}, then every month until you cancel.`);
     assert.equal(clean(h.q('[data-role="trial-cancel-by"]')), `Cancel before ${day} in Settings → Billing and you pay nothing.`);
     assert.doesNotMatch(h.text(), paidWords);
-    h.click('[data-action="trial-continue"]');
-    await settle();
-    assert.deepEqual(plain(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input)), [{ sku: 'standard_monthly_v3', trial: { trialEndsAt } }]);
-    assert.equal(h.mounted, 1, 'the same embedded checkout as Standard');
 });
 
-test('trial_quote_stale: re-quote, show the NEW end with a notice, and only that end reaches checkout', async h => {
+test('one checkout on a double activation: a second open while the first is quoting is the same sheet', async h => {
+    let release;
+    h.replies['billing.quoteTrial'] = () => new Promise(resolve => { release = () => resolve(quote('2027-02-28T03:00:00Z')); });
+    h.replies['billing.createCheckout'] = () => embedded;
+    const first = h.openTrial({ timeZone: 'UTC' });
+    const second = h.openTrial({ timeZone: 'UTC' });
+    assert.equal(second, first, 'the open sheet is returned, not a second one');
+    await settle();
+    assert.match(clean(h.q('[data-role="checkout-state"]')), /^Checking your free month…$/, 'loading is said while the quote runs');
+    assert.equal(h.count('billing.createCheckout'), 0, 'no checkout before the quote');
+    release();
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 1);
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.qa('[data-role="upgrade-sheet"]').length, 1);
+});
+
+test('retry: a failed quote retries the quote and goes on to checkout; a failed checkout retries with the same quote', async h => {
+    let quotes = 0;
+    h.replies['billing.quoteTrial'] = () => quotes++ ? quote('2027-02-28T03:00:00Z') : { ok: false, message: 'Billing is unavailable right now.' };
+    let creates = 0;
+    h.replies['billing.createCheckout'] = () => creates++ ? embedded : { ok: false, message: 'Could not open billing. Try again.' };
+    h.openTrial({ timeZone: 'UTC' });
+    await settle();
+    assert.equal(h.count('billing.createCheckout'), 0, 'no checkout without a quote');
+    assert.ok(h.q('[data-role="trial-terms"]').hidden, 'no terms without a quote');
+    h.click('[data-action="retry"]');
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 2);
+    assert.equal(h.count('billing.createCheckout'), 1, 'one activation of Retry: quote, then checkout');
+    assert.equal(h.mounted, 0);
+    assert.ok(! h.q('[data-role="trial-terms"]').hidden, 'the quoted terms stay while checkout is retried');
+    h.click('[data-action="retry"]');
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 2, 'the same quote is reused');
+    assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input.trial.trialEndsAt), ['2027-02-28T03:00:00Z', '2027-02-28T03:00:00Z']);
+    assert.equal(h.mounted, 1);
+});
+
+// Review follow-up: the quote runs on its own when the sheet opens, so a sheet closed while it waits can be answered late.
+for ( const order of ['before', 'after'] ) {
+    test(`closed while quoting, then reopened: the old quote's late reply (${order} the new one) opens no Checkout and never changes the new terms`, async h => {
+        const oldEnd = '2027-02-28T03:00:00Z', newEnd = '2027-02-28T03:41:07Z';
+        const pending = [];
+        h.replies['billing.quoteTrial'] = () => new Promise(resolve => pending.push(resolve));
+        h.replies['billing.createCheckout'] = () => embedded;
+        h.openTrial({ timeZone: 'UTC' }).close();
+        await settle();
+        assert.equal(h.qa('[data-role="upgrade-sheet"]').length, 0, 'the first sheet is closed');
+        h.openTrial({ timeZone: 'UTC' });
+        await settle();
+        assert.equal(pending.length, 2, 'the reopened sheet asks for its own quote');
+        const [answerOld, answerNew] = pending.map(resolve => end => resolve(quote(end)));
+        if ( order === 'before' ) {
+            answerOld(oldEnd);
+            await settle();
+            assert.equal(h.count('billing.createCheckout'), 0, 'no checkout from the old quote');
+            assert.match(clean(h.q('[data-role="checkout-state"]')), /^Checking your free month…$/, 'the new sheet still waits for its own quote');
+            assert.ok(h.q('[data-role="trial-terms"]').hidden, 'no terms from the old quote');
+        }
+        answerNew(newEnd);
+        await settle();
+        if ( order === 'after' ) { answerOld(oldEnd); await settle(); }
+        assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input.trial.trialEndsAt), [newEnd]);
+        assert.equal(h.mounted, 1);
+        assert.equal(h.qa('[data-role="upgrade-sheet"]').length, 1);
+        const terms = h.q('[data-role="trial-terms"]');
+        assert.equal(terms.querySelector('time').getAttribute('datetime'), newEnd);
+        assert.equal(terms.querySelector('[data-role="trial-changed"]'), null, 'a late old reply is not a changed end');
+        assert.doesNotMatch(h.text(), /3:00 AM/, 'the old end is never shown');
+    });
+}
+
+test('trial_quote_stale: re-quote once on its own, show the NEW end with a notice above the form, and only that end reaches checkout', async h => {
     const first = '2027-02-28T03:00:00Z', second = '2027-02-28T03:41:07Z';
     let quotes = 0;
     h.replies['billing.quoteTrial'] = () => quote(quotes++ ? second : first);
@@ -315,18 +394,36 @@ test('trial_quote_stale: re-quote, show the NEW end with a notice, and only that
     h.replies['billing.createCheckout'] = () => creates++ ? embedded : fail('trial_quote_stale');
     h.openTrial({ timeZone: 'UTC' });
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
     assert.equal(h.count('billing.quoteTrial'), 2, 'a stale quote is quoted again');
-    assert.equal(h.mounted, 0, 'nothing is mounted for a stale quote');
-    assert.equal(clean(h.q('[data-role="trial-changed"]')), "Your free month's end date changed. Check the new date before you continue.");
-    assert.equal(clean(h.q('[data-role="trial-ends"]')), 'Your free month ends on Sunday, February 28, 2027 at 3:41 AM Coordinated Universal Time.');
-    assert.equal(h.q('[data-role="trial-ends"] time').getAttribute('datetime'), second);
-    assert.equal(h.document.activeElement, h.q('[data-action="trial-continue"]'), 'focus lands on Continue for the new date');
-    h.click('[data-action="trial-continue"]');
-    await settle();
     assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input.trial.trialEndsAt), [first, second]);
     assert.equal(h.mounted, 1);
+    const terms = h.q('[data-role="trial-terms"]');
+    assert.equal(clean(terms.querySelector('[data-role="trial-changed"]')), "Your free month's end date changed. Check the new date before you start.");
+    assert.equal(clean(terms.querySelector('[data-role="trial-ends"]')), '$0 today. Your free month ends on Sunday, February 28, 2027 at 3:41 AM Coordinated Universal Time.');
+    assert.equal(terms.querySelector('time').getAttribute('datetime'), second);
+});
+
+test('trial_quote_stale twice: no loop; Retry asks again, and never a paid checkout', async h => {
+    const ends = ['2027-02-28T03:00:00Z', '2027-02-28T03:41:07Z', '2027-02-28T03:52:00Z'];
+    let quotes = 0;
+    h.replies['billing.quoteTrial'] = () => quote(ends[quotes++]);
+    let creates = 0;
+    h.replies['billing.createCheckout'] = () => creates++ < 2 ? fail('trial_quote_stale') : embedded;
+    h.openTrial({ timeZone: 'UTC' });
+    await settle();
+    await h.tick(60000);
+    assert.equal(h.count('billing.quoteTrial'), 2, 'one automatic re-quote only');
+    assert.equal(h.count('billing.createCheckout'), 2);
+    assert.equal(h.mounted, 0);
+    assert.match(clean(h.q('[data-role="checkout-state"]')), /Your free month's end date changed\. Check the new date before you start\.Retry/);
+    assert.ok(h.q('[data-role="trial-terms"]').hidden, 'no stale date is left on screen');
+    h.click('[data-action="retry"]');
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 3);
+    assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => plain(call.input)),
+        ends.map(trialEndsAt => ({ sku: 'standard_monthly_v3', trial: { trialEndsAt } })), 'every checkout carried its own quoted end');
+    assert.equal(h.mounted, 1);
+    assert.equal(clean(h.q('[data-role="trial-ends"] time')), 'Sunday, February 28, 2027 at 3:52 AM Coordinated Universal Time');
 });
 
 test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; an unreadable quote is never shown; never a paid checkout', async h => {
@@ -342,11 +439,10 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
     h.replies['billing.createCheckout'] = () => fail('trial_checkout_complete');
     h.openTrial();
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
     assert.match(h.text(), /Your free month is already starting\. Wait a moment, then refresh Billing\./);
     assert.ok(h.q('[data-action="return-to-billing"]'));
     assert.equal(h.q('[data-action="retry"]'), null);
+    assert.equal(h.mounted, 0);
     h.handle.close();
     // Anything but a $0 Standard quote whose end is its first charge is refused before it is disclosed.
     for ( const bad of [{ todayCents: 2000 }, { sku: 'premium_monthly_v3' }, { firstChargeAt: '2027-03-01T00:00:00Z' }, { trialEndsAt: 'next month' }, { amountCents: 0 }] ) {
@@ -354,7 +450,8 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
         const before = h.count('billing.createCheckout');
         h.openTrial();
         await settle();
-        assert.equal(h.q('[data-role="trial-confirm"]'), null, JSON.stringify(bad));
+        assert.ok(h.q('[data-role="trial-terms"]').hidden, JSON.stringify(bad));
+        assert.equal(h.q('[data-role="trial-ends"]'), null, JSON.stringify(bad));
         assert.ok(h.q('[data-action="retry"]'), JSON.stringify(bad));
         assert.equal(h.count('billing.createCheckout'), before);
         h.handle.close();
@@ -370,8 +467,6 @@ test('completion: "Your free month is starting", then "has started" with the fir
     let summary = summaryV3('free');
     h.replies['billing.summary'] = () => ok(summary);
     h.openTrial({ timeZone: 'America/Los_Angeles' });
-    await settle();
-    h.click('[data-action="trial-continue"]');
     await settle();
     status = ok({ status: 'complete', paymentStatus: 'no_payment_required', sku: 'standard_monthly_v3' });
     h.complete();
@@ -394,8 +489,6 @@ test('review U1: a completed trial checkout is confirmed only by paid access, ne
     h.replies['billing.summary'] = () => ok(summary);
     h.openTrial({ timeZone: 'UTC' });
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
     h.complete();
     // Standard SKU, but paused (payment_pending, standing free), then the SKU with no standing at all: no success.
     await h.tick(1500);
@@ -416,8 +509,6 @@ test('redirect mode: the trial checkout opens the same hosted tab and polls as S
     h.replies['billing.checkoutStatus'] = () => ok({ status: 'complete', paymentStatus: 'no_payment_required', sku: 'standard_monthly_v3' });
     h.replies['billing.summary'] = () => ok(trialSummaryV3('trialing', { endsAt: '2027-02-28T03:00:00Z' }));
     h.openTrial({ timeZone: 'UTC' });
-    await settle();
-    h.click('[data-action="trial-continue"]');
     await settle();
     assert.equal(h.opens[0][0], 'https://checkout.example.test/c/pay');
     await h.tick(1500);
@@ -490,6 +581,58 @@ test('plan picker and session end: Standard is the free month when offered (chec
     // The top-up recovery dialog offers the same free month.
     assert.deepEqual(plain(h.api.topupUpgrade(trialSummaryV3('offer'))), { action: 'trial', sku: 'standard_monthly_v3', label: 'Start your free month', note: 'Standard adds 200 AI credits every month.' });
     assert.equal(h.api.topupUpgrade(trialSummaryV3('ineligible')).action, 'checkout');
+});
+
+// ── Founder 2026-11-05: no Free session length as a number on any Free-context surface ──
+
+test('Free copy inventory: Billing, offers, Usage, cancel, session end and the plan picker never give the Free session a length', async h => {
+    const freeHour = /\b(1|one)[- ]hours?\b|sessions? (last|up to) (1|one)\b|up to an hour/i;
+    assert.match('Sessions up to 1 hour', freeHour);
+    const held = () => { const s = summaryV3('free'); Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } }); return s; };
+    const summaries = [summaryV3('free'), held(), trialSummaryV3('offer'), trialSummaryV3('ineligible'),
+        trialSummaryV3('payment_pending', { standing: 'free' }), trialSummaryV3('payment_pending', { standing: 'files_on_aws' }),
+        trialSummaryV3('payment_failed', { standing: 'files_on_aws' })];
+    const texts = [];
+    // Review follow-up: assistive-technology names, descriptions, values and tooltips are copy too.
+    const labels = [];
+    const audited = ['aria-label', 'aria-description', 'aria-valuetext', 'title', 'data-tooltip'];
+    const accessible = root => {
+        for ( const el of root.querySelectorAll('*') ) labels.push(...audited.map(name => el.getAttribute(name)).filter(Boolean));
+        return clean(root);
+    };
+    for ( const summary of summaries ) {
+        texts.push(accessible(h.fragment(h.api.summaryV3Html(summary))));
+        texts.push(accessible(h.fragment(h.api.usageHtml(usageSample, summary))));
+    }
+    // The Free offer card's configuration line and the paid cards' six hours.
+    const offers = h.fragment(h.api.summaryV3Html(summaryV3('free')));
+    assert.doesNotMatch(clean(offers.querySelector('[data-role="plan-offer"][data-sku="free_v3"]')), /sessions up to|\bhours?\b/i);
+    assert.match(clean(offers.querySelector('[data-role="plan-offer"][data-sku="standard_monthly_v3"]')), /Sessions up to 6 hours/);
+    // A paid plan cancelled onto a held 2 vCPU computer, and a trial cancel: "Free limits", no length.
+    const paid = summaryV3('premium'); Object.assign(paid.computer, { filesOn: 'aws', standing: 'paid', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } });
+    const trialing = trialSummaryV3('trialing'); Object.assign(trialing.computer, { filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } });
+    for ( const summary of [paid, trialing] ) {
+        h.handle = h.api.openCancelSheet({ container: h.q('#container'), summary, trpc: h.trpc, onDone: () => {}, onClose: () => {} });
+        const sheet = accessible(h.q('[data-role="billing-sheet"]'));
+        assert.match(sheet, /your computer opens under Free limits; your files stay on your AWS computer\./);
+        texts.push(sheet);
+        h.handle.close();
+    }
+    for ( const summary of [summaryV3('free'), trialSummaryV3('offer')] ) {
+        h.handle = h.api.openSessionEndSheet({ container: h.q('#container'), summary, reason: 'session_max', trpc: h.trpc, onClose: () => {}, checkout: () => {} });
+        const sheet = accessible(h.q('[data-sheet="session-end"]'));
+        assert.match(sheet, /Your session ended\s*Your Free session ended\. Standard: sessions up to 6 hours/);
+        texts.push(sheet);
+        h.handle.close();
+        h.handle = h.api.openPlanPickerSheet({ container: h.q('#container'), summary, trpc: h.trpc, onClose: () => {}, checkout: () => {} });
+        texts.push(accessible(h.q('[data-role="billing-sheet"]')));
+        h.handle.close();
+    }
+    for ( const text of texts ) assert.doesNotMatch(text, freeHour, text.slice(0, 200));
+    for ( const label of labels ) assert.doesNotMatch(label, freeHour, label);
+    assert.ok(labels.includes('Current plan'), 'the audit reads accessible names, not only visible text');
+    // Truthful operational lines stay: the month's time left (also under an hour) is not a session length.
+    assert.ok(texts.some(text => /left this month|hours of computer time each month|Free limits/.test(text)), 'the Free limits are still said');
 });
 
 // ── Usage: no new meter, the authoritative balance, plan-labelled credits ─────

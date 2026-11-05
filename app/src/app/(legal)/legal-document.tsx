@@ -20,8 +20,11 @@ export function OperatorContact() {
     );
 }
 
+/** A page revised after the shared effective date passes its own. */
+const DEFAULT_EFFECTIVE = { dateTime: '2026-10-21', label: '21 October 2026' } as const;
+
 export function LegalDocument({
-    kind, title, introduction, changeSummary, summary, sections,
+    kind, title, introduction, changeSummary, summary, sections, effective = DEFAULT_EFFECTIVE,
 }: {
     kind: 'terms' | 'privacy' | 'refunds';
     title: string;
@@ -29,6 +32,7 @@ export function LegalDocument({
     changeSummary: string;
     summary: ReactNode;
     sections: readonly LegalSection[];
+    effective?: { dateTime: string; label: string };
 }) {
     return (
         <main id="legal-content" tabIndex={-1} className={styles.main}>
@@ -41,7 +45,7 @@ export function LegalDocument({
                 <p className={styles.eyebrow}>EZiL OS / Hosted service</p>
                 <h1>{title}</h1>
                 <p className={styles.description}>{introduction}</p>
-                <p className={styles.date}>Effective <time dateTime="2026-10-21">21 October 2026</time> <span aria-hidden="true">·</span> os.ezil.org</p>
+                <p className={styles.date}>Effective <time dateTime={effective.dateTime}>{effective.label}</time> <span aria-hidden="true">·</span> os.ezil.org</p>
                 <p className={styles.description}>What changed: {changeSummary}</p>
             </div>
             <div className={styles.documentGrid}>

@@ -17,7 +17,8 @@ describe('v3 catalog', () => {
         expect(publicOffers().map(offer => offer.storageGiB)).toEqual([null, 50, 100]);
         expect(Object.values(CATALOG_V3).map(offer => offer.storageGiB)).toEqual([null, 50, 100]);
         expect(publicOffers().map(({ tagline, bullets }) => [tagline, bullets])).toEqual([
-            ['Try EZiL OS and build small projects.', ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour']],
+            // Founder 2026-11-05: no Free session length as a number in sales copy.
+            ['Try EZiL OS and build small projects.', ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Your files saved between sessions']],
             // Paid compute policy v1: six-hour sessions; no monthly-time claim on paid offers.
             ['For regular work, every day.', ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Sessions up to 6 hours; your files are kept']],
             ['For bigger projects and long sessions.', ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Sessions up to 6 hours; your files are kept']],

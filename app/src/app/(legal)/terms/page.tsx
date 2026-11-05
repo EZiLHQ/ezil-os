@@ -69,7 +69,7 @@ const sections: readonly LegalSection[] = [
         content: <>
             <p>Your hosted computer can connect to websites, identity providers, package registries, editor extensions, and other external services. Those services may require their own accounts, permissions, terms, and charges. You are responsible for deciding which to use and what information to send them.</p>
             <p>Creating an EZiL OS account does not automatically connect it to an AI model provider. You choose whether to use an AI tool.</p>
-            <p>AI is not included in any plan. AI tools you choose to connect have their own accounts, terms, and charges.</p>
+            <p>Plans include AI credits for EZiL AI in Code and Chat, as listed under Plans and payments. AI tools from other providers that you choose to connect have their own accounts, terms, and charges.</p>
             <p>If you configure an AI tool or connect an external client, including an MCP client, it may receive the information you submit, tool responses, computer details, and access links, and may take actions with the permissions you give it. Review those permissions and the provider’s data-use and retention terms before connecting it. EZiL does not promise that an external AI provider will refrain from retaining data or using it for training.</p>
             <p>Check AI output and automated actions before relying on them. They can be incomplete or wrong and may change or delete work. Third-party products are controlled by their providers, and their availability or compatibility can change.</p>
         </>,
@@ -79,23 +79,24 @@ const sections: readonly LegalSection[] = [
         content: <>
             <p>EZiL LLC offers these plans. See <Link href="/pricing" prefetch={false}>the pricing page</Link> before purchasing. Prices are in USD, before tax. Tax is added where it applies and shown before you pay.</p>
             <ul>
-                <li><strong>Free — $0:</strong> a 2 vCPU · 6 GB computer on Cloudflare, sessions up to 1 hour, and about 5 standard-hours/month. Older accounts keep 8 standard-hours/month.</li>
-                <li><strong>Standard — $20/month:</strong> a 2 vCPU · 8 GB computer on AWS in Mumbai, no session time limit, and about 40 standard-hours/month fair use.</li>
-                <li><strong>Premium — $100/month:</strong> choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai, with no session time limit and about 500 standard-hours/month fair use.</li>
+                <li><strong>Free — $0:</strong> a 2 vCPU · 6 GB computer on Cloudflare, shorter sessions than paid plans, about 5 hours of computer time a month (older Free accounts keep 8 hours), and 100 AI credits once.</li>
+                <li><strong>Standard — $20/month:</strong> your own 2 vCPU · 8 GB computer on AWS in Mumbai with a 50 GB disk, sessions up to 6 hours, and 200 AI credits each billing period. Eligible customers can start with one free month, described below.</li>
+                <li><strong>Premium — $100/month:</strong> choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai with a 100 GB disk, sessions up to 6 hours, and 1,000 AI credits each billing period.</li>
             </ul>
-            <p>One standard-hour is one hour on a 2 vCPU computer. Bigger Premium computers use time faster: 4 vCPU uses time at ×2 and 8 vCPU at ×4. No session time limit on paid plans does not remove monthly fair-use limits. Fair use renews each calendar month in UTC for Free and each billing period for paid plans. If you reach fair use, wait for it to renew or upgrade to a plan with enough time.</p>
-            <p>Paid plans are billed monthly through Stripe and renew automatically until cancelled. A paid plan starts and its Mumbai computer is prepared only after payment succeeds: on signed payment confirmation, not a checkout redirect. Refund requests are covered by our <Link href="/refunds" prefetch={false}>Refund Policy</Link>.</p>
+            <p>A session is one stretch of time while your computer is running. At the session limit, your files are saved and the computer stops; you can start a new session from those files. Free’s computer time renews each calendar month in UTC. If you reach it, your computer pauses until it renews, or you can upgrade. Starting another session does not reset it. Standard and Premium have no monthly computer-hours allowance: each session lasts up to 6 hours, and starting a computer depends on available capacity.</p>
+            <p>Paid plans are billed monthly through Stripe and renew automatically until cancelled. A paid plan starts and its Mumbai computer is prepared only after payment succeeds, or for the Standard free month once Stripe confirms it: on signed confirmation from Stripe, not a checkout redirect. Refund requests are covered by our <Link href="/refunds" prefetch={false}>Refund Policy</Link>.</p>
+            <p><strong>Standard free month.</strong> If you are eligible, you can start Standard at $0 for one calendar month, with the same Standard computer, disk and AI credits. Stripe Checkout collects a payment method and your consent to the recurring charge, and the exact date the free month ends is shown before you pay. On that date Standard renews at $20/month unless you cancel before then. The free month is for Standard only, once per person, and is not available if you have had a paid plan before. If you cancel during the free month, Standard stays available until it ends and you are not charged; then you move to Free. While Stripe collects the first payment, Standard is paused. If that payment does not succeed, paid access ends and you move to Free; your files are kept, and unused AI credits from the free month are removed.</p>
             <p>An upgrade from Standard to Premium is charged on a prorated basis and takes effect only after payment succeeds. Downgrades and cancellations take effect at the end of the paid period. You can cancel any time in Settings → Billing.</p>
             <p>If a renewal payment fails, paid computer use pauses until the payment is fixed. Your files are kept. Use the customer portal in Settings → Billing to update your payment method.</p>
             <p>Price changes take effect from the next billing period after at least 30 days’ notice. If the next renewal falls within that notice period, the change takes effect from a later billing period that meets the notice requirement.</p>
-            <p>Saved storage is an allowance for stored data and does not reset each billing period. If it is full, free space or choose an available plan with enough storage before adding more saved data. See <Link href="/pricing" prefetch={false}>the pricing page</Link> for storage allowances and limits.</p>
+            <p>Storage is the disk on your computer and does not reset each billing period. Standard comes with a 50 GB disk and Premium with a 100 GB disk when the computer is first set up; some space is used by the system. A computer keeps its existing disk when you change plan, so a plan change does not make that disk larger. If it is full, free space before adding more saved data. See <Link href="/pricing" prefetch={false}>the pricing page</Link> for current storage details.</p>
         </>,
     },
     {
         id: 'plan-changes-files', title: 'Your files when changing plans',
         content: <>
             <p>On upgrade, your project files and HOME directory move to the new computer, including dotfiles, SSH keys and git configuration. Software installed with apt or npm -g, or in /opt, does not move and must be reinstalled. Running processes stop during the move.</p>
-            <p>On downgrade or cancellation at the end of the paid period, your files move back to the Free computer. The paid computer’s disk is kept for 14 days and then deleted. Free storage limits still apply to what is kept.</p>
+            <p>When a paid plan ends, after a cancellation or when a free month ends without payment, your account moves to Free and your computer keeps its disk and files. Files on an AWS computer stay on that computer and are not moved to a Free computer automatically. A 2 vCPU AWS computer opens under Free limits; a 4 or 8 vCPU computer can’t open on the Free plan.</p>
         </>,
     },
     {
@@ -159,7 +160,8 @@ export default function TermsPage() {
         kind="terms"
         title="Terms and Conditions"
         introduction="The terms for your account, your work, and your use of the hosted EZiL OS desktop."
-        changeSummary="Updated Free, Standard and Premium plans, payment timing, and files on plan changes."
+        changeSummary="Updated plans: the Standard free month, six-hour paid sessions, included AI credits, storage, and files when a paid plan ends."
+        effective={{ dateTime: '2026-11-05', label: '5 November 2026' }}
         summary={<>
             <p>Your content stays yours. Use the Service lawfully, protect your account, and keep your own copies of important work. The hosted desktop is an alpha service with limits, and deleting a computer does not erase its stored files.</p>
         </>}

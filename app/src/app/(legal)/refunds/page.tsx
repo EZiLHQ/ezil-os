@@ -13,7 +13,7 @@ const sections: readonly LegalSection[] = [
     {
         id: 'scope', title: 'When this policy applies',
         content: <>
-            <p>EZiL LLC offers Free ($0), Standard ($20/month), and Premium ($100/month) for the hosted EZiL OS service. Prices are in USD, before tax; tax is added where it applies. This policy covers monthly Standard and Premium charges. AI is not included in any plan.</p>
+            <p>EZiL LLC offers Free ($0), Standard ($20/month), and Premium ($100/month) for the hosted EZiL OS service. Prices are in USD, before tax; tax is added where it applies. This policy covers monthly Standard and Premium charges. Plans include AI credits for EZiL AI in Code and Chat.</p>
             <p>Review the <Link href="/pricing" prefetch={false}>pricing page</Link> and <Link href="/terms#plans-payments" prefetch={false}>Plans and payments</Link> terms before purchasing.</p>
         </>,
     },
@@ -52,7 +52,8 @@ export default function RefundsPage() {
         kind="refunds"
         title="Refund Policy"
         introduction="How to ask EZiL LLC about a Standard or Premium refund or payment."
-        changeSummary="Applied the 14-day refund window to Standard and Premium with a threshold below 10% of monthly fair use."
+        changeSummary="Stated that plans include EZiL AI credits. The refund window and eligibility are unchanged."
+        effective={{ dateTime: '2026-11-05', label: '5 November 2026' }}
         summary={<>
             <p>Request a refund within 14 days of a monthly Standard or Premium charge if less than 10% of the plan’s monthly fair use was used during that paid period. Your statutory consumer rights are not affected.</p>
         </>}

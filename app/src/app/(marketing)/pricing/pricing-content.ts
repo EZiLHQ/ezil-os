@@ -76,7 +76,8 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
             items: [
                 {
                     question: 'What is a session?',
-                    answer: `A session is one stretch of time while your computer is running. Free sessions last up to ${hours(CATALOG_V3.free_v3.sessionMaxSeconds!)} hour. Standard and Premium sessions last up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours. At the session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
+                    // Founder 2026-11-05: Free's session length is not sold as a number; it is shorter, and that is said.
+                    answer: `A session is one stretch of time while your computer is running. Free sessions are shorter; Standard and Premium sessions last up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours. At the session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
                 },
                 {
                     // Paid compute policy v1 (founder e713d157): Free keeps a monthly allowance; Standard and Premium have none.
