@@ -1,0 +1,137 @@
+# No external trigger. Only the disabled, approved-source graph calls this workflow.
+name: AWS staging fixed-document delivery
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        type: string
+        required: true
+      artifact_id:
+        type: string
+        required: true
+      artifact_run:
+        type: string
+        required: true
+      artifact_digest:
+        type: string
+        required: true
+      receipt_sha256:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      delivery_role: ${{ steps.admit.outputs.delivery_role }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate source and explicit activation pins before requesting an identity
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_JSON: ${{ inputs.candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').write_text(os.environ['CANDIDATE_JSON'])
+          PY
+          python3 -B deploy/aws/os-staging/release_admission.py "$RUNNER_TEMP/candidate.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('delivery_role=' + json.load(open('deploy/aws/os-staging/pipeline.json'))['delivery_role_arn'] + '\n')
+          PY
+  install:
+    needs: preflight
+    # Future independent approval reviews the exact artifact ID/digest/receipt.
+    environment: staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LEASE_OWNER: github-os-app-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck after installation approval
+        env:
+          CANDIDATE_JSON: ${{ inputs.candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').write_text(os.environ['CANDIDATE_JSON'])
+          PY
+          python3 -B deploy/aws/os-staging/release_admission.py "$RUNNER_TEMP/candidate.json"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          unset-current-credentials: true
+      - name: Acquire existing shared lease without waiting or displacing an owner
+        id: acquire
+        run: |
+          [[ $(aws sts get-caller-identity --query Arn --output text) == arn:aws:sts::452630323510:assumed-role/ezil-os-staging-lease/* ]]
+          python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 2100 --wait 0
+          python3 - <<'PY'
+          import json, os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'delivery.json').write_text(json.dumps({
+              'schema': 1, 'state': 'lease_acquired_no_submission', 'lease_release_allowed': True}))
+          PY
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.preflight.outputs.delivery_role }}
+          aws-region: ap-south-1
+          unset-current-credentials: true
+      - name: Verify immutable artifact and invoke only the fixed document
+        env:
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_RUN: ${{ inputs.artifact_run }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          RECEIPT_SHA256: ${{ inputs.receipt_sha256 }}
+        run: |
+          python3 -B deploy/aws/os-staging/staging_delivery.py "$RUNNER_TEMP/candidate.json" \
+            --artifact-id "$ARTIFACT_ID" --artifact-run "$ARTIFACT_RUN" --artifact-digest "$ARTIFACT_DIGEST" \
+            --receipt-sha256 "$RECEIPT_SHA256" --lease-owner "$LEASE_OWNER" --result "$RUNNER_TEMP/delivery.json"
+      - name: Decide cleanup from the recorded execution outcome
+        id: cleanup
+        if: ${{ always() && steps.acquire.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ['RUNNER_TEMP'], 'delivery.json')
+          safe = path.exists() and json.loads(path.read_text()).get('lease_release_allowed') is True
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('release=' + str(safe).lower() + '\n')
+          if not safe:
+              print('Lease retained until original expiry: install/health failed or outcome uncertain; owner must inspect/recover before normal leasing resumes. No retry or automatic rollback.')
+          PY
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: ${{ always() && steps.cleanup.outputs.release == 'true' }}
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          unset-current-credentials: true
+      - name: Release only this run's lease
+        if: ${{ always() && steps.cleanup.outputs.release == 'true' }}
+        run: |
+          [[ $(aws sts get-caller-identity --query Arn --output text) == arn:aws:sts::452630323510:assumed-role/ezil-os-staging-lease/* ]]
+          python3 .github/scripts/staging-lock.py release --owner "$LEASE_OWNER"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: os-staging-delivery-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/delivery.json
+          if-no-files-found: warn
