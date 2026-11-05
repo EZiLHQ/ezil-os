@@ -18,6 +18,7 @@ mock.module('cloudflare:workers', () => ({
 
 import { hmacSha256Hex, mintPreviewTokenV2, PREVIEW_TOKEN_PAYLOAD, type PreviewTokenV2Claims } from './hmac';
 import { REPO_OPEN_ERRORS, type RepoOpenAnswer, type RepoOpenRequest, type RepoOpenRoot } from './repo-open';
+import awsGateway from './aws-gateway.vectors.json';
 
 const SECRET = 'repo-open-route-secret';
 const SANDBOX = 'guac-user1-comp1';
@@ -236,5 +237,121 @@ describe('POST /sandbox/:name/repo-open on the real route table', () => {
     const list = /const PUBLIC_ERROR_CODES = \[([\s\S]*?)\] as const;/.exec(source)![1]!;
     const codes = new Set([...list.matchAll(/'([^']+)'/g)].map((m) => m[1]));
     expect([...REPO_OPEN_ERRORS, 'runtime_not_running', 'hmac_v2_required'].filter((c) => !codes.has(c))).toEqual([]);
+  });
+});
+
+// ── AWS computers: the anonymous public-github dispatch (class `public`, inert on today's AMI) ──
+
+const AWS_SANDBOX = 'guac-0a1b2c3d4e5f6a7b-6f1c2d3e4a5b4c6d';
+const AWS_COMPUTER = '6f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f';
+const PUB_REPO = '00000000-0000-4000-8000-0000000000ab';
+const PUB_URL = 'https://github.com/EZiLHQ/ezil-os.git';
+const PUB_W = `/workspace/projects/${PUB_REPO}`;
+const PUB_BODY = JSON.stringify({ repositoryId: PUB_REPO, canonicalURL: PUB_URL, ref: 'refs/heads/main' });
+const AWS_GRANT = `egg_${'ab12'.repeat(16)}`;
+
+const awsRecord = (over: Record<string, unknown> = {}) => ({
+  computerId: AWS_COMPUTER, sandboxId: AWS_SANDBOX, generation: 3, leaseEpoch: 7, instanceId: 'i-0123456789abcdef0',
+  region: 'ap-south-1', publicIp: '13.200.1.2', tunnelId: 't', dnsRecordId: 'd', hostname: '',
+  controlKey: awsGateway.controlKeyBase64, createdAt: 1, originVerified: true, ...over,
+});
+const awsClaims = (patch: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims =>
+  claims({ provider: 'aws-ec2', sandboxId: AWS_SANDBOX, computerId: AWS_COMPUTER, generation: 3, leaseEpoch: 7, ...patch });
+async function awsSigned(body = PUB_BODY) {
+  const path = `/sandbox/${AWS_SANDBOX}/repo-open`;
+  const token = await mintPreviewTokenV2(SECRET, awsClaims(), { method: 'POST', path, body });
+  return new Request(`https://api-desktop.ezil.org${path}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-ezil-auth': token }, body });
+}
+/** A fake AWS tunnel registry that records every lookup and hands back `record` (or null). */
+function awsRegistry(record: unknown) {
+  const lookups: string[] = [];
+  return { lookups, binding: { idFromName: (n: string) => n, get: () => ({ fetch: async (req: Request) => { lookups.push(new URL(req.url).pathname); return Response.json({ record }); } }) } };
+}
+const AWS_STAGING = {
+  SANDBOX_HMAC_SECRET: SECRET, EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work', AWS_ROUTING_ENABLED: 'on',
+  AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org', SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org',
+};
+
+describe('AWS computer: the anonymous public-github dispatch', () => {
+  it('🟢 os-staging + a live tunnel: the open is relayed with NO grant, and the wrapper folder is answered', async () => {
+    const worker = await loadWorker();
+    const { binding: sandbox } = fakeNamespace();
+    const reg = awsRegistry(awsRecord());
+    const host: { path: string; body: string }[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      host.push({ path: new URL(url as string).pathname, body: String(init?.body ?? '') });
+      // A start that already answers `done` (valid per the relay) so there is no real-timer poll.
+      return Response.json({ ok: true, state: 'done', result: { status: 200, body:
+        { ok: true, state: 'cloned', folder: PUB_W, openFolder: PUB_W, pathNotFound: false, branch: 'main', empty: false } } });
+    }) as typeof fetch;
+    try {
+      const res = await worker.fetch(await awsSigned(), { Sandbox: sandbox, AWS_TUNNELS: reg.binding, ...AWS_STAGING });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, folder: PUB_W, status: 'cloned' });
+      expect([host.length, host[0]?.path.startsWith('/__ezil/control/repo-open/')]).toEqual([1, true]);
+      const relayed = JSON.parse(host[0]!.body);
+      expect('grant' in relayed).toBe(false);
+      expect(host[0]!.body).not.toContain('egg_');
+      expect([relayed.class, relayed.gitHost, relayed.handle, relayed.name, relayed.path]).toEqual(['public', 'github.com', 'EZiLHQ', 'ezil-os', null]);
+      expect(reg.lookups.length).toBe(1);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('🔴 os-staging but no live tunnel: the public branch IS reached (registry consulted) yet the host is never fetched → unsupported', async () => {
+    const worker = await loadWorker();
+    const { binding: sandbox } = fakeNamespace();
+    const reg = awsRegistry(null);
+    const host: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: Parameters<typeof fetch>[0]) => { host.push(new URL(url as string).pathname); return Response.json({}); }) as typeof fetch;
+    try {
+      const res = await worker.fetch(await awsSigned(), { Sandbox: sandbox, AWS_TUNNELS: reg.binding, ...AWS_STAGING });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ ok: false, error: 'repo_open_unsupported_provider' });
+      expect(reg.lookups.length).toBe(1);               // the dispatch DID enter the public branch and consult the registry
+      expect(host).toEqual([]);                          // but nothing was fetched from the host
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('🔴 production (no os-staging Gateway): refused as unsupported BEFORE any AWS contact (registry never consulted, nothing fetched)', async () => {
+    const worker = await loadWorker();
+    const { binding: sandbox } = fakeNamespace();
+    const reg = awsRegistry(awsRecord());
+    const host: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: Parameters<typeof fetch>[0]) => { host.push(new URL(url as string).pathname); return Response.json({}); }) as typeof fetch;
+    try {
+      for (const gateway of [undefined, 'https://ai.ezil.work']) {
+        reg.lookups.length = 0; host.length = 0;
+        const env = { Sandbox: sandbox, AWS_TUNNELS: reg.binding, ...AWS_STAGING, ...(gateway === undefined ? { EZIL_AI_GATEWAY_URL: undefined } : { EZIL_AI_GATEWAY_URL: gateway }) };
+        const res = await worker.fetch(await awsSigned(), env);
+        expect([gateway, res.status]).toEqual([gateway, 409]);
+        expect(await res.json()).toEqual({ ok: false, error: 'repo_open_unsupported_provider' });
+        expect([gateway, reg.lookups.length, host.length]).toEqual([gateway, 0, 0]);
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('🔴 os-staging but a grant-bearing body (auth ≠ none): refused as unsupported before any AWS contact', async () => {
+    const worker = await loadWorker();
+    const { binding: sandbox } = fakeNamespace();
+    const reg = awsRegistry(awsRecord());
+    const host: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: Parameters<typeof fetch>[0]) => { host.push(new URL(url as string).pathname); return Response.json({}); }) as typeof fetch;
+    try {
+      // a public URL carrying a grant, and a staging git-qa remote (basic auth): neither is auth 'none'
+      for (const body of [
+        JSON.stringify({ repositoryId: PUB_REPO, canonicalURL: PUB_URL, ref: 'refs/heads/main', git: { token: AWS_GRANT, expiresAt: new Date(Date.now() + 60_000).toISOString() } }),
+        JSON.stringify({ repositoryId: PUB_REPO, canonicalURL: 'https://git-qa.ezil.work/acme/site.git', ref: 'refs/heads/main', git: { token: AWS_GRANT, expiresAt: new Date(Date.now() + 60_000).toISOString() } }),
+      ]) {
+        reg.lookups.length = 0; host.length = 0;
+        const res = await worker.fetch(await awsSigned(body), { Sandbox: sandbox, AWS_TUNNELS: reg.binding, ...AWS_STAGING });
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ ok: false, error: 'repo_open_unsupported_provider' });
+        expect([reg.lookups.length, host.length]).toEqual([0, 0]);
+      }
+    } finally { globalThis.fetch = realFetch; }
   });
 });
