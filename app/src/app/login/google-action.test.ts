@@ -12,8 +12,6 @@ const supabase = vi.hoisted(() => ({
 const oauth = vi.hoisted(() => vi.fn(async () => ({ data: { url: 'https://supabase.example/authorize' }, error: null })));
 vi.mock('@/utils/supabase/server', () => supabase);
 
-import { safeReturnUrl } from '@/utils/constants';
-
 import { signInWithGoogle } from './actions';
 
 beforeEach(() => { vi.stubEnv('AUTH0_CLIENT_ID', ''); vi.stubEnv('AUTH0_SECRET_ID', ''); redirect.mockClear(); oauth.mockClear(); supabase.createClient.mockClear(); });
@@ -27,10 +25,14 @@ describe('signInWithGoogle', () => {
         expect(redirect).toHaveBeenCalledWith('/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done');
         expect(supabase.createClient).not.toHaveBeenCalled();
         expect(oauth).not.toHaveBeenCalled();
-        // A foreign destination is narrowed to the app's own default before it reaches EZiL ID.
+        // A foreign destination is narrowed to the app's own default (/computers) before it reaches EZiL ID. Literal
+        // expectations, not the sanitizer's own output, so a weakened sanitizer cannot also weaken this test.
         await expect(signInWithGoogle('https://evil.example/x')).rejects.toThrow('NEXT_REDIRECT');
-        expect(redirect).toHaveBeenLastCalledWith(`/auth/auth0/login?${new URLSearchParams({ returnUrl: safeReturnUrl('https://evil.example/x') })}`);
-        expect(safeReturnUrl('https://evil.example/x')).not.toContain('evil');
+        expect(redirect).toHaveBeenLastCalledWith('/auth/auth0/login?returnUrl=%2Fcomputers');
+        await expect(signInWithGoogle('//evil.example/x')).rejects.toThrow('NEXT_REDIRECT');
+        expect(redirect).toHaveBeenLastCalledWith('/auth/auth0/login?returnUrl=%2Fcomputers');
+        await expect(signInWithGoogle('/app/code?folder=%2Fworkspace')).rejects.toThrow('NEXT_REDIRECT');
+        expect(redirect).toHaveBeenLastCalledWith('/auth/auth0/login?returnUrl=%2Fapp%2Fcode%3Ffolder%3D%252Fworkspace');
     });
 
     it('without EZiL ID, keeps the Supabase Google OAuth flow', async () => {
