@@ -31,11 +31,11 @@ type ClientOptions = {
     max: number; max_pipeline: number; prepare: boolean; fetch_types: boolean; connect_timeout: number;
     socket: (address: { host: string[]; port: number[]; path?: string }) => Promise<FakeSocket>;
 };
-type Query = { statement: string; parameters: string[]; role: string; at: number };
+type Query = { statement: string; parameters: unknown[]; role: string; at: number };
 let allowed: unknown;
 let enrollment: unknown;
 let receipts: Map<string, OutboxInsert>;
-let kicks: string[][];
+let kicks: unknown[][];
 let effects: { kind: string; at: number }[];
 let sockets: FakeSocket[];
 let clients: FakeClient[];
@@ -77,7 +77,7 @@ class FakeClient {
     private inTransaction = false;
     private pendingEnrollment = false;
     private pendingReceipt: OutboxInsert | undefined;
-    private pendingKick: string[] | undefined;
+    private pendingKick: unknown[] | undefined;
     private connection: Promise<FakeSocket> | undefined;
     constructor(readonly options: ClientOptions) {}
     private rollback() {
@@ -96,7 +96,7 @@ class FakeClient {
         if (statement.startsWith('update public.ezil_billing_outbox')) return 'kick';
         if (statement === 'commit') return this.transaction === 1 ? 'enroll_commit' : this.pendingKick ? 'kick_commit' : 'outbox_commit';
     }
-    unsafe = vi.fn(async (statement: string, parameters: string[] = []) => {
+    unsafe = vi.fn(async (statement: string, parameters: unknown[] = []) => {
         this.queries.push({ statement, parameters, role: this.role, at: performance.now() });
         const stage = this.stage(statement);
         if (stage === 'acquire' && holdStage === 'acquire') await held;
@@ -126,9 +126,11 @@ class FakeClient {
         } else if (statement.startsWith('insert into')) {
             if (this.role !== 'postgres' || !this.inTransaction) throw new Error('outbox used enrollment role');
             if (!statement.trim().endsWith('on conflict do nothing')) throw new Error('receipt replay may overwrite');
+            // postgres.js serializes a jsonb parameter itself: a pre-stringified payload is stored as a jsonb string.
+            if (typeof parameters[3] !== 'object' || parameters[3] === null) throw new Error('payload bound as a JSON string');
             this.pendingReceipt = {
-                eventKey: parameters[0], userId: parameters[1], kind: parameters[2] as OutboxInsert['kind'],
-                payload: JSON.parse(parameters[3]),
+                eventKey: parameters[0] as string, userId: parameters[1] as string, kind: parameters[2] as OutboxInsert['kind'],
+                payload: parameters[3] as OutboxInsert['payload'],
             };
         } else if (statement.startsWith('update public.ezil_billing_outbox')) {
             if (this.role !== 'postgres' || !this.inTransaction) throw new Error('kick used enrollment role');
