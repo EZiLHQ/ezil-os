@@ -353,6 +353,19 @@ const lastAsk = () => asks.at(-1);
         `repo: one repository ask, no own-files folder ask [${JSON.stringify(lastAsk())}]`);
     await t.notice().waitFor();
     ok((await t.notice().getAttribute('data-outcome')) === 'with_repository', 'repo: a visible notice says the folder was not opened');
+    const REPO_ADDR = `/app/code?repo=${encodeURIComponent('https://github.com/octocat/Hello-World.git').replace(/%2F/g, '/')}`;
+    ok(await t.waitAddress(REPO_ADDR), `repo: the address drops the refused folder after the first report, so a reload never says it again [${await t.address()}]`);
+    // A folder inside the checkout: its own entry, under the repository's keys alone (never `folder` beside them).
+    const lenR = await t.len();
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e/repository'));
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e/repository'), 'repo: a folder inside the checkout opens');
+    await t.quiet();
+    ok(await t.len() === lenR + 1 && await t.address() === REPO_ADDR, `repo: one entry, and the address keeps the repository's keys alone [${lenR} -> ${await t.len()}, ${await t.address()}]`);
+    await t.page.goBack();
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e') && await t.address() === REPO_ADDR, 'repo: Back returns to the repository folder');
+    // Outside the checkout the person is in their own files: `folder` alone.
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
+    ok(await t.waitAddress('/app/code?folder=/workspace/b'), `repo: a folder outside the checkout is the person's own files [${await t.address()}]`);
     await t.context.close();
 }
 
