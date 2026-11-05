@@ -64,7 +64,7 @@ element equal. Resolve indices from the pinned `out/nls.keys.json`; they move be
 
 Gates: every anchor 0, every replacement at its count, `By continuing with {0} Copilot` 0, both files parse (`.js` evaluated in a VM, `.json` parsed) and are identical element-wise.
 
-### Compact chat layout — `workbench.js` (`chat-header`, `attach-execute`, `picker-flip`) and `workbench.css` (`chat-layout`)
+### Compact chat layout — `workbench.js` (`chat-header`, `attach-execute`, `picker-flip`, `picker-order`) and `workbench.css` (`chat-layout`)
 
 Upstream, the bottom of the chat view stacked: the "Chat history" title row (over an empty chat,
 where the Sessions list fills the top), a getting-started tip, the composer (input over a row with
@@ -81,7 +81,11 @@ Where each control is now (same nodes, same listeners, same accessible names):
   row wraps instead of hiding it), context usage, an info button for the notice, the Sessions-sidebar
   toggle. Tab order follows that order. Its pickers open downward when the list does not fit above
   the button (`picker-flip`); upstream forced every chat picker upward, which from the header left one
-  row of the model list in a chat with turns (image e2e, 2026-11-05).
+  row of the model list in a chat with turns (image e2e, 2026-11-05). When the row is too narrow for
+  every picker's label (a phone: Explorer and Chat side by side leave Chat ~160 px), the mode picker
+  becomes its icon first and the model name ellipsizes (`picker-order`); upstream compacted right to
+  left, so the model picker lost its name first and only a sparkle icon was left (image e2e, 390 and
+  412 px, 2026-11-05).
 - **Composer:** input, Add Context, Send (Stop while answering); attachment chips keep their own row
   above. Auto-grow is upstream's: up to 250 px of editor (`vmn`), then the editor scrolls (measured on a
   794 px and a 454 px chat pane: 11 lines, then a scrollbar).
@@ -101,11 +105,15 @@ Where each control is now (same nodes, same listeners, same accessible names):
 | `attach-execute` | workbench.js Add Context (`workbench.action.chat.attachContext`) menu entry for the chat view: `{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(J.lockedToCodingAgent.negate(),J.agentSupportsAttachments)),id:O.ChatInput,group:"navigation",order:-1}` | Same with `id:O.ChatExecute`: the button renders beside Send (the execute toolbar already renders this action; quick chat registers it there), so it stays in the composer when the ChatInput toolbar moves to the header. Applies to location `panel`, i.e. also the chat editor, where it now sits beside Send; its keybinding (Ctrl+/) is unchanged. Anchor 0, replacement 1. |
 | `picker-flip` | workbench.js list options for every chat input picker (mode, model, model options, session target, permissions; `SW`): `function SW(s){return{...Vio(s),anchorPosition:1}}`. The action widget's `computeHeight` takes a set `anchorPosition` as final (always above) and caps the list to the space above the button, less the search box and the cache-break hint: from the header (~97 px down a 900 px window) the model list of a chat with turns was 15 px, under one row. | `function SW(s){return{...Vio(s),anchorPosition:void 0,preferredAnchorPosition:1}}`: upstream's own option (the chat input pills pass it). `SW` still overrides a caller's `anchorPosition` (the agent-host mode/permissions popup, `run`, passes 1), so it alone picks the side, as before; the pickers' base (`A1` → its dropdown's `show`) passes the options through without a side of its own. `computeHeight` lays the list out above when it fits there, below when it fits there instead (`X7`), else on the larger side, up to 60 % of the window; the context view then places it from the widget's `anchorPosition` getter, which falls back to that choice. Composer pickers (chat editor, quick chat) still open above. A picker in a dialog keeps forcing below: the model picker passes `{...SW(K),anchorPosition:0}` there, and a set `anchorPosition` wins. Anchor 0, replacement 1. |
 | `picker-names` | `this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,` (the action widget reads both options), `G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)` (the dialog override) | Checked, never patched: each occurs once. |
+| `picker-order` | workbench.js responsive chat picker layout (`SEt.layout`, `ChatInputPart.primaryPicker`/`secondaryPicker`): `let t=this._getVisibleItemBounds().sort((i,n)=>n.bounds.left-i.bounds.left).map(({item:i})=>i);for(let i of t)i.setMinimal?.(!1),i.setCompact(!1);`. When the pickers do not fit, it compacts them to icons in that order, right to left, until they fit; in the header the model picker sits right of the mode picker, so it was compacted first. | Same, sorted `(i.item.canShrink?1:0)-(n.item.canShrink?1:0)||n.bounds.left-i.bounds.left`: items that can shrink compact last. Only the model picker is `canShrink` (upstream: its name ellipsizes, `.model-picker-item` `flex-shrink:1`, and the fit check accepts it narrower than its preferred width), so on a narrow row the mode picker becomes its icon first and the model name shortens with an ellipsis; the model picker becomes an icon only if even that does not fit. A row without a `canShrink` item (Local, permissions, context usage) compacts right to left as before; nothing changes when everything fits. Compact pickers keep their accessible names (the model picker's is "Models, <full name>"). Anchor 0, replacement 1. |
+| `picker-order-names` | `canShrink:r.id===u2.ID,` (only the model picker shrinks), `static{this.ID="workbench.action.chat.openModelPicker"}` (`u2`), and the fit check's `canShrink` exemption (`if(!i.some(({item:r})=>r.canShrink)&&n.width>e+o4e)return!1;…`) | Checked, never patched: each occurs once. |
 | `chat-layout` | workbench.css: `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}` left as it is (gated once: the welcome disclaimer stays hidden whenever BYOK models exist, so it is not where the notice lives) | Appended to the end of the file, top level (a rule next to the nested upstream one would be nested too), exact text `R_CSS_LAYOUT`: the header row wraps (`flex-wrap`, title label `flex:1 1 96px`), the moved toolbars shrink instead of stretching, the info button looks like a toolbar icon with a focus ring; the composer's `.chat-input-container` is a two-column grid (editor, then the Add Context/Send row bottom-aligned; attachments span both); `min-width:0!important` on that row because the moved responsive toolbar keeps writing its own minimum width onto the container it was created in; the tip is hidden. All rules but the tip's require `.chat-viewpane.ezil-compact-chat`. Gates: upstream rule once, layout block once and at brace depth 0, the previous notice rule (`.interactive-input-part::after{content:"AI responses may be inaccurate.`) 0. |
 
 Offline test (patches a copy, runs `--verify`, checks the CSS and the menu entry, executes
 `_ezilChatHeader` and `createControls` against a DOM double, runs the bundle's own `SW`, `X7` and
-`computeHeight` for a header, a composer and a dialog picker, rejects a moved anchor):
+`computeHeight` for a header, a composer and a dialog picker, runs the bundle's own `SEt.layout` on a
+phone-width, desktop-width and too-narrow header row and a row without a shrinkable picker, against the
+pristine one too, rejects a moved anchor):
 
 ```sh
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-layout-patch.test.cjs
