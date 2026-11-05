@@ -1,4 +1,4 @@
-# Pushes deploy the selected environment before running its live check.
+# Legacy preview delivery is retired; production delivery remains unchanged.
 # Configure staging/production environment secrets and OS_WORKER_URL separately.
 # Vercel rootDirectory=app; this workflow owns deployments and preview aliasing.
 name: Deploy and live check
@@ -144,7 +144,7 @@ jobs:
     needs: changes
     if: >-
       needs.changes.outputs.image_changed == 'true' &&
-      (github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main')
+      github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
@@ -155,12 +155,27 @@ jobs:
       source: ${{ github.sha }}
     secrets: inherit
 
+  staging-retired:
+    name: Legacy staging delivery retired
+    if: github.ref == 'refs/heads/preview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions:
+      contents: read
+    steps:
+      - name: Require the reviewed AWS staging delivery path
+        run: |
+          echo '::error::Legacy preview delivery is retired. AWS staging is https://os-staging.ezil.work.'
+          echo 'Use reviewed PR269 tooling through the release owner after its source, access and activation gates.'
+          echo 'This workflow has not deployed the app, Worker or image to staging.'
+          exit 1
+
   preview:
     name: Deploy and verify staging
     needs: [changes, images]
-    # A skipped image build must not skip deployments for app/Worker-only pushes.
+    # Retained for audit only. No Vercel, Worker, image or lease mutation may run.
     if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/preview' &&
+      ${{ false && !cancelled() && github.ref == 'refs/heads/preview' &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
