@@ -79,13 +79,6 @@ export async function replacementNeverLaunched(deps: ReceiptDeps, p: Placement, 
     catch { return false; }
 }
 
-/** A source released through the pool carries the claim identity instead; it is accepted only once terminated. */
-export const releasedPoolSourceTags = (tags: Readonly<Record<string, string>> | undefined,
-    s: { namespace: string; computerId: string; generation: number; fenceToken: string }) => !!tags
-    && Object.entries({ 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': s.namespace, 'ezil:namespace': s.namespace,
-        'ezil:computer': s.computerId, 'ezil:generation': String(s.generation), 'ezil:fence': s.fenceToken }).every(([k, v]) => tags[k] === v)
-    && !!tags['ezil:pool-host'] && ['ezil:computer-id', 'ezil:fence-token', 'ezil:pool'].every(k => tags[k] === undefined);
-
 /** No EC2 writes. Unknown, absent or contradictory evidence keeps provisional authority reserved.
  * `neverLaunched`: the execution's complete history proves no launch, so zero writers is an answer.
  * `historical`: an authenticated release-execution termination proof (aws-historical-source) for a
@@ -103,8 +96,11 @@ export async function settleReplacementGeneration(deps: ReceiptDeps, p: Placemen
         'ezil:stage': i.deployment.namespace, 'ezil:namespace': i.deployment.namespace, 'ezil:computer-id': i.computerId, 'ezil:computer': i.computerId,
         'ezil:generation': String(i.previousGeneration), 'ezil:fence-token': i.previousFenceToken!, 'ezil:fence': i.previousFenceToken! })
         .every(([k, v]) => tags[k] === undefined || tags[k] === v);
-    const releasedPoolSource = (tags: Readonly<Record<string, string>> | undefined) => releasedPoolSourceTags(tags,
-        { namespace: i.deployment.namespace, computerId: i.computerId, generation: i.previousGeneration!, fenceToken: i.previousFenceToken! });
+    // A source released through the pool carries the claim identity instead; it is accepted only once terminated.
+    const releasedPoolSource = (tags: Readonly<Record<string, string>> | undefined) => !!tags
+        && Object.entries({ 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': i.deployment.namespace, 'ezil:namespace': i.deployment.namespace,
+            'ezil:computer': i.computerId, 'ezil:generation': String(i.previousGeneration), 'ezil:fence': i.previousFenceToken! }).every(([k, v]) => tags[k] === v)
+        && !!tags['ezil:pool-host'] && ['ezil:computer-id', 'ezil:fence-token', 'ezil:pool'].every(k => tags[k] === undefined);
     try {
         const token = createHash('sha256').update(`ezil-lifecycle-v1\ninstance\n${work.digest}`).digest('hex');
         const source = await deps.describer.describeForEnrollment(p.region!, i.previousInstanceId!);

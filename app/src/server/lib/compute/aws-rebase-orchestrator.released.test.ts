@@ -36,8 +36,8 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
         expect(s.fake.imageJobs).toHaveLength(1); expect(s.started).toHaveLength(1);
         expect(s.deps.executions.history).toHaveBeenCalledTimes(reads);
     });
-    it('accepts a unique lower and a host EC2 still lists as a terminated claim of exactly this allocation', async () => {
-        const s = releasedPoolSetup(); s.provider.host = s.terminatedHost();
+    it('accepts a unique lower whose aged-out host is the released one', async () => {
+        const s = releasedPoolSetup();
         expect((await s.request('prepare')).status).toBe(202);
         const j = await s.current();
         expect(j.sourceRelease.amiId).toBe(s.provisioned.amiId);
@@ -74,24 +74,12 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
         it(`${operation} refuses the provision execution named as the release`, async () => {
             const s = releasedPoolSetup({ shared: true }); await refused(s, operation, 'source_identity_mismatch', s.provisionArn);
         });
-        it.each(['running', 'stopped', 'stopping', 'pending', 'shutting-down'])(`${operation} refuses a live host in state %s, never stopping it`, async state => {
+        // Any listed host, even the exact terminated claim of this allocation: launch, recovery and maintenance accept an
+        // absent source but refuse its claim tags after the snapshot (infra rebase-preparation.test.ts, released launch).
+        it.each(['terminated', 'shutting-down', 'running', 'stopped', 'stopping', 'pending'])(`${operation} refuses a listed %s host, never stopping it`, async state => {
             const s = releasedPoolSetup({ shared: true }); s.provider.host = { ...s.terminatedHost(), state };
             await refused(s, operation, 'source_identity_mismatch');
-        });
-        it.each([
-            ['instance', () => ({ instanceId: 'i-99999999999999999' })], ['zone', () => ({ availabilityZoneId: 'aps1-az2' })],
-            ['AMI', (h: Setup) => ({ imageId: h.f.release106.amiId })], ['missing AMI', () => ({ imageId: undefined })],
-            ['pool-host', () => ({ tags: { 'ezil:pool-host': OTHER } })], ['no pool-host', () => ({ tags: { 'ezil:pool-host': undefined } })],
-            ['ezil:computer', () => ({ tags: { 'ezil:computer': OTHER } })], ['ezil:generation', () => ({ tags: { 'ezil:generation': '2' } })],
-            ['ezil:fence', () => ({ tags: { 'ezil:fence': OTHER } })], ['ezil:stage', () => ({ tags: { 'ezil:stage': 'mum' } })],
-            ['canonical ezil:computer-id', (h: Setup) => ({ tags: { 'ezil:computer-id': h.source.computerId } })],
-            ['canonical ezil:fence-token', (h: Setup) => ({ tags: { 'ezil:fence-token': h.source.sourceFenceToken } })],
-            ['spare ezil:pool', () => ({ tags: { 'ezil:pool': '1' } })],
-        ] as const)(`${operation} refuses a terminated host with the wrong %s`, async (_name, patch) => {
-            const s = releasedPoolSetup({ shared: true }), host = s.terminatedHost(), p = patch(s) as Record<string, unknown>;
-            s.provider.host = { ...host, ...p, tags: Object.fromEntries(Object.entries({ ...host.tags, ...(p.tags as object | undefined) })
-                .filter(([, v]) => v !== undefined)) as Record<string, string> };
-            await refused(s, operation, 'source_identity_mismatch');
+            expect(s.deps.executions.history).toHaveBeenCalledTimes(1);
         });
         // No matching retired claim row: R never applies; the shared lower needs a live AMI view, which an aged-out host lacks.
         it.each([

@@ -183,38 +183,22 @@ test('released pool host: a release outside this namespace lifecycle machine is 
     for (const releaseExecutionArn of [arn.replace('-lifecycle:', '-recovery:'), arn.replace('123456789012', '999999999999'), arn.replace(':ap-south-1:', ':us-east-1:')])
         assert.throws(() => PreparationDocumentSchema.parse({ ...f.preparation, releasedPoolHost: { ...f.preparation.releasedPoolHost, releaseExecutionArn } }), /release_mismatch/);
 });
-for (const [name, mutate] of [['aged out of EC2', () => {}], ['still listed as a terminated claim', (f: Released) => { terminatedClaim(f); f.state.instances = [f.instance]; }]] as const) {
-    test(`released pool host ${name}: fences at observation, snapshots, never stops or terminates`, async () => {
-        const { f, result, calls } = await runReleased(mutate);
-        assert.deepEqual(calls, ['createSnapshot']);
-        assert.equal(result.output.state, 'snapshot_ready'); assert.equal(result.output.digest, f.reference.digest);
-        assert.ok(Date.parse(result.output.fencedAt) <= Date.parse(result.output.snapshotStartedAt));
-    });
-}
+test('released pool host aged out of EC2: fences at observation, snapshots, never stops or terminates', async () => {
+    const { f, result, calls } = await runReleased();
+    assert.deepEqual(calls, ['createSnapshot']);
+    assert.equal(result.output.state, 'snapshot_ready'); assert.equal(result.output.digest, f.reference.digest);
+    assert.ok(Date.parse(result.output.fencedAt) <= Date.parse(result.output.snapshotStartedAt));
+});
 test('without the released field an absent source stays unfenced (the branch is load-bearing)', async () => {
     const f = preparationFixture(); f.state.instances = []; f.volume.State = 'available'; f.volume.Attachments = [];
     assert.equal((await observe(f)).code, 'writer_not_fenced');
     const r = preparationFixture(releasedFixture()); r.state.instances = []; r.volume.State = 'available'; r.volume.Attachments = [];
     assert.equal((await observe(r)).decision, 'createSnapshot');
 });
-for (const state of ['running', 'pending', 'stopping', 'stopped', 'shutting-down']) {
-    test(`released pool host: a ${state} host is source_identity_mismatch with no provider action`, async () => {
+// Any listed host, even the exact terminated claim of this allocation: launch, recovery and maintenance refuse its claim tags.
+for (const state of ['terminated', 'shutting-down', 'running', 'pending', 'stopping', 'stopped']) {
+    test(`released pool host: a listed ${state} host is source_identity_mismatch with no provider action`, async () => {
         const { result, calls } = await runReleased(f => { terminatedClaim(f); f.instance.State = { Name: state as 'running' }; f.state.instances = [f.instance]; });
-        assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
-    });
-}
-for (const [name, patch] of [['AMI', { ImageId: 'ami-99999999999999999' }], ['zone', { Placement: { AvailabilityZoneId: 'aps1-az2' } }],
-    ['pool-host', { 'ezil:pool-host': '99999999-9999-4999-8999-999999999999' }], ['ezil:computer', { 'ezil:computer': '99999999-9999-4999-8999-999999999999' }],
-    ['ezil:generation', { 'ezil:generation': '2' }], ['ezil:fence', { 'ezil:fence': '99999999-9999-4999-8999-999999999999' }], ['ezil:namespace', { 'ezil:namespace': 'mum' }],
-    ['canonical ezil:computer-id', { 'ezil:computer-id': 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1' }], ['canonical ezil:fence-token', { 'ezil:fence-token': 'x' }],
-    ['spare ezil:pool', { 'ezil:pool': '1' }]] as const) {
-    test(`released pool host: a terminated host with the wrong ${name} is source_identity_mismatch`, async () => {
-        const { result, calls } = await runReleased(f => {
-            terminatedClaim(f); f.state.instances = [f.instance];
-            const tags = Object.entries(patch).filter(([k]) => k.startsWith('ezil:'));
-            if (tags.length) f.instance.Tags = [...f.instance.Tags!.filter(t => !tags.some(([k]) => k === t.Key)), ...tagList(Object.fromEntries(tags))];
-            else Object.assign(f.instance, patch);
-        });
         assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
     });
 }
@@ -235,6 +219,29 @@ test('released pool host: a writer attaching after the fence fails closed while 
     assert.equal((await observe(f, control, 'snapshot')).decision, 'wait');
     Object.assign(f.volume, { State: 'in-use', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: f.volume.VolumeId, State: 'attached' }] });
     assert.deepEqual(await observe(f, control, 'snapshot'), { decision: 'failed', code: 'writer_not_fenced' });
+});
+/** The launch after a released preparation: the app's launch intent re-bound to the released digest (as the subnet test does). */
+async function releasedLaunch(listed: boolean) {
+    const { f, result } = await runReleased();
+    assert.equal(result.output.state, 'snapshot_ready');
+    Object.assign(f.state.executions[f.reference.executionArn]!, { status: 'SUCCEEDED', stopDate: new Date(f.state.now), output: JSON.stringify(result.output) });
+    f.state.now = Date.parse(f.lease.rebasePermit.issuedAt);
+    if (listed) { terminatedClaim(f); f.state.instances = [f.instance]; }
+    f.intent.rebasePreparation!.digest = f.reference.digest;
+    const version = f.intent.deployment.stateMachineVersionArn, machine = version.replace(/:1$/, '');
+    const executionArn = machine.replace(':stateMachine:', ':execution:') + ':computer-' + f.intent.jobId, document = JSON.stringify(f.intent);
+    f.state.executions[executionArn] = { executionArn, stateMachineArn: machine, stateMachineVersionArn: version, name: 'computer-' + f.intent.jobId,
+        input: JSON.stringify({ schemaVersion: 1, document, digest: createHash('sha256').update(document).digest('hex') }),
+        startDate: new Date(f.state.now), status: 'RUNNING', redriveCount: 0 };
+    return { f, executionArn, helper: createLifecycleHelper(f.settings, f.deps) };
+}
+test('released pool host: the launch re-verifies the released preparation and launches over an aged-out source', async () => {
+    const { executionArn, helper } = await releasedLaunch(false);
+    assert.equal((await helper({ executionArn, phase: 'initial' })).decision, 'runInstances');
+});
+test('released pool host: the launch refuses a released claim EC2 still lists, which is why preparation refuses it first', async () => {
+    const { executionArn, helper } = await releasedLaunch(true);
+    await assert.rejects(helper({ executionArn, phase: 'initial' }), /lifecycle_instance_invalid/);
 });
 test('released pool host: canonical volume tags are still required', async () => {
     const { result, calls } = await runReleased(f => { f.volume.Tags = f.volume.Tags!.map(t => t.Key === 'ezil:generation' ? { ...t, Value: '2' } : t); });

@@ -14,7 +14,6 @@ import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-reb
 import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
 import { rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { readReleasedPoolHostProof } from './aws-historical-source';
-import { releasedPoolSourceTags } from './aws-rebase-generation';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -77,18 +76,14 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             return reply(isTerminalImageJob(j.phase) || j.phase === 'failed' ? 200 : 202, j.failureCode === null);
         }
         /** DESIGN R: a STOPPED computer's released warm-pool host. Its retired claim row switches the source evidence to the
-         * provision (b) and release (a) proofs plus an EC2 view of exactly that host, absent or terminated; no row, no change. */
+         * provision (b) and release (a) proofs; no row, no change. EC2 must no longer list the host: launch, recovery and
+         * maintenance accept an absent source but refuse a listed claim, after the snapshot. Retry once it ages out. */
         const releasedSource = async (d: LifecycleDeployment) => {
             const found = await deps.store.releasedPoolHost(p.computerId);
             if (!found.row) return null;
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
             const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
-            if (!proof) throw new Error('source_identity_mismatch');
-            const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId!);
-            if (host && (host.instanceId !== p.instanceId || host.state !== 'terminated' || host.availabilityZoneId !== p.zoneId
-                || host.imageId !== proof.provisioned.amiId || host.tags['ezil:pool-host'] !== proof.poolHostId
-                || !releasedPoolSourceTags(host.tags, { namespace: d.namespace, computerId: p.computerId, generation: p.generation, fenceToken: p.fenceToken! })))
-                throw new Error('source_identity_mismatch');
+            if (!proof || await deps.describer.describeForEnrollment(p.region!, p.instanceId!)) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: never use them for a placement or row that changed meanwhile.
             if (!isDeepStrictEqual(found, await deps.store.releasedPoolHost(p.computerId))) throw new ImageJobConflictError();
             return proof;
