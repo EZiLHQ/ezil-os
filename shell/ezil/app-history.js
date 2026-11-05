@@ -96,6 +96,8 @@ export function codeParams (value) {
     if ( out.folder !== undefined ) {
         const parsed = parseFolder(out.folder);
         if ( ! out.folder.startsWith('/') || parsed.folder !== out.folder ) return null;
+        // `../app-link.js` refuses a folder beside a project or repository; never write what a reload would refuse.
+        if ( out.project !== undefined || out.repo !== undefined ) return null;
     }
     return out;
 }

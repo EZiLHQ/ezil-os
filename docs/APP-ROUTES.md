@@ -110,8 +110,12 @@ string. It returns `null` (open nothing) or
   (`worker/src/code-folder.ts`: outside the workspace, `.ezil/**` and a
   project's `projects/<uuid>/**` are refused; every component must be a real
   directory, never a link). Rules:
-  - `<path>` is absolute (`/workspace/a`) or relative to `/workspace`, the
-    workspace root of every computer (`a`, `./a`). `/` may be written as is or
+  - `<path>` is absolute (`/workspace/a`) or relative to `/workspace` (`a`,
+    `./a`), the workspace root of an AWS computer and of a Cloudflare computer
+    whose workspace is mounted. An unmounted Cloudflare computer's root is
+    `/home/neko/project` (`REPO_OPEN_UNMOUNTED_ROOT`): there a `/workspace`
+    link answers `outside` (default folder and the notice), and only an
+    absolute `/home/neko/project/...` link opens. `/` may be written as is or
     as `%2F`; a space as `%20` (or `+`); a literal `+` as `%2B`; any other
     character percent-encoded as UTF-8. Spaces and Unicode are kept as they are.
   - `.`, empty segments and a trailing `/` go; `..` is resolved lexically, so
@@ -217,9 +221,11 @@ code-server's workbench document on both computers
 - **What each switch writes.** A folder: `?folder=<path>`. Close Folder (the
   empty window), a workspace (several roots, a `.code-workspace`) or another
   scheme: bare `/app/code`, so a reload opens the default folder (the tab
-  record is cleared or marked, as before). A folder inside a project's
-  checkout keeps the project's own keys and adds `folder`; one outside it is
-  the person's own files (`folder` alone). Creating, renaming or deleting
+  record is cleared or marked, as before). In a project's window, a folder
+  inside its checkout writes the project's own keys alone (never `folder`
+  beside them: §2 refuses that combination, so the shell never writes an
+  address it would refuse on reload; a reload opens the project's folder),
+  and one outside it is the person's own files (`folder` alone). Creating, renaming or deleting
   folders inside the root navigates nothing, so it writes nothing.
 - **What a mint's first document writes.** The asked folder, or the default
   when nothing was asked: `replace` with that folder. A different one (the
@@ -243,7 +249,11 @@ code-server's workbench document on both computers
   Code asks this module to undo that last traversal (`ezil:app-history-undo`),
   so the tab is back on the entry the editor shows and Back can be asked
   again. With no traversal to undo (an editor's own switch it then refused),
-  the address is rewritten to what the editor shows.
+  the address is rewritten to what the editor shows. Known limit (independent
+  review): `leaving` is sent at `beforeunload`, before the browser shows its
+  dialog, so a "Stay" answered after more than 3 s leaves the address on the
+  new entry for a few seconds until the address follows the editor again
+  (measured: healed by about 10 s; no entry lost or rewritten).
 - **Reload, reconnect, sign-in.** The address carries the folder, so a reload
   mints with it; a re-mint (restart, reconnect, Try again) asks for the folder
   the window shows; a signed-out link keeps its query through sign-in (§2

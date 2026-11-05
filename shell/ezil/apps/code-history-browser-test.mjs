@@ -145,20 +145,21 @@ const computerId = '11111111-1111-4111-8111-111111111111';
 const userId = '33333333-3333-4333-8333-333333333333';
 const errors = [];
 
-async function tab (start = '/os', { record } = {}) {
+async function tab (start = '/os', { record, windowed = false } = {}) {
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    await context.addInitScript(({ computerId, userId, record }) => {
+    await context.addInitScript(({ computerId, userId, record, windowed }) => {
         window.__EZIL_BOOT__ = { user: { id: userId, email: 'fixture@example.test' },
             computer: { id: computerId, name: 'Fixture computer', slot: 1 }, apps: [{ id: 'desktop' }],
             desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle', ui: { floatingControls: false, feedbackScreenshots: false } } };
         // Next's App Router keys, as on the real page (a popstate without them would reload the page).
-        history.replaceState({ ...history.state, __NA: true }, '', location.href);
+        // `windowed`: the entry recorded Code windowed (docs/APP-ROUTES.md §3), so the dock stays reachable.
+        history.replaceState({ ...history.state, __NA: true, ...(windowed ? { ezilApp: 'code', ezilView: 'window' } : {}) }, '', location.href);
         // A stale tab record, written once per test tab (the explicit link must win over it).
         if ( record && ! sessionStorage.getItem('fixture-seeded') ) {
             sessionStorage.setItem('fixture-seeded', '1');
             sessionStorage.setItem('ezil-os:code.folder.v1', JSON.stringify({ v: 1, entries: { [`${userId}\n${computerId}\n\n`]: { v: 1, kind: 'folder', path: record, at: 1 } } }));
         }
-    }, { computerId, userId, record: record ?? null });
+    }, { computerId, userId, record: record ?? null, windowed });
     const page = await context.newPage();
     page.setDefaultTimeout(20_000);
     page.on('pageerror', e => errors.push(e.message));
@@ -201,6 +202,7 @@ const lastAsk = () => asks.at(-1);
     const bDoc = docs.length - 1;
     ok(bDoc === aDoc + 1, `switch: the editor loaded once, never torn down and re-inserted [${docs.slice(aDoc)}]`);
     ok(on('beforeunload', aDoc), 'switch: the document the switch left went through its own beforeunload');
+    ok(! on('pagehide', bDoc), 'switch: the new document is never torn down while it is on screen');
 
     // Back: the address AND the editor return to A; Forward: both to B (the old F2, now a passing regression).
     await t.page.goBack();
@@ -230,8 +232,12 @@ const lastAsk = () => asks.at(-1);
 
     // Reconnect (a restart re-mints): the live frame is navigated, never removed, at the same folder.
     const old = docs.length - 1;
+    const mintsBefore2 = mints;
+    const lenBeforeRemint = await t.len();
     await t.page.evaluate((computerId) => window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } })), computerId);
     await t.quiet();
+    ok(mints === mintsBefore2 + 1, `reconnect: the restart re-minted once [${mints - mintsBefore2}]`);
+    ok(await t.len() === lenBeforeRemint + 1, 'reconnect: known, pre-existing cost: the re-mint navigates the frame (src), which adds one entry');
     ok(lastAsk().codeFolder?.path === '/workspace/b', `reconnect: the re-mint asked for the folder on screen [${JSON.stringify(lastAsk())}]`);
     ok(await t.waitEditor('/workspace/b'), 'reconnect: the editor reopens at /workspace/b');
     ok(on('beforeunload', old), 'reconnect: the live editor document went through its own beforeunload (navigated, never removed)');
@@ -296,6 +302,46 @@ const lastAsk = () => asks.at(-1);
     ok((await t.notice().getAttribute('data-outcome')) === 'missing', 'missing: a visible notice says so');
     await t.quiet();
     ok(await t.address() === '/app/code?folder=/workspace/nope', `missing: the address keeps the asked folder for a reload or Try again [${await t.address()}]`);
+    await t.context.close();
+}
+
+// ── D6: a folder the server refused is never opened from an address, even when Back names it ───────────────
+{
+    const t = await tab(`/app/code?folder=${enc('/workspace/nope')}`, { windowed: true });
+    await t.waitEditor(DEFAULT); await t.notice().waitFor(); await t.quiet();
+    ok(await t.address() === '/app/code?folder=/workspace/nope', 'D6: the refused folder stays in the address');
+    await t.page.locator('.taskbar-item[data-app="settings"]').click(); await t.at('/app/settings');
+    const docsBefore = docs.length, mintsBefore = mints;
+    await t.page.goBack(); // the entry names /workspace/nope; the browser has no other editor document to restore for it
+    await t.quiet();
+    ok(docs.length === docsBefore && mints === mintsBefore && t.editorFolder() === DEFAULT,
+        `D6: Back to it neither opens the refused folder nor mints [docs +${docs.length - docsBefore}, mints +${mints - mintsBefore}, editor ${t.editorFolder()}]`);
+    ok(await t.waitAddress(`/app/code?folder=${DEFAULT}`), `D6: the address follows the editor instead [${await t.address()}]`);
+    await t.context.close();
+}
+
+// ── Code open, another app pushed, Code back, Open Folder (the old F2 shape) ───────────────────────────────
+{
+    const t = await tab(`/app/code?folder=${enc('/workspace/a')}`, { windowed: true });
+    await t.waitEditor('/workspace/a'); await t.waitAddress('/app/code?folder=/workspace/a');
+    await t.page.locator('.taskbar-item[data-app="settings"]').click(); await t.at('/app/settings');
+    await t.page.locator('.taskbar-item[data-app="code"]').click(); await t.at('/app/code');
+    ok(await t.address() === '/app/code?folder=/workspace/a', `F2 shape: Code back in front names its folder [${await t.address()}]`);
+    const before = docs.length;
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
+    ok(await t.waitEditor('/workspace/b') && await t.waitAddress('/app/code?folder=/workspace/b'), 'F2 shape: Open Folder after a shell push moves both');
+    await t.quiet();
+    ok(docs.length === before + 1 && ! on('pagehide', docs.length - 1), 'F2 shape: one editor load, never torn down');
+    const path = [];
+    for (const step of [-1, -1, -1, +1, +1, +1]) {
+        if (step < 0) await t.page.goBack(); else await t.page.goForward();
+        await t.quiet();
+        path.push(`${await t.address()}|${t.editorFolder()}`);
+    }
+    ok(JSON.stringify(path) === JSON.stringify([
+        '/app/code?folder=/workspace/a|/workspace/a', '/app/settings|/workspace/a', '/app/code?folder=/workspace/a|/workspace/a',
+        '/app/settings|/workspace/a', '/app/code?folder=/workspace/a|/workspace/a', '/app/code?folder=/workspace/b|/workspace/b',
+    ]), `F2 shape: Back x3 and Forward x3 keep every address and editor together [${path.join(' ; ')}]`);
     await t.context.close();
 }
 

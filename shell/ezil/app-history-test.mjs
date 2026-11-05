@@ -930,7 +930,19 @@ same(routeLaunchContext({ id: 'code', folderRejected: 'outside' }), { folderReje
         same([url(), w.history.length], [`/app/code?folder=/workspace/c&computer=${C}`, len0 + 3], `refused: ${what}`);
     }
     params({ project: P, repo: R, folder: `/workspace/projects/${R}/repository/web` });
-    same(url(), `/app/code?project=${P}&repo=${R}&folder=/workspace/projects/${R}/repository/web&computer=${C}`, "a project's keys ride along");
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, 'a folder beside a project is never written (the parser would refuse it on reload)');
+    params({ repo: 'https://github.com/a/b.git', folder: '/workspace/projects/x/web' });
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, '... nor beside a repository address');
+    params({ project: P, repo: R }, 'replace');
+    same(url(), `/app/code?project=${P}&repo=${R}&computer=${C}`, "a project's own keys are written");
+    params({ folder: '/workspace/c' }, 'replace');
+    // A click on Code itself while its entry is current takes nothing, but its launch is opening: nothing is
+    // written until it ends (the `holds` rule, docs/APP-ROUTES.md §5 "Order").
+    const own = controller.begin('code');
+    params({ folder: '/workspace/held' });
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, "while a click's launch on Code itself is opening, nothing is written");
+    own.end(code);
+    params({ folder: '/workspace/c' }, 'replace');
     focus(settings);
     const len1 = w.history.length;
     params({ folder: '/workspace/d' });
@@ -954,6 +966,12 @@ same(routeLaunchContext({ id: 'code', folderRejected: 'outside' }), { folderReje
     await traverse(-1);
     params({ folder: '/workspace/g' });
     same(undo(), false, 'a push after the Back ends what an undo could mean');
+    // The tab moved by something this module did not write (another script's pushState): the traversal is stale.
+    params({ folder: '/workspace/h' });
+    await traverse(-1);
+    w.history.pushState(w.history.state, '', w.location.href);
+    const before = w.history.length;
+    same([undo(), w.history.length], [false, before], 'a tab no longer on the entry the Back landed on is never moved');
     Object.defineProperty(w, 'navigation', { configurable: true, value: undefined });
     await traverse(-1);
     same(undo(), false, 'without the Navigation API nothing is undone (the window rewrites the address instead)');

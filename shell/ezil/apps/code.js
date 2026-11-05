@@ -683,14 +683,18 @@ export async function openCodeWindow (ctx = {}) {
     let route_timer = null;
     let leaving_timer = null;
     const inside = (path, root) => typeof root === 'string' && (path === root || path.startsWith(`${root}/`));
-    /** The Code parameters for what the editor shows: the project's own keys, and `folder` unless it is the project's own. */
+    /**
+     * The Code parameters for what the editor shows. Own files: `folder`. A project's folder, or any folder inside
+     * its checkout: the project's own keys alone, exactly what `../app-link.js` reads back (a folder beside a
+     * project is refused there until the server can confine it to the checkout, so it is never written either).
+     * Outside the checkout the person is in their own files: `folder` alone.
+     */
     const params_for = (root) => {
         const own = project?.repoUrl ? { repo: project.repoUrl }
             : project ? { project: project.projectId, repo: project.repoId, ...(project.path ? { path: project.path } : {}) } : {};
         if ( root?.kind !== 'folder' ) return own;
-        // Outside the project's checkout the person is in their own files.
-        if ( project && repository_folder && ! inside(root.path, repository_folder) ) return { folder: root.path };
-        return root.path === repository_folder ? own : { ...own, folder: root.path };
+        if ( ! project ) return { folder: root.path };
+        return repository_folder && ! inside(root.path, repository_folder) ? { folder: root.path } : own;
     };
     /** Say what the editor shows to the address bar (`../app-history.js` owns it): 'push' adds an entry, 'replace' rewrites this one. */
     const announce_root = (mode, root) => {
