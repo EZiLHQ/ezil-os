@@ -5,6 +5,7 @@ root is resolved one component at a time with O_DIRECTORY|O_NOFOLLOW relative to
 parent fd; files are read only after fstat proves S_ISREG on the same inode; entries
 are unlinked/renamed as entries (never followed); device nodes are never opened.
 """
+import errno
 import os
 import stat
 
@@ -33,6 +34,80 @@ def open_dir_below(root, rel):
         os.close(fd)
         fd = nfd
     return fd
+
+
+# Per-tab Code folder continuity (edge `folder` op; docs/contracts/code-folder-v1.vectors.json).
+FOLDER_MAX_BYTES = 2048
+FOLDER_MAX_SEGMENT_BYTES = 255
+FOLDER_MAX_SEGMENTS = 64
+
+
+def plain_rel(rel):
+    """The Worker's lexical rule for a remainder below the workspace root: '' (the root itself) or
+    '/'-joined segments, none empty, '.' or '..', no control character or backslash, well-formed
+    UTF-8, at most 64 segments of at most 255 bytes and 2048 bytes in all. True/False only."""
+    if not isinstance(rel, str):
+        return False
+    try:
+        raw = rel.encode("utf-8", "strict")
+    except UnicodeEncodeError:            # a lone surrogate
+        return False
+    if len(raw) > FOLDER_MAX_BYTES:
+        return False
+    if rel == "":
+        return True
+    if any(ord(c) < 0x20 or ord(c) == 0x7F or c == "\\" for c in rel):
+        return False
+    segs = rel.split("/")
+    return len(segs) <= FOLDER_MAX_SEGMENTS and all(
+        s not in ("", ".", "..") and len(s.encode("utf-8")) <= FOLDER_MAX_SEGMENT_BYTES for s in segs)
+
+
+def classify_dir_below(root, rel):
+    """'ok' | 'missing' | 'not_directory' | 'symlink' | 'bad_path' for root/rel. Every component
+    (rel's, never root's own ancestors, which are host paths) is lstat-ed relative to its parent
+    fd and opened O_DIRECTORY|O_NOFOLLOW, so no symlink is ever followed and a race that swaps a
+    component for a link or a file between the lstat and the open is still refused (ELOOP/ENOTDIR).
+    Nothing is created; nothing but directory metadata is read."""
+    if not plain_rel(rel):
+        return "bad_path"
+    try:
+        fd = os.open(root, DIR_FLAGS)
+    except OSError as e:
+        # O_DIRECTORY|O_NOFOLLOW on a link answers ENOTDIR on Linux: lstat says which it was.
+        try:
+            st = os.lstat(root)
+        except OSError:
+            return "missing"
+        return "symlink" if stat.S_ISLNK(st.st_mode) else "not_directory" if e.errno in (errno.ENOTDIR, errno.ELOOP) else "missing"
+    try:
+        for comp in (rel.split("/") if rel else []):
+            try:
+                st = os.stat(comp, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return "missing"
+            except OSError as e:
+                return "not_directory" if e.errno == errno.ENOTDIR else "missing"
+            if stat.S_ISLNK(st.st_mode):
+                return "symlink"
+            if not stat.S_ISDIR(st.st_mode):
+                return "not_directory"
+            try:
+                nfd = os.open(comp, DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                # Raced between the lstat and the open: never followed either way; name what it is now.
+                if e.errno == errno.ELOOP:
+                    return "symlink"
+                try:
+                    now = os.stat(comp, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    return "missing"
+                return "symlink" if stat.S_ISLNK(now.st_mode) else "not_directory"
+            os.close(fd)
+            fd = nfd
+        return "ok"
+    finally:
+        os.close(fd)
 
 
 def read_regular_at(dfd, name, st=None, limit=None):
