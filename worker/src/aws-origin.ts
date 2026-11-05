@@ -351,8 +351,10 @@ async function withCodeFolderBridge(res: Response, origins: readonly string[]): 
   if (origins.length === 0 || !isHtmlDocument(res.status, res.headers.get('content-type'))) return res;
   const html = await res.text();
   const headers = new Headers(res.headers);
-  // The body changed: its old length no longer holds (the runtime encodes it again from Content-Encoding).
-  headers.delete('content-length');
+  // The body changed, as on the Cloudflare host (`preview-bridge.ts` STRIP_RESPONSE_HEADERS): its old length and
+  // validators no longer hold (the runtime encodes it again from Content-Encoding), and it is never cached.
+  for (const name of ['content-length', 'etag', 'last-modified']) headers.delete(name);
+  headers.set('cache-control', 'no-cache, no-store');
   return new Response(injectCodeFolderBridge(html, origins), { status: res.status, statusText: res.statusText, headers });
 }
 

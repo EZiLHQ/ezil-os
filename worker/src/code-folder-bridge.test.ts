@@ -286,12 +286,16 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
       codeShellOrigins: origins,
     }))!;
   };
-  const html = () => new Response(WORKBENCH, { headers: { 'content-type': 'text/html', 'content-length': String(WORKBENCH.length), 'x-keep': '1' } });
-  it('the workbench document gets the bridge, without its stale length', async () => {
+  const html = () => new Response(WORKBENCH, { headers: { 'content-type': 'text/html', 'content-length': String(WORKBENCH.length), 'x-keep': '1',
+    etag: 'W/"1"', 'last-modified': 'Thu, 05 Nov 2026 00:00:00 GMT' } });
+  it('the workbench document gets the bridge, without its stale length or validators, never cached', async () => {
     const res = await call(CODE_PREVIEW_PORT, '/?folder=/workspace', html());
     expect(res.status).toBe(200);
     expect(await res.text()).toContain(BRIDGE_MARKER);
     expect(res.headers.get('content-length')).toBeNull();
+    expect(res.headers.get('etag')).toBeNull();
+    expect(res.headers.get('last-modified')).toBeNull();
+    expect(res.headers.get('cache-control')).toBe('no-cache, no-store');
     expect(res.headers.get('x-keep')).toBe('1');
   });
   it('other ports, paths, methods and answers pass through untouched', async () => {
