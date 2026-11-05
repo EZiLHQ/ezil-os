@@ -16,6 +16,10 @@ import { handlePoolClaim } from './aws-pool-claim';
 import { buildLifecycleWork } from './aws-intent';
 import { failedReplaceHistory } from './aws-historical-source.test-support';
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+// Recognize readPoolDemand's aggregate projection, not the first eligibility CTE:
+// paid standing/funding now precede `effective`. Keep fault injection on this same query.
+const isPoolDemandQuery = (query: string) => /\bAS opens,/.test(query)
+    && /\bAS idle_ready,/.test(query) && /\bAS booting,/.test(query);
 function harness() {
     vi.stubEnv('AWS_REGIONS', 'ap-south-1'); vi.stubEnv('EZIL_AWS_MAX_RUNNING_AP_SOUTH_1', '5'); vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
     const f = poolFixture(); const c = { region: f.row.region, zoneId: f.row.zoneId, instanceType: 'm6i.large' as const };
@@ -26,7 +30,7 @@ function harness() {
     const trace: string[] = []; const state = { subscribers: 1, vcpu: 0, migrations: 0, insert: true, save: true };
     const db: PlacementDb = { execute: vi.fn(async query => {
         const q = new PgDialect().sqlToQuery(query); trace.push(q.sql); const p = q.params;
-        if (/WITH\s+effective/.test(q.sql)) return [{ opens: 0, standard: state.subscribers, premium: 0, spares: 0, vcpu: state.vcpu,
+        if (isPoolDemandQuery(q.sql)) return [{ opens: 0, standard: state.subscribers, premium: 0, spares: 0, vcpu: state.vcpu,
             boot_minutes: null, idle_ready: [], booting: [] }];
         if (q.sql.includes('SELECT count(*) AS count')) return [{ count: state.migrations }];
         if (q.sql.includes('INSERT INTO public.ezil_compute_pool_hosts')) { row.id = p[0]; return state.insert ? [row] : []; }
@@ -269,8 +273,10 @@ function session() {
 it('records pool enrollment completion only at session-ready and leaves replay timestamp intact', async () => {
     const f = session(); expect((await handlePoolSessionReady(f.request(), f.deps)).status).toBe(200);
     expect(f.finish).toHaveBeenCalledWith(expect.anything(), { computerId: f.p.computerId, expected: f.p, success: true, poolClaim: true, sessionReady: true });
+    expect(f.timestamp).toHaveBeenCalledExactlyOnceWith(expect.anything(), f.row.poolHostId, f.p, f.p.updatedAt);
     f.p.lastError = placement.ENROLLMENT_SUCCEEDED;
     expect((await handlePoolSessionReady(f.request(), f.deps)).status).toBe(200); expect(f.finish).toHaveBeenCalledOnce();
+    expect(f.timestamp).toHaveBeenCalledOnce();
 });
 it.each(['health', 'claim', 'binding', 'tags', 'pending', 'finished', 'timestamp'])('session readiness refuses %s', async guard => {
     const f = session(); let req = f.request();
@@ -456,13 +462,13 @@ it.each(['cancelled','deployment','unknown'])('absent provision replay rechecks 
     await h.store.reconcile!().catch(()=>{});
     expect(h.sdk.starter.start).not.toHaveBeenCalled();
     expect(h.row).toMatchObject({state:'booting',dispatch_status:'pending',lifecycle_input:w.input,lifecycle_digest:w.digest});
-    if(fault==='cancelled')expect(h.trace.filter(q=>/WITH\s+effective/.test(q)).length).toBeGreaterThan(1);
+    if(fault==='cancelled')expect(h.trace.filter(isPoolDemandQuery).length).toBeGreaterThan(1);
 });
 it.each(['cancelled','deployment','unknown'])('provision authority rechecks %s rather than trusting a stored reservation', async fault=>{
     const h=harness(),w=await h.prepare(),i=w.intent;
     if(fault==='cancelled')h.state.subscribers=0;
     if(fault==='deployment')h.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS='{}';
-    if(fault==='unknown') {const execute=h.db.execute; h.db.execute=vi.fn(q=>new PgDialect().sqlToQuery(q).sql.match(/WITH\s+effective/)?Promise.reject(new Error('unavailable')):execute(q));}
+    if(fault==='unknown') {const execute=h.db.execute; h.db.execute=vi.fn(q=>isPoolDemandQuery(new PgDialect().sqlToQuery(q).sql)?Promise.reject(new Error('unavailable')):execute(q));}
     expect(await poolJobAuthority(h.db,{computerId:i.computerId,jobId:i.jobId,digest:w.digest,leaseEpoch:i.leaseEpoch,
         poolHostId:i.poolHostId!,poolGeneration:i.poolGeneration!,operation:i.operation},h.env)).toBe(false);
 });
