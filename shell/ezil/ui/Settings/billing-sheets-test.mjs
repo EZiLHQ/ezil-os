@@ -480,7 +480,9 @@ test('v3 cancel states the computer outcome: Free limits on 2 vCPU, cannot open 
     const placed = { 'std-2': { size: 'std-2', vcpu: 2, memoryGiB: 8 }, 'cmp-4': { size: 'cmp-4', vcpu: 4, memoryGiB: 16 }, 'cmp-8': { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } };
     const premium = (computer = {}) => { const s = summaryV3('premium'); Object.assign(s.computer, { filesOn: 'aws', standing: 'paid', awsSize: placed['std-2'], ...computer }); return s; };
     h.summary = premium(); await h.ready('cancel');
-    assert.match(h.text(), /Your plan stays active until Nov 1, then moves to Free\. After Nov 1 your computer opens under Free limits \(sessions up to 1 hour\); your files stay on your AWS computer\./);
+    // Founder 2026-11-05: "Free limits", never the Free session's length as a number.
+    assert.match(h.text(), /Your plan stays active until Nov 1, then moves to Free\. After Nov 1 your computer opens under Free limits; your files stay on your AWS computer\./);
+    assert.doesNotMatch(h.text(), /\b(1|one)[- ]hours?\b|sessions up to 1/i);
     const texts = [h.text()];
     for ( const [size, vcpu] of [['cmp-4', 4], ['cmp-8', 8]] ) {
         h.handle.close(); h.summary = premium({ awsSize: placed[size] }); await h.ready('cancel');
@@ -531,7 +533,9 @@ for ( const tier of ['free'] ) test(`v3 ${tier} limit stop opens one session-end
     assert.ok(h.q('[data-sheet="session-end"]'));
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 4);
-    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard: sessions up to 6 hours — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    // Founder 2026-11-05: the Free session is named, never its length as a number; Standard keeps its six hours.
+    assert.match(h.text(), tier === 'free' ? /Your Free session ended\. Standard: sessions up to 6 hours — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    assert.doesNotMatch(h.text(), /\b(1|one)[- ]hours?\b/i);
     h.click('[data-action="continue"]'); await settle();
     if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
     else assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });

@@ -87,15 +87,15 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     // Nothing read yet is a load in progress, never a failure (live staging 2026-11-01: a 0.2 s "couldn't read" flash).
     const left = !lines ? usageLoading ? 'Checking…' : 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
     const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
-    const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? usageLoading ? '' : "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
         : lines?.equivalents ? esc(lines.equivalents)
         // Round 6 (R4-02): a held 4 or 8 vCPU computer has no Free session to describe; it can't open on Free.
-        : closed ? esc(heldClosedText(closed.vcpu))
-        : free && sessionHours ? `Free sessions last up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}.` : '';
+        // Founder 2026-11-05: no Free session length as a number here; the month's time above and a running session's
+        // end time below stay.
+        : closed ? esc(heldClosedText(closed.vcpu)) : '';
     const ai = summary?.ai, grant = ai?.grant;
     // Round 5 D1: an account without EZiL ID has its credits parked; the server says so, never "Unavailable".
     const enrollment = ai ? ai.enrollment ?? 'enrolled' : null;

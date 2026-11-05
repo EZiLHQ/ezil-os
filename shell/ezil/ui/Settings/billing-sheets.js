@@ -191,9 +191,8 @@ function cancelCopyV3 (summary, trial = null) {
     const placed = summary.computer.awsSize;
     if ( ! placed || ! ['std-2', 'cmp-4', 'cmp-8'].includes(placed.size) ) return `${lead} Your files stay on your AWS computer.`;
     if ( placed.size !== 'std-2' && Number.isSafeInteger(placed.vcpu) ) return `${lead} ${after} your ${placed.vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer.`;
-    const cap = summary.catalog?.offers?.find(offer => offer.sku === 'free_v3')?.sessionMaxSeconds;
-    const hours = Number.isSafeInteger(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
-    return `${lead} ${after} your computer opens under Free limits${hours ? ` (sessions up to ${hours} hour${hours === 1 ? '' : 's'})` : ''}; your files stay on your AWS computer.`;
+    // Founder 2026-11-05: "Free limits", never the Free session's length as a number.
+    return `${lead} ${after} your computer opens under Free limits; your files stay on your AWS computer.`;
 }
 
 /**
@@ -413,7 +412,8 @@ export function openSessionEndSheet (options) {
     const longer = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600 ? `sessions up to ${offer.sessionMaxSeconds / 3600} hours` : 'longer sessions';
     // Standard trial: the free month this viewer is offered, $0 today; the checkout confirms the exact end.
     const trial = free && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
-    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: ${longer} — ${trial
+    // Founder 2026-11-05: the Free session is named, never its length as a number; the paid plan keeps its six hours.
+    sheet.node('p', `Your Free session ended. ${offer.name}: ${longer} — ${trial
         ? `$0 today, then ${money(trial.amountCents)}/month from ${trialDayLabel(trial.endsAt)} unless you cancel` : `${money(offer.priceCents)}/month`}.`);
     offerDetails(sheet, offer);
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');

@@ -246,9 +246,12 @@ test('payment_pending: "Your free month has ended. We\'re collecting your first 
         assert.equal(el.querySelector('[data-action="upgrade"], [data-action="trial"], [data-action="checkout"], [data-action="resume"]'), null, standing);
         // Review U2: the server's cancel (actions.cancel) is offered; its sheet says what it does and does not do.
         assert.equal(clean(el.querySelector('.ezil-billing-v3-footer [data-action="cancel"]')), 'Cancel plan', standing);
-        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions.
-        assert.match(clean(el.querySelector('[data-role="your-computer"]')), standing === 'free'
-            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare Sessions up to 1 hour/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\) Sessions up to 1 hour on Free/, standing);
+        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions, and (founder
+        // 2026-11-05) never the Free session's length as a number.
+        const computer = clean(el.querySelector('[data-role="your-computer"]'));
+        assert.match(computer, standing === 'free'
+            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\)/, standing);
+        assert.doesNotMatch(computer, /Sessions up to|\bhours?\b/, standing);
     }
     // No cancel from the server: none offered.
     const noCancel = trialSummaryV3('payment_pending'); noCancel.actions.cancel = false;
@@ -544,6 +547,48 @@ test('plan picker and session end: Standard is the free month when offered (chec
     // The top-up recovery dialog offers the same free month.
     assert.deepEqual(plain(h.api.topupUpgrade(trialSummaryV3('offer'))), { action: 'trial', sku: 'standard_monthly_v3', label: 'Start your free month', note: 'Standard adds 200 AI credits every month.' });
     assert.equal(h.api.topupUpgrade(trialSummaryV3('ineligible')).action, 'checkout');
+});
+
+// ── Founder 2026-11-05: no Free session length as a number on any Free-context surface ──
+
+test('Free copy inventory: Billing, offers, Usage, cancel, session end and the plan picker never give the Free session a length', async h => {
+    const freeHour = /\b(1|one)[- ]hours?\b|sessions? (last|up to) (1|one)\b|up to an hour/i;
+    const held = () => { const s = summaryV3('free'); Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } }); return s; };
+    const summaries = [summaryV3('free'), held(), trialSummaryV3('offer'), trialSummaryV3('ineligible'),
+        trialSummaryV3('payment_pending', { standing: 'free' }), trialSummaryV3('payment_pending', { standing: 'files_on_aws' }),
+        trialSummaryV3('payment_failed', { standing: 'files_on_aws' })];
+    const texts = [];
+    for ( const summary of summaries ) {
+        texts.push(clean(h.fragment(h.api.summaryV3Html(summary))));
+        texts.push(clean(h.fragment(h.api.usageHtml(usageSample, summary))));
+    }
+    // The Free offer card's configuration line and the paid cards' six hours.
+    const offers = h.fragment(h.api.summaryV3Html(summaryV3('free')));
+    assert.doesNotMatch(clean(offers.querySelector('[data-role="plan-offer"][data-sku="free_v3"]')), /sessions up to|\bhours?\b/i);
+    assert.match(clean(offers.querySelector('[data-role="plan-offer"][data-sku="standard_monthly_v3"]')), /Sessions up to 6 hours/);
+    // A paid plan cancelled onto a held 2 vCPU computer, and a trial cancel: "Free limits", no length.
+    const paid = summaryV3('premium'); Object.assign(paid.computer, { filesOn: 'aws', standing: 'paid', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } });
+    const trialing = trialSummaryV3('trialing'); Object.assign(trialing.computer, { filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } });
+    for ( const summary of [paid, trialing] ) {
+        h.handle = h.api.openCancelSheet({ container: h.q('#container'), summary, trpc: h.trpc, onDone: () => {}, onClose: () => {} });
+        const sheet = clean(h.q('[data-role="billing-sheet"]'));
+        assert.match(sheet, /your computer opens under Free limits; your files stay on your AWS computer\./);
+        texts.push(sheet);
+        h.handle.close();
+    }
+    for ( const summary of [summaryV3('free'), trialSummaryV3('offer')] ) {
+        h.handle = h.api.openSessionEndSheet({ container: h.q('#container'), summary, reason: 'session_max', trpc: h.trpc, onClose: () => {}, checkout: () => {} });
+        const sheet = clean(h.q('[data-sheet="session-end"]'));
+        assert.match(sheet, /Your session ended\s*Your Free session ended\. Standard: sessions up to 6 hours/);
+        texts.push(sheet);
+        h.handle.close();
+        h.handle = h.api.openPlanPickerSheet({ container: h.q('#container'), summary, trpc: h.trpc, onClose: () => {}, checkout: () => {} });
+        texts.push(clean(h.q('[data-role="billing-sheet"]')));
+        h.handle.close();
+    }
+    for ( const text of texts ) assert.doesNotMatch(text, freeHour, text.slice(0, 200));
+    // Truthful operational lines stay: the month's time left (also under an hour) is not a session length.
+    assert.ok(texts.some(text => /left this month|hours of computer time each month|Free limits/.test(text)), 'the Free limits are still said');
 });
 
 // ── Usage: no new meter, the authoritative balance, plan-labelled credits ─────

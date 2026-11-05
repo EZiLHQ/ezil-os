@@ -533,7 +533,8 @@ function yourComputerV3 (summary) {
     const free = plan.sku === 'free_v3' || standing === 'free' || standing === 'files_on_aws';
     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
     const gb = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
-    // Round 6 (R1-11): one provider string, "AWS (India)", on every tab; the Free limits are the session line below.
+    // Round 6 (R1-11): one provider string, "AWS (India)", on every tab. Founder 2026-11-05: a computer that runs as Free
+    // (Free, held on AWS, or a paid plan the server rates as Free) shows no session length; a paid one keeps its six hours.
     const held = standing === 'files_on_aws';
     // Round 6 (R4-02): a held 4 or 8 vCPU computer is shown at its own size, and says it can't open on Free.
     const closed = held ? heldClosedSize(computer) : null;
@@ -543,7 +544,8 @@ function yourComputerV3 (summary) {
     const parts = [size, gb ? `${gb} GB disk` : 'files saved between sessions', where];
     return `<div class="ezil-billing-computer" data-role="your-computer">
         <p><span class="ezil-billing-note">Your computer</span> <strong>${encode(parts.join(' · '))}</strong></p>
-        ${paragraph(closed ? "Can't open on the Free plan at this size" : hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
+        ${closed ? paragraph("Can't open on the Free plan at this size", 'ezil-billing-note') : free ? ''
+            : paragraph(hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}`, 'ezil-billing-note')}
         ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 
@@ -602,8 +604,9 @@ function offerCardV3 (summary, offer) {
     const configs = (offer.machineChoice ?? []).map(code => {
         const size = sizeInfoV3(summary, code);
         if ( ! size ) return '';
-        // Paid compute policy v1: no plan card sells monthly computer hours; each configuration shows its session length.
-        const time = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
+        // Paid compute policy v1: no plan card sells monthly computer hours; each paid configuration shows its session
+        // length. Founder 2026-11-05: Free's is never shown as a number.
+        const time = offer.sku !== 'free_v3' && Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
             ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}` : '';
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
         return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}${time ? ` <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span>` : ''}</li>`;
