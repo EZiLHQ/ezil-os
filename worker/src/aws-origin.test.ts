@@ -351,17 +351,23 @@ describe('handleAwsPreview', () => {
   const answer = async (res: Response) => (await res.json()) as Record<string, unknown> & { codePreviewUrl: string };
   const folderOf = (u: string) => new URL(u).searchParams.get('folder');
 
-  it('no ask: today\'s answer exactly (no folder=, no codeFolder field)', async () => {
+  // Code always names its folder, as on Cloudflare: without one, code-server reopens its own last-visited folder
+  // (it runs without --ignore-last-opened), even /root or a repository opened by hand (user report 2026-11-05).
+  it('no ask: Code opens the workspace root explicitly, and no codeFolder field', async () => {
     const body = await answer(await handleAwsPreview(claims(), codeDeps()));
     expect(body.codeFolder).toBeUndefined();
-    expect(folderOf(body.codePreviewUrl)).toBeNull();
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    expect(folderOf(body.appPreviewUrl as string)).toBeNull();
+    expect(folderOf(body.guacamoleUrl as string)).toBeNull();
     expect(new URL(body.codePreviewUrl).searchParams.get('path')).toBe('/');
   });
 
-  it('an ask with no host walk wired (old host agent / before e1): `unverified`, today\'s default', async () => {
-    const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: '/workspace/sports/sports-web' } })));
-    expect(body.codeFolder).toEqual({ v: 1, outcome: 'unverified' });
-    expect(folderOf(body.codePreviewUrl)).toBeNull();
+  it('an ask with no host walk wired (old host agent / before e1): `unverified`, and the workspace root opens', async () => {
+    for (const path of ['/workspace/sports/sports-web', '/workspace']) {
+      const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path } })));
+      expect(body.codeFolder).toEqual({ v: 1, outcome: 'unverified' });
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    }
   });
 
   it('a walked folder becomes folder= on Code only; the walk gets the remainder below /workspace', async () => {
@@ -385,7 +391,7 @@ describe('handleAwsPreview', () => {
       ['/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b/repository', 'not_allowed'], ['/workspace/../etc', 'invalid']] as const) {
       const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path }, resolveFolder })));
       expect({ path, got: body.codeFolder }).toEqual({ path, got: { v: 1, outcome } });
-      expect(folderOf(body.codePreviewUrl)).toBeNull();
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace'); // never the refused path, never a folder-less URL
     }
     expect(walks).toBe(0);
   });
@@ -394,19 +400,20 @@ describe('handleAwsPreview', () => {
     for (const outcome of ['missing', 'not_directory', 'symlink', 'unverified'] as const) {
       const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => outcome })));
       expect(body.codeFolder).toEqual({ v: 1, outcome });
-      expect(folderOf(body.codePreviewUrl)).toBeNull();
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
     }
     const thrown = await answer(await handleAwsPreview(claims(), codeDeps({
       codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => { throw new Error('host down'); },
     })));
     expect(thrown.codeFolder).toEqual({ v: 1, outcome: 'error' });
+    expect(folderOf(thrown.codePreviewUrl)).toBe('/workspace');
   });
 
   it('a restore whose bootstrap URL would pass 2000 characters is `too_long` and opens the default', async () => {
     const deep = `/workspace/${Array.from({ length: 12 }, () => '日本語のフォルダ名'.repeat(3)).join('/')}`;
     const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: deep }, resolveFolder: async () => 'restored' })));
     expect(body.codeFolder).toEqual({ v: 1, outcome: 'too_long' });
-    expect(folderOf(body.codePreviewUrl)).toBeNull();
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
     expect(body.codePreviewUrl.length).toBeLessThanOrEqual(2000);
   });
 
@@ -418,7 +425,7 @@ describe('handleAwsPreview', () => {
         codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => { walks += 1; return 'restored'; },
       })));
       expect(body.codeFolder).toBeUndefined();
-      expect(folderOf(body.codePreviewUrl)).toBeNull();
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace'); // its Code URL still names the workspace root
     }
     expect(walks).toBe(0);
   });
@@ -442,6 +449,12 @@ describe('AWS Code bootstrap: folder and ezil_mint (per-tab folder continuity)',
     expect(loc.pathname).toBe('/');
     expect(loc.searchParams.get('folder')).toBe('/workspace/My Project/日本 ü');
     expect(loc.searchParams.get('ezil_mint')).toBe('abcdefghijklmnopqrstu_');
+  });
+
+  it('the default folder, the workspace root itself, reaches code-server as an explicit folder', async () => {
+    const res = await boot(8443, `&path=%2F&folder=${encodeURIComponent('/workspace')}`);
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get('location')!, 'https://x').searchParams.get('folder')).toBe('/workspace');
   });
 
   it('awsBrowserUrl sets folder on Code only', () => {

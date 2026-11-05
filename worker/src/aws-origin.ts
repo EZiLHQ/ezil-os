@@ -560,7 +560,11 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
     restored = undefined;
     folderOutcome = 'too_long';
   }
-  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token, '/', port === CODE_PREVIEW_PORT ? restored : undefined);
+  // Code always opens an explicit folder, as on Cloudflare: the walked one, else the workspace root. Without one,
+  // code-server reopens its own last-visited folder (it runs without --ignore-last-opened): anything the person ever
+  // opened, even outside /workspace or a repository opened by hand, while the notice says "its usual folder".
+  const codeFolder = restored ?? AWS_WORKSPACE_ROOT;
+  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token, '/', port === CODE_PREVIEW_PORT ? codeFolder : undefined);
   return json({
     ok: true,
     provider: 'aws-ec2',
