@@ -32,7 +32,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,8 +41,9 @@ let chromium;
 try { ({ chromium } = require('playwright')); } catch { console.log('SKIP playwright not resolvable (set PLAYWRIGHT_REQUIRE_DIR)'); process.exit(2); }
 const assets = process.env.EZIL_SHELL_OUT_DIR || fileURLToPath(new URL('../../../app/public/os/', import.meta.url));
 if ( ! existsSync(path.join(assets, 'bundle.min.js')) ) { console.log(`SKIP missing ${assets}bundle.min.js (run shell/build-shell.sh)`); process.exit(2); }
-// The Worker's own bridge (TypeScript; Node strips the types).
-const { codeFolderBridgeScript } = await import('../../../worker/src/code-folder-bridge.ts');
+// The Worker's own bridge (TypeScript, no imports). CI's Node 22 does not load .ts by default, so strip the types here.
+const bridgeSource = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/code-folder-bridge.ts', import.meta.url), 'utf8'));
+const { codeFolderBridgeScript } = await import(`data:text/javascript,${encodeURIComponent(bridgeSource)}`);
 
 let checks = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); checks += 1; console.log(`PASS  ${msg}`); };
