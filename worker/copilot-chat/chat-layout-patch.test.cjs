@@ -158,6 +158,30 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.deepEqual(order, ['sessions', 'chat', ['listeners', 's', 'c', 'w'], 'visibility', ['error', 'EZiL: chat header layout not applied']]);
     });
 
+    // The bundle's own picker options (SW), anchor layout (X7) and action widget sizing (computeHeight)
+    // in a 900 px window: a header picker sits ~97 px from the top, a Chat editor composer's at ~779.
+    await t.test('chat pickers open above when they fit and flip below in the header (picker-flip)', () => {
+      const between = (from, to) => { const i = code.indexOf(from), j = code.indexOf(to, i); assert(i > 0 && j > i, from); return code.slice(i, j); };
+      const SW = new Function('Vio', between('function SW(s){', '}function ') + '}return SW')(s => ({ ...s }));
+      const X7 = new Function(between('function X7(', '}function ') + '}return X7')();
+      const computeHeight = new Function('ke', 'slt', 'X7', 'return function(){' + between('computeHeight(){', '}layout(e,t){this._hasLaidOut=!0').slice('computeHeight(){'.length) + '}')(() => ({ innerHeight: 900, pageYOffset: 0 }), a => a, X7);
+      assert(code.includes('this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,'), 'the widget reads both options from the list options');
+      assert(code.includes('G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)'), 'a picker in a dialog still forces below');
+      // Six 22 px rows, the search box and (in a chat with turns) the 44 px cache-break hint.
+      const open = (options, top, hint = true) => {
+        const w = { _anchorPosition: options.anchorPosition, _preferredAnchorPosition: options.preferredAnchorPosition, _useFullHeight: options.useFullHeight ?? false, _anchor: { top, height: 22 }, domNode: {},
+          _widget: { computeMaxVisibleItemsHeight: () => 132, computeListHeight: () => 132, computeMaxFullHeight: () => 132, filterContainer: {}, headerContainer: hint ? { hidden: false, offsetHeight: 44 } : undefined, lineHeight: 22 },
+          hasDynamicHeight: () => false, computeActionWidgetVerticalChromeHeight: () => 2 };
+        const list = computeHeight.call(w);
+        return { above: w._showAbove, list };
+      };
+      assert.deepEqual(open(SW({}), 97), { above: false, list: 132 }, 'header picker in a chat with turns: below, every row');
+      assert.deepEqual(open(SW({}), 97, false), { above: false, list: 132 }, 'header picker in an empty chat: below, every row');
+      assert.deepEqual(open(SW({}), 779), { above: true, list: 132 }, 'composer picker: still above');
+      assert.deepEqual(open(SW({}), 300), { above: true, list: 132 }, 'mid-window picker that fits above: above');
+      assert.deepEqual(open({ ...SW({}), anchorPosition: 0 }, 300), { above: false, list: 132 }, 'dialog picker at the same place: still forced below');
+    });
+
     await t.test('patch rejects a moved header anchor', () => {
       fs.copyFileSync(path.join(source, wb), path.join(root, wb));
       fs.copyFileSync(path.join(source, css), path.join(root, css));
