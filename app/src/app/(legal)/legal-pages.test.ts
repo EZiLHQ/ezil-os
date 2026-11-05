@@ -61,7 +61,10 @@ describe('hosted legal identity and navigation', () => {
         expect(html).toContain('30 N Gould St STE R');
         expect(html).toContain('Sheridan, WY 82801, USA');
         expect(html).toContain('href="mailto:contact@ezil.work">contact@ezil.work</a>');
-        expect(html).toMatch(/<time datetime="2026-10-21">21 October 2026<\/time>/i);
+        // Terms was revised on 5 November 2026; the other pages keep the shared date.
+        expect(html).toMatch(route === 'terms'
+            ? /<time datetime="2026-11-05">5 November 2026<\/time>/i
+            : /<time datetime="2026-10-21">21 October 2026<\/time>/i);
         expect(html).toContain('What changed:');
         expect(html.indexOf('What changed:')).toBeLessThan(html.indexOf('<article'));
         const tabs = html.match(/<nav[^>]*aria-label="Legal documents"[^>]*>([\s\S]*?)<\/nav>/)?.[1];

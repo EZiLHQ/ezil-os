@@ -87,6 +87,11 @@ describe('Terms plan facts follow the v3 catalog', () => {
     it('states that plans include AI credits', () => {
         expect(section('third-parties')).toContain('Plans include AI credits for EZiL AI in Code and Chat');
     });
+
+    it('is effective from the revision date, not the shared legal default', () => {
+        expect(html).toMatch(/Effective\s*(<!-- -->)?\s*<time datetime="2026-11-05">5 November 2026<\/time>/i);
+        expect(html).not.toContain('21 October 2026');
+    });
 });
 
 describe('Terms carry none of the retired or contradicting claims', () => {

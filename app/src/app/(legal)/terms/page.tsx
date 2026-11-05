@@ -161,6 +161,7 @@ export default function TermsPage() {
         title="Terms and Conditions"
         introduction="The terms for your account, your work, and your use of the hosted EZiL OS desktop."
         changeSummary="Updated plans: the Standard free month, six-hour paid sessions, included AI credits, storage, and files when a paid plan ends."
+        effective={{ dateTime: '2026-11-05', label: '5 November 2026' }}
         summary={<>
             <p>Your content stays yours. Use the Service lawfully, protect your account, and keep your own copies of important work. The hosted desktop is an alpha service with limits, and deleting a computer does not erase its stored files.</p>
         </>}

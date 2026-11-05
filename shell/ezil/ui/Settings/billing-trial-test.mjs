@@ -352,6 +352,40 @@ test('retry: a failed quote retries the quote and goes on to checkout; a failed 
     assert.equal(h.mounted, 1);
 });
 
+// Review follow-up: the quote runs on its own when the sheet opens, so a sheet closed while it waits can be answered late.
+for ( const order of ['before', 'after'] ) {
+    test(`closed while quoting, then reopened: the old quote's late reply (${order} the new one) opens no Checkout and never changes the new terms`, async h => {
+        const oldEnd = '2027-02-28T03:00:00Z', newEnd = '2027-02-28T03:41:07Z';
+        const pending = [];
+        h.replies['billing.quoteTrial'] = () => new Promise(resolve => pending.push(resolve));
+        h.replies['billing.createCheckout'] = () => embedded;
+        h.openTrial({ timeZone: 'UTC' }).close();
+        await settle();
+        assert.equal(h.qa('[data-role="upgrade-sheet"]').length, 0, 'the first sheet is closed');
+        h.openTrial({ timeZone: 'UTC' });
+        await settle();
+        assert.equal(pending.length, 2, 'the reopened sheet asks for its own quote');
+        const [answerOld, answerNew] = pending.map(resolve => end => resolve(quote(end)));
+        if ( order === 'before' ) {
+            answerOld(oldEnd);
+            await settle();
+            assert.equal(h.count('billing.createCheckout'), 0, 'no checkout from the old quote');
+            assert.match(clean(h.q('[data-role="checkout-state"]')), /^Checking your free month…$/, 'the new sheet still waits for its own quote');
+            assert.ok(h.q('[data-role="trial-terms"]').hidden, 'no terms from the old quote');
+        }
+        answerNew(newEnd);
+        await settle();
+        if ( order === 'after' ) { answerOld(oldEnd); await settle(); }
+        assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input.trial.trialEndsAt), [newEnd]);
+        assert.equal(h.mounted, 1);
+        assert.equal(h.qa('[data-role="upgrade-sheet"]').length, 1);
+        const terms = h.q('[data-role="trial-terms"]');
+        assert.equal(terms.querySelector('time').getAttribute('datetime'), newEnd);
+        assert.equal(terms.querySelector('[data-role="trial-changed"]'), null, 'a late old reply is not a changed end');
+        assert.doesNotMatch(h.text(), /3:00 AM/, 'the old end is never shown');
+    });
+}
+
 test('trial_quote_stale: re-quote once on its own, show the NEW end with a notice above the form, and only that end reaches checkout', async h => {
     const first = '2027-02-28T03:00:00Z', second = '2027-02-28T03:41:07Z';
     let quotes = 0;
@@ -553,14 +587,22 @@ test('plan picker and session end: Standard is the free month when offered (chec
 
 test('Free copy inventory: Billing, offers, Usage, cancel, session end and the plan picker never give the Free session a length', async h => {
     const freeHour = /\b(1|one)[- ]hours?\b|sessions? (last|up to) (1|one)\b|up to an hour/i;
+    assert.match('Sessions up to 1 hour', freeHour);
     const held = () => { const s = summaryV3('free'); Object.assign(s.computer, { standing: 'files_on_aws', filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } }); return s; };
     const summaries = [summaryV3('free'), held(), trialSummaryV3('offer'), trialSummaryV3('ineligible'),
         trialSummaryV3('payment_pending', { standing: 'free' }), trialSummaryV3('payment_pending', { standing: 'files_on_aws' }),
         trialSummaryV3('payment_failed', { standing: 'files_on_aws' })];
     const texts = [];
+    // Review follow-up: assistive-technology names, descriptions, values and tooltips are copy too.
+    const labels = [];
+    const audited = ['aria-label', 'aria-description', 'aria-valuetext', 'title', 'data-tooltip'];
+    const accessible = root => {
+        for ( const el of root.querySelectorAll('*') ) labels.push(...audited.map(name => el.getAttribute(name)).filter(Boolean));
+        return clean(root);
+    };
     for ( const summary of summaries ) {
-        texts.push(clean(h.fragment(h.api.summaryV3Html(summary))));
-        texts.push(clean(h.fragment(h.api.usageHtml(usageSample, summary))));
+        texts.push(accessible(h.fragment(h.api.summaryV3Html(summary))));
+        texts.push(accessible(h.fragment(h.api.usageHtml(usageSample, summary))));
     }
     // The Free offer card's configuration line and the paid cards' six hours.
     const offers = h.fragment(h.api.summaryV3Html(summaryV3('free')));
@@ -571,22 +613,24 @@ test('Free copy inventory: Billing, offers, Usage, cancel, session end and the p
     const trialing = trialSummaryV3('trialing'); Object.assign(trialing.computer, { filesOn: 'aws', awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } });
     for ( const summary of [paid, trialing] ) {
         h.handle = h.api.openCancelSheet({ container: h.q('#container'), summary, trpc: h.trpc, onDone: () => {}, onClose: () => {} });
-        const sheet = clean(h.q('[data-role="billing-sheet"]'));
+        const sheet = accessible(h.q('[data-role="billing-sheet"]'));
         assert.match(sheet, /your computer opens under Free limits; your files stay on your AWS computer\./);
         texts.push(sheet);
         h.handle.close();
     }
     for ( const summary of [summaryV3('free'), trialSummaryV3('offer')] ) {
         h.handle = h.api.openSessionEndSheet({ container: h.q('#container'), summary, reason: 'session_max', trpc: h.trpc, onClose: () => {}, checkout: () => {} });
-        const sheet = clean(h.q('[data-sheet="session-end"]'));
+        const sheet = accessible(h.q('[data-sheet="session-end"]'));
         assert.match(sheet, /Your session ended\s*Your Free session ended\. Standard: sessions up to 6 hours/);
         texts.push(sheet);
         h.handle.close();
         h.handle = h.api.openPlanPickerSheet({ container: h.q('#container'), summary, trpc: h.trpc, onClose: () => {}, checkout: () => {} });
-        texts.push(clean(h.q('[data-role="billing-sheet"]')));
+        texts.push(accessible(h.q('[data-role="billing-sheet"]')));
         h.handle.close();
     }
     for ( const text of texts ) assert.doesNotMatch(text, freeHour, text.slice(0, 200));
+    for ( const label of labels ) assert.doesNotMatch(label, freeHour, label);
+    assert.ok(labels.includes('Current plan'), 'the audit reads accessible names, not only visible text');
     // Truthful operational lines stay: the month's time left (also under an hour) is not a session length.
     assert.ok(texts.some(text => /left this month|hours of computer time each month|Free limits/.test(text)), 'the Free limits are still said');
 });
