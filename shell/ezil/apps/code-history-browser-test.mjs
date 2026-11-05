@@ -82,10 +82,12 @@ const shell = createServer((req, res) => {
                     repository: { name: 'octocat/Hello-World', id: '0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e' } });
             }
             const asked = body.codeFolder?.path;
-            const restored = asked && existing.has(asked);
+            // As the Worker's planner: a project's checkout (projects/<uuid>/**) or .ezil is never an own-files folder.
+            const notAllowed = asked && /^\/workspace\/(\.ezil(\/|$)|projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\/|$))/.test(asked);
+            const restored = asked && ! notAllowed && existing.has(asked);
             const folder = restored ? asked : DEFAULT;
             return json({ ok: true, codePreviewUrl: `${editorOrigin}/preview-bootstrap?token=T${mints}&path=%2F&folder=${encodeURIComponent(folder)}`,
-                ...(asked ? { codeFolder: { v: 1, outcome: restored ? 'restored' : 'missing' } } : {}) });
+                ...(asked ? { codeFolder: { v: 1, outcome: notAllowed ? 'not_allowed' : restored ? 'restored' : 'missing' } } : {}) });
         });
         return;
     }
@@ -342,6 +344,23 @@ const lastAsk = () => asks.at(-1);
         '/app/code?folder=/workspace/a|/workspace/a', '/app/settings|/workspace/a', '/app/code?folder=/workspace/a|/workspace/a',
         '/app/settings|/workspace/a', '/app/code?folder=/workspace/a|/workspace/a', '/app/code?folder=/workspace/b|/workspace/b',
     ]), `F2 shape: Back x3 and Forward x3 keep every address and editor together [${path.join(' ; ')}]`);
+    await t.context.close();
+}
+
+// ── sync-back replay (e1's contract item 5): a checkout opened by hand in an own-files window is never reopened by
+//    its address; the replay is the planner's not_allowed refusal, visible, and the default folder opens ──────
+{
+    const CO = '/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e/repository';
+    const t = await tab(`/app/code?folder=${enc('/workspace/a')}`);
+    await t.waitEditor('/workspace/a'); await t.waitAddress('/app/code?folder=/workspace/a');
+    await t.editorFrame().evaluate((p) => window.openFolder(p), CO);
+    ok(await t.waitEditor(CO), 'replay: a checkout opened by hand in Code opens (the person\'s own act, THE LAYOUT)');
+    ok(await t.waitAddress(`/app/code?folder=${CO}`), `replay: the address names it as an own-files folder [${await t.address()}]`);
+    await t.page.reload();
+    ok(await t.waitEditor(DEFAULT), `replay: a reload never reopens the checkout by its address [${t.editorFolder()}]`);
+    await t.notice().waitFor();
+    ok((await t.notice().getAttribute('data-outcome')) === 'not_allowed', 'replay: the refusal is visible (not_allowed), never a silent fallback');
+    ok(await t.address() === `/app/code?folder=${CO}`, 'replay: the address keeps the refused ask (D6)');
     await t.context.close();
 }
 
