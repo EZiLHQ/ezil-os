@@ -433,6 +433,41 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
 const previewWorkflow = parseWorkflow(workflowText);
 
+test('retired preview cannot deploy any provider or build release images for push or manual dispatch', () => {
+  const jobs = outline(workflowText).children.find(node => node.line === 'jobs:').children;
+  const condition = name => {
+    const node = jobs.find(job => job.line === `${name}:`).children.find(child => child.line.startsWith('if:'));
+    const lines = node => [node.line, ...node.children.flatMap(lines)];
+    const expression = node.line === 'if: >-' ? node.children.flatMap(lines).join(' ') : node.line.slice(4);
+    return expression.replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+  };
+  const evaluate = (name, ref, changed, event, cancelled = false) => Function('github', 'needs', 'cancelled', 'startsWith',
+    `return (${condition(name)});`)(
+      {ref, event_name: event},
+      {changes: {result: 'success', outputs: {image_changed: String(changed)}}, images: {result: 'success'}},
+      () => cancelled, (value, prefix) => value.startsWith(prefix));
+  for (const event of ['push', 'workflow_dispatch']) {
+    for (const ref of ['refs/heads/preview', 'refs/heads/main', 'refs/tags/v1', 'refs/heads/feature']) {
+      for (const changed of [true, false]) {
+        for (const cancelled of [true, false]) {
+          assert.equal(evaluate('preview', ref, changed, event, cancelled), false);
+          assert.equal(evaluate('images', ref, changed, event), changed && ref === 'refs/heads/main');
+          assert.equal(evaluate('production', ref, changed, event, cancelled),
+            !cancelled && (ref === 'refs/heads/main' || ref.startsWith('refs/tags/v')));
+        }
+        assert.equal(evaluate('staging-retired', ref, changed, event), ref === 'refs/heads/preview');
+      }
+    }
+  }
+  const notice = previewWorkflow.jobs.find(job => job.name === 'staging-retired');
+  assert.equal(notice.environment, '');
+  assert.equal(notice.inherit, false);
+  assert.equal(notice.steps.length, 1);
+  assert.match(notice.steps[0].text, /exit 1$/);
+  assert.match(notice.steps[0].text, /https:\/\/os-staging\.ezil\.work/);
+  assert.doesNotMatch(notice.text, /uses:|secrets\.|id-token:|packages:|\$\{\{/);
+});
+
 test('Vercel workflow alias and promotion use the API helper from the repository root with env credentials', () => {
   assert.doesNotMatch(workflowText, /--scope "\$VERCEL_ORG_ID"|\bvercel\s+(?:alias\s+set|promote)\b/);
   const staging = previewWorkflow.jobs.find(job => job.name === 'preview').steps.find(step => step.text.includes('id: preview_app\n'));

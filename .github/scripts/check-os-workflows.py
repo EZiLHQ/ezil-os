@@ -85,7 +85,15 @@ assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
-assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
+assert set(preview['jobs']) == {'changes', 'images', 'staging-retired', 'preview', 'production'}
+retired = preview['jobs']['staging-retired']
+assert retired['if'] == "github.ref == 'refs/heads/preview'"
+assert set(retired) == {'name', 'if', 'runs-on', 'timeout-minutes', 'permissions', 'steps'}
+assert retired['permissions'] == {'contents': 'read'} and retired['timeout-minutes'] == 1
+assert len(retired['steps']) == 1 and set(retired['steps'][0]) == {'name', 'run'}
+assert retired['steps'][0]['run'].strip().endswith('exit 1')
+assert 'https://os-staging.ezil.work' in retired['steps'][0]['run']
+assert not re.search(r'\$\{\{|secrets\.|\b(?:aws|vercel|wrangler|curl|docker)\s', retired['steps'][0]['run'])
 assert not (root / '.github/workflows/live.yml').exists()
 assert 'live.yml' not in (root / '.github/workflows/ci.yml').read_text()
 
@@ -170,7 +178,7 @@ assert any(not step.get('if') and 'node --test' in step.get('run', '') and
 images = preview['jobs']['images']
 assert images['needs'] == 'changes'
 assert images['if'] == ("needs.changes.outputs.image_changed == 'true' && "
-                        "(github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main')")
+                        "github.ref == 'refs/heads/main'")
 assert images['uses'] == './.github/workflows/image.yml'
 assert images['with']['source'] == '${{ github.sha }}'
 assert images['secrets'] == 'inherit'
@@ -200,7 +208,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
                      "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
     assert ' '.join(job['if'].split()) == (
-        "${{ !cancelled() && " + ref_condition + " && "
+        "${{ " + ("false && " if job_name == 'preview' else '') + "!cancelled() && " + ref_condition + " && "
         "needs.changes.result == 'success' && "
         "(needs.images.result == 'success' || needs.images.result == 'skipped') }}")
     assert job['concurrency'] == {'group': f'deploy-{environment}', 'cancel-in-progress': False}
