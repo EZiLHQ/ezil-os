@@ -2,8 +2,9 @@
 // (request standard-trial-01b28d18-20261105-v1) against the BUILT stylesheet (app/public/os/bundle.min.css):
 //   - the Billing pane in each trial state fits the 760 px Settings window and a 390 px phone, with the state's one
 //     primary, and the three plan cards still side by side at 760 px with the free-month lines on Standard;
-//   - the checkout sheet's trial confirmation, in a browser whose time zone is America/Los_Angeles, shows a quote on
-//     31 Jan 2027 03:00 UTC (end 28 Feb 03:00 UTC) as Saturday 27 Feb, 7:00 PM, and Continue echoes that end.
+//   - the checkout sheet's trial mode, in a browser whose time zone is America/Los_Angeles: one activation shows a quote
+//     on 31 Jan 2027 03:00 UTC (end 28 Feb 03:00 UTC) as Saturday 27 Feb, 7:00 PM above the payment form, on the first
+//     screen of a phone too, and checkout echoes that end; there is no Continue step.
 //
 // Run:  PLAYWRIGHT_REQUIRE_DIR=<dir with playwright> node shell/ezil/ui/Settings/billing-trial-browser-test.mjs
 //       (after shell/build-shell.sh). EZIL_TRIAL_SCREENSHOT_DIR=<dir> also saves a PNG per state there; unset
@@ -135,14 +136,15 @@ try {
         await context.close();
     }
 
-    // The checkout sheet's trial confirmation, in the browser's zone (no injected zone): exact quote, then the echo.
+    // The checkout sheet's trial mode, in the browser's zone (no injected zone): one activation quotes, shows the exact
+    // end above the form and opens checkout with that end; no Continue step.
     for ( const [label, viewport] of [['desktop 1440x1000', { width: 1440, height: 1000 }], ['laptop 1280x720', { width: 1280, height: 720 }], ['phone 375x667', { width: 375, height: 667 }]] ) {
         const context = await browser.newContext({ viewport, timezoneId: 'America/Los_Angeles', locale: 'en-US' });
         const page = await context.newPage();
         await page.setContent(page_html(Math.min(760, viewport.width), 560));
         await page.addScriptTag({ content: renderers });
         const offer = trialSummaryV3('offer').catalog.offers.find(item => item.sku === 'standard_monthly_v3');
-        const t = await page.evaluate(async ({ offer, END }) => {
+        await page.evaluate(({ offer, END }) => {
             window.calls = [];
             const trpc = {
                 mutate: async (method, input) => {
@@ -157,33 +159,34 @@ try {
                 const frame = document.createElement('div'); frame.style.height = '320px'; frame.textContent = 'Secure payment form (fake)';
                 frame.dataset.role = 'fake-stripe'; document.querySelector(selector).append(frame); }, destroy: () => {} }) });
             window.trial.openUpgradeSheet({ container: document.querySelector('.window-body'), sku: offer.sku, offer, trpc, trial: true, loadStripe });
-            for ( let i = 0; i < 20; i++ ) await Promise.resolve();
-            await new Promise(resolve => setTimeout(resolve, 50));
+        }, { offer, END });
+        await page.waitForSelector('[data-role="fake-stripe"]');
+        const t = await page.evaluate(() => {
             const dialog = document.querySelector('[data-role="upgrade-sheet"]');
             const rect = dialog.getBoundingClientRect();
-            const ends = dialog.querySelector('[data-role="trial-ends"]');
-            const button = dialog.querySelector('[data-action="trial-continue"]');
-            const b = button.getBoundingClientRect();
+            const terms = dialog.querySelector('[data-role="trial-terms"]');
+            const box = terms.getBoundingClientRect(), form = dialog.querySelector('[data-role="fake-stripe"]').getBoundingClientRect();
+            const ends = terms.querySelector('[data-role="trial-ends"]');
             return {
                 ends: ends?.textContent.replace(/\s+/g, ' ').trim() ?? null, datetime: ends?.querySelector('time')?.getAttribute('datetime') ?? null,
-                charge: dialog.querySelector('[data-role="trial-charge"]')?.textContent ?? null,
+                charge: terms.querySelector('[data-role="trial-charge"]')?.textContent ?? null,
+                cancel: terms.querySelector('[data-role="trial-cancel"]')?.textContent ?? null,
+                shown: getComputedStyle(terms).display !== 'none' && box.height > 0 && box.top >= 0 && box.bottom <= innerHeight,
+                above: box.bottom <= form.top, continues: dialog.querySelectorAll('[data-action="trial-continue"]').length,
                 inside: rect.left >= -0.5 && rect.right <= innerWidth + 0.5, overflow: dialog.scrollWidth - dialog.clientWidth,
-                continueHeight: Math.round(b.height), continueWidth: Math.round(b.width), checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').length,
+                methods: window.calls.map(call => call.method), echoed: window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input),
             };
-        }, { offer, END });
-        push(`${label} · confirmation: the exact quoted end in the browser's zone, with the zone's name`,
-            t.ends === 'Your free month ends on Saturday, February 27, 2027 at 7:00 PM Pacific Standard Time (America/Los_Angeles).' && t.datetime === END, `${t.ends} | ${t.datetime}`);
-        push(`${label} · confirmation: a payment method is required and $20.00 is charged monthly from that date`,
-            t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.', t.charge);
-        push(`${label} · confirmation: no checkout before Continue`, t.checkouts === 0, `${t.checkouts}`);
-        push(`${label} · confirmation: the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
-        push(`${label} · confirmation: Continue is a real target (at least 32 px tall)`, t.continueHeight >= 32 && t.continueWidth >= 44, `${t.continueWidth}x${t.continueHeight}`);
-        if ( shots ) await page.screenshot({ path: path.join(shots, `trial-confirm-${viewport.width}.png`) });
-        await page.click('[data-action="trial-continue"]');
-        await page.waitForSelector('[data-role="fake-stripe"]');
-        const echoed = await page.evaluate(() => window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input));
-        push(`${label} · Continue: createCheckout echoes exactly the quoted end`, JSON.stringify(echoed) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(echoed));
-        if ( shots && viewport.width === 1440 ) await page.screenshot({ path: path.join(shots, 'trial-checkout-1440.png') });
+        });
+        push(`${label} · one activation: quote, then checkout, no Continue`, JSON.stringify(t.methods) === '["billing.quoteTrial","billing.createCheckout"]' && t.continues === 0, `${t.methods} · continue ${t.continues}`);
+        push(`${label} · checkout echoes exactly the quoted end`, JSON.stringify(t.echoed) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(t.echoed));
+        push(`${label} · terms: the exact quoted end in the browser's zone, with the zone's name`,
+            t.ends === '$0 today. Your free month ends on Saturday, February 27, 2027 at 7:00 PM Pacific Standard Time (America/Los_Angeles).' && t.datetime === END, `${t.ends} | ${t.datetime}`);
+        push(`${label} · terms: a payment method is required, $20.00 monthly from that date, cancel before then`,
+            t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.'
+            && t.cancel === 'Cancel any time before then in Settings → Billing and you pay nothing.', `${t.charge} | ${t.cancel}`);
+        push(`${label} · terms: visible on the first screen and above the payment form`, t.shown && t.above, JSON.stringify({ shown: t.shown, above: t.above }));
+        push(`${label} · the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify({ inside: t.inside, overflow: t.overflow }));
+        if ( shots ) await page.screenshot({ path: path.join(shots, `trial-checkout-${viewport.width}.png`) });
         await context.close();
     }
 } finally {

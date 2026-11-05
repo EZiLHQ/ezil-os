@@ -118,6 +118,10 @@
 .ezil-upgrade-sheet [hidden] { display: none; }
 .ezil-upgrade-sheet [data-role="upgrade-success"] > span { color: var(--accent); font-size: 28px; }
 .ezil-upgrade-payment [data-role="checkout-state"] > p:empty { display: none; }
+/* The free month's terms stay above the payment form, also when the summary is folded on a phone. */
+.ezil-upgrade-trial-terms { margin: 0 0 12px; font-size: 13px; line-height: 18px; }
+.ezil-upgrade-trial-terms p { margin: 0 0 4px; }
+.ezil-upgrade-trial-terms [data-role="trial-ends"] { font-weight: 600; }
 
 /* Viewport width, rather than Settings width, decides when payment stacks. */
 .ezil-upgrade-backdrop.is-compact .ezil-upgrade-sheet {
