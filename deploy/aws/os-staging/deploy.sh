@@ -132,37 +132,41 @@ case "$command_name" in
         fi
         GIT_SHA=${GIT_SHA:-$(git -C "$repo_root" rev-parse HEAD)}
         [[ $GIT_SHA =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || fail 'GIT_SHA must be a full commit SHA.'
+        python3 "$script_dir/source_provenance.py" snapshot "$repo_root" "$GIT_SHA" "$temporary/source"
+        build_root=$temporary/source/context
         export GIT_SHA NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
         mkdir -p "$artifacts"
-        for suffix in tar.gz runtime.tar.gz sha256; do
+        for suffix in tar.gz runtime.tar.gz source.json sha256; do
             [[ ! -e $artifacts/$tag.$suffix ]] || fail 'Local tag already exists; use a new tag.'
         done
         # Docker ignores app/.dockerignore for a root context. A temporary
         # Dockerfile-specific ignore applies the allowlist without editing root.
-        cp "$repo_root/app/Dockerfile" "$temporary/Dockerfile"
-        cp "$repo_root/app/.dockerignore" "$temporary/Dockerfile.dockerignore"
+        cp "$build_root/app/Dockerfile" "$temporary/Dockerfile"
+        cp "$build_root/app/.dockerignore" "$temporary/Dockerfile.dockerignore"
         docker build --platform linux/amd64 --file "$temporary/Dockerfile" \
             --build-arg NEXT_PUBLIC_SUPABASE_URL --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY \
             --build-arg NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY --build-arg GIT_SHA \
-            --tag "$image:$tag" "$repo_root"
+            --tag "$image:$tag" "$build_root"
         docker save "$image:$tag" | gzip -1 >"$temporary/$tag.tar.gz"
-        runtime=$script_dir
+        runtime=$build_root/deploy/aws/os-staging
         if [[ $environment == production ]]; then
             runtime=$temporary/runtime
-            python3 "$script_dir/render-runtime.py" "$script_dir" "$runtime"
+            python3 "$build_root/deploy/aws/os-staging/render-runtime.py" "$build_root/deploy/aws/os-staging" "$runtime"
         fi
         tar -czf "$temporary/$tag.runtime.tar.gz" -C "$runtime" \
             compose.yaml Caddyfile render-env.py cron
         (cd "$temporary" && sha256sum "$tag.tar.gz" "$tag.runtime.tar.gz" >"$tag.sha256")
-        for suffix in tar.gz runtime.tar.gz sha256; do
+        python3 "$build_root/deploy/aws/os-staging/source_provenance.py" artifact "$temporary/source" "$temporary" "$tag" "$environment"
+        for suffix in tar.gz runtime.tar.gz source.json sha256; do
             mv "$temporary/$tag.$suffix" "$artifacts/$tag.$suffix"
         done
         printf 'Built %s at %s; artifacts: %s\n' "$tag" "$GIT_SHA" "$artifacts";;
     upload)
         [[ -f $artifacts/$tag.sha256 ]] || fail 'Run build TAG first.'
         (cd "$artifacts" && sha256sum --check "$tag.sha256")
+        python3 "$script_dir/source_provenance.py" verify "$artifacts" "$tag" "$environment"
         # Conditional writes preserve tags; publish the checksum marker LAST.
-        for suffix in tar.gz runtime.tar.gz sha256; do
+        for suffix in tar.gz runtime.tar.gz source.json sha256; do
             aws_call s3api put-object --bucket "$bucket" \
                 --key "$prefix/$tag.$suffix" --body "$artifacts/$tag.$suffix" \
                 --server-side-encryption AES256 --if-none-match '*' >/dev/null

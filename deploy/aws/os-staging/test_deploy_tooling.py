@@ -51,6 +51,15 @@ if name == "aws":
             sys.exit(1)
         shutil.copyfile(source, args[6])
 elif name == "docker":
+    if args[:1] == ["build"]:
+        context = pathlib.Path(args[-1])
+        (state / 'built-dockerfile').write_bytes(pathlib.Path(after('--file')).read_bytes())
+        fixture = context / 'app/provenance-fixture.txt'
+        if fixture.exists():
+            (state / 'built-fixture').write_bytes(fixture.read_bytes())
+        (state / 'built-ignored').write_text(str((context / 'app/ignored.txt').exists()))
+        if os.environ.get('MUTATE_DURING_BUILD'):
+            pathlib.Path(os.environ['MUTATE_DURING_BUILD']).write_text('changed during build\n')
     if args[:1] == ["save"]:
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
@@ -91,6 +100,12 @@ class Sandbox:
         (self.root / "repo/app").mkdir()
         (self.root / "repo/app/Dockerfile").write_text("FROM scratch\n")
         (self.root / "repo/app/.dockerignore").write_text("*\n")
+        (self.root / "repo/.gitignore").write_text("app/ignored.txt\n")
+        subprocess.run(['git', 'init', '-q', str(self.root / 'repo')], check=True)
+        subprocess.run(['git', '-C', str(self.root / 'repo'), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root / 'repo'), '-c', 'user.name=Offline Fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+        self.sha = subprocess.check_output(['git', '-C', str(self.root / 'repo'), 'rev-parse', 'HEAD'], text=True).strip()
         self.state = self.root / "state"
         self.bin = self.root / "bin"
         self.s3 = self.root / "s3"
@@ -107,7 +122,7 @@ class Sandbox:
         base = {key: value for key, value in os.environ.items()
                 if not key.startswith(("OS_ENV", "OS_STAGING_", "OS_PRODUCTION_", "NEXT_PUBLIC_", "AWS_"))}
         base.update(PATH=f"{self.bin}:{os.environ['PATH']}", TMPDIR=str(self.root / "tmp"),
-                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=SHA)
+                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=self.sha)
         base.update(extra)
         return base
 
@@ -127,6 +142,13 @@ class Sandbox:
         directory.mkdir(parents=True, exist_ok=True)
         for suffix in ("tar.gz", "runtime.tar.gz"):
             (directory / f"{tag}.{suffix}").write_bytes(suffix.encode())
+        environment = 'production' if directory.name == 'production' else 'staging'
+        (directory / f'{tag}.source.json').write_text(json.dumps({
+            'schema': 1, 'environment': environment, 'component': 'aws-app',
+            'source': self.sha, 'tree': self.sha, 'source_archive_sha256': '0' * 64,
+            'image': f'ezil-os-{environment}:{tag}',
+            'artifacts': {f'{tag}.{s}': hashlib.sha256((directory / f'{tag}.{s}').read_bytes()).hexdigest()
+                          for s in ('tar.gz', 'runtime.tar.gz')}}))
         with (directory / f"{tag}.sha256").open("w") as manifest:
             subprocess.run(["sha256sum", f"{tag}.tar.gz", f"{tag}.runtime.tar.gz"], cwd=directory, check=True,
                            stdout=manifest)
@@ -303,7 +325,7 @@ class DeployScriptTests(SandboxTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         puts = [(c[c.index("--bucket") + 1], c[c.index("--key") + 1]) for c in self.box.calls() if "put-object" in c]
         self.assertEqual(puts, [("ezil-preview-artifacts-example", f"os-staging/images/v1.{s}")
-                                for s in ("tar.gz", "runtime.tar.gz", "sha256")])
+                                for s in ("tar.gz", "runtime.tar.gz", "source.json", "sha256")])
 
     def test_production_upload_uses_its_bucket_prefix_and_artifacts(self):
         self.box.fake_artifacts(self.box.deploy / "artifacts", "v1")  # A staging build of the same tag.
@@ -314,7 +336,7 @@ class DeployScriptTests(SandboxTestCase):
         result = self.box.deploy_sh("upload", "v1", OS_ENV="production", OS_STAGING_ARTIFACT_BUCKET="b-staging")
         self.assertEqual(result.returncode, 0, result.stderr)
         puts = [(c[c.index("--bucket") + 1], c[c.index("--key") + 1]) for c in self.box.calls() if "put-object" in c]
-        self.assertEqual(puts, [(PROD_BUCKET, f"os/images/v1.{s}") for s in ("tar.gz", "runtime.tar.gz", "sha256")])
+        self.assertEqual(puts, [(PROD_BUCKET, f"os/images/v1.{s}") for s in ("tar.gz", "runtime.tar.gz", "source.json", "sha256")])
 
     def test_build_inputs_and_bundles_per_environment(self):
         production = {"OS_ENV": "production", "NEXT_PUBLIC_SUPABASE_URL": "https://db.ezil.work",
