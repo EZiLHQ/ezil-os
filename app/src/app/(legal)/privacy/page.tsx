@@ -99,7 +99,7 @@ const sections: readonly LegalSection[] = [
             <p>When you visit a website, install an extension, use an external development service, or configure an AI provider, information flows to that service according to your actions and its functionality. This may include prompts, code, documents, website data, and outputs. Those providers determine their own retention and other uses under their policies.</p>
             <p>If you connect an external client to your EZiL account, the client receives the data returned for its authorized operations. For example, the optional MCP connector can return computer details and desktop, editor, or preview access links, and can manage computers with your account’s permissions. Your chosen client or AI provider may receive that information.</p>
             <p>Creating an EZiL OS account does not automatically connect it to an AI model provider. We make no general promise about an external provider’s model training, data retention, or confidentiality. Check the provider, selected account settings, and permissions before sending sensitive information. Revoking a connection does not recall data already sent to that provider.</p>
-            <p>AI is not included in any plan. Creating an account alone does not send workspace content to an AI provider; information is sent when you choose to connect and use an AI tool.</p>
+            <p>Plans include AI credits for EZiL AI in Code and Chat. Creating an account alone does not send workspace content to an AI provider; information is sent when you choose to connect and use an AI tool.</p>
         </>,
     },
     {
@@ -181,7 +181,8 @@ export default function PrivacyPage() {
         kind="privacy"
         title="Privacy Policy"
         introduction="What the hosted Service processes, where your work lives, and how to ask for access or deletion."
-        changeSummary="Added compute usage and AWS Mumbai processing, clarified Stripe payment data, and removed included AI."
+        changeSummary="Added compute usage and AWS Mumbai processing, clarified Stripe payment data, and stated that plans include EZiL AI credits."
+        effective={{ dateTime: '2026-11-05', label: '5 November 2026' }}
         summary={<>
             <p>A hosted desktop processes your work on remote infrastructure. Account records, workspace files, and diagnostics have different storage and deletion behavior. Deleting a computer does not erase its stored files; contact us for an erasure or export request.</p>
         </>}
