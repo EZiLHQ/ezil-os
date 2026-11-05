@@ -130,6 +130,17 @@ P_HEADER_NOTIFY='this.logService=v;this.notificationService=b;'
 # renders this action (quick chat registers it there).
 A_ATTACH='{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(J.lockedToCodingAgent.negate(),J.agentSupportsAttachments)),id:O.ChatInput,group:"navigation",order:-1}'
 R_ATTACH='{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(J.lockedToCodingAgent.negate(),J.agentSupportsAttachments)),id:O.ChatExecute,group:"navigation",order:-1}'
+# workbench.js `picker-flip`: every chat input picker (mode, model, model options, Local, permissions)
+# takes its list options from SW, which forces anchorPosition 1: always above the button, the list
+# capped to the space above it. From the header that leaves one row in a chat with turns. The upstream
+# preferredAnchorPosition 1 (the chat input pills use it) opens above when the list fits and flips below
+# when it does not. SW still overrides a caller's anchorPosition (the agent-host mode/permissions popup
+# passes 1), so it alone picks the side; a picker in a dialog sets anchorPosition 0 after it, which wins.
+A_PICKER_FLIP='function SW(s){return{...Vio(s),anchorPosition:1}}'
+R_PICKER_FLIP='function SW(s){return{...Vio(s),anchorPosition:void 0,preferredAnchorPosition:1}}'
+# Names the flip relies on (checked, never patched): the widget reads both options; the dialog override.
+P_PICKER_OPTIONS='this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,'
+P_PICKER_DIALOG='G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)'
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -270,6 +281,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch chat-header    "$WB"  1  "$A_CHAT_HEADER" "$R_CHAT_HEADER"
   patch attach-execute "$WB"  1  "$A_ATTACH" "$R_ATTACH"
+  for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
+  patch picker-flip    "$WB"  1  "$A_PICKER_FLIP" "$R_PICKER_FLIP"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -327,6 +340,8 @@ for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEA
 done
 gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER"
 gate attach-execute   "$WB"  0  "$A_ATTACH";        gate attach-execute   "$WB"  1  "$R_ATTACH"
+for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
+gate picker-flip      "$WB"  0  "$A_PICKER_FLIP";   gate picker-flip      "$WB"  1  "$R_PICKER_FLIP"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"
