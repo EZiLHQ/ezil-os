@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions} "
+# Passes to run, in order (default all): fresh returning history sessions compaction
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -170,6 +170,10 @@ run_browser() { # run_browser <outdir>
   EZIL_E2E_OUT="$1" node "$here/copilot-ezil.mjs"
 }
 
+run_compaction() { # run_compaction <outdir>
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" EZIL_E2E_OUT="$1" node "$here/copilot-ezil-compaction.mjs"
+}
 run_history() { # run_history <create|verify|sessions> <outdir>
   EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
   EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" node "$here/copilot-ezil-history.mjs"
@@ -269,6 +273,19 @@ start_mock || fail=1
 run_history sessions "$OUT/sessions" || fail=1
 collect_logs sessions
 network_checks sessions || fail=1
+fi
+
+# ── Pass 5: a long Kimi chat outgrows the input bound and continues, compacted (founder 75e327c8) ──
+if [[ "$PASSES" == *" compaction "* ]]; then
+echo "[e2e] pass 5 — compaction: a long Kimi K3 chat with Copilot's summariser off continues past the byte bound"
+ST6="$WORK/compaction"; mkdir -p "$ST6/home/neko/project" "$ST6/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST6/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST6"
+start_mock || fail=1
+run_compaction "$OUT/compaction" || fail=1
+collect_logs compaction
+network_checks compaction || fail=1
 fi
 
 rm -rf "$WORK" 2>/dev/null || true

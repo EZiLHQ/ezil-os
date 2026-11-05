@@ -417,10 +417,59 @@ describe('EZiL gateway VS Code bridge', () => {
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await send('字'.repeat(10000));
             expect(bodies[0]!.byteLength + 1056).toBeLessThanOrEqual(32768);
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and your conversation history is kept. You can start a new chat. (local_input_too_large)');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and the conversation is kept. Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
             expect(bodies).toHaveLength(1); expect(host.models()[0]!.maxInputTokens).toBe(configured);
         });
     }
+    test('a long chat is compacted, not refused: one request, the host told once, and its turn settles with the request', async () => {
+        const bodies: Uint8Array[] = [];
+        const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+            bodies.push(init!.body as Uint8Array);
+            return Response.json(messageJson());
+        }) as unknown as typeof fetch);
+        const compacted: { model: string; folded: number; finished: Promise<void> }[] = [];
+        const provider = new EZiLModelsProvider({ ...host, compacted: (model, info, finished) => compacted.push({ model: model.id, folded: info.folded, finished }) });
+        const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+        const kimi = infos.find(info => info.id === KIMI)!;
+        const history = Array.from({ length: 50 }, (_, i) => [message(1, [new TextPart(`Rule ${i}.`)]), message(2, [new TextPart('a'.repeat(4000))])]).flat();
+        let settled = false;
+        const turn = provider.provideLanguageModelChatResponse(kimi, [...history, message(1, [new TextPart('Now?')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        await turn;
+        expect(bodies).toHaveLength(1);
+        expect(bodies[0]!.byteLength).toBeLessThan(131072);
+        expect(compacted).toHaveLength(1);
+        expect(compacted[0]).toMatchObject({ model: KIMI });
+        expect(compacted[0]!.folded).toBeGreaterThan(0);
+        void compacted[0]!.finished.then(() => { settled = true; });
+        await Promise.resolve(); await Promise.resolve();
+        expect(settled).toBe(true);
+    });
+    test('a failed request reaches Copilot as its message alone, without stack frames (Copilot prints a stack under "Reason:")', async () => {
+        const host = gatewayHost((async () => Response.json({ error: { code: 'killswitch' } }, { status: 503 })) as unknown as typeof fetch);
+        const provider = new EZiLModelsProvider(host);
+        const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+        const send = (text: string) => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        for (const text of ['q', '字'.repeat(50_000)]) {
+            let caught: Error | undefined;
+            try { await send(text); } catch (error) { caught = error as Error; }
+            expect(caught).toBeInstanceOf(Error);
+            expect(caught!.stack).toBe('');
+            expect(caught!.message).toStartWith('EZiL');
+            expect(caught!.message).not.toMatch(/\n\s+at |extension\.js|provideLanguageModelChatResponse/);
+        }
+    });
+    test('a nested cause reaches Copilot without its stack either (VS Code serializes cause; re-review LOW-3)', async () => {
+        const host = gatewayHost((async () => { throw new Error('socket closed', { cause: new Error('inner') }); }) as unknown as typeof fetch);
+        const failing = { ...host, models: () => { throw new Error('config broke', { cause: new Error('nested reason') }); } };
+        const provider = new EZiLModelsProvider(failing);
+        let caught: Error | undefined;
+        try { await provider.provideLanguageModelChatResponse({ id: 'x' } as never, [] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never); }
+        catch (error) { caught = error as Error; }
+        expect(caught!.stack).toBe('');
+        expect((caught!.cause as Error).stack).toBe('');
+    });
     for (const [status, code] of [[400, 'max_output_tokens_invalid'], [413, 'input_too_large']] as const) {
         test(`${status} ${code} clears cached limits for the next call without retrying`, async () => {
             let gets = 0;

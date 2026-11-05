@@ -9,9 +9,12 @@ export type LocalRequestCounts = {
     bodyBytes: number; limitBytes: number; messages: number; maxBlocks: number; tools: number; toolBytes: number;
 };
 
-/** A request this computer refused before sending anything: nothing reached EZiL OS or EZiL AI. */
+/**
+ * A request this computer refused before sending anything: nothing reached EZiL OS or EZiL AI. `afterCompaction`: the
+ * counts are those of the most compacted form, which still did not fit (compact.ts).
+ */
 export class LocalRequestError extends Error {
-    constructor(public readonly code: LocalRequestCode, public readonly counts: LocalRequestCounts) {
+    constructor(public readonly code: LocalRequestCode, public readonly counts: LocalRequestCounts, public readonly afterCompaction = false) {
         super(`EZiL Models: request refused before sending (${code})`);
         this.name = 'LocalRequestError';
     }
