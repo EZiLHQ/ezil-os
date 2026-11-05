@@ -9,6 +9,8 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   deriveAiProxyToken,
+  exactCacheEligible,
+  exactCacheScope,
   AI_PROXY_COMPLETION_TIMEOUT_MS,
   AI_PROXY_HEADERS_TIMEOUT_MS,
   handleAiProxyRequest,
@@ -1102,5 +1104,117 @@ describe('non-stream completion deadline', () => {
     })();
     expect(response.status).toBe(504);
     expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_completion_timeout');
+  });
+});
+
+describe('exact response cache opt-in (Gateway docs/RESPONSE-CACHE.md): staging Gateway only, no setting', () => {
+  const STAGING = 'https://ai-staging.ezil.work';
+  const enc = (value: unknown) => new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
+  const kimi = { model: 'us.moonshotai.kimi-k3', max_tokens: 64, stream: false, messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }] };
+  const tool = { name: 'read_file', input_schema: { type: 'object' } };
+
+  it('is eligible only on the staging Gateway, for Messages JSON with stream false and no tools', () => {
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc(kimi))).toBe(true);
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc({ ...kimi, tools: [] }))).toBe(true);
+    // Production (also the default), and anything that is not exactly the staging origin: off.
+    for (const origin of ['https://ai.ezil.work', 'https://ai-staging.ezil.work/', 'https://AI-STAGING.ezil.work', 'http://ai-staging.ezil.work',
+      'https://ai-staging.ezil.work.evil.example', 'http://localhost:8787', '']) {
+      expect(exactCacheEligible(origin, '/v1/messages', enc(kimi))).toBe(false);
+    }
+    for (const body of [{ ...kimi, stream: true }, { ...kimi, stream: undefined }, { ...kimi, stream: 'false' }, { ...kimi, stream: 0 },
+      { ...kimi, tools: [tool] }, { ...kimi, tools: {} }, { ...kimi, tools: null }]) {
+      expect(exactCacheEligible(STAGING, '/v1/messages', enc(body))).toBe(false);
+    }
+    // The Gateway ignores the opt-in on Responses: never sent there.
+    expect(exactCacheEligible(STAGING, '/v1/responses', enc({ model: 'gpt-6-sol', input: 'q', stream: false }))).toBe(false);
+    for (const raw of ['', 'not json', '[]', 'null', '{"stream":false']) {
+      expect(exactCacheEligible(STAGING, '/v1/messages', enc(raw))).toBe(false);
+    }
+    // Decoded exactly as isNonStreamBody decodes it (a leading BOM is UTF-8's, not JSON's): the two never disagree.
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc('﻿{"stream":false}'))).toBe(isNonStreamBody(enc('﻿{"stream":false}')));
+    expect(exactCacheEligible(STAGING, '/v1/messages', undefined)).toBe(false);
+  });
+
+  it('scopes by a versioned HMAC of the computer, never the id itself, within the Gateway grammar', async () => {
+    const scope = await exactCacheScope(SECRET, SANDBOX);
+    expect(scope).toMatch(/^os-[0-9a-f]{32}$/);
+    expect(scope).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    expect(scope).not.toContain(SANDBOX);
+    expect(scope).not.toContain(SANDBOX.split('-')[1]!);
+    expect(await exactCacheScope(SECRET, SANDBOX)).toBe(scope);
+    expect(await exactCacheScope(SECRET, SANDBOX.toUpperCase())).toBe(scope); // hostnames are case-insensitive
+    expect(await exactCacheScope(SECRET, `${SANDBOX}x`)).not.toBe(scope);
+    expect(await exactCacheScope(`${SECRET}x`, SANDBOX)).not.toBe(scope);
+    // Not the proxy token: a different HMAC context.
+    expect(scope.slice(3)).not.toBe((await deriveAiProxyToken(SECRET, SANDBOX, NONCE)).slice(0, 32));
+  });
+
+  async function send(body: unknown, opts: { gatewayUrl?: string; path?: string; extra?: Record<string, string>;
+    respond?: () => Response } = {}) {
+    const gw = mockGateway(opts.respond ?? (() => new Response('{"id":"msg_1"}', { status: 200,
+      headers: { 'content-type': 'application/json', 'x-ezil-cache': 'HIT', 'x-ezil-request-id': 'req-c' } })));
+    const d = await deps({ fetch: gw.fetch, gatewayUrl: opts.gatewayUrl ?? STAGING });
+    const raw = JSON.stringify(body);
+    const res = await handleAiProxyRequest(new Request(`${HOST}${opts.path ?? '/ai/v1/messages'}`, { method: 'POST',
+      headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-1', ...opts.extra }, body: raw }), d);
+    return { res, call: gw.calls[0]!, logs: d.logs, raw };
+  }
+  const forged = { 'x-ezil-cache': 'exact', 'x-ezil-cache-scope': 'client-chosen', 'x-ezil-cache-anything': 'x' };
+
+  it('opts an eligible call in with the computer scope; client values are dropped; body and auth unchanged; HIT passed back', async () => {
+    const { res, call, logs, raw } = await send(kimi, { extra: forged });
+    expect(call.url).toBe(`${STAGING}/v1/messages`);
+    // Exactly the existing allow-list plus the two server-set cache headers, with the stored member bearer.
+    expect(call.headers).toEqual({ authorization: `Bearer ${USER_JWT}`, 'content-type': 'application/json', 'idempotency-key': 'turn-1',
+      'x-ezil-cache': 'exact', 'x-ezil-cache-scope': await exactCacheScope(SECRET, SANDBOX) });
+    expect(call.body).toEqual(new TextEncoder().encode(raw));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-ezil-cache')).toBe('HIT');
+    expect(await res.text()).toBe('{"id":"msg_1"}');
+    expect(logs.at(-1)).toMatchObject({ status: 200, request_id: 'req-c', cache: 'HIT' });
+    expect(JSON.stringify(logs)).not.toContain(SANDBOX);
+  });
+
+  it('passes MISS back, and never an untrusted value', async () => {
+    const miss = await send(kimi, { respond: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': 'MISS' } }) });
+    expect(miss.res.headers.get('x-ezil-cache')).toBe('MISS');
+    await miss.res.text();
+    expect(miss.logs.at(-1)!.cache).toBe('MISS');
+    for (const value of ['hit', 'FORCED', 'HIT, MISS', '']) {
+      const odd = await send(kimi, { respond: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': value } }) });
+      expect(odd.res.headers.get('x-ezil-cache')).toBeNull();
+      await odd.res.text();
+      expect(odd.logs.at(-1)!.cache).toBeNull();
+    }
+  });
+
+  it('sends nothing for tool turns, streams, Responses, production or an unknown Gateway, and never passes a cache header back', async () => {
+    const cases: Array<[unknown, { gatewayUrl?: string; path?: string }]> = [
+      [{ ...kimi, tools: [tool] }, {}],
+      [{ ...kimi, stream: true }, {}],
+      [{ model: 'gpt-6-sol', input: 'q', stream: false }, { path: '/ai/v1/responses' }],
+      [kimi, { gatewayUrl: 'https://ai.ezil.work' }],
+      [kimi, { gatewayUrl: 'https://ai-staging.ezil.work.evil.example' }],
+    ];
+    for (const [body, opts] of cases) {
+      const { res, call, logs, raw } = await send(body, { ...opts, extra: forged });
+      expect(Object.keys(call.headers).filter((k) => k.startsWith('x-ezil-cache'))).toEqual([]);
+      expect(call.body).toEqual(new TextEncoder().encode(raw));
+      expect(res.headers.get('x-ezil-cache')).toBeNull(); // the mock Gateway said HIT: not ours to pass on
+      await res.text();
+      expect('cache' in logs.at(-1)!).toBe(false);
+    }
+  });
+
+  it('a Gateway error on an opted-in call is answered exactly as without the opt-in, never masked as a cache result', async () => {
+    const respond = () => Response.json({ error: { code: 'insufficient_credits', reason: 'balance' } }, { status: 402 });
+    const opted = await send(kimi, { respond });
+    const plain = await send(kimi, { respond, gatewayUrl: 'https://ai.ezil.work' });
+    expect(opted.call.headers['x-ezil-cache']).toBe('exact');
+    expect(plain.call.headers['x-ezil-cache']).toBeUndefined();
+    expect(opted.res.status).toBe(402);
+    expect(opted.res.headers.get('x-ezil-cache')).toBeNull();
+    expect(await opted.res.json()).toEqual(await plain.res.json());
+    expect(plain.res.status).toBe(402);
   });
 });
