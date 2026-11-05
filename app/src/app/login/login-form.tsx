@@ -5,8 +5,11 @@ import { useEffect, useRef, useState } from 'react';
 
 import { signInWithGoogle, signInWithPassword } from './actions';
 
-/** Google handles both new and existing accounts; passwords only sign in. */
-export function LoginForm({ returnUrl, startWithEmail }: { returnUrl: string; startWithEmail: boolean }) {
+/**
+ * Google handles both new and existing accounts; passwords only sign in. With EZiL ID configured, the page's
+ * "Continue with EZiL ID" is the only new-account entry: the Supabase Google button is not offered.
+ */
+export function LoginForm({ returnUrl, startWithEmail, ezilId = false }: { returnUrl: string; startWithEmail: boolean; ezilId?: boolean }) {
     const [pending, setPending] = useState<'google' | 'password' | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [emailOpen, setEmailOpen] = useState(startWithEmail);
@@ -65,12 +68,14 @@ export function LoginForm({ returnUrl, startWithEmail }: { returnUrl: string; st
 
     return (
         <div className="ezil-lock-auth">
-            <form action={() => submit('google')} className="w-full">
-                <button type="submit" disabled={busy} className="ezil-lock-google">
-                    <GoogleIcon className="h-[1.125rem] w-[1.125rem]" aria-hidden="true" />
-                    {pending === 'google' ? 'Connecting to Google…' : 'Continue with Google'}
-                </button>
-            </form>
+            {!ezilId && (
+                <form action={() => submit('google')} className="w-full">
+                    <button type="submit" disabled={busy} className="ezil-lock-google">
+                        <GoogleIcon className="h-[1.125rem] w-[1.125rem]" aria-hidden="true" />
+                        {pending === 'google' ? 'Connecting to Google…' : 'Continue with Google'}
+                    </button>
+                </form>
+            )}
 
             {error && <p role="alert" className="ezil-lock-error">{error}</p>}
             <span role="status" className="sr-only">
@@ -143,7 +148,9 @@ export function LoginForm({ returnUrl, startWithEmail }: { returnUrl: string; st
                     {pending === 'password' ? 'Signing in…' : 'Sign in'}
                 </button>
                 <p className="mt-3 text-center text-xs leading-relaxed text-white/65">
-                    Email and password work for existing accounts. New accounts start with Continue with Google.
+                    {ezilId
+                        ? 'Email and password work for existing accounts. New accounts start with Continue with EZiL ID.'
+                        : 'Email and password work for existing accounts. New accounts start with Continue with Google.'}
                 </p>
             </form>
         </div>

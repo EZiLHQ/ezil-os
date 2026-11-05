@@ -75,8 +75,13 @@ describe('EZiL ID entry', () => {
         const html = await render({ returnUrl: '/os?computer=one' });
         expect(html).toContain('Continue with EZiL ID');
         expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');
-        expect(html).toContain('Continue with Google');
+        // Founder 2026-11-05: with EZiL ID configured, the Supabase Google button is not offered; new accounts
+        // start with EZiL ID, and existing email/password accounts keep their form.
+        expect(html).not.toContain('Continue with Google');
+        expect(html).not.toContain('Connecting to Google');
+        expect(html).toContain('New accounts start with Continue with EZiL ID.');
         expect(html).toContain('id="email-sign-in"');
+        expect(html).toContain('<label for="password"');
         expect(html).not.toContain('private-test-secret');
     });
     it('sanitises the Auth0 link destination', async () => {
@@ -108,9 +113,10 @@ describe('auth recovery: Sign out and use another account', () => {
         expect(form).toContain('<span id="switch-account-hint" class="sr-only">');
         // Not the email disclosure's class: `.ezil-lock-disclosure` is that toggle (e2e/login-layout.mjs selects it).
         expect(form).not.toContain('ezil-lock-disclosure');
-        // Order: Continue with EZiL ID, then the sign-out, then the Google and password forms.
+        // Order: Continue with EZiL ID, then the sign-out, then the password disclosure (no Google form with EZiL ID).
         expect(html.indexOf('Continue with EZiL ID</a>')).toBeLessThan(html.indexOf(form!));
-        expect(html.indexOf(form!)).toBeLessThan(html.indexOf('Continue with Google'));
+        expect(html.indexOf(form!)).toBeLessThan(html.indexOf('Sign in with email and password'));
+        expect(html).not.toContain('Continue with Google');
         expect(html).not.toContain('private-test-secret');
     });
 
