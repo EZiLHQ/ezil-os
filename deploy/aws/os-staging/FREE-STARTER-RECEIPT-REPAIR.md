@@ -46,6 +46,9 @@ The script refuses, and writes nothing, unless all of these hold:
   `created_at` + 365 days.
 - **User:** the auth user exists and is not deleted, has **no** non-ended subscription (currently
   Free), and is enrolled (`ezil_works.ai_members`).
+- **Confirmed EZiL ID**, as `app/src/server/billing/store.ts` defines it: `email_confirmed_at` is set
+  and `raw_app_meta_data->>'auth0_sub'` is non-empty after trimming. Otherwise `capture` reports
+  `ezil_id_not_confirmed`, and `dry-run`/`apply` refuse the whole batch.
 - **Uniqueness:** no other outbox row and no Gateway grant or funding event exists for that root.
 - **After the update, inside the same REPEATABLE READ transaction:** every row is an object equal to
   its decoded original, its fixed columns are unchanged, and it is claimable. Every other outbox row

@@ -57,11 +57,14 @@ describe('against PostgreSQL', { skip: !url && 'BILLING_TEST_DATABASE_URL is not
         expiresAt: new Date(T0.getTime() + 365 * 86_400_000).toISOString(),
         eventId: `ezil-os:v1:free-once:${userId}:grant`, action: 'grant',
     });
-    /** One user with the pre-fix sign-in receipt, stored exactly as the double-encoded jsonb string. */
-    async function user({ paid = false, enrolled = true, gatewayGrant = false, attempts = 0, rawString, objectRow = false } = {}) {
+    /** One user with the pre-fix sign-in receipt, stored exactly as the double-encoded jsonb string.
+     * By default a confirmed EZiL ID: a confirmed email and a stored Auth0 subject. */
+    async function user({ paid = false, enrolled = true, gatewayGrant = false, attempts = 0, rawString, objectRow = false,
+        emailConfirmed = true, subject = 'auth0|synthetic-fixture' } = {}) {
         const id = randomUUID();
         users.push(id);
-        await db`insert into auth.users (id) values (${id})`;
+        await db`insert into auth.users (id, email_confirmed_at, raw_app_meta_data)
+            values (${id}, ${emailConfirmed ? T0 : null}, ${JSON.stringify(subject === null ? {} : { auth0_sub: subject })}::text::jsonb)`;
         if (enrolled) await db`insert into ezil_works.ai_members (auth_user_id) values (${id})`;
         if (paid) await db`insert into public.ezil_billing_subscriptions (stripe_subscription_id, user_id, status, sku, stripe_event_created)
             values (${`sub_${id}`}, ${id}, 'active', 'standard_monthly_v3', now())`;
@@ -116,6 +119,7 @@ describe('against PostgreSQL', { skip: !url && 'BILLING_TEST_DATABASE_URL is not
         const a = await user(), b = await user(), paid = await user({ paid: true }), unenrolled = await user({ enrolled: false });
         const granted = await user({ gatewayGrant: true }), attempted = await user({ attempts: 1 }), garbled = await user({ rawString: 'not json' });
         const parked = await user({ objectRow: true });
+        const unconfirmed = await user({ emailConfirmed: false }), unlinked = await user({ subject: null }), blank = await user({ subject: '  ' });
         const { code, lines } = await repair(['capture', ...pin()]);
         assert.equal(code, 0);
         const byHash = new Map(lines.filter(line => line.event === 'candidate').map(line => [line.hash, line]));
@@ -125,8 +129,9 @@ describe('against PostgreSQL', { skip: !url && 'BILLING_TEST_DATABASE_URL is not
         assert.deepEqual(byHash.get(granted.hash).reasons, ['gateway_grant_exists']);
         assert.deepEqual(byHash.get(attempted.hash).reasons, ['attempted']);
         assert.deepEqual(byHash.get(garbled.hash).reasons, ['payload_not_object', 'payload_protocol', 'not_own_free_once', 'credits', 'expiry_invalid']);
+        for (const u of [unconfirmed, unlinked, blank]) assert.deepEqual(byHash.get(u.hash).reasons, ['ezil_id_not_confirmed']);
         assert.equal(byHash.has(parked.hash), false);
-        assert.deepEqual(lines.at(-1), { event: 'capture', stringRows: 7, eligible: 2 });
+        assert.deepEqual(lines.at(-1), { event: 'capture', stringRows: 10, eligible: 2 });
         const printed = JSON.stringify(lines);
         for (const u of [a, b, paid, parked]) { assert.equal(printed.includes(u.id), false); assert.equal(printed.includes(u.key), false); }
     });
@@ -182,6 +187,17 @@ describe('against PostgreSQL', { skip: !url && 'BILLING_TEST_DATABASE_URL is not
         assert.equal(code, 1);
         assert.equal(last.code, 'rows_not_eligible');
         assert.deepEqual(last.blocked, [{ hash: paid.hash.slice(0, 12), reasons: ['not_currently_free'] }]);
+        assert.equal(await snapshot(), before);
+    });
+
+    test('an unconfirmed email or a missing Auth0 subject refuses the batch, and nothing is written', async () => {
+        const a = await user(), unconfirmed = await user({ emailConfirmed: false }), unlinked = await user({ subject: null });
+        const before = await snapshot();
+        for (const other of [unconfirmed, unlinked]) {
+            const { code, last } = await repair(['apply', ...pin(), '--allowlist', 'f', '--expect', '2', '--yes'], `${a.hash}\n${other.hash}\n`);
+            assert.deepEqual([code, last.code, last.committed], [1, 'rows_not_eligible', false]);
+            assert.deepEqual(last.blocked, [{ hash: other.hash.slice(0, 12), reasons: ['ezil_id_not_confirmed'] }]);
+        }
         assert.equal(await snapshot(), before);
     });
 

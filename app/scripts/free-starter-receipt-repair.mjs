@@ -115,6 +115,10 @@ function classify(tx, scope) {
                     then 'expiry_not_original' end,
             case when not exists (select 1 from auth.users u where u.id = s.user_id and u.deleted_at is null)
                 then 'user_missing_or_deleted' end,
+            -- A confirmed EZiL ID, as the app defines it (billing/store.ts): a confirmed email and a stored Auth0 subject.
+            case when exists (select 1 from auth.users u where u.id = s.user_id and u.deleted_at is null
+                and (u.email_confirmed_at is null or coalesce(trim(u.raw_app_meta_data->>'auth0_sub'), '') = ''))
+                then 'ezil_id_not_confirmed' end,
             case when exists (select 1 from public.ezil_billing_subscriptions b where b.user_id = s.user_id
                 and b.status <> all(string_to_array(${csv(ENDED_SUBSCRIPTION)}::text, ','))) then 'not_currently_free' end,
             case when not exists (select 1 from ezil_works.ai_members m where m.auth_user_id = s.user_id) then 'not_enrolled' end,
