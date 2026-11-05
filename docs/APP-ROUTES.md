@@ -267,6 +267,39 @@ the real bridge script: link, switch, Back/Forward, reload, reconnect, close,
 workspace, nested, Unicode, relative, invalid, missing, repository, the veto),
 `worker/src/code-folder-bridge.test.ts` (the bridge and where it is injected).
 
+Scope and open gates (2026-11-05):
+
+- **In this change: the person's own folders.** `?folder=` alone, in both
+  directions, on both computers. The bridge rides the Worker: the Cloudflare
+  code host, and the AWS code port. Verified against real code-server 4.141
+  from the live desktop image (`e2e/code-folder-url-image.sh`) and in Chromium.
+  The staging deploy and its signed-in acceptance are the release owner's step.
+- **AWS link folders.** An AWS computer walks `folder` only with the host
+  agent's `folder` op, which ships in an AMI. Until then the server answers
+  `unverified`: the default folder opens with the notice, and the address keeps
+  the ask. Code→address sync, Back/Forward and Close Folder need no AMI.
+- **Repository links are unchanged.** `repo=`/`project=` open the
+  server-authorised folder W, with the checkout at `W/repository`, exactly as
+  before. `folder=` beside them is refused (`with_repository`).
+- **Not implemented: the checkout as Code's folder, and repo+folder.** With
+  workspace trust off (today), a repository's own `.vscode/settings.json` at
+  Code's root applies: its terminal profile and env run when a terminal opens.
+  Measured with trust on, using `e2e/code-trust-spike.sh` with the live image
+  and a marker repository:
+  - Restricted Mode keeps the checkout inert, but there is no terminal and
+    there are no tasks until the person trusts it. Trusting it applies the
+    repository's settings.
+  - Trust is inherited from the longest trusted parent, and only trusted
+    folders are stored. So once the person trusts `/workspace`, every checkout
+    under it is trusted.
+  - A checkout opened from a path outside `/workspace` stays restricted.
+  - The choice is a product decision, still pending:
+    - Restricted Mode with per-checkout trust as consent. This needs trust on
+      for every user, checkouts outside `/workspace`, and an image and AMI.
+    - W stays Code's folder, and the terminal starts in the checkout.
+  - A repo+folder walk (no-follow, inside the checkout) comes after that
+    decision.
+
 Why the push happens first: in Chromium a frame navigation is filed under
 the entry that was current when it started. The Code and Browser windows
 start their iframes' navigations while they are built; committing after a
