@@ -236,14 +236,17 @@ type Built = { bytes: Uint8Array };
 /**
  * Compacts `request`, which `first` says does not fit, into a copy that `build` accepts at COMPACT_TARGET of the limit
  * (else at the full limit). `build(request, scale)` is the protocol's own builder with the input limit scaled, so every
- * bound it checks (bytes, messages, blocks, items) is measured exactly as for sending. Throws a LocalRequestError marked
- * `afterCompaction` when even the last plan does not fit; any other builder error is passed on.
+ * bound it checks (bytes, messages, blocks, items) is measured exactly as for sending. Throws a LocalRequestError when even
+ * the last plan does not fit, marked `afterCompaction` only if that plan compacted anything; any other builder error is
+ * passed on.
  */
 export function compactRequest<B extends Built>(request: ChatRequest, first: LocalRequestError, build: (request: ChatRequest, scale: number) => B,
     cause: CompactionInfo['cause'] = first.code): { request: ChatRequest; built: B; info: CompactionInfo } {
     const parts = shape(request.messages);
     const foldable = parts.history.length + Math.max(0, parts.steps.length - 1);
     let last: LocalRequestError = first;
+    // Whether the last refused candidate had anything compacted: if not, the refusal must not say it was.
+    let lastChanged = false;
     const attempt = (plan: Plan, fold: number, scale: number) => {
         const counts = { folded: 0, shortened: 0 };
         const candidate: ChatRequest = { ...request, messages: assemble(parts, plan, fold, counts) };
@@ -253,6 +256,7 @@ export function compactRequest<B extends Built>(request: ChatRequest, first: Loc
         } catch (error) {
             if (!(error instanceof LocalRequestError)) throw error;
             last = error;
+            lastChanged = counts.folded + counts.shortened > 0;
             return undefined;
         }
     };
@@ -280,5 +284,5 @@ export function compactRequest<B extends Built>(request: ChatRequest, first: Loc
             }
         }
     }
-    throw new LocalRequestError(last.code, last.counts, true);
+    throw new LocalRequestError(last.code, last.counts, lastChanged);
 }

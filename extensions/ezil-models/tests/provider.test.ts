@@ -460,6 +460,16 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(caught!.message).not.toMatch(/\n\s+at |extension\.js|provideLanguageModelChatResponse/);
         }
     });
+    test('a nested cause reaches Copilot without its stack either (VS Code serializes cause; re-review LOW-3)', async () => {
+        const host = gatewayHost((async () => { throw new Error('socket closed', { cause: new Error('inner') }); }) as unknown as typeof fetch);
+        const failing = { ...host, models: () => { throw new Error('config broke', { cause: new Error('nested reason') }); } };
+        const provider = new EZiLModelsProvider(failing);
+        let caught: Error | undefined;
+        try { await provider.provideLanguageModelChatResponse({ id: 'x' } as never, [] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never); }
+        catch (error) { caught = error as Error; }
+        expect(caught!.stack).toBe('');
+        expect((caught!.cause as Error).stack).toBe('');
+    });
     for (const [status, code] of [[400, 'max_output_tokens_invalid'], [413, 'input_too_large']] as const) {
         test(`${status} ${code} clears cached limits for the next call without retrying`, async () => {
             let gets = 0;

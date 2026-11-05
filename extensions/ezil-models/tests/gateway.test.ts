@@ -343,8 +343,9 @@ describe('local refusals and error origin', () => {
         const { bodyBytes } = error.counts!;
         expect(error.counts).toEqual({ bodyBytes, limitBytes: 130_016, messages: 1, maxBlocks: 1, tools: 1, toolBytes });
         expect(bodyBytes).toBeGreaterThan(130_016);
-        // The one message is the current request: compaction keeps it whole, so it is what to shorten.
-        expect(error.message).toBe(`EZiL Models: This request is too large for ${KIMI}, even with the earlier conversation compacted: ${bodyBytes.toLocaleString('en-US')} bytes `
+        // The one message is the current request: compaction keeps it whole and had nothing else to compact, so it
+        // does not claim to have compacted anything; the message is what to shorten.
+        expect(error.message).toBe(`EZiL Models: This request is too large for ${KIMI}: ${bodyBytes.toLocaleString('en-US')} bytes `
             + `(${toolBytes} of them tool definitions), over the 130,016-byte limit. Nothing was sent or charged, and the conversation is kept. `
             + 'Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
         expect(error.message).not.toMatch(/invalid|new chat/i);

@@ -123,7 +123,9 @@ export function isUtilityRequest(options: Record<string, unknown>): boolean {
  */
 function withoutStack(error: unknown): Error {
     const plain = error instanceof Error ? error : new Error(String(error));
-    plain.stack = '';
+    // VS Code serializes `cause` too (transformErrorForSerialization): clear every stack in the chain.
+    let link: unknown = plain;
+    for (let depth = 0; link instanceof Error && depth < 8; depth++, link = link.cause) link.stack = '';
     return plain;
 }
 

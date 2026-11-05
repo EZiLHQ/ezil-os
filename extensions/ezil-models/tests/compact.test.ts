@@ -332,6 +332,21 @@ describe('compactRequest', () => {
         expect(body.messages.at(-2)!.content).toContainEqual({ type: 'tool_use', id: 'r4', name: 'read_file', input: {} });
         expect(wire(body.messages.at(-1))).toMatch(/"tool_use_id":"r4".*file 4 f+\\n\[… \d+ characters left out by EZiL/);
     });
+    test('a result pairs with the nearest earlier unanswered call of its id, not the first (re-review LOW-1)', () => {
+        const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Go.')), msg('assistant', call('dup', 'read_file', { n: 1 })),
+            msg('assistant', call('dup', 'read_file', { n: 2 })), msg('user', result('dup', [txt('answer for two')])),
+            ...Array.from({ length: 40 }, (_, i) => [msg('user', txt(`next ${i}`)), msg('assistant', txt('a'.repeat(4000)))]).flat(), msg('user', txt('last'))]), tools: [tool] };
+        const model = { ...gw(), maxInputTokens: 40_000 };
+        const text = new TextDecoder().decode(compactRequest(request, first(request, model), build(model)).built.bytes);
+        expect(text).toContain('Tool read_file {\\"n\\":1} → (no result recorded)');
+        expect(text).toContain('Tool read_file {\\"n\\":2} → answer for two');
+    });
+    test('nothing compacted: the refusal does not claim the conversation was compacted (re-review LOW-2)', () => {
+        const request = ask([msg('user', txt('字'.repeat(50_000)))]);
+        let error: unknown;
+        try { compactRequest(request, first(request), build(gw())); } catch (caught) { error = caught; }
+        expect((error as LocalRequestError).afterCompaction).toBe(false);
+    });
     test('the latest step is kept verbatim, whatever is folded before it (review LOW-6)', () => {
         const request = { ...ask([msg('system', txt(SYSTEM)), msg('user', txt('Fix it.')),
             ...Array.from({ length: 60 }, (_, i) => [msg('assistant', txt(`step ${i}`), call(`s${i}`)), msg('user', result(`s${i}`, [txt(`out ${i} ${'o'.repeat(3000)}`)]))]).flat()]), tools: [tool] };
