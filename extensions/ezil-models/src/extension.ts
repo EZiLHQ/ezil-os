@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
 import { forgetGatewayModels, gatewayModels } from './gateway';
+import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
 import type { Usage } from './types';
@@ -207,6 +208,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const store = new ConfigStore(resolveConfigPath(settings().get<string>('configPath')), log);
     const usage = new UsageTracker();
     const aiStatus = new EZiLAIStatus(() => store.models().find(model => model.provider.type === 'ezil-gateway')?.provider);
+    const compaction = new CompactionNotice(log);
     const provider = new EZiLModelsProvider({
         models: () => store.models(),
         configError: () => store.error(),
@@ -218,8 +220,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
         },
         requestFinished: model => { if (model.provider.type === 'ezil-gateway') { void aiStatus.refresh(); provider.refreshIfCatalogChanged(); } },
+        compacted: (model, info, finished) => compaction.show(model.name, info, finished),
     });
-    context.subscriptions.push(output, store, provider, aiStatus);
+    context.subscriptions.push(output, store, provider, aiStatus, compaction);
     context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));
     store.watch();
     store.load();
@@ -295,6 +298,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.showStatus', showCredits),
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
+        vscode.commands.registerCommand('ezil-models.compactionInfo', () => compaction.explain()),
     );
     log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}`);
 }
