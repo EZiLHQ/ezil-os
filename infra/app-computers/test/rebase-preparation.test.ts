@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import test from 'node:test';
 import { createPreparationHelper, preparationControl } from '../lib/lifecycle/preparation-helper.js';
 import { preparationDefinition } from '../lib/lifecycle/preparation-definition.js';
 import { verifyPreparation } from '../lib/lifecycle/preparation-evidence.js';
+import { parsePreparationInput, PreparationDocumentSchema } from '../lib/lifecycle/preparation-contract.js';
 import { preparationFixture } from './preparation-fixture.js';
+import { envelopeFor, rebaseFixture } from './rebase-fixture.js';
 import { createLifecycleHelper } from '../lib/lifecycle/helper.js';
-import { authorityFor } from '../lib/lifecycle/contract.js';
+import { authorityFor, tagList } from '../lib/lifecycle/contract.js';
 import { runAsl, taskError } from './asl.js';
 
 async function run(options: { lost?: boolean; duplicate?: boolean; absent?: boolean; pending?: boolean; revoke?: boolean } = {}) {
@@ -133,6 +137,108 @@ test('retained source uses its own approved subnet instead of the new deployment
     assert.equal((await helper({ executionArn, phase: 'initial' })).decision, 'runInstances');
     f.instance.SubnetId = 'subnet-33333333333333333';
     await assert.rejects(helper({ executionArn, phase: 'initial' }), /lifecycle_instance_invalid/);
+});
+// App DESIGN R: a STOPPED computer's released warm-pool host. The document is the app's pinned bytes (aws-rebase-released.fixtures.json).
+const pinned = JSON.parse(readFileSync(join(__dirname, '../../../app/src/server/lib/compute/aws-rebase-released.fixtures.json'), 'utf8'))['released-pool-preparation'];
+function releasedFixture() {
+    const base = rebaseFixture(), released = JSON.parse(pinned.document).releasedPoolHost;
+    const preparation = PreparationDocumentSchema.parse({ ...base.preparation, releasedPoolHost: released }), preparationEnvelope = envelopeFor(preparation);
+    return { ...base, preparation, preparationEnvelope, reference: { ...base.reference, digest: preparationEnvelope.digest } };
+}
+type Released = ReturnType<typeof preparationFixture>;
+/** EC2 still listing the released host: terminated, claim identity, no canonical or pool tag. */
+const terminatedClaim = (f: Released) => Object.assign(f.instance, { State: { Name: 'terminated' }, BlockDeviceMappings: [], Tags: tagList({
+    'ezil:managed-by': 'app-computer-platform', 'ezil:stage': 'pilot', 'ezil:namespace': 'pilot', 'ezil:pool-host': f.preparation.releasedPoolHost!.poolHostId,
+    'ezil:computer': f.preparation.computerId, 'ezil:generation': String(f.preparation.sourceGeneration), 'ezil:fence': f.preparation.sourceFenceToken }) });
+async function runReleased(mutate: (f: Released) => void = () => {}) {
+    const f = preparationFixture(releasedFixture()), calls: string[] = [];
+    f.state.instances = []; f.volume.State = 'available'; f.volume.Attachments = []; mutate(f);
+    const helper = createPreparationHelper(f.settings, f.deps);
+    const result = await runAsl(preparationDefinition('observer:1'), { input: f.preparationEnvelope, executionArn: f.reference.executionArn,
+        sleep: seconds => { f.state.now += seconds * 1000; }, invoke: async (_resource, p, name) => {
+            if (name.startsWith('Observe-')) return helper(p);
+            calls.push(name); assert.equal(name, 'createSnapshot');
+            const snapshot = f.snapshot(); f.state.snapshots.push(snapshot); return { SnapshotId: snapshot.SnapshotId };
+        }, maxSteps: 100 });
+    return { f, result, calls };
+}
+const observe = (f: Released, control: Record<string, unknown> = preparationControl, phase: 'initial' | 'snapshot' = 'initial') =>
+    createPreparationHelper(f.settings, f.deps)({ executionArn: f.reference.executionArn, phase, control });
+test('released pool host: infra re-stringifies the app document byte-for-byte, field last; existing digests unchanged', () => {
+    const f = releasedFixture();
+    assert.equal(JSON.stringify(f.preparation), pinned.document); assert.equal(f.preparationEnvelope.digest, pinned.digest);
+    assert.equal(Object.keys(f.preparation).at(-1), 'releasedPoolHost');
+    assert.equal(parsePreparationInput(JSON.stringify(f.preparationEnvelope)).document.releasedPoolHost!.poolHostId, JSON.parse(pinned.document).releasedPoolHost.poolHostId);
+    const base = rebaseFixture(); assert.equal(JSON.stringify(base.preparation).includes('releasedPoolHost'), false);
+    assert.equal(base.preparationEnvelope.digest, base.intent.rebasePreparation!.digest);
+});
+test('released pool host: the pre-change strict document shape refuses the field, so an older helper fails closed', () => {
+    const old = PreparationDocumentSchema.innerType().omit({ releasedPoolHost: true }).strict(), f = releasedFixture();
+    assert.equal(old.safeParse(rebaseFixture().preparation).success, true);
+    const r = old.safeParse(f.preparation);
+    assert.equal(r.success, false); assert.deepEqual(r.error!.issues.map(i => [i.code, (i as { keys?: string[] }).keys]), [['unrecognized_keys', ['releasedPoolHost']]]);
+});
+test('released pool host: a release outside this namespace lifecycle machine is release_mismatch', () => {
+    const f = releasedFixture(), arn = f.preparation.releasedPoolHost!.releaseExecutionArn;
+    for (const releaseExecutionArn of [arn.replace('-lifecycle:', '-recovery:'), arn.replace('123456789012', '999999999999'), arn.replace(':ap-south-1:', ':us-east-1:')])
+        assert.throws(() => PreparationDocumentSchema.parse({ ...f.preparation, releasedPoolHost: { ...f.preparation.releasedPoolHost, releaseExecutionArn } }), /release_mismatch/);
+});
+for (const [name, mutate] of [['aged out of EC2', () => {}], ['still listed as a terminated claim', (f: Released) => { terminatedClaim(f); f.state.instances = [f.instance]; }]] as const) {
+    test(`released pool host ${name}: fences at observation, snapshots, never stops or terminates`, async () => {
+        const { f, result, calls } = await runReleased(mutate);
+        assert.deepEqual(calls, ['createSnapshot']);
+        assert.equal(result.output.state, 'snapshot_ready'); assert.equal(result.output.digest, f.reference.digest);
+        assert.ok(Date.parse(result.output.fencedAt) <= Date.parse(result.output.snapshotStartedAt));
+    });
+}
+test('without the released field an absent source stays unfenced (the branch is load-bearing)', async () => {
+    const f = preparationFixture(); f.state.instances = []; f.volume.State = 'available'; f.volume.Attachments = [];
+    assert.equal((await observe(f)).code, 'writer_not_fenced');
+    const r = preparationFixture(releasedFixture()); r.state.instances = []; r.volume.State = 'available'; r.volume.Attachments = [];
+    assert.equal((await observe(r)).decision, 'createSnapshot');
+});
+for (const state of ['running', 'pending', 'stopping', 'stopped', 'shutting-down']) {
+    test(`released pool host: a ${state} host is source_identity_mismatch with no provider action`, async () => {
+        const { result, calls } = await runReleased(f => { terminatedClaim(f); f.instance.State = { Name: state as 'running' }; f.state.instances = [f.instance]; });
+        assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
+    });
+}
+for (const [name, patch] of [['AMI', { ImageId: 'ami-99999999999999999' }], ['zone', { Placement: { AvailabilityZoneId: 'aps1-az2' } }],
+    ['pool-host', { 'ezil:pool-host': '99999999-9999-4999-8999-999999999999' }], ['ezil:computer', { 'ezil:computer': '99999999-9999-4999-8999-999999999999' }],
+    ['ezil:generation', { 'ezil:generation': '2' }], ['ezil:fence', { 'ezil:fence': '99999999-9999-4999-8999-999999999999' }], ['ezil:namespace', { 'ezil:namespace': 'mum' }],
+    ['canonical ezil:computer-id', { 'ezil:computer-id': 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1' }], ['canonical ezil:fence-token', { 'ezil:fence-token': 'x' }],
+    ['spare ezil:pool', { 'ezil:pool': '1' }]] as const) {
+    test(`released pool host: a terminated host with the wrong ${name} is source_identity_mismatch`, async () => {
+        const { result, calls } = await runReleased(f => {
+            terminatedClaim(f); f.state.instances = [f.instance];
+            const tags = Object.entries(patch).filter(([k]) => k.startsWith('ezil:'));
+            if (tags.length) f.instance.Tags = [...f.instance.Tags!.filter(t => !tags.some(([k]) => k === t.Key)), ...tagList(Object.fromEntries(tags))];
+            else Object.assign(f.instance, patch);
+        });
+        assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
+    });
+}
+for (const [name, volume] of [['attached', { State: 'in-use', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attached' }] }],
+    ['attaching', { State: 'available', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attaching' }] }],
+    ['detaching (in-use, empty)', { State: 'in-use', Attachments: [] }]] as const) {
+    test(`released pool host: a ${name} volume is writer_not_fenced at once, never a wait`, async () => {
+        const f = preparationFixture(releasedFixture()); f.state.instances = []; Object.assign(f.volume, structuredClone(volume));
+        assert.deepEqual(await observe(f), { decision: 'failed', code: 'writer_not_fenced' });
+        const { result, calls } = await runReleased(r => Object.assign(r.volume, structuredClone(volume)));
+        assert.equal(result.cause, 'writer_not_fenced'); assert.deepEqual(calls, []);
+    });
+}
+test('released pool host: a writer attaching after the fence fails closed while the snapshot is pending', async () => {
+    const f = preparationFixture(releasedFixture()); f.state.instances = []; f.volume.State = 'available'; f.volume.Attachments = [];
+    const control = { ...preparationControl, fencedAt: f.preparation.createdAt, snapshotId: f.lease.rebase.snapshotId, createAttempted: true };
+    f.state.snapshots.push({ ...f.snapshot(), State: 'pending' });
+    assert.equal((await observe(f, control, 'snapshot')).decision, 'wait');
+    Object.assign(f.volume, { State: 'in-use', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: f.volume.VolumeId, State: 'attached' }] });
+    assert.deepEqual(await observe(f, control, 'snapshot'), { decision: 'failed', code: 'writer_not_fenced' });
+});
+test('released pool host: canonical volume tags are still required', async () => {
+    const { result, calls } = await runReleased(f => { f.volume.Tags = f.volume.Tags!.map(t => t.Key === 'ezil:generation' ? { ...t, Value: '2' } : t); });
+    assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
 });
 test('a late preparation authority denial is a bounded failure before the provider mutation', async () => {
     const f = preparationFixture(); let calls = 0;

@@ -5,6 +5,9 @@ import { describe, expect, it } from 'vitest';
 import { fixtureRebasePreparation, fixtureRebaseRelease } from './aws-intent.test-support';
 import { IMAGE_JOB_NEXT, IMAGE_JOB_PHASES, newReservedImageJob, parseImageJobRow, validateImageJob } from './aws-rebase-store';
 import { parseRebaseRelease } from './aws-rebase-release';
+import { buildRebasePreparation, RebasePreparationSchema } from './aws-rebase-preparation';
+import fixtures from './aws-intent.fixtures.json';
+import releasedFixtures from './aws-rebase-released.fixtures.json';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { assertNoImageReservation, readPlacement, transitionPlacement } from './placement';
 import { leasePoolHost } from './ready-pool';
@@ -99,6 +102,42 @@ describe('image job store and release read contracts', () => {
         { lowerImageRef: '999999999999.dkr.ecr.ap-south-1.amazonaws.com/desktop@sha256:' + 'a'.repeat(64) },
     ])('refuses unreviewed or partial release evidence #%#', patch => {
         expect(() => parseRebaseRelease({ ...fixtureRebaseRelease(p.intent.deployment), ...patch }, p.intent.deployment, repository)).toThrow();
+    });
+});
+
+describe('DESIGN R preparation field: last key, omitted when absent', () => {
+    const released = { poolHostId: 'a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0', lifecycleDigest: 'c'.repeat(64),
+        releaseExecutionArn: 'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3' };
+    const pinned = (fixtures as { 'rebase-replace': { input: string } })['rebase-replace'];
+    it('keeps every existing document and digest byte-identical (pinned lane fixture)', () => {
+        const launch = JSON.parse(JSON.parse(pinned.input).document) as { rebasePreparation: { digest: string } };
+        expect(p.digest).toBe(launch.rebasePreparation.digest);
+        expect(Object.keys(JSON.parse(p.document))).not.toContain('releasedPoolHost');
+        expect(buildRebasePreparation({ ...p.intent, releasedPoolHost: undefined }).document).toBe(p.document);
+    });
+    it('appends the field last, pinned for infra, and the job validates and round-trips', () => {
+        const w = buildRebasePreparation({ ...p.intent, releasedPoolHost: released });
+        expect(Object.keys(JSON.parse(w.document)).at(-1)).toBe('releasedPoolHost');
+        expect(w.document).toBe(p.document.slice(0, -1) + ',"releasedPoolHost":' + JSON.stringify(released) + '}');
+        expect({ document: w.document, digest: w.digest }).toEqual(releasedFixtures['released-pool-preparation']);
+        const j = newReservedImageJob({ preparation: w, ownerUserId: '33333333-3333-4333-8333-333333333333',
+            sourceRelease: fixtureRebaseRelease(p.intent.sourceDeployment), targetRelease: fixtureRebaseRelease(p.intent.deployment) });
+        expect(parseImageJobRow(rowOf(j))).toEqual(j); expect(j.preparationDigest).not.toBe(p.digest);
+    });
+    it('the pre-change strict shape refuses the field (an old helper fails closed); a plain document still parses', () => {
+        const old = RebasePreparationSchema.innerType().omit({ releasedPoolHost: true }).strict();
+        expect(old.safeParse(JSON.parse(p.document)).success).toBe(true);
+        const r = old.safeParse(JSON.parse(buildRebasePreparation({ ...p.intent, releasedPoolHost: released }).document));
+        expect(r.success).toBe(false);
+        expect(r.error!.issues).toEqual([expect.objectContaining({ code: 'unrecognized_keys', keys: ['releasedPoolHost'] })]);
+    });
+    it.each([
+        ['another machine', { releaseExecutionArn: released.releaseExecutionArn.replace('-lifecycle:', '-recovery:') }],
+        ['another account', { releaseExecutionArn: released.releaseExecutionArn.replace('123456789012', '999999999999') }],
+        ['another region', { releaseExecutionArn: released.releaseExecutionArn.replace(':ap-south-1:', ':us-east-1:') }],
+        ['a short digest', { lifecycleDigest: 'c'.repeat(63) }], ['an unknown key', { extra: true }], ['no pool host', { poolHostId: undefined }],
+    ] as const)('refuses a releasedPoolHost with %s', (_name, patch) => {
+        expect(() => buildRebasePreparation({ ...p.intent, releasedPoolHost: { ...released, ...patch } as typeof released })).toThrow();
     });
 });
 
