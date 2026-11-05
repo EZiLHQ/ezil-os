@@ -442,7 +442,8 @@ describe('awsCodeFolderResolver: the host edge folder op (host-agent edge.py `_f
     for (const [path, outcome] of [['/workspace/sports/gone', 'missing'], ['/workspace/link-out', 'symlink'], ['/workspace/via-link/child', 'symlink']] as const) {
       const body = await read(path);
       expect(body.codeFolder).toEqual({ v: 1, outcome });
-      expect(new URL(body.codePreviewUrl).searchParams.get('folder')).toBeNull();
+      // The workspace root, named explicitly: never code-server's own last-visited folder.
+      expect(new URL(body.codePreviewUrl).searchParams.get('folder')).toBe('/workspace');
     }
     // Refused by the planner before any host call: another root, a project's repository, the shell's own files.
     host.seen.length = 0;
@@ -451,7 +452,9 @@ describe('awsCodeFolderResolver: the host edge folder op (host-agent edge.py `_f
       ['/workspace/projects/0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b/repository', 'not_allowed'],
       ['/workspace/.ezil/x', 'not_allowed'],
     ] as const) {
-      expect((await read(path)).codeFolder).toEqual({ v: 1, outcome });
+      const body = await read(path);
+      expect(body.codeFolder).toEqual({ v: 1, outcome });
+      expect(new URL(body.codePreviewUrl).searchParams.get('folder')).toBe('/workspace');
     }
     expect(host.seen).toEqual([]);
   });
