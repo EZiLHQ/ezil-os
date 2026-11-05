@@ -78,7 +78,7 @@ describe('v3 public plans', () => {
         expect(faq).toHaveLength(6);
         // Founder 2026-11-05: Free's session length is never a number; paid keeps its six hours.
         expect(faq[0].answer).toContain('Free sessions are shorter; Standard and Premium sessions last up to 6 hours.');
-        expect(JSON.stringify(getPricingContent())).not.toMatch(/\b(1|one)[- ]hours?\b|up to an hour/i);
+        expect(JSON.stringify(getPricingContent())).not.toMatch(/\b(1|one)[- ]hours?\b|hour-long|\b(60|sixty)[- ]minutes?\b|up to an hour/i);
         expect(faq[0].answer).toContain('computer stops');
         // Paid compute policy v1: Free keeps its monthly allowance; no paid plan is sold monthly hours (or "unlimited").
         expect(faq[1].question).toBe('How much computer time is included?');
