@@ -2,7 +2,8 @@
 """Host-agent unit runner: no Docker, mounts, AWS, or network sockets.
 
 The privileged run-all.sh remains the integration runner. Its TCP EdgeE2E
-tests are explicitly excluded here; all other discovered Python tests run.
+and FolderE2E tests are explicitly excluded here; all other discovered Python
+tests run.
 """
 from pathlib import Path
 import socket
@@ -22,7 +23,7 @@ def cases(suite):
 if __name__ == "__main__":
     sys.dont_write_bytecode = True
     found = list(cases(unittest.defaultTestLoader.discover(str(Path(__file__).parent))))
-    excluded = [t for t in found if t.id().startswith("test_edge.EdgeE2E.")]
+    excluded = [t for t in found if t.id().startswith(("test_edge.EdgeE2E.", "test_folder.FolderE2E."))]
     suite = unittest.TestSuite(t for t in found if t not in excluded)
     print(f"Offline host-agent suite: {suite.countTestCases()} tests; {len(excluded)} TCP integration tests excluded",
           flush=True)
