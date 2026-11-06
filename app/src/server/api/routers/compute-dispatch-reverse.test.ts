@@ -805,7 +805,9 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         // code.js needs a DOM to import, so its body is pinned to its source (as readMoveAsk's URL is below); the shell's
         // code-test.mjs drives the built bundle's mint and checks the same body on the wire.
         const code = readFileSync(path.resolve(__dirname, '../../../../../shell/ezil/apps/code.js'), 'utf8');
-        expect(code).toContain("body: JSON.stringify({ computerId, intent: 'open' }),");
+        // Still exactly { computerId, intent: 'open' }, plus the per-tab folder hint `codeFolder` only when this tab asks
+        // for one (the address's folder, else its record; code-folder-test.mjs; the procedure never 400s on it).
+        expect(code).toContain("body: JSON.stringify({ computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),");
         const w = world([held({ instance_type: 'm6i.large' })]);
         const seen = shellRoutes(w.db);
         await post('/api/shell/code-preview-url', { computerId: C, intent: 'open' });

@@ -384,13 +384,16 @@ describe('the Worker really does emit appPreviewUrl as string|null, never omitte
         // assigned from it unconditionally, then included in the response.
         expect(src).toMatch(/buildBridgeUrl\s*=\s*async\s*\([^)]*\):\s*Promise<string \| null>/);
         expect(src).toMatch(/const appPreviewUrl = await buildBridgeUrl\(appPreviewExpose\)/);
-        // `codePreviewUrl` additionally passes `codePreviewFolderParams(workspace)`
+        // `codePreviewUrl` additionally passes `codePreviewFolderParams(workspace, …)`
         // — the `folder=` fix for code-server's empty file tree (see
-        // `worker/src/index.ts`'s `codePreviewFolderParams` doc comment) — so
-        // this no longer matches a bare single-argument call.
+        // `worker/src/index.ts`'s `codePreviewFolderParams` doc comment), plus the
+        // per-tab folder continuity's walked folder — so this no longer matches a
+        // bare single-argument call. It is still always assigned (a `let`, since a
+        // restore too long for the frame-confirm cap is rebuilt with the default).
         expect(src).toMatch(
-            /const codePreviewUrl = await buildBridgeUrl\(codePreviewExpose, codePreviewFolderParams\(workspace\)\)/,
+            /let codePreviewUrl = await buildBridgeUrl\(codePreviewExpose, codePreviewFolderParams\(workspace, codeFolder\.folder\)\)/,
         );
+        expect(src).toMatch(/codePreviewUrl = await buildBridgeUrl\(codePreviewExpose, codePreviewFolderParams\(workspace\)\)/);
         expect(src).toMatch(/^\s*appPreviewUrl,\s*$/m);
         expect(src).toMatch(/^\s*codePreviewUrl,\s*$/m);
     });
