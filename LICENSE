@@ -1,36 +1,3 @@
-EZiL-OS
-
-Copyright (C) 2026 EZiL <contact@ezil.work>
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-EZiL-OS is a derivative work of the Puter web desktop
-(https://github.com/HeyPuter/puter), which is licensed AGPL-3.0-only.
-Puter-derived source is confined to shell/src/ and has been modified; the
-file-by-file record of what was taken and what was changed is
-shell/PUTER-PROVENANCE.md. The repository also incorporates ordinary
-unmodified third-party dependencies and container-image components. See
-NOTICE and ATTRIBUTIONS.md at the root of this repository for the complete
-list of upstream projects, their licenses, and the specific obligations that
-apply to those components. Nothing in this file overrides or diminishes any
-upstream license notice preserved elsewhere in this repository.
-
-================================================================================
-                    GNU AFFERO GENERAL PUBLIC LICENSE
-                     (full text of version 3, reproduced verbatim below)
-================================================================================
-
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
