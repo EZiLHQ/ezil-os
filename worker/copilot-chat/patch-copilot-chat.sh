@@ -256,12 +256,18 @@ R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
 # web sets reach the picker only around the first request (measured: 7 rows before it, 9 after), so
 # a user who switched every row off before that got those sets and their members back (`tools-absent`).
 # A stored selection whose every entry is off now keeps ids it has never seen off too; any other
-# selection (never configured, partial, the pre-version-2 disabled-only format) keeps upstream's
-# missing-means-on, so new tools still appear for those users.
+# selection (never configured, partial, the pre-version-2 disabled-only format, or one a prompt file
+# or tool include/exclude wrote for the session: `tools-session`) keeps upstream's missing-means-on,
+# so new tools still appear for those users and a prompt file naming not-yet-registered sets keeps them.
 A_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l)}}'
-R_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l),ezilLegacy:!0}}'
+R_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l),ezilMissingOn:!0}}'
+# workbench.js `tools-session`: a session selection written by code (`set(e,!0)`: a prompt file's
+# `tools:`, tool include/exclude) is tagged missing-means-on; one Configure Tools writes (`set(b,!1)`)
+# is not. Measured: a prompt file with tools ['edit','search'] as the first request lost both otherwise.
+A_TOOLS_SESSION='set(e,t){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,j_e.fromMap(e));return}'
+R_TOOLS_SESSION='set(e,t){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,t?{...j_e.fromMap(e),ezilMissingOn:!0}:j_e.fromMap(e));return}'
 A_TOOLS_ABSENT='r||(r=this._globalState.read(e));for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,r.tools.get(a.id)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=r.toolSets.get(a.id)!==!1;'
-R_TOOLS_ABSENT='r||(r=this._globalState.read(e));let ezilAbsent=!!r.ezilLegacy||!(r.tools.size||r.toolSets.size)||[...r.tools.values(),...r.toolSets.values()].some(z=>z!==!1);for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,(r.tools.get(a.id)??ezilAbsent)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=(r.toolSets.get(a.id)??ezilAbsent)!==!1;'
+R_TOOLS_ABSENT='r||(r=this._globalState.read(e));let ezilAbsent=!!r.ezilMissingOn||!(r.tools.size||r.toolSets.size)||[...r.tools.values(),...r.toolSets.values()].some(z=>z!==!1);for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,(r.tools.get(a.id)??ezilAbsent)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=(r.toolSets.get(a.id)??ezilAbsent)!==!1;'
 # Names the selection relies on (checked, never patched): a set's members follow the set unless
 # explicitly on; the request's tool map is entriesMap without the sets; Configure Tools saves the full
 # map it showed; the storage format the legacy branch is told apart from.
@@ -269,6 +275,9 @@ P_TOOLS_MEMBERS='t.set(a,c);for(let l of a.getTools(e))t.set(l,c||r.tools.get(l.
 P_TOOLS_REQUEST='this.userSelectedTools=be(e=>{let t={},i=this.entriesMap.read(e);for(let[n,r]of i)dm(n)||(t[n.id]=r);return t});'
 P_TOOLS_PICKER='b&&r.input.selectedToolsModel.set(b,!1)'
 P_TOOLS_STORAGE='function e(r){return ui(r)&&r.version===2&&Array.isArray(r.toolSetEntries)&&Array.isArray(r.toolEntries)}'
+# The only code-written selections pass !0 (prompt-file metadata; tool include/exclude), which `tools-session` relies on.
+P_TOOLS_PROMPT='let r=this.toolsService.toToolAndToolSetEnablementMap(t,this.input.selectedLanguageModel.get()?.metadata);this.input.selectedToolsModel.set(r,!0)'
+P_TOOLS_FILTER='b.input.selectedToolsModel.set(D.enablementMap,!0)'
 # extension.js `tools-forced`: the Agent's tool function (Ret) turns some tools on that the request's
 # map does not list (insert_edit_into_file, replace_string_in_file, session_store_sql, tool search,
 # tests/tasks, ...). When that map lists tools and every one is off, nothing is turned on: a tool
@@ -333,9 +342,10 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
   patch submenu-label  "$PKG_NLS" 1 "$A_SUBMENU"     "$R_SUBMENU"
   patch walkthrough    "$PKG_NLS" 1 "$A_WALKTHROUGH" "$R_WALKTHROUGH"
-  for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE"; do gate tools-names "$WB" 1 "$p"; done
+  for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE" "$P_TOOLS_PROMPT" "$P_TOOLS_FILTER"; do gate tools-names "$WB" 1 "$p"; done
   patch tools-legacy   "$WB"  1  "$A_TOOLS_LEGACY" "$R_TOOLS_LEGACY"
   patch tools-absent   "$WB"  1  "$A_TOOLS_ABSENT" "$R_TOOLS_ABSENT"
+  patch tools-session  "$WB"  1  "$A_TOOLS_SESSION" "$R_TOOLS_SESSION"
   for p in "$P_TOOLS_EDITFILES" "$P_TOOLS_ENABLED"; do gate tools-names "$EXT" 1 "$p"; done
   patch tools-forced   "$EXT" 1  "$A_TOOLS_FORCED" "$R_TOOLS_FORCED"
   # modification notices (comments; the .json cannot carry one)
@@ -384,10 +394,11 @@ gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB" 
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
 gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
 gate history-picker   "$WB"  0  "$A_HISTORY_PICKER"; gate history-picker   "$WB"  1  "$R_HISTORY_PICKER"
-for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE"; do gate tools-names "$WB" 1 "$p"; done
+for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE" "$P_TOOLS_PROMPT" "$P_TOOLS_FILTER"; do gate tools-names "$WB" 1 "$p"; done
 for p in "$P_TOOLS_EDITFILES" "$P_TOOLS_ENABLED"; do gate tools-names "$EXT" 1 "$p"; done
 gate tools-legacy     "$WB"  0  "$A_TOOLS_LEGACY";  gate tools-legacy     "$WB"  1  "$R_TOOLS_LEGACY"
 gate tools-absent     "$WB"  0  "$A_TOOLS_ABSENT";  gate tools-absent     "$WB"  1  "$R_TOOLS_ABSENT"
+gate tools-session    "$WB"  0  "$A_TOOLS_SESSION"; gate tools-session    "$WB"  1  "$R_TOOLS_SESSION"
 gate tools-forced     "$EXT" 0  "$A_TOOLS_FORCED";  gate tools-forced     "$EXT" 1  "$R_TOOLS_FORCED"
 gate session-filter   "$WB"  0  "$A_SESSION_FILTER"; gate session-filter   "$WB"  1  "$R_SESSION_FILTER"
 for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEADER_INPUT_TOOLBAR" "$P_HEADER_INPUT_CONTAINER" "$P_HEADER_SECONDARY" "$P_HEADER_TRAILING" "$P_HEADER_LAYOUT" "$P_HEADER_COMMANDS" "$P_HEADER_NOTIFY"; do
