@@ -219,6 +219,7 @@ jobs:
                    shell/ezil/apps/relay-renewal-test.mjs \
                    shell/ezil/apps/viewer-evidence-test.mjs \
                    shell/ezil/apps/code-test.mjs \
+                   shell/ezil/apps/code-folder-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
                    shell/ezil/apps/frame-confirmation-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
@@ -260,6 +261,7 @@ jobs:
           for t in shell/touch-focus-browser-test.mjs \
                    shell/ezil/context-menu-stack-browser-test.mjs \
                    shell/ezil/app-link-browser-test.mjs \
+                   shell/ezil/apps/code-history-browser-test.mjs \
                    shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
                    shell/ezil/apps/os-chrome-browser-test.mjs \
