@@ -141,6 +141,20 @@ R_PICKER_FLIP='function SW(s){return{...Vio(s),anchorPosition:void 0,preferredAn
 # Names the flip relies on (checked, never patched): the widget reads both options; the dialog override.
 P_PICKER_OPTIONS='this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,'
 P_PICKER_DIALOG='G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)'
+# workbench.js `picker-order`: when the header's pickers do not fit (a phone: Explorer and Chat side by side leave
+# Chat about 160 px), the responsive layout (SEt) compacts them to icons right to left, so the model picker, right of
+# the mode picker, lost its name first: only a sparkle icon was left (image e2e, 390 and 412 px). The model picker is
+# the one item upstream lets shrink (canShrink: its name ellipsizes, model-picker-item flex-shrink:1), so it now
+# compacts last: the mode picker becomes its icon first, then the model name shortens with an ellipsis, and only if
+# even that does not fit is the model picker compacted. Same items, same compaction, same accessible names; nothing
+# changes when everything fits (a desktop chat).
+A_PICKER_ORDER='let t=this._getVisibleItemBounds().sort((i,n)=>n.bounds.left-i.bounds.left).map(({item:i})=>i);for(let i of t)i.setMinimal?.(!1),i.setCompact(!1);'
+R_PICKER_ORDER='let t=this._getVisibleItemBounds().sort((i,n)=>(i.item.canShrink?1:0)-(n.item.canShrink?1:0)||n.bounds.left-i.bounds.left).map(({item:i})=>i);for(let i of t)i.setMinimal?.(!1),i.setCompact(!1);'
+# Names the order relies on (checked, never patched): only the model picker is canShrink; the fit check lets a
+# canShrink item be narrower than its preferred width.
+P_PICKER_SHRINK='canShrink:r.id===u2.ID,'
+P_PICKER_MODEL_ID='static{this.ID="workbench.action.chat.openModelPicker"}'
+P_PICKER_FIT='if(!i.some(({item:r})=>r.canShrink)&&n.width>e+o4e)return!1;for(let{item:r,bounds:a}of i){let c=n.itemWidths.get(r);if(!r.canShrink&&c!==void 0&&a.width<c-o4e)return!1}return!0}'
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -283,6 +297,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch attach-execute "$WB"  1  "$A_ATTACH" "$R_ATTACH"
   for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
   patch picker-flip    "$WB"  1  "$A_PICKER_FLIP" "$R_PICKER_FLIP"
+  for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done
+  patch picker-order   "$WB"  1  "$A_PICKER_ORDER" "$R_PICKER_ORDER"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -342,6 +358,8 @@ gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB" 
 gate attach-execute   "$WB"  0  "$A_ATTACH";        gate attach-execute   "$WB"  1  "$R_ATTACH"
 for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
 gate picker-flip      "$WB"  0  "$A_PICKER_FLIP";   gate picker-flip      "$WB"  1  "$R_PICKER_FLIP"
+for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done
+gate picker-order     "$WB"  0  "$A_PICKER_ORDER";  gate picker-order     "$WB"  1  "$R_PICKER_ORDER"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"

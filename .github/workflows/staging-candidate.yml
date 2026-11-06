@@ -1,0 +1,35 @@
+# Reusable handoff scaffold only. No dispatch, push trigger, environment or cloud credentials.
+# pipeline.json intentionally leaves activation, release branch and app delivery role unset.
+name: AWS staging candidate
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        description: 'Reviewed candidate JSON; independently pinned app, Worker and rollback'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate pinned staging handoff (no deployment)
+        env:
+          CANDIDATE_JSON: ${{ inputs.candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').write_text(os.environ['CANDIDATE_JSON'])
+          PY
+          python3 deploy/aws/os-staging/staging_candidate.py "$RUNNER_TEMP/candidate.json" > "$RUNNER_TEMP/staging-handoff.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-staging-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-handoff.json
+          if-no-files-found: error

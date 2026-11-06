@@ -35,6 +35,11 @@
  * The script is a constant except for the origins (validated https origins, JSON-encoded) and it carries the page's
  * own CSP nonce, so code-server's Content-Security-Policy is unchanged. Every error inside it is swallowed: a broken
  * bridge leaves the editor exactly as code-server built it.
+ *
+ * The same insertion carries one constant style rule, `LEGACY_NOTICE_HIDE_CSS`: an older editor image draws the AI
+ * notice as a permanent line under the chat input, and the rule hides that generated line only. A plain `<style>`, as
+ * the workbench's own startup-fallback style is: code-server's CSP allows inline styles (`style-src 'self'
+ * 'unsafe-inline'`, the served header of both editor images, measured 2026-11-05), so the CSP stays as it is.
  */
 
 /**
@@ -50,6 +55,17 @@ export const CODE_SHELL_ORIGINS_MAX = 4;
 export const GO_FALLBACK_MS = 1500;
 /** Marks an injected document, so a document is never given two bridges. */
 export const BRIDGE_MARKER = 'data-ezil-folder-bridge';
+/** Marks the injected legacy-notice style. */
+export const LEGACY_NOTICE_MARKER = 'data-ezil-legacy-notice';
+/**
+ * Hides the notice line an older editor image (AWS AMI 1.0.30's, desktop 67c939f0) appends under the chat input. That
+ * image's workbench.css draws it with exactly this selector:
+ * `.chat-viewpane .interactive-session>.interactive-input-part::after{content:"AI responses may be inaccurate. Review
+ * changes before applying them.";display:block;…}`. The current image (2031b2c1) has no such rule: its chat header's
+ * info button carries the notice, so there the rule matches nothing that is drawn. Only that generated box: the input,
+ * its toolbars, the welcome message and every other notice are untouched.
+ */
+export const LEGACY_NOTICE_HIDE_CSS = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:none!important;display:none!important}';
 
 const ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 /** A CSP nonce as code-server writes it (a UUID today); anything else is not copied into an attribute. */
@@ -108,9 +124,9 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
  * document's own CSP nonce (the first `<script nonce="…">`'s). After the charset declaration, not before it: the
  * script is about 2 KB, and code-server sends `text/html` without a charset, so a declaration pushed past the first
  * 1024 bytes would leave the encoding to each browser's prescan (review N2). It still runs before every workbench
- * script that matters (those are modules at the end of the document). Unchanged when: no origins (no bridge
- * configured), no nonce to carry (it could not run under code-server's CSP anyway), no `<head>`, or the document
- * already has one.
+ * script that matters (those are modules at the end of the document). The legacy-notice `<style>` follows it (its
+ * `!important` wins over the old image's rule wherever it sits). Unchanged when: no origins (no bridge configured),
+ * no nonce to carry (it could not run under code-server's CSP anyway), no `<head>`, or the document already has one.
  */
 export function injectCodeFolderBridge(html: string, origins: readonly string[]): string {
   if (origins.length === 0 || html.includes(BRIDGE_MARKER)) return html;
@@ -125,7 +141,8 @@ export function injectCodeFolderBridge(html: string, origins: readonly string[])
   const headEnd = html.indexOf('</head>', headStart);
   const charset = /<meta\s+charset\s*=\s*["']?[A-Za-z0-9_-]+["']?\s*\/?>/i.exec(html.slice(headStart, headEnd < 0 ? undefined : headEnd));
   const at = charset ? headStart + charset.index + charset[0].length : headStart;
-  return `${html.slice(0, at)}\n<script nonce="${nonce}" ${BRIDGE_MARKER}="1">${script}</script>${html.slice(at)}`;
+  return `${html.slice(0, at)}\n<script nonce="${nonce}" ${BRIDGE_MARKER}="1">${script}</script>`
+    + `<style ${LEGACY_NOTICE_MARKER}="1">${LEGACY_NOTICE_HIDE_CSS}</style>${html.slice(at)}`;
 }
 
 /**
