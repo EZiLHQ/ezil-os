@@ -407,8 +407,9 @@ const COPY = {
     child: (n) => `This project reopened at its folder. “${n}” isn't reopened automatically, so the repository's own settings stay off. Open it from File > Open Recent.`,
     // A link's own `folder` the address-bar parser refused (`../app-link.js` parseFolder): nothing was asked for.
     link_invalid: () => "This link's folder isn't a folder Code can open, so Code opened its usual folder.",
-    // A folder beside a project or repository: the repository opens at its own folder (docs/APP-ROUTES.md §2).
-    with_repository: () => "A folder inside a repository can't be opened from a link yet, so the repository opened at its own folder. Open the folder from the Explorer.",
+    // A folder beside a project or repository (docs/APP-ROUTES.md §2): the folder is dropped and nothing project-wise
+    // opens here, so the mint asks for the tab's own folder, else the default: Code's usual folder.
+    with_repository: () => "A link can't name a folder beside a project, so Code opened its usual folder. Open the folder from File > Open Recent.",
 };
 COPY.invalid = COPY.unsupported;
 // Not `unverified`: the server cannot check folders yet (no resolver wired), so a re-mint gets the same answer.

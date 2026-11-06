@@ -346,6 +346,11 @@ for ( const code of ['link_invalid', 'with_repository'] ) {
     eq(body.children.at(-1).children.slice(1).map(b => b.textContent), ['Dismiss'], `${code}: Dismiss only`);
     ok(! /unsaved|come back/i.test(body.children.at(-1).children[0].textContent), `${code}: no recovery promise`);
 }
+// Beside a project link the folder is dropped and Code opens its usual folder: the notice says exactly that, and
+// never that a repository opened (main's Code window does not open a project).
+nb.fallback('with_repository', null);
+ok(/beside a project, so Code opened its usual folder/.test(body.children.at(-1).children[0].textContent), 'with_repository: says what opened');
+ok(! /repository opened|its own folder/i.test(body.children.at(-1).children[0].textContent), 'with_repository: never claims a repository opened');
 nb.close(); ok(body.children.at(-1).removed, 'close');
 
 // ── storage that throws never breaks the window ─────────────────────────────
