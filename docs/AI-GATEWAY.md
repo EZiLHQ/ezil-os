@@ -58,6 +58,25 @@ would not have paused. Later than that, it can. These gateway figures are
 cited, not verified here.
 Error inspection for logging is bounded and never replaces a gateway body.
 
+## Image requests: the effective limit at each hop
+
+Image input is default off at every hop (see `extensions/ezil-models/README.md`).
+When it is on, a user PNG crosses these limits, and the smallest one decides:
+
+| Hop | Limit | Where |
+| --- | --- | --- |
+| EZiL Models extension | PNG only, Gateway PNG structure rules, ≤ 1 MiB and 1–8,000 px per image, ≤ 4 images per request; whole body ≤ 160 KiB, else refused locally with nothing sent | `extensions/ezil-models/src/gateway-messages.ts` |
+| Code host `/ai/v1` proxy (Cloudflare and `aws-` hosts, one handler) | **160 KiB** request body, read bounded, after the HMAC bearer check; bytes forwarded unchanged | `worker/src/ai-proxy.ts` `AI_PROXY_MAX_BODY_BYTES` |
+| EZiL AI Gateway, default-off candidate `8e28cfe4` | 4 MiB raw Messages body; same per-image rules; each image counts 4,784 input tokens; staging-only flag; Sonnet 5.5 and Haiku 5.5 Messages routes only | Gateway `src/protocols/anthropic/validate.ts`, `docs/STAGING-CLAUDE-IMAGE.md` |
+| Provider (Anthropic Messages, Bedrock InvokeModel) | Provider limits; not checked in this repository | Gateway owner |
+
+The effective limit is this proxy's 160 KiB whole body. Base64 takes 4 bytes for every 3, so that is about 120 KB of PNG
+with an empty chat. With Agent mode's tool definitions (about 54 KB) and history, the room is less. The extension mirrors
+the constant (a test fails on drift). An offline test runs a request through this proxy's real handler:
+`extensions/ezil-models/tests/image-e2e.test.ts`. Across the boundary, the extension either refuses the request or the
+proxy forwards it, and the proxy never answers 413. Raising the 160 KiB bound needs its own memory and abuse review.
+It must not be raised as a global limit just for images.
+
 ## Boot token v2
 
 Each launcher start, including restart, stores a fresh random nonce in the

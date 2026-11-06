@@ -86,8 +86,11 @@ one of more than 4, or the images would not fit the code host's 160 KiB
 anything is sent and says why (while the model list cannot be read, it says
 that instead). Title, summary and progress requests still go,
 with images as notes. Image bytes are never logged. That cap admits PNGs of
-about 115 KB, so ordinary screenshots also need the proxy cap raised as a
-separate, reviewed change.
+about 120 KB with an empty chat, less with Agent mode's tools. The hop-by-hop
+limits are in `docs/AI-GATEWAY.md`. `tests/image-e2e.test.ts` runs requests
+through the code host proxy's real handler to check that it never refuses what
+this client sends. Larger screenshots need the proxy bound raised as a separate,
+reviewed change.
 
 Token counting measures serialized UTF-8 bytes; a message counts as its
 serialized wire message. Copilot 0.69 uses this count for its own tool
