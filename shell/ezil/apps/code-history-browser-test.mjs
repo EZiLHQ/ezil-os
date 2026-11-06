@@ -190,26 +190,31 @@ const lastAsk = () => asks.at(-1);
 // ── Forget a refused link: the URL and subsequent mints follow the editor ───────────────────────────────
 {
     const rejected = '/workspace/nope';
-    const t = await tab(`/app/code?folder=${enc(rejected)}`);
+    const extra = `computer=${computerId}&campaign=a%2Fb&section=notes#anchor`;
+    const expected = `/app/code?folder=${DEFAULT}&${extra}`;
+    const t = await tab(`/app/code?folder=${enc(rejected)}&${extra}`);
+    const fullAddress = () => t.page.evaluate(() => location.pathname + location.search + location.hash);
     ok(await t.waitEditor(DEFAULT), 'forget: a missing folder opens the default');
     await t.notice().waitFor();
     ok((await t.notice().getAttribute('data-outcome')) === 'missing', 'forget: the missing-folder notice appears');
     const beforeLength = await t.len();
     await t.notice().getByRole('button', { name: 'Forget it' }).click();
     await t.page.waitForTimeout(150);
-    ok(await t.address() === `/app/code?folder=${DEFAULT}`, `forget: the address names the folder actually open [${await t.address()}]`);
+    ok(await fullAddress() === expected, `forget: the address names the open folder and preserves other query fields and hash [${await fullAddress()}]`);
     ok(await t.len() === beforeLength, 'forget: the current history entry is replaced, not pushed');
     const beforeReconnect = mints;
     await t.page.evaluate((computerId) => window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } })), computerId);
     await t.quiet();
     ok(mints === beforeReconnect + 1 && lastAsk().codeFolder?.path !== rejected,
         `forget: reconnect does not re-request the rejected folder [${JSON.stringify(lastAsk())}]`);
+    ok(await fullAddress() === expected, 'forget: reconnect retains the unrelated query fields and hash');
     const beforeReload = mints;
     await t.page.reload();
     ok(await t.waitEditor(DEFAULT), 'forget: reload reopens the folder on screen');
     ok(mints === beforeReload + 1 && lastAsk().codeFolder?.path !== rejected,
         `forget: reload does not re-request the rejected folder [${JSON.stringify(lastAsk())}]`);
     ok(await t.notice().count() === 0, 'forget: the rejected-folder notice does not return');
+    ok(await fullAddress() === expected, 'forget: reload retains the unrelated query fields and hash');
     await t.context.close();
 }
 
@@ -229,6 +234,35 @@ const lastAsk = () => asks.at(-1);
     ok(mints === beforeReconnect + 1 && lastAsk().codeFolder?.path !== rejected,
         `forget-same: reconnect does not ask for the refused path [${JSON.stringify(lastAsk())}]`);
     ok(await t.waitEditor(DEFAULT), 'forget-same: the next mint opens the default');
+    await t.context.close();
+}
+
+// The refused ask can come from the tab record, while the editor reports that same old root.
+{
+    const rejected = '/workspace/missing-last-root';
+    const t = await tab('/app/code', { record: rejected });
+    ok(await t.waitEditor(rejected), 'forget-record: the editor reports its refused last root');
+    await t.notice().waitFor();
+    ok((await t.notice().getAttribute('data-outcome')) === 'missing', 'forget-record: the stored ask is visibly refused');
+    await t.notice().getByRole('button', { name: 'Forget it' }).click();
+    await t.page.waitForTimeout(150);
+    ok(await t.address() === '/app/code', 'forget-record: the rejected root is not written to the address');
+    const beforeReconnect = mints;
+    await t.page.evaluate((computerId) => window.dispatchEvent(new CustomEvent('ezil:desktop-restarted', { detail: { computerId } })), computerId);
+    await t.quiet();
+    ok(mints === beforeReconnect + 1 && lastAsk().codeFolder?.path !== rejected,
+        `forget-record: reconnect does not request the rejected record [${JSON.stringify(lastAsk())}]`);
+    ok(await t.waitEditor(DEFAULT), 'forget-record: reconnect opens the default');
+    const beforeReload = mints;
+    await t.page.reload();
+    ok(await t.waitEditor(DEFAULT) && mints === beforeReload + 1 && lastAsk().codeFolder?.path !== rejected,
+        'forget-record: reload does not resurrect the rejected record');
+    const copied = await t.address();
+    const beforeNewTab = mints;
+    const fresh = await tab(copied);
+    ok(await fresh.waitEditor(DEFAULT) && mints === beforeNewTab + 1 && lastAsk().codeFolder?.path !== rejected,
+        'forget-record: a copied address in a new tab does not request the rejected record');
+    await fresh.context.close();
     await t.context.close();
 }
 

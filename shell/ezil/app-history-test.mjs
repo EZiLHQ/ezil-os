@@ -10,7 +10,7 @@ const dataUrl = text => `data:text/javascript;base64,${Buffer.from(text).toStrin
 // app-history.js imports './app-link.js'; a data: module cannot resolve that.
 const link = dataUrl(readFileSync(new URL('./app-link.js', import.meta.url), 'utf8'));
 const history = readFileSync(new URL('./app-history.js', import.meta.url), 'utf8').replace("from './app-link.js'", `from '${link}'`);
-const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
+const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, replaceCodeParamsUrl, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
 let checks = 0;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const same = (actual, expected, message) => { assert.deepEqual(plain(actual), plain(expected), message); checks += 1; };
@@ -55,6 +55,16 @@ same(withoutKeys(loc('?%75pgrade=pro&upgrade=x&keep=1'), ['upgrade']), '/os?keep
 same(withoutKeys(loc('?upgrade=pro'), ['upgrade']), '/os', 'nothing left: no `?`');
 same(withoutKeys({ pathname: '/app/settings', search: '?tab=billing&upgrade=pro' }, ['upgrade']), '/app/settings?tab=billing', 'the path form too');
 same(withoutKeys(loc('?upgrades=1&keep=1'), ['upgrade']), '/os?upgrades=1&keep=1', 'positive control: any other key stays');
+// A Code replace changes only Code-owned parameters; unrelated pairs remain raw and in order.
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: `?folder=/workspace/nope&computer=${C}&campaign=a%2Fb&section=notes`, hash: '#anchor' },
+    { folder: '/workspace' }), `/app/code?folder=/workspace&computer=${C}&campaign=a%2Fb&section=notes#anchor`);
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: '?%66older=old&campaign=%41&folder=other&project=p&repo=r&path=x', hash: '#frag' },
+    {}), '/app/code?campaign=%41#frag', 'every decoded Code key goes; unrelated raw bytes and hash stay');
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: '?campaign=a%2Fb', hash: '#x' },
+    { folder: '/workspace/my site' }, [['computer', C]]), `/app/code?folder=/workspace/my%20site&campaign=a%2Fb&computer=${C}#x`,
+    'a missing page-level computer is retained without decoding unrelated pairs');
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: `?computer=${C}&x=1`, hash: '' },
+    {}, [['computer', C]]), `/app/code?computer=${C}&x=1`, 'an existing computer parameter is not duplicated');
 // The launch context a route gives an app (contract item 3).
 same(routeLaunchContext({ id: 'code' }), { view: 'full' });
 same(routeLaunchContext({ id: 'code' }, { hasWindow: true }), {}, 'Back to an open Code does not resize it');
@@ -873,6 +883,16 @@ for (const renames of [false, true]) {
     older.end(null);
     controller.begin('code');
     same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
+}
+// A Code replace preserves non-Code query values and hash while keeping history state.
+{
+    const { w, open, url } = harness(`/app/code?folder=/workspace/nope&computer=${C}&campaign=a%2Fb&section=notes#anchor`);
+    open('code', 5);
+    const beforeLength = w.history.length;
+    w.dispatchEvent(new w.CustomEvent('ezil:app-params-changed', { detail: { appId: 'code', params: { folder: '/workspace' }, mode: 'replace' } }));
+    same([url(), w.history.length, w.history.state.__NA],
+        [`/app/code?folder=/workspace&computer=${C}&campaign=a%2Fb&section=notes#anchor`, beforeLength, true],
+        'a folder replace keeps other query bytes, hash, state and the current history entry');
 }
 // ── folder-url-sync: Code's folder in the address bar, and the refused traversal's undo ──────────────────────
 same(linkParams({ id: 'code', folder: '/workspace/a b' }), { folder: '/workspace/a b' }, 'a folder link is written back');

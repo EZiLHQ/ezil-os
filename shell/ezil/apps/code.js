@@ -851,11 +851,11 @@ export async function openCodeWindow (ctx = {}) {
                     folder_notice?.close();
                     folder_notice = createFolderNotice(el_body, {
                         retry: () => { void start_boot(); },
-                        forget: () => {
+                        forget: (refused_path) => {
                             forgetFolder(bind);
-                            // The refused link also lives in this window and its URL. Forget it everywhere,
-                            // then name the folder actually on screen without navigating the live editor.
-                            const displayed = editor_root?.kind === 'folder' && editor_root.path !== wanted_folder
+                            // The refused folder can come from the URL or tab storage. Never name it again:
+                            // follow a different displayed root, without navigating or tearing down the editor.
+                            const displayed = editor_root?.kind === 'folder' && editor_root.path !== refused_path
                                 ? editor_root : null;
                             wanted_folder = displayed?.path ?? null;
                             announce_root('replace', displayed);
