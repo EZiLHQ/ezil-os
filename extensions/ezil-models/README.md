@@ -49,6 +49,51 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 (or `temperature`/`top_p` in modelOptions) clamp to [0,1]. `stream` configures
 Qwen's response mode. Both models advertise `imageInput: false`.
 
+### Images (default off)
+
+A Gateway model takes user images only when both hold: its own `models.json`
+entry says `"capabilities": { "imageInput": true }` (`defaults` never opt a
+Gateway model in), and a catalog read now (`ezil.gateway.models.v1`) says
+`capabilities.image_input: true` for its row, whose first protocol is
+`anthropic-messages`. An unread, legacy or absent row means no images.
+Catalog-only rows never take images. The shipped `models.json` opts no model
+in, so nothing changes until a release adds such an entry and the Gateway's
+staging-only flag advertises the route.
+
+Then each PNG the user attached goes intact as
+`{type:"image",source:{type:"base64",media_type:"image/png",data}}` in its user
+message, in its original place among the text. This mirrors the Gateway's
+default-off Claude image candidate (Gateway 8e28cfe4 on
+`feat/gw-claude-image-20261106`, not deployed): PNG only, at most 1 MiB decoded and 1–8000 px a side, at most 4
+images per request, each counted as 4784 input tokens in place of its base64.
+Its PNG structure rules (`validPng`: every chunk CRC, IHDR depth/color, no
+APNG chunks, PLTE/IDAT order, no unknown critical chunk, IEND last) are
+mirrored, so an image it would refuse fails here and is never resent.
+Copilot resends the whole chat every turn, so its 4 most recent valid images
+go (and are billed) every turn; older or invalid ones become a marked
+`[image omitted: …]` note. Images in tool results or assistant messages are
+never sent as images. When images make a request larger than the code host's
+cap, earlier messages' images become notes before compaction folds any text.
+A Gateway `unsupported_parameter` refusal of a request with images (its flag
+went off) drops the cached catalog, so the next turn reads it again. On a
+Responses model, an earlier message's image is a note.
+
+The current message's own images are never turned into a note: if the model
+does not take images now, or an image is not a PNG, is malformed, too large or
+one of more than 4, or the images would not fit the code host's 160 KiB
+`/ai/v1` request cap (`worker/src/ai-proxy.ts`, mirrored as
+`AI_PROXY_MAX_BODY_BYTES` and checked by a test), the turn fails before
+anything is sent and says why (while the model list cannot be read, it says
+that instead). Title, summary and progress requests still go,
+with images as notes. Image bytes are never logged. That cap admits PNGs of
+about 120 KB with an empty chat, less with Agent mode's tools. The hop-by-hop
+limits are in `docs/AI-GATEWAY.md`. `tests/image-e2e.test.ts` runs requests
+through the code host proxy's real handler, including an Agent-mode turn that
+is compacted, to check that it never refuses what this client sends and that
+the image arrives intact. Compaction never drops the user's current images:
+every compacted copy must carry them as images, or nothing is sent. Larger screenshots need the proxy bound raised as a separate,
+reviewed change.
+
 Token counting measures serialized UTF-8 bytes; a message counts as its
 serialized wire message. Copilot 0.69 uses this count for its own tool
 definitions against the advertised input, one count per schema key and string

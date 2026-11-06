@@ -225,7 +225,8 @@
         },
         "imageInput": {
           "type": "boolean",
-          "default": true
+          "default": true,
+          "description": "Whether the model takes images. An ezil-gateway model takes them only when its own entry says true and the Gateway catalog says image_input true for its Messages route; defaults never opt it in."
         }
       }
     },

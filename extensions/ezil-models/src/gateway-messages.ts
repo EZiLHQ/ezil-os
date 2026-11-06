@@ -1,7 +1,7 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or previous reasoning.
 import type { GatewayProtocol, ResolvedModel } from './config';
-import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
+import { base64, isCacheMarker, isStatefulMarker, type ChatRequest, type DataPart, type Message, type Part, type Tool } from './types';
 
 export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
 /** Sizes only, never payload text. `bodyBytes` is the size checked against `limitBytes`. */
@@ -36,12 +36,23 @@ export const ENVELOPE_RESERVE = 1536;
 // never counts schema numbers, booleans or punctuation); the byte bound in buildGatewayBody still
 // refuses anything over the gateway limit before sending (LocalRequestError, nothing sent).
 export const DEFAULT_TOOL_RESERVE = 8_000;
+// User images, as the Gateway's default-off Claude image candidate accepts them (EZiL AI Gateway
+// src/protocols/anthropic/validate.ts at 8e28cfe4, feat/gw-claude-image-20261106): base64 PNG blocks in user messages only, at most 4 per request,
+// each at most 1 MiB decoded and 1-8000 px a side. Its input bound counts each image as CLAUDE_IMAGE_TOKENS in place of
+// its base64 bytes. The Gateway validates every chunk and CRC; this checks only what it can say clearly before sending.
+export const MAX_IMAGE_BYTES = 1024 * 1024;
+export const MAX_IMAGE_DIMENSION = 8000;
+export const MAX_REQUEST_IMAGES = 4;
+export const CLAUDE_IMAGE_TOKENS = 4784;
+/** The code host's `/ai/v1` request cap (worker/src/ai-proxy.ts AI_PROXY_MAX_BODY_BYTES): a larger body is refused there. */
+export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
 export type TextBlock = { type: 'text'; text: string };
 export type ToolUse = { type: 'tool_use'; id: string; name: string; input: ObjectValue };
 export type ToolResult = { type: 'tool_result'; tool_use_id: string; content: TextBlock[]; is_error?: boolean };
-export type Block = TextBlock | ToolUse | ToolResult;
+export type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: 'image/png'; data: string } };
+export type Block = TextBlock | ImageBlock | ToolUse | ToolResult;
 export type GatewayMessage = { role: 'user' | 'assistant'; content: Block[] };
 export type GatewayTool = { name: string; input_schema: ObjectValue; description?: string };
 export type GatewayBody = {
@@ -67,6 +78,127 @@ function jsonValue(value: unknown, seen = new Set<unknown>(), depth = 0): boolea
 }
 
 const text = (value: string): TextBlock => ({ type: 'text', text: value });
+
+/** An image the user attached: a data part directly in a user message (not inside a tool result, not a marker). */
+export function isImagePart(part: Part): part is DataPart {
+    return part.type === 'data' && part.mimeType.startsWith('image/');
+}
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_DEPTHS: Record<number, readonly number[]> = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let bit = 0; bit < 8; bit++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+});
+function crc32(data: Uint8Array, start: number, end: number): number {
+    let crc = 0xffffffff;
+    for (let index = start; index < end; index++) crc = (CRC_TABLE[(crc ^ data[index]!) & 255]! ^ (crc >>> 8)) >>> 0;
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * The Gateway candidate's PNG structure rules (validPng), so an image it would refuse fails here, before sending, and is
+ * never picked again from history: signature; IHDR first with valid size, depth and color; every chunk's CRC; no APNG
+ * chunks; PLTE before IDAT; contiguous IDAT; no unknown critical chunk; IEND last and at the end; at most 4096 chunks.
+ */
+function pngProblem(data: Uint8Array): string | undefined {
+    const invalid = 'the image is not a valid PNG';
+    if (data.byteLength < 8 || !PNG_SIGNATURE.every((byte, index) => data[index] === byte)) return invalid;
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let pos = 8, chunks = 0, header = false, idat = false, afterIdat = false, idatBytes = 0, color = -1, palette = false;
+    while (pos + 12 <= data.byteLength && ++chunks <= 4096) {
+        const size = view.getUint32(pos), end = pos + 12 + size;
+        if (end > data.byteLength) return invalid;
+        const type = String.fromCharCode(...data.subarray(pos + 4, pos + 8));
+        if (!/^[A-Za-z]{4}$/.test(type) || crc32(data, pos + 4, pos + 8 + size) !== view.getUint32(pos + 8 + size)) return invalid;
+        if (!header) {
+            if (type !== 'IHDR' || size !== 13) return invalid;
+            const width = view.getUint32(pos + 8), height = view.getUint32(pos + 12);
+            if (!width || !height || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) return `the image is ${width}×${height} px; each side must be 1 to ${MAX_IMAGE_DIMENSION}`;
+            color = data[pos + 17]!;
+            if (!PNG_DEPTHS[color]?.includes(data[pos + 16]!) || data[pos + 18] !== 0 || data[pos + 19] !== 0 || data[pos + 20]! > 1) return invalid;
+            header = true;
+        } else if (type === 'acTL' || type === 'fcTL' || type === 'fdAT') {
+            return 'animated PNGs are not supported';
+        } else if (type === 'IHDR') {
+            return invalid;
+        } else if (type === 'PLTE') {
+            if (palette || idat || size === 0 || size > 768 || size % 3 !== 0) return invalid;
+            palette = true;
+        } else if (type === 'IDAT') {
+            if (afterIdat || (color === 3 && !palette)) return invalid;
+            idat = true;
+            idatBytes += size;
+        } else if (type === 'IEND') {
+            return size === 0 && idat && idatBytes > 0 && end === data.byteLength ? undefined : invalid;
+        } else {
+            if (idat) afterIdat = true;
+            if (data[pos + 4]! < 97) return invalid; // an unknown critical chunk
+        }
+        pos = end;
+    }
+    return invalid;
+}
+
+/** Why EZiL AI would refuse this image, or undefined. Never logs the bytes. */
+// Copilot's parts are reused across builds (compaction tries many), so each image is checked and encoded once.
+const problems = new WeakMap<DataPart, string | undefined>();
+const encoded = new WeakMap<DataPart, string>();
+
+export function imageProblem(part: DataPart): string | undefined {
+    if (problems.has(part)) return problems.get(part);
+    const problem = part.mimeType !== 'image/png' ? `${part.mimeType} images are not supported; only PNG is`
+        : part.data.byteLength > MAX_IMAGE_BYTES ? 'the image is larger than 1 MiB' : pngProblem(part.data);
+    problems.set(part, problem);
+    return problem;
+}
+
+/**
+ * The request's current user message, as compaction keeps it (compact.ts `typed`): the last user message with typed text
+ * or an attachment, not only tool results; else the last user message.
+ */
+export function currentUserIndex(messages: readonly Message[]): number {
+    let fallback = -1;
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index]!;
+        if (message.role !== 'user') continue;
+        if (fallback < 0) fallback = index;
+        if (message.parts.some(part => (part.type === 'text' && part.value.trim() !== '') || (part.type === 'data' && !isCacheMarker(part) && !isStatefulMarker(part)))) return index;
+    }
+    return fallback;
+}
+
+/**
+ * The images sent as image blocks: valid user images, newest first, up to MAX_REQUEST_IMAGES (Copilot resends the
+ * whole chat each turn, and the Gateway counts every image in it). Every other image goes as a marked text note.
+ */
+export function sendableImages(messages: readonly Message[], imageInput: boolean, from = 0, required: ReadonlySet<DataPart> = new Set()): Set<Part> {
+    const chosen = new Set<Part>();
+    if (!imageInput) return chosen;
+    // The user's own current images first, wherever a compacted copy put them.
+    for (const part of required) if (chosen.size < MAX_REQUEST_IMAGES && !imageProblem(part)) chosen.add(part);
+    for (let index = messages.length - 1; index >= from && chosen.size < MAX_REQUEST_IMAGES; index--) {
+        if (messages[index]!.role !== 'user') continue;
+        const images = messages[index]!.parts.filter(isImagePart).filter(part => !imageProblem(part) && !chosen.has(part));
+        for (let at = images.length - 1; at >= 0 && chosen.size < MAX_REQUEST_IMAGES; at--) chosen.add(images[at]!);
+    }
+    return chosen;
+}
+
+function imageBlock(part: DataPart): ImageBlock {
+    let data = encoded.get(part);
+    if (data === undefined) encoded.set(part, data = base64(part.data));
+    return { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
+}
+
+const RECENT_NOTE = `only the ${MAX_REQUEST_IMAGES} most recent images are sent`;
+const SIZE_NOTE = "earlier images are left out to fit EZiL AI's request size limit";
+
+function omittedImage(part: DataPart, imageInput: boolean, note = RECENT_NOTE): string {
+    if (!imageInput) return '[image omitted: not supported by this model]';
+    return `[image omitted: ${imageProblem(part) ?? note}]`;
+}
 
 export function gatewayTools(tools: readonly Tool[], log: (line: string) => void = () => {}): GatewayTool[] {
     const names = new Set<string>();
@@ -96,11 +228,17 @@ function partText(part: Part): string {
     return '[tool call omitted]';
 }
 
-/** One message before conversation pairing, also used for byte counting. No synthetic history here. */
-export function gatewayMessage(message: Message): { role: Message['role']; content: Block[] } {
+/**
+ * One message before conversation pairing, also used for byte counting. No synthetic history here. `images` are the
+ * user image parts sent as image blocks (sendableImages); any other user image is a marked note, never dropped silently.
+ */
+export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new Set(), imageInput = false, note?: string, sent?: Set<Part>): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
     for (const part of message.parts) {
-        if (message.role === 'assistant' && part.type === 'tool_call') {
+        if (message.role === 'user' && isImagePart(part)) {
+            if (images.has(part)) sent?.add(part);
+            content.push(images.has(part) ? imageBlock(part) : text(omittedImage(part, imageInput, note)));
+        } else if (message.role === 'assistant' && part.type === 'tool_call') {
             if (typeof part.callId === 'string' && typeof part.name === 'string' && TOOL_NAME.test(part.callId) && TOOL_NAME.test(part.name) && isObject(part.input) && jsonValue(part.input)) {
                 content.push({ type: 'tool_use', id: part.callId, name: part.name, input: part.input });
             } else content.push(text('[tool call omitted: invalid arguments or identifier]'));
@@ -117,7 +255,11 @@ export function gatewayMessage(message: Message): { role: Message['role']; conte
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[]): { system: TextBlock[]; messages: GatewayMessage[] } {
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], imageInput = false, currentImagesOnly = false,
+    required: ReadonlySet<DataPart> = new Set(), sent?: Set<Part>): { system: TextBlock[]; messages: GatewayMessage[] } {
+    // `required`: the request's own current images, known before compaction, are always among them.
+    const images = sendableImages(messages, imageInput, currentImagesOnly ? Math.max(0, currentUserIndex(messages)) : 0, required);
+    const note = currentImagesOnly ? SIZE_NOTE : undefined;
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
     const names = new Set(tools.map(tool => tool.name));
@@ -127,7 +269,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
         }
-        const converted = gatewayMessage(message);
+        const converted = gatewayMessage(message, images, imageInput, note, sent);
         const content = converted.content.map(block => {
             if (block.type !== 'tool_use') return block;
             if (!names.has(block.name) || seen.has(block.id)) return text('[tool call omitted: unavailable tool or duplicate identifier]');
@@ -168,30 +310,49 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
     return Math.max(1, Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING - ENVELOPE_RESERVE - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
 }
 
-export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
+/**
+ * `required`: the user's current images (gatewayChat), which every built copy must carry as image blocks. Compaction
+ * adds its own user note after them, so a compacted copy's "current message" is not the user's.
+ */
+export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, required: ReadonlySet<DataPart> = new Set()): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log);
-    const conversation = gatewayConversation(request.messages, tools);
-    const body: GatewayBody = {
-        model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
-        stream: model.model !== KIMI && model.stream !== false,
+    const imageInput = model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
+    const serialize = (currentImagesOnly: boolean) => {
+        const sent = new Set<Part>();
+        const conversation = gatewayConversation(request.messages, tools, imageInput, currentImagesOnly, required, sent);
+        // Never send a copy without the user's own image (nothing is sent; reported as an internal error).
+        if ([...required].some(part => !sent.has(part))) throw new Error('The attached image could not be kept in the request');
+        const body: GatewayBody = {
+            model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
+            stream: model.model !== KIMI && model.stream !== false,
+        };
+        if (conversation.system.length) body.system = conversation.system;
+        if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
+        for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+            const value = request.modelOptions[key] ?? configured;
+            if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
+        }
+        return { body, bytes: new TextEncoder().encode(JSON.stringify(body)) };
     };
-    if (conversation.system.length) body.system = conversation.system;
-    if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
+    let { body, bytes } = serialize(false);
+    // Over the code host's cap with images: earlier messages' images go as notes first, before compaction folds any text.
+    if (imageInput && bytes.byteLength > AI_PROXY_MAX_BODY_BYTES) ({ body, bytes } = serialize(true));
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
-        const value = request.modelOptions[key] ?? configured;
-        if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
-    }
-    const bytes = new TextEncoder().encode(JSON.stringify(body));
+    // The Gateway counts each image as CLAUDE_IMAGE_TOKENS in place of its base64 (ASCII, so one byte a character).
+    let imageCount = 0, imageBytes = 0;
+    for (const message of body.messages) for (const block of message.content) if (block.type === 'image') { imageCount++; imageBytes += block.source.data.length; }
+    const bound = bytes.byteLength - imageBytes + imageCount * CLAUDE_IMAGE_TOKENS;
     // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
-    const counts = (): LocalRequestCounts => ({
-        bodyBytes: bytes.byteLength, limitBytes: Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING,
+    const counts = (raw = false): LocalRequestCounts => ({
+        bodyBytes: raw ? bytes.byteLength : bound, limitBytes: raw ? AI_PROXY_MAX_BODY_BYTES : Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING,
         messages: body.messages.length, maxBlocks: body.messages.reduce((most, message) => Math.max(most, message.content.length), 0),
         tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0,
     });
     if (body.messages.length > 1024) throw new LocalRequestError('local_too_many_messages', counts());
     if (body.messages.some(message => message.content.length > 1024)) throw new LocalRequestError('local_too_many_blocks', counts());
-    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new LocalRequestError('local_input_too_large', counts());
+    if (bound + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new LocalRequestError('local_input_too_large', counts());
+    // Without images the bound above is stricter; with them, the code host's raw cap can be the one that refuses.
+    if (bytes.byteLength > AI_PROXY_MAX_BODY_BYTES) throw new LocalRequestError('local_input_too_large', counts(true));
     return { body, bytes };
 }
 
@@ -209,7 +370,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
  * text and adds 128 bytes per tool and 32 per item, so Responses strings count escaped. Messages count as their
  * serialized wire message.
  */
-export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
+export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages', imageInput = false): number {
     if (typeof value === 'string') {
         const block = JSON.stringify(text(value));
         return protocol === 'openai-responses' ? escapeNonAscii(block).length : Buffer.byteLength(block, 'utf8');
@@ -218,5 +379,8 @@ export function gatewayTokenCount(value: string | Message, protocol: GatewayProt
         const blocks = value.parts.map(partText).filter(Boolean).map(text);
         return blocks.length ? Buffer.byteLength(JSON.stringify(blocks), 'utf8') : 0;
     }
-    return Buffer.byteLength(JSON.stringify(gatewayMessage(value)), 'utf8');
+    // An image the model takes counts as the Gateway counts it (plus its short note's bytes), not as its base64.
+    const takes = imageInput && protocol === 'anthropic-messages';
+    const images = value.role === 'user' ? sendableImages([value], takes).size : 0;
+    return Buffer.byteLength(JSON.stringify(gatewayMessage(value, new Set(), takes)), 'utf8') + images * CLAUDE_IMAGE_TOKENS;
 }

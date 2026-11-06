@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, currentUserIndex, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, imageProblem, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type GatewayBody, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -79,6 +79,11 @@ export type GatewayOptions = {
     onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
     /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
     onCompact?: (info: CompactionInfo) => void;
+    /**
+     * Title, summary and progress calls only: an image that cannot go is a marked note. Otherwise (the default, fail
+     * closed) the request's current images go as images in every built copy, or nothing is sent.
+     */
+    imagesAsNotes?: boolean;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
@@ -203,15 +208,19 @@ export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayMode
 /**
  * Apply validated catalog caps and capabilities without mutating config; callers still apply wire clamps/reserves.
  * The catalog can only take a capability away: a row saying `streaming: false` sends JSON from the first request.
+ * Image input is the exception that must be proven, not just not denied: the config opts the model in, and the row of
+ * a catalog read now says `image_input: true` for a Messages route. Without that row (unread, legacy, absent) it is off.
  */
 export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
+    if (model.provider.type !== 'ezil-gateway') return model;
     const entry = catalog?.data.find(entry => entry.id === model.model);
-    if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    if (!entry) return model.capabilities.imageInput ? { ...model, capabilities: { ...model.capabilities, imageInput: false } } : model;
     const capabilities = entry.capabilities;
     return { ...model, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
-            imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
+            imageInput: model.capabilities.imageInput && capabilities?.image_input === true
+                && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages' && entry.protocols?.[0] === 'anthropic-messages' },
         stream: capabilities?.streaming === false ? false : model.stream };
 }
 
@@ -244,7 +253,7 @@ export function parseCatalogModelId(id: string): { providerName: string; alias: 
  * `available` for this caller over a protocol this client speaks, listed under `catalogModelId`. A model configured
  * on the same provider with the same alias wins; another provider's configuration never hides this account's row.
  * A catalog without `availability` adds nothing. Nothing the row does not say is assumed: tool calling, image input
- * and streaming stay off unless its capabilities turn them on (images always do, as for every Gateway model), and
+ * and streaming stay off unless its capabilities turn them on (images always do: only a configured entry opts in), and
  * caps are the row's own.
  */
 export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[]): ResolvedModel[] {
@@ -617,17 +626,29 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     options.signal.addEventListener('abort', cancelAttempt, { once: true });
     try {
         options.signal.throwIfAborted();
-        // A direct client invocation must enforce the same opt-in as the model picker.
-        if (responses) {
+        // A direct client invocation must enforce the same opt-in as the model picker, also before sending an image.
+        if (responses || (model.capabilities.imageInput && request.messages.some(message => message.role === 'user' && message.parts.some(isImagePart)))) {
             const catalog = await gatewayModels(provider, doFetch, now(), options.signal);
             options.signal.throwIfAborted();
-            if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined, undefined, 'local');
+            if (!gatewayModelAvailable(model, catalog)) {
+                throw new GatewayError(responses ? 'EZiL AI: This model does not advertise an available Responses route' : 'EZiL AI: This model is not available right now.',
+                    undefined, 'model_unavailable', undefined, undefined, 'local');
+            }
             model = withGatewayModelLimits(model, catalog);
         }
+        const current = request.messages[currentUserIndex(request.messages)];
+        const currentImages = current?.role === 'user' ? current.parts.filter(isImagePart) : [];
+        // The catalog can change between the provider's read and this one: refuse, never turn the user's image into a note.
+        const strict = options.imagesAsNotes !== true;
+        if (strict && !responses && currentImages.length && !model.capabilities.imageInput) {
+            throw new GatewayError(`EZiL AI: ${model.name} does not accept images through EZiL AI right now. Remove the image or pick a model that accepts images. Nothing was sent or charged.`,
+                undefined, 'image_input_unsupported', undefined, undefined, 'local');
+        }
+        const required = new Set(strict && !responses && model.capabilities.imageInput ? currentImages.filter(part => !imageProblem(part)) : []);
         // The protocol's own builder, with the input limit scaled for compaction's target.
         const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
             const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(Math.min(GATEWAY_INPUT_TOKENS, limits.maxInputTokens) * scale)) };
-            return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log);
+            return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log, required);
         };
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);
@@ -741,7 +762,10 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     retried = true;
                     waitMs = retryDelay(retryAfter, 60, now()) * 1000;
                 } else {
-                    if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
+                    // An image refused as unsupported means the catalog that allowed it is out of date (the Gateway's flag went off).
+                    const imageRefused = body.code === 'unsupported_parameter' && !responses
+                        && (built.body as GatewayBody).messages.some(message => message.content.some(block => block.type === 'image'));
+                    if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '') || imageRefused) forgetGatewayModels(provider.baseUrl);
                     const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
                     // A 413 size refusal by EZiL AI or EZiL OS answers before any model runs (the Gateway checks the body
                     // against the model's input allowance before reserving; the proxy before forwarding), so nothing was
@@ -842,7 +866,11 @@ function localRefusal(model: ResolvedModel, error: LocalRequestError): GatewayEr
     const c = error.counts;
     const compacted = error.afterCompaction ? ', even with the earlier conversation compacted' : '';
     const kept = 'Nothing was sent or charged, and the conversation is kept.';
-    const text = error.code === 'local_input_too_large'
+    // Only a request with images can be over the code host's raw cap and not the input bound (gateway-messages.ts).
+    const text = error.code === 'local_input_too_large' && c.limitBytes === AI_PROXY_MAX_BODY_BYTES
+        ? `This request with its images is too large to send${compacted}: ${bytes(c.bodyBytes)} bytes, over EZiL AI's ${bytes(c.limitBytes)}-byte `
+            + `request limit (images go as base64, about 4 bytes for every 3). ${kept} Attach a smaller PNG, about 100 KB or less, or start a new chat.`
+        : error.code === 'local_input_too_large'
         ? `This request is too large for ${model.name}${compacted}: ${bytes(c.bodyBytes)} bytes (${bytes(c.toolBytes)} of them tool definitions), `
             + `over the ${bytes(c.limitBytes)}-byte limit. ${kept} ${SHORTEN}.`
         : error.code === 'local_too_many_messages'
