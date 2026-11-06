@@ -39,6 +39,14 @@
     "virtualWorkspaces": true
   },
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "ezil-models.ezil",
+        "name": "ezil",
+        "fullName": "EZiL",
+        "description": "Ask without tools: a plain answer from the selected EZiL model, no file access or edits"
+      }
+    ],
     "languageModelChatProviders": [
       {
         "vendor": "ezil",
