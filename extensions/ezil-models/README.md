@@ -49,6 +49,38 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 (or `temperature`/`top_p` in modelOptions) clamp to [0,1]. `stream` configures
 Qwen's response mode. Both models advertise `imageInput: false`.
 
+### Images (default off)
+
+A Gateway model takes user images only when both hold: its own `models.json`
+entry says `"capabilities": { "imageInput": true }` (`defaults` never opt a
+Gateway model in), and a catalog read now (`ezil.gateway.models.v1`) says
+`capabilities.image_input: true` for its row, whose first protocol is
+`anthropic-messages`. An unread, legacy or absent row means no images.
+Catalog-only rows never take images. The shipped `models.json` opts no model
+in, so nothing changes until a release adds such an entry and the Gateway's
+staging-only flag advertises the route.
+
+Then each PNG the user attached goes intact as
+`{type:"image",source:{type:"base64",media_type:"image/png",data}}` in its user
+message, in its original place among the text. This mirrors the Gateway's
+default-off Claude image candidate (read 6 Nov 2026, uncommitted on Gateway
+2b5b4ab): PNG only, at most 1 MiB decoded and 1–8000 px a side, at most 4
+images per request, each counted as 4784 input tokens in place of its base64.
+Copilot resends the whole chat every turn, so its 4 most recent valid images
+go (and are billed) every turn; older or invalid ones become a marked
+`[image omitted: …]` note. Images in tool results or assistant messages are
+never sent as images.
+
+The current message's own images are never turned into a note: if the model
+does not take images now, or an image is not a PNG, is malformed, too large or
+one of more than 4, or the images would not fit the code host's 160 KiB
+`/ai/v1` request cap (`worker/src/ai-proxy.ts`, mirrored as
+`AI_PROXY_MAX_BODY_BYTES` and checked by a test), the turn fails before
+anything is sent and says why. Title, summary and progress requests still go,
+with images as notes. Image bytes are never logged. That cap admits PNGs of
+about 115 KB, so ordinary screenshots also need the proxy cap raised as a
+separate, reviewed change.
+
 Token counting measures serialized UTF-8 bytes; a message counts as its
 serialized wire message. Copilot 0.69 uses this count for its own tool
 definitions against the advertised input, one count per schema key and string

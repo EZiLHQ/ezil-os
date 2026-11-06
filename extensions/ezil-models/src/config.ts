@@ -385,7 +385,10 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 detail: typeof merged.detail === 'string' ? merged.detail : undefined,
                 maxInputTokens: positiveInt(merged.maxInputTokens, 'maxInputTokens', provider.type === 'ezil-gateway' ? 131_072 : 200_000),
                 maxOutputTokens: provider.type === 'ezil-gateway' ? gatewayOutput() : positiveInt(merged.maxOutputTokens, 'maxOutputTokens', isAnthropic(provider.type) ? 64_000 : 32_768),
-                capabilities: { toolCalling: toolCalling as boolean | number, imageInput: provider.type === 'ezil-gateway' ? false : imageInput as boolean },
+                // A Gateway model takes images only when its own entry says `imageInput: true` (never from defaults), and then
+                // only while a catalog read says so for its route (gateway.ts withGatewayModelLimits).
+                capabilities: { toolCalling: toolCalling as boolean | number,
+                    imageInput: provider.type === 'ezil-gateway' ? isRecord(entry.capabilities) && entry.capabilities.imageInput === true : imageInput as boolean },
                 thinking,
                 cache,
                 default: isDefault,

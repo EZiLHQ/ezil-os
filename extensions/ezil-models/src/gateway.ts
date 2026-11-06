@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -203,15 +203,19 @@ export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayMode
 /**
  * Apply validated catalog caps and capabilities without mutating config; callers still apply wire clamps/reserves.
  * The catalog can only take a capability away: a row saying `streaming: false` sends JSON from the first request.
+ * Image input is the exception that must be proven, not just not denied: the config opts the model in, and the row of
+ * a catalog read now says `image_input: true` for a Messages route. Without that row (unread, legacy, absent) it is off.
  */
 export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
+    if (model.provider.type !== 'ezil-gateway') return model;
     const entry = catalog?.data.find(entry => entry.id === model.model);
-    if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    if (!entry) return model.capabilities.imageInput ? { ...model, capabilities: { ...model.capabilities, imageInput: false } } : model;
     const capabilities = entry.capabilities;
     return { ...model, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
-            imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
+            imageInput: model.capabilities.imageInput && capabilities?.image_input === true
+                && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages' && entry.protocols?.[0] === 'anthropic-messages' },
         stream: capabilities?.streaming === false ? false : model.stream };
 }
 
@@ -244,7 +248,7 @@ export function parseCatalogModelId(id: string): { providerName: string; alias: 
  * `available` for this caller over a protocol this client speaks, listed under `catalogModelId`. A model configured
  * on the same provider with the same alias wins; another provider's configuration never hides this account's row.
  * A catalog without `availability` adds nothing. Nothing the row does not say is assumed: tool calling, image input
- * and streaming stay off unless its capabilities turn them on (images always do, as for every Gateway model), and
+ * and streaming stay off unless its capabilities turn them on (images always do: only a configured entry opts in), and
  * caps are the row's own.
  */
 export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[]): ResolvedModel[] {
@@ -617,11 +621,14 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     options.signal.addEventListener('abort', cancelAttempt, { once: true });
     try {
         options.signal.throwIfAborted();
-        // A direct client invocation must enforce the same opt-in as the model picker.
-        if (responses) {
+        // A direct client invocation must enforce the same opt-in as the model picker, also before sending an image.
+        if (responses || (model.capabilities.imageInput && request.messages.some(message => message.role === 'user' && message.parts.some(isImagePart)))) {
             const catalog = await gatewayModels(provider, doFetch, now(), options.signal);
             options.signal.throwIfAborted();
-            if (!gatewayModelAvailable(model, catalog)) throw new GatewayError('EZiL AI: This model does not advertise an available Responses route', undefined, 'model_unavailable', undefined, undefined, 'local');
+            if (!gatewayModelAvailable(model, catalog)) {
+                throw new GatewayError(responses ? 'EZiL AI: This model does not advertise an available Responses route' : 'EZiL AI: This model is not available right now.',
+                    undefined, 'model_unavailable', undefined, undefined, 'local');
+            }
             model = withGatewayModelLimits(model, catalog);
         }
         // The protocol's own builder, with the input limit scaled for compaction's target.

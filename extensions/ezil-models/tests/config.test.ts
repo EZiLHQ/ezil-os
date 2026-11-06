@@ -210,15 +210,21 @@ describe('config loader', () => {
     });
 });
 
-test('gateway defaults and configurable reserves; forced choice and images stay off', () => {
+test('gateway defaults and configurable reserves; forced choice stays off, images only by the entry\'s own opt-in', () => {
     const config = parseModelsConfig(JSON.stringify({
         providers: { p: { type: 'ezil-gateway', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: '{env:TOKEN}' } },
+        defaults: { capabilities: { imageInput: true } },
         models: [{ id: 'qwen', provider: 'p', model: 'qwen.qwen3-coder-next', forcedToolChoice: true, temperature: 3, topP: -1, toolReserve: 12000 },
-            { id: 'kimi', provider: 'p', model: 'us.moonshotai.kimi-k3', stream: true, capabilities: { imageInput: true } }],
+            { id: 'kimi', provider: 'p', model: 'us.moonshotai.kimi-k3', stream: true, capabilities: { imageInput: true } },
+            { id: 'sonnet', provider: 'p', model: 'claude-sonnet-5-5', capabilities: { toolCalling: true } }],
     }), { env: { TOKEN: 'synthetic-key' } });
     expect(config.errors).toEqual([]);
     expect(config.models[0]).toMatchObject({ maxInputTokens: 131072, maxOutputTokens: 8192, forcedToolChoice: false, toolReserve: 12000 });
-    expect(config.models[1]).toMatchObject({ maxOutputTokens: 4096, stream: false, capabilities: { imageInput: false } });
+    // Defaults never opt a Gateway model in (qwen inherits them; sonnet's own capabilities omit imageInput).
+    expect(config.models[0]!.capabilities.imageInput).toBe(false);
+    expect(config.models[2]!.capabilities.imageInput).toBe(false);
+    // The entry's own `imageInput: true` is kept here; the catalog decides per request (gateway-image.test.ts).
+    expect(config.models[1]).toMatchObject({ maxOutputTokens: 4096, stream: false, capabilities: { imageInput: true } });
 });
 
 test('manifest and image keep Qwen utility roles independent of Kimi selection', () => {
