@@ -43,15 +43,18 @@ function loadWorkbench(code) {
   const derived = between(code, 'this.entriesMap=be(e=>{', 'return jT.fromMap(t)});').slice('this.entriesMap=be(e=>'.length, -2);
   const entriesFn = new Function('scope', `with(scope){return function(e)${derived}}`)(scope({ j_e: codec, jT: { fromMap: m => m }, dm: isToolSet }));
   // ChatSelectedTools.set: where Configure Tools (`set(b,!1)`) and code (`set(map,!0)`) store a selection.
-  const setSrc = between(code, 'set(e,t){let i=this._mode.get();', '}async updateCustomModeTools(').slice('set(e,t){'.length, -'}async updateCustomModeTools('.length);
-  const setFn = new Function('scope', `with(scope){return function(e,t){${setSrc}}}`)(scope({ j_e: codec }));
-  return { codec, entriesFn, setFn };
+  // Patched, set takes a third parameter (the prompt file's tool names); pristine ignores it.
+  const setParams = code.includes('set(e,t,ezilNames){') ? 'e,t,ezilNames' : 'e,t';
+  const setStart = code.includes('set(e,t,ezilNames){') ? 'set(e,t,ezilNames){let i=this._mode.get();' : 'set(e,t){let i=this._mode.get();';
+  const setBody = between(code, setStart, '}async updateCustomModeTools(').slice(setStart.length - 'let i=this._mode.get();'.length, -'}async updateCustomModeTools('.length);
+  const setFn = new Function('scope', `with(scope){return function(${setParams}){${setBody}}}`)(scope({ j_e: codec }));
+  return { codec, entriesFn, setFn, promptMap: (names, reg) => enablementFromNames(names, reg.tools, reg.sets) };
 }
 // Runs the bundle's set() for the plain Agent mode and returns the session state it stored (undefined if it wrote global).
-function storeSession(wb, shown, byCode, { existing = false } = {}) {
+function storeSession(wb, shown, byCode, { existing = false, names } = {}) {
   const sessions = new Map(existing ? [['agent', { toolSets: new Map(), tools: new Map() }]] : []);
   const self = { _mode: { get: () => ({ id: 'agent', kind: 'agent', customTools: undefined }) }, _sessionStates: { has: k => sessions.has(k), set: (k, v) => sessions.set(k, v) }, _globalState: { set() {} } };
-  wb.setFn.call(self, new Map(shown), byCode);
+  wb.setFn.call(self, new Map(shown), byCode, names);
   return sessions.get('agent');
 }
 
@@ -70,16 +73,19 @@ function entries(wb, { stored, tools = [], sets = [], session, mode = { id: 'age
     _currentTools: { read: () => tools },
     _toolsService: {
       getToolSetsForModel: () => sets,
-      toToolAndToolSetEnablementMap: names => {
-        const m = new Map();
-        for (const s of sets) { const on = names.includes(s.id); m.set(s, on); if (on) for (const t of s.members) m.set(t, true); }
-        for (const t of [...tools, ...sets.flatMap(s => s.members)]) if (!m.has(t)) m.set(t, names.includes(t.id));
-        return m;
-      },
+      toToolAndToolSetEnablementMap: names => enablementFromNames(names, tools, sets),
     },
   };
   const result = wb.entriesFn.call(self, undefined);
   return Object.fromEntries([...result].map(([k, v]) => [k.id, v]));
+}
+// The tools service's toToolAndToolSetEnablementMap, reduced: every registered set and tool, on when named
+// (a named set turns its members on).
+function enablementFromNames(names, tools, sets) {
+  const m = new Map();
+  for (const s of sets) { const on = names.includes(s.id); m.set(s, on); if (on) for (const t of s.members) m.set(t, true); }
+  for (const t of [...tools, ...sets.flatMap(s => s.members)]) if (!m.has(t)) m.set(t, names.includes(t.id));
+  return m;
 }
 // What Configure Tools saves: the full map of every entry it showed (`set(b,!1)` -> toStorage(fromMap(b))).
 const save = (wb, shown) => wb.codec.toStorage(wb.codec.fromMap(new Map(shown)));
@@ -214,11 +220,23 @@ test('Agent tool selection: explicit all-off holds for late registrations; defau
       assert.equal(map.read, false); assert.equal(map.edit, true);
     });
 
-    await both('prompt file naming sets not registered yet (all-off snapshot, set(..., true)): late sets on as upstream', ({ wb }) => {
-      // toToolAndToolSetEnablementMap(['edit','search']) before Copilot's sets exist: every known entry false.
-      const session = storeSession(wb, shownEntries(early, false), true);
-      const map = entries(wb, { session, ...late });
-      assert.equal(map.edit, true); assert.equal(map.search, true); assert.equal(map.copilot_createFile, true); assert.equal(map.read, false);
+    // A prompt file's `tools:` as _applyPromptMetadata applies it: the map computed from its names when it runs
+    // (before Copilot's sets exist every entry is off), plus, patched, the names themselves.
+    const promptSession = (wb, names) => storeSession(wb, [...wb.promptMap(names, early)], true, { names });
+    await both('prompt file tools [edit, search] run before those sets exist: they appear when registered; web, read stay off', ({ wb }) => {
+      const map = entries(wb, { session: promptSession(wb, ['edit', 'search']), ...late });
+      assert.equal(map.edit, true); assert.equal(map.search, true); assert.equal(map.copilot_createFile, true); assert.equal(map.copilot_findFiles, true);
+      assert.equal(map.web, false); assert.equal(map.copilot_githubRepo, false); assert.equal(map.read, false); assert.equal(map.manage_todo_list, false);
+    }, { defect: true });
+
+    await both('prompt file tools: [] stays empty after the late sets register', ({ wb }) => {
+      const map = entries(wb, { session: promptSession(wb, []), ...late });
+      assert.ok(Object.values(map).every(v => v === false), JSON.stringify(map));
+    }, { defect: true });
+
+    await both('prompt file tools [read] run after every set exists: read only', ({ wb }) => {
+      const map = entries(wb, { session: storeSession(wb, [...wb.promptMap(['read'], late)], true, { names: ['read'] }), ...late });
+      assert.deepEqual(Object.entries(map).filter(([, v]) => v).map(([k]) => k).sort(), ['copilot_getErrors', 'copilot_readFile', 'read']);
     });
 
     await both('Configure Tools all off in a chat that has a session selection (set(..., false)): late sets off', ({ wb }) => {
@@ -231,11 +249,11 @@ test('Agent tool selection: explicit all-off holds for late registrations; defau
       assert.equal(storeSession(wb, shownEntries(early, false), false), undefined);
     });
 
-    await both('per-session partial selection is kept; late sets on as upstream', ({ wb }) => {
+    await both('tool include/exclude session (set(map, true), no names) partial: kept; unseen late sets off', ({ wb }) => {
       const session = storeSession(wb, shownEntries(early, x => x.id === 'execute' || x.id === 'run_in_terminal'), true);
       const map = entries(wb, { session, ...late });
-      assert.equal(map.execute, true); assert.equal(map.read, false); assert.equal(map.web, true);
-    });
+      assert.equal(map.execute, true); assert.equal(map.run_in_terminal, true); assert.equal(map.read, false); assert.equal(map.web, false);
+    }, { defect: true });
 
     await both('custom agent `tools: []`: nothing on; `tools: [read]`: read only (computed over every registered tool)', ({ wb }) => {
       const none = entries(wb, { ...late, mode: { id: 'c', kind: 'agent', customTools: { read: () => [] } } });
@@ -299,6 +317,7 @@ test('Agent tool selection: explicit all-off holds for late registrations; defau
     const moves = [
       ['tools-forced', extFile, 'let h=r.getEnabledTools(e,n,y=>{', 'let h=r.getEnabledTools(e,n,(y)=>{'],
       ['tools-absent', wbFile, 'let c=r.toolSets.get(a.id)!==!1;', 'let c=r.toolSets.get(a.id)!=!1;'],
+      ['tools-prompt', wbFile, 'this.input.selectedToolsModel.set(r,!0)}', 'this.input.selectedToolsModel.set(r,!0);}'],
       ['tools-session', wbFile, 'if(t||this._sessionStates.has(i.id)){', 'if(this._sessionStates.has(i.id)||t){'],
       ['tools-legacy', wbFile, 'return{toolSets:new Map(c),tools:new Map(l)}}', 'return{tools:new Map(l),toolSets:new Map(c)}}'],
     ];
