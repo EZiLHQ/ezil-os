@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { parseModelsConfig, type ResolvedConfig } from '../src/config';
-import { forgetGatewayModels, gatewayCatalogModels, gatewayChat, parseGatewayModels, withGatewayModelLimits } from '../src/gateway';
+import { forgetGatewayModels, gatewayCatalogModels, gatewayChat, gatewayModels, parseGatewayModels, withGatewayModelLimits } from '../src/gateway';
 import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, CLAUDE_IMAGE_TOKENS, gatewayMessage, gatewayTokenCount, imageProblem, LocalRequestError, MAX_IMAGE_BYTES,
     sendableImages } from '../src/gateway-messages';
 import { buildGatewayResponsesBody } from '../src/gateway-responses';
@@ -356,12 +356,39 @@ describe('provider: the user\'s image goes intact or the turn fails before sendi
             return new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
         }) as typeof globalThis.fetch;
         const model = { ...config(true).models[1]!, capabilities: { toolCalling: true, imageInput: true } };
-        const run = async (strictImages: boolean) => { for await (const _ of gatewayChat(model, ask([msg('user', txt('look'), image())]), { signal: new AbortController().signal, fetch, strictImages })) { /* drain */ } };
-        expect(await run(true).then(() => undefined, (e: Error) => e.message)).toMatch(/does not accept images through EZiL AI right now.*Nothing was sent or charged/);
+        const run = async (imagesAsNotes?: boolean) => { for await (const _ of gatewayChat(model, ask([msg('user', txt('look'), image())]), { signal: new AbortController().signal, fetch, imagesAsNotes })) { /* drain */ } };
+        // A direct caller fails closed by default.
+        expect(await run().then(() => undefined, (e: Error) => e.message)).toMatch(/does not accept images through EZiL AI right now.*Nothing was sent or charged/);
         expect(posts).toHaveLength(0);
-        // A title or summary request (not strict) still goes, with the image as a note.
-        await run(false);
+        // A title or summary request still goes, with the image as a note.
+        await run(true);
         expect(posts).toHaveLength(1);
+    });
+
+    test('the catalog cache expiring exactly between the provider\'s check and gatewayChat\'s refuses, never sends a note', async () => {
+        // Independent reviewer's TTL-boundary repro at 2d466315: read 1 (t=0) says image_input true; the provider checks at
+        // 299,999 ms (cached); gatewayChat reads again at 300,000 ms (expired) and the catalog now says false.
+        const resolved = config(true);
+        const sonnet = resolved.models.find(model => model.id === SONNET)!;
+        const posts: unknown[] = [];
+        let reads = 0;
+        const fetchMock = (async (input: string | URL | Request, init: RequestInit = {}) => {
+            if (String(input).endsWith('/models')) return Response.json(catalog(++reads === 1));
+            posts.push(JSON.parse(new TextDecoder().decode(init.body as Uint8Array)));
+            return new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof globalThis.fetch;
+        const provider = new EZiLModelsProvider({ models: () => resolved.models, configError: () => undefined, secrets: () => resolved.secrets,
+            logRequests: () => true, log: () => {}, recordUsage: () => {}, fetch: fetchMock });
+        expect((await gatewayModels(sonnet.provider, fetchMock, 0))?.data.find(row => row.id === SONNET)?.capabilities?.image_input).toBe(true);
+        const realNow = Date.now;
+        let calls = 0;
+        Date.now = () => ++calls <= 2 ? 299_999 : 300_000;
+        let message: string | undefined;
+        try { message = await failure(send(provider, SONNET, [user(new TextPart('what is pictured?'), new VsDataPart(SMALL, 'image/png'))])); }
+        finally { Date.now = realNow; }
+        expect(reads).toBe(2);
+        expect(message).toMatch(/Claude Sonnet 5\.5 does not accept images through EZiL AI right now.*Nothing was sent or charged/);
+        expect(posts).toHaveLength(0);
     });
 
     test('imageRefusal ignores requests without images', () => {

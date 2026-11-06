@@ -80,10 +80,10 @@ export type GatewayOptions = {
     /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
     onCompact?: (info: CompactionInfo) => void;
     /**
-     * The user's own request (not a title, summary or progress call): its current images go as images in every built
-     * copy, or nothing is sent. Without it, any image that cannot go is a marked note.
+     * Title, summary and progress calls only: an image that cannot go is a marked note. Otherwise (the default, fail
+     * closed) the request's current images go as images in every built copy, or nothing is sent.
      */
-    strictImages?: boolean;
+    imagesAsNotes?: boolean;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
@@ -639,11 +639,12 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const current = request.messages[currentUserIndex(request.messages)];
         const currentImages = current?.role === 'user' ? current.parts.filter(isImagePart) : [];
         // The catalog can change between the provider's read and this one: refuse, never turn the user's image into a note.
-        if (options.strictImages && !responses && currentImages.length && !model.capabilities.imageInput) {
+        const strict = options.imagesAsNotes !== true;
+        if (strict && !responses && currentImages.length && !model.capabilities.imageInput) {
             throw new GatewayError(`EZiL AI: ${model.name} does not accept images through EZiL AI right now. Remove the image or pick a model that accepts images. Nothing was sent or charged.`,
                 undefined, 'image_input_unsupported', undefined, undefined, 'local');
         }
-        const required = new Set(options.strictImages && !responses && model.capabilities.imageInput ? currentImages.filter(part => !imageProblem(part)) : []);
+        const required = new Set(strict && !responses && model.capabilities.imageInput ? currentImages.filter(part => !imageProblem(part)) : []);
         // The protocol's own builder, with the input limit scaled for compaction's target.
         const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
             const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(Math.min(GATEWAY_INPUT_TOKENS, limits.maxInputTokens) * scale)) };

@@ -321,7 +321,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
-                gateway: { onCompact: info => this.host.compacted?.(sending, info, finished), strictImages: !isUtilityRequest(options.modelOptions ?? {}) },
+                gateway: { onCompact: info => this.host.compacted?.(sending, info, finished), imagesAsNotes: isUtilityRequest(options.modelOptions ?? {}) },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
                     if (resolved.provider.type === 'ezil-gateway') return;
