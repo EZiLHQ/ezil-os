@@ -6,6 +6,7 @@ import { forgetGatewayModels, gatewayModels } from './gateway';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
+import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
@@ -300,7 +301,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
         vscode.commands.registerCommand('ezil-models.compactionInfo', () => compaction.explain()),
     );
-    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}`);
+    // `@ezil`: plain questions to the selected EZiL model without tools (participant.ts). Registered last and
+    // guarded, so a host without chat participants still gets every command above.
+    let participant = 'none';
+    try {
+        context.subscriptions.push(registerNoToolsParticipant());
+        participant = PARTICIPANT_ID;
+    } catch (error) {
+        log(`[activate] @ezil participant not registered: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}; participant=${participant}`);
 }
 
 export function deactivate(): void {}
