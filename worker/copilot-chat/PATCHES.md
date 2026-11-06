@@ -292,13 +292,15 @@ Without a local pinned bundle it explicitly skips; release validation must suppl
 
 Configure Tools (Agent mode) stores the user's choice as a map of tool and
 tool-set id → enabled (storage key `chat/selectedTools`, version 2), and every
-id missing from that map counts as enabled. Copilot creates its `edit`,
-`search` and `web` tool sets when it activates, which happens at the first chat
-request. A user who opened Configure Tools before that and switched every row
-off therefore got those sets and their members back on. Copilot's Agent tool
-function then turns some tools on that the request does not list. Measured on
-image 33 with an offline mock gateway: 14 tools and `tool_choice: auto` after
-"all off". 11 came from members of the late sets, and 3 were forced by Copilot
+id missing from that map counts as enabled. Copilot's `edit`, `search` and
+`web` tool sets reach the picker only around the first chat request (measured
+on image 33: 7 rows before it, 9 after; the exact registration trigger is not
+pinned, since Copilot itself activates on `onStartupFinished`). A user who opened
+Configure Tools before that and switched every row off therefore got those sets
+and their members back on. Copilot's Agent tool function then turns some tools
+on that the request does not list. Measured on image 33 with an offline mock
+gateway: 14 tools and `tool_choice: auto` after "all off". 11 came from members
+of the late sets, and 3 were forced by Copilot
 (`insert_edit_into_file`, `replace_string_in_file`, `session_store_sql`).
 
 | id | file / source | anchor | replacement | count | why |
@@ -308,9 +310,29 @@ image 33 with an offline mock gateway: 14 tools and `tool_choice: auto` after
 | `tools-forced` | extension.js Agent tool function `Ret` (`extension/intents/node/agentIntent.ts` `getAgentTools`) | `let h=r.getEnabledTools(e,n,y=>{if(typeof m[y.name]=="boolean")return m[y.name]});` | `let ezilNone=$a.some(e.tools,()=>!0)&&!$a.some(e.tools,([,y])=>y!==!1),h=r.getEnabledTools(e,n,y=>{if(!ezilNone&&typeof m[y.name]=="boolean")return m[y.name]});` | 1 | `getEnabledTools` honours an explicit off first, then this override, then prompt references, then an explicit on. The override turns on edit tools, `session_store_sql`, tool search, tests and tasks, and subagents for ids the request map does not list. When that map lists tools and all are off, the override is skipped. A missing id is then sent only if the prompt references a tool that enables it (`enable_other_tool_*`, upstream). Partial and empty maps keep upstream forcing, including the `copilot_editFiles`-off rule that drops the edit tools. Autopilot adds `task_complete` itself in the tool-calling loop, not here. |
 | `tools-names` | workbench.js / extension.js | `P_TOOLS_MEMBERS` (set members follow the set), `P_TOOLS_REQUEST` (the request map is `entriesMap` without sets), `P_TOOLS_PICKER` (Configure Tools saves the full map it showed: `b&&r.input.selectedToolsModel.set(b,!1)`), `P_TOOLS_STORAGE` (the version 2 check); `P_TOOLS_EDITFILES`, `P_TOOLS_ENABLED` (getEnabledTools' order, above) | Checked, never patched | 1 each | These are the meanings the three patches rely on. |
 
-The all-off inference relies on Configure Tools saving every row it showed
-(`P_TOOLS_PICKER`), so an all-false map means every visible row was off. With
-no tools, EZiL's provider omits `tools` and `tool_choice` from the gateway body.
+The all-off inference relies on Configure Tools saving every row it showed:
+its picker walks the whole item tree. That was read in the 4.141.0 bundle and
+measured in the UI. `P_TOOLS_PICKER` only pins the call that saves it, not the
+walk. With no tools, EZiL's provider omits `tools` and `tool_choice` from the
+gateway body (measured: Default permissions, all off, no `tools` key).
+
+Limits, all unchanged from upstream unless stated:
+
+- **Autopilot** (permission level `autopilot`, not the default): the
+  tool-calling loop adds `task_complete` itself, so an all-off request in
+  Autopilot still offers that one tool with `tool_choice: auto`.
+- **Edit and notebook intents** (not Agent mode) pass their own overrides and
+  still force their edit tools.
+- **Changed for prompt files and custom agents:** a prompt file's `tools:` is
+  applied once per chat as a session selection. If none of the tools it names
+  is registered yet, that selection is all-off, and under `tools-absent` they
+  stay off until a new chat. Upstream instead turned on every tool registered
+  later, named or not. Likewise, a custom agent whose `tools:` resolves to
+  nothing now sends no tools; upstream still forced the edit tools,
+  `session_store_sql` and tool search.
+- **Partial selections:** Copilot still forces `session_store_sql`, plus the
+  edit tools unless `editFiles` is off (measured: "read" only sends 8 tools,
+  before and after).
 
 Offline test (patches a copy, runs `--verify`, then runs the bundle's own
 storage codec, `entriesMap`, `Ret` and `getEnabledTools` against stubs on both

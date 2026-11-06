@@ -252,9 +252,9 @@ A_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];for(let l of this.chatSess
 R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
 
 # Part 4 — Agent tool selection (PATCHES.md "Agent tool selection"). Configure Tools stores a map of
-# tool/tool-set id -> enabled; an id missing from it counts as enabled. Copilot creates its edit,
-# search and web sets when it activates, i.e. after a user who opened Configure Tools before the
-# first request switched every row off, so those sets and their members came back on (`tools-absent`).
+# tool/tool-set id -> enabled; an id missing from it counts as enabled. Copilot's edit, search and
+# web sets reach the picker only around the first request (measured: 7 rows before it, 9 after), so
+# a user who switched every row off before that got those sets and their members back (`tools-absent`).
 # A stored selection whose every entry is off now keeps ids it has never seen off too; any other
 # selection (never configured, partial, the pre-version-2 disabled-only format) keeps upstream's
 # missing-means-on, so new tools still appear for those users.

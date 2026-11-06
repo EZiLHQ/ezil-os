@@ -267,17 +267,26 @@ test('Agent tool selection: explicit all-off holds for late registrations; defau
       assert.ok(!(await ext({ toolNames: EXT_TOOLS, request: { tools } })).includes('session_store_sql'));
     });
 
-    await t.test('a moved anchor fails the build and names it', () => {
-      const moved = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-selection-moved-'));
-      try {
-        for (const f of files) { fs.mkdirSync(path.dirname(path.join(moved, f)), { recursive: true }); fs.copyFileSync(path.join(source, f), path.join(moved, f)); }
-        const ext = path.join(moved, extFile);
-        fs.writeFileSync(ext, fs.readFileSync(ext, 'utf8').replace('let h=r.getEnabledTools(e,n,y=>{', 'let h=r.getEnabledTools(e,n,(y)=>{'));
-        const r = run(moved);
-        assert.notEqual(r.status, 0);
-        assert.match(r.stderr, /\[tools-forced\] anchor occurs 0 times/);
-      } finally { fs.rmSync(moved, { recursive: true, force: true }); }
-    });
+    // Each anchor, moved in its own copy: the build stops at that patch and names it.
+    const moves = [
+      ['tools-forced', extFile, 'let h=r.getEnabledTools(e,n,y=>{', 'let h=r.getEnabledTools(e,n,(y)=>{'],
+      ['tools-absent', wbFile, 'let c=r.toolSets.get(a.id)!==!1;', 'let c=r.toolSets.get(a.id)!=!1;'],
+      ['tools-legacy', wbFile, 'return{toolSets:new Map(c),tools:new Map(l)}}', 'return{tools:new Map(l),toolSets:new Map(c)}}'],
+    ];
+    for (const [id, file, from, to] of moves) {
+      await t.test(`a moved ${id} anchor fails the build and names it`, () => {
+        const moved = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-selection-moved-'));
+        try {
+          for (const f of files) { fs.mkdirSync(path.dirname(path.join(moved, f)), { recursive: true }); fs.copyFileSync(path.join(source, f), path.join(moved, f)); }
+          const target = path.join(moved, file), code = fs.readFileSync(target, 'utf8');
+          assert.equal(code.split(from).length - 1, 1, `fixture text for ${id} occurs once`);
+          fs.writeFileSync(target, code.replace(from, to));
+          const r = run(moved);
+          assert.notEqual(r.status, 0);
+          assert.match(r.stderr, new RegExp(`\\[${id}\\] anchor occurs 0 times`));
+        } finally { fs.rmSync(moved, { recursive: true, force: true }); }
+      });
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
