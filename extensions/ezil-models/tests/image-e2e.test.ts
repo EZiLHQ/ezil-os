@@ -7,7 +7,7 @@ import { deflateSync } from 'node:zlib';
 import { parseModelsConfig } from '../src/config';
 import { forgetGatewayModels } from '../src/gateway';
 import { AI_PROXY_MAX_BODY_BYTES } from '../src/gateway-messages';
-import { fakeVscode, DataPart, TextPart } from './fixtures/fake-vscode';
+import { fakeVscode, DataPart, TextPart, ToolCallPart, ToolResultPart } from './fixtures/fake-vscode';
 
 mock.module('vscode', () => fakeVscode);
 const { EZiLModelsProvider } = await import('../src/provider');
@@ -91,8 +91,9 @@ async function stack() {
     return { provider: new EZiLModelsProvider(host), hop };
 }
 const token = () => ({ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
-const send = (provider: InstanceType<typeof EZiLModelsProvider>, content: unknown[]) => provider.provideLanguageModelChatResponse({ id: SONNET } as never,
-    [{ role: 1, content }] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never).then(() => undefined, (error: Error) => error.message);
+const chat = (provider: InstanceType<typeof EZiLModelsProvider>, messages: unknown[], tools: unknown[] = []) => provider.provideLanguageModelChatResponse({ id: SONNET } as never,
+    messages as never, { tools, modelOptions: {} } as never, { report: () => {} }, token() as never).then(() => undefined, (error: Error) => error.message);
+const send = (provider: InstanceType<typeof EZiLModelsProvider>, content: unknown[]) => chat(provider, [{ role: 1, content }]);
 
 beforeEach(() => forgetGatewayModels());
 
@@ -110,6 +111,20 @@ describe('image end to end over the OS hops (offline)', () => {
         const body = JSON.parse(new TextDecoder().decode(hop.gatewayBodies[0]!));
         const block = body.messages[0].content.find((b: { type: string }) => b.type === 'image');
         expect(Buffer.from(block.source.data, 'base64').equals(Buffer.from(shot))).toBe(true);
+    });
+
+    test('an Agent-mode turn with tools and tool steps over the cap is compacted, and the image still arrives intact', async () => {
+        const { provider, hop } = await stack();
+        const shot = png(150);
+        const tools = Array.from({ length: 38 }, (_, i) => ({ name: `tool_${i}`, description: 'd'.repeat(1200), inputSchema: { type: 'object', properties: {} } }));
+        const steps = Array.from({ length: 12 }, (_, i) => [{ role: 2, content: [new ToolCallPart(`c${i}`, 'tool_0', {})] },
+            { role: 1, content: [new ToolResultPart(`c${i}`, [new TextPart('y'.repeat(4000))])] }]).flat();
+        expect(await chat(provider, [{ role: 1, content: [new TextPart('fix it'), new DataPart(shot, 'image/png')] }, ...steps], tools)).toBeUndefined();
+        expect(hop.proxyStatuses).toEqual([200]);
+        const body = JSON.parse(new TextDecoder().decode(hop.gatewayBodies[0]!));
+        const images = body.messages.flatMap((m: { content: { type: string; source?: { data: string } }[] }) => m.content).filter((b: { type: string }) => b.type === 'image');
+        expect(images).toHaveLength(1);
+        expect(Buffer.from(images[0].source.data, 'base64').equals(Buffer.from(shot))).toBe(true);
     });
 
     test('across the effective limit, a request is refused here or accepted by the proxy: the proxy never refuses it', async () => {

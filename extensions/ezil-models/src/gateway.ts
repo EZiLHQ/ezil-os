@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type GatewayBody, type LocalRequestCounts } from './gateway-messages';
+import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, currentUserIndex, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, imageProblem, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type GatewayBody, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -79,6 +79,11 @@ export type GatewayOptions = {
     onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
     /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
     onCompact?: (info: CompactionInfo) => void;
+    /**
+     * The user's own request (not a title, summary or progress call): its current images go as images in every built
+     * copy, or nothing is sent. Without it, any image that cannot go is a marked note.
+     */
+    strictImages?: boolean;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
@@ -631,10 +636,18 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             }
             model = withGatewayModelLimits(model, catalog);
         }
+        const current = request.messages[currentUserIndex(request.messages)];
+        const currentImages = current?.role === 'user' ? current.parts.filter(isImagePart) : [];
+        // The catalog can change between the provider's read and this one: refuse, never turn the user's image into a note.
+        if (options.strictImages && !responses && currentImages.length && !model.capabilities.imageInput) {
+            throw new GatewayError(`EZiL AI: ${model.name} does not accept images through EZiL AI right now. Remove the image or pick a model that accepts images. Nothing was sent or charged.`,
+                undefined, 'image_input_unsupported', undefined, undefined, 'local');
+        }
+        const required = new Set(options.strictImages && !responses && model.capabilities.imageInput ? currentImages.filter(part => !imageProblem(part)) : []);
         // The protocol's own builder, with the input limit scaled for compaction's target.
         const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
             const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(Math.min(GATEWAY_INPUT_TOKENS, limits.maxInputTokens) * scale)) };
-            return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log);
+            return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log, required);
         };
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);

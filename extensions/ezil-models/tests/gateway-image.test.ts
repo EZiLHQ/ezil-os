@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { parseModelsConfig, type ResolvedConfig } from '../src/config';
-import { forgetGatewayModels, gatewayCatalogModels, parseGatewayModels, withGatewayModelLimits } from '../src/gateway';
+import { forgetGatewayModels, gatewayCatalogModels, gatewayChat, parseGatewayModels, withGatewayModelLimits } from '../src/gateway';
 import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, CLAUDE_IMAGE_TOKENS, gatewayMessage, gatewayTokenCount, imageProblem, LocalRequestError, MAX_IMAGE_BYTES,
     sendableImages } from '../src/gateway-messages';
 import { buildGatewayResponsesBody } from '../src/gateway-responses';
@@ -331,6 +331,37 @@ describe('provider: the user\'s image goes intact or the turn fails before sendi
         expect(await failure(send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(SMALL, 'image/png'))])))
             .toMatch(/Could not load the model list, so whether Claude Sonnet 5\.5 accepts images cannot be checked right now/);
         expect(h.posts).toHaveLength(0);
+    });
+
+    test('when compaction folds the current task\'s tool steps, the user\'s image still goes intact', async () => {
+        // About 103 KB of base64 plus 20 tool steps of 3 KB: over the code host cap, so steps are folded into a user note
+        // placed after the user's message. That note must not take the image's place as "the current message".
+        const h = harness(config(true), true);
+        const shot = png(160, 160, true);
+        const steps = Array.from({ length: 20 }, (_, i) => [{ role: 2, content: [new ToolCallPart(`c${i}`, 'read_file', {})] },
+            user(new ToolResultPart(`c${i}`, [new TextPart('x'.repeat(3000))]))]).flat();
+        expect(await failure(send(h.provider, SONNET, [user(new TextPart('fix the layout'), new VsDataPart(shot, 'image/png')), ...steps], {},
+            [{ name: 'read_file', inputSchema: { type: 'object', properties: {} } }]))).toBeUndefined();
+        expect(h.posts).toHaveLength(1);
+        const blocks = (h.posts[0]!.messages as { content: { type: string; text?: string }[] }[]).flatMap(m => m.content);
+        expect(blocks.some(b => b.type === 'text' && b.text!.includes('EZiL compacted'))).toBe(true);
+        expect(blocks.filter(b => b.type === 'image').map(decoded)).toEqual([shot]);
+    });
+
+    test('a catalog that changed after the provider read refuses the user\'s image in gatewayChat, never a note', async () => {
+        const posts: unknown[] = [];
+        const fetch = (async (input: string | URL | Request) => {
+            if (String(input).endsWith('/models')) return Response.json(catalog(false));
+            posts.push(input);
+            return new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof globalThis.fetch;
+        const model = { ...config(true).models[1]!, capabilities: { toolCalling: true, imageInput: true } };
+        const run = async (strictImages: boolean) => { for await (const _ of gatewayChat(model, ask([msg('user', txt('look'), image())]), { signal: new AbortController().signal, fetch, strictImages })) { /* drain */ } };
+        expect(await run(true).then(() => undefined, (e: Error) => e.message)).toMatch(/does not accept images through EZiL AI right now.*Nothing was sent or charged/);
+        expect(posts).toHaveLength(0);
+        // A title or summary request (not strict) still goes, with the image as a note.
+        await run(false);
+        expect(posts).toHaveLength(1);
     });
 
     test('imageRefusal ignores requests without images', () => {

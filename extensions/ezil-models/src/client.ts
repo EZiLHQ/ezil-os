@@ -21,7 +21,7 @@ export class ProviderError extends Error {
 export type ChatOptions = {
     signal: AbortSignal;
     log?: (line: string) => void;
-    gateway?: Pick<GatewayOptions, 'newIdempotencyKey' | 'sleep' | 'now' | 'onCompact'>;
+    gateway?: Pick<GatewayOptions, 'newIdempotencyKey' | 'sleep' | 'now' | 'onCompact' | 'strictImages'>;
     fetch?: typeof fetch;
     /** Called with the request URL and the exact JSON body about to be sent (contains no credentials). */
     onRequest?: (url: string, body: Record<string, unknown>) => void;

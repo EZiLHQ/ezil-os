@@ -72,7 +72,7 @@ When it is on, a user PNG crosses these limits, and the smallest one decides:
 
 The effective limit is this proxy's 160 KiB whole body. Base64 takes 4 bytes for every 3, so that is about 120 KB of PNG
 with an empty chat. With Agent mode's tool definitions (about 54 KB) and history, the room is less. The extension mirrors
-the constant (a test fails on drift). An offline test runs a request through this proxy's real handler:
+the constant (a test fails on drift). An offline test runs requests through this proxy's real handler, including a compacted Agent-mode turn:
 `extensions/ezil-models/tests/image-e2e.test.ts`. Across the boundary, the extension either refuses the request or the
 proxy forwards it, and the proxy never answers 413. Raising the 160 KiB bound needs its own memory and abuse review.
 It must not be raised as a global limit just for images.

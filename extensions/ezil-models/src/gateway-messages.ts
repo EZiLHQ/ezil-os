@@ -142,10 +142,16 @@ function pngProblem(data: Uint8Array): string | undefined {
 }
 
 /** Why EZiL AI would refuse this image, or undefined. Never logs the bytes. */
+// Copilot's parts are reused across builds (compaction tries many), so each image is checked and encoded once.
+const problems = new WeakMap<DataPart, string | undefined>();
+const encoded = new WeakMap<DataPart, string>();
+
 export function imageProblem(part: DataPart): string | undefined {
-    if (part.mimeType !== 'image/png') return `${part.mimeType} images are not supported; only PNG is`;
-    if (part.data.byteLength > MAX_IMAGE_BYTES) return 'the image is larger than 1 MiB';
-    return pngProblem(part.data);
+    if (problems.has(part)) return problems.get(part);
+    const problem = part.mimeType !== 'image/png' ? `${part.mimeType} images are not supported; only PNG is`
+        : part.data.byteLength > MAX_IMAGE_BYTES ? 'the image is larger than 1 MiB' : pngProblem(part.data);
+    problems.set(part, problem);
+    return problem;
 }
 
 /**
@@ -167,19 +173,23 @@ export function currentUserIndex(messages: readonly Message[]): number {
  * The images sent as image blocks: valid user images, newest first, up to MAX_REQUEST_IMAGES (Copilot resends the
  * whole chat each turn, and the Gateway counts every image in it). Every other image goes as a marked text note.
  */
-export function sendableImages(messages: readonly Message[], imageInput: boolean, from = 0): Set<Part> {
+export function sendableImages(messages: readonly Message[], imageInput: boolean, from = 0, required: ReadonlySet<DataPart> = new Set()): Set<Part> {
     const chosen = new Set<Part>();
     if (!imageInput) return chosen;
+    // The user's own current images first, wherever a compacted copy put them.
+    for (const part of required) if (chosen.size < MAX_REQUEST_IMAGES && !imageProblem(part)) chosen.add(part);
     for (let index = messages.length - 1; index >= from && chosen.size < MAX_REQUEST_IMAGES; index--) {
         if (messages[index]!.role !== 'user') continue;
-        const images = messages[index]!.parts.filter(isImagePart).filter(part => !imageProblem(part));
+        const images = messages[index]!.parts.filter(isImagePart).filter(part => !imageProblem(part) && !chosen.has(part));
         for (let at = images.length - 1; at >= 0 && chosen.size < MAX_REQUEST_IMAGES; at--) chosen.add(images[at]!);
     }
     return chosen;
 }
 
 function imageBlock(part: DataPart): ImageBlock {
-    return { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64(part.data) } };
+    let data = encoded.get(part);
+    if (data === undefined) encoded.set(part, data = base64(part.data));
+    return { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
 }
 
 const RECENT_NOTE = `only the ${MAX_REQUEST_IMAGES} most recent images are sent`;
@@ -222,10 +232,11 @@ function partText(part: Part): string {
  * One message before conversation pairing, also used for byte counting. No synthetic history here. `images` are the
  * user image parts sent as image blocks (sendableImages); any other user image is a marked note, never dropped silently.
  */
-export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new Set(), imageInput = false, note?: string): { role: Message['role']; content: Block[] } {
+export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new Set(), imageInput = false, note?: string, sent?: Set<Part>): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
     for (const part of message.parts) {
         if (message.role === 'user' && isImagePart(part)) {
+            if (images.has(part)) sent?.add(part);
             content.push(images.has(part) ? imageBlock(part) : text(omittedImage(part, imageInput, note)));
         } else if (message.role === 'assistant' && part.type === 'tool_call') {
             if (typeof part.callId === 'string' && typeof part.name === 'string' && TOOL_NAME.test(part.callId) && TOOL_NAME.test(part.name) && isObject(part.input) && jsonValue(part.input)) {
@@ -244,8 +255,10 @@ export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], imageInput = false, currentImagesOnly = false): { system: TextBlock[]; messages: GatewayMessage[] } {
-    const images = sendableImages(messages, imageInput, currentImagesOnly ? Math.max(0, currentUserIndex(messages)) : 0);
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], imageInput = false, currentImagesOnly = false,
+    required: ReadonlySet<DataPart> = new Set(), sent?: Set<Part>): { system: TextBlock[]; messages: GatewayMessage[] } {
+    // `required`: the request's own current images, known before compaction, are always among them.
+    const images = sendableImages(messages, imageInput, currentImagesOnly ? Math.max(0, currentUserIndex(messages)) : 0, required);
     const note = currentImagesOnly ? SIZE_NOTE : undefined;
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
@@ -256,7 +269,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
         }
-        const converted = gatewayMessage(message, images, imageInput, note);
+        const converted = gatewayMessage(message, images, imageInput, note, sent);
         const content = converted.content.map(block => {
             if (block.type !== 'tool_use') return block;
             if (!names.has(block.name) || seen.has(block.id)) return text('[tool call omitted: unavailable tool or duplicate identifier]');
@@ -297,11 +310,18 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
     return Math.max(1, Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING - ENVELOPE_RESERVE - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
 }
 
-export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
+/**
+ * `required`: the user's current images (gatewayChat), which every built copy must carry as image blocks. Compaction
+ * adds its own user note after them, so a compacted copy's "current message" is not the user's.
+ */
+export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, required: ReadonlySet<DataPart> = new Set()): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log);
     const imageInput = model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
     const serialize = (currentImagesOnly: boolean) => {
-        const conversation = gatewayConversation(request.messages, tools, imageInput, currentImagesOnly);
+        const sent = new Set<Part>();
+        const conversation = gatewayConversation(request.messages, tools, imageInput, currentImagesOnly, required, sent);
+        // Never send a copy without the user's own image (nothing is sent; reported as an internal error).
+        if ([...required].some(part => !sent.has(part))) throw new Error('The attached image could not be kept in the request');
         const body: GatewayBody = {
             model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
             stream: model.model !== KIMI && model.stream !== false,
