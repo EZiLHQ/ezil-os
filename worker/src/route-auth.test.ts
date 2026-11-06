@@ -4026,6 +4026,7 @@ describe('Code folder bridge on the code host: staging only, by the existing pre
   it('production (zone unset, ezil.org): the workbench is served without a bridge', async () => {
     const body = await workbenchAt(CODE_HOST, {});
     expect(body).not.toContain('data-ezil-folder-bridge');
+    expect(body).not.toContain('data-ezil-legacy-notice');
     expect(body).toContain('performance.mark("x")');
   });
 
@@ -4033,5 +4034,8 @@ describe('Code folder bridge on the code host: staging only, by the existing pre
     const body = await workbenchAt(`8443-${SANDBOX_NAME}-code.ezil.work`, { SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work' });
     expect(body.split('data-ezil-folder-bridge').length - 1).toBe(1);
     expect(body).toContain(JSON.stringify(['https://os-staging.ezil.work']));
+    // The older image's composer notice is hidden by the same insertion, once.
+    expect(body.split('<style data-ezil-legacy-notice="1">.chat-viewpane .interactive-session>.interactive-input-part::after'
+      + '{content:none!important;display:none!important}</style>').length - 1).toBe(1);
   });
 });
