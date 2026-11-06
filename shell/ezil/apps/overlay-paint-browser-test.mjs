@@ -443,8 +443,14 @@ async function testApp (app) {
     }, app.id, 8000);
 
     const success = await measure(app.id);
+    // Code appends one per-mint folder-continuity nonce without changing the
+    // minted URL's bytes. Require that exact suffix; Preview stays byte-exact.
+    const mintSuffix = /&ezil_mint=[A-Za-z0-9_-]{22}$/;
+    const matchesMint = app.id === 'code'
+        ? mintSuffix.test(success.iframeSrc) && success.iframeSrc.replace(mintSuffix, '') === app.mintedUrl
+        : success.iframeSrc === app.mintedUrl;
     push(`${L} DIRECTION A (success): window opened and iframe carries the minted URL`,
-        success.windowFound && success.iframeSrc === app.mintedUrl, JSON.stringify(success.iframeSrc));
+        success.windowFound && matchesMint, JSON.stringify(success.iframeSrc));
     push(`\u{1f534} ${L} DIRECTION A (success): the boot panel is TRULY hidden (computed display: none, not just the attribute)`,
         success.progress?.hiddenAttr === true && success.progress?.display === 'none',
         `hiddenAttr=${success.progress?.hiddenAttr} display=${success.progress?.display}`);
