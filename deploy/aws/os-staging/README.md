@@ -1,5 +1,31 @@
 # OS billing staging on AWS
 
+Source-only safeguards and unresolved GitHub activation gates are documented in
+[OS source provenance](../../../docs/OS-CICD-PROVENANCE.md) and the
+[activation proposal](../../../docs/OS-CICD-ACTIVATION.md). This patch is based on
+canonical S, not main. `build TAG` requires a clean checkout and exact SHA=HEAD,
+builds app/runtime from one Git snapshot and emits `TAG.source.json`; upload
+checks its target and hashes. Existing `install TAG` keeps the legacy two-archive
+contract and does **not** verify a source receipt.
+
+The optional `install-verified TAG APPROVED_SHA RECEIPT_SHA256` is staging-only
+and pins instance `i-014810524754b9ed0`, Name `ezil-os-billing-staging-host`, env
+`billing-staging`, VPC `vpc-0f6bc19fdfd4209aa` and bucket
+`ezil-main-preview-artifacts-452630323510-aps1`. It verifies receipt and image
+before replacement. Runtime SHA is checked **after replacement and timer stops**:
+failure prints candidate/prior identities, no success, and leaves stopped timers
+stopped for release-owner recovery. Inspect the SSM command and container,
+restore the reviewed app/runtime pair or repair the candidate, verify health and
+source, then restore the reviewed timer set. Prior observed metadata is not a
+rollback artifact receipt; legacy fallback is never automatic.
+
+The reusable GitHub candidate scaffold is disabled, without a release branch,
+delivery role, caller, credentials or deployment. Nothing in this runbook update
+authorizes an install, paid build, access/policy change or release. Main's
+production safeguards must be preserved during eventual owner-led reconciliation;
+this S staging tool refuses `OS_ENV=production` and imports no production workflow.
+
+
 Author-only runbook for `https://os-staging.ezil.work`: a new x86_64 t3.medium
 running Amazon Linux 2023 in Mumbai (`ap-south-1`). Caddy publishes TCP 80/443;
 Next listens only on the Compose network at `web:3000`. Caddy persists TLS state

@@ -1,0 +1,51 @@
+# Source-only receipt. No credentials, image build, cloud calls or deployment.
+name: Source provenance
+on:
+  push:
+    branches: ['**']
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: os-source-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  provenance:
+    name: OS source provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record exact source, ancestry and target
+        # Write outside the checkout so the clean-source check sees only Git inputs.
+        run: python3 deploy/aws/os-staging/source_provenance.py ci . > "$RUNNER_TEMP/source-provenance.json"
+      - name: Offline source and deployment-tooling regressions
+        run: python3 -B -m unittest discover -s deploy/aws/os-staging -p 'test_*provenance.py' -v
+      - name: Offline build and install compatibility
+        run: python3 -B deploy/aws/os-staging/test_deploy_tooling.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-source-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/source-provenance.json
+          if-no-files-found: error
+      - name: Render fixed installer document for review (no AWS call)
+        run: |
+          python3 -B - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, 'deploy/aws/os-staging')
+          from fixed_document import definition, document_digest
+          path = pathlib.Path(os.environ['RUNNER_TEMP'], 'fixed-installer')
+          path.mkdir()
+          document = definition()
+          (path / 'document.json').write_text(json.dumps(document, indent=2) + '\n')
+          (path / 'receipt.json').write_text(json.dumps({'schema': 1, 'tested_source': os.environ['GITHUB_SHA'],
+              'document_sha256': document_digest(document), 'created_in_aws': False}, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-installer-document-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fixed-installer/
+          if-no-files-found: error

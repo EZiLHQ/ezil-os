@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction} "
+# Passes to run, in order (default all): fresh returning history sessions compaction phone
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -288,6 +288,18 @@ collect_logs compaction
 network_checks compaction || fail=1
 fi
 
+# ── Pass 6: a phone's narrow chat keeps the model picker's name (patch-copilot-chat.sh picker-order) ──
+if [[ "$PASSES" == *" phone "* ]]; then
+echo "[e2e] pass 6 — phone: the header's model picker keeps its name at 390 and 412 px, and a desktop chat every label"
+ST7="$WORK/phone"; mkdir -p "$ST7/home/neko/project" "$ST7/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST7/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST7"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
+collect_logs phone
+network_checks phone || fail=1
+fi
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi
 exit $fail
