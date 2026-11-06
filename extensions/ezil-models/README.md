@@ -63,8 +63,8 @@ staging-only flag advertises the route.
 Then each PNG the user attached goes intact as
 `{type:"image",source:{type:"base64",media_type:"image/png",data}}` in its user
 message, in its original place among the text. This mirrors the Gateway's
-default-off Claude image candidate (read 6 Nov 2026, uncommitted on Gateway
-2b5b4ab): PNG only, at most 1 MiB decoded and 1–8000 px a side, at most 4
+default-off Claude image candidate (Gateway 8e28cfe4 on
+`feat/gw-claude-image-20261106`, not deployed): PNG only, at most 1 MiB decoded and 1–8000 px a side, at most 4
 images per request, each counted as 4784 input tokens in place of its base64.
 Its PNG structure rules (`validPng`: every chunk CRC, IHDR depth/color, no
 APNG chunks, PLTE/IDAT order, no unknown critical chunk, IEND last) are

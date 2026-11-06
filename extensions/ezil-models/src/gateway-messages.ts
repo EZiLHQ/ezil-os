@@ -37,7 +37,7 @@ export const ENVELOPE_RESERVE = 1536;
 // refuses anything over the gateway limit before sending (LocalRequestError, nothing sent).
 export const DEFAULT_TOOL_RESERVE = 8_000;
 // User images, as the Gateway's default-off Claude image candidate accepts them (EZiL AI Gateway
-// src/protocols/anthropic/validate.ts, read 6 Nov 2026): base64 PNG blocks in user messages only, at most 4 per request,
+// src/protocols/anthropic/validate.ts at 8e28cfe4, feat/gw-claude-image-20261106): base64 PNG blocks in user messages only, at most 4 per request,
 // each at most 1 MiB decoded and 1-8000 px a side. Its input bound counts each image as CLAUDE_IMAGE_TOKENS in place of
 // its base64 bytes. The Gateway validates every chunk and CRC; this checks only what it can say clearly before sending.
 export const MAX_IMAGE_BYTES = 1024 * 1024;
