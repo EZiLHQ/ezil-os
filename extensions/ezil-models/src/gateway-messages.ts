@@ -85,31 +85,80 @@ export function isImagePart(part: Part): part is DataPart {
 }
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-const IEND = [0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
-
-/** Why EZiL AI would refuse this image, or undefined. Reads only the PNG header and trailer, never logs the bytes. */
-export function imageProblem(part: DataPart): string | undefined {
-    if (part.mimeType !== 'image/png') return `${part.mimeType} images are not supported; only PNG is`;
-    const data = part.data;
-    if (data.byteLength > MAX_IMAGE_BYTES) return 'the image is larger than 1 MiB';
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const at = (offset: number, bytes: readonly number[]) => bytes.every((byte, index) => data[offset + index] === byte);
-    // Signature, then IHDR (length 13, type) first, and the IEND chunk last.
-    if (data.byteLength < 8 + 25 + 12 || !at(0, PNG_SIGNATURE) || view.getUint32(8) !== 13 || !at(12, [0x49, 0x48, 0x44, 0x52])
-        || !at(data.byteLength - 12, IEND)) return 'the image is not a valid PNG';
-    const width = view.getUint32(16), height = view.getUint32(20);
-    if (!width || !height || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) return `the image is ${width}×${height} px; each side must be 1 to ${MAX_IMAGE_DIMENSION}`;
-    return undefined;
+const PNG_DEPTHS: Record<number, readonly number[]> = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let bit = 0; bit < 8; bit++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+});
+function crc32(data: Uint8Array, start: number, end: number): number {
+    let crc = 0xffffffff;
+    for (let index = start; index < end; index++) crc = (CRC_TABLE[(crc ^ data[index]!) & 255]! ^ (crc >>> 8)) >>> 0;
+    return (crc ^ 0xffffffff) >>> 0;
 }
 
-/** The request's current user message: the last one with something besides tool results, else the last user message. */
+/**
+ * The Gateway candidate's PNG structure rules (validPng), so an image it would refuse fails here, before sending, and is
+ * never picked again from history: signature; IHDR first with valid size, depth and color; every chunk's CRC; no APNG
+ * chunks; PLTE before IDAT; contiguous IDAT; no unknown critical chunk; IEND last and at the end; at most 4096 chunks.
+ */
+function pngProblem(data: Uint8Array): string | undefined {
+    const invalid = 'the image is not a valid PNG';
+    if (data.byteLength < 8 || !PNG_SIGNATURE.every((byte, index) => data[index] === byte)) return invalid;
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let pos = 8, chunks = 0, header = false, idat = false, afterIdat = false, idatBytes = 0, color = -1, palette = false;
+    while (pos + 12 <= data.byteLength && ++chunks <= 4096) {
+        const size = view.getUint32(pos), end = pos + 12 + size;
+        if (end > data.byteLength) return invalid;
+        const type = String.fromCharCode(...data.subarray(pos + 4, pos + 8));
+        if (!/^[A-Za-z]{4}$/.test(type) || crc32(data, pos + 4, pos + 8 + size) !== view.getUint32(pos + 8 + size)) return invalid;
+        if (!header) {
+            if (type !== 'IHDR' || size !== 13) return invalid;
+            const width = view.getUint32(pos + 8), height = view.getUint32(pos + 12);
+            if (!width || !height || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) return `the image is ${width}×${height} px; each side must be 1 to ${MAX_IMAGE_DIMENSION}`;
+            color = data[pos + 17]!;
+            if (!PNG_DEPTHS[color]?.includes(data[pos + 16]!) || data[pos + 18] !== 0 || data[pos + 19] !== 0 || data[pos + 20]! > 1) return invalid;
+            header = true;
+        } else if (type === 'acTL' || type === 'fcTL' || type === 'fdAT') {
+            return 'animated PNGs are not supported';
+        } else if (type === 'IHDR') {
+            return invalid;
+        } else if (type === 'PLTE') {
+            if (palette || idat || size === 0 || size > 768 || size % 3 !== 0) return invalid;
+            palette = true;
+        } else if (type === 'IDAT') {
+            if (afterIdat || (color === 3 && !palette)) return invalid;
+            idat = true;
+            idatBytes += size;
+        } else if (type === 'IEND') {
+            return size === 0 && idat && idatBytes > 0 && end === data.byteLength ? undefined : invalid;
+        } else {
+            if (idat) afterIdat = true;
+            if (data[pos + 4]! < 97) return invalid; // an unknown critical chunk
+        }
+        pos = end;
+    }
+    return invalid;
+}
+
+/** Why EZiL AI would refuse this image, or undefined. Never logs the bytes. */
+export function imageProblem(part: DataPart): string | undefined {
+    if (part.mimeType !== 'image/png') return `${part.mimeType} images are not supported; only PNG is`;
+    if (part.data.byteLength > MAX_IMAGE_BYTES) return 'the image is larger than 1 MiB';
+    return pngProblem(part.data);
+}
+
+/**
+ * The request's current user message, as compaction keeps it (compact.ts `typed`): the last user message with typed text
+ * or an attachment, not only tool results; else the last user message.
+ */
 export function currentUserIndex(messages: readonly Message[]): number {
     let fallback = -1;
     for (let index = messages.length - 1; index >= 0; index--) {
         const message = messages[index]!;
         if (message.role !== 'user') continue;
         if (fallback < 0) fallback = index;
-        if (message.parts.some(part => part.type !== 'tool_result' && !isCacheMarker(part) && !isStatefulMarker(part))) return index;
+        if (message.parts.some(part => (part.type === 'text' && part.value.trim() !== '') || (part.type === 'data' && !isCacheMarker(part) && !isStatefulMarker(part)))) return index;
     }
     return fallback;
 }
@@ -118,10 +167,10 @@ export function currentUserIndex(messages: readonly Message[]): number {
  * The images sent as image blocks: valid user images, newest first, up to MAX_REQUEST_IMAGES (Copilot resends the
  * whole chat each turn, and the Gateway counts every image in it). Every other image goes as a marked text note.
  */
-export function sendableImages(messages: readonly Message[], imageInput: boolean): Set<Part> {
+export function sendableImages(messages: readonly Message[], imageInput: boolean, from = 0): Set<Part> {
     const chosen = new Set<Part>();
     if (!imageInput) return chosen;
-    for (let index = messages.length - 1; index >= 0 && chosen.size < MAX_REQUEST_IMAGES; index--) {
+    for (let index = messages.length - 1; index >= from && chosen.size < MAX_REQUEST_IMAGES; index--) {
         if (messages[index]!.role !== 'user') continue;
         const images = messages[index]!.parts.filter(isImagePart).filter(part => !imageProblem(part));
         for (let at = images.length - 1; at >= 0 && chosen.size < MAX_REQUEST_IMAGES; at--) chosen.add(images[at]!);
@@ -133,10 +182,12 @@ function imageBlock(part: DataPart): ImageBlock {
     return { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64(part.data) } };
 }
 
-function omittedImage(part: DataPart, imageInput: boolean): string {
+const RECENT_NOTE = `only the ${MAX_REQUEST_IMAGES} most recent images are sent`;
+const SIZE_NOTE = "earlier images are left out to fit EZiL AI's request size limit";
+
+function omittedImage(part: DataPart, imageInput: boolean, note = RECENT_NOTE): string {
     if (!imageInput) return '[image omitted: not supported by this model]';
-    const problem = imageProblem(part);
-    return `[image omitted: ${problem ?? `only the ${MAX_REQUEST_IMAGES} most recent images are sent`}]`;
+    return `[image omitted: ${imageProblem(part) ?? note}]`;
 }
 
 export function gatewayTools(tools: readonly Tool[], log: (line: string) => void = () => {}): GatewayTool[] {
@@ -171,11 +222,11 @@ function partText(part: Part): string {
  * One message before conversation pairing, also used for byte counting. No synthetic history here. `images` are the
  * user image parts sent as image blocks (sendableImages); any other user image is a marked note, never dropped silently.
  */
-export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new Set(), imageInput = false): { role: Message['role']; content: Block[] } {
+export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new Set(), imageInput = false, note?: string): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
     for (const part of message.parts) {
         if (message.role === 'user' && isImagePart(part)) {
-            content.push(images.has(part) ? imageBlock(part) : text(omittedImage(part, imageInput)));
+            content.push(images.has(part) ? imageBlock(part) : text(omittedImage(part, imageInput, note)));
         } else if (message.role === 'assistant' && part.type === 'tool_call') {
             if (typeof part.callId === 'string' && typeof part.name === 'string' && TOOL_NAME.test(part.callId) && TOOL_NAME.test(part.name) && isObject(part.input) && jsonValue(part.input)) {
                 content.push({ type: 'tool_use', id: part.callId, name: part.name, input: part.input });
@@ -193,8 +244,9 @@ export function gatewayMessage(message: Message, images: ReadonlySet<Part> = new
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], imageInput = false): { system: TextBlock[]; messages: GatewayMessage[] } {
-    const images = sendableImages(messages, imageInput);
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], imageInput = false, currentImagesOnly = false): { system: TextBlock[]; messages: GatewayMessage[] } {
+    const images = sendableImages(messages, imageInput, currentImagesOnly ? Math.max(0, currentUserIndex(messages)) : 0);
+    const note = currentImagesOnly ? SIZE_NOTE : undefined;
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
     const names = new Set(tools.map(tool => tool.name));
@@ -204,7 +256,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
         }
-        const converted = gatewayMessage(message, images, imageInput);
+        const converted = gatewayMessage(message, images, imageInput, note);
         const content = converted.content.map(block => {
             if (block.type !== 'tool_use') return block;
             if (!names.has(block.name) || seen.has(block.id)) return text('[tool call omitted: unavailable tool or duplicate identifier]');
@@ -248,19 +300,24 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
 export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log);
     const imageInput = model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
-    const conversation = gatewayConversation(request.messages, tools, imageInput);
-    const body: GatewayBody = {
-        model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
-        stream: model.model !== KIMI && model.stream !== false,
+    const serialize = (currentImagesOnly: boolean) => {
+        const conversation = gatewayConversation(request.messages, tools, imageInput, currentImagesOnly);
+        const body: GatewayBody = {
+            model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
+            stream: model.model !== KIMI && model.stream !== false,
+        };
+        if (conversation.system.length) body.system = conversation.system;
+        if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
+        for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+            const value = request.modelOptions[key] ?? configured;
+            if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
+        }
+        return { body, bytes: new TextEncoder().encode(JSON.stringify(body)) };
     };
-    if (conversation.system.length) body.system = conversation.system;
-    if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
+    let { body, bytes } = serialize(false);
+    // Over the code host's cap with images: earlier messages' images go as notes first, before compaction folds any text.
+    if (imageInput && bytes.byteLength > AI_PROXY_MAX_BODY_BYTES) ({ body, bytes } = serialize(true));
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
-        const value = request.modelOptions[key] ?? configured;
-        if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
-    }
-    const bytes = new TextEncoder().encode(JSON.stringify(body));
     // The Gateway counts each image as CLAUDE_IMAGE_TOKENS in place of its base64 (ASCII, so one byte a character).
     let imageCount = 0, imageBytes = 0;
     for (const message of body.messages) for (const block of message.content) if (block.type === 'image') { imageCount++; imageBytes += block.source.data.length; }

@@ -9,8 +9,9 @@ import { parseModelsConfig, type ResolvedConfig } from '../src/config';
 import { forgetGatewayModels, gatewayCatalogModels, parseGatewayModels, withGatewayModelLimits } from '../src/gateway';
 import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, CLAUDE_IMAGE_TOKENS, gatewayMessage, gatewayTokenCount, imageProblem, LocalRequestError, MAX_IMAGE_BYTES,
     sendableImages } from '../src/gateway-messages';
+import { buildGatewayResponsesBody } from '../src/gateway-responses';
 import type { DataPart } from '../src/types';
-import { fakeVscode, DataPart as VsDataPart, TextPart, ToolResultPart } from './fixtures/fake-vscode';
+import { fakeVscode, DataPart as VsDataPart, TextPart, ToolCallPart, ToolResultPart } from './fixtures/fake-vscode';
 import { ask, gw, msg, txt } from './fixtures/gateway';
 
 mock.module('vscode', () => fakeVscode);
@@ -25,14 +26,18 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
     view.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
     return out;
 }
-/** A structurally valid RGB PNG; `noise` makes it incompressible (deterministic), so its size follows its pixels. */
-function png(width: number, height: number, noise = false): Uint8Array {
+/**
+ * A structurally valid RGB PNG; `noise` makes it incompressible (deterministic), so its size follows its pixels. `shape`
+ * edits the header or the chunk list (each chunk with a correct CRC) to build a PNG the Gateway refuses.
+ */
+function png(width: number, height: number, noise = false, shape: { depth?: number; chunks?: (chunks: Uint8Array[]) => Uint8Array[] } = {}): Uint8Array {
     const header = new Uint8Array(13), view = new DataView(header.buffer);
-    view.setUint32(0, width); view.setUint32(4, height); header.set([8, 2, 0, 0, 0], 8);
+    view.setUint32(0, width); view.setUint32(4, height); header.set([shape.depth ?? 8, 2, 0, 0, 0], 8);
     const raw = new Uint8Array(height * (1 + width * 3));
     let seed = 7;
     for (let i = 0; i < raw.length; i++) if (noise && i % (1 + width * 3) !== 0) raw[i] = (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 24;
-    const parts = [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', header), chunk('IDAT', deflateSync(raw)), chunk('IEND', new Uint8Array())];
+    const chunks = [chunk('IHDR', header), chunk('IDAT', deflateSync(raw)), chunk('IEND', new Uint8Array())];
+    const parts = [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), ...(shape.chunks ? shape.chunks(chunks) : chunks)];
     const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
     let at = 0; for (const p of parts) { out.set(p, at); at += p.length; }
     return out;
@@ -81,9 +86,9 @@ describe('the wire: PNG bytes go intact, everything else is a marked note', () =
         expect(blocks.filter(b => b.type === 'text' && b.text === '[image omitted: only the 4 most recent images are sent]')).toHaveLength(2);
         expect(sendableImages(request.messages, true).size).toBe(4);
         // The budget can split one message: its newest images go first.
-        const [a, b, c, d, e] = Array.from({ length: 5 }, (_, i) => image(png(i + 1, 2)));
-        expect([...sendableImages([msg('user', a!, b!, c!), msg('assistant', txt('ok')), msg('user', d!, e!)], true)]).toEqual([e, d, c, b]);
-        expect(sendableImages([msg('user', a!)], false).size).toBe(0);
+        const [a, b, c, d, e] = Array.from({ length: 5 }, (_, i) => image(png(i + 1, 2))) as [DataPart, DataPart, DataPart, DataPart, DataPart];
+        expect([...sendableImages([msg('user', a, b, c), msg('assistant', txt('ok')), msg('user', d, e)], true)]).toEqual([e, d, c, b]);
+        expect(sendableImages([msg('user', a)], false).size).toBe(0);
     });
 
     test('only user images count or become blocks, whatever set a caller passes', () => {
@@ -94,8 +99,13 @@ describe('the wire: PNG bytes go intact, everything else is a marked note', () =
     });
 
     test('unsupported type, size, structure and dimensions are explained, not sent', () => {
-        const wide = png(8001, 1), empty = png(1, 1);
-        new DataView(empty.buffer).setUint32(16, 0);
+        const wide = png(8001, 1), empty = png(0, 1);
+        const badCrc = png(4, 3); badCrc[45]! ^= 1; // a byte inside IDAT
+        const apng = png(4, 3, false, { chunks: ([ihdr, ...rest]) => [ihdr!, chunk('acTL', new Uint8Array(8)), ...rest] });
+        const noIdat = png(4, 3, false, { chunks: ([ihdr, , iend]) => [ihdr!, iend!] });
+        const critical = png(4, 3, false, { chunks: ([ihdr, ...rest]) => [ihdr!, chunk('XYZW', new Uint8Array(1)), ...rest] });
+        const ancillary = png(4, 3, false, { chunks: ([ihdr, ...rest]) => [ihdr!, chunk('tEXt', new TextEncoder().encode('k\0v')), ...rest] });
+        const split = png(4, 3, false, { chunks: ([ihdr, idat, iend]) => [ihdr!, idat!, chunk('tEXt', new Uint8Array(1)), idat!, iend!] });
         const cases: [DataPart, RegExp][] = [
             [image(SMALL, 'image/jpeg'), /image\/jpeg images are not supported; only PNG/],
             [image(new Uint8Array(MAX_IMAGE_BYTES + 1)), /larger than 1 MiB/],
@@ -103,6 +113,13 @@ describe('the wire: PNG bytes go intact, everything else is a marked note', () =
             [image(new TextEncoder().encode('<svg/>'.padEnd(64, ' '))), /not a valid PNG/],
             [image(wide), /8001×1 px/],
             [image(empty), /0×1 px/],
+            [image(badCrc), /not a valid PNG/],
+            [image(apng), /animated PNGs are not supported/],
+            [image(noIdat), /not a valid PNG/],
+            [image(png(4, 3, false, { depth: 3 })), /not a valid PNG/],
+            [image(critical), /not a valid PNG/],
+            [image(split), /not a valid PNG/],
+            [image(new Uint8Array([...SMALL, 0])), /not a valid PNG/],
         ];
         for (const [part, reason] of cases) {
             expect(imageProblem(part)).toMatch(reason);
@@ -110,6 +127,9 @@ describe('the wire: PNG bytes go intact, everything else is a marked note', () =
             expect(content[1]).toEqual({ type: 'text', text: expect.stringMatching(reason) });
         }
         expect(imageProblem(image())).toBeUndefined();
+        expect(imageProblem(image(ancillary))).toBeUndefined();
+        // A PNG the Gateway would refuse is never picked from history, so it cannot fail later turns.
+        expect(sendableImages([msg('user', image(badCrc)), msg('assistant', txt('?')), msg('user', txt('next'))], true).size).toBe(0);
     });
 
     test('the input bound counts an image as the Gateway does, and the code host cap still applies', () => {
@@ -123,6 +143,23 @@ describe('the wire: PNG bytes go intact, everything else is a marked note', () =
             expect(error).toBeInstanceOf(LocalRequestError);
             expect((error as LocalRequestError).counts.limitBytes).toBe(AI_PROXY_MAX_BODY_BYTES);
         }
+    });
+
+    test('over the code host cap, earlier images become notes before any text is folded; the current image stays intact', () => {
+        const earlier = png(150, 150, true), now = png(151, 150, true); // about 90 KB of base64 each: 180 KB together
+        const built = buildGatewayBody(vision(), ask([msg('user', txt('first'), image(earlier)), msg('assistant', txt('A chart.')), msg('user', txt('and this'), image(now))]));
+        const blocks = built.body.messages.flatMap(m => m.content);
+        expect(blocks.filter(b => b.type === 'image').map(decoded)).toEqual([now]);
+        expect(blocks).toContainEqual({ type: 'text', text: "[image omitted: earlier images are left out to fit EZiL AI's request size limit]" });
+        expect(blocks).toContainEqual({ type: 'text', text: 'first' });
+        expect(built.bytes.byteLength).toBeLessThanOrEqual(AI_PROXY_MAX_BODY_BYTES);
+    });
+
+    test('on a Responses model an earlier message\'s image is a note; the current one still refuses', () => {
+        const responses = { ...gw('synthetic-responses'), gatewayProtocol: 'openai-responses' as const };
+        const built = buildGatewayResponsesBody(responses, ask([msg('user', txt('look'), image()), msg('assistant', txt('A chart.')), msg('user', txt('thanks'))]));
+        expect(built.body.input[0]).toEqual({ type: 'message', role: 'user', content: 'look[image omitted: not supported by this model]' });
+        expect(() => buildGatewayResponsesBody(responses, ask([msg('user', txt('look'), image())]))).toThrow('text and function tools only');
     });
 
     test('token counts use the Gateway visual-token ceiling, not base64 length', () => {
@@ -178,23 +215,28 @@ const catalog = (imageInput: boolean | undefined) => ({ object: 'list', contract
     { id: SONNET, enabled: true, max_input_tokens: 200_000, max_output_tokens: 16_000, protocols: ['anthropic-messages'], availability: { state: 'available', reasons: [] },
         capabilities: { tool_calling: true, streaming: true, ...imageInput === undefined ? {} : { image_input: imageInput } } }] });
 
-function harness(resolved: ResolvedConfig, imageInput: boolean | undefined) {
+function harness(resolved: ResolvedConfig, imageInput: boolean | undefined, options: { catalogDown?: boolean; answer?: () => Response } = {}) {
     const posts: Record<string, unknown>[] = [];
     const logs: string[] = [];
+    const gets: number[] = [];
     const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
-        if (String(input).endsWith('/models')) return Response.json(catalog(imageInput));
+        if (String(input).endsWith('/models')) { gets.push(1); return options.catalogDown ? new Response('unavailable', { status: 503 }) : Response.json(catalog(imageInput)); }
         posts.push(JSON.parse(new TextDecoder().decode(init.body as Uint8Array)));
-        return new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
+        return options.answer?.() ?? new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
     }) as typeof globalThis.fetch;
     const host = { models: () => resolved.models, configError: () => undefined, secrets: () => resolved.secrets, logRequests: () => true,
         log: (line: string) => { logs.push(line); }, recordUsage: () => {}, fetch };
-    return { provider: new EZiLModelsProvider(host), posts, logs };
+    return { provider: new EZiLModelsProvider(host), posts, logs, gets };
 }
 const token = () => ({ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
 const user = (...content: unknown[]) => ({ role: 1, content });
 type Provider = InstanceType<typeof EZiLModelsProvider>;
-const send = (provider: Provider, id: string, messages: unknown[], modelOptions = {}) =>
-    provider.provideLanguageModelChatResponse({ id } as never, messages as never, { tools: [], modelOptions } as never, { report: () => {} }, token() as never);
+const send = (provider: Provider, id: string, messages: unknown[], modelOptions = {}, tools: unknown[] = []) =>
+    provider.provideLanguageModelChatResponse({ id } as never, messages as never, { tools, modelOptions } as never, { report: () => {} }, token() as never);
+const failure = (promise: Promise<unknown>) => promise.then(() => undefined, (error: Error) => error.message);
+// Agent mode's size: 38 tools, about 54 KB of definitions.
+const AGENT_TOOLS = Array.from({ length: 38 }, (_, i) => ({ name: `tool_${i}`, description: 'd'.repeat(1200),
+    inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'p'.repeat(150) } } } }));
 const infos = (provider: Provider) => provider.provideLanguageModelChatInformation({} as never, token() as never);
 
 beforeEach(() => forgetGatewayModels());
@@ -228,6 +270,8 @@ describe('provider: the user\'s image goes intact or the turn fails before sendi
         const refused = async (...content: unknown[]) => (await send(h.provider, SONNET, [user(...content)]).then(() => undefined, (e: Error) => e))?.message;
         expect(await refused(new TextPart('x'), new VsDataPart(SMALL, 'image/jpeg'))).toMatch(/Image 1 cannot be sent: image\/jpeg images are not supported; only PNG is/);
         expect(await refused(new TextPart('x'), new VsDataPart(SMALL.subarray(0, 40), 'image/png'))).toMatch(/not a valid PNG/);
+        // A trailing whitespace-only user message is not the current request (as compaction's `typed`): the image still is.
+        expect(await failure(send(h.provider, SONNET, [user(new TextPart('x'), new VsDataPart(SMALL, 'image/jpeg')), user(new TextPart('  '))]))).toMatch(/image\/jpeg/);
         expect(await refused(...Array.from({ length: 5 }, () => new VsDataPart(SMALL, 'image/png')))).toMatch(/5 images; EZiL AI accepts at most 4/);
         expect(await refused(new VsDataPart(png(240, 240, true), 'image/png'))).toMatch(/too large to send: .*over the 163840-byte request limit/);
         expect(h.posts).toHaveLength(0);
@@ -251,6 +295,42 @@ describe('provider: the user\'s image goes intact or the turn fails before sendi
         await send(h.provider, SONNET, [user(new TextPart('run it')), { role: 2, content: [] }, user(new ToolResultPart('c1', [new TextPart('out'), new VsDataPart(SMALL, 'image/png')]))]);
         expect(h.posts).toHaveLength(1);
         expect(JSON.stringify(h.posts[0])).not.toContain('"type":"image"');
+    });
+
+    test('in an agent loop the user\'s image stays the current request and goes intact on every step', async () => {
+        const h = harness(config(true), true);
+        const shot = png(32, 32, true);
+        const step = [user(new TextPart('fix the layout'), new VsDataPart(shot, 'image/png')), { role: 2, content: [new ToolCallPart('c1', 'read_file', {})] },
+            user(new ToolResultPart('c1', [new TextPart('file text')]))];
+        await send(h.provider, SONNET, step, {}, [{ name: 'read_file', inputSchema: { type: 'object', properties: {} } }]);
+        const content = (h.posts[0]!.messages as { content: { type: string }[] }[])[0]!.content;
+        expect(decoded(content.find(block => block.type === 'image'))).toEqual(shot);
+    });
+
+    test('with Agent mode\'s tools, an image over the code host cap is refused as an image problem, nothing sent', async () => {
+        const h = harness(config(true), true);
+        const message = await failure(send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(png(175, 175, true), 'image/png'))], {}, AGENT_TOOLS));
+        expect(message).toMatch(/This request with its images is too large to send.*over EZiL AI's 163,840-byte request limit.*Attach a smaller PNG/);
+        expect(h.posts).toHaveLength(0);
+        // A small screenshot with the same tools still goes.
+        await send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(png(40, 40, true), 'image/png'))], {}, AGENT_TOOLS);
+        expect(h.posts).toHaveLength(1);
+    });
+
+    test('a Gateway refusal of the image (its flag went off) forgets the catalog, so the next turn re-reads it', async () => {
+        const h = harness(config(true), true, { answer: () => Response.json({ type: 'error', error: { type: 'invalid_request_error', code: 'unsupported_parameter',
+            message: 'Image input is not enabled for this gateway.' } }, { status: 400 }) });
+        expect(await failure(send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(SMALL, 'image/png'))]))).toBeDefined();
+        const reads = h.gets.length;
+        await failure(send(h.provider, SONNET, [user(new TextPart('again'))]));
+        expect(h.gets.length).toBe(reads + 1);
+    });
+
+    test('while the model list cannot be read, an opted-in model says so instead of "does not accept images"', async () => {
+        const h = harness(config(true), true, { catalogDown: true });
+        expect(await failure(send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(SMALL, 'image/png'))])))
+            .toMatch(/Could not load the model list, so whether Claude Sonnet 5\.5 accepts images cannot be checked right now/);
+        expect(h.posts).toHaveLength(0);
     });
 
     test('imageRefusal ignores requests without images', () => {

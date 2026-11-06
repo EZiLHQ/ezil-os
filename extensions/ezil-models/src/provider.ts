@@ -117,10 +117,12 @@ export function requestForLog(body: Record<string, unknown>, secrets: readonly s
  * Why the images the user attached to the current request cannot go to this Gateway model as they are, or undefined.
  * Earlier messages' images never refuse a turn: they go as marked notes when they cannot be sent (gateway-messages.ts).
  */
-export function imageRefusal(request: ChatRequest, model: ResolvedModel): string | undefined {
+export function imageRefusal(request: ChatRequest, model: ResolvedModel, unchecked = false): string | undefined {
     const current = request.messages[currentUserIndex(request.messages)];
     const images = current?.parts.filter(isImagePart) ?? [];
     if (!images.length) return undefined;
+    // `unchecked`: the config opts this model in, but the model list could not be read to confirm it now.
+    if (unchecked) return `Could not load the model list, so whether ${model.name} accepts images cannot be checked right now. Try again.`;
     if (!model.capabilities.imageInput) return `${model.name} does not accept images through EZiL AI right now. Remove the image or pick a model that accepts images.`;
     if (images.length > MAX_REQUEST_IMAGES) return `This message has ${images.length} images; EZiL AI accepts at most ${MAX_REQUEST_IMAGES}.`;
     for (const [index, image] of images.entries()) {
@@ -298,6 +300,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 if (!gatewayModelAvailable(resolved, catalog)) {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
+                const optedIn = resolved.capabilities.imageInput;
                 resolved = withGatewayModelLimits(resolved, catalog);
                 // Never send tools to a model without tool calling: leave them out, as Copilot 0.69 does for its own
                 // endpoints without tool calls (interceptBody), and earlier tool calls go as text. A picker entry from
@@ -308,7 +311,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
                 // The user's own image goes intact or the turn fails here, before anything is sent; never a silent note.
                 // Title, summary and progress requests send what they can (their images as notes).
-                const refusal = isUtilityRequest(options.modelOptions ?? {}) ? undefined : imageRefusal(request, resolved);
+                const refusal = isUtilityRequest(options.modelOptions ?? {}) ? undefined : imageRefusal(request, resolved, optedIn && !catalog);
                 if (refusal) {
                     if ((model.capabilities as { imageInput?: unknown } | undefined)?.imageInput && !resolved.capabilities.imageInput) this.refresh();
                     throw new GatewayError(`EZiL AI: ${refusal} Nothing was sent or charged.`, undefined, 'image_input_unsupported', undefined, undefined, 'local');
@@ -376,7 +379,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }).catch(() => {});
             }
             // The picker still shows what the refusal says is gone or changed: list again from a fresh catalog.
-            if (error instanceof GatewayError && CATALOG_REFUSALS.includes(error.code ?? '')) this.refresh();
+            if (error instanceof GatewayError && (CATALOG_REFUSALS.includes(error.code ?? '') || error.code === 'unsupported_parameter')) this.refresh();
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {

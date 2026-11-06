@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { AI_PROXY_MAX_BODY_BYTES, buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, isImagePart, KIMI, LocalRequestError, type GatewayBody, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
@@ -748,7 +748,10 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     retried = true;
                     waitMs = retryDelay(retryAfter, 60, now()) * 1000;
                 } else {
-                    if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '')) forgetGatewayModels(provider.baseUrl);
+                    // An image refused as unsupported means the catalog that allowed it is out of date (the Gateway's flag went off).
+                    const imageRefused = body.code === 'unsupported_parameter' && !responses
+                        && (built.body as GatewayBody).messages.some(message => message.content.some(block => block.type === 'image'));
+                    if (CATALOG_REFUSALS.includes(body.code ?? '') || ['max_output_tokens_invalid', 'input_too_large'].includes(body.code ?? '') || imageRefused) forgetGatewayModels(provider.baseUrl);
                     const refusal = describeGatewayError(model.model, status, retryAfter, body, requestId ?? null, undefined, now());
                     // A 413 size refusal by EZiL AI or EZiL OS answers before any model runs (the Gateway checks the body
                     // against the model's input allowance before reserving; the proxy before forwarding), so nothing was
@@ -849,7 +852,11 @@ function localRefusal(model: ResolvedModel, error: LocalRequestError): GatewayEr
     const c = error.counts;
     const compacted = error.afterCompaction ? ', even with the earlier conversation compacted' : '';
     const kept = 'Nothing was sent or charged, and the conversation is kept.';
-    const text = error.code === 'local_input_too_large'
+    // Only a request with images can be over the code host's raw cap and not the input bound (gateway-messages.ts).
+    const text = error.code === 'local_input_too_large' && c.limitBytes === AI_PROXY_MAX_BODY_BYTES
+        ? `This request with its images is too large to send${compacted}: ${bytes(c.bodyBytes)} bytes, over EZiL AI's ${bytes(c.limitBytes)}-byte `
+            + `request limit (images go as base64, about 4 bytes for every 3). ${kept} Attach a smaller PNG, about 100 KB or less, or start a new chat.`
+        : error.code === 'local_input_too_large'
         ? `This request is too large for ${model.name}${compacted}: ${bytes(c.bodyBytes)} bytes (${bytes(c.toolBytes)} of them tool definitions), `
             + `over the ${bytes(c.limitBytes)}-byte limit. ${kept} ${SHORTEN}.`
         : error.code === 'local_too_many_messages'

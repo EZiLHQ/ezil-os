@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError } from './gateway-messages';
+import { currentUserIndex, escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isImagePart, isObject, LocalRequestError } from './gateway-messages';
 import { GatewayResponseError } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -60,7 +60,10 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     const input: Input[] = [];
     const calls = new Set<string>();
     const pending = new Set<string>();
-    for (const message of request.messages) {
+    // An earlier message's attached image is a marked note, as on Messages; the current message's still refuses (the
+    // provider refuses it first, with its reason).
+    const current = currentUserIndex(request.messages);
+    for (const [index, message] of request.messages.entries()) {
         let content = '';
         const flush = () => { if (content) input.push({ type: 'message', role: message.role, content }); content = ''; };
         for (const part of message.parts) {
@@ -82,7 +85,8 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
                 const output = part.content.map(textPart).join('\n') || '(no output)';
                 if (pending.delete(id)) input.push({ type: 'function_call_output', call_id: id, output });
                 else input.push({ type: 'message', role: 'user', content: `[Earlier tool output]\n${output}` });
-            } else content += textPart(part);
+            } else if (message.role === 'user' && index !== current && isImagePart(part)) content += '[image omitted: not supported by this model]';
+            else content += textPart(part);
         }
         flush();
     }
