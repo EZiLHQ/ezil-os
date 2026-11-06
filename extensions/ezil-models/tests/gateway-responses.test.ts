@@ -94,6 +94,13 @@ describe('Responses request subset', () => {
         expect(input.at(-1)).toEqual({ type: 'function_call_output', call_id: 'call_1', output: 'Result:\nline one\nline two' });
     });
 
+    test('text data decodes UTF-8 and reads only its own view, never the backing buffer', () => {
+        const backing = new TextEncoder().encode('LEAK|héllo 🌍 日本語|LEAK');
+        const view = backing.subarray(5, backing.byteLength - 5);
+        const data = { ...image, mimeType: 'text/plain; charset=utf-8', data: view };
+        expect(build(ask([msg('user', data)])).body.input).toEqual([{ type: 'message', role: 'user', content: 'héllo 🌍 日本語' }]);
+    });
+
     for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'application/json']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
         const data = { ...image, mimeType };
         expect(() => build(ask([msg('user', txt('Inspect this'), data)]))).toThrow('text and function tools only');
