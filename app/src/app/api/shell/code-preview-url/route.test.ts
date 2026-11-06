@@ -53,3 +53,22 @@ describe('POST /api/shell/code-preview-url hands the body to codePreviewUrl as g
         expect(state.seen).toEqual([]);
     });
 });
+
+describe('per-tab folder continuity: the own-files `codeFolder` hint', () => {
+    it('is forwarded verbatim (the procedure checks it) and its answer code passes back', async () => {
+        state.answer = { ok: true, codePreviewUrl: 'https://x/preview-bootstrap?token=t', codeFolder: { v: 1, outcome: 'missing' } };
+        const res = await post({ computerId, intent: 'open', codeFolder: { v: 1, path: '/workspace/sports/sports-web' } });
+        expect(await res.json()).toEqual(state.answer);
+        // Even a malformed hint is the procedure's to answer `invalid`, never this route's 400.
+        await post({ computerId, intent: 'open', codeFolder: { v: 9, path: '../etc', extra: true } });
+        expect(state.seen).toStrictEqual([
+            { computerId, intent: 'open', codeFolder: { v: 1, path: '/workspace/sports/sports-web' } },
+            { computerId, intent: 'open', codeFolder: { v: 9, path: '../etc', extra: true } },
+        ]);
+    });
+    it('a body without it is today\'s input exactly (no `codeFolder` key at all)', async () => {
+        await post({ computerId, intent: 'open' });
+        expect(state.seen).toStrictEqual([{ computerId, intent: 'open' }]);
+        expect(Object.keys(state.seen[0] as object)).not.toContain('codeFolder');
+    });
+});
