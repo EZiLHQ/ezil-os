@@ -86,7 +86,15 @@ describe('Responses request subset', () => {
         expect(buildGatewayResponsesBody({ ...model(), stream: false }, ask()).body.stream).toBe(false);
     });
 
-    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'text/plain']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
+    for (const mimeType of ['text/plain', 'text/markdown']) test(`inlines ${mimeType} data in messages and nested tool results, as on Messages`, () => {
+        const data = { ...image, mimeType, data: new TextEncoder().encode('line one\nline two') };
+        expect(build(ask([msg('user', txt('Inspect this '), data)])).body.input).toEqual([
+            { type: 'message', role: 'user', content: 'Inspect this line one\nline two' }]);
+        const input = build(ask([msg('assistant', call('call_1')), msg('user', result('call_1', [txt('Result:'), data]))])).body.input;
+        expect(input.at(-1)).toEqual({ type: 'function_call_output', call_id: 'call_1', output: 'Result:\nline one\nline two' });
+    });
+
+    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'application/json']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
         const data = { ...image, mimeType };
         expect(() => build(ask([msg('user', txt('Inspect this'), data)]))).toThrow('text and function tools only');
         expect(() => build(ask([msg('assistant', call('call_1')), msg('user', result('call_1', [txt('Result:'), data]))]))).toThrow('text and function tools only');

@@ -38,6 +38,8 @@ function identifier(value: unknown, max = 256): string {
 function textPart(part: Part): string {
     if (part.type === 'text' && typeof part.value === 'string') return part.value;
     if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part)) return '';
+    // Text data (an attached or tool-returned text/* file) is text, inlined as on Messages (gateway-messages.ts partText).
+    if (part.type === 'data' && part.mimeType.startsWith('text/')) return Buffer.from(part.data).toString('utf8');
     // Even tool results must be text. Do not silently send an image/file/audio as a successful result.
     throw new Error('Responses supports text and function tools only; images, files and audio are not supported');
 }
