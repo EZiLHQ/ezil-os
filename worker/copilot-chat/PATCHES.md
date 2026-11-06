@@ -288,6 +288,39 @@ throwing entitlement accessors, and rejects restored quota text or anchor drift.
 Without a local pinned bundle it explicitly skips; release validation must supply
 `COPILOT_TEST_ROOT`.
 
+## Part 4 — Agent tool selection
+
+Configure Tools (Agent mode) stores the user's choice as a map of tool and
+tool-set id → enabled (storage key `chat/selectedTools`, version 2), and every
+id missing from that map counts as enabled. Copilot creates its `edit`,
+`search` and `web` tool sets when it activates, which happens at the first chat
+request. A user who opened Configure Tools before that and switched every row
+off therefore got those sets and their members back on. Copilot's Agent tool
+function then turns some tools on that the request does not list. Measured on
+image 33 with an offline mock gateway: 14 tools and `tool_choice: auto` after
+"all off". 11 came from members of the late sets, and 3 were forced by Copilot
+(`insert_edit_into_file`, `replace_string_in_file`, `session_store_sql`).
+
+| id | file / source | anchor | replacement | count | why |
+|---|---|---|---|---|---|
+| `tools-absent` | workbench.js `ChatSelectedTools.entriesMap` (`vs/workbench/contrib/chat/browser/widget/input/chatSelectedTools.ts`) | `r\|\|(r=this._globalState.read(e));for(…)a.canBeReferencedInPrompt&&t.set(a,r.tools.get(a.id)!==!1);for(…){if(a.hiddenInToolsPicker)continue;let c=r.toolSets.get(a.id)!==!1;` (exact text: `A_TOOLS_ABSENT`) | Computes `ezilAbsent` once: it is false only when the selection in effect (session, custom agent or global) has at least one entry and every entry is off, and the selection is not in the pre-version-2 format. A tool or set whose id is missing from the map then gets `ezilAbsent` instead of `true` (`(get(id)??ezilAbsent)!==!1`). | 1 | After an explicit all-off, tools and sets registered later stay off. In every other state upstream's "missing means on" stays: never configured (empty map), all on, any partial choice, and old storage. A new MCP server or extension still appears enabled for those users. A set's members still follow the set unless they are explicitly on. Explicit values are never changed. Persistent computers that already stored an all-off selection with image 33 are covered on the next load, with no migration. |
+| `tools-legacy` | workbench.js, the same file's storage codec `fromStorage`, pre-version-2 branch | `if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l)}}` | same with `,ezilLegacy:!0` in the returned object | 1 | The old format lists only disabled ids, so it is always all-false. Without this flag, `tools-absent` would read any old partial choice as all-off. The flag is only read by `tools-absent`. The next save writes version 2 without it (`toStorage` writes only the two maps). |
+| `tools-forced` | extension.js Agent tool function `Ret` (`extension/intents/node/agentIntent.ts` `getAgentTools`) | `let h=r.getEnabledTools(e,n,y=>{if(typeof m[y.name]=="boolean")return m[y.name]});` | `let ezilNone=$a.some(e.tools,()=>!0)&&!$a.some(e.tools,([,y])=>y!==!1),h=r.getEnabledTools(e,n,y=>{if(!ezilNone&&typeof m[y.name]=="boolean")return m[y.name]});` | 1 | `getEnabledTools` honours an explicit off first, then this override, then prompt references, then an explicit on. The override turns on edit tools, `session_store_sql`, tool search, tests and tasks, and subagents for ids the request map does not list. When that map lists tools and all are off, the override is skipped. A missing id is then sent only if the prompt references a tool that enables it (`enable_other_tool_*`, upstream). Partial and empty maps keep upstream forcing, including the `copilot_editFiles`-off rule that drops the edit tools. Autopilot adds `task_complete` itself in the tool-calling loop, not here. |
+| `tools-names` | workbench.js / extension.js | `P_TOOLS_MEMBERS` (set members follow the set), `P_TOOLS_REQUEST` (the request map is `entriesMap` without sets), `P_TOOLS_PICKER` (Configure Tools saves the full map it showed: `b&&r.input.selectedToolsModel.set(b,!1)`), `P_TOOLS_STORAGE` (the version 2 check); `P_TOOLS_EDITFILES`, `P_TOOLS_ENABLED` (getEnabledTools' order, above) | Checked, never patched | 1 each | These are the meanings the three patches rely on. |
+
+The all-off inference relies on Configure Tools saving every row it showed
+(`P_TOOLS_PICKER`), so an all-false map means every visible row was off. With
+no tools, EZiL's provider omits `tools` and `tool_choice` from the gateway body.
+
+Offline test (patches a copy, runs `--verify`, then runs the bundle's own
+storage codec, `entriesMap`, `Ret` and `getEnabledTools` against stubs on both
+the pristine and the patched bundle. The cases marked as defects must fail on
+pristine. It also rejects a moved anchor):
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/tool-selection-patch.test.cjs
+```
+
 ## Re-deriving the 4.141.0 anchors
 
 The three moved anchors are `token` (`yGe.env.devDeviceId`), `accounts-menu`
