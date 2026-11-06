@@ -8,6 +8,7 @@ import { describe, expect, it } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
 import {
   AWS_EDGE_PORTS,
+  awsBrowserUrl,
   AWS_GATEWAY_HEADER,
   awsOriginHostname,
   awsRoutingEnabled,
@@ -208,6 +209,24 @@ describe('handleAwsBrowserHost', () => {
     const wrong = await mintPreviewBootstrapToken(SECRET, 'guac-other-sandbox');
     expect((await call(`/preview-bootstrap?token=${encodeURIComponent(wrong)}`, d))!.status).toBe(401);
   });
+  it('bootstrap: a path whose dot segments normalise to `//host` is invalid_redirect, never a Location', async () => {
+    const { d } = deps();
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const boot = (path: string) => call(`/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`, d);
+    for (const path of ['/.//evil.com', '/..//evil.com', '/%2e//evil.com', '/%2E//evil.com', '/.%2e//evil.com', '/a/..//evil.com',
+      '/\\evil.com', '/\t//evil.com', '/\\[']) {
+      const res = (await boot(path))!;
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ ok: false, error: 'invalid_redirect' });
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('set-cookie')).toBeNull();
+    }
+    // A raw `//host` still falls back to the root, and a plain path is forwarded unchanged.
+    expect((await boot('//evil.com/x'))!.headers.get('location')).toBe('/');
+    const ok = (await boot('/app?x=1'))!;
+    expect(ok.status).toBe(302);
+    expect(ok.headers.get('location')).toBe('/app?x=1');
+  });
   it('no or wrong-sandbox cookie: 401 and nothing forwarded', async () => {
     const { f, d } = deps();
     expect((await call('/', d))!.status).toBe(401);
@@ -323,6 +342,155 @@ describe('handleAwsPreview', () => {
   });
   it('no secret: 401', async () => {
     expect((await handleAwsPreview(claims(), deps({ secrets: [] }))).status).toBe(401);
+  });
+
+  // ── Per-tab folder continuity (./code-folder.ts): Code only, a code never a path ──
+  const codeDeps = (over: Partial<Parameters<typeof handleAwsPreview>[1]> = {}) => deps({
+    surface: 'code', ensureConfig: async () => ({ state: 'applied' }) as never, codeAnswers: async () => true, ...over,
+  });
+  const answer = async (res: Response) => (await res.json()) as Record<string, unknown> & { codePreviewUrl: string };
+  const folderOf = (u: string) => new URL(u).searchParams.get('folder');
+
+  // Code always names its folder, as on Cloudflare: without one, code-server reopens its own last-visited folder
+  // (it runs without --ignore-last-opened), even /root or a repository opened by hand (user report 2026-11-05).
+  it('no ask: Code opens the workspace root explicitly, and no codeFolder field', async () => {
+    const body = await answer(await handleAwsPreview(claims(), codeDeps()));
+    expect(body.codeFolder).toBeUndefined();
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    expect(folderOf(body.appPreviewUrl as string)).toBeNull();
+    expect(folderOf(body.guacamoleUrl as string)).toBeNull();
+    expect(new URL(body.codePreviewUrl).searchParams.get('path')).toBe('/');
+  });
+
+  it('an ask with no host walk wired (old host agent / before e1): `unverified`, and the workspace root opens', async () => {
+    for (const path of ['/workspace/sports/sports-web', '/workspace']) {
+      const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path } })));
+      expect(body.codeFolder).toEqual({ v: 1, outcome: 'unverified' });
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    }
+  });
+
+  it('a walked folder becomes folder= on Code only; the walk gets the remainder below /workspace', async () => {
+    const walked: string[] = [];
+    const body = await answer(await handleAwsPreview(claims(), codeDeps({
+      codeFolder: { v: 1, path: '/workspace/My Project/日本 ü' },
+      resolveFolder: async (rec, rel) => { expect(rec.sandboxId).toBe(SID); walked.push(rel); return 'restored'; },
+    })));
+    expect(walked).toEqual(['My Project/日本 ü']);
+    expect(body.codeFolder).toEqual({ v: 1, outcome: 'restored' });
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace/My Project/日本 ü');
+    expect(folderOf(body.appPreviewUrl as string)).toBeNull();
+    expect(folderOf(body.guacamoleUrl as string)).toBeNull();
+    expect(JSON.stringify(body.codeFolder)).not.toContain('Project');
+  });
+
+  it('refusals never reach the host: outside, not_allowed, invalid', async () => {
+    let walks = 0;
+    const resolveFolder = async () => { walks += 1; return 'restored' as const; };
+    for (const [path, outcome] of [['/etc', 'outside'], ['/home/neko/project', 'outside'], ['/workspace/.ezil/x', 'not_allowed'],
+      ['/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b/repository', 'not_allowed'], ['/workspace/../etc', 'invalid']] as const) {
+      const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path }, resolveFolder })));
+      expect({ path, got: body.codeFolder }).toEqual({ path, got: { v: 1, outcome } });
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace'); // never the refused path, never a folder-less URL
+    }
+    expect(walks).toBe(0);
+  });
+
+  it('a host answer other than restored opens the default with its code; a throw is `error`', async () => {
+    for (const outcome of ['missing', 'not_directory', 'symlink', 'unverified'] as const) {
+      const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => outcome })));
+      expect(body.codeFolder).toEqual({ v: 1, outcome });
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    }
+    const thrown = await answer(await handleAwsPreview(claims(), codeDeps({
+      codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => { throw new Error('host down'); },
+    })));
+    expect(thrown.codeFolder).toEqual({ v: 1, outcome: 'error' });
+    expect(folderOf(thrown.codePreviewUrl)).toBe('/workspace');
+  });
+
+  it('a restore whose bootstrap URL would pass 2000 characters is `too_long` and opens the default', async () => {
+    const deep = `/workspace/${Array.from({ length: 12 }, () => '日本語のフォルダ名'.repeat(3)).join('/')}`;
+    const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: deep }, resolveFolder: async () => 'restored' })));
+    expect(body.codeFolder).toEqual({ v: 1, outcome: 'too_long' });
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace');
+    expect(body.codePreviewUrl.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('the desktop and app surfaces never ask, walk or answer a folder', async () => {
+    let walks = 0;
+    for (const surface of [undefined, 'app'] as const) {
+      const body = await answer(await handleAwsPreview(claims(), deps({
+        surface, ensureConfig: async () => ({ state: 'applied' }) as never,
+        codeFolder: { v: 1, path: '/workspace/a' }, resolveFolder: async () => { walks += 1; return 'restored'; },
+      })));
+      expect(body.codeFolder).toBeUndefined();
+      expect(folderOf(body.codePreviewUrl)).toBe('/workspace'); // its Code URL still names the workspace root
+    }
+    expect(walks).toBe(0);
+  });
+});
+
+describe('AWS Code bootstrap: folder and ezil_mint (per-tab folder continuity)', () => {
+  const at = (port: number) => `aws-${port}-${SID}-aws.${ROOT}`;
+  const d = { routingEnabled: true, zone: ZONE, secrets: [SECRET], zoneRoot: ROOT, lookup: async () => record(), fetch: captureFetch().fetch, nowMs: Date.now };
+  const boot = async (port: number, query: string) => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const u = `https://${at(port)}/preview-bootstrap?token=${encodeURIComponent(token)}${query}`;
+    return (await handleAwsBrowserHost(new Request(u), new URL(u), d))!;
+  };
+
+  it('the minted URL round-trips: folder (spaces, Unicode) and ezil_mint reach code-server\'s first request', async () => {
+    const minted = new URL(awsBrowserUrl(8443, SID, ROOT, 'TOKEN', '/', '/workspace/My Project/日本 ü'));
+    expect(minted.searchParams.get('folder')).toBe('/workspace/My Project/日本 ü');
+    const res = await boot(8443, `&path=%2F&folder=${encodeURIComponent('/workspace/My Project/日本 ü')}&ezil_mint=abcdefghijklmnopqrstu_`);
+    expect(res.status).toBe(302);
+    const loc = new URL(res.headers.get('location')!, 'https://x');
+    expect(loc.pathname).toBe('/');
+    expect(loc.searchParams.get('folder')).toBe('/workspace/My Project/日本 ü');
+    expect(loc.searchParams.get('ezil_mint')).toBe('abcdefghijklmnopqrstu_');
+  });
+
+  it('the default folder, the workspace root itself, reaches code-server as an explicit folder', async () => {
+    const res = await boot(8443, `&path=%2F&folder=${encodeURIComponent('/workspace')}`);
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get('location')!, 'https://x').searchParams.get('folder')).toBe('/workspace');
+  });
+
+  it('awsBrowserUrl sets folder on Code only', () => {
+    expect(new URL(awsBrowserUrl(3002, SID, ROOT, 'T', '/', '/workspace/a')).searchParams.has('folder')).toBe(false);
+    expect(new URL(awsBrowserUrl(8181, SID, ROOT, 'T', '/', '/workspace/a')).searchParams.has('folder')).toBe(false);
+    expect(new URL(awsBrowserUrl(8443, SID, ROOT, 'T')).searchParams.has('folder')).toBe(false);
+  });
+
+  it('the critic\'s injection: an open key inside `path` is 400 invalid_folder on Code, with no cookie', async () => {
+    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
+      const res = await boot(8443, `&path=${encodeURIComponent(hidden)}`);
+      expect({ hidden, status: res.status }).toEqual({ hidden, status: 400 });
+      expect(await res.json()).toEqual({ ok: false, error: 'invalid_folder' });
+      expect(res.headers.get('set-cookie')).toBeNull();
+    }
+  });
+
+  it('a folder that is not plain-absolute under /workspace is 400 invalid_folder', async () => {
+    for (const bad of ['/etc', '/workspacefoo', '/workspace/../etc', 'workspace/a', '/workspace//a', '/home/neko/project']) {
+      const res = await boot(8443, `&folder=${encodeURIComponent(bad)}`);
+      expect({ bad, status: res.status }).toEqual({ bad, status: 400 });
+    }
+  });
+
+  it('a malformed ezil_mint is dropped, never an error', async () => {
+    const res = await boot(8443, '&ezil_mint=short');
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/');
+  });
+
+  it('desktop and app ports are unchanged: their path query is theirs, folder and ezil_mint are ignored', async () => {
+    const app = await boot(3002, `&path=${encodeURIComponent('/files?folder=a')}&folder=%2Fetc&ezil_mint=abcdefghijklmnopqrstu_`);
+    expect(app.status).toBe(302);
+    expect(app.headers.get('location')).toBe('/files?folder=a');
+    const desk = await boot(8181, '&path=%2Fdesk%3Fx%3D1&folder=%2Fetc');
+    expect(desk.headers.get('location')).toBe('/desk?x=1');
   });
 });
 

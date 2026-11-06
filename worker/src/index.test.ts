@@ -1163,15 +1163,35 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
 
   it('mints a bootstrap token and builds appPreviewUrl/codePreviewUrl from the exposed bridge URL', () => {
     expect(src).toContain('const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);');
+    // Per-tab folder continuity: a walked folder (`settleCodeFolder` -> `restored`) wins over the default, and a
+    // restore whose URL would pass the frame-confirm cap falls back to the default (`too_long`).
     expect(src).toContain(
-      'const codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));',
+      'let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));',
     );
+    expect(src).toContain(
+      'const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,\n'
+      + '      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));',
+    );
+    expect(src).toContain(
+      'const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : CODE_FOLDER_UNMOUNTED_ROOT;',
+    );
+    expect(src).toContain("codeFolder.outcome = 'too_long';");
+    expect(src).toContain('codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));');
     expect(src).toContain("bridgeUrl.pathname = '/preview-bootstrap';");
     expect(src).toContain("bridgeUrl.searchParams.set('token', bootstrapToken);");
   });
 
   it('includes both URLs (never omitted, null when not available) in the JSON response', () => {
     expect(src).toContain('appPreviewExpose,\n      codePreviewExpose,\n      appPreviewUrl,\n      codePreviewUrl,');
+  });
+
+  it('answers the per-tab folder outcome as a code only, and forwards the AWS hint unchanged', () => {
+    expect(src).toContain('...codeFolderAnswer(codeFolder.outcome),');
+    expect(src).toContain('codeFolder: body.codeFolder,');
+    // The walk is e1cd418a's (code-folder-resolve.ts): one exec, the whole resolve bounded; it answers a code, never a path.
+    expect(src).toContain("import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';");
+    // AWS: the host edge's folder op, signed for the record's own origin; with no zone nothing is wired (`unverified`).
+    expect(src).toContain('...(zone ? { resolveFolder: awsCodeFolderResolver(zone, awsFetch, Date.now) } : {}),');
   });
 
   it('a mint failure is caught and degrades to null rather than failing the whole /sandbox/preview response', () => {
@@ -1215,6 +1235,17 @@ describe('codePreviewFolderParams', () => {
   it('omits folder when mounted is true but mountPath is missing (defensive — should not happen)', async () => {
     const { codePreviewFolderParams } = await import('./index-test-helpers.test');
     expect(codePreviewFolderParams({ mounted: true })).toBeUndefined();
+  });
+
+  it('a restored (walked) folder wins over both defaults; none restored is today\'s value exactly', async () => {
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' }, '/workspace/sports/sports-web')).toEqual({
+      folder: '/workspace/sports/sports-web',
+    });
+    expect(codePreviewFolderParams({ mounted: false }, '/home/neko/project/site')).toEqual({ folder: '/home/neko/project/site' });
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' }, undefined)).toEqual({ folder: '/workspace' });
+    expect(codePreviewFolderParams({ mounted: false }, undefined)).toBeUndefined();
+    expect(codePreviewFolderParams({ mounted: false }, '')).toBeUndefined();
   });
 });
 

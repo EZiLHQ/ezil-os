@@ -1,0 +1,72 @@
+{
+  "contract": "ezil.code-folder.v1",
+  "note": "Per-tab Code folder continuity. ONE table for the shell (shell/ezil/apps/code-folder.js), the app (app/src/server/lib/compute/code-folder.ts), the Worker (worker/src/code-folder.ts) and the host agent's folder op. plainFolderPath: accept -> the normalised value; reject -> null. plan: the server's root + the asked path -> what is walked on the computer (resolve: rel) or the refusal code, before any filesystem access. walk: the no-follow walk's answer for a tree (resolver tests). mint: the per-mint instance id the shell adds as ezil_mint (never authority, never a secret). The tab's record is a HINT; a folder opens only after the server stripped ITS root and the computer walked the remainder with no symlink followed.",
+  "plainFolderPath": {
+    "accept": [
+      ["/workspace", "/workspace"],
+      ["/workspace/", "/workspace"],
+      ["/workspace/sports/sports-web", "/workspace/sports/sports-web"],
+      ["/workspace/My Project", "/workspace/My Project"],
+      ["/workspace/ leading and trailing space ", "/workspace/ leading and trailing space "],
+      ["/workspace/日本語/фото/emoji-😀", "/workspace/日本語/фото/emoji-😀"],
+      ["/workspace/a#b?c&d%2Fe+f", "/workspace/a#b?c&d%2Fe+f"],
+      ["/workspace/projects", "/workspace/projects"],
+      ["/home/neko/project", "/home/neko/project"],
+      ["/", "/"]
+    ],
+    "reject": [
+      "", "workspace", "./workspace", "//workspace", "/workspace//a", "/workspace/./a", "/workspace/..", "/workspace/../etc",
+      "/workspace/a\\b", "/workspace/a\u0000b", "/workspace/a\nb", "/workspace/a\u007fb", "/workspace/\ud800", "/workspace/\udc00x",
+      "SEGMENT_256_BYTES", "PATH_2049_BYTES", "SEGMENTS_65"
+    ],
+    "generated": {
+      "SEGMENT_256_BYTES": "'/workspace/' + 'a'.repeat(256)",
+      "PATH_2049_BYTES": "'/' + ('b'.repeat(200) + '/').repeat(10) + 'c'.repeat(38)",
+      "SEGMENTS_65": "'/' + Array(65).fill('d').join('/')"
+    }
+  },
+  "ask": {
+    "accept": [
+      [{ "v": 1, "path": "/workspace/sports" }, "/workspace/sports"],
+      [{ "path": "/workspace/", "v": 1 }, "/workspace"]
+    ],
+    "reject": [
+      null, "/workspace", [],{ "v": 1 }, { "path": "/workspace" }, { "v": 2, "path": "/workspace" }, { "v": "1", "path": "/workspace" },
+      { "v": 1, "path": "/workspace", "extra": true }, { "v": 1, "path": "workspace" }, { "v": 1, "path": "/workspace/../etc" }
+    ]
+  },
+  "plan": [
+    { "root": "/workspace", "path": "/workspace", "expect": { "resolve": "" } },
+    { "root": "/workspace", "path": "/workspace/sports/sports-web", "expect": { "resolve": "sports/sports-web" } },
+    { "root": "/workspace", "path": "/workspace/My Project/日本", "expect": { "resolve": "My Project/日本" } },
+    { "root": "/workspace", "path": "/workspacefoo", "expect": { "refused": "outside" } },
+    { "root": "/workspace", "path": "/etc", "expect": { "refused": "outside" } },
+    { "root": "/workspace", "path": "/", "expect": { "refused": "outside" } },
+    { "root": "/workspace", "path": "/home/neko/project/x", "expect": { "refused": "outside" } },
+    { "root": "/home/neko/project", "path": "/workspace/x", "expect": { "refused": "outside" } },
+    { "root": "/home/neko/project", "path": "/home/neko/project/site", "expect": { "resolve": "site" } },
+    { "root": "/workspace", "path": "/workspace/.ezil", "expect": { "refused": "not_allowed" } },
+    { "root": "/workspace", "path": "/workspace/.ezil/state", "expect": { "refused": "not_allowed" } },
+    { "root": "/workspace", "path": "/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b", "expect": { "refused": "not_allowed" } },
+    { "root": "/workspace", "path": "/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b/repository/web", "expect": { "refused": "not_allowed" } },
+    { "root": "/workspace", "path": "/workspace/projects/my-site", "expect": { "resolve": "projects/my-site" } },
+    { "root": "/workspace", "path": "/workspace/projects", "expect": { "resolve": "projects" } },
+    { "root": "/workspace", "path": "/workspace/../etc", "expect": { "refused": "invalid" } },
+    { "root": "relative", "path": "/workspace", "expect": { "refused": "invalid" } }
+  ],
+  "walk": [
+    { "tree": "real dir", "rel": "sports/sports-web", "expect": "restored" },
+    { "tree": "missing leaf", "rel": "sports/gone", "expect": "missing" },
+    { "tree": "regular file", "rel": "sports/next.config.ts", "expect": "not_directory" },
+    { "tree": "symlink leaf -> /etc", "rel": "link-out", "expect": "symlink" },
+    { "tree": "symlink leaf -> inside root", "rel": "link-in", "expect": "symlink" },
+    { "tree": "symlink middle component", "rel": "via-link/child", "expect": "symlink" },
+    { "tree": "space + Unicode", "rel": "My Project/日本", "expect": "restored" },
+    { "tree": "root itself", "rel": "", "expect": "restored" }
+  ],
+  "mint": {
+    "accept": ["AAAAAAAAAAAAAAAAAAAAAA", "abcdefghijklmnopqrstu_", "-_0123456789abcdefghij"],
+    "reject": ["", "short", "AAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAA=", "AAAAAAAAAAAAAAAAAAAA+/", "AAAAAAAAAAAAAAAAAAAA A"]
+  },
+  "bootstrapPathRefusedKeys": ["folder", "workspace", "ew", "payload", "ezil_mint"]
+}
