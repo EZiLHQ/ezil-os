@@ -466,6 +466,78 @@ body.device-phone {
     outline-offset: 2px;
 }
 
+/* ── the Code folder notice (per-tab folder continuity, apps/code-folder.js) ──
+ * Said when this tab's folder was not reopened (missing, a link, outside the
+ * workspace, too deep, an editor that could not check yet, a project child).
+ * The same band as `.ezil-display-notice`: pinned to the top of `.window-body`
+ * over the live editor, never `inset: 0`; below the full-view drawer. No inline
+ * `display` anywhere, so `[hidden]` keeps working. Text only (textContent). */
+.ezil-code-folder-notice {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    right: 12px;
+    z-index: 3;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 10px 12px;
+    border: 1px solid rgba(245, 245, 244, 0.16);
+    border-radius: 10px;
+    background-color: rgba(16, 17, 17, 0.94);
+    color: #f5f5f4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.ezil-code-folder-notice[hidden] {
+    display: none;
+}
+
+.ezil-code-window.ezil-fullbleed .ezil-code-folder-notice {
+    top: 55px;
+}
+
+.ezil-code-folder-notice-text {
+    flex: 1 1 260px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.ezil-code-folder-notice-action {
+    appearance: none;
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    border: 1px solid rgba(245, 245, 244, 0.22);
+    border-radius: 6px;
+    color: #f5f5f4;
+    background-color: transparent;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.ezil-code-folder-notice-action:first-of-type {
+    border-color: transparent;
+    color: var(--ezil-accent-contrast);
+    background-color: var(--ezil-accent);
+}
+
+.ezil-code-folder-notice-action:hover {
+    opacity: 0.9;
+}
+
+.ezil-code-folder-notice-action:focus-visible {
+    outline: 2px solid #f5f5f4;
+    outline-offset: 2px;
+}
+
 /* ── the control tray ─────────────────────────────────────────────────────
  * 🔴 `enter_fullpage_mode` hides the taskbar AND the window head, and
  * `style.css:246` hides `.window-minimize-btn` in fullpage mode. The drawer is

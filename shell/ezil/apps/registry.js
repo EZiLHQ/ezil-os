@@ -462,10 +462,10 @@ export function settingsDrawerAction (ctx = {}) {
  * click lives in. That window may have been opened by a ROUTE (the boot's
  * link, Back/Forward), and its routing keys must not ride along: a carried
  * `historyMode: 'replace'` would stop this click from adding its history
- * entry, and Code's `view`/`project` mean nothing to another app.
+ * entry, and Code's `view`/`project`/`folder` mean nothing to another app.
  */
 function gestureContext (ctx = {}) {
-    const { historyMode: _mode, view: _view, project: _project, initialTab: _tab, ...rest } = ctx;
+    const { historyMode: _mode, view: _view, project: _project, initialTab: _tab, folder: _folder, folderRejected: _rejected, ...rest } = ctx;
     return rest;
 }
 
