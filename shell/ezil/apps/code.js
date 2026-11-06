@@ -849,7 +849,18 @@ export async function openCodeWindow (ctx = {}) {
                 if ( ! nativeSurface ) {
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id };
                     folder_notice?.close();
-                    folder_notice = createFolderNotice(el_body, { retry: () => { void start_boot(); }, forget: () => forgetFolder(bind) });
+                    folder_notice = createFolderNotice(el_body, {
+                        retry: () => { void start_boot(); },
+                        forget: () => {
+                            forgetFolder(bind);
+                            // The refused link also lives in this window and its URL. Forget it everywhere,
+                            // then name the folder actually on screen without navigating the live editor.
+                            const displayed = editor_root?.kind === 'folder' && editor_root.path !== wanted_folder
+                                ? editor_root : null;
+                            wanted_folder = displayed?.path ?? null;
+                            announce_root('replace', displayed);
+                        },
+                    });
                     attachFolderBridge({
                         iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
                         onRoot: on_root, onOpen: on_open, onLeaving: on_leaving,
