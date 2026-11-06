@@ -8,8 +8,8 @@
  * patch-folder-bridge.sh on the folder lane, was never merged, so nothing reported a folder until now).
  *
  * What the editor tells the shell (shell/ezil/apps/code-folder.js), and to whom:
- *   - only when framed, only to the OS shell that frames this realm's editors (`codeShellOriginsFor`: staging's
- *     preview zone has the staging shell; production's has none, so no bridge at all), never with a `*` target;
+ *   - only when framed, only to the OS shell that frames this realm's editors (`codeShellOriginsFor`: one exact
+ *     origin per preview zone), never with a `*` target;
  *   - `ezil.code.ready` {v:1} once at load, so the shell says hello;
  *   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, base?} only in answer to a hello whose source is
  *     window.parent, whose origin is allowed and whose nonce is 22 base64url characters. `kind` is `folder` (a path
@@ -41,9 +41,16 @@
  * The EZiL OS shell that frames each realm's editors, keyed by the realm's preview zone: the Worker's existing
  * `SANDBOX_PREVIEW_ZONE_ROOT`, which only ever names production's `ezil.org` (unset) or staging's own `ezil.work`
  * (`resolvePreviewZoneRoot` in `./index.ts`). Compiled in, not configured: the bridge adds no setting of its own.
- * Production has no entry, so its editors get no bridge at all.
+ * Production's editors (`*-code.ezil.org`, `*-aws.ezil.org`) are framed by the production app, whose one public
+ * origin is the release contract's canonical (.github/scripts/release-state.mjs `canonical`; pinned by
+ * code-folder-bridge.test.ts). Its former host and its provider alias are never listed.
  */
-const SHELL_ORIGINS_BY_PREVIEW_ZONE: Readonly<Record<string, string>> = { 'ezil.work': 'https://os-staging.ezil.work' };
+const SHELL_ORIGINS_BY_PREVIEW_ZONE: Readonly<Record<string, string>> = {
+  'ezil.org': 'https://os.ezil.work',
+  'ezil.work': 'https://os-staging.ezil.work',
+};
+/** The zone an unset `SANDBOX_PREVIEW_ZONE_ROOT` means: `resolvePreviewZoneRoot`'s default, production's. */
+const DEFAULT_PREVIEW_ZONE = 'ezil.org';
 /** At most this many origins (staging has one). */
 export const CODE_SHELL_ORIGINS_MAX = 4;
 /** How long the editor waits for the shell's `ezil.code.go` before it switches folder by itself. */
@@ -70,11 +77,11 @@ export function parseShellOrigins(value: string | undefined | null): string[] {
 
 /**
  * The shell origins for this Worker's realm, from its `SANDBOX_PREVIEW_ZONE_ROOT` (read the way
- * `resolvePreviewZoneRoot` reads it). Unset (production) or any zone without a shell: none, so no bridge.
+ * `resolvePreviewZoneRoot` reads it; unset is production's zone). Any zone without a shell: none, so no bridge.
  */
 export function codeShellOriginsFor(previewZoneRoot: string | undefined): string[] {
-  if (typeof previewZoneRoot !== 'string') return [];
-  const zone = previewZoneRoot.trim().toLowerCase();
+  if (previewZoneRoot !== undefined && typeof previewZoneRoot !== 'string') return [];
+  const zone = previewZoneRoot === undefined ? DEFAULT_PREVIEW_ZONE : previewZoneRoot.trim().toLowerCase();
   return Object.hasOwn(SHELL_ORIGINS_BY_PREVIEW_ZONE, zone) ? parseShellOrigins(SHELL_ORIGINS_BY_PREVIEW_ZONE[zone]) : [];
 }
 

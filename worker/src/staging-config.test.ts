@@ -69,11 +69,11 @@ describe('staging Worker resources and routes', () => {
     expect(staging.vars).toMatchObject({ AWS_ORIGIN_ZONE: 'ezil.work', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work' });
   });
 
-  it('injects Code\'s folder bridge on staging only, chosen by the existing preview zone, with no setting of its own', () => {
-    // Staging's own zone selects the staging shell; production leaves the zone unset (ezil.org), so no bridge.
+  it('chooses Code\'s folder bridge origin by the existing preview zone, one exact app per realm, with no setting of its own', () => {
+    // Staging's own zone selects the staging app; production leaves the zone unset (ezil.org): the production app.
     expect(codeShellOriginsFor(staging.vars.SANDBOX_PREVIEW_ZONE_ROOT)).toEqual(['https://os-staging.ezil.work']);
     expect(config.vars.SANDBOX_PREVIEW_ZONE_ROOT).toBeUndefined();
-    expect(codeShellOriginsFor(config.vars.SANDBOX_PREVIEW_ZONE_ROOT)).toEqual([]);
+    expect(codeShellOriginsFor(config.vars.SANDBOX_PREVIEW_ZONE_ROOT)).toEqual(['https://os.ezil.work']);
     expect(readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8')).not.toMatch(/SHELL_ORIGIN/);
   });
 

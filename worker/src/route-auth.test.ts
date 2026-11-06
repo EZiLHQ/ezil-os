@@ -3966,9 +3966,9 @@ describe('Worker JSON error response boundary', () => {
 });
 
 // Code's folder bridge, through worker.fetch(): the realm comes from the Worker's EXISTING preview zone
-// (src/code-folder-bridge.ts codeShellOriginsFor), never from a setting of its own. Production's zone
-// (unset, ezil.org) must serve code-server's workbench exactly as before; staging's (ezil.work) gets the bridge.
-describe('Code folder bridge on the code host: staging only, by the existing preview zone', () => {
+// (src/code-folder-bridge.ts codeShellOriginsFor), never from a setting of its own. Each zone's editors report to
+// exactly their own app: production's (unset, ezil.org) to https://os.ezil.work, staging's (ezil.work) to os-staging.
+describe('Code folder bridge on the code host: each realm reports to its own app, by the existing preview zone', () => {
   const WORKBENCH = '<!DOCTYPE html><html><head><script nonce="0f3c1e9a-8b7d-4c2e-9f10-3a5b6c7d8e9f">performance.mark("x")</script>'
     + '<meta charset="utf-8" /></head><body></body></html>';
   const workbenchAt = async (host: string, zone: Record<string, string>) => {
@@ -3986,9 +3986,11 @@ describe('Code folder bridge on the code host: staging only, by the existing pre
     return res.text();
   };
 
-  it('production (zone unset, ezil.org): the workbench is served without a bridge', async () => {
+  it('production (zone unset, ezil.org): the workbench gets one bridge, reporting to the production app only', async () => {
     const body = await workbenchAt(CODE_HOST, {});
-    expect(body).not.toContain('data-ezil-folder-bridge');
+    expect(body.split('data-ezil-folder-bridge').length - 1).toBe(1);
+    expect(body).toContain(JSON.stringify(['https://os.ezil.work']));
+    for (const other of ['os.ezil.org', 'os-staging.ezil.work', 'vercel.app', '"*"']) expect(body).not.toContain(other);
     expect(body).toContain('performance.mark("x")');
   });
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 import { handleAwsBrowserHost, type AwsTunnelRecord, type FetchLike } from './aws-origin';
@@ -18,6 +19,8 @@ import { handlePreviewProxy, type ContainerFetcher } from './preview-bridge';
 import vectors from './aws-gateway.vectors.json';
 
 const SHELL = 'https://os-staging.ezil.work';
+/** Production's app (.github/scripts/release-state.mjs `canonical`; pinned below). */
+const PROD_SHELL = 'https://os.ezil.work';
 const EDITOR = 'https://8443-guac-u-c-code.ezil.work';
 
 /** The shape of code-server 4.141's workbench.html head: nonce'd inline scripts, a CSP header elsewhere. */
@@ -54,10 +57,53 @@ describe('codeShellOriginsFor (no setting of its own: the existing preview zone 
     expect(codeShellOriginsFor('ezil.work')).toEqual([SHELL]);
     expect(codeShellOriginsFor(' EZIL.WORK ')).toEqual([SHELL]);
   });
-  it('production (unset, or its own ezil.org) and anything else: no origins, so no bridge', () => {
-    for (const zone of [undefined, '', 'ezil.org', 'evil.work', 'os-staging.ezil.work', 'constructor', '__proto__', 'toString']) {
+  it('production (unset, or its own ezil.org) has exactly the production app\'s origin', () => {
+    for (const zone of [undefined, 'ezil.org', ' EZIL.ORG ']) expect(codeShellOriginsFor(zone)).toEqual([PROD_SHELL]);
+  });
+  it('anything else: no origins, so no bridge (never the former host, the provider alias or a shell host as a zone)', () => {
+    for (const zone of ['', 'evil.work', 'os.ezil.org', 'os.ezil.work', 'os-staging.ezil.work', 'ezil-os-preview-ezil1.vercel.app',
+      'ezil.org.evil.example', 'constructor', '__proto__', 'toString']) {
       expect(codeShellOriginsFor(zone)).toEqual([]);
     }
+    expect(codeShellOriginsFor(null as unknown as string)).toEqual([]);
+  });
+  it('production\'s origin IS the release contract\'s canonical public origin, and its editors are on ezil.org', () => {
+    const release = readFileSync(new URL('../../.github/scripts/release-state.mjs', import.meta.url), 'utf8');
+    const canonical = /^export const canonical = '([^']+)';$/m.exec(release)?.[1];
+    expect(canonical).toBe(PROD_SHELL);
+    expect(codeShellOriginsFor(undefined)).toEqual([canonical!]);
+    // The production Worker's code hosts (default env, no zone override) are the zone the table keys on.
+    const wrangler = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+    const top = wrangler.slice(0, wrangler.indexOf('[env.staging]'));
+    for (const route of ['*-code.ezil.org/*', '*-aws.ezil.org/*']) expect(top).toContain(`pattern = "${route}"`);
+    expect(top).not.toMatch(/^SANDBOX_PREVIEW_ZONE_ROOT\s*=/m);
+  });
+});
+
+describe('the bridge script in production (parent https://os.ezil.work, editor on ezil.org)', () => {
+  const prod = () => run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL });
+  it('says ready to the production app only', () => {
+    expect(prod().posted).toEqual([{ m: { type: 'ezil.code.ready', v: 1 }, o: PROD_SHELL }]);
+  });
+  it('round trip: a hello from the production app is answered there with the folder, byte for byte', () => {
+    const b = run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL,
+      search: '?folder=/workspace/my%20site/%E6%97%A5&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA', pathname: '/' });
+    b.posted.length = 0;
+    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
+    expect(b.posted).toEqual([{ m: { type: 'ezil.code.folder', v: 1, nonce: NONCE, mint: 'AAAAAAAAAAAAAAAAAAAAAA', kind: 'folder',
+      path: '/workspace/my site/日', base: '/' }, o: PROD_SHELL }]);
+  });
+  it('a hello from the former host, the provider alias, staging or another window is never answered', () => {
+    const b = prod();
+    b.posted.length = 0;
+    for (const origin of ['https://os.ezil.org', 'https://ezil-os-preview-ezil1.vercel.app', SHELL, 'http://os.ezil.work',
+      'https://os.ezil.work.evil.example']) {
+      b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE }, { origin });
+    }
+    const stranger: Posted[] = [];
+    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE }, { source: { postMessage: (m: Record<string, unknown>, o: string) => stranger.push({ m, o }) } });
+    expect(stranger).toEqual([]);
+    expect(b.posted).toEqual([]);
   });
 });
 
@@ -121,8 +167,9 @@ describe('isWorkbenchDocumentRequest / isHtmlDocument', () => {
 // ── The script itself, run against a stand-in window ─────────────────────────────────────────────────────────────
 
 interface Posted { m: Record<string, unknown>; o: string }
-function run(opts: { search?: string; pathname?: string; framed?: boolean; navigation?: boolean; origins?: string[] } = {}) {
-  const { search = '?folder=/workspace/a&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA', pathname = '/', framed = true, navigation = true, origins = [SHELL] } = opts;
+function run(opts: { search?: string; pathname?: string; framed?: boolean; navigation?: boolean; origins?: string[]; origin?: string } = {}) {
+  const { search = '?folder=/workspace/a&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA', pathname = '/', framed = true, navigation = true, origins = [SHELL],
+    origin: parentOrigin = SHELL } = opts;
   const posted: Posted[] = [];
   const replaced: string[] = [];
   const timers: Array<{ fn: () => void; ms: number; cleared?: boolean }> = [];
@@ -141,7 +188,7 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   if (navigation) g.navigation = { addEventListener: (type: string, fn: (ev: unknown) => void) => { if (type === 'navigate') navListeners.push(fn); } };
   runInNewContext(codeFolderBridgeScript(origins), g);
   const message = (data: unknown, over: { source?: unknown; origin?: string } = {}) =>
-    (listeners.message ?? []).forEach((fn) => fn({ source: over.source ?? parent, origin: over.origin ?? SHELL, data }));
+    (listeners.message ?? []).forEach((fn) => fn({ source: over.source ?? parent, origin: over.origin ?? parentOrigin, data }));
   const navigate = (url: string, over: Record<string, unknown> = {}) => {
     const ev = { navigationType: 'push', cancelable: true, hashChange: false, downloadRequest: null, destination: { url }, prevented: false,
       preventDefault() { this.prevented = true; }, ...over };
