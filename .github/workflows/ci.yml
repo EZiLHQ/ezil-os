@@ -301,9 +301,13 @@ jobs:
   # unit + graph + exact-IAM tests, and every CDK synth. Fully offline: the
   # synth scripts blank the AWS credential chain and never look anything up.
   # No secrets and no AWS credentials, ever; deploys are founder-gated.
+  # Pinned to 24.04, not ubuntu-latest: the AMI base is Ubuntu 24.04 (noble, enforced by
+  # build-host-ami.sh), and test-units.sh checks against the runner's own systemd and
+  # <asm/unistd_64.h>. On ubuntu-26.04 the runner's units warn under systemd-analyze and
+  # gen-seccomp.py sees newer syscalls, so both checks failed for reasons outside this repo.
   computer-infrastructure:
     name: computer infrastructure (typecheck + test + synth)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

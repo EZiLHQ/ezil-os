@@ -384,7 +384,7 @@ describe("comment templates are data, asserted verbatim", () => {
 		expect(body).toContain("local (typecheck + unit + smoke)");
 		expect(body).toContain("private GitHub Container Registry");
 		expect(body).toMatch(/\.github\/workflows\/ci\.yml#L\d+-L\d+/);
-		expect(body.endsWith("Neither is one of the fifteen required contexts, so this does not block your merge.")).toBe(true);
+		expect(body.endsWith("Neither is one of the seven required contexts, so this does not block your merge.")).toBe(true);
 	});
 
 	it("not-required-red displays the same line range that its ci.yml URL targets", () => {

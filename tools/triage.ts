@@ -33,8 +33,8 @@
  *
  * ## The two contracts this file mirrors, and how they drift
  *
- * `REQUIRED_CONTEXTS` is the fifteen status checks that branch-protection
- * ruleset 22265548 requires on `main` (measured 2026-09-05, not assumed). It is
+ * `REQUIRED_CONTEXTS` is the seven status checks that branch-protection
+ * ruleset 22265548 requires on `main` (measured 2026-11-06, not assumed). It is
  * a constant here because `classifyPr` must be pure and the tests must be
  * deterministic, but a constant that mirrors a live ruleset drifts silently --
  * exactly the failure mode this project keeps paying for. So the CLI cross-checks
@@ -79,24 +79,17 @@ import { dirname, join } from "node:path";
 // ---------------------------------------------------------------------------
 
 /**
- * The fifteen required status contexts on `main`, from ruleset 22265548
- * (`gh api repos/EZiLHQ/ezil-os/rulesets/22265548`, measured 2026-09-05).
+ * The seven required status contexts on `main`, from ruleset 22265548
+ * (`gh api repos/EZiLHQ/ezil-os/rulesets/22265548`, measured 2026-11-06; the
+ * Windows/macOS legs went with #218, which made CI Ubuntu-only).
  * `container (real image)`, `local (typecheck + unit + smoke)` and `Vercel` are
  * intentionally absent -- see the file header.
  */
 export const REQUIRED_CONTEXTS: readonly string[] = [
 	"worker (typecheck + unit) (ubuntu-latest)",
-	"worker (typecheck + unit) (windows-latest)",
-	"worker (typecheck + unit) (macos-latest)",
 	"app (typecheck + unit) (ubuntu-latest)",
-	"app (typecheck + unit) (windows-latest)",
-	"app (typecheck + unit) (macos-latest)",
 	"sdk + mcp (typecheck + unit) (ubuntu-latest)",
-	"sdk + mcp (typecheck + unit) (windows-latest)",
-	"sdk + mcp (typecheck + unit) (macos-latest)",
 	"shell (bundle check + browser suites) (ubuntu-latest)",
-	"shell (bundle check + browser suites) (windows-latest)",
-	"shell (bundle check + browser suites) (macos-latest)",
 	"tools (typecheck + unit)",
 	"DCO",
 	"CodeQL (javascript-typescript)",
@@ -203,7 +196,7 @@ const REPO_BLOB = "https://github.com/EZiLHQ/ezil-os/blob/main";
 
 // Keep the link label and URL in sync; triage.test.ts validates this exact
 // paragraph against ci.yml so moving or rewriting it fails the tools CI job.
-const CI_PRIVATE_PACKAGE_LINES = { start: 362, end: 372 } as const;
+const CI_PRIVATE_PACKAGE_LINES = { start: 366, end: 376 } as const;
 
 /**
  * The findings that carry a contributor-facing comment. `CommentFinding` is the
@@ -237,7 +230,7 @@ A check failed here that is currently green on \`main\` for the same name, and i
 
 	"not-required-red": `### A non-required check is red
 
-A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines ${CI_PRIVATE_PACKAGE_LINES.start}–${CI_PRIVATE_PACKAGE_LINES.end}](${REPO_BLOB}/.github/workflows/ci.yml#L${CI_PRIVATE_PACKAGE_LINES.start}-L${CI_PRIVATE_PACKAGE_LINES.end})). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
+A check failed here that is not among the seven required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines ${CI_PRIVATE_PACKAGE_LINES.start}–${CI_PRIVATE_PACKAGE_LINES.end}](${REPO_BLOB}/.github/workflows/ci.yml#L${CI_PRIVATE_PACKAGE_LINES.start}-L${CI_PRIVATE_PACKAGE_LINES.end})). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the seven required contexts, so this does not block your merge.`,
 
 	"size-xl": `### This pull request is large (size/XL)
 

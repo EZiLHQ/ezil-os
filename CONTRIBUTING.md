@@ -97,21 +97,13 @@ approval count is zero rather than bypassed).
 ## Reading CI
 
 Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-Fifteen of its checks are **required contexts** — the branch ruleset on `main`
+Seven of its checks are **required contexts** — the branch ruleset on `main`
 will not offer the merge button until every one of these exact names is green:
 
 - `worker (typecheck + unit) (ubuntu-latest)`
-- `worker (typecheck + unit) (windows-latest)`
-- `worker (typecheck + unit) (macos-latest)`
 - `app (typecheck + unit) (ubuntu-latest)`
-- `app (typecheck + unit) (windows-latest)`
-- `app (typecheck + unit) (macos-latest)`
 - `sdk + mcp (typecheck + unit) (ubuntu-latest)`
-- `sdk + mcp (typecheck + unit) (windows-latest)`
-- `sdk + mcp (typecheck + unit) (macos-latest)`
 - `shell (bundle check + browser suites) (ubuntu-latest)`
-- `shell (bundle check + browser suites) (windows-latest)`
-- `shell (bundle check + browser suites) (macos-latest)`
 - `tools (typecheck + unit)`
 - `DCO`
 - `CodeQL (javascript-typescript)`
@@ -135,13 +127,15 @@ can't be required yet (`.github/workflows/ci.yml:64-72`):
 block your merge.** If you see one, it is almost certainly this, not
 something you did.
 
-A few other checks can appear that also aren't among the fifteen: `label`
+A few other checks can appear that also aren't among the seven: `label`
 (the existing labeler workflow), a plain `CodeQL` alongside the required
 `CodeQL (javascript-typescript)`, and `Vercel Preview Comments` — Vercel's
 GitHub integration deploys a preview of `app/` for every branch
 (`.github/workflows/deploy.yml`'s own header explains why that's safe: only
 `main`'s deploy is disabled at the integration level). None of these gate
-the merge; only the fifteen named above do.
+the merge; only the seven named above do. `computer infrastructure`,
+`ezil-models` and `OS cloud release contracts` also run on every pull
+request; they are not required, but a red one is a real failure to fix.
 
 ## "A skip is not a pass"
 
