@@ -98,7 +98,7 @@ string. It returns `null` (open nothing) or
   - `<path>` is absolute (`/workspace/a`) or relative to `/workspace` (`a`,
     `./a`), the workspace root of an AWS computer and of a Cloudflare computer
     whose workspace is mounted. An unmounted Cloudflare computer's root is
-    `/home/neko/project` (`REPO_OPEN_UNMOUNTED_ROOT`): there a `/workspace`
+    `/home/neko/project` (`CODE_FOLDER_UNMOUNTED_ROOT`): there a `/workspace`
     link answers `outside` (default folder and the notice), and only an
     absolute `/home/neko/project/...` link opens. `/` may be written as is or
     as `%2F`; a space as `%20` (or `+`); a literal `+` as `%2B`; any other
@@ -205,11 +205,10 @@ code-server's workbench document on both computers
 - **What each switch writes.** A folder: `?folder=<path>`. Close Folder (the
   empty window), a workspace (several roots, a `.code-workspace`) or another
   scheme: bare `/app/code`, so a reload opens the default folder (the tab
-  record is cleared or marked, as before). In a project's window, a folder
-  inside its checkout writes the project's own keys alone (never `folder`
-  beside them: §2 refuses that combination, so the shell never writes an
-  address it would refuse on reload; a reload opens the project's folder),
-  and one outside it is the person's own files (`folder` alone). Creating, renaming or deleting
+  record is cleared or marked, as before). Code here is always the person's
+  own files, so a folder is written as `folder` alone, never beside a
+  project's keys (§2 refuses that combination, so the shell never writes an
+  address it would refuse on reload). Creating, renaming or deleting
   folders inside the root navigates nothing, so it writes nothing.
 - **What a mint's first document writes.** The asked folder, or the default
   when nothing was asked: `replace` with that folder. A different one (the
