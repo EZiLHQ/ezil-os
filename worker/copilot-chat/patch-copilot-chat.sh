@@ -255,10 +255,11 @@ R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
 # tool/tool-set id -> enabled; an id missing from it counts as enabled. Copilot's edit, search and
 # web sets reach the picker only around the first request (measured: 7 rows before it, 9 after), so
 # a user who switched every row off before that got those sets and their members back (`tools-absent`).
-# A stored selection whose every entry is off now keeps ids it has never seen off too; any other
-# selection (never configured, partial, the pre-version-2 disabled-only format, or one a prompt file
-# or tool include/exclude wrote for the session: `tools-session`) keeps upstream's missing-means-on,
-# so new tools still appear for those users and a prompt file naming not-yet-registered sets keeps them.
+# A selection the user curated in Configure Tools (any entry off) now keeps ids it has never seen off
+# too, so a narrowed choice never gains tools the user did not see; a missing id stays on (upstream)
+# only when nothing is off (never configured, all on) or the selection is the pre-version-2
+# disabled-only format or one a prompt file or tool include/exclude wrote (`tools-session`), so a
+# prompt file naming not-yet-registered sets keeps them. Late tools then show unchecked in the picker.
 A_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l)}}'
 R_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l),ezilMissingOn:!0}}'
 # workbench.js `tools-session`: a session selection written by code (`set(e,!0)`: a prompt file's
@@ -267,7 +268,7 @@ R_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTo
 A_TOOLS_SESSION='set(e,t){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,j_e.fromMap(e));return}'
 R_TOOLS_SESSION='set(e,t){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,t?{...j_e.fromMap(e),ezilMissingOn:!0}:j_e.fromMap(e));return}'
 A_TOOLS_ABSENT='r||(r=this._globalState.read(e));for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,r.tools.get(a.id)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=r.toolSets.get(a.id)!==!1;'
-R_TOOLS_ABSENT='r||(r=this._globalState.read(e));let ezilAbsent=!!r.ezilMissingOn||!(r.tools.size||r.toolSets.size)||[...r.tools.values(),...r.toolSets.values()].some(z=>z!==!1);for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,(r.tools.get(a.id)??ezilAbsent)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=(r.toolSets.get(a.id)??ezilAbsent)!==!1;'
+R_TOOLS_ABSENT='r||(r=this._globalState.read(e));let ezilAbsent=!!r.ezilMissingOn||!(r.tools.size||r.toolSets.size)||[...r.tools.values(),...r.toolSets.values()].every(z=>z!==!1);for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,(r.tools.get(a.id)??ezilAbsent)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=(r.toolSets.get(a.id)??ezilAbsent)!==!1;'
 # Names the selection relies on (checked, never patched): a set's members follow the set unless
 # explicitly on; the request's tool map is entriesMap without the sets; Configure Tools saves the full
 # map it showed; the storage format the legacy branch is told apart from.

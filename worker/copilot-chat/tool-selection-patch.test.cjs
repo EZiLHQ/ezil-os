@@ -175,17 +175,24 @@ test('Agent tool selection: explicit all-off holds for late registrations; defau
       assert.ok(Object.values(map).every(Boolean));
     });
 
-    await both('partial (read off, rest on): read stays off, late sets follow upstream (on)', ({ wb }) => {
+    await both('partial (read off, rest on), saved before the late sets exist: read off, the unseen late sets off too', ({ wb }) => {
       const stored = save(wb, shownEntries(early, x => !['read', 'copilot_readFile', 'copilot_getErrors'].includes(x.id)));
       const map = entries(wb, { stored, ...late });
       assert.equal(map.read, false); assert.equal(map.copilot_readFile, false);
-      assert.equal(map.edit, true); assert.equal(map.copilot_createFile, true); assert.equal(map.execute, true);
-    });
+      assert.equal(map.execute, true); assert.equal(map.run_in_terminal, true); assert.equal(map.manage_todo_list, true);
+      assert.equal(map.edit, false); assert.equal(map.copilot_createFile, false); assert.equal(map.web, false);
+    }, { defect: true });
 
-    await both('partial (only read on): late sets follow upstream (on); the choices shown stay as chosen', ({ wb }) => {
+    await both('review case: all off, then only read on, then the late sets register: only read and its members', ({ wb }) => {
       const stored = save(wb, shownEntries(early, x => ['read', 'copilot_readFile', 'copilot_getErrors'].includes(x.id)));
       const map = entries(wb, { stored, ...late });
-      assert.equal(map.read, true); assert.equal(map.execute, false); assert.equal(map.run_in_terminal, false); assert.equal(map.edit, true);
+      assert.deepEqual(Object.entries(map).filter(([, v]) => v).map(([k]) => k).sort(), ['copilot_getErrors', 'copilot_readFile', 'read']);
+    }, { defect: true });
+
+    await both('partial saved after every set exists keeps exactly the choice', ({ wb }) => {
+      const stored = save(wb, shownEntries(late, x => !['web', 'copilot_githubRepo'].includes(x.id)));
+      const map = entries(wb, { stored, ...late });
+      assert.equal(map.web, false); assert.equal(map.copilot_githubRepo, false); assert.equal(map.edit, true); assert.equal(map.read, true);
     });
 
     await both('all off, then one tool switched back on in a set that is off: only that tool', ({ wb }) => {
