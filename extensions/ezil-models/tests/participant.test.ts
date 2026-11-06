@@ -13,14 +13,15 @@ const { toNeutralRequest } = await import('../src/provider');
 const { buildGatewayBody } = await import('../src/gateway-messages');
 
 const KIMI = 'us.moonshotai.kimi-k3';
-type Sent = { messages: unknown[]; options: Record<string, unknown> };
+type Sent = { messages: unknown[]; options: Record<string, unknown>; token: unknown };
+const TOKEN = { isCancellationRequested: false };
 
 function fakeModel(vendor = 'ezil', reply: string[] | Error = ['Hel', 'lo']) {
     const sent: Sent[] = [];
     const model = {
         vendor, id: KIMI,
-        sendRequest: async (messages: unknown[], options: Record<string, unknown>) => {
-            sent.push({ messages, options });
+        sendRequest: async (messages: unknown[], options: Record<string, unknown>, token: unknown) => {
+            sent.push({ messages, options, token });
             if (reply instanceof Error) throw reply;
             return { text: (async function* () { yield* reply; })() };
         },
@@ -32,7 +33,7 @@ async function ask(prompt: string, opts: { vendor?: string; reply?: string[] | E
     const { model, sent } = fakeModel(opts.vendor, opts.reply);
     const shown: string[] = [];
     const result = await handleNoToolsRequest({ prompt, model, references: opts.references ?? [] } as never, { history: opts.history ?? [] } as never,
-        { markdown: (value: string) => shown.push(value) } as never, { isCancellationRequested: false } as never);
+        { markdown: (value: string) => shown.push(value) } as never, TOKEN as never);
     return { result, sent, shown };
 }
 
@@ -47,7 +48,15 @@ describe('@ezil no-tools participant', () => {
         expect(result).toEqual({});
         expect(sent).toHaveLength(1);
         expect(sent[0]!.options).toEqual({});
+        expect(sent[0]!.token).toBe(TOKEN);
         expect(shown.join('')).toBe('Hello');
+    });
+
+    test('Kimi stays non-streamed even when its configured model says stream (serializer rule, not the fixture)', async () => {
+        const { sent } = await ask('q');
+        const body = buildGatewayBody({ ...gw(KIMI), stream: true }, toNeutralRequest(sent[0]!.messages as never, sent[0]!.options as never)).body as Record<string, unknown>;
+        expect(body.stream).toBe(false);
+        expect(body).not.toHaveProperty('tools');
     });
 
     test('the Gateway body for that call carries no tools and no tool_choice, and Kimi stays non-streamed', async () => {
@@ -89,10 +98,11 @@ describe('@ezil no-tools participant', () => {
     });
 
     test('attached references are not sent, and the user is told so', async () => {
-        const { sent, shown } = await ask('look at this', { references: [{ id: 'file', value: 'x' }] });
+        const { sent, shown } = await ask('look at this', { references: [{ id: 'file', value: 'SECRET_FILE_TEXT' }] });
         expect(shown[0]).toContain('not sent');
         const body = gatewayBody(sent[0]!);
-        expect(JSON.stringify(body)).not.toContain('"x"');
+        expect(body.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: 'look at this' }] }]);
+        expect(JSON.stringify(body)).not.toContain('SECRET_FILE_TEXT');
     });
 
     test('a model error is returned as errorDetails, never as a successful answer', async () => {
