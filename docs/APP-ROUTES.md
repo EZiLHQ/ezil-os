@@ -89,9 +89,37 @@ string. It returns `null` (open nothing) or
   An invalid path is dropped (the project is not) with `pathRejected`:
   `empty`, `encoded_separator`, `too_long`, `absolute`, `backslash`,
   `control`, `dot_segment`, `segment`.
-- **Never read from the URL:** a repo URL, a ref, a folder, a user or account
-  id, a token. Unknown keys are ignored by the parser and preserved in the
-  address bar.
+- **Code's folder** (folder-url-sync, 2026-11-05): `/app/code?folder=<path>`,
+  also on the alias form. Navigation intent only: `parseFolder` normalises it
+  here, and the server walks it on the computer before anything opens
+  (`worker/src/code-folder.ts`: outside the workspace, `.ezil/**` and a
+  project's `projects/<uuid>/**` are refused; every component must be a real
+  directory, never a link). Rules:
+  - `<path>` is absolute (`/workspace/a`) or relative to `/workspace` (`a`,
+    `./a`), the workspace root of an AWS computer and of a Cloudflare computer
+    whose workspace is mounted. An unmounted Cloudflare computer's root is
+    `/home/neko/project` (`CODE_FOLDER_UNMOUNTED_ROOT`): there a `/workspace`
+    link answers `outside` (default folder and the notice), and only an
+    absolute `/home/neko/project/...` link opens. `/` may be written as is or
+    as `%2F`; a space as `%20` (or `+`); a literal `+` as `%2B`; any other
+    character percent-encoded as UTF-8. Spaces and Unicode are kept as they are.
+  - `.`, empty segments and a trailing `/` go; `..` is resolved lexically, so
+    `/workspace/a/../b` is `/workspace/b`. A `..` that climbs above `/` (or,
+    relative, above `/workspace`) is `folderRejected: 'outside'`. Also refused:
+    `empty`, `control`, `backslash`, `too_long` (2048 bytes, 64 segments, 255
+    bytes a segment), `invalid` (a lone surrogate).
+  - Beside `project`/`repo` the folder is `folderRejected: 'with_repository'`
+    and dropped with a visible notice. Until the server can confine a folder to
+    a checkout, a folder is never sent beside a project, and a local folder link
+    never names one.
+  - The address always WRITES the absolute path (`encodeQueryValue`: `/`
+    readable). Precedence when Code mints: the address's folder, then this
+    tab's record (`apps/code-folder.js`), then the computer's default.
+  Result: `folder: '<absolute path>'` or `folderRejected: '<reason>'`. Example:
+  `/app/code?folder=/workspace/sports/sports-web`.
+- **Never read from the URL:** a repo URL, a ref, a user or account id, a
+  token. (Code's folder is read only as above.) Unknown keys are ignored by the
+  parser and preserved in the address bar.
 - **Writing `path`.** `/` is left unencoded in query values everywhere this
   codebase writes one (`appUrl` in `app-history.js`, `returnUrlFor` in
   `constants.ts`), so `path=src/main.ts` survives sign-in as written. A link
@@ -148,8 +176,79 @@ nothing sets.)
 | Focus moves to another app's window | **replace** with that app's URL |
 | A window closes | **replace** with the front app: the focused app window, else the visible one focused most recently, else `/os` |
 | Code reports a view change (`ezil:app-view-changed`, `{appId, view}`) | **replace** state `ezilView` on the current entry, only if the entry is that app's |
+| Code reports its folder (`ezil:app-params-changed`, `{appId: 'code', params, mode}`) | `mode: 'push'` (the person switched folder inside Code): **push** `/app/code?folder=<path>` (or bare `/app/code`), even when the address reads the same; `mode: 'replace'`: **replace** in place. Only if the entry is Code's, no click's launch is opening, and the params are Code's own keys with a normalised absolute folder. See "Code's folder" below. |
+| Code's editor refused a Back/Forward (`ezil:app-history-undo`, `{appId: 'code'}`) | **traverse** back to the entry the editor still shows, once, only for the last traversal and only while the tab is still on the entry it landed on (Navigation API index); `detail.handled` says whether it did |
 | Back/Forward (`popstate`) | focus that app's window, or launch it, with the entry's own parameters and `historyMode: 'replace'` (an already-open window gets no `view`, §3). If the window is open, the entry first takes the view it shows, in place, at the popstate itself ("State" below). Never closes a window, stops a computer, deletes state or pushes. An entry that names no usable app (`/os`, an invalid link) launches nothing. Either way, a launch still pending loses its say ("Order" below). |
 | Boot with a link | **replace** (canonicalise) before launching; the billing link after its launch, its `upgrade` key already gone before it. Either launch is numbered ("Order" below). |
+
+### Code's folder (folder-url-sync, 2026-11-05)
+
+The address bar names the folder Code's editor shows, and each folder switch
+made inside Code is its own history entry, so Back/Forward restore the folder
+together with the address. Pieces: the Worker injects a bridge into
+code-server's workbench document on both computers
+(`worker/src/code-folder-bridge.ts`); `apps/code-folder.js` binds it;
+`apps/code.js` announces; this module writes.
+
+- **Why the shell pushes BEFORE the editor moves.** Measured in Chromium: a
+  frame's own navigation that PUSHES shares its top-level part with the entry
+  before it, so rewriting the address after it rewrites both (Back then shows
+  the new address over the old folder). So the bridge cancels the editor's own
+  push (Navigation API `navigate`, same document path, `folder`/`workspace`/
+  `ew`) and asks the shell (`ezil.code.open`); Code announces `push`, this
+  module pushes, and the editor is told to go (`ezil.code.go`) and REPLACES its
+  document inside the new entry. The browser then files each editor document
+  under its own entry, and Back/Forward reload it natively, through its own
+  `beforeunload`. A browser without the Navigation API keeps the editor's own
+  push; the address then follows each new document by `replace` (it ends right,
+  but Back/Forward show the editor first).
+- **What each switch writes.** A folder: `?folder=<path>`. Close Folder (the
+  empty window), a workspace (several roots, a `.code-workspace`) or another
+  scheme: bare `/app/code`, so a reload opens the default folder (the tab
+  record is cleared or marked, as before). Code here is always the person's
+  own files, so a folder is written as `folder` alone, never beside a
+  project's keys (§2 refuses that combination, so the shell never writes an
+  address it would refuse on reload). Creating, renaming or deleting
+  folders inside the root navigates nothing, so it writes nothing.
+- **What a mint's first document writes.** The asked folder, or the default
+  when nothing was asked: `replace` with that folder. A different one (the
+  server refused the ask: `missing`, `symlink`, `outside`, AWS without the
+  host walk: `unverified`, …): nothing; the visible notice says so and the
+  address KEEPS the asked folder, so a reload or Try again asks the server for
+  it again. An invalid link folder (`folderRejected`) asks nothing, says so,
+  and the address then follows the editor.
+- **Back/Forward.** The route hands Code the entry's `folder`. The browser is
+  given `ROUTE_SETTLE_MS` (800 ms) to start restoring the editor (the bridge
+  says `ezil.code.leaving` at once); if the editor does not move and still
+  shows another folder, Code navigates it IN PLACE (`location.replace`, so its
+  veto still runs) — but only to a folder this window's editor has already
+  shown (walked by a mint, or opened in Code). Any other folder is never opened
+  from an address: the address follows the editor instead.
+- **Unsaved work.** Nothing here removes or re-inserts the editor frame. Every
+  switch is a navigation of the live document, so code-server's own
+  `beforeunload` (its veto while a backup is pending) runs. If the person
+  answers "Stay", Chromium keeps the editor but still moves the address
+  (measured); `LEAVING_SETTLE_MS` (3 s) after `leaving` with no new document,
+  Code asks this module to undo that last traversal (`ezil:app-history-undo`),
+  so the tab is back on the entry the editor shows and Back can be asked
+  again. With no traversal to undo (an editor's own switch it then refused),
+  the address is rewritten to what the editor shows. Known limit (independent
+  review): `leaving` is sent at `beforeunload`, before the browser shows its
+  dialog, so a "Stay" answered after more than 3 s leaves the address on the
+  new entry for a few seconds until the address follows the editor again
+  (measured: healed by about 10 s; no entry lost or rewritten).
+- **Reload, reconnect, sign-in.** The address carries the folder, so a reload
+  mints with it; a re-mint (restart, reconnect, Try again) asks for the folder
+  the window shows; a signed-out link keeps its query through sign-in (§2
+  "Writing `path`" applies to `folder` too).
+
+Tests: `app-link-test.mjs` (parser vectors), `app-history-test.mjs`
+(push/replace/refusals, the undo), `apps/code-folder-test.mjs` (open/go/
+leaving, the fallback flag), `apps/code-test.mjs` (link folder over the tab
+record; never with a project), `apps/code-history-browser-test.mjs` (Chromium,
+the real bridge script: link, switch, Back/Forward, reload, reconnect, close,
+workspace, nested, Unicode, relative, invalid, missing, repository, the veto),
+`worker/src/code-folder-bridge.test.ts` (the bridge and where it is injected).
 
 Why the push happens first: in Chromium a frame navigation is filed under
 the entry that was current when it started. The Code and Browser windows
@@ -321,7 +420,7 @@ view and while minimised from it, `'window'` when restored.
 windowed, and full as the control.
 
 **URLs written.** `/app/<id>` plus the app's own parameters (Code's
-`project`/`repo`/`path` from its link, Settings' `tab` from its launch) plus
+`project`/`repo`/`path` from its link and `folder` from its link or its editor, Settings' `tab` from its launch) plus
 page-level `computer` (captured once at boot; the server picks the computer
 from it on reload). Synthesised URLs carry only validated values.
 

@@ -10,7 +10,7 @@ const dataUrl = text => `data:text/javascript;base64,${Buffer.from(text).toStrin
 // app-history.js imports './app-link.js'; a data: module cannot resolve that.
 const link = dataUrl(readFileSync(new URL('./app-link.js', import.meta.url), 'utf8'));
 const history = readFileSync(new URL('./app-history.js', import.meta.url), 'utf8').replace("from './app-link.js'", `from '${link}'`);
-const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
+const { appUrl, encodeQueryValue, linkParams, mergeHistoryState, canonicalUrl, withoutKeys, replaceCodeParamsUrl, routeLaunchContext, createAppHistory, OS_PATH } = await import(dataUrl(history));
 let checks = 0;
 const plain = value => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const same = (actual, expected, message) => { assert.deepEqual(plain(actual), plain(expected), message); checks += 1; };
@@ -55,6 +55,16 @@ same(withoutKeys(loc('?%75pgrade=pro&upgrade=x&keep=1'), ['upgrade']), '/os?keep
 same(withoutKeys(loc('?upgrade=pro'), ['upgrade']), '/os', 'nothing left: no `?`');
 same(withoutKeys({ pathname: '/app/settings', search: '?tab=billing&upgrade=pro' }, ['upgrade']), '/app/settings?tab=billing', 'the path form too');
 same(withoutKeys(loc('?upgrades=1&keep=1'), ['upgrade']), '/os?upgrades=1&keep=1', 'positive control: any other key stays');
+// A Code replace changes only Code-owned parameters; unrelated pairs remain raw and in order.
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: `?folder=/workspace/nope&computer=${C}&campaign=a%2Fb&section=notes`, hash: '#anchor' },
+    { folder: '/workspace' }), `/app/code?folder=/workspace&computer=${C}&campaign=a%2Fb&section=notes#anchor`);
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: '?%66older=old&campaign=%41&folder=other&project=p&repo=r&path=x', hash: '#frag' },
+    {}), '/app/code?campaign=%41#frag', 'every decoded Code key goes; unrelated raw bytes and hash stay');
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: '?campaign=a%2Fb', hash: '#x' },
+    { folder: '/workspace/my site' }, [['computer', C]]), `/app/code?folder=/workspace/my%20site&campaign=a%2Fb&computer=${C}#x`,
+    'a missing page-level computer is retained without decoding unrelated pairs');
+same(replaceCodeParamsUrl({ pathname: '/app/code', search: `?computer=${C}&x=1`, hash: '' },
+    {}, [['computer', C]]), `/app/code?computer=${C}&x=1`, 'an existing computer parameter is not duplicated');
 // The launch context a route gives an app (contract item 3).
 same(routeLaunchContext({ id: 'code' }), { view: 'full' });
 same(routeLaunchContext({ id: 'code' }, { hasWindow: true }), {}, 'Back to an open Code does not resize it');
@@ -874,4 +884,99 @@ for (const renames of [false, true]) {
     controller.begin('code');
     same(url(), '/app/code', "a failed launch's parameters do not ride on the next plain click");
 }
-console.log(`PASS ${checks} checks: app-history helpers (consume included), push-before-open, rollback, replace, focus, close, view recording, the entry follows the screen (an open window's view on Back/Forward, focus, close, push, commit, sync and give-back; none reported, none kept), Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters)`);
+// A Code replace preserves non-Code query values and hash while keeping history state.
+{
+    const { w, open, url } = harness(`/app/code?folder=/workspace/nope&computer=${C}&campaign=a%2Fb&section=notes#anchor`);
+    open('code', 5);
+    const beforeLength = w.history.length;
+    w.dispatchEvent(new w.CustomEvent('ezil:app-params-changed', { detail: { appId: 'code', params: { folder: '/workspace' }, mode: 'replace' } }));
+    same([url(), w.history.length, w.history.state.__NA],
+        [`/app/code?folder=/workspace&computer=${C}&campaign=a%2Fb&section=notes#anchor`, beforeLength, true],
+        'a folder replace keeps other query bytes, hash, state and the current history entry');
+}
+// ── folder-url-sync: Code's folder in the address bar, and the refused traversal's undo ──────────────────────
+same(linkParams({ id: 'code', folder: '/workspace/a b' }), { folder: '/workspace/a b' }, 'a folder link is written back');
+same(appUrl('code', linkParams({ id: 'code', folder: '/workspace/a b/日' })), '/app/code?folder=/workspace/a%20b/%E6%97%A5', '/ readable, the rest encoded');
+same(routeLaunchContext({ id: 'code', folder: '/workspace/a' }, { hasWindow: true }), { folder: '/workspace/a' }, 'a route hands Code its folder, even to an open window');
+same(routeLaunchContext({ id: 'code', folderRejected: 'outside' }), { folderRejected: 'outside', view: 'full' }, 'and a refused one, to say so');
+{
+    const { w, controller, open, focus, url, traverse } = harness(`/app/code?folder=/workspace/a&computer=${C}`);
+    // jsdom has no Navigation API: a stand-in index that follows pushes and traversals as the browser's does.
+    let idx = 5;
+    const realPush = w.history.pushState.bind(w.history);
+    w.history.pushState = (...args) => { idx += 1; realPush(...args); };
+    const realGo = w.history.go.bind(w.history);
+    w.history.go = (d) => { idx += d; realGo(d); };
+    Object.defineProperty(w, 'navigation', { configurable: true, value: { get currentEntry () { return { index: idx }; } } });
+    const params = (p, mode = 'push', appId = 'code') => w.dispatchEvent(new w.CustomEvent('ezil:app-params-changed', { detail: { appId, params: p, mode } }));
+    const undo = () => { const detail = { appId: 'code', handled: false }; w.dispatchEvent(new w.CustomEvent('ezil:app-history-undo', { detail })); return detail.handled; };
+    const code = open('code', 5);
+    const settings = open('settings', 4);
+    focus(code);
+    const len0 = w.history.length;
+    params({ folder: '/workspace/a' }, 'replace');
+    same([url(), w.history.length], [`/app/code?folder=/workspace/a&computer=${C}`, len0], 'replace with what the address says: nothing written');
+    params({ folder: '/workspace/b' });
+    same([url(), w.history.length, w.history.state.ezilApp], [`/app/code?folder=/workspace/b&computer=${C}`, len0 + 1, 'code'], 'a switch in Code pushes its own entry');
+    params({});
+    params({});
+    same([url(), w.history.length], [`/app/code?computer=${C}`, len0 + 3], 'Close Folder then a workspace: two entries, though the address reads the same');
+    params({ folder: '/workspace/c' }, 'replace');
+    same([url(), w.history.length], [`/app/code?folder=/workspace/c&computer=${C}`, len0 + 3], 'replace rewrites this entry in place');
+    for ( const [p, mode, appId, what] of [
+        [{ folder: '../x' }, 'push', 'code', 'a relative folder'], [{ folder: '/a/../b' }, 'push', 'code', 'a folder that is not normalised'],
+        [{ folder: '' }, 'push', 'code', 'an empty folder'], [{ other: 'x' }, 'push', 'code', 'an unknown key'], [{ folder: 5 }, 'push', 'code', 'a number'],
+        [{ folder: '/workspace/z' }, 'bogus', 'code', 'an unknown mode'], [{ folder: '/workspace/z' }, 'push', 'settings', 'another app'],
+        ['folder=/x', 'push', 'code', 'a string'], [null, 'push', 'code', 'nothing'],
+    ] ) {
+        params(p, mode, appId);
+        same([url(), w.history.length], [`/app/code?folder=/workspace/c&computer=${C}`, len0 + 3], `refused: ${what}`);
+    }
+    params({ project: P, repo: R, folder: `/workspace/projects/${R}/repository/web` });
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, 'a folder beside a project is never written (the parser would refuse it on reload)');
+    params({ repo: 'https://github.com/a/b.git', folder: '/workspace/projects/x/web' });
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, '... nor beside a repository address');
+    params({ project: P, repo: R }, 'replace');
+    same(url(), `/app/code?project=${P}&repo=${R}&computer=${C}`, "a project's own keys are written");
+    params({ folder: '/workspace/c' }, 'replace');
+    // A click on Code itself while its entry is current takes nothing, but its launch is opening: nothing is
+    // written until it ends (the `holds` rule, docs/APP-ROUTES.md §5 "Order").
+    const own = controller.begin('code');
+    params({ folder: '/workspace/held' });
+    same(url(), `/app/code?folder=/workspace/c&computer=${C}`, "while a click's launch on Code itself is opening, nothing is written");
+    own.end(code);
+    params({ folder: '/workspace/c' }, 'replace');
+    focus(settings);
+    const len1 = w.history.length;
+    params({ folder: '/workspace/d' });
+    same([url(), w.history.length], [`/app/settings?computer=${C}`, len1], "while the entry is another app's, Code's switch writes nothing");
+    focus(code);
+    const pending = controller.begin('settings');
+    params({ folder: '/workspace/d' });
+    same(url(), `/app/settings?computer=${C}`, "while a click's launch is opening, nothing is written");
+    pending.end(settings);
+    focus(code);
+    params({ folder: '/workspace/e' });
+    const atE = url();
+    // A Back the editor refused ("Stay"): the traversal is undone, once, to the entry the editor still shows.
+    await traverse(-1);
+    ok(url() !== atE, 'the Back moved the address');
+    same(undo(), true, 'the refused Back is undone');
+    await new Promise(r => w.addEventListener('popstate', r, { once: true }));
+    same(url(), atE, '... back to the entry the editor shows');
+    same(undo(), false, 'only once: the undo itself is not a traversal that can be undone');
+    params({ folder: '/workspace/f' });
+    await traverse(-1);
+    params({ folder: '/workspace/g' });
+    same(undo(), false, 'a push after the Back ends what an undo could mean');
+    // The tab moved by something this module did not write (another script's pushState): the traversal is stale.
+    params({ folder: '/workspace/h' });
+    await traverse(-1);
+    w.history.pushState(w.history.state, '', w.location.href);
+    const before = w.history.length;
+    same([undo(), w.history.length], [false, before], 'a tab no longer on the entry the Back landed on is never moved');
+    Object.defineProperty(w, 'navigation', { configurable: true, value: undefined });
+    await traverse(-1);
+    same(undo(), false, 'without the Navigation API nothing is undone (the window rewrites the address instead)');
+}
+console.log(`PASS ${checks} checks: app-history helpers (consume included), push-before-open, rollback, replace, focus, close, view recording, the entry follows the screen (an open window's view on Back/Forward, focus, close, push, commit, sync and give-back; none reported, none kept), Back/Forward, adopt, /os-only hosts, idempotent install, order (the entry's owner decides: 48 launch orders x outcomes, late focus, close/reopen, Back/Forward and route launches while pending, a click on Settings itself while the billing link opens, a close that renames nothing, review interleavings N1-N11, parameters), Code's folder (push/replace/refusals) and the refused-traversal undo`);

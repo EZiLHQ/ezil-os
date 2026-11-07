@@ -255,6 +255,9 @@ export async function requestAwsPreview(
             ...(options.screen ? { screen: options.screen } : {}),
             // Seam B: only when set, last. Pool relay preparation is the desktop's exchange: never a surface.
             ...(options.surface && !preparePool ? { surface: options.surface } : {}),
+            // Per-tab folder continuity: Code's own-files hint only, never pool preparation. Digested with the body.
+            ...(options.surface === 'code' && options.codeFolder && !preparePool
+                ? { codeFolder: { v: 1 as const, path: options.codeFolder.path } } : {}),
         });
         // AWS always requires v2, independently of the Cloudflare opt-in flag.
         // EBS has no v2 object-store claim; '' means no store claim.
@@ -316,10 +319,17 @@ export async function requestAwsPreview(
                 expiresAt: z.number().int().gt(Date.now()),
             }).optional(),
             turnRelay: z.boolean().optional(),
+            // Per-tab folder continuity: an outcome CODE only (never a path). Anything else is DROPPED (`.catch`), so
+            // no path passes, and a hint answer from a Worker of another version never fails the Code open itself
+            // (the Worker and the app deploy separately). The shell then says it couldn't check (`unsupported_server`).
+            codeFolder: z.object({ v: z.literal(1), outcome: z.string().regex(/^[a-z_]{1,32}$/) }).strict().optional()
+                .catch(undefined),
         }).safeParse(data);
         if (!parsed.success) return unavailable('parse_failed');
+        // A dropped folder answer leaves no `codeFolder` key at all, so callers see exactly "no answer code".
+        const { codeFolder, ...answer } = parsed.data;
         // Readiness is not a browser-frame observation. Keep that field absent on the wire.
-        return { ...parsed.data, correlationId, frame: undefined };
+        return { ...answer, ...(codeFolder ? { codeFolder } : {}), correlationId, frame: undefined };
     } catch (error) {
         // Neither Worker bodies nor fetch/parse/signing exceptions reach the shell.
         if (error instanceof PlacementOwnerError) return unavailable('placement_foreign');

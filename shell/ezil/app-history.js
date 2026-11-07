@@ -32,7 +32,7 @@
 // local runtime serve the shell at `/os` alone (the native one refuses any
 // query string), so a rewritten URL there would be a 404 on reload. On those
 // providers this module never rewrites the path; Back/Forward still focuses.
-import { parseAppLink } from './app-link.js';
+import { parseAppLink, parseFolder } from './app-link.js';
 
 export const OS_PATH = '/os';
 // Page-level: the server picks the computer from it on a reload, so it rides
@@ -67,10 +67,61 @@ export function appUrl (id, params = {}) {
 export function linkParams (link) {
     if ( ! link ) return {};
     if ( link.id === 'settings' ) return link.initialTab ? { tab: link.initialTab } : {};
-    if ( link.id === 'code' && link.project ) {
-        return { project: link.project.projectId, repo: link.project.repoId, path: link.project.path };
+    if ( link.id !== 'code' ) return {};
+    const project = link.project ? { project: link.project.projectId, repo: link.project.repoId, path: link.project.path } : {};
+    // Code's folder (folder-url-sync): always written as the absolute path the parser normalised.
+    return typeof link.folder === 'string' ? { ...project, folder: link.folder } : project;
+}
+
+const CODE_PARAM_KEYS = new Set(['project', 'repo', 'path', 'folder']);
+
+/**
+ * Replace Code-owned parameters in the current entry while keeping every other
+ * raw query pair and the fragment. Existing page parameters absent from the
+ * current URL still ride along, as they do on a normal app navigation.
+ */
+export function replaceCodeParamsUrl (location, next, pageParams = []) {
+    const raw = String(location.search ?? '').replace(/^\?/, '');
+    const old = raw ? raw.split('&') : [];
+    const replacement = Object.entries(next).map(([key, value]) => `${encodeURIComponent(key)}=${encodeQueryValue(value)}`);
+    const pairs = [];
+    let inserted = false;
+    for ( const pair of old ) {
+        if ( CODE_PARAM_KEYS.has(decodedKey(pair)) ) {
+            if ( ! inserted ) { pairs.push(...replacement); inserted = true; }
+        } else pairs.push(pair);
     }
-    return {};
+    if ( ! inserted ) pairs.unshift(...replacement);
+    for ( const [key, value] of pageParams ) {
+        if ( value !== undefined && value !== null && value !== '' && ! pairs.some(pair => decodedKey(pair) === key) ) {
+            pairs.push(`${encodeURIComponent(key)}=${encodeQueryValue(value)}`);
+        }
+    }
+    return `${location.pathname}${pairs.length ? `?${pairs.join('&')}` : ''}${location.hash ?? ''}`;
+}
+
+/**
+ * The Code parameters a Code window announces for the folder its editor shows
+ * (`ezil:app-params-changed`), or null when they are not that: only its own
+ * keys, string values, and a `folder` that is a plain absolute path once
+ * normalised. A project's keys ride along as the window holds them.
+ */
+export function codeParams (value) {
+    if ( ! value || typeof value !== 'object' || Array.isArray(value) ) return null;
+    const out = {};
+    for ( const [key, v] of Object.entries(value) ) {
+        if ( ! CODE_PARAM_KEYS.has(key) ) return null;
+        if ( v === undefined ) continue;
+        if ( typeof v !== 'string' || v === '' ) return null;
+        out[key] = v;
+    }
+    if ( out.folder !== undefined ) {
+        const parsed = parseFolder(out.folder);
+        if ( ! out.folder.startsWith('/') || parsed.folder !== out.folder ) return null;
+        // `../app-link.js` refuses a folder beside a project or repository; never write what a reload would refuse.
+        if ( out.project !== undefined || out.repo !== undefined ) return null;
+    }
+    return out;
 }
 
 /**
@@ -138,6 +189,8 @@ export function routeLaunchContext (link, { hasWindow = false, recordedView } = 
     return {
         ...(link.initialTab ? { initialTab: link.initialTab } : {}),
         ...(link.project ? { project: link.project } : {}),
+        ...(typeof link.folder === 'string' ? { folder: link.folder } : {}),
+        ...(link.folderRejected ? { folderRejected: link.folderRejected } : {}),
         ...(view ? { view } : {}),
     };
 }
@@ -227,8 +280,18 @@ export function createAppHistory () {
         const el = known(state?.ezilApp) ? liveWindow(state.ezilApp) : null;
         return el ? mergeHistoryState(state, { ezilView: viewOf(el) }) : state;
     };
+    // Where this tab is in its history (Navigation API, where the browser has it) and the last Back/Forward that
+    // moved it: only that traversal may be undone (`onUndo`), and only while nothing has been written since.
+    const navIndex = () => { try { const i = win().navigation?.currentEntry?.index; return Number.isInteger(i) ? i : null; } catch { return null; } };
+    let lastIndex = null;
+    let lastTraversal = null;
+    // The traversal an undo starts is never undone in turn.
+    let undoing = false;
     const write = (method, url, patch) => {
         win().history[method](mergeHistoryState(win().history.state, patch), '', url);
+        lastIndex = navIndex();
+        // A new entry ends what an undo could mean; a rewrite in place does not.
+        if ( method === 'pushState' ) lastTraversal = null;
     };
     // Record what this launch says about the app's own URL parameters:
     // Settings' tab always follows the launch (it reopens at Account without
@@ -238,12 +301,17 @@ export function createAppHistory () {
     const remember = (id, ctx) => {
         const before = JSON.stringify(params.get(id) ?? {});
         if ( id === 'settings' ) params.set(id, ctx.initialTab ? { tab: ctx.initialTab } : {});
-        else if ( ctx.project ) params.set(id, linkParams({ id, project: ctx.project }));
-        else params.set(id, { ...params.get(id) });
+        else if ( ctx.project || (id === 'code' && typeof ctx.folder === 'string') ) {
+            params.set(id, linkParams({ id, project: ctx.project, folder: ctx.folder }));
+        } else params.set(id, { ...params.get(id) });
         return JSON.stringify(params.get(id)) !== before;
     };
 
     function onPopState () {
+        const now = navIndex();
+        lastTraversal = ! undoing && lastIndex !== null && now !== null && now !== lastIndex ? { from: lastIndex, to: now } : null;
+        undoing = false;
+        lastIndex = now;
         // The newest intent, and it moved to another entry, whichever one it
         // lands on (`/os` included): a click's launch or an earlier
         // traversal's still opening must not write over it.
@@ -324,6 +392,43 @@ export function createAppHistory () {
         write('replaceState', here(), { ezilApp: appId, ezilView: view });
     }
 
+    // Code says which folder its editor shows (folder-url-sync, docs/APP-ROUTES.md §5 "Code's folder"):
+    //   - 'push' when the person switches folder inside Code, BEFORE the editor replaces its own document: the
+    //     new entry is the folder's, and the editor's document is then filed under it, so Back/Forward restore
+    //     the address and the folder together (the browser reloads the editor's document per entry);
+    //   - 'replace' when the entry should say what is on screen (a mint's first document, a restored one).
+    // Only while the entry is Code's (a switch made behind another app's entry stays with Code's own entry), and
+    // never while a click's launch is still opening (its push owns the entry until it ends).
+    function onParamsChanged (event) {
+        const { appId, params: next, mode } = event.detail ?? {};
+        if ( ! enabled || appId !== 'code' || ! known(appId) || (mode !== 'push' && mode !== 'replace') ) return;
+        const clean = codeParams(next);
+        if ( ! clean || ! liveWindow(appId) || currentApp() !== appId || holds > 0 ) return;
+        params.set(appId, clean);
+        const url = mode === 'replace' ? replaceCodeParamsUrl(win().location, clean, pageParams) : urlFor(appId);
+        // A switch is a navigation of the editor, so it gets its own entry even when the address reads the same
+        // (the empty window, then a workspace: both bare `/app/code`); Back then restores the editor it left.
+        if ( mode === 'replace' && url === here() ) return;
+        // A push takes the entry, as a click's would: a launch still pending from before it may not write over it.
+        take();
+        write(mode === 'push' ? 'pushState' : 'replaceState', url, stateFor(appId));
+    }
+
+    // Code's editor refused the folder switch a Back/Forward asked of it (the person answered "Stay" to its
+    // unsaved-work veto). The browser moved the address anyway, so the traversal itself is undone: the tab goes
+    // back to the entry the editor still shows. Only that last traversal, only while the tab is still on the entry
+    // it landed on and that entry is Code's; `handled` tells the window, which otherwise rewrites the address.
+    function onUndo (event) {
+        const detail = event.detail;
+        if ( ! enabled || ! detail || typeof detail !== 'object' || detail.appId !== 'code' || ! lastTraversal ) return;
+        if ( navIndex() !== lastTraversal.to || currentApp() !== detail.appId ) return;
+        const delta = lastTraversal.from - lastTraversal.to;
+        lastTraversal = null;
+        undoing = true;
+        detail.handled = true;
+        win().history.go(delta);
+    }
+
     return {
         get enabled () { return enabled; },
 
@@ -345,6 +450,9 @@ export function createAppHistory () {
             options.win.addEventListener('ezil:window-focus', onFocus);
             options.win.addEventListener('ezil:window-closed', onClosed);
             options.win.addEventListener('ezil:app-view-changed', onViewChanged);
+            options.win.addEventListener('ezil:app-params-changed', onParamsChanged);
+            options.win.addEventListener('ezil:app-history-undo', onUndo);
+            lastIndex = navIndex();
         },
 
         /**

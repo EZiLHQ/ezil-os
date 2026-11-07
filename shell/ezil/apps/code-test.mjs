@@ -116,6 +116,13 @@ let codePreviewUrlMode = 'ok';
 const confirmScript = [];
 
 const mintedUrls = [];
+/**
+ * Per-tab folder continuity (`apps/code-folder.js`): the Code iframe shows the minted URL plus this mint's
+ * `&ezil_mint=<22 base64url>`, appended as text. `untag` gives back exactly the minted URL; a URL without a
+ * well-formed id stays as it is, so a comparison against `mintedUrls` still fails if the id were missing or wrong.
+ */
+const MINT_TAG = /[?&]ezil_mint=[A-Za-z0-9_-]{22}$/;
+const untag = (u) => (typeof u === 'string' ? u.replace(MINT_TAG, '') : u);
 /** What the cheap status probe (`GET /api/shell/desktop?computerId=`) answers. Section 7k flips it. */
 let guacRunning = true;
 /** `computer.progress` (tRPC) for the transition watch, only while section 7j sets it; otherwise unstubbed (500), as before. */
@@ -271,7 +278,10 @@ push('🔴 it minted from `/api/shell/code-preview-url`, NOT `/api/shell/preview
 
 const iframe = win?.querySelector('.window-app-iframe');
 push('🔴 the iframe is showing the URL THAT call minted',
-    iframe?.getAttribute('src') === mintedUrls[mintedUrls.length - 1],
+    untag(iframe?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1],
+    `${iframe?.getAttribute('src')}`);
+push('🔴 per-tab folder continuity: the frame URL is that minted URL plus one 22-char ezil_mint',
+    MINT_TAG.test(iframe?.getAttribute('src') ?? '') && (iframe?.getAttribute('src') ?? '').startsWith(`${mintedUrls[mintedUrls.length - 1]}&ezil_mint=`),
     `${iframe?.getAttribute('src')}`);
 push('the URL is the CODE bridge (`-code.`), never the app bridge (`-app.`)',
     /-code\.ezil\.org/.test(iframe?.getAttribute('src') ?? '')
@@ -300,7 +310,7 @@ push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     remintCalls.length === 1 && iframe2?.getAttribute('src') !== firstUrl,
     `${remintCalls.length} mint(s); src changed: ${iframe2?.getAttribute('src') !== firstUrl}`);
 push('and the fresh URL is the one the SECOND call returned',
-    iframe2?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]);
+    untag(iframe2?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1]);
 push('r9: the re-open\'s mint says intent \'open\' too',
     JSON.stringify(remintCalls[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
     JSON.stringify(remintCalls[0]?.body));
@@ -491,7 +501,7 @@ await settle(4);
         await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
         const w = q('.window[data-app="code"]');
         const frame = w?.querySelector('.window-app-iframe');
-        await waitFor(() => mintedUrls.length > mintsBefore && frame?.getAttribute('src') === mintedUrls.at(-1), 3000);
+        await waitFor(() => mintedUrls.length > mintsBefore && untag(frame?.getAttribute('src')) === mintedUrls.at(-1), 3000);
         let navigations = 0;
         const mo = new window.MutationObserver(records => {
             const n = records.filter(r => r.attributeName === 'src').length;
@@ -608,14 +618,30 @@ await settle(4);
     const frame = () => q('.window[data-app="code"] .window-app-iframe');
     const before = mintedUrls.length, src = frame()?.getAttribute('src');
     push('a Code window is open before the restart', !! frame() && !! src);
+    // Unsaved work: a re-mint NAVIGATES the live frame in place, so the editor's own `beforeunload` (code-server's
+    // "pending backups" veto) still runs. It is never removed and re-inserted, which would skip that veto
+    // (independent review, 3 Nov 2026). Known cost: the navigation adds a joint history entry (F2 is open).
+    const el0 = frame();
+    const srcWhileConnected = [];
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLIFrameElement.prototype, 'src');
+    Object.defineProperty(el0, 'src', { configurable: true, get () { return desc.get.call(this); },
+        set (v) { srcWhileConnected.push(this.isConnected); desc.set.call(this, v); } });
+    let removals = 0;
+    const mo = new window.MutationObserver(records => { for ( const r of records ) for ( const n of r.removedNodes ) if ( n === el0 ) removals += 1; });
+    mo.observe(el0.parentNode, { childList: true });
     window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: 'some-other-computer' } }));
     await settle(10);
     push('a restart of ANOTHER computer does not re-mint Code', mintedUrls.length === before, `${mintedUrls.length - before}`);
     window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: COMPUTER.id } }));
     await settle(20);
+    mo.disconnect();
     push('🔴 a restart of THIS computer re-mints Code exactly once', mintedUrls.length === before + 1, `${mintedUrls.length - before}`);
     push('the Code frame now shows the freshly minted URL',
-        !! frame() && frame().getAttribute('src') === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
+        !! frame() && untag(frame().getAttribute('src')) === mintedUrls[mintedUrls.length - 1] && frame().getAttribute('src') !== src);
+    push('the re-mint navigates the live frame in place (never removed, src set while connected): the editor can still veto',
+        frame() === el0 && removals === 0 && srcWhileConnected.length === 1 && srcWhileConnected[0] === true,
+        `same element: ${frame() === el0}; removals: ${removals}; src set while connected: ${JSON.stringify(srcWhileConnected)}`);
+    delete el0.src;
     await window.$(q('.window[data-app="code"]')).close();
     await settle(6);
     const closedMints = mintedUrls.length;
@@ -853,9 +879,9 @@ await settle(4);
         `seen=${preparingSeen} asks=${mintAsks - asked} kind=${kind()} "${status()}"`);
     const mintsBefore = mintedUrls.length;
     mintAnswer = null; // the stub's own ok mint
-    await waitFor(() => mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1], 8000);
+    await waitFor(() => mintedUrls.length > mintsBefore && untag(w?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1], 8000);
     push('🔴 C2: the answer at ~222 s opens Code (its frame gets that URL), never "Code isn\'t reachable right now"',
-        mintedUrls.length > mintsBefore && w?.querySelector('.window-app-iframe')?.getAttribute('src') === mintedUrls[mintedUrls.length - 1]
+        mintedUrls.length > mintsBefore && untag(w?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls[mintedUrls.length - 1]
         && ! /isn't reachable/.test(spinner?.textContent ?? ''),
         `${mintedUrls.length - mintsBefore} mint(s) kind=${kind()}`);
     await window.$(w).close();
@@ -1109,7 +1135,7 @@ await settle(4);
         await settle(10);
         push('7j 🔴 when the server settles it, the same Code window re-mints exactly once and the cover goes',
             mintedUrls.length === before + 1 && ! shown(state())
-            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+            && untag(d4.querySelector('.window-app-iframe').getAttribute('src')) === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
         // A watch that never settles (the server keeps reporting the transition
         // in flight) gives up after its poll budget without calling back. The
         // cover must not then stay up forever with nothing to press.
@@ -1174,7 +1200,7 @@ await settle(4);
         await settle(10);
         push('7k 🔴 Start re-mints the same Code window once (the existing mint path) and the cover goes',
             mintedUrls.length === before + 1 && ! shown(state())
-            && d4.querySelector('.window-app-iframe').getAttribute('src') === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
+            && untag(d4.querySelector('.window-app-iframe').getAttribute('src')) === mintedUrls[mintedUrls.length - 1], `${mintedUrls.length - before}`);
         const before2 = mintedUrls.length;
         await away(6);
         push('setup: stopped again', shown(state()) && state().dataset.state === 'stopped' && mintedUrls.length === before2);

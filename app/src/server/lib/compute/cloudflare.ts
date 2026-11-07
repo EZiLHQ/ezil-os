@@ -97,6 +97,8 @@ export function createCloudflareComputeProvider(overrides: Partial<CloudflareCom
                     projectId: c.computerId,
                     desktopMode: opts.desktopMode,
                     ...(opts.screen ? { screen: opts.screen } : {}),
+                    // Code only: the own-files folder hint (a hint, resolved by the Worker). Last, and only when set.
+                    ...(opts.codeFolder ? { codeFolder: { v: 1 as const, path: opts.codeFolder.path } } : {}),
                 },
                 ctx.correlationId,
                 authOf(c),

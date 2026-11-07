@@ -66,16 +66,21 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', intent } = (body ?? {}) as {
+        const { computerId = '', intent, codeFolder } = (body ?? {}) as {
             computerId?: string;
             /**
              * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` on the r9 shell's Code mint. Forwarded
              * VERBATIM, like the desktop route's `intent`: the procedure types it `z.unknown()` and reads only `=== 'open'`.
              */
             intent?: unknown;
+            /**
+             * Per-tab folder continuity, own files only: `{v:1, path}` the tab's editor last reported. Forwarded
+             * VERBATIM to the procedure (which checks it, `z.unknown()`: never a 400).
+             */
+            codeFolder?: unknown;
         };
 
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent });
+        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}) });
 
         return shellJson(preview);
     } catch (err) {

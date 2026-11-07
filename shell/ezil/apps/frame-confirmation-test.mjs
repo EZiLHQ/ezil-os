@@ -11,6 +11,8 @@ const out = process.env.EZIL_SHELL_OUT_DIR || new URL('../../../app/public/os/',
 const asset = name => fs.readFileSync(new URL(name, typeof out === 'string' ? `file://${out}/` : out), 'utf8');
 const bundle = asset('bundle.min.js');
 const icons = asset('icons.js');
+/** Code's frame URL without this mint's per-tab `ezil_mint` (apps/code-folder.js appends it as text, last). */
+const untag = url => String(url).replace(/[?&]ezil_mint=[A-Za-z0-9_-]{22}$/, '');
 
 async function open(app, answer) {
     const dom = new JSDOM('<div id="ezil-os-root"></div>', {
@@ -99,7 +101,11 @@ async function open(app, answer) {
     const win = w.document.querySelector(`.window[data-app="${app}"]`);
     assert.ok(win, `${app} window opens`);
     const frame = win.querySelector('.window-app-iframe');
-    assert.equal(frame.src, frameUrl);
+    // Per-tab folder continuity: Code's iframe shows the minted URL plus this mint's `ezil_mint` (apps/code-folder.js),
+    // appended as text; the app's iframe shows the minted URL exactly.
+    if (app === 'code') assert.match(frame.src, /^https:\/\/8443-code\.example\/preview-bootstrap\?token=test&ezil_mint=[A-Za-z0-9_-]{22}$/);
+    else assert.equal(frame.src, frameUrl);
+    assert.equal(untag(frame.src), frameUrl);
     const panel = win.querySelector('[data-kind]');
     let navigations = 0;
     new w.MutationObserver(records => {
@@ -427,7 +433,7 @@ for (const app of ['code', 'preview']) {
             assert.ok(h.calls[0].at >= 250 && h.calls[0].at <= 500);
             assert.equal(h.calls[0].opts.credentials, 'same-origin');
             assert.equal(h.calls[0].url.searchParams.get('computerId'), 'c-1');
-            assert.equal(h.calls[0].url.searchParams.get('frameUrl'), h.frameUrl);
+            assert.equal(untag(h.calls[0].url.searchParams.get('frameUrl')), h.frameUrl);
             assert.equal(h.panel.hidden, true);
             await h.advance(10000);
             assert.equal(h.calls.length, 1, 'success cancels later probes');
@@ -515,7 +521,7 @@ for (const app of ['code', 'preview']) {
             await h.advance(0);
             assert.equal(h.panel.hidden, false);
             assert.equal(h.panel.dataset.kind, 'failed');
-            assert.equal(h.calls[0].url.searchParams.get('frameUrl'), h.frameUrl);
+            assert.equal(untag(h.calls[0].url.searchParams.get('frameUrl')), h.frameUrl);
         } finally { h.close(); }
     });
 

@@ -779,6 +779,35 @@ describe('handlePreviewBootstrap', () => {
     expect(locUrl.searchParams.has(PREVIEW_COOKIE_QUERY_PARAM)).toBe(true);
   });
 
+  it('refuses a `path` whose `..` segments pop /preview into `//host` (invalid_redirect, no cookie), both targets', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    for (const [port, label, target] of [
+      [APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, 'app'],
+      [CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN, 'code'],
+    ] as const) {
+      for (const path of ['/..//evil.com', '/../..//evil.com', '/%2e%2e//evil.com', '/%2E%2E//evil.com', '/.%2e//evil.com', '/a/../..//evil.com']) {
+        const url = new URL(
+          `https://${port}-${SID}-${label}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`,
+        );
+        const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, target);
+        expect(res.status).toBe(400);
+        expect(res.headers.get('content-type')).toBe('application/json');
+        expect(await res.json()).toEqual({ ok: false, error: 'invalid_redirect' });
+        expect(res.headers.get('location')).toBeNull();
+        expect(res.headers.get('set-cookie')).toBeNull();
+      }
+    }
+    // A `//host` or `/.//host` path stays under /preview, and a plain path still redirects.
+    for (const [path, pathname] of [['//evil.com', '/preview//evil.com'], ['/.//evil.com', '/preview//evil.com'], ['/app?x=1', '/preview/app']]) {
+      const url = new URL(
+        `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path!)}`,
+      );
+      const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')!.startsWith(`${pathname}?`)).toBe(true);
+    }
+  });
+
   // ── `folder=` passthrough — the "Code opens with an empty file tree" fix ───
   //
   // GAP: production never sent `folder=` on the code-server bridge URL, so
@@ -822,6 +851,89 @@ describe('handlePreviewBootstrap', () => {
     const res = await handlePreviewBootstrap(url, codeSid, [SECRET], SECRET, 'code');
     const locUrl = new URL(res.headers.get('location')!, 'https://example.com');
     expect(locUrl.searchParams.has('folder')).toBe(false);
+  });
+
+  // ── Per-tab folder continuity (./code-folder.ts): the code bootstrap never trusts a raw folder ──
+  const codeBootstrap = async (query: string) => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}${query}`,
+    );
+    return handlePreviewBootstrap(url, SID, [SECRET], SECRET, 'code');
+  };
+  const locationOf = (res: Response) => new URL(res.headers.get('location')!, 'https://example.com');
+
+  it('code: a traversal, relative or control-character folder is 400 invalid_folder, never forwarded', async () => {
+    for (const bad of ['/workspace/../etc', 'workspace', './workspace', '/workspace//a', '/workspace/a\nb', '/workspace/a\\b']) {
+      const res = await codeBootstrap(`&folder=${encodeURIComponent(bad)}`);
+      expect({ bad, status: res.status }).toEqual({ bad, status: 400 });
+      expect(await res.json()).toEqual({ ok: false, error: 'invalid_folder' });
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('set-cookie')).toBeNull();
+    }
+  });
+
+  it('code: a plain folder with spaces and Unicode is forwarded exactly (one trailing slash dropped)', async () => {
+    const res = await codeBootstrap(`&folder=${encodeURIComponent('/workspace/My Project/日本 ü/')}`);
+    expect(res.status).toBe(302);
+    expect(locationOf(res).searchParams.get('folder')).toBe('/workspace/My Project/日本 ü');
+  });
+
+  it('code: the project folder repo-open composes still passes', async () => {
+    const res = await codeBootstrap(`&folder=${encodeURIComponent('/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b')}`);
+    expect(res.status).toBe(302);
+    expect(locationOf(res).searchParams.get('folder')).toBe('/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b');
+  });
+
+  it('code: an open key hidden inside `path` is refused (the `path=/?folder=/etc` injection)', async () => {
+    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
+      const res = await codeBootstrap(`&path=${encodeURIComponent(hidden)}`);
+      expect({ hidden, status: res.status }).toEqual({ hidden, status: 400 });
+    }
+    // An ordinary query in `path` is still forwarded on the code target.
+    const ok = await codeBootstrap(`&path=${encodeURIComponent('/?x=1')}`);
+    expect(ok.status).toBe(302);
+    expect(locationOf(ok).searchParams.get('x')).toBe('1');
+  });
+
+  it('app: the same hidden keys stay the dev server\'s business (unchanged)', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent('/files?folder=a&ew=1')}`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, 'app');
+    expect(res.status).toBe(302);
+    expect(locationOf(res).searchParams.get('folder')).toBe('a');
+  });
+
+  it('code: a well-formed ezil_mint is forwarded; a malformed one is dropped, never an error', async () => {
+    const mint = 'abcdefghijklmnopqrstu_';
+    const good = await codeBootstrap(`&folder=%2Fworkspace&ezil_mint=${mint}`);
+    expect(good.status).toBe(302);
+    expect(locationOf(good).searchParams.get('ezil_mint')).toBe(mint);
+    expect(locationOf(good).searchParams.get('folder')).toBe('/workspace');
+    for (const bad of ['short', `${mint}x`, 'AAAAAAAAAAAAAAAAAAAA+/']) {
+      const res = await codeBootstrap(`&ezil_mint=${encodeURIComponent(bad)}`);
+      expect(res.status).toBe(302);
+      expect(locationOf(res).searchParams.has('ezil_mint')).toBe(false);
+    }
+  });
+
+  it('app: ezil_mint is never forwarded', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&ezil_mint=abcdefghijklmnopqrstu_`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, 'app');
+    expect(locationOf(res).searchParams.has('ezil_mint')).toBe(false);
+  });
+
+  it('an invalid token is still 401 before any folder check', async () => {
+    const url = new URL(
+      `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=t=1,v1=deadbeef&folder=..`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, 'code');
+    expect(res.status).toBe(401);
   });
 });
 

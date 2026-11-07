@@ -19,7 +19,9 @@
  *       `ezil_preview` HttpOnly cookie, and 302-redirects to `/preview/<path>`.
  *       `folder` (code bridge only — see `handlePreviewBootstrap`) is
  *       forwarded onto that redirect so code-server's very first request
- *       opens with a workspace instead of an empty file tree.
+ *       opens with a workspace instead of an empty file tree. It must be a
+ *       plain absolute path (`./code-folder.ts`), else 400 `invalid_folder`;
+ *       `ezil_mint` (code only, 22 base64url chars) is forwarded too.
  *
  *   * /preview/<path>
  *       Cookie-gated HTTP reverse-proxy to the container's dev server
@@ -70,6 +72,8 @@ import {
   verifyPreviewCookie,
 } from './hmac';
 import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
+import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
+import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
@@ -727,6 +731,12 @@ export function resolveForwardedHost(url: URL, target: BridgeTarget): string {
 
 // ── /preview-bootstrap ────────────────────────────────────────────────────────
 
+/** A Code bootstrap whose folder is not plain-absolute, or that hides an open key in `path`: 400, nothing opens. */
+const invalidFolder = (): Response => new Response(JSON.stringify({ ok: false, error: 'invalid_folder' }), {
+  status: 400,
+  headers: { 'content-type': 'application/json' },
+});
+
 export interface BootstrapResult {
   response: Response;
 }
@@ -756,6 +766,12 @@ export interface BootstrapResult {
  * named. Nothing else is (deliberately — the app target still has no use for
  * it, and forwarding an unknown query param into a user's own Next.js/Vite
  * dev server risks confusing its own routing for no benefit).
+ *
+ * Per-tab folder continuity (code target only): `folder` must be a plain
+ * absolute path (else 400 `invalid_folder`); `path`'s own query may not carry
+ * `folder`, `workspace`, `ew`, `payload` or `ezil_mint` (400 `invalid_folder`);
+ * and a well-formed `ezil_mint` — the shell's per-mint instance id — is named
+ * too, so it reaches the mint's first code-server document.
  */
 export async function handlePreviewBootstrap(
   url: URL,
@@ -803,14 +819,35 @@ export async function handlePreviewBootstrap(
   // carries it forward onto same-origin client-side requests for the rest of
   // that page load.
   const locationUrl = new URL(`/preview${destPath}`, url);
+  // `..` segments pop `/preview` itself: `path=/../..//evil.com` normalises to `//evil.com`, which the Location
+  // below would hand the browser as another host (with this cookie as `ezil_pv`).
+  if (locationUrl.pathname.startsWith('//')) {
+    return new Response(JSON.stringify({ ok: false, error: 'invalid_redirect' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
   // 🔴 code-server's file tree gap: see this function's doc comment above.
   // `handlePreviewProxy` forwards every remaining query param on the
   // eventual `/preview` request straight to the container
   // (`stripPreviewQueryParam` strips only `PREVIEW_COOKIE_QUERY_PARAM`), so
   // once `folder` survives THIS redirect it reaches code-server unmodified.
   if (target === 'code') {
+    // Per-tab folder continuity (./code-folder.ts): what a Code document opens may only arrive as THIS bootstrap's
+    // own `folder`, checked here, never hidden in `path`'s query (`path=/?folder=/etc`), which is forwarded as
+    // given. Lexical defense in depth: the Worker composes `folder` itself, from the mount or from a walked hint.
+    if (codeBootstrapPathProblem(locationUrl.searchParams)) return invalidFolder();
     const folder = url.searchParams.get('folder');
-    if (folder) locationUrl.searchParams.set('folder', folder);
+    if (folder) {
+      const plain = plainFolderPath(folder);
+      if (!plain) return invalidFolder();
+      locationUrl.searchParams.set('folder', plain);
+    }
+    // The shell's per-mint id rides into this mint's FIRST editor document only (code-server's own redirect keeps
+    // it; VS Code's Open Folder drops it). An instance binding, not a credential and not authority; a malformed
+    // one is dropped, never an error.
+    const mint = codeFolderMint(url.searchParams.get(CODE_FOLDER_MINT_PARAM));
+    if (mint) locationUrl.searchParams.set(CODE_FOLDER_MINT_PARAM, mint);
   }
   locationUrl.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
   const location = `${locationUrl.pathname}${locationUrl.search}`;
@@ -845,6 +882,10 @@ export async function handlePreviewBootstrap(
  * immediately and silently (it just never connects). This is a known, narrow
  * landmine: keep this check target-based, never port-based or content-type
  * heuristic-based, so it can't regress if the ports are ever renumbered.
+ *
+ * `codeShellOrigins` (code target only): the EZiL OS shell origins the Code folder bridge may report to
+ * (`./code-folder-bridge.ts`). The bridge goes into code-server's workbench document (a GET of `/`) and nothing
+ * else; none configured, nothing is injected.
  */
 export async function handlePreviewProxy(
   request: Request,
@@ -854,6 +895,7 @@ export async function handlePreviewProxy(
   appPath: string,
   port: number = APP_PREVIEW_PORT,
   target: BridgeTarget = 'app',
+  codeShellOrigins: readonly string[] = [],
 ): Promise<Response> {
   const url = new URL(request.url);
   const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
@@ -906,7 +948,10 @@ export async function handlePreviewProxy(
 
   if (contentType.includes('text/html')) {
     const bodyText = await upstream.text();
-    const injected = target === 'code' ? bodyText : injectRuntimeShim(bodyText);
+    const workbench = target === 'code' && isHtmlDocument(upstream.status, contentType)
+      && isWorkbenchDocumentRequest(request.method, targetPath, request.headers.get('upgrade'));
+    const injected = target === 'code' ? (workbench ? injectCodeFolderBridge(bodyText, codeShellOrigins) : bodyText)
+      : injectRuntimeShim(bodyText);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }

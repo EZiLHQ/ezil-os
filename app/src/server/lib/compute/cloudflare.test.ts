@@ -153,6 +153,38 @@ describe('Cloudflare ComputeProvider adapter — per-operation wire equivalence'
         expect(JSON.parse(request.body!)).not.toHaveProperty('screen');
     });
 
+    it('ensure puts codeFolder on the wire only when asked: absent otherwise, explicit {v, path} last when asked', async () => {
+        answer = () => Response.json({ ok: true, url: 'https://desktop.example/x' });
+        await adapter.ensure(ctx, computer, { sessionId: computer.computerId, desktopMode: 'neko' });
+        expect(Object.keys(JSON.parse(wire[0]!.body!))).toEqual(['sessionId', 'userId', 'projectId', 'desktopMode', 'token']);
+
+        wire = [];
+        const { request } = await compare(
+            () =>
+                requestGuacamolePreview(
+                    config,
+                    secret,
+                    {
+                        sessionId: computer.computerId,
+                        userId: computer.userId,
+                        projectId: computer.computerId,
+                        desktopMode: 'neko',
+                        codeFolder: { v: 1, path: '/workspace/a' },
+                    },
+                    correlationId,
+                ),
+            // A stray key on the options never reaches the Worker: the adapter writes the two fields itself.
+            () => adapter.ensure(ctx, computer, {
+                sessionId: computer.computerId,
+                desktopMode: 'neko',
+                codeFolder: { v: 1, path: '/workspace/a', extra: 'x' } as never,
+            }),
+        );
+        const body = JSON.parse(request.body!);
+        expect(Object.keys(body)).toEqual(['sessionId', 'userId', 'projectId', 'desktopMode', 'codeFolder', 'token']);
+        expect(body.codeFolder).toStrictEqual({ v: 1, path: '/workspace/a' });
+    });
+
     it('ensure carries a Worker failure through unchanged', async () => {
         answer = () => new Response('boom', { status: 503 });
         await compare(
