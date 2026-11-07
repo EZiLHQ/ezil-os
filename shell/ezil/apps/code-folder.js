@@ -64,12 +64,26 @@ const NOT_RESTORED = new Set(['missing', 'not_directory']);
 
 /**
  * The notice code for a mint that asked for a folder and whose first document opened something else. Shell-local
- * codes, never on the wire: `not_reopened` when the server said `restored` (the editor still opened another thing),
- * `unsupported_server` when the server answered no code it knows (an older Worker or app ignored the ask).
+ * codes, never on the wire: `not_reopened` when the server said `restored` or `file` (the editor still opened
+ * another thing), `unsupported_server` when the server answered no code it knows (an older Worker or app ignored
+ * the ask).
  */
 function fallbackCode (outcome) {
     if ( FALLBACKS.has(outcome) ) return outcome;
-    return outcome === 'restored' ? 'not_reopened' : 'unsupported_server';
+    return outcome === 'restored' || outcome === 'file' ? 'not_reopened' : 'unsupported_server';
+}
+
+/**
+ * The file a report names inside its folder (`file`, the Worker's walked regular file, which the bridge also hands
+ * VS Code at boot): a plain path that is a direct child of `folder`, else null. A link may name a file
+ * (`/app/code?folder=/workspace/pages/index.js`): the server answers `file`, the editor opens the parent with the
+ * file in it, and the address keeps the file.
+ */
+function fileInFolder (folder, value) {
+    const file = plainFolderPath(value);
+    if ( ! file ) return null;
+    const prefix = folder === '/' ? '/' : `${folder}/`;
+    return file.startsWith(prefix) && file.length > prefix.length && ! file.slice(prefix.length).includes('/') ? file : null;
 }
 
 const utf8 = (s) => new TextEncoder().encode(s).length;
@@ -217,6 +231,9 @@ export function editorDocumentUrl (frameUrl, report) {
         const path = plainFolderPath(report.path);
         if ( ! path ) return null;
         u.searchParams.set('folder', path);
+        // A file inside that folder: the bridge turns `file` into VS Code's payload at load, as for a mint.
+        const file = report.file === undefined ? null : fileInFolder(path, report.file);
+        if ( file ) u.searchParams.set('file', file);
     } else if ( report.kind === 'empty' ) {
         u.searchParams.set('ew', 'true');
     } else {
@@ -256,10 +273,12 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  *
  * Folder URL sync:
  *   - `onRoot(root, {mintDriven, fallback})` hears every report that counts, with
- *     what the editor shows: `{kind: 'folder', path, base?}`, `{kind: 'empty', base?}`
+ *     what the editor shows: `{kind: 'folder', path, file?, base?}` (`file`: a file
+ *     the editor was told to open inside `path`, a file link's), `{kind: 'empty', base?}`
  *     or `{kind: 'unsupported'}` (a workspace, another scheme, a path the grammar
- *     refuses). `fallback` is the mint-driven report that is NOT the asked folder
- *     (the notice is shown; the address should keep what was asked).
+ *     refuses). `fallback` is the mint-driven report that is NOT the asked folder, or
+ *     not the asked file for a `file` answer (the notice is shown; the address should
+ *     keep what was asked).
  *   - `onOpen(next)` hears the editor's own folder switch BEFORE it happens
  *     (`ezil.code.open`, same `next` shapes), once the first document has
  *     reported; this module then answers `ezil.code.go` so the editor replaces its
@@ -307,7 +326,11 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
         const base = typeof d.base === 'string' ? { base: d.base } : {};
         if ( d.kind === 'folder' ) {
             const path = plainFolderPath(d.path);
-            return path ? { kind: 'folder', path, ...base } : { kind: 'unsupported' };
+            if ( ! path ) return { kind: 'unsupported' };
+            // A file the editor was told to open inside that folder (a file link): kept beside the folder, so the
+            // address can keep naming the file. A `file` that is not a direct child is not one: dropped.
+            const file = d.file === undefined ? null : fileInFolder(path, d.file);
+            return { kind: 'folder', path, ...(file ? { file } : {}), ...base };
         }
         if ( d.kind === 'empty' ) return { kind: 'empty', ...base };
         return d.kind === 'workspace' || d.kind === 'foreign' ? { kind: 'unsupported' } : null;
@@ -335,8 +358,11 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
         const mintDriven = mintId !== null && d.mint === mintId;
         if ( ! mintDriven && ! (d.mint === null && firstSeen) ) return;
         firstSeen = true;
-        if ( mintDriven && mint.asked
-            && (! (d.kind === 'folder' && plainFolderPath(d.path) === mint.asked) || NOT_RESTORED.has(mint.outcome)) ) {
+        // What the first document shows, against what was asked: the asked folder itself, or, for a `file` answer,
+        // the asked file inside its parent (the server opened the parent and named the file; the bridge reports both).
+        const shown = d.kind === 'folder' ? rootOf(d) : null;
+        const exact = shown?.kind === 'folder' && (mint.outcome === 'file' ? shown.file === mint.asked : shown.path === mint.asked);
+        if ( mintDriven && mint.asked && (! exact || NOT_RESTORED.has(mint.outcome)) ) {
             // The mint asked for a folder and its first document opened anything else: another folder, an empty
             // window, a workspace, a folder of another host or one the grammar refuses. The editor's provider fixes
             // this document's workspace synchronously from its URL at startup, so this is the final answer for the
@@ -362,8 +388,10 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
                 const prev = readFolderRecord(bind);
                 if ( prev?.kind === 'folder' && prev.path !== path ) notice?.projectChild?.(prev.path);
             }
+            // The record is the FOLDER (what a tab reopens by itself); the address, not the record, keeps a file.
             putFolderRecord(bind, { kind: 'folder', path });
-            changed(mintDriven, `folder:${path}`, { kind: 'folder', path, base: d.base });
+            const file = d.file === undefined ? null : fileInFolder(path, d.file);
+            changed(mintDriven, `folder:${path}${file ? `\n${file}` : ''}`, { kind: 'folder', path, ...(file ? { file } : {}), base: d.base });
         } else if ( d.kind === 'empty' ) {
             if ( ! mintDriven ) putFolderRecord(bind, null); // Close Folder: the tab has no folder now
             changed(mintDriven, 'empty', { kind: 'empty', base: d.base });
