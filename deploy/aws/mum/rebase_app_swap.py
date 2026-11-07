@@ -33,9 +33,9 @@ PLAN_KEYS = {'schemaVersion', 'operation', 'ledgerGeneration', 'agentCommit', 'f
 ALLOWED = re.compile(r'shell/[^\0]+|app/public/os/bundle\.min\.js')
 INSTALLER = 'deploy/aws/os-staging/install-host.sh'
 SLUG = 'ezil-os-staging'
-IN_FLIGHT = ('Pending', 'InProgress', 'Cancelling')
 SMALL = 1024 * 1024
-PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'timers', 'lockFree'}
+SECRET_DRIFT = 'app secret changed while pending; manual reconciliation required'
+PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
 METADATA = ('manifest.json', 'repositories', 'index.json')
 # install-host.sh extracts exactly these runtime members and runs render-env.py as root.
 RUNTIME = ('compose.yaml', 'Caddyfile', 'render-env.py',
@@ -209,19 +209,27 @@ def services_idle(observed):
 
 
 def at(observed, side, deployment):
-    # compose.env names the image a later restart or recreate would run; it must agree too.
-    return (observed['gitSha'], observed['imageId'], observed['composeTag'], observed['killSwitch'], observed['deployment']) == \
-        (side['gitSha'], side['imageId'], side['tag'], '1', deployment) and timers_running(observed)
+    # compose.env names the image a later restart or recreate would run; its tag must still resolve to
+    # this side's image. Caddy must serve this side's SHA from /api/health.
+    return (observed['gitSha'], observed['imageId'], observed['composeTag'], observed['composeImageId'], observed['servedSha'],
+            observed['killSwitch'], observed['deployment']) == \
+        (side['gitSha'], side['imageId'], side['tag'], side['imageId'], side['gitSha'], '1', deployment) and timers_running(observed)
 
 
 def other_in_flight():
-    """Evidence only: SSM commands on the host that have not ended. It cannot see non-SSM host access."""
-    for status in IN_FLIGHT:
-        response = release.aws('ssm', 'list-commands', '--instance-id', rebase_ssm.HOST,
-                               '--filters', json.dumps([{'key': 'Status', 'value': status}]))
-        need(not response.get('NextToken'), 'incomplete SSM listing')
-        if response.get('Commands'):
-            return True
+    """Evidence only: unfinished SSM commands that may reach the host. It cannot see non-SSM host access.
+
+    ListCommands rejects --instance-id together with Status=Pending and has no Cancelling filter, so
+    list the account's executing and pending commands and inspect their targets. A command addressed
+    by Targets lists no instance IDs; it cannot be ruled out and counts as in flight.
+    """
+    for selector in ({'key': 'ExecutionStage', 'value': 'Executing'}, {'key': 'Status', 'value': 'Pending'}):
+        response = release.aws('ssm', 'list-commands', '--filters', json.dumps([selector]))
+        need(not response.get('NextToken') and isinstance(response.get('Commands'), list), 'incomplete SSM listing')
+        for command in response['Commands']:
+            targets = command.get('InstanceIds') if isinstance(command, dict) else None
+            if not targets or rebase_ssm.HOST in targets:
+                return True
     return False
 
 
@@ -262,6 +270,8 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
         admitted = False
         if latest.get('state') == 'pending':
             need(latest['planSha256'] == plan_sha and latest['operation'] == plan['operation'], 'pending operation of another plan; run ledger-reconcile')
+            # The installer re-renders the environment from the current secret: resuming after a rotation would change non-app state.
+            need(envelope['VersionId'] == latest['before']['secretVersionId'], SECRET_DRIFT)
             need(latest['expected'] == {**release.release_state(d, dst['gitSha']), 'appImageId': dst['imageId']}, 'ledger drift')
             pending = latest
         else:
@@ -319,6 +329,8 @@ def reconcile(plan_path, apply, ledger_path=None):
         need(rebase_ssm.generation_terminal(Path(plan_path).parent, pending['generation'], release.aws),
              'remote command not terminal; wait or cancel')
         envelope = read_secret(fd)
+        # After a rotation the host may have rendered either secret version; only the owner can tell.
+        need(envelope['VersionId'] == pending['before']['secretVersionId'], SECRET_DRIFT)
         _, d = release.secret_deployment(envelope)
         deployment = rebase_app.public_deployment(d)
         if not apply:
@@ -334,6 +346,8 @@ def reconcile(plan_path, apply, ledger_path=None):
             print(json.dumps({'gitSha': {'live': second['gitSha'], 'before': src['gitSha'], 'expected': dst['gitSha']},
                               'imageId': {'before': second['imageId'] == src['imageId'], 'expected': second['imageId'] == dst['imageId']},
                               'composeTag': {'live': second['composeTag'], 'before': src['tag'], 'expected': dst['tag']},
+                              'composeImageId': {'before': second['composeImageId'] == src['imageId'], 'expected': second['composeImageId'] == dst['imageId']},
+                              'servedSha': {'live': second['servedSha'], 'before': src['gitSha'], 'expected': dst['gitSha']},
                               'deploymentMatches': second['deployment'] == deployment,
                               'timersNotRunning': sorted(k for k, t in second['timers'].items()
                                                          if t.get('enabled') != 'enabled' or t.get('active') != 'active')}, sort_keys=True))

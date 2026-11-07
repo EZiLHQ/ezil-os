@@ -30,6 +30,10 @@ import rebase_ssm as ssm
 
 REPO = HERE.parents[3]
 JOBS = rebase_app.JOBS
+# The Status filter values AWS ListCommands accepts (aws ssm list-commands help). Cancelling is not one.
+LIST_COMMANDS_STATUS = ('Pending', 'InProgress', 'Success', 'Cancelled', 'Failed', 'TimedOut', 'AccessDenied',
+                        'DeliveryTimedOut', 'ExecutionTimedOut', 'Incomplete', 'NoInstancesInTag', 'LimitExceeded')
+OTHER = 'feedfeed-1111-4111-8111-111111111111'
 
 
 def sha256(data):
@@ -87,6 +91,8 @@ class Host:
         self.tags = {app.tag: app.image}
         self.timers = {job: {'enabled': 'enabled', 'active': 'active', 'service': 'inactive'} for job in JOBS}
         self.lock_free = True
+        # Caddy -> web /api/health: serving, the SHA it reports when not the running app's, or a whole replacement body.
+        self.serving, self.served_sha, self.health_body = True, None, None
 
     def systemctl(self, verb, unit):
         job, kind = unit[len('ezil-os-staging-'):].rsplit('.', 1)
@@ -122,6 +128,12 @@ def execute(payload, host, install):
             return done(0, host.systemctl(command[1], command[2]) + '\n')
         if command[:2] == ['flock', '-n']:
             return done(0 if host.lock_free else 1)
+        if command[0] == 'curl':
+            # Through the host's Caddy with certificate verification (no -k), to the public health route.
+            assert command[-3:] == ['--resolve', 'os-staging.ezil.work:443:127.0.0.1', 'https://os-staging.ezil.work/api/health'], command
+            assert '-k' not in command and '--insecure' not in command and '-fsS' in command
+            body = host.health_body if host.health_body is not None else json.dumps({'ok': True, 'sha': host.served_sha or host.git_sha})
+            return done(0, body) if host.serving else done(22)
         raise AssertionError(command)
 
     with patch('subprocess.run', side_effect=run), patch('sys.stdout', new_callable=io.StringIO) as output, \
@@ -176,6 +188,7 @@ class AppSwapTests(unittest.TestCase):
             **release.observed_state(self.envelope, d, self.agent)}]})
         self.calls, self.payloads, self.commands, self.results = [], {}, {}, {}
         self.in_flight, self.install_mode, self.lose_reply, self.crash_poll, self.probe_hooks = [], 'success', False, False, {}
+        self.listing_extra = {}
         patches = [patch.object(release, 'REPO', checkout), patch.object(release, 'aws', self.aws),
                    patch.object(release.json_tool, 'APP_SECRET_LOCK', str(self.root / 'app-secret.lock')),
                    patch.object(release.json_tool, 'secret_aws', self.secret_aws), patch('sys.stdout', new_callable=io.StringIO)]
@@ -247,8 +260,20 @@ class AppSwapTests(unittest.TestCase):
                 command_id = flag('--command-id')
                 return {'Commands': [{'CommandId': command_id, 'Status': self.results[command_id]['Status']}]}
             filters = json.loads(flag('--filters'))
-            if filters[0]['key'] == 'Status':
-                return {'Commands': [{'CommandId': c} for c, status in self.in_flight if status == filters[0]['value']]}
+            self.assertEqual(len(filters), 1)
+            key, value = filters[0]['key'], filters[0]['value']
+            # AWS ListCommands: no node ID with Status=Pending; only these Status/ExecutionStage values.
+            if key == 'Status' and (value not in LIST_COMMANDS_STATUS or (value == 'Pending' and '--instance-id' in args)):
+                raise ValueError('InvalidFilter: rejected by AWS ListCommands')
+            if key == 'ExecutionStage' and value not in ('Executing', 'Complete'):
+                raise ValueError('InvalidFilterValue: rejected by AWS ListCommands')
+            if key in ('Status', 'ExecutionStage'):
+                # Executing is a running command, including one being cancelled; this fake keeps Pending out of it.
+                stage = {'InProgress': 'Executing', 'Cancelling': 'Executing', 'Pending': None}
+                listed = [(c, ids) for c, status, ids in self.in_flight
+                          if (status == value if key == 'Status' else stage.get(status, 'Complete') == value)
+                          and ('--instance-id' not in args or flag('--instance-id') in ids)]
+                return {'Commands': [{'CommandId': c, 'InstanceIds': ids} for c, ids in listed], **self.listing_extra}
             return {'Commands': [{'CommandId': c, 'Comment': comment, 'InstanceIds': [ssm.HOST]} for c, comment in self.commands.items()]}
         raise AssertionError(args)
 
@@ -379,7 +404,7 @@ class AppSwapTests(unittest.TestCase):
         path = self.plan('swap', self.old, self.new)
         for setup, message in ((lambda: setattr(self.host, 'lock_free', False), 'not quiescent'),
                                (lambda: self.host.timers['sandbox-reap'].update(service='activating'), 'not quiescent'),
-                               (lambda: self.in_flight.append(('feedfeed-1111-4111-8111-111111111111', 'InProgress')), 'not quiescent'),
+                               (lambda: self.in_flight.append((OTHER, 'InProgress', [ssm.HOST])), 'not quiescent'),
                                (lambda: self.host.tags.update({'new-app': 'sha256:' + '9' * 64}), 'tag already names another image'),
                                (lambda: self.host.timers['aws-reconcile'].update(enabled='disabled'), 'before-state')):
             host, in_flight = copy.deepcopy(self.host), list(self.in_flight)
@@ -469,7 +494,7 @@ class AppSwapTests(unittest.TestCase):
         ops.reconcile(path, False, self.ledger)
         self.assertEqual(self.entries()[-1]['state'], 'pending')
         for setup in (lambda: setattr(self.host, 'lock_free', False),
-                      lambda: self.in_flight.append(('feedfeed-1111-4111-8111-111111111111', 'InProgress'))):
+                      lambda: self.in_flight.append((OTHER, 'InProgress', [ssm.HOST]))):
             host, in_flight = copy.deepcopy(self.host), list(self.in_flight)
             setup()
             with self.assertRaisesRegex(ValueError, 'not proven quiescent'):
@@ -551,6 +576,122 @@ class AppSwapTests(unittest.TestCase):
         ops.reconcile(path, True, self.ledger)
         self.assertEqual(self.entries()[-1]['state'], 'aborted')
 
+    # ---- review regressions ----------------------------------------------------------------
+    def test_secret_rotation_while_pending_blocks_resume_and_reconcile(self):
+        path = self.plan('swap', self.old, self.new)
+        with patch.object(ops, 'terminal', side_effect=OSError('crash before append')):
+            with self.assertRaises(OSError):
+                ops.swap(path, self.repo, True, self.ledger)
+        before = self.ledger.read_bytes()
+        self.assertEqual(self.entries()[-1]['before']['secretVersionId'], 'v1')
+        # Same tuple and registry, new version: the installer would re-render from it.
+        self.envelope['VersionId'] = 'v2'
+        for action in (lambda: ops.swap(path, self.repo, True, self.ledger), lambda: ops.swap(path, self.repo, False, self.ledger),
+                       lambda: ops.reconcile(path, True, self.ledger), lambda: ops.reconcile(path, False, self.ledger)):
+            self.calls.clear()
+            with self.assertRaisesRegex(ValueError, 'app secret changed while pending; manual reconciliation required'):
+                action()
+            self.assertEqual(self.ledger.read_bytes(), before)
+            # Refused before any probe, install or upload.
+            self.assertFalse(any(c[:2] in (('ssm', 'send-command'), ('s3api', 'put-object')) for c in self.calls))
+        self.envelope['VersionId'] = 'v1'
+        ops.swap(path, self.repo, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
+        # Every install ever sent, across the cleared call logs.
+        self.assertEqual(sum(map(self.is_install, self.commands.values())), 1)
+
+    def test_in_flight_check_uses_only_supported_list_commands_queries(self):
+        # The fake rejects what AWS rejects: a node ID with Status=Pending, and a Cancelling filter.
+        for args in (('--instance-id', ssm.HOST, '--filters', json.dumps([{'key': 'Status', 'value': 'Pending'}])),
+                     ('--filters', json.dumps([{'key': 'Status', 'value': 'Cancelling'}]))):
+            with self.assertRaisesRegex(ValueError, 'InvalidFilter'):
+                self.aws('ssm', 'list-commands', *args)
+        self.calls.clear()
+        self.assertFalse(ops.other_in_flight())
+        queries = [c for c in self.calls if c[:2] == ('ssm', 'list-commands')]
+        self.assertEqual([json.loads(c[c.index('--filters') + 1]) for c in queries],
+                         [[{'key': 'ExecutionStage', 'value': 'Executing'}], [{'key': 'Status', 'value': 'Pending'}]])
+        self.assertTrue(all('--instance-id' not in c for c in queries))
+        elsewhere = ['i-0123456789abcdef0']
+        for status, targets, expected in (('InProgress', [ssm.HOST], True), ('Cancelling', [ssm.HOST], True),
+                                          ('Pending', [ssm.HOST], True), ('InProgress', [ssm.HOST, *elsewhere], True),
+                                          ('InProgress', elsewhere, False), ('Pending', elsewhere, False),
+                                          # Addressed by Targets: no instance IDs, so it cannot be ruled out.
+                                          ('Pending', [], True), ('Cancelling', [], True), ('Success', [ssm.HOST], False)):
+            self.in_flight = [(OTHER, status, targets)]
+            with self.subTest(status=status, targets=targets):
+                self.assertEqual(ops.other_in_flight(), expected)
+        self.in_flight, self.listing_extra = [], {'NextToken': 'more'}
+        with self.assertRaisesRegex(ValueError, 'incomplete SSM listing'):
+            ops.other_in_flight()
+        self.listing_extra = {}
+        # A command running on another instance does not hold up this host.
+        self.in_flight = [(OTHER, 'InProgress', elsewhere)]
+        ops.swap(self.plan('swap', self.old, self.new), self.repo, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
+
+    def test_moved_tag_blocks_admission_and_completion(self):
+        moved = 'sha256:' + '4' * 64
+        # The old tag no longer names the running image: a restart would run something else.
+        self.host.tags['old-app'] = moved
+        self.assert_refused_before_pending('before-state', self.plan('before', self.old, self.new))
+        self.host.tags['old-app'] = self.old.image
+        path = self.plan('swap', self.old, self.new)
+        # A concurrent load moves the candidate tag after the container was created.
+        self.probe_hooks = {'-after-': lambda: self.host.tags.update({'new-app': moved})}
+        with self.assertRaisesRegex(ValueError, 'post-install state differs'):
+            ops.swap(path, self.repo, True, self.ledger)
+        self.probe_hooks = {}
+        self.assertEqual(self.entries()[-1]['state'], 'pending')
+        self.assertEqual((self.host.git_sha, self.host.image_id, self.host.compose_tag), (self.new.sha, self.new.image, self.new.tag))
+        with self.assertRaisesRegex(ValueError, 'manual reconciliation required'):
+            ops.reconcile(path, True, self.ledger)
+        self.assertIn('"composeImageId": {"before": false, "expected": false}', sys.stdout.getvalue())
+        self.assertEqual(self.entries()[-1]['state'], 'pending')
+        self.host.tags['new-app'] = self.new.image
+        ops.reconcile(path, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
+        self.assertEqual(len(self.installs()), 1)
+
+    def test_moved_old_tag_blocks_abort(self):
+        path = self.leave_pending()
+        self.host.tags['old-app'] = 'sha256:' + '4' * 64
+        with self.assertRaisesRegex(ValueError, 'manual reconciliation required'):
+            ops.reconcile(path, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'pending')
+        self.host.tags['old-app'] = self.old.image
+        ops.reconcile(path, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'aborted')
+
+    def test_served_health_required_before_admission_and_terminal_rows(self):
+        path = self.plan('swap', self.old, self.new)
+        for setup in (lambda: setattr(self.host, 'serving', False), lambda: setattr(self.host, 'served_sha', self.worker_sha)):
+            host = copy.deepcopy(self.host)
+            setup()
+            self.assert_refused_before_pending('before-state', path)
+            self.host = host
+        # The web container runs the candidate, but Caddy/Next is not serving after the forced recreate.
+        self.probe_hooks = {'-after-': lambda: setattr(self.host, 'serving', False)}
+        with self.assertRaisesRegex(ValueError, 'post-install state differs'):
+            ops.swap(path, self.repo, True, self.ledger)
+        self.probe_hooks = {}
+        self.assertEqual(self.entries()[-1]['state'], 'pending')
+        with self.assertRaisesRegex(ValueError, 'manual reconciliation required'):
+            ops.reconcile(path, True, self.ledger)
+        self.assertIn(f'"servedSha": {{"before": "{self.old.sha}", "expected": "{self.new.sha}", "live": null}}', sys.stdout.getvalue())
+        # Serving again, but a stale app answers, the app reports itself not ok, or the body is not JSON.
+        self.host.serving = True
+        for served_sha, body in ((self.old.sha, None), (None, json.dumps({'ok': False, 'sha': self.new.sha})),
+                                 (None, json.dumps({'ok': 'true', 'sha': self.new.sha})), (None, '<html>502</html>')):
+            self.host.served_sha, self.host.health_body = served_sha, body
+            with self.subTest(served_sha=served_sha, body=body), self.assertRaisesRegex(ValueError, 'manual reconciliation required'):
+                ops.reconcile(path, True, self.ledger)
+            self.assertEqual(self.entries()[-1]['state'], 'pending')
+        self.host.served_sha, self.host.health_body = None, None
+        ops.reconcile(path, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
+        self.assertEqual(len(self.installs()), 1)
+
     # ---- restore ---------------------------------------------------------------------------
     def test_restore_is_its_own_ledger_valid_operation(self):
         swap_path = self.plan('swap', self.old, self.new)
@@ -620,7 +761,8 @@ class AppSwapTests(unittest.TestCase):
         # Every refusal the plan's stop conditions branch on: raised verbatim, quoted by the plan, and public.
         stop_conditions = ('live app differs from the plan before-state', 'post-install state differs; run app-swap-reconcile',
                            'one-shot SSM command failed; reconcile under the retained fence', 'manual reconciliation required',
-                           'uncertain SSM submission; reconcile command before retry')
+                           'uncertain SSM submission; reconcile command before retry',
+                           'app secret changed while pending; manual reconciliation required')
         for message in stop_conditions:
             self.assertIn("'" + message + "'", sources)
             self.assertTrue(any(message.startswith(text) for text in quoted), message)

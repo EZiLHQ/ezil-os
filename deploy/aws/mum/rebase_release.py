@@ -46,7 +46,8 @@ PUBLIC_REASONS = {'ledger drift', 'manual reconciliation required',
                   'candidate tag already names another image', 'post-install state differs; run app-swap-reconcile',
                   'staging host is not proven quiescent; retain the fence', 'app-swap-reconcile requires this plan pending entry',
                   'uncertain SSM submission; reconcile command before retry', 'archive receipt missing; run app-archive-check',
-                  'stale plan: ledger generation advanced', 'app-restore must undo the latest completed app-swap'}
+                  'stale plan: ledger generation advanced', 'app-restore must undo the latest completed app-swap',
+                  'app secret changed while pending; manual reconciliation required'}
 
 
 def release_roles(directory, maintenance=False, legacy=False):
