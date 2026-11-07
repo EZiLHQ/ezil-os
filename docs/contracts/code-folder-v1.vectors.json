@@ -1,6 +1,6 @@
 {
   "contract": "ezil.code-folder.v1",
-  "note": "Per-tab Code folder continuity. ONE table for the shell (shell/ezil/apps/code-folder.js), the app (app/src/server/lib/compute/code-folder.ts), the Worker (worker/src/code-folder.ts) and the host agent's folder op. plainFolderPath: accept -> the normalised value; reject -> null. plan: the server's root + the asked path -> what is walked on the computer (resolve: rel) or the refusal code, before any filesystem access. walk: the no-follow walk's answer for a tree (resolver tests). mint: the per-mint instance id the shell adds as ezil_mint (never authority, never a secret). The tab's record is a HINT; a folder opens only after the server stripped ITS root and the computer walked the remainder with no symlink followed.",
+  "note": "Per-tab Code folder continuity. ONE table for the shell (shell/ezil/apps/code-folder.js), the app (app/src/server/lib/compute/code-folder.ts), the Worker (worker/src/code-folder.ts) and the host agent's folder op. plainFolderPath: accept -> the normalised value; reject -> null. plan: the server's root + the asked path -> what is walked on the computer (resolve: rel) or the refusal code, before any filesystem access. walk: the no-follow walk's answer for a tree (resolver tests); `file` is a regular file as the LAST component (file-url-open-regression 2026-11-07: a link may name a file, which opens inside its parent folder), never one in the middle. mint: the per-mint instance id the shell adds as ezil_mint (never authority, never a secret). The tab's record is a HINT; a folder opens only after the server stripped ITS root and the computer walked the remainder with no symlink followed.",
   "plainFolderPath": {
     "accept": [
       ["/workspace", "/workspace"],
@@ -57,7 +57,8 @@
   "walk": [
     { "tree": "real dir", "rel": "sports/sports-web", "expect": "restored" },
     { "tree": "missing leaf", "rel": "sports/gone", "expect": "missing" },
-    { "tree": "regular file", "rel": "sports/next.config.ts", "expect": "not_directory" },
+    { "tree": "regular file (last component: the editor opens it inside its parent)", "rel": "sports/next.config.ts", "expect": "file" },
+    { "tree": "regular file as a middle component", "rel": "sports/next.config.ts/x", "expect": "not_directory" },
     { "tree": "symlink leaf -> /etc", "rel": "link-out", "expect": "symlink" },
     { "tree": "symlink leaf -> inside root", "rel": "link-in", "expect": "symlink" },
     { "tree": "symlink middle component", "rel": "via-link/child", "expect": "symlink" },
@@ -68,5 +69,5 @@
     "accept": ["AAAAAAAAAAAAAAAAAAAAAA", "abcdefghijklmnopqrstu_", "-_0123456789abcdefghij"],
     "reject": ["", "short", "AAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAA=", "AAAAAAAAAAAAAAAAAAAA+/", "AAAAAAAAAAAAAAAAAAAA A"]
   },
-  "bootstrapPathRefusedKeys": ["folder", "workspace", "ew", "payload", "ezil_mint"]
+  "bootstrapPathRefusedKeys": ["folder", "workspace", "ew", "payload", "file", "ezil_mint"]
 }

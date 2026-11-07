@@ -477,8 +477,9 @@ class Edge:
         hashed BEFORE parsing and compared with the signed digest; the body is {"v":1,"rel":…} and
         nothing else, rel lexically plain (fsops.plain_rel). Walks <dataMount>/workspace/<rel> with
         fsops.classify_dir_below (lstat + O_DIRECTORY|O_NOFOLLOW per component; nothing created).
-        Answers 200 {"ok": true, "result": ok|missing|not_directory|symlink}; rel is never echoed or
-        logged. Read-only and idempotent: no agent message, no state."""
+        Answers 200 {"ok": true, "result": ok|file|missing|not_directory|symlink} (`file`: the last
+        component is a regular file, which the editor then opens inside its parent); rel is never
+        echoed or logged. Read-only and idempotent: no agent message, no state."""
         cl, te = head.get("content-length"), head.get("transfer-encoding")
         if head.method != "POST" or query:
             _reply(client, 404, {"ok": False, "error": "not_found"})

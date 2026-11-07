@@ -430,16 +430,27 @@ export async function openCodeWindow (ctx = {}) {
     /** A link `folder` the address-bar parser refused (`../app-link.js` parseFolder), said once at the first bind. */
     let link_folder_problem = nativeSurface || ! ctx.folderRejected ? null
         : ctx.folderRejected === 'with_repository' ? 'with_repository' : 'link_invalid';
-    /** What the editor shows, from its last report: `{kind: 'folder', path, base?}`, `{kind: 'empty'}`, `{kind: 'unsupported'}`. */
+    /**
+     * What the editor shows, from its last report: `{kind: 'folder', path, file?, base?}` (`file`: a file link's
+     * file, opened inside `path`), `{kind: 'empty'}`, `{kind: 'unsupported'}`.
+     */
     let editor_root = null;
-    /** Every folder this window's editor has shown (walked by a mint, or opened by the person in Code). */
-    const opened_roots = new Set();
+    /** What an address names for a root: the file a file link opened, else the folder. */
+    const named_by = (root) => (root?.kind === 'folder' ? root.file ?? root.path : null);
+    /**
+     * Every folder or file this window's editor has shown (walked by a mint, or opened by the person in Code), by
+     * the address value that names it, with the root the editor reported for it.
+     */
+    const opened_roots = new Map();
     /** A navigation of the editor is under way (its own switch, or the browser restoring it): start none. */
     let editor_moving = false;
     let route_timer = null;
     let leaving_timer = null;
-    /** The Code parameters for what the editor shows: its folder, or nothing (an empty window, a workspace). */
-    const params_for = (root) => (root?.kind === 'folder' ? { folder: root.path } : {});
+    /**
+     * The Code parameters for what the editor shows: its folder (or the file a file link opened inside it, so the
+     * address keeps naming the file), or nothing (an empty window, a workspace).
+     */
+    const params_for = (root) => (root?.kind === 'folder' ? { folder: named_by(root) } : {});
     /** Say what the editor shows to the address bar (`../app-history.js` owns it): 'push' adds an entry, 'replace' rewrites this one. */
     const announce_root = (mode, root) => {
         if ( disposed || nativeSurface ) return;
@@ -449,18 +460,21 @@ export async function openCodeWindow (ctx = {}) {
         editor_root = root;
         editor_moving = false;
         clearTimeout(leaving_timer); leaving_timer = null;
-        if ( root.kind === 'folder' ) opened_roots.add(root.path);
+        if ( root.kind === 'folder' ) {
+            opened_roots.set(root.path, { kind: 'folder', path: root.path });
+            if ( root.file ) opened_roots.set(root.file, { kind: 'folder', path: root.path, file: root.file });
+        }
         // A mint that asked for a folder and opened another: the notice says so, and the address keeps the asked
         // folder, so a reload or Try again asks the server for it again.
         if ( fallback ) return;
-        wanted_folder = root.kind === 'folder' ? root.path : null;
+        wanted_folder = named_by(root);
         announce_root('replace', root);
     };
     // The editor is about to switch folder itself: its entry first, then the editor replaces its document in it.
     const on_open = (next) => {
         editor_moving = true;
         clearTimeout(route_timer); route_timer = null;
-        wanted_folder = next.kind === 'folder' ? next.path : null;
+        wanted_folder = named_by(next);
         announce_root('push', next);
     };
     const on_leaving = () => {
@@ -489,12 +503,13 @@ export async function openCodeWindow (ctx = {}) {
     const follow_route = (folder) => {
         clearTimeout(route_timer); route_timer = null;
         if ( disposed || nativeSurface || typeof folder !== 'string' ) return;
-        if ( editor_root?.kind === 'folder' && editor_root.path === folder ) return;
+        // `folder` is the entry's address value: a folder, or the file a file link opened (named_by).
+        if ( named_by(editor_root) === folder ) return;
         route_timer = setTimeout(() => {
             route_timer = null;
-            if ( disposed || editor_moving || (editor_root?.kind === 'folder' && editor_root.path === folder) ) return;
-            const target = opened_roots.has(folder) && editor_root?.base
-                ? editorDocumentUrl(el_iframe.src, { kind: 'folder', path: folder, base: editor_root.base }) : null;
+            if ( disposed || editor_moving || named_by(editor_root) === folder ) return;
+            const known = opened_roots.get(folder);
+            const target = known && editor_root?.base ? editorDocumentUrl(el_iframe.src, { ...known, base: editor_root.base }) : null;
             if ( target ) {
                 editor_moving = true;
                 try {
@@ -855,9 +870,9 @@ export async function openCodeWindow (ctx = {}) {
                             forgetFolder(bind);
                             // The refused folder can come from the URL or tab storage. Never name it again:
                             // follow a different displayed root, without navigating or tearing down the editor.
-                            const displayed = editor_root?.kind === 'folder' && editor_root.path !== refused_path
+                            const displayed = editor_root?.kind === 'folder' && named_by(editor_root) !== refused_path
                                 ? editor_root : null;
-                            wanted_folder = displayed?.path ?? null;
+                            wanted_folder = named_by(displayed);
                             announce_root('replace', displayed);
                         },
                     });
