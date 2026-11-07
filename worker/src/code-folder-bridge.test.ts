@@ -167,18 +167,21 @@ describe('isWorkbenchDocumentRequest / isHtmlDocument', () => {
 // ── The script itself, run against a stand-in window ─────────────────────────────────────────────────────────────
 
 interface Posted { m: Record<string, unknown>; o: string }
-function run(opts: { search?: string; pathname?: string; framed?: boolean; navigation?: boolean; origins?: string[]; origin?: string } = {}) {
-  const { search = '?folder=/workspace/a&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA', pathname = '/', framed = true, navigation = true, origins = [SHELL],
-    origin: parentOrigin = SHELL } = opts;
+function run(opts: { search?: string; pathname?: string; framed?: boolean; navigation?: boolean; history?: boolean; origins?: string[]; origin?: string } = {}) {
+  const { search = '?folder=/workspace/a&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA', pathname = '/', framed = true, navigation = true, history = true,
+    origins = [SHELL], origin: parentOrigin = SHELL } = opts;
   const posted: Posted[] = [];
   const replaced: string[] = [];
+  /** `history.replaceState` targets: the file link's payload rewrite, before the workbench reads the address. */
+  const rewritten: string[] = [];
   const timers: Array<{ fn: () => void; ms: number; cleared?: boolean }> = [];
   const listeners: Record<string, Array<(ev: unknown) => void>> = {};
   const navListeners: Array<(ev: unknown) => void> = [];
   const parent = { postMessage: (m: Record<string, unknown>, o: string) => posted.push({ m: structuredClone(m), o }) };
   const g: Record<string, unknown> = {
-    URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON,
-    location: { search, pathname, origin: EDITOR, replace: (u: string) => replaced.push(u) },
+    URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON, encodeURIComponent,
+    // As code-server's workbench sees it: `location.host` is its remote authority (patches/base-path.diff).
+    location: { search, pathname, origin: EDITOR, host: new URL(EDITOR).host, href: `${EDITOR}${pathname}${search}`, replace: (u: string) => replaced.push(u) },
     setTimeout: (fn: () => void, ms: number) => timers.push({ fn, ms }),
     clearTimeout: (id: number) => { const t = timers[id - 1]; if (t) t.cleared = true; },
     addEventListener: (type: string, fn: (ev: unknown) => void) => { (listeners[type] ??= []).push(fn); },
@@ -186,6 +189,7 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   g.window = g;
   g.parent = framed ? parent : g;
   if (navigation) g.navigation = { addEventListener: (type: string, fn: (ev: unknown) => void) => { if (type === 'navigate') navListeners.push(fn); } };
+  if (history) g.history = { state: { k: 1 }, replaceState: (_s: unknown, _t: string, u: string) => { rewritten.push(u); (g.location as { href: string }).href = u; } };
   runInNewContext(codeFolderBridgeScript(origins), g);
   const message = (data: unknown, over: { source?: unknown; origin?: string } = {}) =>
     (listeners.message ?? []).forEach((fn) => fn({ source: over.source ?? parent, origin: over.origin ?? parentOrigin, data }));
@@ -197,7 +201,7 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   };
   const fire = () => { for (const t of timers.splice(0)) if (!t.cleared) t.fn(); };
   const unload = () => (listeners.beforeunload ?? []).forEach((fn) => fn({}));
-  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners };
+  return { posted, replaced, rewritten, timers, message, navigate, fire, unload, parent, navListeners };
 }
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
@@ -231,6 +235,55 @@ describe('the bridge script', () => {
       b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
       expect(b.posted[0]!.m).toEqual({ type: 'ezil.code.folder', v: 1, nonce: NONCE, mint: null, ...report });
     }
+  });
+  // ── a file link (file-url-open-regression, 2026-11-07): `file=` beside its folder ──────────────────────────
+  it('a file beside its folder: hands VS Code the file as its payload before boot, and reports folder and file', () => {
+    const b = run({ search: '?folder=/workspace/pages&file=/workspace/pages/index.js&ezil_mint=AAAAAAAAAAAAAAAAAAAAAA' });
+    expect(b.rewritten.length).toBe(1);
+    const u = new URL(b.rewritten[0]!);
+    expect(u.origin + u.pathname).toBe(`${EDITOR}/`);
+    expect(u.searchParams.get('folder')).toBe('/workspace/pages');
+    expect(u.searchParams.get('file')).toBe('/workspace/pages/index.js');
+    expect(u.searchParams.get('ezil_mint')).toBe('AAAAAAAAAAAAAAAAAAAAAA');
+    // VS Code's `payload`: `[["openFile", <uri>]]`, the URI on this document's own host (code-server's remoteAuthority).
+    expect(JSON.parse(u.searchParams.get('payload')!)).toEqual([['openFile', `vscode-remote://${new URL(EDITOR).host}/workspace/pages/index.js`]]);
+    b.posted.length = 0;
+    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
+    expect(b.posted).toEqual([{ m: { type: 'ezil.code.folder', v: 1, nonce: NONCE, mint: 'AAAAAAAAAAAAAAAAAAAAAA', kind: 'folder',
+      path: '/workspace/pages', file: '/workspace/pages/index.js', base: '/' }, o: SHELL }]);
+  });
+  it('a file name with a space, Unicode, # or ? is percent-encoded in the URI (VS Code decodes the path) and reported as is', () => {
+    const file = '/workspace/my site/日本 notes #1?.md';
+    const b = run({ search: `?folder=${encodeURIComponent('/workspace/my site')}&file=${encodeURIComponent(file)}` });
+    const payload = JSON.parse(new URL(b.rewritten[0]!).searchParams.get('payload')!) as [string, string][];
+    expect(payload).toEqual([['openFile', `vscode-remote://${new URL(EDITOR).host}/workspace/my%20site/%E6%97%A5%E6%9C%AC%20notes%20%231%3F.md`]]);
+    expect(new URL(payload[0]![1].replace(/^vscode-remote:/, 'https:')).pathname).toBe('/workspace/my%20site/%E6%97%A5%E6%9C%AC%20notes%20%231%3F.md');
+    b.posted.length = 0;
+    b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
+    expect(b.posted[0]!.m).toMatchObject({ kind: 'folder', path: '/workspace/my site', file });
+  });
+  it('a `file` that is not a direct child of the folder is neither opened nor reported', () => {
+    for (const file of ['/workspace/other/index.js', '/workspace/pages', '/workspace/pages/', '/workspace/pages/a/b.js', '/workspace/pagesx/a.js', 'index.js', '']) {
+      const b = run({ search: `?folder=/workspace/pages&file=${encodeURIComponent(file)}` });
+      expect({ file, rewritten: b.rewritten }).toEqual({ file, rewritten: [] });
+      b.posted.length = 0;
+      b.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
+      expect(b.posted[0]!.m).toEqual({ type: 'ezil.code.folder', v: 1, nonce: NONCE, mint: null, kind: 'folder', path: '/workspace/pages', base: '/' });
+    }
+  });
+  it('an address that already carries a payload (the browser restoring this document) is left alone; no history API, no file open, still a report', () => {
+    const restored = run({ search: '?folder=/workspace/pages&file=/workspace/pages/index.js&payload=%5B%5D' });
+    expect(restored.rewritten).toEqual([]);
+    restored.posted.length = 0;
+    restored.message({ type: 'ezil.code.hello', v: 1, nonce: NONCE });
+    expect(restored.posted[0]!.m).toMatchObject({ kind: 'folder', path: '/workspace/pages', file: '/workspace/pages/index.js' });
+    const bare = run({ search: '?folder=/workspace/pages&file=/workspace/pages/index.js', history: false });
+    expect(bare.rewritten).toEqual([]);
+    expect(bare.posted).toEqual([{ m: { type: 'ezil.code.ready', v: 1 }, o: SHELL }]);
+  });
+  it('a plain folder address is never rewritten', () => {
+    expect(run().rewritten).toEqual([]);
+    expect(run({ search: '?ew=true' }).rewritten).toEqual([]);
   });
   it('ignores a hello from another window, another origin, a bad nonce or another version', () => {
     const b = run();

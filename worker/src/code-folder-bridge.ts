@@ -11,12 +11,14 @@
  *   - only when framed, only to the OS shell that frames this realm's editors (`codeShellOriginsFor`: one exact
  *     origin per preview zone), never with a `*` target;
  *   - `ezil.code.ready` {v:1} once at load, so the shell says hello;
- *   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, base?} only in answer to a hello whose source is
+ *   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, file?, base?} only in answer to a hello whose source is
  *     window.parent, whose origin is allowed and whose nonce is 22 base64url characters. `kind` is `folder` (a path
  *     on this computer: code-server's `folder=` that starts with `/`), `workspace`, `foreign` (another scheme) or
- *     `empty`; `mint` is this document's own `ezil_mint`, else null; `base` is its `location.pathname`. Read from
- *     the document's OWN address: every remote folder or workspace change in the web workbench is a new document
- *     load (`workspaceProvider.open`), so the address is the whole truth for this document;
+ *     `empty`; `file` is the document's `file=` when it is a direct child of that folder (the Worker's walked
+ *     regular file, which this script also hands VS Code as its `payload`, below); `mint` is this document's own
+ *     `ezil_mint`, else null; `base` is its `location.pathname`. Read from the document's OWN address: every remote
+ *     folder or workspace change in the web workbench is a new document load (`workspaceProvider.open`), so the
+ *     address is the whole truth for this document;
  *   - `ezil.code.open` {v:1, id, kind, path?} when the editor is about to switch folder IN THIS FRAME (Open Folder,
  *     Open Recent, Close Folder, a workspace). The editor's own switch would PUSH a frame entry; a frame entry's
  *     top-level part is shared with the entry before it, so the shell could not give it its own address (measured,
@@ -92,8 +94,15 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
   return `(()=>{try{const O=${O};if(window.parent===window||!O.length)return;`
     + `const T=/^[A-Za-z0-9_-]{22}$/;`
     + `const tok=()=>{const b=new Uint8Array(16);crypto.getRandomValues(b);return btoa(String.fromCharCode(...b)).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"")};`
-    + `const what=s=>{const q=new URLSearchParams(s);const f=q.get("folder");if(f!==null)return f.startsWith("/")&&f.length<=4096?{kind:"folder",path:f}:{kind:"foreign"};if(q.has("workspace"))return{kind:"workspace"};return{kind:"empty"}};`
+    + `const what=s=>{const q=new URLSearchParams(s);const f=q.get("folder");if(f!==null){if(!(f.startsWith("/")&&f.length<=4096))return{kind:"foreign"};const r={kind:"folder",path:f};const x=q.get("file");const p=f==="/"?"/":f+"/";if(x!==null&&x.length<=4096&&x.startsWith(p)&&x.length>p.length&&!x.slice(p.length).includes("/"))r.file=x;return r}if(q.has("workspace"))return{kind:"workspace"};return{kind:"empty"}};`
     + `const here=what(location.search);const base=String(location.pathname||"");if((here.kind==="folder"||here.kind==="empty")&&base.length<=256)here.base=base;`
+    // A file beside its folder (`file=`, the Worker's walked regular file): VS Code opens a file at boot only from
+    // its `payload` (`[["openFile", <uri>]]`, workbench.ts -> environmentService filesToOpenOrCreate), and code-server's
+    // workbench takes its remoteAuthority from the document's own `location.host` (patches/base-path.diff), so the
+    // URI is composed here, from this document, and written into the address BEFORE the workbench reads it (this
+    // script runs in <head>; the workbench is a module at the end of the document). An address that already has a
+    // payload (the browser restoring this document) is left alone.
+    + `if(here.kind==="folder"&&here.file){try{const u=new URL(location.href);if(!u.searchParams.has("payload")){u.searchParams.set("payload",JSON.stringify([["openFile","vscode-remote://"+location.host+here.file.split("/").map(encodeURIComponent).join("/")]]));history.replaceState(history.state,"",u.href)}}catch{}}`
     + `let mint=null;try{const m=new URLSearchParams(location.search).get("ezil_mint");mint=m&&T.test(m)?m:null}catch{}`
     + `const tell=(m)=>{for(const o of O){try{window.parent.postMessage(m,o)}catch{}}};`
     + `const pending=new Map();`

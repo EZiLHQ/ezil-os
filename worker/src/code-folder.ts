@@ -14,8 +14,14 @@
  *      `unverified` and today's default folder opens;
  *   3. only a walked folder becomes the bootstrap's `folder=`, and only when the bootstrap URL
  *      stays within CODE_FOLDER_URL_MAX (`too_long` otherwise).
- * The answer carries `codeFolder: {v:1, outcome}`: a CODE, never a path. Anything but `restored`
- * opens today's per-provider default, and the shell says so visibly while keeping its record.
+ * A link may also name a FILE (`/app/code?folder=/workspace/pages/index.js`, file-url-open-regression
+ * 2026-11-07): the walk answers `file` when every component but the last is a real directory and the
+ * last is a regular file (never a symlink); the bootstrap then opens the file's own parent as `folder=`
+ * and names the file as `file=`, which the workbench bridge turns into VS Code's `payload`
+ * (`[["openFile", …]]`) before the editor boots (`./code-folder-bridge.ts`). A missing file is `missing`,
+ * exactly as a missing folder: nothing is ever created.
+ * The answer carries `codeFolder: {v:1, outcome}`: a CODE, never a path. Anything but `restored` or
+ * `file` opens today's per-provider default, and the shell says so visibly while keeping its record.
  *
  * Same grammar as the shell and the app: docs/contracts/code-folder-v1.vectors.json.
  */
@@ -36,11 +42,16 @@ export const CODE_FOLDER_URL_MAX = 2000;
 /** The shell's per-mint instance id on the bootstrap URL (shell/ezil/apps/code-folder.js MINT_PARAM). */
 export const CODE_FOLDER_MINT_PARAM = 'ezil_mint';
 /**
- * Keys code-server reads to choose what a document opens (`folder`, `workspace`, `ew`, `payload`), plus the
- * mint id. On a Code bootstrap they may only arrive as the bootstrap's OWN parameters, checked here, never
- * hidden inside its `path` (which is forwarded as given).
+ * The file a Code bootstrap opens inside its `folder=` (a direct child of it, walked as a regular file). Read by
+ * the workbench bridge only (`./code-folder-bridge.ts`), which turns it into VS Code's own `payload`.
  */
-export const CODE_BOOTSTRAP_PATH_REFUSED_KEYS = ['folder', 'workspace', 'ew', 'payload', CODE_FOLDER_MINT_PARAM] as const;
+export const CODE_FOLDER_FILE_PARAM = 'file';
+/**
+ * Keys code-server reads to choose what a document opens (`folder`, `workspace`, `ew`, `payload`), the file the
+ * bridge opens, plus the mint id. On a Code bootstrap they may only arrive as the bootstrap's OWN parameters,
+ * checked here, never hidden inside its `path` (which is forwarded as given).
+ */
+export const CODE_BOOTSTRAP_PATH_REFUSED_KEYS = ['folder', 'workspace', 'ew', 'payload', CODE_FOLDER_FILE_PARAM, CODE_FOLDER_MINT_PARAM] as const;
 
 const MAX_SEGMENT_BYTES = 255;
 const MAX_SEGMENTS = 64;
@@ -50,7 +61,7 @@ const utf8Bytes = (s: string) => new TextEncoder().encode(s).length;
 
 /** What the answer's `codeFolder.outcome` may say. Codes only, never a path. */
 export const CODE_FOLDER_OUTCOMES = [
-  'restored', 'missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error',
+  'restored', 'file', 'missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error',
 ] as const;
 export type CodeFolderOutcome = (typeof CODE_FOLDER_OUTCOMES)[number];
 
@@ -87,6 +98,15 @@ export function plainFolderPath(value: unknown): string | null {
   const segments = path.slice(1).split('/');
   if (segments.length > MAX_SEGMENTS) return null;
   return segments.every((s) => s !== '' && s !== '.' && s !== '..' && utf8Bytes(s) <= MAX_SEGMENT_BYTES) ? path : null;
+}
+
+/**
+ * Whether `file` is a direct child of `folder` (both plain, as `plainFolderPath` gives them): the only shape a
+ * bootstrap's `file=` may take, since the walk opens a file inside its own parent.
+ */
+export function codeFileInFolder(file: string, folder: string): boolean {
+  const prefix = folder === '/' ? '/' : `${folder}/`;
+  return file.startsWith(prefix) && file.length > prefix.length && !file.slice(prefix.length).includes('/');
 }
 
 /** `{v:1, path}` exactly (an unknown key, another version or a non-plain path is refused), else null. */
@@ -136,20 +156,28 @@ export function planCodeFolder(ask: unknown, root: string): CodeFolderPlan {
 
 /**
  * Walks `rel` below the root ON THE COMPUTER with no symlink followed, and answers a code (`restored` only for a
- * real directory every component of which is a real directory). Written by e1cd418a (`code-folder-resolve.ts`).
+ * real directory every component of which is a real directory; `file` only for a regular file whose every parent
+ * component is a real directory). Written by e1cd418a (`code-folder-resolve.ts`).
  */
 export type CodeFolderResolver = (rel: string) => Promise<CodeFolderOutcome>;
 
-/** One mint's folder decision: the outcome to answer (absent when nothing was asked) and the folder to open. */
+/** One mint's folder decision: the outcome to answer (absent when nothing was asked) and what to open. */
 export interface CodeFolderSettlement {
   outcome?: CodeFolderOutcome;
-  /** Set only when the computer walked it (`restored`): `<root>/<rel>`, or the root itself. */
+  /**
+   * Set only when the computer walked it: `<root>/<rel>` or the root itself (`restored`), or the walked file's own
+   * parent (`file`).
+   */
   folder?: string;
+  /** Set only for `file`: the walked regular file, `<root>/<rel>`, a direct child of `folder`. */
+  file?: string;
 }
 
 /**
  * Plan, then walk with `resolve` when one is wired. Never throws: a resolver failure is `error`, an unknown
- * resolver answer is `error`, and no resolver at all is `unverified`. Only `restored` yields a folder.
+ * resolver answer is `error`, and no resolver at all is `unverified`. Only `restored` yields a folder; only `file`
+ * yields a file (inside its parent folder). A `file` answer for the root itself cannot be (the root is a directory
+ * or the walk says so): it is `error`, so no parent above the root is ever composed.
  */
 export async function settleCodeFolder(ask: unknown, root: string, resolve?: CodeFolderResolver): Promise<CodeFolderSettlement> {
   const plan = planCodeFolder(ask, root);
@@ -163,9 +191,13 @@ export async function settleCodeFolder(ask: unknown, root: string, resolve?: Cod
   } catch {
     outcome = 'error';
   }
-  if (outcome !== 'restored') return { outcome };
+  if (outcome === 'file' && plan.rel === '') outcome = 'error';
+  if (outcome !== 'restored' && outcome !== 'file') return { outcome };
   const base = plainFolderPath(root)!;
-  return { outcome, folder: plan.rel === '' ? base : `${base === '/' ? '' : base}/${plan.rel}` };
+  const walked = plan.rel === '' ? base : `${base === '/' ? '' : base}/${plan.rel}`;
+  if (outcome === 'restored') return { outcome, folder: walked };
+  const cut = walked.lastIndexOf('/');
+  return { outcome, folder: cut === 0 ? '/' : walked.slice(0, cut), file: walked };
 }
 
 /** Whether a bootstrap URL that opens a restored folder still fits the shell's frame confirmation. */

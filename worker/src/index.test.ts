@@ -1165,9 +1165,11 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
     expect(src).toContain('const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);');
     // Per-tab folder continuity: a walked folder (`settleCodeFolder` -> `restored`) wins over the default, and a
     // restore whose URL would pass the frame-confirm cap falls back to the default (`too_long`).
+    // A walked regular file (`file`) rides beside its parent folder; `too_long` drops both.
     expect(src).toContain(
-      'let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));',
+      'let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder, codeFolder.file));',
     );
+    expect(src).toContain('codeFolder.file = undefined;');
     expect(src).toContain(
       'const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,\n'
       + '      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));',
@@ -1246,6 +1248,14 @@ describe('codePreviewFolderParams', () => {
     expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' }, undefined)).toEqual({ folder: '/workspace' });
     expect(codePreviewFolderParams({ mounted: false }, undefined)).toBeUndefined();
     expect(codePreviewFolderParams({ mounted: false }, '')).toBeUndefined();
+  });
+
+  it('a walked file (`file`) rides beside its parent folder only; never without a folder', async () => {
+    const { codePreviewFolderParams } = await import('./index-test-helpers.test');
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' }, '/workspace/pages', '/workspace/pages/index.js'))
+      .toEqual({ folder: '/workspace/pages', file: '/workspace/pages/index.js' });
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' }, undefined, '/workspace/pages/index.js')).toEqual({ folder: '/workspace' });
+    expect(codePreviewFolderParams({ mounted: false }, undefined, '/home/neko/project/x')).toBeUndefined();
   });
 });
 

@@ -174,11 +174,13 @@ describe('the walk script in real shells', () => {
         expect(walk(shell, root, 'a/dang')).toBe('symlink');
         expect(walk(shell, root, 'a/flink')).toBe('symlink');
       });
-      it('answers not_directory for a file, and missing for what is not there', () => {
-        expect(walk(shell, root, 'a/file.txt')).toBe('not_directory');
+      it('answers file for a regular file as the last component, not_directory for one in the middle, and missing for what is not there', () => {
+        expect(walk(shell, root, 'a/file.txt')).toBe('file');
         expect(walk(shell, root, 'a/file.txt/x')).toBe('not_directory');
         expect(walk(shell, root, 'a/nope')).toBe('missing');
         expect(walk(shell, root, 'a/nope/x')).toBe('missing');
+        // a symlink TO a file is a symlink, never a file (checked before -f, which follows links)
+        expect(walk(shell, root, 'a/flink')).toBe('symlink');
       });
       it('keeps spaces, Unicode, glob characters and a leading - literal', () => {
         expect(walk(shell, root, 'my folder/ünï cødé')).toBe('restored');
@@ -229,7 +231,9 @@ describe('the walk script in real shells', () => {
     expect(await settleCodeFolder({ v: 1, path: root }, root, resolve)).toEqual({ outcome: 'restored', folder: root });
     expect(await settleCodeFolder({ v: 1, path: `${root}/link/b` }, root, resolve)).toEqual({ outcome: 'symlink' });
     expect(await settleCodeFolder({ v: 1, path: `${root}/a/b/last` }, root, resolve)).toEqual({ outcome: 'symlink' });
-    expect(await settleCodeFolder({ v: 1, path: `${root}/a/file.txt` }, root, resolve)).toEqual({ outcome: 'not_directory' });
+    // a regular file: its parent is the folder, the file rides beside it (the bootstrap's `file=`)
+    expect(await settleCodeFolder({ v: 1, path: `${root}/a/file.txt` }, root, resolve)).toEqual({ outcome: 'file', folder: `${root}/a`, file: `${root}/a/file.txt` });
+    expect(await settleCodeFolder({ v: 1, path: `${root}/a/file.txt/x` }, root, resolve)).toEqual({ outcome: 'not_directory' });
     expect(await settleCodeFolder({ v: 1, path: `${root}/my folder/ünï cødé` }, root, resolve)).toEqual({ outcome: 'restored', folder: `${root}/my folder/ünï cødé` });
     // the planner's refusals never reach the walk
     expect(await settleCodeFolder({ v: 1, path: `${dir}/outside` }, root, resolve)).toEqual({ outcome: 'outside' });
@@ -289,7 +293,8 @@ describe('the walk script in real shells', () => {
       expect(await resolve('a/b')).toBe('restored');
       expect(await resolve('nope')).toBe('missing');
       expect(await resolve('link/b')).toBe('symlink');
-      expect(await resolve('a/file.txt')).toBe('not_directory');
+      expect(await resolve('a/file.txt')).toBe('file');
+      expect(await resolve('a/file.txt/x')).toBe('not_directory');
       expect(await cloudflareCodeFolderResolver(s.exec, 'relative/root')('a')).toBe('error');
       expect(await resolve('x*')).toBe('missing'); // a glob is still literal (set -f, inside the subshell)
       // The same shell, unchanged: no `set -f`, default IFS, no positional parameters, and it still runs commands.
@@ -329,7 +334,7 @@ describe('awsCodeFolderResolver: the host edge folder op (host-agent edge.py `_f
   });
   const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
   /** The walk's code → the host's `result` (the inverse of the resolver's table). */
-  const HOST_RESULT: Record<string, string> = { restored: 'ok', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink' };
+  const HOST_RESULT: Record<string, string> = { restored: 'ok', file: 'file', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink' };
 
   /**
    * A host edge stand-in that holds the Worker to the op's contract before answering: POST, the record's own origin,
