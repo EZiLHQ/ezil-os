@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -45,12 +46,15 @@ def git(repo, *args):
                            '-c', 'commit.gpgsign=false', *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def tar_gz(members, directories=()):
+def tar_gz(members, directories=(), special=None):
+    """special maps an entry name to a non-regular tar type (directory, symlink, hardlink, FIFO)."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode='w:gz') as bundle:
-        for name in directories:
+        for name, kind in {**{name: tarfile.DIRTYPE for name in directories}, **(special or {})}.items():
             info = tarfile.TarInfo(name)
-            info.type = tarfile.DIRTYPE
+            info.type = kind
+            if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                info.linkname = '/etc/systemd/system' if kind == tarfile.SYMTYPE else 'compose.yaml'
             bundle.addfile(info)
         for name, data in members.items():
             info = tarfile.TarInfo(name)
@@ -62,7 +66,7 @@ def tar_gz(members, directories=()):
 class App:
     """One whole-app artifact: a docker-save style archive, its checksum marker and identities."""
     def __init__(self, root, tag, sha, repo, repo_tags=None, index_name=None, revision=None, architecture='amd64',
-                 index_entries=1, pad_index=0, runtime_extra=None):
+                 index_entries=1, pad_index=0, runtime_extra=None, cron_type=tarfile.DIRTYPE):
         self.tag, self.sha = tag, sha
         config = json.dumps({'architecture': architecture, 'os': 'linux', 'config': {
             'Labels': {'org.opencontainers.image.revision': revision or sha, 'fixture.tag': tag}, 'Env': ['EZIL_GIT_SHA=' + sha]}}).encode()
@@ -79,7 +83,7 @@ class App:
                                         check=True, capture_output=True).stdout for name in ops.RUNTIME}
         runtime.update(runtime_extra or {})
         self.runtime = root / (tag + '.runtime.tar.gz')
-        self.runtime.write_bytes(tar_gz(runtime, directories=('cron',)))
+        self.runtime.write_bytes(tar_gz(runtime, special={'cron': cron_type}))
         self.marker = root / (tag + '.sha256')
         self.marker.write_text(f'{sha256(self.archive.read_bytes())}  {tag}.tar.gz\n{sha256(self.runtime.read_bytes())}  {tag}.runtime.tar.gz\n')
         self.checksum = sha256(self.marker.read_bytes())
@@ -331,6 +335,10 @@ class AppSwapTests(unittest.TestCase):
                  # A >1 MiB index naming another tag must be refused, not skipped.
                  (dict(index_name='docker.io/library/ezil-os-staging:old-app', pad_index=ops.SMALL), 'not inspectable', False),
                  (dict(runtime_extra={'cron/extra.timer': b'x'}), 'invalid runtime archive members', False),
+                 # install-host.sh accepts cron only as a directory: refuse before any docker load moves a tag.
+                 (dict(cron_type=tarfile.SYMTYPE), 'invalid runtime archive members', False),
+                 (dict(cron_type=tarfile.LNKTYPE), 'invalid runtime archive members', False),
+                 (dict(cron_type=tarfile.FIFOTYPE), 'invalid runtime archive members', False),
                  (dict(runtime_extra={'render-env.py': b'import os\n'}), 'runtime archive differs from the baked source', False))
         for number, (options, message, pin_good_image) in enumerate(cases):
             bad = self.root / f'bad-{number}'
@@ -692,6 +700,76 @@ class AppSwapTests(unittest.TestCase):
         self.assertEqual(self.entries()[-1]['state'], 'completed')
         self.assertEqual(len(self.installs()), 1)
 
+    def test_completion_requires_post_install_quiescence(self):
+        # Each condition appears only once the install has run, before the after-probe reads the host.
+        for name, condition, clear in (
+                ('deploy lock held', lambda: setattr(self.host, 'lock_free', False), lambda: setattr(self.host, 'lock_free', True)),
+                ('install queued for this host', lambda: self.in_flight.append((OTHER, 'Pending', [ssm.HOST])), lambda: self.in_flight.clear()),
+                ('command addressed by Targets', lambda: self.in_flight.append((OTHER, 'InProgress', [])), lambda: self.in_flight.clear()),
+                ('timer service running', lambda: self.host.timers['pool-replenish'].update(service='activating'),
+                 lambda: self.host.timers['pool-replenish'].update(service='inactive'))):
+            with self.subTest(name):
+                self.setUp()
+                path = self.plan('swap', self.old, self.new)
+                self.probe_hooks = {'-after-': condition}
+                with self.assertRaisesRegex(ValueError, 'staging host is not proven quiescent; retain the fence'):
+                    ops.swap(path, self.repo, True, self.ledger)
+                self.probe_hooks = {}
+                # The host is at the expected state, but the row stays pending.
+                self.assertEqual((self.host.git_sha, self.host.image_id), (self.new.sha, self.new.image))
+                self.assertEqual(self.entries()[-1]['state'], 'pending')
+                # Rerunning resumes the same command, re-probes and refuses again; reconciliation refuses too.
+                with self.assertRaisesRegex(ValueError, 'not proven quiescent'):
+                    ops.swap(path, self.repo, True, self.ledger)
+                with self.assertRaisesRegex(ValueError, 'not proven quiescent'):
+                    ops.reconcile(path, True, self.ledger)
+                self.assertEqual(self.entries()[-1]['state'], 'pending')
+                clear()
+                ops.swap(path, self.repo, True, self.ledger)
+                self.assertEqual(self.entries()[-1]['state'], 'completed')
+                self.assertEqual(len(self.installs()), 1)
+
+    def test_swap_reinspects_the_artifacts_the_receipt_names(self):
+        path = self.plan('swap', self.old, self.new)
+        good = manifest.read(ops.receipt_path(path))
+        self.assertEqual((good['archivePath'], good['checksumPath'], good['runtimePath']),
+                         (str(self.new.archive), str(self.new.marker), str(self.new.runtime)))
+        refusal = re.escape(ops.RECEIPT_UNVERIFIED)
+        receipts = (('forged image evidence', {**good, 'archiveSha256': '0' * 64}),
+                    ('forged runtime evidence', {**good, 'runtimeSha256': '0' * 64}),
+                    ('forged public configuration', {**good, 'publicConfigSha256': '1' * 64}),
+                    # Paths to other, genuine artifacts: they do not hash to this plan's marker pins.
+                    ('other artifacts', {**good, 'archivePath': str(self.old.archive), 'runtimePath': str(self.old.runtime)}),
+                    ('relative path', {**good, 'archivePath': self.new.archive.name}),
+                    ('evidence without paths', {k: v for k, v in good.items() if not k.endswith('Path')}))
+        for name, receipt in receipts:
+            TOOL.write(ops.receipt_path(path), receipt)
+            self.calls.clear()
+            with self.subTest(name):
+                self.assert_refused_before_pending(refusal, path)
+                self.assertEqual(self.calls, [])
+        TOOL.write(ops.receipt_path(path), good)
+        # The checked bytes are replaced or removed after app-archive-check.
+        runtime = self.new.runtime.read_bytes()
+        with tarfile.open(self.new.runtime) as bundle:
+            files = {m.name: bundle.extractfile(m).read() for m in bundle.getmembers() if m.isfile()}
+        # Same members in another order: different bytes from the marker's pin.
+        repacked = tar_gz(dict(reversed(list(files.items()))), directories=('cron',))
+        self.assertNotEqual(repacked, runtime)
+        for name, damage, repair in (('runtime re-packed', lambda: self.new.runtime.write_bytes(repacked),
+                                      lambda: self.new.runtime.write_bytes(runtime)),
+                                     ('archive removed', lambda: self.new.archive.rename(self.root / 'moved.tar.gz'),
+                                      lambda: (self.root / 'moved.tar.gz').rename(self.new.archive))):
+            damage()
+            self.calls.clear()
+            with self.subTest(name):
+                self.assert_refused_before_pending(refusal, path)
+                self.assertEqual(self.calls, [])
+            repair()
+        ops.swap(path, self.repo, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
+        self.assertEqual(len(self.installs()), 1)
+
     # ---- restore ---------------------------------------------------------------------------
     def test_restore_is_its_own_ledger_valid_operation(self):
         swap_path = self.plan('swap', self.old, self.new)
@@ -762,13 +840,14 @@ class AppSwapTests(unittest.TestCase):
         stop_conditions = ('live app differs from the plan before-state', 'post-install state differs; run app-swap-reconcile',
                            'one-shot SSM command failed; reconcile under the retained fence', 'manual reconciliation required',
                            'uncertain SSM submission; reconcile command before retry',
-                           'app secret changed while pending; manual reconciliation required')
+                           'app secret changed while pending; manual reconciliation required',
+                           'staging host is not proven quiescent; retain the fence')
         for message in stop_conditions:
             self.assertIn("'" + message + "'", sources)
             self.assertTrue(any(message.startswith(text) for text in quoted), message)
         # The other app-operation refusals an operator acts on must also print.
         operator = (*stop_conditions, 'staging host is not quiescent', 'candidate tag already names another image',
-                    'staging host is not proven quiescent; retain the fence', 'app-swap-reconcile requires this plan pending entry',
+                    'archive receipt does not match the inspected artifacts; run app-archive-check', 'app-swap-reconcile requires this plan pending entry',
                     'archive receipt missing; run app-archive-check', 'stale plan: ledger generation advanced',
                     'app-restore must undo the latest completed app-swap', 'app operation pending; run app-swap-reconcile',
                     'one-shot SSM command already ended; reconcile it, never resubmit', 'remote command not terminal; wait or cancel')

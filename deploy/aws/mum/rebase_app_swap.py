@@ -35,6 +35,7 @@ INSTALLER = 'deploy/aws/os-staging/install-host.sh'
 SLUG = 'ezil-os-staging'
 SMALL = 1024 * 1024
 SECRET_DRIFT = 'app secret changed while pending; manual reconciliation required'
+RECEIPT_UNVERIFIED = 'archive receipt does not match the inspected artifacts; run app-archive-check'
 PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
 METADATA = ('manifest.json', 'repositories', 'index.json')
 # install-host.sh extracts exactly these runtime members and runs render-env.py as root.
@@ -84,7 +85,7 @@ def receipt_path(plan_path):
 
 
 def scan_archive(path):
-    """SHA-256 of the gzip file, the bytes of every small regular member, and every member name."""
+    """SHA-256 of the gzip file, the bytes of every small regular member, and every member name with its tar type."""
     digest = hashlib.sha256()
 
     class Reader:
@@ -96,13 +97,13 @@ def scan_archive(path):
             digest.update(chunk)
             return chunk
 
-    members, names = {}, set()
+    members, names = {}, {}
     with release.safe_path(path).open('rb') as raw:
         reader = Reader(raw)
         with tarfile.open(fileobj=reader, mode='r|gz') as bundle:
             for member in bundle:
                 need(member.name not in names, 'duplicate archive member')
-                names.add(member.name)
+                names[member.name] = member.type
                 if member.isfile() and member.size <= SMALL:
                     members[member.name] = bundle.extractfile(member).read()
         while reader.read(SMALL):
@@ -150,7 +151,9 @@ def runtime_check(runtime, sha, plan, source_repo):
     """The runtime archive install-host.sh extracts must equal the baked commit's files, byte for byte."""
     digest, members, names = scan_archive(runtime)
     need(digest == sha, 'runtime archive differs from the checksum marker')
-    need(names - {'cron'} == set(RUNTIME) and set(members) == set(RUNTIME), 'invalid runtime archive members')
+    # As install-host.sh: an entry named cron may only be a directory; every other member is a regular file.
+    need(set(names) - {'cron'} == set(RUNTIME) and set(members) == set(RUNTIME) and names.get('cron', tarfile.DIRTYPE) == tarfile.DIRTYPE,
+         'invalid runtime archive members')
     for name in RUNTIME:
         path = 'deploy/aws/os-staging/' + name
         need(members[name] == git_file(source_repo, plan['agentCommit'], path) == git_file(source_repo, plan['to']['gitSha'], path),
@@ -158,9 +161,8 @@ def runtime_check(runtime, sha, plan, source_repo):
     return digest
 
 
-def archive_check(plan_path, archive, checksum, runtime, source_repo, apply):
+def inspect_artifacts(plan_path, plan, archive, checksum, runtime, source_repo):
     """Local preflight of the exact archive bytes the checksum marker pins, before any docker load."""
-    plan = load_plan(plan_path)
     dst = plan['to']
     marker = release.safe_path(checksum).read_bytes()
     need(hashlib.sha256(marker).hexdigest() == dst['checksumSha256'], 'checksum marker differs from the plan pin')
@@ -173,22 +175,34 @@ def archive_check(plan_path, archive, checksum, runtime, source_repo, apply):
     public = archive_tags(members, names, dst['tag'], dst['imageId'], dst['gitSha'])
     runtime_sha = runtime_check(runtime, runtime_pin.group(1), plan, source_repo)
     # Evidence for the operator: compare with the approved staging public configuration.
-    receipt = {'planSha256': release.digest(plan_path), 'tag': dst['tag'], 'imageId': dst['imageId'],
-               'checksumSha256': dst['checksumSha256'], 'archiveSha256': sha, 'runtimeSha256': runtime_sha, 'publicConfigSha256': public}
+    return {'planSha256': release.digest(plan_path), 'tag': dst['tag'], 'imageId': dst['imageId'],
+            'checksumSha256': dst['checksumSha256'], 'archiveSha256': sha, 'runtimeSha256': runtime_sha, 'publicConfigSha256': public,
+            'archivePath': str(archive), 'checksumPath': str(checksum), 'runtimePath': str(runtime)}
+
+
+def archive_check(plan_path, archive, checksum, runtime, source_repo, apply):
+    receipt = inspect_artifacts(plan_path, load_plan(plan_path), archive, checksum, runtime, source_repo)
     if apply:
         release.json_tool.write(receipt_path(plan_path), receipt)
-    print(('Archive receipt written: ' if apply else 'DRY RUN: archive verified: ') + dst['tag'])
+    print(('Archive receipt written: ' if apply else 'DRY RUN: archive verified: ') + receipt['tag'])
     return receipt
 
 
-def require_receipt(plan_path, plan):
+def require_receipt(plan_path, plan, source_repo):
+    """The receipt is a claim, not proof: inspect the artifacts it names again and require the same result.
+
+    install-host.sh checks both downloaded archives against the plan-pinned marker before docker load,
+    so equal hashes here mean the host loads exactly the bytes inspected here.
+    """
     need(receipt_path(plan_path).is_file(), 'archive receipt missing; run app-archive-check')
     receipt = manifest.read(release.safe_path(receipt_path(plan_path)))
-    dst = plan['to']
-    need(isinstance(receipt, dict) and set(receipt) == {'planSha256', 'tag', 'imageId', 'checksumSha256', 'archiveSha256', 'runtimeSha256', 'publicConfigSha256'} and
-         receipt['planSha256'] == release.digest(plan_path) and
-         (receipt['tag'], receipt['imageId'], receipt['checksumSha256']) == (dst['tag'], dst['imageId'], dst['checksumSha256']),
-         'archive receipt does not match plan')
+    paths = ('archivePath', 'checksumPath', 'runtimePath')
+    need(isinstance(receipt, dict) and all(isinstance(receipt.get(key), str) for key in paths), RECEIPT_UNVERIFIED)
+    try:
+        inspected = inspect_artifacts(plan_path, plan, *(receipt[key] for key in paths), source_repo)
+    except (ValueError, OSError, tarfile.TarError, UnicodeDecodeError):
+        inspected = None
+    need(inspected == receipt, RECEIPT_UNVERIFIED)
 
 
 def probe(plan_path, operation, tag):
@@ -260,7 +274,7 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
     installer = release.safe_path(release.REPO / INSTALLER)
     need(release.digest(installer) == plan['installerSha256'], 'staging installer changed')
     check_source(plan, source_repo)
-    require_receipt(plan_path, plan)
+    require_receipt(plan_path, plan, source_repo)
     with release.json_tool.app_secret_lock() as fd:
         envelope = read_secret(fd)
         _, d = release.secret_deployment(envelope)
@@ -309,6 +323,8 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
                        release.aws, release.json_tool.write, one_shot=True)
         after = probe(plan_path, f'app-probe-g{pending["generation"]}-after', dst['tag'])
         need(at(after, dst, deployment), 'post-install state differs; run app-swap-reconcile')
+        # As reconciliation: another install still queued or holding deploy.lock could replace the app after this row closes.
+        need(after['lockFree'] and services_idle(after) and not other_in_flight(), 'staging host is not proven quiescent; retain the fence')
         check = read_secret(fd)
         need(check['VersionId'] == envelope['VersionId'], 'app secret changed during app swap')
         terminal(ledger_path, ledger, pending, 'completed', check, d, dst)
