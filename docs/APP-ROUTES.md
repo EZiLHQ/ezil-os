@@ -262,7 +262,16 @@ code-server's workbench document on both computers
   the folder, and Back/Forward to a file entry navigate the editor to
   `folder=<parent>&file=<file>` again (only to a file this window's editor
   has already shown, as for a folder). A `file` answer whose first document
-  does not show that file is `not_reopened`, visibly.
+  does not show that file is `not_reopened`, visibly. Known limits
+  (independent review, 7 Nov 2026): a Back/Forward to a file entry re-sends
+  `file=` without a new walk, so a file deleted meanwhile is opened by VS Code
+  as an untitled buffer at that path (the link path never does this: `file=`
+  follows a walk that answered `file`); and from a file document, Back to an
+  entry naming the same parent FOLDER navigates the editor once more (to drop
+  the open file), through its own `beforeunload`. Release order: the shell
+  bundle with or before the Worker (an older shell shows `unsupported_server`
+  over a file the new Worker did open; a newer shell over an older Worker or
+  host is honest: `not_directory`).
 
 Tests: `app-link-test.mjs` (parser vectors), `app-history-test.mjs`
 (push/replace/refusals, the undo), `apps/code-folder-test.mjs` (open/go/
