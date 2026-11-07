@@ -444,7 +444,7 @@ export function createFolderNotice (el_body, { retry, forget } = {}) {
             el.appendChild(b);
         };
         if ( RETRYABLE.has(code) && retry ) button('Try again', retry);
-        if ( path && forget && code !== 'child' ) button('Forget it', forget);
+        if ( path && forget && code !== 'child' ) button('Forget it', () => forget(path));
         button('Dismiss', null);
         el_body.appendChild(el);
     };
