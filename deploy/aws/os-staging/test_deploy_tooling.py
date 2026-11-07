@@ -134,7 +134,8 @@ class Sandbox:
         base = {key: value for key, value in os.environ.items()
                 if not key.startswith(("OS_ENV", "OS_STAGING_", "OS_PRODUCTION_", "NEXT_PUBLIC_", "AWS_"))}
         base.update(PATH=f"{self.bin}:{os.environ['PATH']}", TMPDIR=str(self.root / "tmp"),
-                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=self.sha)
+                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=self.sha,
+                    OS_STAGING_PROMOTION_LEDGER=str(self.root / "absent-ledger.json"))
         base.update(extra)
         return base
 
@@ -249,6 +250,22 @@ class LegacyStagingTests(SandboxTestCase):
                                        OS_STAGING_ARTIFACT_BUCKET='fixture-staging', FAKE_DESCRIBE=name)
             self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any('send-command' in c for c in self.box.calls()))
+
+    def test_install_refuses_pending_or_unreadable_ledger_before_any_aws_call(self):
+        # Cooperative fence only: it guards this checkout's deploy.sh, not raw SSM or older checkouts.
+        ledger = self.box.root / 'ledger.json'
+        environment = dict(OS_STAGING_INSTANCE_ID='i-0123456789abcdef0', OS_STAGING_ARTIFACT_BUCKET='fixture-staging',
+                           FAKE_DESCRIBE='staging', OS_STAGING_PROMOTION_LEDGER=str(ledger))
+        for content in (json.dumps({'entries': [{'state': 'completed'}, {'state': 'pending'}]}), '{not json'):
+            ledger.write_text(content)
+            for command in (('install', 'old'), ('install-verified', 'old', SHA, '0' * 64)):
+                result = self.box.deploy_sh(*command, **environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('pending operation', result.stderr)
+        self.assertEqual(self.box.calls(), [])
+        self.box.publish('fixture-staging', 'os-staging/images', 'old', 'ezil-os-staging', self.box.deploy)
+        ledger.write_text(json.dumps({'entries': [{'state': 'pending'}, {'state': 'completed'}]}))
+        self.assertEqual(self.box.deploy_sh('install', 'old', **environment).returncode, 0)
 
     def test_staging_tooling_refuses_production_selection(self):
         for command in ('build', 'upload', 'install'):
