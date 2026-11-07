@@ -79,6 +79,32 @@ export function linkParams (link) {
 const CODE_PARAM_KEYS = new Set(['project', 'repo', 'path', 'folder']);
 
 /**
+ * Replace Code-owned parameters in the current entry while keeping every other
+ * raw query pair and the fragment. Existing page parameters absent from the
+ * current URL still ride along, as they do on a normal app navigation.
+ */
+export function replaceCodeParamsUrl (location, next, pageParams = []) {
+    const raw = String(location.search ?? '').replace(/^\?/, '');
+    const old = raw ? raw.split('&') : [];
+    const replacement = Object.entries(next).map(([key, value]) => `${encodeURIComponent(key)}=${encodeQueryValue(value)}`);
+    const pairs = [];
+    let inserted = false;
+    for ( const pair of old ) {
+        if ( CODE_PARAM_KEYS.has(decodedKey(pair)) ) {
+            if ( ! inserted ) { pairs.push(...replacement); inserted = true; }
+        } else pairs.push(pair);
+    }
+    if ( ! inserted ) pairs.unshift(...replacement);
+    for ( const [key, value] of pageParams ) {
+        if ( value !== undefined && value !== null && value !== '' && ! pairs.some(pair => decodedKey(pair) === key) ) {
+            pairs.push(`${encodeURIComponent(key)}=${encodeQueryValue(value)}`);
+        }
+    }
+    return `${location.pathname}${pairs.length ? `?${pairs.join('&')}` : ''}${location.hash ?? ''}`;
+}
+
+
+/**
  * The Code parameters a Code window announces for the folder its editor shows
  * (`ezil:app-params-changed`), or null when they are not that: only its own
  * keys, string values, and a `folder` that is a plain absolute path once
@@ -383,7 +409,7 @@ export function createAppHistory () {
         const clean = codeParams(next);
         if ( ! clean || ! liveWindow(appId) || currentApp() !== appId || holds > 0 ) return;
         params.set(appId, clean);
-        const url = urlFor(appId);
+        const url = mode === 'replace' ? replaceCodeParamsUrl(win().location, clean, pageParams) : urlFor(appId);
         // A switch is a navigation of the editor, so it gets its own entry even when the address reads the same
         // (the empty window, then a workspace: both bare `/app/code`); Back then restores the editor it left.
         if ( mode === 'replace' && url === here() ) return;
