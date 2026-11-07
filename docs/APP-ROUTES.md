@@ -115,6 +115,15 @@ string. It returns `null` (open nothing) or
   - The address always WRITES the absolute path (`encodeQueryValue`: `/`
     readable). Precedence when Code mints: the address's folder, then this
     tab's record (`apps/code-folder.js`), then the computer's default.
+  - **A file** (file-url-open-regression, 2026-11-07): `<path>` may name a
+    regular file (`/app/code?folder=/workspace/pages/index.js`). The same
+    grammar and the same walk apply; the computer answers `file` when every
+    parent component is a real directory and the last is a regular file (never
+    a link; a file in the middle is `not_directory`), and Code opens the file's
+    own parent folder with the file open in it. The address keeps the file, so
+    a reload, a re-mint and Back/Forward ask for the file again. A missing file
+    is `missing` exactly as a missing folder: the default opens with the
+    notice, nothing is created, nothing falls back silently.
   Result: `folder: '<absolute path>'` or `folderRejected: '<reason>'`. Example:
   `/app/code?folder=/workspace/sports/sports-web`.
 - **Never read from the URL:** a repo URL, a ref, a user or account id, a
@@ -241,6 +250,19 @@ code-server's workbench document on both computers
   mints with it; a re-mint (restart, reconnect, Try again) asks for the folder
   the window shows; a signed-out link keeps its query through sign-in (§2
   "Writing `path`" applies to `folder` too).
+- **A file link** (file-url-open-regression, 2026-11-07). The server answers
+  `file` for a walked regular file and the bootstrap opens its parent
+  (`folder=<parent>&file=<file>`); the Worker's bridge, which runs in the
+  workbench document's head before the workbench reads its address, turns
+  `file` into VS Code's own `payload=[["openFile", "vscode-remote://<this
+  document's host><file>"]]` (code-server's workbench takes its remote
+  authority from `location.host`, patches/base-path.diff), and reports
+  `{kind: 'folder', path: <parent>, file}`. Code then writes the FILE as
+  `?folder=` (the address keeps naming what was asked), the tab record keeps
+  the folder, and Back/Forward to a file entry navigate the editor to
+  `folder=<parent>&file=<file>` again (only to a file this window's editor
+  has already shown, as for a folder). A `file` answer whose first document
+  does not show that file is `not_reopened`, visibly.
 
 Tests: `app-link-test.mjs` (parser vectors), `app-history-test.mjs`
 (push/replace/refusals, the undo), `apps/code-folder-test.mjs` (open/go/
