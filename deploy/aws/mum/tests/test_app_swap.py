@@ -35,6 +35,7 @@ JOBS = rebase_app.JOBS
 LIST_COMMANDS_STATUS = ('Pending', 'InProgress', 'Success', 'Cancelled', 'Failed', 'TimedOut', 'AccessDenied',
                         'DeliveryTimedOut', 'ExecutionTimedOut', 'Incomplete', 'NoInstancesInTag', 'LimitExceeded')
 OTHER = 'feedfeed-1111-4111-8111-111111111111'
+OCI_MANIFEST, OCI_INDEX = 'application/vnd.oci.image.manifest.v1+json', 'application/vnd.oci.image.index.v1+json'
 
 
 def sha256(data):
@@ -66,17 +67,23 @@ def tar_gz(members, directories=(), special=None):
 class App:
     """One whole-app artifact: a docker-save style archive, its checksum marker and identities."""
     def __init__(self, root, tag, sha, repo, repo_tags=None, index_name=None, revision=None, architecture='amd64',
-                 index_entries=1, pad_index=0, runtime_extra=None, cron_type=tarfile.DIRTYPE):
+                 index_entries=1, pad_index=0, runtime_extra=None, cron_type=tarfile.DIRTYPE, index_digest=None):
         self.tag, self.sha = tag, sha
         config = json.dumps({'architecture': architecture, 'os': 'linux', 'config': {
             'Labels': {'org.opencontainers.image.revision': revision or sha, 'fixture.tag': tag}, 'Env': ['EZIL_GIT_SHA=' + sha]}}).encode()
         self.image = 'sha256:' + sha256(config)
+        # OCI layout as current docker save writes it: index.json -> image manifest -> config, beside manifest.json.
+        image_manifest = json.dumps({'schemaVersion': 2, 'mediaType': OCI_MANIFEST, 'layers': [],
+                                     'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': self.image, 'size': len(config)}}).encode()
+        self.manifest_digest = 'sha256:' + sha256(image_manifest)
         members = {'manifest.json': json.dumps([{'Config': 'blobs/sha256/' + sha256(config),
                                                  'RepoTags': repo_tags or ['ezil-os-staging:' + tag], 'Layers': []}]).encode(),
-                   'blobs/sha256/' + sha256(config): config, 'oci-layout': b'{"imageLayoutVersion":"1.0.0"}'}
-        if index_name or index_entries != 1 or pad_index:
-            entry = {'annotations': {'io.containerd.image.name': index_name or 'docker.io/library/ezil-os-staging:' + tag}}
-            members['index.json'] = json.dumps({'manifests': [entry] * index_entries, 'pad': ' ' * pad_index}).encode()
+                   'blobs/sha256/' + sha256(config): config, 'blobs/sha256/' + sha256(image_manifest): image_manifest,
+                   'oci-layout': b'{"imageLayoutVersion":"1.0.0"}'}
+        entry = {'mediaType': OCI_MANIFEST, 'digest': index_digest or self.manifest_digest, 'size': len(image_manifest),
+                 'annotations': {'io.containerd.image.name': index_name or 'docker.io/library/ezil-os-staging:' + tag,
+                                 'org.opencontainers.image.ref.name': tag}}
+        members['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [entry] * index_entries, 'pad': ' ' * pad_index}).encode()
         self.archive = root / (tag + '.tar.gz')
         self.archive.write_bytes(tar_gz(members))
         runtime = {name: subprocess.run(['git', '-C', str(repo), 'show', sha + ':deploy/aws/os-staging/' + name],
@@ -332,6 +339,8 @@ class AppSwapTests(unittest.TestCase):
                  (dict(revision=self.worker_sha), 'revision differs from approved source', False),
                  (dict(architecture='arm64'), 'Wrong image architecture', False),
                  (dict(index_entries=2), 'invalid archive index', False),
+                 # The tagged index descriptor names a manifest the archive does not carry.
+                 (dict(index_digest='sha256:' + '7' * 64), 'archive index is not inspectable', False),
                  # A >1 MiB index naming another tag must be refused, not skipped.
                  (dict(index_name='docker.io/library/ezil-os-staging:old-app', pad_index=ops.SMALL), 'not inspectable', False),
                  (dict(runtime_extra={'cron/extra.timer': b'x'}), 'invalid runtime archive members', False),
@@ -769,6 +778,70 @@ class AppSwapTests(unittest.TestCase):
         ops.swap(path, self.repo, True, self.ledger)
         self.assertEqual(self.entries()[-1]['state'], 'completed')
         self.assertEqual(len(self.installs()), 1)
+
+    def test_oci_index_must_resolve_to_the_pinned_image(self):
+        _, members, names = ops.scan_archive(self.new.archive)
+        tagged = {'io.containerd.image.name': 'docker.io/library/ezil-os-staging:new-app', 'org.opencontainers.image.ref.name': 'new-app'}
+
+        def blob(document):
+            data = json.dumps(document).encode()
+            return 'sha256:' + sha256(data), data
+
+        def tags(index, *blobs):
+            extended, listed = dict(members), dict(names)
+            for digest, data in blobs:
+                extended['blobs/sha256/' + digest[7:]] = data
+                listed['blobs/sha256/' + digest[7:]] = tarfile.REGTYPE
+            extended['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': index}).encode()
+            return ops.archive_tags(extended, listed, 'new-app', self.new.image, self.candidate_sha)
+
+        def image_manifest(config_digest):
+            return blob({'schemaVersion': 2, 'mediaType': OCI_MANIFEST, 'layers': [], 'config': {'digest': config_digest}})
+        other_digest, other = image_manifest(self.old.image)
+        attestation_digest, attestation = image_manifest('sha256:' + 'a' * 64)
+        attestation_entry = {'mediaType': OCI_MANIFEST, 'digest': attestation_digest,
+                             'annotations': {'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': self.new.manifest_digest}}
+
+        def nested(*entries):
+            digest, data = blob({'schemaVersion': 2, 'mediaType': OCI_INDEX, 'manifests': list(entries)})
+            return {'mediaType': OCI_INDEX, 'digest': digest, 'annotations': tagged}, (digest, data)
+        # Accepted: the classic store's direct manifest, and the containerd store's nested index with an attestation.
+        self.assertIsNone(tags([{'mediaType': OCI_MANIFEST, 'digest': self.new.manifest_digest, 'annotations': tagged}]))
+        entry, index_blob = nested({'mediaType': OCI_MANIFEST, 'digest': self.new.manifest_digest,
+                                    'platform': {'architecture': 'amd64', 'os': 'linux'}}, attestation_entry)
+        self.assertIsNone(tags([entry], index_blob, (attestation_digest, attestation)))
+        # Refused: each would let docker load move the expected tag to something other than the pinned image.
+        two_images, two_blob = nested({'mediaType': OCI_MANIFEST, 'digest': self.new.manifest_digest},
+                                      {'mediaType': OCI_MANIFEST, 'digest': other_digest})
+        inner, inner_blob = nested({'mediaType': OCI_MANIFEST, 'digest': self.new.manifest_digest})
+        outer, outer_blob = nested(inner)
+        for name, index, blobs, message in (
+                ('another image', [{'mediaType': OCI_MANIFEST, 'digest': other_digest, 'annotations': tagged}], [(other_digest, other)],
+                 'index does not name the pinned image'),
+                ('another image inside a nested index', [nested({'mediaType': OCI_MANIFEST, 'digest': other_digest})[0]],
+                 [nested({'mediaType': OCI_MANIFEST, 'digest': other_digest})[1], (other_digest, other)], 'index does not name the pinned image'),
+                ('two images inside a nested index', [two_images], [two_blob, (other_digest, other)], 'invalid archive index'),
+                ('index inside a nested index', [outer], [outer_blob, inner_blob], 'invalid archive index'),
+                ('bytes that do not hash to the digest', [{'mediaType': OCI_MANIFEST, 'digest': other_digest, 'annotations': tagged}],
+                 [(other_digest, image_manifest(self.new.image)[1])], 'not inspectable'),
+                ('media type disagreeing with the document', [{'mediaType': OCI_INDEX, 'digest': self.new.manifest_digest, 'annotations': tagged}],
+                 [], 'invalid archive index'),
+                ('no digest', [{'mediaType': OCI_MANIFEST, 'annotations': tagged}], [], 'invalid archive index')):
+            with self.subTest(name), self.assertRaisesRegex(ValueError, message):
+                tags(index, *blobs)
+
+    def test_install_sends_the_installer_bytes_that_were_hashed(self):
+        path = self.plan('swap', self.old, self.new)
+        installer = release.REPO / ops.INSTALLER
+        reviewed = installer.read_text()
+        # The checkout's installer changes after the digest check, while the before-probe runs.
+        self.probe_hooks = {'-before-': lambda: installer.write_text(reviewed + '\necho changed-after-admission\n')}
+        ops.swap(path, self.repo, True, self.ledger)
+        sent = [body for body in self.payloads.values() if 'INSTALL = True' in body]
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn('changed-after-admission', sent[0])
+        self.assertIn(repr(reviewed)[1:40], sent[0])
+        self.assertEqual(self.entries()[-1]['state'], 'completed')
 
     # ---- restore ---------------------------------------------------------------------------
     def test_restore_is_its_own_ledger_valid_operation(self):

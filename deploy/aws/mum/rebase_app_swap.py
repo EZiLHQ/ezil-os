@@ -38,6 +38,8 @@ SECRET_DRIFT = 'app secret changed while pending; manual reconciliation required
 RECEIPT_UNVERIFIED = 'archive receipt does not match the inspected artifacts; run app-archive-check'
 PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
 METADATA = ('manifest.json', 'repositories', 'index.json')
+OCI_MANIFESTS = ('application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json')
+OCI_INDEXES = ('application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json')
 # install-host.sh extracts exactly these runtime members and runs render-env.py as root.
 RUNTIME = ('compose.yaml', 'Caddyfile', 'render-env.py',
            *(f'cron/ezil-os-staging-{job}.{kind}' for job in rebase_app.JOBS for kind in ('service', 'timer')))
@@ -144,7 +146,32 @@ def archive_tags(members, names, tag, image_id, source):
             need(isinstance(annotations, dict) and
                  annotations.get('io.containerd.image.name', 'docker.io/library/' + SLUG + ':' + tag) == 'docker.io/library/' + SLUG + ':' + tag and
                  annotations.get('org.opencontainers.image.ref.name', tag) == tag, 'archive would tag an unexpected name')
+            # docker load follows the index, not manifest.json: the tagged descriptor must reach the pinned config.
+            need(index_config(members, item) == image_id, 'archive index does not name the pinned image')
     return public
+
+
+def index_config(members, descriptor, nested=False):
+    """Config digest an index descriptor resolves to, through content-addressed blobs.
+
+    At most one nested index (the containerd image store's form), holding exactly one image manifest
+    besides attestation manifests, which carry no runnable image. Anything else is refused.
+    """
+    digest = descriptor.get('digest') if isinstance(descriptor, dict) else None
+    need(isinstance(digest, str) and manifest.matches(r'sha256:[0-9a-f]{64}', digest), 'invalid archive index')
+    blob = members.get('blobs/sha256/' + digest.removeprefix('sha256:'))
+    need(blob is not None and 'sha256:' + hashlib.sha256(blob).hexdigest() == digest, 'archive index is not inspectable')
+    document = manifest.loads(blob.decode('utf-8'))
+    media = descriptor.get('mediaType')
+    need(isinstance(document, dict) and document.get('mediaType', media) == media, 'invalid archive index')
+    if media in OCI_MANIFESTS:
+        config = document.get('config')
+        return config.get('digest') if isinstance(config, dict) else None
+    need(media in OCI_INDEXES and not nested and isinstance(document.get('manifests'), list), 'invalid archive index')
+    images = [item for item in document['manifests'] if not (isinstance(item, dict) and isinstance(item.get('annotations'), dict) and
+                                                             item['annotations'].get('vnd.docker.reference.type') == 'attestation-manifest')]
+    need(len(images) == 1, 'invalid archive index')
+    return index_config(members, images[0], nested=True)
 
 
 def runtime_check(runtime, sha, plan, source_repo):
@@ -271,8 +298,9 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
     plan = load_plan(plan_path)
     plan_sha = release.digest(plan_path)
     src, dst = plan['from'], plan['to']
-    installer = release.safe_path(release.REPO / INSTALLER)
-    need(release.digest(installer) == plan['installerSha256'], 'staging installer changed')
+    # One snapshot: the bytes hashed here are the bytes sent, whatever happens to the file later.
+    installer = release.safe_path(release.REPO / INSTALLER).read_bytes()
+    need(hashlib.sha256(installer).hexdigest() == plan['installerSha256'], 'staging installer changed')
     check_source(plan, source_repo)
     require_receipt(plan_path, plan, source_repo)
     with release.json_tool.app_secret_lock() as fd:
@@ -319,7 +347,7 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
             # Nothing was sent yet; re-establish the before-state after any crash.
             admit_before(plan_path, plan, pending['generation'], deployment)
         app = {'tag': dst['tag'], 'gitSha': dst['gitSha'], 'checksumSha256': dst['checksumSha256']}
-        rebase_ssm.run(Path(plan_path).parent, operation, rebase_app.body(installer.read_text(), app, deployment), True,
+        rebase_ssm.run(Path(plan_path).parent, operation, rebase_app.body(installer.decode('utf-8'), app, deployment), True,
                        release.aws, release.json_tool.write, one_shot=True)
         after = probe(plan_path, f'app-probe-g{pending["generation"]}-after', dst['tag'])
         need(at(after, dst, deployment), 'post-install state differs; run app-swap-reconcile')
