@@ -12,7 +12,7 @@ const source = process.env.COPILOT_TEST_ROOT;
 const script = path.join(__dirname, 'patch-copilot-chat.sh');
 const wb = 'out/vs/code/browser/workbench/workbench.js';
 const css = 'out/vs/code/browser/workbench/workbench.css';
-const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, css];
+const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, css, 'out/server-main.js'];
 const run = (...args) => spawnSync('bash', [script, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
 const NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
 
