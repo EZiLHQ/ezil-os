@@ -9,11 +9,14 @@
  *   - `restored`: the root is a directory and every component of `rel` is a real directory
  *     (lstat: never a symlink, so no component can lead outside the root or into a project's
  *     repository, which the lexical refusals alone could not promise);
+ *   - `file`: every component but the last is a real directory and the last is a regular file (a link
+ *     may name a file; the editor then opens it inside its parent, `./code-folder.ts`);
  *   - `symlink`: a component is a symlink, dangling or not (checked BEFORE anything that follows it);
  *   - `missing`: the root or a component does not exist;
- *   - `not_directory`: a component exists and is not a directory;
+ *   - `not_directory`: a component exists and is not a directory (a file in the middle, a socket, a
+ *     device, …);
  *   - `error`: anything else (a timeout, a non-zero exit, a refused exec, any other output).
- * Never a path: the answer is a code, and only `restored` lets `settleCodeFolder` add a folder.
+ * Never a path: the answer is a code, and only `restored` or `file` lets `settleCodeFolder` add what opens.
  *
  * The script is a constant. The root and `rel` reach it only as exec env values (never
  * interpolated into the command), `set -f` keeps `*`, `?` and `[` in names literal, and the
@@ -52,12 +55,13 @@ export const CODE_FOLDER_RESOLVE_TIMEOUT_MS = 5_000;
 export const CODE_FOLDER_ROOT_ENV = 'EZIL_CODE_FOLDER_ROOT';
 export const CODE_FOLDER_REL_ENV = 'EZIL_CODE_FOLDER_REL';
 /** What the walk itself may answer; `outside`, `not_allowed`, `invalid`, `unverified` and `too_long` are the planner's. */
-export const CODE_FOLDER_WALK_OUTCOMES = ['restored', 'missing', 'not_directory', 'symlink', 'error'] as const satisfies readonly CodeFolderOutcome[];
+export const CODE_FOLDER_WALK_OUTCOMES = ['restored', 'file', 'missing', 'not_directory', 'symlink', 'error'] as const satisfies readonly CodeFolderOutcome[];
 
 /**
  * The in-container walk (bash or any POSIX sh). One result line, `ezil-code-folder:<outcome>`, then
  * exit 0. The root may be a symlink the image itself made (it is the server's choice, not the ask);
- * every component below it is checked with -L before -e or -d, both of which follow symlinks.
+ * every component below it is checked with -L before -e, -d or -f, all of which follow symlinks. Only
+ * the LAST component may be a regular file (`file`); one in the middle is `not_directory`.
  */
 export const CODE_FOLDER_RESOLVE_SCRIPT = [
   'set -f',
@@ -71,12 +75,17 @@ export const CODE_FOLDER_RESOLVE_SCRIPT = [
   'oldifs=$IFS; IFS=/',
   'set -- $rel',
   'IFS=$oldifs',
+  'n=$#',
+  'i=0',
   'for c in "$@"; do',
+  '  i=$((i+1))',
   '  [ -n "$c" ] || say error',
   '  p=$p/$c',
   '  [ -L "$p" ] && say symlink',
   '  [ -e "$p" ] || say missing',
-  '  [ -d "$p" ] || say not_directory',
+  '  [ -d "$p" ] && continue',
+  '  [ "$i" -eq "$n" ] && [ -f "$p" ] && say file',
+  '  say not_directory',
   'done',
   'say restored',
 ].join('\n');
@@ -138,9 +147,13 @@ export function cloudflareCodeFolderResolver(exec: CodeFolderExec, root: string,
 
 /** The host edge's folder op: `POST <this>/<sha256hex(body)>`, nothing else in the path, no query. */
 export const AWS_CODE_FOLDER_CONTROL_PATH = '/__ezil/control/folder';
-/** The host's `result` (`fsops.classify_dir_below`) → the walk's code. `bad_path` and anything else are `error`. */
+/**
+ * The host's `result` (`fsops.classify_dir_below`) → the walk's code. `bad_path` and anything else are `error`.
+ * `file` needs a host agent that answers it (host tree 9242b8b7 and earlier say `not_directory` for a regular
+ * file, which the shell then reports as such: honest, never a fallback).
+ */
 const AWS_FOLDER_RESULTS: Readonly<Record<string, CodeFolderOutcome>> = {
-  ok: 'restored', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink',
+  ok: 'restored', file: 'file', missing: 'missing', not_directory: 'not_directory', symlink: 'symlink',
 };
 /** The host's whole answer is `{"ok": true, "result": "not_directory"}`; anything longer is not one. */
 const AWS_FOLDER_ANSWER_MAX_BYTES = 256;

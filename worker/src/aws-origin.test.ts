@@ -409,6 +409,17 @@ describe('handleAwsPreview', () => {
     expect(folderOf(thrown.codePreviewUrl)).toBe('/workspace');
   });
 
+  it('a host answer of `file` opens the file\'s own parent with the file beside it (file-url-open-regression)', async () => {
+    const file = '/workspace/pages/index.js';
+    const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: file }, resolveFolder: async () => 'file' })));
+    expect(body.codeFolder).toEqual({ v: 1, outcome: 'file' });
+    expect(folderOf(body.codePreviewUrl)).toBe('/workspace/pages');
+    expect(new URL(body.codePreviewUrl).searchParams.get('file')).toBe(file);
+    expect(JSON.stringify(body)).not.toContain('"file":'); // the answer carries a code, never a path
+    // the desktop and app URLs of the same mint never carry it
+    for (const u of [body.guacamoleUrl, body.appPreviewUrl]) expect(new URL(u).searchParams.has('file')).toBe(false);
+  });
+
   it('a restore whose bootstrap URL would pass 2000 characters is `too_long` and opens the default', async () => {
     const deep = `/workspace/${Array.from({ length: 12 }, () => '日本語のフォルダ名'.repeat(3)).join('/')}`;
     const body = await answer(await handleAwsPreview(claims(), codeDeps({ codeFolder: { v: 1, path: deep }, resolveFolder: async () => 'restored' })));
@@ -463,8 +474,26 @@ describe('AWS Code bootstrap: folder and ezil_mint (per-tab folder continuity)',
     expect(new URL(awsBrowserUrl(8443, SID, ROOT, 'T')).searchParams.has('folder')).toBe(false);
   });
 
+  it('a walked file is forwarded beside its folder; one that is not a direct child of it, or without a folder, is 400 invalid_folder', async () => {
+    const res = await boot(8443, `&path=%2F&folder=${encodeURIComponent('/workspace/My Project')}&file=${encodeURIComponent('/workspace/My Project/日本 ü.md')}`);
+    expect(res.status).toBe(302);
+    const loc = new URL(res.headers.get('location')!, 'https://x');
+    expect(loc.searchParams.get('folder')).toBe('/workspace/My Project');
+    expect(loc.searchParams.get('file')).toBe('/workspace/My Project/日本 ü.md');
+    for (const q of [`&file=${encodeURIComponent('/workspace/a/x.js')}`, `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/b/x.js')}`,
+      `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/a/b/x.js')}`, '&folder=%2Fworkspace%2Fa&file=%2Fworkspace%2Fa',
+      `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/a/../a/x.js')}`, `&folder=%2Fworkspace&file=${encodeURIComponent('/etc/passwd')}`]) {
+      const bad = await boot(8443, q);
+      expect({ q, status: bad.status }).toEqual({ q, status: 400 });
+      expect(await bad.json()).toEqual({ ok: false, error: 'invalid_folder' });
+    }
+    expect(new URL(awsBrowserUrl(8443, SID, ROOT, 'T', '/', '/workspace/a', '/workspace/a/x.js')).searchParams.get('file')).toBe('/workspace/a/x.js');
+    expect(new URL(awsBrowserUrl(3002, SID, ROOT, 'T', '/', '/workspace/a', '/workspace/a/x.js')).searchParams.has('file')).toBe(false);
+    expect(new URL(awsBrowserUrl(8443, SID, ROOT, 'T', '/', undefined, '/workspace/a/x.js')).searchParams.has('file')).toBe(false);
+  });
+
   it('the critic\'s injection: an open key inside `path` is 400 invalid_folder on Code, with no cookie', async () => {
-    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
+    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?file=/etc/passwd', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
       const res = await boot(8443, `&path=${encodeURIComponent(hidden)}`);
       expect({ hidden, status: res.status }).toEqual({ hidden, status: 400 });
       expect(await res.json()).toEqual({ ok: false, error: 'invalid_folder' });
