@@ -1131,7 +1131,19 @@ export async function openCodeWindow (ctx = {}) {
                 if ( ! nativeSurface ) {
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
                     folder_notice?.close();
-                    folder_notice = createFolderNotice(el_body, { retry: () => { void start_boot(); }, forget: () => forgetFolder(bind) });
+                    folder_notice = createFolderNotice(el_body, {
+                        retry: () => { void start_boot(); },
+                        forget: (refused_path) => {
+                            forgetFolder(bind);
+                            // Project tabs retain their repository binding; own-files tabs forget the refused ask.
+                            if ( ! project ) {
+                                const displayed = editor_root?.kind === 'folder' && editor_root.path !== refused_path
+                                    ? editor_root : null;
+                                wanted_folder = displayed?.path ?? null;
+                                announce_root('replace', displayed);
+                            }
+                        },
+                    });
                     attachFolderBridge({
                         iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
                         onRoot: on_root, onOpen: on_open, onLeaving: on_leaving,
