@@ -64,11 +64,13 @@ def plain_rel(rel):
 
 
 def classify_dir_below(root, rel):
-    """'ok' | 'missing' | 'not_directory' | 'symlink' | 'bad_path' for root/rel. Every component
-    (rel's, never root's own ancestors, which are host paths) is lstat-ed relative to its parent
-    fd and opened O_DIRECTORY|O_NOFOLLOW, so no symlink is ever followed and a race that swaps a
-    component for a link or a file between the lstat and the open is still refused (ELOOP/ENOTDIR).
-    Nothing is created; nothing but directory metadata is read."""
+    """'ok' | 'file' | 'missing' | 'not_directory' | 'symlink' | 'bad_path' for root/rel. Every
+    component (rel's, never root's own ancestors, which are host paths) is lstat-ed relative to its
+    parent fd and opened O_DIRECTORY|O_NOFOLLOW, so no symlink is ever followed and a race that swaps
+    a component for a link or a file between the lstat and the open is still refused (ELOOP/ENOTDIR).
+    'file' is the LAST component being a regular file (a link may name a file: the editor opens it
+    inside its parent); one in the middle, or anything else that is not a directory, is
+    'not_directory'. Nothing is created; nothing but directory metadata is read."""
     if not plain_rel(rel):
         return "bad_path"
     try:
@@ -80,8 +82,9 @@ def classify_dir_below(root, rel):
         except OSError:
             return "missing"
         return "symlink" if stat.S_ISLNK(st.st_mode) else "not_directory" if e.errno in (errno.ENOTDIR, errno.ELOOP) else "missing"
+    comps = rel.split("/") if rel else []
     try:
-        for comp in (rel.split("/") if rel else []):
+        for i, comp in enumerate(comps):
             try:
                 st = os.stat(comp, dir_fd=fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -91,7 +94,7 @@ def classify_dir_below(root, rel):
             if stat.S_ISLNK(st.st_mode):
                 return "symlink"
             if not stat.S_ISDIR(st.st_mode):
-                return "not_directory"
+                return "file" if i == len(comps) - 1 and stat.S_ISREG(st.st_mode) else "not_directory"
             try:
                 nfd = os.open(comp, DIR_FLAGS, dir_fd=fd)
             except OSError as e:
