@@ -414,10 +414,11 @@ class AppSwapTests(unittest.TestCase):
             ops.swap(competing, self.repo, True, self.ledger)
 
     def test_tooling_before_app_operations_refuses_the_ledger(self):
-        old = subprocess.run(['git', '-C', str(REPO), 'show', 'f565c97f40a1e8e921d386ece7afbe11d6dac9ef:deploy/aws/mum/rebase_release.py'],
+        # The staging base this change applies to carries the pre-app-operation rebase_release.py.
+        old = subprocess.run(['git', '-C', str(REPO), 'show', '9e3dd5f3d54921df9ce28ae960e5023041750bbd:deploy/aws/mum/rebase_release.py'],
                              capture_output=True, text=True)
         if old.returncode:
-            self.skipTest('pre-change rebase_release.py is not available outside the Git checkout')
+            self.skipTest('pre-change rebase_release.py needs a Git checkout containing the staging base')
         self.leave_pending()
         # Tooling from before this change refuses the unknown operation instead of ignoring it.
         old_source = self.root / 'old/old_rebase_release.py'

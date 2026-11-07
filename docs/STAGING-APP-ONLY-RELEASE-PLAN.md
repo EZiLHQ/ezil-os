@@ -7,12 +7,12 @@
 | Item | State |
 | --- | --- |
 | `rebase-release.sh app-swap`, `app-swap-reconcile` and `app-archive-check` (`deploy/aws/mum/rebase_app_swap.py`) | Implemented. Tested with fakes only. |
-| `app-swap` and `app-restore` ledger rows. Each pending row records the before and expected app SHA and **web image ID**, and changes nothing else. A restore must undo the latest completed swap. | Implemented. Tested with fakes only. The live 109-entry ledger was validated in memory with this code, and nothing was written to it. |
+| `app-swap` and `app-restore` ledger rows. Each pending row records the before and expected app SHA and **web image ID**, and changes nothing else. A restore must undo the latest completed swap. | Implemented. Tested with fakes only. |
 | One-shot SSM transport. A failed or ended install journal is never re-armed or resent. | Implemented. Tested with fakes only. |
 | Read-only host probe. It reports app SHA, kill switch, deployment, web image ID, the candidate tag's image, the `compose.env` tag, the six timers and their services, and whether `deploy.lock` is free. | Implemented. Fake-executed only. It has never run on the host. |
 | Archive preflight. It checks the marker-pinned bytes and requires exactly one image, tagged only `ezil-os-staging:<tag>` (manifest, `repositories` and `index.json`), whose config digest equals the planned image ID. It applies `install_receipt.py`'s rules: revision label, `EZIL_GIT_SHA`, amd64 and linux. It records the public-configuration label as evidence. | Implemented. Tested on synthetic archives, not on a real `docker save` archive. |
-| `deploy.sh install` and `install-verified` refuse when the ledger's latest row is pending. | Implemented. **This is cooperative only.** It applies only where the ledger file exists, which is the scheduler host. On any other workstation, and for raw `AWS-RunShellScript`, older checkouts or direct host access, it does nothing. |
-| Real IAM or SSM-document enforcement against other app-mutating paths | **Not implemented.** The protections are scheduler custody, the operator's in-flight SSM check and the host deploy-lock check. These are evidence, not enforcement. |
+| `deploy.sh install` and `install-verified` refuse when the ledger's latest row is pending. | Implemented. **This is cooperative only.** It applies only where the ledger file exists, which is the scheduler host. Callers that bypass this checkout's `deploy.sh` are not stopped by it. |
+| Enforcement outside this tooling (IAM or SSM-document restrictions) | **Not provided by this change.** The operator's in-flight SSM check and host deploy-lock check are evidence, not enforcement; scheduler custody is the control. |
 | Runtime archive check. `app-archive-check` requires the marker-pinned `<tag>.runtime.tar.gz` to contain exactly the installer's 15 members, byte-equal to `deploy/aws/os-staging/` at both `agentCommit` and the target commit. | Implemented. Tested with fakes only. |
 | `app_only_offline.py` kernel | A superseded design model. It is not used by the operator. |
 
@@ -38,7 +38,7 @@ The installer's remaining effects, and how each is checked:
 ## Consequences the scheduler must accept before running it
 
 1. **Older tooling stops working on this ledger.** Once an `app-swap` row exists, any checkout of `rebase_release.py` older than this change refuses the whole ledger, and that is tested. It refuses on the row's shape (`invalid ledger entry` or `invalid pending snapshots`) before it even reaches the operation name. Every later ledger operation must run from this tooling version or newer: `ledger-reconcile`, `registry-gc`, `ledger-adopt-app` and any release32 phase.
-2. **The release32 `rollback` path closes.** After any app row is written, `rebase-release.sh rollback` for plan `446cafac…` refuses, because the latest entry belongs to another plan. Run the swap only after release32's recovery observation (r9) is final. Otherwise, accept that a tuple rollback would need a new plan.
+2. **The release32 `rollback` path closes.** After any app row is written, `rebase-release.sh rollback` for the release32 plan refuses, because the latest entry belongs to another plan. Run the swap only after release32's recovery observation (r9) is final. Otherwise, accept that a tuple rollback would need a new plan.
 3. **Fresh recovery evidence is needed.** A new app identity means the current fixed-window observation does not carry over. KS1 stays closed until the scheduler's own gates reopen it.
 
 ## Live prerequisites (none done by this lane)
@@ -46,21 +46,21 @@ The installer's remaining effects, and how each is checked:
 | # | Prerequisite | Evidence required |
 | --- | --- | --- |
 | P1 | The tooling checkout on the scheduler host is this reviewed head. | `git rev-parse HEAD`; `sha256sum deploy/aws/os-staging/install-host.sh` equals the plan's `installerSha256`. |
-| P2 | Candidate image `320f938d2c96`, built from `320f938d2c964f20a4e3a45847760b025c3d056f` with the three staging public values (currently absent here) and uploaded with `--if-none-match`. | All four object version IDs and the image ID (config digest). Docker root and `TMPDIR` on `/data`, because `/` has about 600 MB free. Immutable remote source custody for 320f938d (it is local-only today). |
+| P2 | Candidate image `320f938d2c96`, built from `320f938d2c964f20a4e3a45847760b025c3d056f` with the three approved staging public values and uploaded with `--if-none-match`. | All four object version IDs and the image ID (config digest). Docker root and `TMPDIR` on a volume with enough free space. Immutable remote source custody for the candidate commit. |
 | P3 | The 7fcc rollback archive at an exact S3 version, marker `20236fc8…`. | Its config-digest image ID, derived exactly as `install_receipt.py` does. It must equal the live web image ID read by the before-probe. If the before-probe reports a different `from` image ID, treat it as "this derivation does not hold on this host (for example a containerd image store)": stop, and do not edit the plan to match. |
 | P3b | The live `compose.env` tag, which is the plan's `from.tag`. Expected `7fcc76d4efdb`, written by release32 `apply-app`. | The before-probe requires `OS_STAGING_TAG=<from.tag>` exactly. A mismatch refuses as `live app differs from the plan before-state` before anything changes. Confirm the value from the release32 apply-app receipt or tag; never edit the plan merely to make the probe pass. |
-| P4 | Ledger tail. At 01:55Z it was generation 109, a completed `promote-canary` with registry pin, app `7fcc76d4`. | Re-read under the lock; `ledgerGeneration` in the plan = latest generation. |
+| P4 | Ledger tail: the latest entry is completed, carries a registry pin and records app `7fcc76d4`. | Re-read under the lock; `ledgerGeneration` in the plan = latest generation. |
 | P5 | The single staging lease, held by the scheduler, with at least 30 minutes left (15-minute install timeout plus probes). | The scheduler's lease readback. |
-| P6 | r9/recovery for release32 is final: 03:18:34Z (08:48:34 IST), or 20:18:34Z if 24h15 applies. | The scheduler's gate record. |
+| P6 | Release32's recovery observation is final. | The scheduler's gate record. |
 | P7 | All six timers are enabled and active, no timer service is running, the host deploy lock is free, and no other SSM command is in flight. | Enforced by the operator. A refusal before the pending row is written changes nothing; retry later. |
-| P8 | Worker identity. Wrangler is unauthenticated, so the live OS staging Worker version and bridge digest are unverified. | An authenticated read-only deployment listing, or an already running signed-in workbench. This blocks product acceptance claims, not technical ledger completion. The expected folder bridge script SHA-256 is `2e8cd726…ebee78`. |
-| P9 | Residual risk: no IAM fence. `ezil-admin` can still send arbitrary `AWS-RunShellScript`. | Keep the operation inside scheduler custody. A fixed-document IAM restriction (`delivery_permissions.py` proposal) is a separate change. |
+| P8 | Worker identity: the live OS staging Worker version and bridge digest. | An authenticated read-only deployment listing, or an already running signed-in workbench. This blocks product acceptance claims, not technical ledger completion. The expected folder bridge script SHA-256 is `2e8cd726…ebee78`. |
+| P9 | Residual risk: this change adds no IAM or SSM-document enforcement. | The release owner confirms the access posture through the private release record and keeps the operation inside scheduler custody. A fixed-document restriction (`delivery_permissions.py` proposal) is a separate change. |
 | P10 | Public configuration of the candidate. `pipeline.json` has no approved `public_config`, and the 7fcc build predates the label. | Compare the receipt's `publicConfigSha256` with the fingerprint of the approved staging values (`public_config.py`) before applying. |
-| P11 | Ledger readers. Only `rebase_release.py` and `registry_gc.py` (via `rebase_release`) read the ledger, plus the new `deploy.sh` check. The app's TypeScript does not. | Retire ledger operations from older checkouts, including the `rel132-7fcc76d4` worktree, before the first app row. |
+| P11 | Ledger readers. Only `rebase_release.py` and `registry_gc.py` (via `rebase_release`) read the ledger, plus the new `deploy.sh` check. The app's TypeScript does not. | Retire ledger operations from older checkouts before the first app row. |
 
 ## Ordered procedure (scheduler)
 
-Use a new absolute release directory, for example `/root/ezil-aws-mum/release/app-swap-320f938d-20261107/`. `REPO` is a checkout containing both `7fcc76d4` and `320f938d`.
+Use a new, empty, absolute release directory for this operation. `REPO` is a checkout containing both `7fcc76d4` and `320f938d`.
 
 1. **Plan inputs.** Download the exact-version candidate `.tar.gz` and `.sha256` into the release directory. Read the image ID from the archive:
    ```
