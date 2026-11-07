@@ -22,7 +22,7 @@
 # Files patched (all inside <root>):
 #   extensions/copilot/dist/extension.js               copilot-chat extension host bundle
 #   out/nls.messages.js, out/nls.messages.json         workbench English strings (index-addressed array)
-#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status + chat history + chat header
+#   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status + chat history + chat header + tool selection
 #   out/vs/code/browser/workbench/workbench.css        compact chat layout (header controls, one-row composer)
 #   extensions/copilot/package{,.nls}.json            display strings
 set -euo pipefail
@@ -251,6 +251,49 @@ P_HISTORY_PICKER_SERVICE='R9e=class{constructor(o,e,t,i,n,r,a){this.anchor=o;thi
 A_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];for(let l of this.chatSessionsService.getAllChatSessionContributions()){let u=l.sessionListGroup??l.type;r.find(p=>p.id===u)||r.push({id:u,label:n(u)})}'
 R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
 
+# Part 4 — Agent tool selection (PATCHES.md "Agent tool selection"). Configure Tools stores a map of
+# tool/tool-set id -> enabled; an id missing from it counts as enabled. Copilot's edit, search and
+# web sets reach the picker only around the first request (measured: 7 rows before it, 9 after), so
+# a user who switched every row off before that got those sets and their members back (`tools-absent`).
+# A selection the user curated in Configure Tools (any entry off) now keeps ids it has never seen off
+# too, so a narrowed choice never gains tools the user did not see; a missing id stays on (upstream)
+# only when nothing is off (never configured, all on) or the selection is the pre-version-2
+# disabled-only format. A prompt file's selection is recomputed from its names (`tools-prompt`).
+# Late tools then show unchecked in the picker.
+A_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l)}}'
+R_TOOLS_LEGACY='if(o(a)){let c=a.disabledToolSets?.map(u=>[u,!1]),l=a.disabledTools?.map(u=>[u,!1]);return{toolSets:new Map(c),tools:new Map(l),ezilMissingOn:!0}}'
+# workbench.js `tools-prompt` + `tools-session`: a prompt file's `tools:` (`set(map,!0)` from
+# _applyPromptMetadata) was applied as a one-time snapshot, so names not registered yet (Copilot's
+# edit/search before the first request) were lost, or under `tools-absent` every late set came on,
+# named or not. The prompt now passes its names; the session keeps them and `tools-absent` recomputes
+# the selection from them on every read, as upstream already does for a custom agent's `tools:`.
+# Named sets appear when they register, unnamed ones stay off, `tools: []` stays empty.
+A_TOOLS_SESSION='set(e,t){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,j_e.fromMap(e));return}'
+R_TOOLS_SESSION='set(e,t,ezilNames){let i=this._mode.get();if(t||this._sessionStates.has(i.id)){this._sessionStates.set(i.id,ezilNames?{...j_e.fromMap(e),ezilNames}:j_e.fromMap(e));return}'
+A_TOOLS_PROMPT='let r=this.toolsService.toToolAndToolSetEnablementMap(t,this.input.selectedLanguageModel.get()?.metadata);this.input.selectedToolsModel.set(r,!0)}'
+R_TOOLS_PROMPT='let r=this.toolsService.toToolAndToolSetEnablementMap(t,this.input.selectedLanguageModel.get()?.metadata);this.input.selectedToolsModel.set(r,!0,t)}'
+A_TOOLS_ABSENT='r||(r=this._globalState.read(e));for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,r.tools.get(a.id)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=r.toolSets.get(a.id)!==!1;'
+R_TOOLS_ABSENT='r?.ezilNames&&(r=j_e.fromMap(this._toolsService.toToolAndToolSetEnablementMap(r.ezilNames,i)));r||(r=this._globalState.read(e));let ezilAbsent=!!r.ezilMissingOn||!(r.tools.size||r.toolSets.size)||[...r.tools.values(),...r.toolSets.values()].every(z=>z!==!1);for(let a of this._currentTools.read(e))a.canBeReferencedInPrompt&&t.set(a,(r.tools.get(a.id)??ezilAbsent)!==!1);for(let a of this._toolsService.getToolSetsForModel(i,e)){if(a.hiddenInToolsPicker)continue;let c=(r.toolSets.get(a.id)??ezilAbsent)!==!1;'
+# Names the selection relies on (checked, never patched): a set's members follow the set unless
+# explicitly on; the request's tool map is entriesMap without the sets; Configure Tools saves the full
+# map it showed; the storage format the legacy branch is told apart from.
+P_TOOLS_MEMBERS='t.set(a,c);for(let l of a.getTools(e))t.set(l,c||r.tools.get(l.id)===!0)}return jT.fromMap(t)});'
+P_TOOLS_REQUEST='this.userSelectedTools=be(e=>{let t={},i=this.entriesMap.read(e);for(let[n,r]of i)dm(n)||(t[n.id]=r);return t});'
+P_TOOLS_PICKER='b&&r.input.selectedToolsModel.set(b,!1)'
+P_TOOLS_STORAGE='function e(r){return ui(r)&&r.version===2&&Array.isArray(r.toolSetEntries)&&Array.isArray(r.toolEntries)}'
+# The other code-written selection (tool include/exclude); it passes no names, so `tools-absent` applies.
+P_TOOLS_FILTER='b.input.selectedToolsModel.set(D.enablementMap,!0)'
+# extension.js `tools-forced`: the Agent's tool function (Ret) turns some tools on that the request's
+# map does not list (insert_edit_into_file, replace_string_in_file, session_store_sql, tool search,
+# tests/tasks, ...). When that map lists tools and every one is off, nothing is turned on: a tool
+# missing from it is then sent only if the prompt references it (`enable_other_tool_*`), as upstream.
+A_TOOLS_FORCED='let h=r.getEnabledTools(e,n,y=>{if(typeof m[y.name]=="boolean")return m[y.name]});'
+R_TOOLS_FORCED='let ezilNone=$a.some(e.tools,()=>!0)&&!$a.some(e.tools,([,y])=>y!==!1),h=r.getEnabledTools(e,n,y=>{if(!ezilNone&&typeof m[y.name]=="boolean")return m[y.name]});'
+# Names it relies on (checked, never patched): `$a.some` over the request's tool map, and
+# getEnabledTools' order (explicit off, then the override, then prompt references, then explicit on).
+P_TOOLS_EDITFILES='$a.some(e.tools,([y,v])=>(typeof y=="string"?y:y.name)==="copilot_editFiles"&&v===!1)'
+P_TOOLS_ENABLED='let p=c.get(uH(d.name));if(p===!1)return!1;let m=o?.(d);if(m!==void 0)return m;for(let A of n.toolReferences)if(s.get(A.name)?.tags.includes(`enable_other_tool_${d.name}`))return!0;return p===!0'
+
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
@@ -304,6 +347,13 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
   patch submenu-label  "$PKG_NLS" 1 "$A_SUBMENU"     "$R_SUBMENU"
   patch walkthrough    "$PKG_NLS" 1 "$A_WALKTHROUGH" "$R_WALKTHROUGH"
+  for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE" "$P_TOOLS_FILTER"; do gate tools-names "$WB" 1 "$p"; done
+  patch tools-legacy   "$WB"  1  "$A_TOOLS_LEGACY" "$R_TOOLS_LEGACY"
+  patch tools-absent   "$WB"  1  "$A_TOOLS_ABSENT" "$R_TOOLS_ABSENT"
+  patch tools-session  "$WB"  1  "$A_TOOLS_SESSION" "$R_TOOLS_SESSION"
+  patch tools-prompt   "$WB"  1  "$A_TOOLS_PROMPT" "$R_TOOLS_PROMPT"
+  for p in "$P_TOOLS_EDITFILES" "$P_TOOLS_ENABLED"; do gate tools-names "$EXT" 1 "$p"; done
+  patch tools-forced   "$EXT" 1  "$A_TOOLS_FORCED" "$R_TOOLS_FORCED"
   # modification notices (comments; the .json cannot carry one)
   for f in "$EXT" "$NLS_JS" "$WB"; do
     if ! head -c 400 "$f" | grep -qF 'Modified at build time by EZiL'; then
@@ -350,6 +400,13 @@ gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB" 
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
 gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
 gate history-picker   "$WB"  0  "$A_HISTORY_PICKER"; gate history-picker   "$WB"  1  "$R_HISTORY_PICKER"
+for p in "$P_TOOLS_MEMBERS" "$P_TOOLS_REQUEST" "$P_TOOLS_PICKER" "$P_TOOLS_STORAGE" "$P_TOOLS_FILTER"; do gate tools-names "$WB" 1 "$p"; done
+for p in "$P_TOOLS_EDITFILES" "$P_TOOLS_ENABLED"; do gate tools-names "$EXT" 1 "$p"; done
+gate tools-legacy     "$WB"  0  "$A_TOOLS_LEGACY";  gate tools-legacy     "$WB"  1  "$R_TOOLS_LEGACY"
+gate tools-absent     "$WB"  0  "$A_TOOLS_ABSENT";  gate tools-absent     "$WB"  1  "$R_TOOLS_ABSENT"
+gate tools-session    "$WB"  0  "$A_TOOLS_SESSION"; gate tools-session    "$WB"  1  "$R_TOOLS_SESSION"
+gate tools-prompt     "$WB"  0  "$A_TOOLS_PROMPT";  gate tools-prompt     "$WB"  1  "$R_TOOLS_PROMPT"
+gate tools-forced     "$EXT" 0  "$A_TOOLS_FORCED";  gate tools-forced     "$EXT" 1  "$R_TOOLS_FORCED"
 gate session-filter   "$WB"  0  "$A_SESSION_FILTER"; gate session-filter   "$WB"  1  "$R_SESSION_FILTER"
 for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEADER_INPUT_TOOLBAR" "$P_HEADER_INPUT_CONTAINER" "$P_HEADER_SECONDARY" "$P_HEADER_TRAILING" "$P_HEADER_LAYOUT" "$P_HEADER_COMMANDS" "$P_HEADER_NOTIFY"; do
   gate header-names "$WB" 1 "$p"
