@@ -51,6 +51,10 @@ const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.png': 'im
 const DEFAULT = '/workspace';
 /** Folders the fake computer has (the Worker's walk answers `restored` for these, `missing` for any other). */
 const existing = new Set(['/workspace', '/workspace/a', '/workspace/b', '/workspace/c', '/workspace/my site/日本']);
+// Regular files the fake computer has (file-url-open-regression): the server answers `file`, opens the parent and
+// names the file; the REAL bridge then hands the fake editor VS Code's `payload`.
+const files = new Set(['/workspace/pages/index.js', '/workspace/my site/日本/notes 1.md']);
+const parentOf = (p) => p.slice(0, p.lastIndexOf('/')) || '/';
 let mints = 0;
 const asks = []; // every mint body's codeFolder / repository, in order
 const docs = []; // every editor document the browser loaded, by query, in order (its index is its id)
@@ -85,10 +89,12 @@ const shell = createServer((req, res) => {
             // As the Worker's planner: a project's checkout (projects/<uuid>/**) or .ezil is never an own-files folder.
             const notAllowed = asked && /^\/workspace\/(\.ezil(\/|$)|projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\/|$))/.test(asked);
             const restored = asked && ! notAllowed && existing.has(asked);
+            const isFile = asked && ! notAllowed && files.has(asked);
             // An editor may itself reopen its last folder even after the server refuses it.
-            const folder = restored || asked === '/workspace/missing-last-root' ? asked : DEFAULT;
-            return json({ ok: true, codePreviewUrl: `${editorOrigin}/preview-bootstrap?token=T${mints}&path=%2F&folder=${encodeURIComponent(folder)}`,
-                ...(asked ? { codeFolder: { v: 1, outcome: notAllowed ? 'not_allowed' : restored ? 'restored' : 'missing' } } : {}) });
+            const folder = restored || asked === '/workspace/missing-last-root' ? asked : isFile ? parentOf(asked) : DEFAULT;
+            const fileParam = isFile ? `&file=${encodeURIComponent(asked)}` : '';
+            return json({ ok: true, codePreviewUrl: `${editorOrigin}/preview-bootstrap?token=T${mints}&path=%2F&folder=${encodeURIComponent(folder)}${fileParam}`,
+                ...(asked ? { codeFolder: { v: 1, outcome: notAllowed ? 'not_allowed' : restored ? 'restored' : isFile ? 'file' : 'missing' } } : {}) });
         });
         return;
     }
@@ -125,6 +131,7 @@ const editor = createServer((req, res) => {
         // As the Worker: the first document, with this mint's id and the folder the mint chose.
         const to = new URLSearchParams();
         if ( url.searchParams.get('folder') ) to.set('folder', url.searchParams.get('folder'));
+        if ( url.searchParams.get('file') ) to.set('file', url.searchParams.get('file'));
         const mint = url.searchParams.get('ezil_mint'); if ( mint ) to.set('ezil_mint', mint);
         res.statusCode = 302; res.setHeader('location', `/?${to}`); res.end(); return;
     }
@@ -172,16 +179,25 @@ async function tab (start = '/os', { record, windowed = false } = {}) {
     const editorFrame = () => page.frames().find(f => f !== page.mainFrame() && f.url().startsWith(`${editorOrigin}/?`));
     const editorQuery = () => new URL(editorFrame()?.url() ?? `${editorOrigin}/`).search;
     const editorFolder = () => new URLSearchParams(editorQuery()).get('folder');
+    /** The file VS Code would open at boot: the `openFile` URI of the editor document's `payload`, else null. */
+    const editorFile = () => {
+        try { return JSON.parse(new URLSearchParams(editorQuery()).get('payload') ?? 'null')?.find?.((e) => e[0] === 'openFile')?.[1] ?? null; } catch { return null; }
+    };
     const waitEditor = (folder) => page.waitForFunction(() => true).then(async () => {
         const end = Date.now() + 15_000;
         while ( Date.now() < end ) { if ( editorFolder() === folder ) return true; await page.waitForTimeout(100); }
+        return false;
+    });
+    const waitEditorFile = (uri) => page.waitForFunction(() => true).then(async () => {
+        const end = Date.now() + 15_000;
+        while ( Date.now() < end ) { if ( editorFile() === uri ) return true; await page.waitForTimeout(100); }
         return false;
     });
     const len = () => page.evaluate(() => history.length);
     const quiet = () => page.waitForTimeout(1500); // a reload or a route follow, if any, has started and been seen
     const notice = () => page.locator('.ezil-code-folder-notice').first();
     await page.goto(`${shellOrigin}${start}`);
-    return { context, page, at, address, waitAddress, editorFrame, editorQuery, editorFolder, waitEditor, len, quiet, notice };
+    return { context, page, at, address, waitAddress, editorFrame, editorQuery, editorFolder, editorFile, waitEditor, waitEditorFile, len, quiet, notice };
 }
 const enc = (p) => encodeURIComponent(p).replace(/%2F/g, '/');
 const on = (e, doc) => events.some(x => x.e === e && x.doc === doc);
@@ -468,6 +484,70 @@ const lastAsk = () => asks.at(-1);
     await t.context.close();
 }
 
+// ── a file link (file-url-open-regression, 2026-11-07): the file opens in its folder; reload, switch, Back/Forward ──
+{
+    const file = '/workspace/pages/index.js';
+    const uri = `vscode-remote://${new URL(editorOrigin).host}${file}`;
+    const t = await tab(`/app/code?folder=${enc(file)}`);
+    ok(await t.waitEditor('/workspace/pages'), `file: the editor opens the file's own folder [${t.editorQuery()}]`);
+    ok(await t.waitEditorFile(uri), `file: the editor is told to open the file at boot (VS Code payload openFile, this host's authority) [${t.editorQuery()}]`);
+    ok(lastAsk().codeFolder?.path === file, `file: the mint asked for the file byte for byte [${JSON.stringify(lastAsk())}]`);
+    ok(await t.waitAddress(`/app/code?folder=${enc(file)}`), `file: the address keeps naming the file [${await t.address()}]`);
+    await t.quiet();
+    ok(await t.notice().count() === 0, 'file: no notice: exactly what was asked opened');
+    ok(await t.address() === `/app/code?folder=${enc(file)}`, `file: the address is stable afterwards [${await t.address()}]`);
+    // Reload: the address names the file, so the mint asks for it again and it reopens.
+    const mintsBefore = mints;
+    await t.page.reload();
+    ok(await t.waitEditor('/workspace/pages') && await t.waitEditorFile(uri), `file reload: the file reopens in its folder [${t.editorQuery()}]`);
+    ok(mints === mintsBefore + 1 && lastAsk().codeFolder?.path === file, `file reload: one mint, asking for the file [${JSON.stringify(lastAsk())}]`);
+    ok(await t.waitAddress(`/app/code?folder=${enc(file)}`), `file reload: the address keeps the file [${await t.address()}]`);
+    // Open Folder in Code: its own entry; Back returns to the file (address AND editor); Forward to the folder.
+    const lenFile = await t.len();
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
+    ok(await t.waitEditor('/workspace/b') && await t.waitAddress('/app/code?folder=/workspace/b'), 'file switch: Open Folder moves the address with the editor');
+    await t.quiet();
+    ok(await t.len() === lenFile + 1 && t.editorFile() === null, 'file switch: one new entry; the folder document carries no file');
+    await t.page.goBack();
+    ok(await t.waitAddress(`/app/code?folder=${enc(file)}`), `file back: the address returns to the file [${await t.address()}]`);
+    ok(await t.waitEditor('/workspace/pages') && await t.waitEditorFile(uri), `file back: the editor returns to the file in its folder [${t.editorQuery()}]`);
+    await t.page.goForward();
+    ok(await t.waitAddress('/app/code?folder=/workspace/b') && await t.waitEditor('/workspace/b'), 'file forward: Forward returns to the folder with the address');
+    await t.quiet();
+    ok(await t.address() === '/app/code?folder=/workspace/b', 'file forward: stable afterwards');
+    await t.context.close();
+}
+// A file with a space and Unicode in its name and its folder's.
+{
+    const file = '/workspace/my site/日本/notes 1.md';
+    const t = await tab(`/app/code?folder=${encodeURIComponent(file)}`);
+    ok(await t.waitEditor('/workspace/my site/日本'), `unicode file: the folder opens [${t.editorQuery()}]`);
+    ok(await t.waitEditorFile(`vscode-remote://${new URL(editorOrigin).host}/workspace/my%20site/%E6%97%A5%E6%9C%AC/notes%201.md`),
+        `unicode file: the file URI is percent-encoded for VS Code [${t.editorQuery()}]`);
+    ok(lastAsk().codeFolder?.path === file, `unicode file: asked byte for byte [${JSON.stringify(lastAsk())}]`);
+    ok(await t.waitAddress(`/app/code?folder=${enc(file)}`), `unicode file: the address keeps the file, / readable [${await t.address()}]`);
+    await t.context.close();
+}
+// A missing file: the default opens with the truthful notice; nothing is created, the address keeps the ask.
+{
+    const gone = '/workspace/pages/gone.js';
+    const t = await tab(`/app/code?folder=${enc(gone)}`);
+    ok(await t.waitEditor(DEFAULT), 'missing file: a file the computer does not have: the default opens');
+    ok(t.editorFile() === null, 'missing file: the editor is never told to open (or create) it');
+    ok(lastAsk().codeFolder?.path === gone, 'missing file: it was asked for');
+    await t.notice().waitFor();
+    ok((await t.notice().getAttribute('data-outcome')) === 'missing', 'missing file: the notice says missing, never a silent fallback');
+    await t.quiet();
+    ok(await t.address() === `/app/code?folder=${enc(gone)}`, `missing file: the address keeps the asked file for a reload or Try again [${await t.address()}]`);
+    await t.context.close();
+}
+// A folder link whose folder also has files: a directory still opens as a directory (no file is opened).
+{
+    const t = await tab(`/app/code?folder=${enc('/workspace/a')}`);
+    ok(await t.waitEditor('/workspace/a') && t.editorFile() === null, 'folder still a folder: a directory link opens the directory, no payload');
+    await t.context.close();
+}
+
 ok(errors.length === 0, `no uncaught page errors [${errors.join(' | ')}]`);
 await browser.close(); shell.close(); editor.close();
-console.log(`PASS ${checks} checks: Code folder in the address bar (link, switch, Back/Forward, reload, reconnect, close, multi-root, nested, unicode, relative, invalid, missing, unsaved veto)`);
+console.log(`PASS ${checks} checks: Code folder in the address bar (link, switch, Back/Forward, reload, reconnect, close, multi-root, nested, unicode, relative, invalid, missing, unsaved veto, file link, unicode file, missing file)`);
