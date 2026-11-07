@@ -307,6 +307,75 @@ M.detachFolderBridge(F);
     M.forgetFolder(bind);
 }
 
+// 20 a file link (file-url-open-regression, 2026-11-07): the server answers `file`, the first document shows the
+//    file's parent with the file in it (the bridge reports both); exactly that is silent, anything else is said.
+{
+    M.forgetFolder(bind);
+    const roots = [];
+    const FILE = '/workspace/pages/index.js';
+    const attachF = (t, asked, answer) => {
+        const u = M.tagFolderMint(minted(t), { asked, answer }); F.src = u;
+        M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onRoot: (r, how) => roots.push([r, how]) });
+        return u;
+    };
+    const reportF = (mint, path, file, base = '/') => fire({ type: 'ezil.code.folder', v: 1, nonce: F.sent.at(-1).m.nonce, mint, kind: 'folder', path, ...(file === undefined ? {} : { file }), base });
+    // a. the asked file inside its parent: silent, onRoot carries the file, the record is the FOLDER
+    let before = notices.length;
+    url = attachF('f1', { v: 1, path: FILE }, { v: 1, outcome: 'file' });
+    F.load(); reportF(mintOf(url), '/workspace/pages', FILE);
+    eq(notices.length, before, 'file: the asked file in its parent: no notice');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/pages', file: FILE, base: '/' }, { mintDriven: true, fallback: false }], 'file: onRoot hears the folder with the file');
+    eq(M.folderAskFor(bind), { v: 1, path: '/workspace/pages' }, 'file: the tab record keeps the folder (the address keeps the file)');
+    M.detachFolderBridge(F);
+    // b. the parent opened but no file in it (an editor whose address lost `file`): said, as not_reopened
+    url = attachF('f2', { v: 1, path: FILE }, { v: 1, outcome: 'file' });
+    F.load(); reportF(mintOf(url), '/workspace/pages', undefined);
+    eq(notices.at(-1), ['not_reopened', FILE], 'file: the parent without the file: not_reopened, naming the file');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/pages', base: '/' }, { mintDriven: true, fallback: true }], 'file: onRoot with the fallback flag');
+    M.detachFolderBridge(F);
+    // c. a `file` that is not a direct child of the reported folder is dropped, so it is not the asked file either
+    for ( const odd of ['/workspace/other/index.js', '/workspace/pages/sub/index.js', '/workspace/pages', 'index.js', '/workspace/pages/../pages/index.js'] ) {
+        url = attachF(`f3-${odd}`, { v: 1, path: FILE }, { v: 1, outcome: 'file' });
+        F.load(); reportF(mintOf(url), '/workspace/pages', odd);
+        eq(notices.at(-1), ['not_reopened', FILE], `file: a stray file ${JSON.stringify(odd)} is not the asked one`);
+        eq(roots.at(-1)[0], { kind: 'folder', path: '/workspace/pages', base: '/' }, `file: the stray file ${JSON.stringify(odd)} is dropped from the root`);
+        M.detachFolderBridge(F);
+    }
+    // d. the asked file reported as if it were the open FOLDER (no `file` answer semantics): not what was asked
+    url = attachF('f4', { v: 1, path: FILE }, { v: 1, outcome: 'file' });
+    F.load(); reportF(mintOf(url), FILE, undefined);
+    eq(notices.at(-1), ['not_reopened', FILE], 'file: the file path shown as a folder is not the file open in its parent');
+    M.detachFolderBridge(F);
+    // e. an older host answers not_directory for a file: the default opens and the notice says so (never silent)
+    url = attachF('f5', { v: 1, path: FILE }, { v: 1, outcome: 'not_directory' });
+    F.load(); reportF(mintOf(url), '/workspace', undefined);
+    eq(notices.at(-1), ['not_directory', FILE], 'file: an older computer that cannot open files from a link says not_directory');
+    M.detachFolderBridge(F);
+    // f. a missing file: missing, exactly as a missing folder
+    url = attachF('f6', { v: 1, path: '/workspace/pages/gone.js' }, { v: 1, outcome: 'missing' });
+    F.load(); reportF(mintOf(url), '/workspace', undefined);
+    eq(notices.at(-1), ['missing', '/workspace/pages/gone.js'], 'file: a missing file is missing');
+    M.detachFolderBridge(F);
+    // g. a folder ask stays a folder ask: a `file` in the report does not make the parent match
+    url = attachF('f7', { v: 1, path: '/workspace/pages' }, { v: 1, outcome: 'restored' });
+    F.load(); reportF(mintOf(url), '/workspace/pages', FILE);
+    before = notices.length;
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/pages', file: FILE, base: '/' }, { mintDriven: true, fallback: false }], 'folder ask: the folder matched; a file in it is carried');
+    M.detachFolderBridge(F);
+    // h. a user-driven document naming a file (Back/Forward to a file entry): heard with the file, the record is the folder
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind, notice, onRoot: (r, how) => roots.push([r, how]), continued: true });
+    F.load(); reportF(null, '/workspace/pages', FILE, '/preview/');
+    eq(roots.at(-1), [{ kind: 'folder', path: '/workspace/pages', file: FILE, base: '/preview/' }, { mintDriven: false, fallback: false }], 'continued: a file document is heard with its file');
+    eq(M.folderAskFor(bind), { v: 1, path: '/workspace/pages' }, 'continued: the record is the folder');
+    M.detachFolderBridge(F);
+    // i. the editor document URL for a file entry: folder AND file; a stray file is left out
+    eq(M.editorDocumentUrl('https://e.example/preview-bootstrap?token=t', { kind: 'folder', path: '/workspace/pages', file: FILE, base: '/preview/' }),
+        'https://e.example/preview/?folder=%2Fworkspace%2Fpages&file=%2Fworkspace%2Fpages%2Findex.js', 'editorDocumentUrl: folder and file');
+    eq(M.editorDocumentUrl('https://e.example/x', { kind: 'folder', path: '/workspace/pages', file: '/workspace/other/x.js', base: '/' }),
+        'https://e.example/?folder=%2Fworkspace%2Fpages', 'editorDocumentUrl: a file outside the folder is left out');
+    M.forgetFolder(bind);
+}
+
 // ── the notice band: text only, actions per outcome ─────────────────────────
 globalThis.document = { createElement: (t) => ({ t, children: [], attrs: {}, listeners: {}, className: '', textContent: '',
     appendChild (c) { this.children.push(c); }, setAttribute (k, v) { this.attrs[k] = v; }, addEventListener (k, f) { this.listeners[k] = f; },

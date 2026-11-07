@@ -879,6 +879,21 @@ describe('handlePreviewBootstrap', () => {
     expect(locationOf(res).searchParams.get('folder')).toBe('/workspace/My Project/日本 ü');
   });
 
+  it('code: a walked file is forwarded beside its folder; not a direct child of it, or without a folder, is 400 invalid_folder', async () => {
+    const res = await codeBootstrap(`&folder=${encodeURIComponent('/workspace/My Project/')}&file=${encodeURIComponent('/workspace/My Project/日本 ü.md')}`);
+    expect(res.status).toBe(302);
+    expect(locationOf(res).searchParams.get('folder')).toBe('/workspace/My Project');
+    expect(locationOf(res).searchParams.get('file')).toBe('/workspace/My Project/日本 ü.md');
+    for (const q of [`&file=${encodeURIComponent('/workspace/a/x.js')}`, `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/b/x.js')}`,
+      `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/a/b/x.js')}`, '&folder=%2Fworkspace%2Fa&file=%2Fworkspace%2Fa',
+      `&folder=%2Fworkspace%2Fa&file=${encodeURIComponent('/workspace/a/../a/x.js')}`]) {
+      const bad = await codeBootstrap(q);
+      expect({ q, status: bad.status }).toEqual({ q, status: 400 });
+      expect(await bad.json()).toEqual({ ok: false, error: 'invalid_folder' });
+      expect(bad.headers.get('set-cookie')).toBeNull();
+    }
+  });
+
   it('code: the project folder repo-open composes still passes', async () => {
     const res = await codeBootstrap(`&folder=${encodeURIComponent('/workspace/projects/0b0e9b8e-6b1f-4c5e-9d3a-2f1e8c7d6a5b')}`);
     expect(res.status).toBe(302);
@@ -886,7 +901,7 @@ describe('handlePreviewBootstrap', () => {
   });
 
   it('code: an open key hidden inside `path` is refused (the `path=/?folder=/etc` injection)', async () => {
-    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
+    for (const hidden of ['/?folder=/etc', '/?workspace=/etc/x.code-workspace', '/?ew=true', '/?payload=%5B%5D', '/?file=/etc/passwd', '/?ezil_mint=AAAAAAAAAAAAAAAAAAAAAA']) {
       const res = await codeBootstrap(`&path=${encodeURIComponent(hidden)}`);
       expect({ hidden, status: res.status }).toEqual({ hidden, status: 400 });
     }

@@ -72,7 +72,7 @@ import {
   verifyPreviewCookie,
 } from './hmac';
 import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
-import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
+import { codeBootstrapPathProblem, codeFileInFolder, CODE_FOLDER_FILE_PARAM, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
 import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
@@ -842,6 +842,15 @@ export async function handlePreviewBootstrap(
       const plain = plainFolderPath(folder);
       if (!plain) return invalidFolder();
       locationUrl.searchParams.set('folder', plain);
+    }
+    // A walked regular file (`settleCodeFolder` -> `file`): plain, and a direct child of THIS bootstrap's own
+    // `folder`, else 400. The workbench bridge turns it into VS Code's `payload` (`./code-folder-bridge.ts`).
+    const file = url.searchParams.get(CODE_FOLDER_FILE_PARAM);
+    if (file) {
+      const plainFile = plainFolderPath(file);
+      const parent = locationUrl.searchParams.get('folder');
+      if (!plainFile || !parent || !codeFileInFolder(plainFile, parent)) return invalidFolder();
+      locationUrl.searchParams.set(CODE_FOLDER_FILE_PARAM, plainFile);
     }
     // The shell's per-mint id rides into this mint's FIRST editor document only (code-server's own redirect keeps
     // it; VS Code's Open Folder drops it). An instance binding, not a credential and not authority; a malformed

@@ -26,8 +26,10 @@ import type { AwsDesktopConfigReadiness, AwsDesktopReadiness } from './aws-ice';
 import { APP_PREVIEW_PORT, CODE_PREVIEW_PORT, portFor } from './desktop-mode';
 import { relayFailureResult, type RelayState } from './relay-refresh';
 import {
+  CODE_FOLDER_FILE_PARAM,
   CODE_FOLDER_MINT_PARAM,
   codeBootstrapPathProblem,
+  codeFileInFolder,
   codeFolderAnswer,
   codeFolderMint,
   fitsCodeFolderUrl,
@@ -245,14 +247,18 @@ function underAwsWorkspace(path: string): boolean {
 }
 
 /**
- * `folder` is Code's only (port 8443) and only ever a folder the host walked (`handleAwsPreview`); the
- * bootstrap re-checks it lexically. Every other port ignores it.
+ * `folder` is Code's only (port 8443) and only ever a folder the host walked (`handleAwsPreview`); `file` (a
+ * regular file the host walked, a direct child of `folder`) rides only beside it. The bootstrap re-checks both
+ * lexically. Every other port ignores them.
  */
-export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string, bootstrapToken: string, path = '/', folder?: string): string {
+export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string, bootstrapToken: string, path = '/', folder?: string, file?: string): string {
   const u = new URL(`https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap`);
   u.searchParams.set('token', bootstrapToken);
   u.searchParams.set('path', path);
-  if (folder && port === CODE_PREVIEW_PORT) u.searchParams.set('folder', folder);
+  if (folder && port === CODE_PREVIEW_PORT) {
+    u.searchParams.set('folder', folder);
+    if (file) u.searchParams.set(CODE_FOLDER_FILE_PARAM, file);
+  }
   return u.toString();
 }
 
@@ -396,6 +402,17 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
         const plain = plainFolderPath(folder);
         if (!plain || !underAwsWorkspace(plain)) return json({ ok: false, error: 'invalid_folder' }, 400);
         dest.searchParams.set('folder', plain);
+      }
+      // A walked regular file (`settleCodeFolder` -> `file`): plain, under /workspace and a direct child of THIS
+      // bootstrap's own `folder`, else 400. The workbench bridge turns it into VS Code's `payload`.
+      const file = url.searchParams.get(CODE_FOLDER_FILE_PARAM);
+      if (file) {
+        const plainFile = plainFolderPath(file);
+        const parent = dest.searchParams.get('folder');
+        if (!plainFile || !underAwsWorkspace(plainFile) || !parent || !codeFileInFolder(plainFile, parent)) {
+          return json({ ok: false, error: 'invalid_folder' }, 400);
+        }
+        dest.searchParams.set(CODE_FOLDER_FILE_PARAM, plainFile);
       }
       // The shell's per-mint id rides into this mint's FIRST editor document only (an instance binding, not a
       // credential and not authority); a malformed one is dropped, never an error.
@@ -554,17 +571,21 @@ export async function handleAwsPreview(claims: PreviewTokenV2Claims, deps: AwsPr
   const now = deps.nowMs();
   const token = await mintPreviewBootstrapToken(secrets[0]!, claims.sandboxId, now);
   let restored = folder.folder;
+  let restoredFile = folder.file;
   let folderOutcome = folder.outcome;
-  if (restored && !fitsCodeFolderUrl(awsBrowserUrl(CODE_PREVIEW_PORT, claims.sandboxId, deps.zoneRoot, token, '/', restored))) {
+  if (restored && !fitsCodeFolderUrl(awsBrowserUrl(CODE_PREVIEW_PORT, claims.sandboxId, deps.zoneRoot, token, '/', restored, restoredFile))) {
     // The shell's frame confirmation caps the URL; a deep folder opens today's default with a visible notice.
     restored = undefined;
+    restoredFile = undefined;
     folderOutcome = 'too_long';
   }
-  // Code always opens an explicit folder, as on Cloudflare: the walked one, else the workspace root. Without one,
-  // code-server reopens its own last-visited folder (it runs without --ignore-last-opened): anything the person ever
-  // opened, even outside /workspace or a repository opened by hand, while the notice says "its usual folder".
+  // Code always opens an explicit folder, as on Cloudflare: the walked one (with the walked file inside it, for a
+  // `file` answer), else the workspace root. Without one, code-server reopens its own last-visited folder (it runs
+  // without --ignore-last-opened): anything the person ever opened, even outside /workspace or a repository opened
+  // by hand, while the notice says "its usual folder".
   const codeFolder = restored ?? AWS_WORKSPACE_ROOT;
-  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token, '/', port === CODE_PREVIEW_PORT ? codeFolder : undefined);
+  const url = (port: number) => awsBrowserUrl(port, claims.sandboxId, deps.zoneRoot, token, '/',
+    port === CODE_PREVIEW_PORT ? codeFolder : undefined, port === CODE_PREVIEW_PORT ? restoredFile : undefined);
   return json({
     ok: true,
     provider: 'aws-ec2',

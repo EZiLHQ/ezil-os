@@ -730,8 +730,10 @@ const DEFAULT_WORKSPACE_MOUNT_PATH = '/workspace';
 function codePreviewFolderParams(
   workspace: { mounted: boolean; mountPath?: string },
   restored?: string,
+  file?: string,
 ): Record<string, string> | undefined {
-  if (restored) return { folder: restored };
+  // `file` (a walked regular file, `settleCodeFolder` -> `file`) only ever rides beside its own parent folder.
+  if (restored) return file ? { folder: restored, file } : { folder: restored };
   return workspace.mounted && workspace.mountPath ? { folder: workspace.mountPath } : undefined;
 }
 
@@ -5099,15 +5101,17 @@ async function handlePreview(
     // Per-tab folder continuity (`./code-folder.ts`): the tab's hint, stripped of THIS computer's root (the mount,
     // else the container's own fallback root) and walked in the container with no symlink followed
     // (`./code-folder-resolve.ts`, e1cd418a: one exec, the whole resolve bounded, a code back, never a path).
-    // Only `restored` adds a folder; any other outcome opens today's default.
+    // Only `restored` adds a folder, only `file` a file inside its parent folder; any other outcome opens today's
+    // default.
     const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : CODE_FOLDER_UNMOUNTED_ROOT;
     const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,
       cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));
-    let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));
+    let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder, codeFolder.file));
     if (codeFolder.folder && codePreviewUrl && !fitsCodeFolderUrl(codePreviewUrl)) {
       // The shell's frame confirmation caps the URL: a deep folder opens today's default with a visible notice.
       codeFolder.outcome = 'too_long';
       codeFolder.folder = undefined;
+      codeFolder.file = undefined;
       codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));
     }
 

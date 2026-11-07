@@ -7,6 +7,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
   CODE_BOOTSTRAP_PATH_REFUSED_KEYS,
+  codeFileInFolder,
   CODE_FOLDER_URL_MAX,
   codeBootstrapPathProblem,
   codeFolderAnswer,
@@ -120,6 +121,28 @@ describe('settleCodeFolder', () => {
   it('a throwing resolver or an unknown answer is `error`, never a folder', async () => {
     expect(await settleCodeFolder(ask('/workspace/a'), '/workspace', async () => { throw new Error('boom'); })).toEqual({ outcome: 'error' });
     expect(await settleCodeFolder(ask('/workspace/a'), '/workspace', async () => '/etc' as never)).toEqual({ outcome: 'error' });
+  });
+
+  // file-url-open-regression (2026-11-07): a link may name a regular file.
+  it('`file`: the walked file is the file, its own parent is the folder (spaces and Unicode kept; a root-level file under /)', async () => {
+    const r = async () => 'file' as const;
+    expect(await settleCodeFolder(ask('/workspace/pages/index.js'), '/workspace', r))
+      .toEqual({ outcome: 'file', folder: '/workspace/pages', file: '/workspace/pages/index.js' });
+    expect(await settleCodeFolder(ask('/workspace/README.md'), '/workspace', r)).toEqual({ outcome: 'file', folder: '/workspace', file: '/workspace/README.md' });
+    expect(await settleCodeFolder(ask('/workspace/My Project/日本/notes 1.md'), '/workspace', r))
+      .toEqual({ outcome: 'file', folder: '/workspace/My Project/日本', file: '/workspace/My Project/日本/notes 1.md' });
+    expect(await settleCodeFolder(ask('/x.txt'), '/', r)).toEqual({ outcome: 'file', folder: '/', file: '/x.txt' });
+  });
+  it('`file` for the root itself cannot be: it is `error`, so no folder above the root is ever composed', async () => {
+    expect(await settleCodeFolder(ask('/workspace'), '/workspace', async () => 'file' as const)).toEqual({ outcome: 'error' });
+  });
+  it('codeFileInFolder: a direct child only', () => {
+    expect(codeFileInFolder('/workspace/pages/index.js', '/workspace/pages')).toBe(true);
+    expect(codeFileInFolder('/x.txt', '/')).toBe(true);
+    for (const [file, folder] of [['/workspace/pages/a/b.js', '/workspace/pages'], ['/workspace/pages', '/workspace/pages'], ['/workspace/pagesx/a.js', '/workspace/pages'],
+      ['/workspace/other/index.js', '/workspace/pages'], ['/workspace/pages/', '/workspace/pages'], ['/', '/']]) {
+      expect({ file, folder, got: codeFileInFolder(file!, folder!) }).toEqual({ file, folder, got: false });
+    }
   });
 });
 
