@@ -22,6 +22,17 @@ case "$command_name" in
     smoke) [[ $# == 1 ]] || fail 'smoke takes no argument.';;
     *) fail 'Usage: deploy.sh build TAG | upload TAG | install TAG | smoke';;
 esac
+if [[ $command_name == install || $command_name == install-verified ]]; then
+    # Cooperative only: a raw AWS-RunShellScript or an older checkout bypasses this.
+    ledger=${OS_STAGING_PROMOTION_LEDGER:-/root/ezil-aws-mum/releases/promotion-ledger.json}
+    if [[ -e $ledger || -L $ledger ]]; then
+        python3 - "$ledger" <<'PY' || fail 'Promotion ledger is unreadable or has a pending operation; reconcile it before any install.'
+import json, sys
+entries = json.load(open(sys.argv[1]))["entries"]
+sys.exit(1 if entries[-1].get("state") == "pending" else 0)
+PY
+    fi
+fi
 aws_call() { aws --region ap-south-1 --no-cli-pager "$@"; }
 guard_instance() {
     local instance_name

@@ -8,6 +8,36 @@ import rebase_manifest as manifest
 
 need=manifest.need
 
+# Read-only readback of the running app. The JSON is nonsecret.
+NODE="""const e=process.env;if(e.EZIL_AWS_KILL_SWITCH!=='1')process.exit(1);const ds=JSON.parse(e.EZIL_AWS_LIFECYCLE_DEPLOYMENTS||'{}');const d=ds['ap-south-1'];if(!d)process.exit(1);const keys=['accountId','region','namespace','zoneId','subnetId','securityGroupId','instanceTypes','storage','dataKeyArn','amiId','launchTemplateId','launchTemplateVersion','stateMachineVersionArn','lowerImageDigest','previousLowerImageDigest','preparationStateMachineVersionArn','recoveryStateMachineVersionArn'];const deployment=Object.fromEntries(keys.filter(k=>k in d).map(k=>[k,d[k]]));if('releases' in d)deployment.releasesSha256=require('crypto').createHash('sha256').update(JSON.stringify(d.releases),'utf8').digest('hex');console.log(JSON.stringify({gitSha:e.EZIL_GIT_SHA,killSwitch:'1',deployment}));"""
+# Must equal install-host.sh's jobs; the installer stops and re-enables all six.
+JOBS=('telemetry-maintenance','sandbox-reap','billing-session-sweep','aws-stop-settle','pool-replenish','aws-reconcile')
+PROBE=r"""
+import json, subprocess, sys
+def run(*command):
+    return subprocess.run(list(command),cwd='/opt/ezil-os-staging',text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+try:
+    r=run('docker','compose','--env-file','compose.env','exec','-T','web','node','-e',NODE)
+    if r.returncode: raise RuntimeError()
+    result=json.loads(r.stdout)
+    if result['killSwitch']!='1': raise RuntimeError()
+    r=run('docker','container','inspect','ezil-os-staging-web-1','--format','{{.Image}}')
+    if r.returncode: raise RuntimeError()
+    result['imageId']=r.stdout.strip()
+    r=run('docker','image','inspect','ezil-os-staging:'+TAG,'--format','{{.Id}}')
+    result['tagImageId']=r.stdout.strip() if r.returncode==0 else None
+    r=run('cat','compose.env')
+    result['composeTag']=r.stdout[len('OS_STAGING_TAG='):-1] if r.returncode==0 and r.stdout.startswith('OS_STAGING_TAG=') and r.stdout.count('\n')==1 and r.stdout.endswith('\n') else None
+    result['timers']={job:{'enabled':run('systemctl','is-enabled','ezil-os-staging-'+job+'.timer').stdout.strip(),
+                           'active':run('systemctl','is-active','ezil-os-staging-'+job+'.timer').stdout.strip(),
+                           'service':run('systemctl','is-active','ezil-os-staging-'+job+'.service').stdout.strip()} for job in JOBS}
+    # Evidence, not proof: no install-host.sh holds the host deploy lock at this instant.
+    result['lockFree']=run('flock','-n','deploy.lock','true').returncode==0
+    print(json.dumps(result,separators=(',',':')))
+except Exception:
+    print('staging app probe refused',file=sys.stderr);sys.exit(1)
+"""
+
 
 def gate(outer):
     need(outer.get('EZIL_AWS_KILL_SWITCH')=='1','admission must remain gated by the existing kill switch')
@@ -23,7 +53,6 @@ def body(install_script, app, deployment=None, install=True):
     command='set -- '+app['tag']+' ezil-main-preview-artifacts-452630323510-aps1\n'+install_script
     # JSON.stringify(d.releases) matches public_deployment's compact UTF-8 JSON:
     # registry strings are ASCII, numbers are ints, nulls match, and both parsers preserve insertion order.
-    node="""const e=process.env;if(e.EZIL_AWS_KILL_SWITCH!=='1')process.exit(1);const ds=JSON.parse(e.EZIL_AWS_LIFECYCLE_DEPLOYMENTS||'{}');const d=ds['ap-south-1'];if(!d)process.exit(1);const keys=['accountId','region','namespace','zoneId','subnetId','securityGroupId','instanceTypes','storage','dataKeyArn','amiId','launchTemplateId','launchTemplateVersion','stateMachineVersionArn','lowerImageDigest','previousLowerImageDigest','preparationStateMachineVersionArn','recoveryStateMachineVersionArn'];const deployment=Object.fromEntries(keys.filter(k=>k in d).map(k=>[k,d[k]]));if('releases' in d)deployment.releasesSha256=require('crypto').createHash('sha256').update(JSON.stringify(d.releases),'utf8').digest('hex');console.log(JSON.stringify({gitSha:e.EZIL_GIT_SHA,killSwitch:'1',deployment}));"""
     program=r'''
 import json, subprocess, sys
 try:
@@ -40,7 +69,7 @@ try:
 except Exception:
     print('staging app operation refused',file=sys.stderr);sys.exit(1)
 '''
-    constants={'INSTALL':install,'SCRIPT':command,'NODE':node,'APP':app,'EXPECTED':deployment}
+    constants={'INSTALL':install,'SCRIPT':command,'NODE':NODE,'APP':app,'EXPECTED':deployment}
     return "set -euo pipefail\nset +x\npython3 - <<'EZIL_APP_PY'\n"+'\n'.join(k+' = '+repr(v) for k,v in constants.items())+program+"\nEZIL_APP_PY\n"
 
 
@@ -52,3 +81,10 @@ def public_deployment(d):
         releases=json.dumps(d['releases'],separators=(',',':'),ensure_ascii=False)
         result['releasesSha256']=hashlib.sha256(releases.encode('utf-8')).hexdigest()
     return result
+
+
+def probe_body(tag):
+    """Read-only host probe: app identity, web image ID, candidate tag owner, compose.env tag, timers and deploy lock."""
+    need(manifest.matches(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}',tag),'invalid probe tag')
+    constants={'NODE':NODE,'TAG':tag,'JOBS':JOBS}
+    return "set -euo pipefail\nset +x\npython3 - <<'EZIL_APP_PY'\n"+'\n'.join(k+' = '+repr(v) for k,v in constants.items())+PROBE+"\nEZIL_APP_PY\n"
