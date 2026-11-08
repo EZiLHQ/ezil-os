@@ -240,6 +240,7 @@ describe('computeBootUiState — never fabricates progress', () => {
             // error codes still land on `unknown` rather than reaching for it.
             'capacity_unavailable',
             'computer_stopped',
+            'computer_update_required',
             'desktop_config_unapplied',
             'desktop_failed',
             'desktop_unreachable',
@@ -417,6 +418,8 @@ describe('the port is a module-format conversion and nothing more', () => {
         'max_running',
         'user_hours_cap',
         'global_hours_cap',
+        // The server's answer for a volume on another lower.
+        'computer_rebase_required',
         // Round 6 (seam A): the Worker's terminal desktop answers.
         'desktop_config_unapplied',
         'desktop_failed',

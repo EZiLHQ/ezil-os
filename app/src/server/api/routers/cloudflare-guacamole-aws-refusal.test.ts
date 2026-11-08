@@ -129,6 +129,7 @@ describe.each(['previewUrl', 'codePreviewUrl', 'appPreviewUrl'] as const)('%s AW
         ['capacity_unavailable', 'No capacity in India right now'],
         ['user_hours_cap', "Your computer reached EZiL's monthly AWS limit"],
         ['global_hours_cap', "All AWS computers reached EZiL's monthly limit"],
+        ['computer_rebase_required', 'Your computer needs an update before it can start'],
         ['aws_lifecycle_start_failed', 'Something went wrong'],
     ])('%s returns its code as a value and renders %s', async (errorCode, title) => {
         mocks.ensure.mockResolvedValue({ ok: false, error: errorCode, errorCode, retryable: false });

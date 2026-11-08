@@ -1634,6 +1634,14 @@ export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement,
     return rows.length === 1 && rows[0]!.lower_image_digest === digest;
 }
 
+/** The lower this computer's volume last booted on (enrollment or image-job evidence); null when never recorded or unreadable. */
+export async function readRecordedLowerDigest(db: PlacementExecutor, computerId: string): Promise<string | null> {
+    const rows = rowsOf(await db.execute(sql`/* placement:recorded-lower */ SELECT lower_image_digest
+        FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid LIMIT 2`));
+    const digest = rows.length === 1 ? rows[0]!.lower_image_digest : null;
+    return typeof digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
 export const POOL_SESSION_PENDING = 'pool_session_pending';
 export async function finishEnrollment(
