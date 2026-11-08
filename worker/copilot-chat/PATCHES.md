@@ -357,23 +357,97 @@ reloaded.
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/static-id-patch.test.cjs
 ```
 
-## App-failure renderer command
+## App-failure renderer command and definite startup timeout
 
-`app-failure` registers `_ezil.appFailure` in the renderer's CommandsRegistry. The extension host invokes it
-with a canonical, content-free record. Its handler only dispatches `CustomEvent("ezil-app-failure")` on
-`window`, with `detail: JSON.stringify(record)`, swallowing serialization or dispatch errors. The separate
-Worker-injected diagnostic bridge validates the record and transports it to the pinned shell parent after
-`ezil.code.diag.hello` (see `docs/FEEDBACK-APP-FAILURES-CONTRACT.md`). No logging or storage is added.
+`app-failure` registers `_ezil.appFailure` in the renderer's CommandsRegistry. Both the extension-host
+command and the startup producer call `ezilDispatchAppFailure`. It constructs a fresh closed record from
+own data descriptors only: contract strings of at most 64 characters, finite integers for numeric fields,
+and a boolean for `retryable`. It never invokes getters, `toJSON`, functions or Error message/stack accessors.
+Unknown keys, accessors, objects or invalid primitives are dropped from the projection and invalidate the
+whole input (so an extra object key or overlong optional string cannot dispatch a repaired record). Only
+that projected record is validated and serialized into `CustomEvent("ezil-app-failure")`; exceptions are
+swallowed without logging. The compact validator is byte-for-byte equal to the bridge's embedded validator,
+including the canonical namespaced model-key rules; the patch test pins this equality.
 
-The exact 4.141.0 anchor is `qe.registerCommand("noop",()=>{});var YLi=`: **one occurrence** in the pristine
-workbench. `qe` is the CommandsRegistry instance defined immediately before it; `YLi` is the following
-declaration and is used only as an anchor boundary. The new registration goes between them. Verification
-requires zero old-anchor occurrences, one exact replacement and one `_ezil.appFailure` registration.
-Re-running apply on a bundle with the exact replacement runs all verification gates without changing bytes,
-including the static-id gate; partially patched or altered bundles fail. Existing upstream registrations stay.
+The exact 4.141.0 command anchor is `qe.registerCommand("noop",()=>{});var YLi=`: **one occurrence** in the
+pristine workbench. `qe` is the CommandsRegistry just initialized; `YLi` is the next declaration. Verification
+requires **zero old anchors, one exact replacement, one command registration**. Re-running apply on the exact
+patched bundle runs verification without changing bytes, including the content-derived static id. Partial,
+older or altered patches fail closed; use a compatible image or rebuild from pristine 4.141.0.
 
-`COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/app-failure-patch.test.cjs`
-checks apply, verify, idempotence, the actual registered handler and gate rejection on drift.
+`app-start-timeout` patches the unique timeout branch of SetupAgent's
+`async doForwardRequestToChatWhenReady(e,t,i,n,r,a,c)` (**one definition**). Exact anchor (**one occurrence**):
+
+```js
+if(M==="timedout"){let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);
+```
+
+NLS entries 10557 and 10558 both start with "Chat took too long to get ready". Only this `timedout` branch calls
+the same projection with `{eventId:crypto.randomUUID(),source:"code_app",operation:"app_start",category:"app_startup",
+code:"app_start_timeout",stage:"startup",outcome:"failed"}`. No elapsed time is in scope, so `durationMs` is
+omitted. The upstream warning, later activation recovery and resend remain intact. `--verify` requires **zero
+old timeout anchors and one exact replacement**. The patched method is evaluated in the offline test: timeout
+emits exactly one valid record with a fresh lowercase UUID; success and panel-guidance branches emit none.
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/app-failure-patch.test.cjs
+```
+
+This test copies pristine inputs into a temporary root; it never mutates `COPILOT_TEST_ROOT`. It checks both
+anchor counts, apply, verify, idempotence, every valid/rejected record fixture, projection traps, the actual
+patched readiness method, and failure on either anchor or replacement drifting.
+
+The separate Worker's diagnostic bridge uses the same validator and only the parent origin pinned at injection.
+Each accepted hello emits exactly `{type:"ezil.code.diag.ready",v:1,nonce}` before flushing failures. Ready and
+failure messages share the 20/minute cap; a hello that cannot be acknowledged at the cap is not accepted.
+Canonical envelope fixtures pin exact output shapes. No console, persistent storage or global names are added.
+
+### Real shell / Code / extension-host fault QA (coordinator only)
+
+`e2e/code-app-failure-image.sh` installs the branch VSIX into the built-in vendor directory using the image's
+Dockerfile unzip/move layout, applies the branch patch and runs `--verify`, all before `start-codeserver.sh`.
+It requires a local Linux Docker daemon (bind mounts must exist on its host), a local desktop image with
+code-server 4.141.0, Node with TypeScript stripping, an already-built shell, branch VSIX, and installed Playwright
+Chromium. It creates an internal network and never pulls images or downloads packages.
+
+```sh
+# Optional isolated shell output, run by the coordinator with its already available build tools:
+EZIL_SHELL_OUT_DIR=/tmp/task-e-shell bash shell/build-shell.sh
+
+IMAGE=ezil-os-desktop:wbebfcc0a PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules \
+  SHELL_ASSETS_DIR=/tmp/task-e-shell FAULT_VARIANT=missing_terminal \
+  bash e2e/code-app-failure-image.sh /tmp/task-e-missing-terminal
+IMAGE=ezil-os-desktop:wbebfcc0a PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules \
+  SHELL_ASSETS_DIR=/tmp/task-e-shell FAULT_VARIANT=settlement_pending \
+  bash e2e/code-app-failure-image.sh /tmp/task-e-settlement-pending
+```
+
+Without `SHELL_ASSETS_DIR` the committed `app/public/os` build is served. `VSIX` can override the default
+`worker/ezil-models/dist/ezil-models-0.1.0.vsix`; `PLAYWRIGHT_BROWSERS_PATH` uses Playwright's normal override.
+The metadata-only mock lists one safe dotted key, `qwen.qwen3-coder-next` (the current catalog alias regex
+rejects `/`), and emits a valid message start/text delta followed by EOF without `message_stop`, or an SSE
+`error` carrying `settlement_pending`. It never accesses bodies or headers and logs only closed method/path,
+status and a fixed synthetic lowercase Gateway UUID. The container discards its stdout.
+
+The harness serves the real shell bundle and proxies real code-server with both real Worker injection functions.
+A unique, checked export-binding insertion in the served bundle exposes the existing `app_failures_for` singleton
+for assertions; it creates no replacement store or frame registration and does not modify any shell/app file.
+The real Code app registers its own iframe and sends its own hello. Assertions cover ready, one real UI request,
+visible failure, the real store's exact record/UUIDs, direct nonregistered-frame and extra-key forgery rejection,
+and the diagnostics-consented frozen feedback preview. The feedback endpoint refuses submission.
+
+Artifacts contain fixed pass/fail lines and screenshots with every iframe masked, so chat text is never captured.
+There is no HAR, Playwright trace, browser console capture, body dump or chat-log export. Failures report a fixed
+phase name without exception operands or stacks. Image/VSIX compatibility, actual UI selectors, extension mapping
+of both stream faults, and the complete container run require coordinator validation; offline tests do not claim
+that those image paths have passed. Stale bundle export shapes and prepatched images fail their gates explicitly.
+
+```sh
+node --test e2e/code-app-failure.test.mjs
+bash -n e2e/code-app-failure-image.sh
+node --check e2e/code-app-failure.mjs
+node --check e2e/code-app-failure-mock.mjs
+```
 
 ## Re-deriving the 4.141.0 anchors
 
