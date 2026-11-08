@@ -224,15 +224,15 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
     });
 
     // The bundle's own model picker button wiring and chat title handler, against doubles of the helpers they use.
-    await t.test('a tap opens the model picker once; touch pointerdown leaves it to the Tap (picker-touch)', () => {
+    await t.test('a tap opens the model picker once; the mouse opens it on mousedown (picker-touch, upstream #339777)', () => {
       const i = code.indexOf('_registerButtonAction(e,t){'), j = code.indexOf('}getCacheBreakLearnMoreLink(){', i);
       assert(i > 0 && j > i, '_registerButtonAction found');
-      const wire = new Function('$p', 'bt', 'hs', 'q', 'jn', 'oe', 'Jt', 'return function(e,t){' + code.slice(i + '_registerButtonAction(e,t){'.length, j) + '}');
+      const wire = new Function('bt', 'hs', 'q', 'jn', 'oe', 'Jt', 'return function(e,t){' + code.slice(i + '_registerButtonAction(e,t){'.length, j) + '}');
       const run = () => {
         const calls = { opened: [], down: null, listeners: {}, targets: [], stopped: 0 };
         const fn = wire(
-          (el, h) => { calls.down = h; return {}; }, { stop: () => calls.stopped++ }, { addTarget: el => (calls.targets.push(el), {}) },
-          (el, type, h) => { calls.listeners[type] = h; return {}; }, { Tap: '-monaco-gesturetap' }, { KEY_DOWN: 'keydown' }, class { equals() { return false; } });
+          { stop: () => calls.stopped++ }, { addTarget: el => (calls.targets.push(el), {}) },
+          (el, type, h) => { calls.listeners[type] = h; return {}; }, { Tap: '-monaco-gesturetap' }, { KEY_DOWN: 'keydown', MOUSE_DOWN: 'mousedown', POINTER_DOWN: 'pointerdown' }, class { equals() { return false; } });
         const button = {};
         fn.call({ _register: d => d }, button, keyboard => calls.opened.push(keyboard));
         return { calls, button };
@@ -241,10 +241,9 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.deepEqual(calls.targets, [button], 'the button is a Gesture target');
       calls.listeners['-monaco-gesturetap']({});
       assert.deepEqual(calls.opened, [false], 'a Tap opens it (from the pointer, not the keyboard)');
-      calls.down({ button: 0, pointerType: 'touch' }); calls.down({ button: 0, pointerType: 'pen' });
-      assert.deepEqual(calls.opened, [false], 'iOS touch/pen pointerdown does not open it a second time');
-      calls.down({ button: 0 }); calls.down({ button: 0, pointerType: 'mouse' }); calls.down({ button: 2 });
-      assert.deepEqual(calls.opened, [false, false, false], 'mousedown and mouse pointerdown still open it; other buttons do not');
+      assert.deepEqual(Object.keys(calls.listeners).sort(), ['-monaco-gesturetap', 'keydown', 'mousedown'], 'no pointerdown listener: an iOS tap cannot open it a second time');
+      calls.listeners.mousedown({ button: 0 }); calls.listeners.mousedown({ button: 2 });
+      assert.deepEqual(calls.opened, [false, false], 'a left mousedown still opens it; other buttons do not');
       const pristine = fs.readFileSync(path.join(source, wb), 'utf8');
       assert(!pristine.slice(pristine.indexOf('_registerButtonAction(e,t){'), pristine.indexOf('}getCacheBreakLearnMoreLink(){')).includes('jn.Tap'), 'unpatched: no Tap handler');
     });
