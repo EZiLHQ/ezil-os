@@ -205,6 +205,26 @@ try {
         second.send(failure(25)); assert.equal(store.app_failures_for(context).failures[0].eventId, uuid(24));
         stop(); store.clear_app_failures();
     });
+    await check('shared envelope fixtures: exact hello, ready and failure; every rejected envelope stores nothing', () => {
+        const env = fixtures.envelopes;
+        const fill = (value, nonce) => JSON.parse(JSON.stringify(value), (_key, v) =>
+            v === '$NONCE' ? nonce : v === '$VALID_0' ? fixtures.valid[0].failure : v);
+        for (const { name, envelope } of env.rejected) {
+            const store = M.create_app_failure_store(); const f = frame(store);
+            assert.deepEqual(f.sent.at(-1), { data: fill(env.hello, f.nonce()), origin: ORIGIN }, 'exact hello');
+            f.post(fill(envelope, f.nonce()));
+            assert.deepEqual(store.app_failures_for(context), { available: false, failures: [] }, name);
+            f.unregister();
+        }
+        for (const { name, envelope, stores } of env.accepted) {
+            const store = M.create_app_failure_store(); const f = frame(store);
+            f.post(fill(envelope, f.nonce()));
+            const result = store.app_failures_for(context);
+            assert.equal(result.available, true, name);
+            assert.equal(result.failures.length, stores ? 1 : 0, name);
+            f.unregister();
+        }
+    });
     await check('maximal records export <=10 and <=8 KiB, newest first', () => {
         const store = M.create_app_failure_store(); const f = frame(store);
         for (let n = 1; n <= 20; n++) f.send({ ...failure(n), clientRequestId: uuid(100), gatewayRequestId: uuid(101),
@@ -301,6 +321,14 @@ try {
         assert.deepEqual(payload().diagnostics.appFailures.map(f => f.eventId), [uuid(301)]); close();
         open({ computerId: A, appSession: 'session-a' }); change(true);
         assert.ok(!payload().diagnostics.appFailures.some(f => f.eventId === uuid(301)), 'sessions stay isolated'); close();
+    });
+    await check('healthy producer with zero errors: available, empty list, no unavailable line', () => {
+        const healthy = frame(M, { ...options, computerId: B, appSession: 'session-healthy' });
+        healthy.ready();
+        open({ computerId: B, appSession: 'session-healthy' }); change(true);
+        assert.deepEqual(payload().diagnostics.appFailures, []);
+        assert.equal(line().hidden, false); assert.doesNotMatch(line().textContent, /unavailable/);
+        assert.match(line().textContent, /0 app events/); close(); healthy.unregister();
     });
     await check('outbox replay after computer switch keeps exact frozen app entries and ages', async () => {
         setCurrentComputer({ id: A }); open(); change(true); const frozen = body();

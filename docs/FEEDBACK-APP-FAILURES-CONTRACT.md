@@ -3,8 +3,9 @@
 Status: consumer side (shell + app feedback API) owned by the feedback lane;
 producer (EZiL chat extension + workbench transport) owned by the worker chat
 lane. Both sides test against the shared golden fixtures in
-`app/src/server/feedback/app-failures.fixtures.json`. A change to any enum or
-bound below changes those fixtures first.
+`app/src/server/feedback/app-failures.fixtures.json` (`valid` / `rejected`
+records, and `envelopes` for the exact hello, ready and failure messages). A
+change to any enum or bound below changes those fixtures first.
 
 ## Why a separate channel
 
