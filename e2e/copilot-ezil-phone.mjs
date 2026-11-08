@@ -1,5 +1,5 @@
 // Image e2e, pass "phone" (copilot-ezil-image.sh): on a phone, Explorer and Chat sit side by side and leave the chat
-// header about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
+// composer's mode/model row about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
 // if need be (patch-copilot-chat.sh `picker-order`), and be usable by touch (`picker-touch`, `title-tap`): real taps
 // (touch events, not mouse clicks: a mouse click in a touch context never showed that a tap did nothing) open it, it
 // stays open, and a tapped Kimi K3 is the model the Gateway receives for the turn. The pick survives a reload and a
@@ -86,6 +86,7 @@ try {
         width: b ? Math.round(b.width) : 0, compact: Boolean(item?.classList.contains('compact-picker')),
         chatWidth: Math.round(document.querySelector('.part.auxiliarybar')?.getBoundingClientRect().width ?? 0),
         mode: mode ? { aria: mode.querySelector('.action-label')?.getAttribute('aria-label') ?? '', compact: mode.classList.contains('compact-picker') } : null,
+        inComposer: Boolean(m?.closest('.interactive-input-part')), inHeader: Boolean(m?.closest('.chat-view-title-container')),
       };
     });
     try {
@@ -97,9 +98,10 @@ try {
       check(`${at}: a fresh profile starts on the declared default, ${MODEL_NAME}`, before.aria === `Models, ${MODEL_NAME}`, before.aria);
       check(`${at}: the model picker shows its name, not only an icon`, !before.compact && before.text === MODEL_NAME && before.labelWidth >= 40, JSON.stringify(before));
       check(`${at}: the mode picker keeps an accessible name`, Boolean(before.mode?.aria), JSON.stringify(before.mode));
+      check(`${at}: the model picker sits in the composer, not the chat header`, before.inComposer && !before.inHeader, JSON.stringify(before));
       if (!v.touch) check(`${at}: a desktop chat keeps every label (the mode picker is not compacted)`, before.mode && !before.mode.compact, JSON.stringify(before.mode));
 
-      // The mode picker sits in the same header: a tap opens it and it stays open.
+      // The mode picker sits in the same composer row: a tap opens it and it stays open.
       const modeLabel = page.locator('.part.auxiliarybar .chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
       if (await modeLabel.count()) { await press(modeLabel); await page.waitForTimeout(1200); }
       check(`${at}: the mode picker opens and stays open`, (await modeLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);

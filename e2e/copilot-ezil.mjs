@@ -153,9 +153,9 @@ try {
   // extension host time to activate copilot-chat and ezil-models.
   const inputContainer = aux.locator('.chat-input-container').first();
   await inputContainer.waitFor({ state: 'visible', timeout: T }).catch(() => {});
-  // The mode/model pickers and the Local/permission pickers sit in the chat header (the title row,
-  // patch-copilot-chat.sh `chat-header`); the composer keeps the input, Add Context and Send.
-  const chatControls = aux.locator('.chat-view-title-container').first();
+  // The mode/model pickers sit in the composer, under the input beside Add Context and Send; Local and
+  // the permission picker sit in the chat header (the title row, patch-copilot-chat.sh `chat-header`).
+  const chatControls = aux.locator('.chat-controls-container > .interactive-session .interactive-input-part').first();
   let toolbar = '';
   for (let i = 0; i < 40; i++) {
     toolbar = clean(await chatControls.innerText().catch(() => ''));
@@ -230,13 +230,22 @@ try {
     info('Plan agent offered in the mode picker', String(rows.some((r) => /\bPlan\b/.test(r))));
     await page.keyboard.press('Escape'); await page.waitForTimeout(400);
   } else {
-    info('mode picker', 'no mode button found in the chat header');
+    info('mode picker', 'no mode button found in the composer');
   }
 
   // The picker must expose both models, with Qwen selected before any input.
   const modelButton = () => chatControls.locator('.action-label').filter({ hasText: /Qwen3 Coder Next|Kimi K3|^Auto$/ }).first();
   await modelButton().waitFor({ state: 'visible', timeout: T });
   check('Qwen is selected by default', (await modelButton().innerText()).includes(MODEL_NAME));
+  // Founder feedback 2026-11-08: the model picker belongs with the composer, not across the panel in the header.
+  const placement = await page.evaluate(() => {
+    const m = document.querySelector('.part.auxiliarybar .action-label[aria-label^="Models, "]');
+    const input = document.querySelector('.part.auxiliarybar .chat-controls-container > .interactive-session .interactive-input-part .chat-editor-container');
+    if (!m || !input) return { found: false };
+    const a = m.getBoundingClientRect(), b = input.getBoundingClientRect();
+    return { found: true, inHeader: !!m.closest('.chat-view-title-container'), inComposer: !!m.closest('.interactive-input-part'), gap: Math.round(a.top - b.bottom) };
+  });
+  check('the model picker sits in the composer, just under the input (not in the chat header)', placement.found && placement.inComposer && !placement.inHeader && placement.gap >= -2 && placement.gap <= 40, JSON.stringify(placement));
   await modelButton().click();
   await page.waitForTimeout(800);
   let models = await pickerRows();
