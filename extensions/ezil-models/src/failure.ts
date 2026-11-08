@@ -74,6 +74,13 @@ export const MODEL_KEY_NAMESPACES = Object.freeze([
     'xai', 'cohere', 'minimax', 'groq', 'cerebras', 'openrouter', 'ezil',
 ]);
 const NAMESPACES = new Set<string>(MODEL_KEY_NAMESPACES);
+/** Model families a bare key (no namespace) may start with, e.g. `claude-sonnet-5-5`, `ezil-fast`. */
+export const MODEL_KEY_FAMILIES = Object.freeze([
+    'claude', 'gemini', 'gpt', 'qwen', 'kimi', 'glm', 'deepseek', 'mistral', 'codestral', 'llama', 'grok',
+    'nova', 'ezil', 'minimax', 'command', 'sonar',
+]);
+const FAMILIES = new Set<string>(MODEL_KEY_FAMILIES);
+const REGION = /^(?:us|eu|apac|global|au|jp)\./;
 const TOKEN_WORD = /secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/;
 const TOKEN_PREFIX = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/;
 
@@ -81,9 +88,14 @@ export function isSafeModelKey(value: unknown): value is string {
     // `$` also matches before a final newline, hence the explicit exact test.
     if (typeof value !== 'string' || !MODEL_KEY.test(value) || value !== value.trim()) return false;
     if (value.includes('://') || value.split('/').length > 2) return false;
-    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(value);
-    if (!match || !NAMESPACES.has(match[1]!)) return false;
-    const segments = match[2]!.split(/[/.:]/);
+    // An optional inference-region prefix, then `ns/model`, `ns.model` or a bare family key.
+    const key = value.replace(REGION, '');
+    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(key);
+    let model: string;
+    if (match && NAMESPACES.has(match[1]!)) model = match[2]!;
+    else if (FAMILIES.has(/^[a-z]+/.exec(key)?.[0] ?? '')) model = key;
+    else return false;
+    const segments = model.split(/[/.:]/);
     if (segments.some(segment => !segment || TOKEN_PREFIX.test(segment) || TOKEN_WORD.test(segment)
         || /[a-z0-9]{20,}/.test(segment))) return false;
     // The model name itself carries a version or a family separator.

@@ -222,7 +222,7 @@ describe('Gateway admission boundary', () => {
         admission(); expect(b.posts()).toBe(0);
     });
     test('unsafe model key is omitted from an admission failure without dropping the record', async () => {
-        const b = setupAdmission('ezil-gateway', 'us.anthropic.claude-sonnet-5-5'); await b.list();
+        const b = setupAdmission('ezil-gateway', 'us.unknownvendor.model-1'); await b.list();
         b.state.configError = SENTINEL; b.state.models = [];
         await expect(b.turn()).rejects.toThrow();
         expect(admission()).not.toHaveProperty('modelKey');

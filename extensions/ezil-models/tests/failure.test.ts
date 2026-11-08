@@ -19,7 +19,7 @@ describe('canonical golden fixtures', () => {
 });
 
 describe('appFailure mapping', () => {
-    for (const model of ['us.anthropic.claude-sonnet-5-5', 'claude-sonnet-5-5', 'us.moonshotai.kimi-k3']) {
+    for (const model of ['claude', 'x.claude-sonnet-5-5', 'us.unknownvendor.model-1', 'eu.claude-secret-1']) {
         test(`unsafe model ${model} is omitted without losing the record or its IDs`, () => {
             const record = appFailure({ ...base, model, error: gatewayError('upstream_error', 500) });
             expect(record).not.toHaveProperty('modelKey');
@@ -28,7 +28,7 @@ describe('appFailure mapping', () => {
             expect(isAppFailure({ ...record, modelKey: model })).toBe(false);
         });
     }
-    for (const model of ['qwen.qwen3-coder-next', 'anthropic/claude-sonnet-4-5-20250929']) {
+    for (const model of ['qwen.qwen3-coder-next', 'anthropic/claude-sonnet-4-5-20250929', 'us.anthropic.claude-sonnet-5-5', 'claude-sonnet-5-5', 'us.moonshotai.kimi-k3']) {
         test(`safe model ${model} is preserved`, () => {
             const record = appFailure({ ...base, model });
             expect(record.modelKey).toBe(model);
