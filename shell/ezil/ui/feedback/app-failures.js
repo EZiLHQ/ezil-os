@@ -15,15 +15,26 @@ export const MODEL_KEY_NAMESPACES = Object.freeze([
     'xai', 'cohere', 'minimax', 'groq', 'cerebras', 'openrouter', 'ezil',
 ]);
 const NAMESPACES = new Set(MODEL_KEY_NAMESPACES);
+/** Mirror of the server's `MODEL_KEY_FAMILIES`. */
+export const MODEL_KEY_FAMILIES = Object.freeze([
+    'claude', 'gemini', 'gpt', 'qwen', 'kimi', 'glm', 'deepseek', 'mistral', 'codestral', 'llama', 'grok',
+    'nova', 'ezil', 'minimax', 'command', 'sonar',
+]);
+const FAMILIES = new Set(MODEL_KEY_FAMILIES);
+const REGION = /^(?:us|eu|apac|global|au|jp)\./;
 const TOKEN_WORD = /secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/;
 const TOKEN_PREFIX = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/;
-/** Mirror of the server's `isSafeModelKey` (contract §2): namespaced, never a credential, path or URL. */
+/** Mirror of the server's `isSafeModelKey` (contract §2): region/namespace/family-scoped, never a credential, path or URL. */
 export function safe_model_key (value) {
     if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,63}$/.test(value) || value !== value.trim()) return false;
     if (value.includes('://') || value.split('/').length > 2) return false;
-    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(value);
-    if (!match || !NAMESPACES.has(match[1])) return false;
-    const segments = match[2].split(/[/.:]/);
+    const key = value.replace(REGION, '');
+    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(key);
+    let model;
+    if (match && NAMESPACES.has(match[1])) model = match[2];
+    else if (FAMILIES.has(/^[a-z]+/.exec(key)?.[0] ?? '')) model = key;
+    else return false;
+    const segments = model.split(/[/.:]/);
     if (segments.some(segment => !segment || TOKEN_PREFIX.test(segment) || TOKEN_WORD.test(segment)
         || /[a-z0-9]{20,}/.test(segment))) return false;
     return /[0-9-]/.test(segments[0]);

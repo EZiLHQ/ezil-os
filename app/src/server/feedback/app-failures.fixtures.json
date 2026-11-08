@@ -250,6 +250,71 @@
         "outcome": "failed",
         "modelKey": "qwen.qwen3-coder-next"
       }
+    },
+    {
+      "name": "source-backed model key claude-sonnet-5-5",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000300",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "claude-sonnet-5-5"
+      }
+    },
+    {
+      "name": "source-backed model key gemini-3.8-flash",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000301",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "gemini-3.8-flash"
+      }
+    },
+    {
+      "name": "source-backed model key us.moonshotai.kimi-k3",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000303",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "us.moonshotai.kimi-k3"
+      }
+    },
+    {
+      "name": "source-backed model key ezil-code",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000304",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "ezil-code"
+      }
+    },
+    {
+      "name": "source-backed model key ezil-fast",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000305",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "ezil-fast"
+      }
     }
   ],
   "rejected": [
@@ -582,6 +647,71 @@
         "stage": "admission",
         "outcome": "failed",
         "modelKey": "anthropic/claude-api-key-1"
+      }
+    },
+    {
+      "name": "unsafe model key us.sb_secret_ab-cd",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000300",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "us.sb_secret_ab-cd"
+      }
+    },
+    {
+      "name": "unsafe model key claude-secret-1",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000301",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "claude-secret-1"
+      }
+    },
+    {
+      "name": "unsafe model key ezil-session-1",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000302",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "ezil-session-1"
+      }
+    },
+    {
+      "name": "unsafe model key claude.sk_live-1",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000303",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "claude.sk_live-1"
+      }
+    },
+    {
+      "name": "unsafe model key us.project/file-1",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000304",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "us.project/file-1"
       }
     }
   ],

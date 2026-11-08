@@ -51,11 +51,12 @@ await check('closed enums, category codes, required keys, optional types, UUIDs 
     for (const value of [true, false]) assert.ok(M.validate_failure({ ...base, retryable: value }));
     for (const value of [1, 'true', null, undefined]) assert.equal(M.validate_failure({ ...base, retryable: value }), null);
     assert.deepEqual([...M.MODEL_KEY_NAMESPACES], [...server.MODEL_KEY_NAMESPACES], 'namespace allowlist parity');
-    for (const value of ['anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0', 'qwen.qwen3-coder-next', 'openai/gpt-6', 'google/gemini-2.5-flash']) {
+    assert.deepEqual([...M.MODEL_KEY_FAMILIES], [...server.MODEL_KEY_FAMILIES], 'family allowlist parity');
+    for (const value of ['anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0', 'openai/gpt-6', 'google/gemini-2.5-flash', 'gpt-6', 'claude-sonnet-5-5', 'gemini-3.8-flash', 'qwen.qwen3-coder-next', 'us.moonshotai.kimi-k3', 'ezil-code', 'ezil-fast']) {
         assert.ok(M.validate_failure({ ...base, modelKey: value }), value);
         assert.ok(server.isSafeModelKey(value), `server agrees: ${value}`);
     }
-    for (const value of ['gpt-6', '1', 'catalog:model_1.2/variant-3', 'project/file-1', 'sb_secret_abcd-efgh-ijkl-mnop', 'openai/sb_secret_abcd-efgh', 'anthropic/claude-api-key-1', 'anthropic/sk-proj-1', 'ezil/session-1', '', 'a', 'a'.repeat(64), 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null,
+    for (const value of ['1', 'catalog:model_1.2/variant-3', 'us.sb_secret_ab-cd', 'claude-secret-1', 'ezil-session-1', 'claude.sk_live-1', 'us.project/file-1', 'project/file-1', 'sb_secret_abcd-efgh-ijkl-mnop', 'openai/sb_secret_abcd-efgh', 'anthropic/claude-api-key-1', 'anthropic/sk-proj-1', 'ezil/session-1', '', 'a', 'a'.repeat(64), 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null,
         'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
         assert.equal(M.validate_failure({ ...base, modelKey: value }), null, String(value));
         assert.equal(server.isSafeModelKey(value), false, `server agrees: ${String(value)}`);
