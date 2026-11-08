@@ -77,8 +77,11 @@ function counters(value: unknown): Counters {
  * A stream's final usage, with the authority rules of the Gateway's own usage tap (EZiL AI Gateway
  * src/protocols/anthropic/sse.ts). The final message_delta must carry the cumulative output count, never below
  * message_start's preliminary one, which is never used. Input and cache counters come from the final delta (the
- * Converse route reports them only there, all three together), else from message_start (the native route); a native
- * delta that repeats one must repeat it unchanged. A counter neither event carries fails the stream: nothing is zero-filled.
+ * Converse route reports them only there, all three together), else from message_start (the native route). A delta that
+ * restates only some of them must restate them unchanged. A delta that carries all three is taken as the final input
+ * authority even if it differs from message_start: the client cannot tell a Converse report from a native restatement,
+ * and relies on the Gateway's native tap, which rejects such a contradiction and withholds the terminal event. A counter
+ * neither event carries fails the stream: nothing is zero-filled.
  * Explicit zeros are valid. The cache counters are REQUIRED like input_tokens, with no default: the Gateway's tap needs
  * all four (parseAnthropicUsage) and keeps a reservation pending without them, so a reply missing one cannot settle.
  */
