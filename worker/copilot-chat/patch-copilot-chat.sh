@@ -158,22 +158,23 @@ P_PICKER_FIT='if(!i.some(({item:r})=>r.canShrink)&&n.width>e+o4e)return!1;for(le
 # workbench.js `picker-touch` + `title-tap`: a tap on a phone never changed the model (image e2e, touch taps). On a touch
 # device VS Code's Gesture cancels touchstart/touchend once a registered target gets a gesture, so the browser sends no
 # mouse events and no click. The model picker's name and settings buttons opened only on mousedown (pointerdown on
-# iOS), so on Android a tap did nothing; `picker-touch` opens them on the Gesture Tap, like upstream's phone chip,
-# and leaves non-mouse pointerdown to it (one open per tap on iOS). The chat-header patch put the pickers inside the
+# iOS), so on Android a tap did nothing; `picker-touch` is upstream's own fix (microsoft/vscode#339777, after 1.141):
+# plain mousedown for the mouse and a Gesture Tap for touch and pen, so a tap opens it once on iOS too (the iOS
+# pointerdown listener is gone; _show toggles, so two opens would close it). The chat-header patch put the pickers inside the
 # chat title row, whose Tap/click handler focuses the input: the open list lost focus and closed at once (iOS, and
 # Android after picker-touch). The header's stopPropagation cannot help, because Gesture dispatches its non-bubbling
 # Tap to each registered target directly; `title-tap` makes the title row ignore Taps and clicks that start inside
 # the EZiL header. Taps elsewhere on the title still focus the input.
 A_PICKER_TOUCH='_registerButtonAction(e,t){this._register($p(e,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),'
-R_PICKER_TOUCH='_registerButtonAction(e,t){this._register($p(e,i=>{i.button===0&&(i.pointerType===void 0||i.pointerType==="mouse")&&(bt.stop(i,!0),t(!1))})),this._register(hs.addTarget(e)),this._register(q(e,jn.Tap,i=>{bt.stop(i,!0),t(!1)})),'
+R_PICKER_TOUCH='_registerButtonAction(e,t){this._register(q(e,oe.MOUSE_DOWN,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),this._register(hs.addTarget(e)),this._register(q(e,jn.Tap,i=>{bt.stop(i,!0),t(!1)})),'
 A_TITLE_TAP='this._register(hs.addTarget(this.titleContainer));for(let i of[jn.Tap,oe.CLICK])this._register(q(this.titleContainer,i,()=>{this.delegate.focusChat()}))'
 R_TITLE_TAP='this._register(hs.addTarget(this.titleContainer));for(let i of[jn.Tap,oe.CLICK])this._register(q(this.titleContainer,i,n=>{(n.initialTarget??n.target)?.closest?.(".ezil-chat-header")||this.delegate.focusChat()}))'
 # Names both rely on (checked, never patched): Gesture (hs), its Tap event (jn), the listener helper (q), EventHelper
-# (bt) and the mousedown/pointerdown helper ($p), as upstream's phone chip uses them in this bundle.
+# (bt) and dom.EventType (oe, MOUSE_DOWN), as upstream's phone chip uses them in this bundle.
 P_TOUCH_CHIP='this._renderDisposables.add(hs.addTarget(t));for(let i of[oe.CLICK,jn.Tap])this._renderDisposables.add(q(t,i,n=>{bt.stop(n,!0),this._showSheet()}))'
 P_TOUCH_GESTURE='var hs=tx;'
 P_TOUCH_TAP='var jn;(n=>(n.Tap="-monaco-gesturetap",'
-P_TOUCH_DOWN='function $p(s,o,e){return q(s,Kl&&qv.pointerEvents?oe.POINTER_DOWN:oe.MOUSE_DOWN,o,e)}'
+P_TOUCH_DOWN='var oe={CLICK:"click",AUXCLICK:"auxclick",DBLCLICK:"dblclick",MOUSE_UP:"mouseup",MOUSE_DOWN:"mousedown",'
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
