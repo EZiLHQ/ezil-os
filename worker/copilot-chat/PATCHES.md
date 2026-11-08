@@ -9,7 +9,7 @@ gates alone). If a code-server bump moves a string, the Docker build fails
 with the offending anchor printed; re-derive it from the new bundle (grep the
 source tree at the matching `microsoft/vscode` tag — the anchors are the
 compiled form of the files named below) and update both the script and this
-table. Only the documented strings, network call sites, visibility filters, the chat history index (Part 3) and the chat view layout (one menu placement, DOM placement, CSS) change: no command id, setting key, contribution point,
+table. Only the documented strings, network call sites, visibility filters, the chat history index (Part 3), the chat view layout (one menu placement, DOM placement, CSS) and the workbench static path (`static-id`) change: no command id, setting key, contribution point,
 `product.json` field or LICENSE file is changed. The original work stays
 MIT, Copyright (c) Microsoft Corporation; each patched `.js` gets a one-line
 "Modified at build time by EZiL" notice (see `ATTRIBUTIONS.md`).
@@ -71,27 +71,30 @@ where the Sessions list fills the top), a getting-started tip, the composer (inp
 Add Context, Agent, model, Configure Tools and Send), a Local + permissions + context-usage row, and,
 from the previous build of this script, a notice line (`chat-notice`, two lines on a ~400 px panel).
 Measured in the image (mock gateway, chat panel 818 / 400 CSS px): 191 / 225 px of an empty chat and
-130 / 146 px under a conversation. After: 56 px (one-row composer) in every state, with a 30 px header
-(54 px when it wraps to two rows below ~600 px).
+130 / 146 px under a conversation. With every control in the header and a one-row composer (2026-11-04
+to 2026-11-08) it was 56 px in every state, with a 30 px header (54 px when it wraps below ~600 px). Since
+2026-11-08 the composer keeps upstream's two rows (input, then the mode/model and Send row) so the model
+picker sits at the input, as the founder asked.
 
 Where each control is now (same nodes, same listeners, same accessible names):
 
 - **Header (the chat title row, always on top):** Go Back, the chat title / "Chat history" (opens the
-  session picker), mode (Agent), model, Configure Tools, Local, the permission level (label kept: the
-  row wraps instead of hiding it), context usage, an info button for the notice, the Sessions-sidebar
-  toggle. Tab order follows that order. Its pickers open downward when the list does not fit above
-  the button (`picker-flip`); upstream forced every chat picker upward, which from the header left one
-  row of the model list in a chat with turns (image e2e, 2026-11-05). When the row is too narrow for
-  every picker's label (a phone: Explorer and Chat side by side leave Chat ~160 px), the mode picker
-  becomes its icon first and the model name ellipsizes (`picker-order`); upstream compacted right to
-  left, so the model picker lost its name first and only a sparkle icon was left (image e2e, 390 and
-  412 px, 2026-11-05). On a touch screen a tap opens the header's pickers and they stay open
-  (`picker-touch`, `title-tap`): before, a tap on the model picker did nothing on Android and opened and
-  at once closed it on iPhone, so a phone could not change the model (image e2e, Chromium touch taps with
-  Android and iPhone user agents, 2026-11-08).
-- **Composer:** input, Add Context, Send (Stop while answering); attachment chips keep their own row
-  above. Auto-grow is upstream's: up to 250 px of editor (`vmn`), then the editor scrolls (measured on a
-  794 px and a 454 px chat pane: 11 lines, then a scrollbar).
+  session picker), Local, the permission level (label kept: the row wraps instead of hiding it),
+  context usage, an info button for the notice, the Sessions-sidebar toggle. Tab order follows that
+  order. On a touch screen a tap opens the header's pickers and they stay open (`title-tap`).
+- **Composer:** input on top; under it mode (Agent), model, Configure Tools, then Add Context and Send
+  (Stop while answering); attachment chips keep their own row above. Pickers open downward when the
+  list does not fit above the button (`picker-flip`); upstream forced every chat picker upward, which
+  from the header left one row of the model list in a chat with turns (image e2e, 2026-11-05). When the
+  row is too narrow for every picker's label (a phone: Explorer and Chat side by side leave Chat
+  ~160 px), the mode picker becomes its icon first and the model name ellipsizes (`picker-order`);
+  upstream compacted right to left, so the model picker lost its name first and only a sparkle icon was
+  left (image e2e, 390 and 412 px, 2026-11-05, measured in the header). On a touch screen a tap opens
+  the model picker once (`picker-touch`): before, a tap on it did nothing on Android and opened and at
+  once closed it on iPhone, so a phone could not change the model (image e2e, Chromium touch taps with
+  Android and iPhone user agents, 2026-11-08). Until 2026-11-08 mode, model and Configure Tools sat in
+  the header, across the panel from the input; the founder asked for them at the composer. Auto-grow is
+  upstream's: up to 250 px of editor (`vmn`), then the editor scrolls.
 - **Notice:** the info button's accessible name and tooltip are "AI responses may be inaccurate. Review
   changes before applying them."; Enter/Space/click opens EZiL AI status (`ezil-models.showStatus`),
   which lists the same sentence (and, if that command is missing, a notification shows it). The AI
@@ -103,8 +106,8 @@ Where each control is now (same nodes, same listeners, same accessible names):
 
 | id | file / anchor | replacement / gate |
 |---|---|---|
-| `chat-header` | workbench.js `ChatViewPane.createControls` (`vs/workbench/contrib/chat/browser/widgetHosts/viewPane/chatViewPane.ts`): `createControls(e){let t=this.createSessionsControl(e),i=this.welcomeController=this._register(this.instantiationService.createInstance(P3e,e,this,"panel")),n=this.createChatControl(e);this.registerControlsListeners(t,n,i),this.updateSessionsControlVisibility()}` | Same, then `try{this._ezilChatHeader(e)}catch(f){this.logService.error(…)}` and a new method `_ezilChatHeader(e)` (exact text: `R_CHAT_HEADER` in the script). It needs the title row, the input part, its editor cell, toolbar row, primary toolbar and secondary toolbar, else returns without changing anything. It creates `div.interactive-session.ezil-chat-header` (the class keeps upstream's `.interactive-session …` picker styles matching; CSS gives it `display:contents`) that stops `click`/gesture-tap from reaching the title row (whose click focuses the input), wraps the primary toolbar (`inputToolbarElement`) in a `div.chat-input-toolbars` (so `.chat-input-toolbars>.chat-input-toolbar` rules match), appends the secondary toolbar (`secondaryToolbarContainer`: Local, permissions, context usage, status) and a `button.ezil-chat-help.codicon-info`, and inserts it before the title's actions toolbar. It inserts the still-empty header first and only then moves the toolbars into it, so a title row whose shape changed (an actions toolbar no longer a direct child) throws before any control has moved: the try/catch logs and the composer keeps upstream's controls, never a half-moved, dead-control chat. The title container then moves before `.voice-agent-controls-wrapper` (top of `.chat-viewpane`, in stacked and side-by-side orientations); the view's layout already subtracts the title's measured height (`ChatViewTitleControl` ResizeObserver), so a wrapped header relayouts the chat. The pane gets `ezil-compact-chat`, which every layout rule requires. A ResizeObserver on the composer's editor cell and toolbar row measures the cell (`clientWidth` minus its padding) against the Monaco editor's laid-out width and corrects `inputPart.setInputEditorTrailingSpace(…)` by the difference, so the editor is exactly as wide as its cell beside Add Context and Send (the input part's own estimate assumes 10 px of inner padding; measured 10 px too wide when given the toolbar width alone). Only the chat view: editor-hosted, quick and inline chats keep upstream layout. Anchor 0, replacement 1. |
-| `header-names` | `createChatTitleControl(e){this.titleControl=`, `this.titleContainer=t.root,`, `get inputPart(){return this.inputPartDisposable.value}`, `get inputToolbarElement(){return this.inputActionsToolbar.getElement()}`, `get inputContainerElement(){return this.inputContainer}`, `this.secondaryToolbarContainer=r.secondaryToolbar;`, `setInputEditorTrailingSpace(e){let t=Math.max(0,e);`, the default input layout `Ze(".chat-input-container@inputContainer",[…attachments…,…editor…,Ze(".chat-input-toolbars@inputToolbars")])`, `this.chatEntitlementService=M;this.commandService=N;`, `this.logService=v;this.notificationService=b;` | Checked, never patched: each occurs once, so the names `_ezilChatHeader` uses mean what it expects. |
+| `chat-header` | workbench.js `ChatViewPane.createControls` (`vs/workbench/contrib/chat/browser/widgetHosts/viewPane/chatViewPane.ts`): `createControls(e){let t=this.createSessionsControl(e),i=this.welcomeController=this._register(this.instantiationService.createInstance(P3e,e,this,"panel")),n=this.createChatControl(e);this.registerControlsListeners(t,n,i),this.updateSessionsControlVisibility()}` | Same, then `try{this._ezilChatHeader(e)}catch(f){this.logService.error(…)}` and a new method `_ezilChatHeader(e)` (exact text: `R_CHAT_HEADER` in the script). It needs the title row, the input part and its secondary toolbar, else returns without changing anything. It creates `div.interactive-session.ezil-chat-header` (the class keeps upstream's `.interactive-session …` picker styles matching; CSS gives it `display:contents`) that stops `click`/gesture-tap from reaching the title row (whose click focuses the input), appends the secondary toolbar (`secondaryToolbarContainer`: Local, permissions, context usage, status) and a `button.ezil-chat-help.codicon-info`, and inserts it before the title's actions toolbar. It inserts the still-empty header first and only then moves the toolbar into it, so a title row whose shape changed (an actions toolbar no longer a direct child) throws before any control has moved: the try/catch logs and the composer keeps upstream's controls, never a half-moved, dead-control chat. The title container then moves before `.voice-agent-controls-wrapper` (top of `.chat-viewpane`, in stacked and side-by-side orientations); the view's layout already subtracts the title's measured height (`ChatViewTitleControl` ResizeObserver), so a wrapped header relayouts the chat. The pane gets `ezil-compact-chat`, which every layout rule requires. The primary toolbar (mode, model, Configure Tools) is not moved: it stays in the composer's `.chat-input-toolbars` row under the input, beside Add Context and Send, and the editor keeps upstream's full-width layout (until 2026-11-08 the primary toolbar moved to the header too and a ResizeObserver corrected `setInputEditorTrailingSpace` for a one-row grid; the founder asked for the model picker at the composer). Only the chat view: editor-hosted, quick and inline chats keep upstream layout. Anchor 0, replacement 1. |
+| `header-names` | `createChatTitleControl(e){this.titleControl=`, `this.titleContainer=t.root,`, `get inputPart(){return this.inputPartDisposable.value}`, `this.secondaryToolbarContainer=r.secondaryToolbar;`, `this.chatEntitlementService=M;this.commandService=N;`, `this.logService=v;this.notificationService=b;` | Checked, never patched: each occurs once, so the names `_ezilChatHeader` uses mean what it expects. |
 | `attach-execute` | workbench.js Add Context (`workbench.action.chat.attachContext`) menu entry for the chat view: `{when:T.and(J.inQuickChat.negate(),J.location.isEqualTo("panel"),T.or(J.lockedToCodingAgent.negate(),J.agentSupportsAttachments)),id:O.ChatInput,group:"navigation",order:-1}` | Same with `id:O.ChatExecute`: the button renders beside Send (the execute toolbar already renders this action; quick chat registers it there), so it stays in the composer when the ChatInput toolbar moves to the header. Applies to location `panel`, i.e. also the chat editor, where it now sits beside Send; its keybinding (Ctrl+/) is unchanged. Anchor 0, replacement 1. |
 | `picker-flip` | workbench.js list options for every chat input picker (mode, model, model options, session target, permissions; `SW`): `function SW(s){return{...Vio(s),anchorPosition:1}}`. The action widget's `computeHeight` takes a set `anchorPosition` as final (always above) and caps the list to the space above the button, less the search box and the cache-break hint: from the header (~97 px down a 900 px window) the model list of a chat with turns was 15 px, under one row. | `function SW(s){return{...Vio(s),anchorPosition:void 0,preferredAnchorPosition:1}}`: upstream's own option (the chat input pills pass it). `SW` still overrides a caller's `anchorPosition` (the agent-host mode/permissions popup, `run`, passes 1), so it alone picks the side, as before; the pickers' base (`A1` → its dropdown's `show`) passes the options through without a side of its own. `computeHeight` lays the list out above when it fits there, below when it fits there instead (`X7`), else on the larger side, up to 60 % of the window; the context view then places it from the widget's `anchorPosition` getter, which falls back to that choice. Composer pickers (chat editor, quick chat) still open above. A picker in a dialog keeps forcing below: the model picker passes `{...SW(K),anchorPosition:0}` there, and a set `anchorPosition` wins. Anchor 0, replacement 1. |
 | `picker-names` | `this._anchorPosition=a?.anchorPosition,this._preferredAnchorPosition=a?.preferredAnchorPosition,` (the action widget reads both options), `G=r.closest(".monaco-dialog-box")?{...SW(K),anchorPosition:0}:SW(K)` (the dialog override) | Checked, never patched: each occurs once. |
@@ -113,10 +116,10 @@ Where each control is now (same nodes, same listeners, same accessible names):
 | `picker-touch` | workbench.js model picker buttons (`ModelPickerWidget._registerButtonAction`, name and settings buttons): `_registerButtonAction(e,t){this._register($p(e,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),`. `$p` (`addDisposableGenericMouseDownListener`) listens for `pointerdown` on iOS and `mousedown` elsewhere. On a touch device VS Code's `Gesture` cancels `touchstart`/`touchend` once a registered target got a gesture (the title row is one), so the browser sends no compatibility mouse events and no click: on Android a tap never opened the picker. | Upstream's own fix, microsoft/vscode#339777 (merged 2026-10-05, after 1.141): `this._register(q(e,oe.MOUSE_DOWN,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),this._register(hs.addTarget(e)),this._register(q(e,jn.Tap,i=>{bt.stop(i,!0),t(!1)})),` — `mousedown` for the mouse, a Gesture Tap for touch and pen. The iOS `pointerdown` listener is gone, so a tap opens it once (`_show` toggles: a second open would close it). Mouse and keyboard unchanged. Anchor 0, replacement 1. |
 | `title-tap` | workbench.js chat title row (`ChatViewTitleControl`): `this._register(hs.addTarget(this.titleContainer));for(let i of[jn.Tap,oe.CLICK])this._register(q(this.titleContainer,i,()=>{this.delegate.focusChat()}))`. `chat-header` put the pickers inside this row; a Tap on one reached this handler, which focused the chat input, the picker list lost focus and closed (iPhone: opened on `pointerdown`, closed after `touchend`; Android after `picker-touch`). The header's own `stopPropagation` of `-monaco-gesturetap` cannot prevent it: `Gesture` dispatches a non-bubbling event to each registered target directly. Clicks were already stopped by the header. | Same, with the handler `n=>{(n.initialTarget??n.target)?.closest?.(".ezil-chat-header")||this.delegate.focusChat()}`: a Tap or click that starts inside the EZiL header does not focus the input; anywhere else on the title (Go Back, "Chat history", empty space) it still does. Anchor 0, replacement 1. |
 | `touch-names` | `var hs=tx;` (Gesture), `var jn;(n=>(n.Tap="-monaco-gesturetap",` (TouchEventType), the start of `var oe={CLICK:"click",…,MOUSE_DOWN:"mousedown",` (dom.EventType), and upstream's phone chip `this._renderDisposables.add(hs.addTarget(t));for(let i of[oe.CLICK,jn.Tap])this._renderDisposables.add(q(t,i,n=>{bt.stop(n,!0),this._showSheet()}))` (the same `hs`, `jn`, `q`, `bt`, `oe` in this bundle) | Checked, never patched: each occurs once. |
-| `chat-layout` | workbench.css: `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}` left as it is (gated once: the welcome disclaimer stays hidden whenever BYOK models exist, so it is not where the notice lives) | Appended to the end of the file, top level (a rule next to the nested upstream one would be nested too), exact text `R_CSS_LAYOUT`: the header row wraps (`flex-wrap`, title label `flex:1 1 96px`), the moved toolbars shrink instead of stretching, the info button looks like a toolbar icon with a focus ring; the composer's `.chat-input-container` is a two-column grid (editor, then the Add Context/Send row bottom-aligned; attachments span both); `min-width:0!important` on that row because the moved responsive toolbar keeps writing its own minimum width onto the container it was created in; the tip is hidden. All rules but the tip's require `.chat-viewpane.ezil-compact-chat`. Gates: upstream rule once, layout block once and at brace depth 0, the previous notice rule (`.interactive-input-part::after{content:"AI responses may be inaccurate.`) 0. |
+| `chat-layout` | workbench.css: `.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}` left as it is (gated once: the welcome disclaimer stays hidden whenever BYOK models exist, so it is not where the notice lives) | Appended to the end of the file, top level (a rule next to the nested upstream one would be nested too), exact text `R_CSS_LAYOUT`: the header row wraps (`flex-wrap`, title label `flex:1 1 96px`), the moved secondary toolbar shrinks instead of stretching, the info button looks like a toolbar icon with a focus ring; the composer keeps upstream's layout (input over the mode/model, Add Context and Send row; no grid rule), with `min-width:0!important` on that row (the responsive toolbar writes its own minimum onto it). Below a 208 px composer (`@container ezil-composer`; a phone, where Chat is ~162 px and the row 121 px) mode, model and Configure Tools need 144 px (written inline: they never overflow) and Add Context + Send 48, so Add Context and Send wrap to their own line, right-aligned; the pickers keep the first line, the mode picker compacts and the model name ellipsizes (`model-picker-item` minimum 56 px, above what is left beside an expanded mode picker). Measured at 412 and 390 px: model label 60 px, Send inside the composer (before: Send at 438-460 px, outside a composer ending at 394). The tip is hidden. All rules but the tip's require `.chat-viewpane.ezil-compact-chat`. Gates: upstream rule once, layout block once and at brace depth 0, the previous notice rule (`.interactive-input-part::after{content:"AI responses may be inaccurate.`) 0. |
 
 Offline test (patches a copy, runs `--verify`, checks the CSS and the menu entry, executes
-`_ezilChatHeader` and `createControls` against a DOM double, runs the bundle's own `SW`, `X7` and
+`_ezilChatHeader` and `createControls` against a DOM double (the mode/model toolbar stays in the composer), runs the bundle's own `SW`, `X7` and
 `computeHeight` for a header, a composer and a dialog picker, runs the bundle's own `SEt.layout` on a
 phone-width, desktop-width and too-narrow header row and a row without a shrinkable picker, against the
 pristine one too, runs the bundle's own model picker button wiring and title handler against doubles
@@ -126,6 +129,23 @@ anchor). The image e2e `phone` pass covers the same by real touch taps (`copilot
 ```sh
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-layout-patch.test.cjs
 ```
+
+### Chat stays enabled on a new browser profile — `workbench.js` (`chat-enabled`)
+
+On a browser profile's first load (`builtinChatExtensionEnablementMigration` not yet stored), 1.141's
+`ensureChatExtensionInitialDisabledState` disables the built-in chat extension when chat setup has not
+completed. EZiL Chat is anonymous with EZiL models, so the setup agent's `z3t` sends a message down the
+no-setup path (setup not completed, but BYOK models present), which waits for Copilot's default agent from
+the disabled extension: "Chat took too long to get ready. Please ensure that the extension
+`GitHub.copilot-chat` is installed and enabled." after 60 s (remote) and no answer. Measured 2026-11-08 with a
+healthy mock gateway, a new browser profile and a send about 4-6 s after load: the timeout on the staging
+image (9e3dd5f3) and the main-lineage image (2031b2c1) alike, diagnostic `agentReady:false`,
+`agentDefaultIsCore:true`, `languageModelReady:true`; Copilot Chat never activated. A send after ~40 s took
+the setup path, which re-enabled the extension, and worked; a relaunched profile worked.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `chat-enabled` | workbench.js `ensureChatExtensionInitialDisabledState`: `else try{this.logService.debug("Disabling builtin chat extension as chat set up is not completed"),this._disableExtension({id:this._chatExtensionId})}catch(n){this.logService.error("Failed to disable builtin chat extension during enablement migration",n)}` | `else try{this.logService.debug("EZiL: builtin chat extension stays enabled; EZiL Chat needs no setup, so setup is marked completed"),i.value.update({completed:!0})}catch(n){…}` (`i` is the function's own `chatEntitlementService.context`). Setup is marked completed as a successful setup run would mark it: nothing else does once requests reach Copilot's agent instead of the setup agent (`markSetupCompleted` has no caller), and the setup-only entries gated on `Setup.completed.negate()` would otherwise stay. A new profile then stores `completed:true, installed:true, disabled:false` before any message (read back from the browser state, 2026-11-08), the state of a profile that has finished setup. The migration flag is still stored once per profile, and the other branch (setup completed, extension disabled by the user: turn AI features off) is upstream's. With the same image and only this file changed, a new profile's message sent 3.5-3.7 s after load was answered in 4.7-6.4 s. A profile that the old build already disabled recovers as before (Restart / the setup path). Anchor 0, replacement 1. Offline test runs the bundle's own function against doubles (`chat-layout-patch.test.cjs`); image e2e pass `early` sends at once from new desktop and Android profiles. |
 
 ### Accounts menu — `out/vs/code/browser/workbench/workbench.js`
 
@@ -296,6 +316,47 @@ throwing entitlement accessors, and rejects restored quota text or anchor drift.
 Without a local pinned bundle it explicitly skips; release validation must supply
 `COPILOT_TEST_ROOT`.
 
+## static-id — a new workbench URL for every distinct set of served files
+
+code-server serves its workbench (`workbench.js`, `workbench.css`,
+`nls.messages.js`, the webview `pre/` page, workers) from
+`/<quality>-<commit>/static/…` with `Cache-Control: public, max-age=31536000`
+and no revalidation (`server-main.js` `_handleStatic`, mode 2 when built). The
+patches in this file change those files but not the commit, so a browser that
+had loaded an older EZiL image kept running its workbench after the computer
+moved to a new image: measured on a carried browser profile, the image-33
+workbench showed the pre-`chat-header` layout until the HTTP cache was removed.
+Revalidation would not help that browser (its copies are fresh for a year), and
+the commit is compiled into the client, server, extension-host and pty bundles
+(the client also builds `/vscode-remote-resource` URLs from it), so it stays.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `static-id` | `out/server-main.js`: `IE="/static",Vq="/callback"` (the static route constant) | `IE="/static/ezil-<id>",Vq="/callback"`. Anchor 0, `IE="/static/ezil-` 1, and the exact replacement with the id recomputed by `--verify` 1. |
+| `static-names` | `server-main.js`: `o.startsWith(IE)&&o.charCodeAt(IE.length)===47?this._handleStatic(t,e,o.substring(IE.length))` (router), `let I=Be.join(l,this._productPath,IE),` (the page's static base), `WORKBENCH_WEB_BASE_URL:I,`, `webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/pre"` | Checked, never patched: each occurs once, so the constant still sets the URL of everything the page loads from the static route and the router still strips it. |
+
+`<id>` is `ezil-` plus 20 hex digits of a SHA-256 over every file under
+`lib/vscode` (sorted relative path and each file's SHA-256; symlinks by target),
+computed after every other patch in this script. Excluded: `extensions/` (the
+browser loads built-in extension files through `/vscode-remote-resource`, which
+this path does not cover), `product.json` (compiled into the bundles; the
+Dockerfile edits it afterwards) and `server-main.js` (it carries the id). The
+same files give the same id; any changed served byte gives a new URL, so a new
+image's workbench cannot be answered from an older image's cache entries, while
+cookies, IndexedDB, local storage and the chat history are left alone. URLs
+without the id (`…/static/out/…`) now answer 404. `--verify` recomputes the
+id, and the Dockerfile re-runs it after its last layer, so a later edit of a
+served file fails the build instead of shipping new bytes under an old URL.
+
+Not covered: `/vscode-remote-resource` answers built-in extension files with the
+same one-year header (no patched file is loaded by the browser that way), and a
+tab left open across an image change requests the old path and has to be
+reloaded.
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/static-id-patch.test.cjs
+```
+
 ## Re-deriving the 4.141.0 anchors
 
 The three moved anchors are `token` (`yGe.env.devDeviceId`), `accounts-menu`
@@ -308,8 +369,9 @@ token branch. Do not copy minifier names from a different release.
 
 Extract the checksummed .deb with `dpkg-deb -x`, copy the extracted tree,
 and run this script followed by `--verify` against `lib/vscode` in that copy.
-Every pre-patch count must match. The verification also parses all three
-patched JS files, compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
+Every pre-patch count must match. The verification also parses the four
+patched JS files (`server-main.js` in place, where `lib/vscode/package.json`
+makes it a module), compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
 identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are

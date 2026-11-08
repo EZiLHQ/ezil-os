@@ -12,7 +12,7 @@ const source = process.env.COPILOT_TEST_ROOT;
 const script = path.join(__dirname, 'patch-copilot-chat.sh');
 const editorState = path.join(__dirname, '..', 'scripts', 'editor-state.sh');
 const wb = 'out/vs/code/browser/workbench/workbench.js';
-const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, 'out/vs/code/browser/workbench/workbench.css'];
+const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, 'out/vs/code/browser/workbench/workbench.css', 'out/server-main.js'];
 const run = (...args) => spawnSync('bash', [script, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
 const between = (code, start, end) => {
   const i = code.indexOf(start); assert(i >= 0, `missing ${start.slice(0, 40)}`);
