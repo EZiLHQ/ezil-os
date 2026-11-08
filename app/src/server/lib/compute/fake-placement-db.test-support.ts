@@ -480,6 +480,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     if (nullable) return (r) => (r[nullable[1]!] ?? null) === value(nullable[2]!, params);
                     const available = text.match(/^\((\w+) IS NULL OR \1 = (\$\d+)\)$/);
                     if (available) return (r) => r[available[1]!] == null || r[available[1]!] === value(available[2]!, params);
+                    // Fake rows hold JavaScript Dates, already whole milliseconds.
+                    const truncated = text.match(/^date_trunc\('milliseconds', (\w+)\) = (\$\d+::timestamptz)$/);
+                    if (truncated) return (r) => instant(r[truncated[1]!]) === instant(value(truncated[2]!, params));
                     const list = text.match(/^(\w+) IN \(([^)]+)\)$/);
                     if (list) {
                         const values = list[2]!.split(',').map((v) => value(v.trim(), params));
