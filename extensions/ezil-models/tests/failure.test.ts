@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { APP_FAILURE_CODES, appFailure, isAppFailure, isSafeModelKey, MODEL_KEY_NAMESPACES, type AppFailureInput } from '../src/failure';
+import { APP_FAILURE_CODES, appFailure, emittableModelKey, isAppFailure, isSafeModelKey, MODEL_KEY_NAMESPACES, type AppFailureInput } from '../src/failure';
 import { GatewayError } from '../src/gateway';
 import { GatewayResponseError } from '../src/gateway-response';
 import { CLIENT_ID, GATEWAY_ID, SENTINEL } from './fixtures/failure';
@@ -28,7 +28,20 @@ describe('appFailure mapping', () => {
             expect(isAppFailure({ ...record, modelKey: model })).toBe(false);
         });
     }
-    for (const model of ['qwen.qwen3-coder-next', 'anthropic/claude-sonnet-4-5-20250929', 'us.anthropic.claude-sonnet-5-5', 'claude-sonnet-5-5', 'us.moonshotai.kimi-k3']) {
+    // Credential shapes: rejected outright, or (embedded after a delimiter) accepted by the consumer's predicate but
+    // never emitted by the producer. Either way the record and its request IDs are kept.
+    for (const model of ['project/file-1', 'sb_secret_abcd-efgh-ijkl-mnop', 'claude-sk-abcd1234', 'gemini-ghp_x1', 'anthropic/claude-xoxb-1',
+        'ezil-pat-1', 'qwen.sk-proj-abc1', 'claude-token-5']) {
+        test(`credential-shaped model ${model} is never emitted, and the record keeps its IDs`, () => {
+            const record = appFailure({ ...base, model, error: gatewayError('upstream_error', 500) });
+            expect(record).not.toHaveProperty('modelKey');
+            expect(record).toMatchObject({ eventId: EVENT_ID, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+            expect(isAppFailure(record)).toBe(true);
+            expect(emittableModelKey(model)).toBe(false);
+        });
+    }
+    for (const model of ['qwen.qwen3-coder-next', 'anthropic/claude-sonnet-4-5-20250929', 'us.anthropic.claude-sonnet-5-5', 'claude-sonnet-5-5', 'us.moonshotai.kimi-k3',
+        'gemini-3.8-flash', 'ezil-code', 'ezil-fast']) {
         test(`safe model ${model} is preserved`, () => {
             const record = appFailure({ ...base, model });
             expect(record.modelKey).toBe(model);

@@ -102,6 +102,17 @@ export function isSafeModelKey(value: unknown): value is string {
     return /[0-9-]/.test(segments[0]!);
 }
 
+/** A credential prefix as a whole part (`claude-sk-…`, `gemini-ghp_…`, `anthropic/claude-xoxb-…`, `ezil-pat-…`). */
+const CREDENTIAL_PART = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github|pat|xox[abpr])$/;
+/**
+ * What the producer emits as modelKey: the consumer's predicate, and also no credential prefix or credential word in
+ * ANY part delimited by `/ . : _ -` (the consumer checks prefixes only at a segment's start). Stricter than the consumer
+ * on purpose: an unsafe optional key is omitted here, before emitting, so it can never cost the record or its IDs.
+ */
+export function emittableModelKey(value: unknown): value is string {
+    return isSafeModelKey(value) && !value.split(/[/.:_-]/).some(part => CREDENTIAL_PART.test(part) || TOKEN_WORD.test(part));
+}
+
 // JavaScript's $ also matches before a final newline; metadata must match the entire string.
 function matches(value: unknown, pattern: RegExp): value is string {
     return typeof value === 'string' && pattern.exec(value)?.[0] === value;
@@ -163,7 +174,7 @@ export function appFailure(input: AppFailureInput): AppFailure {
         ...(cancelled ? {} : { retryable: input.outcome !== 'failed' || RETRYABLE.has(code) && error?.code !== 'settlement_pending'
             && !(error instanceof GatewayResponseError && error.upstreamType === 'settlement_pending') }),
         ...(integer(durationMs, 0, 3_600_000) ? { durationMs } : durationMs > 3_600_000 ? { durationMs: 3_600_000 } : {}),
-        ...(isSafeModelKey(input.model) ? { modelKey: input.model } : {}),
+        ...(emittableModelKey(input.model) ? { modelKey: input.model } : {}),
         // A recovered record names what was retried (its code) under the successful attempt's IDs; the retried
         // attempt's HTTP status belongs to that earlier attempt, so it is never paired with the new Gateway ID.
         ...(status !== undefined && input.outcome !== 'recovered' ? { httpStatus: status } : {}),
