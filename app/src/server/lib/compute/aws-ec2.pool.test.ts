@@ -877,6 +877,19 @@ describe('a volume on another lower is refused before any host is spent', () => 
         expect(s.starts).toEqual([]);
     });
 
+    it('an image job reservation keeps its existing answer (the rebase path), never the refusal', async () => {
+        const reserved = { image_upgrade_job_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', ...recorded(PREVIOUS) };
+        const before = setup({ rows: [stopped(reserved)] });
+        const baseline = await before.ensure().then(r => r, (e: unknown) => ({ threw: (e as Error).name }));
+        const s = setup({ rows: [stopped(reserved)], deployment: R });
+        const result = await s.ensure().then(r => r, (e: unknown) => ({ threw: (e as Error).name }));
+        expect(baseline).toEqual({ threw: 'ImageJobConflictError' });
+        expect(result).toEqual(baseline);
+        expect(JSON.stringify(result)).not.toContain('computer_rebase_required');
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts).toEqual([]);
+    });
+
     it('the current lower adopts warm exactly as before', async () => {
         const s = setup({ rows: [stopped(recorded(CURRENT))], deployment: R });
         const { result, lines } = await open(s);
