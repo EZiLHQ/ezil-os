@@ -29,6 +29,9 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
    a fresh random token per document load.
 3. The producer posts
    `{ type: 'ezil.code.failure', v: 1, nonce, failure }` to `window.parent`.
+   It may also post `{ type: 'ezil.code.diag.ready', v: 1, nonce }` once per
+   hello, with no other keys, to say the collector is present even before any
+   failure; it counts toward the rate cap and stores nothing.
 4. The shell accepts a message only when ALL hold:
    - `event.source === registeredIframe.contentWindow` (rejects nested,
      sibling and stale frames);
@@ -107,12 +110,17 @@ A code is valid only in its own category (or `unexpected_error` in any).
 - A report selects ONLY its frozen context: the dialog snapshots
   `currentComputer()` when it opens (Settings / global entry) or the
   requesting frame's registration (app "Report problem" entry, which prefills
-  but never sends).
+  but never sends). Scope: with an app session (app entry), only that
+  window's ring; without one (global entry), every app session of the frozen
+  computer, never another computer's.
+- Entries outlive their window: closing or reminting a Code window stops new
+  messages from it but keeps its unexpired entries reportable.
 - Export = newest 10 for that context, each `failure` plus `app` (`code`) and
   `ageMs` (shell clock), total ≤ 8 KiB. Only with diagnostics consent; frozen
   into the previewed body like every other diagnostic.
-- If no Code frame of that context answered a hello, the preview says app
-  failure context is unavailable instead of an empty list. This is NOT a
+- If the context has no retained entries and no live Code frame of it has
+  answered a hello (`ready` or a valid failure), the preview says app failure
+  context is unavailable instead of an empty list. This is NOT a
   privileged device log.
 
 ## 5. Server

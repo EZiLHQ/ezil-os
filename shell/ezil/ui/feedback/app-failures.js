@@ -147,13 +147,17 @@ export function create_app_failure_store ({ now = () => Date.now() } = {}) {
         const at = now();
         prune(at);
         for (const context of frames) if (!context.live()) context.unregister();
+        // Scope (contract §4): with an appSession, that one window; without one
+        // (the global entry), every app session of the frozen computer.
         const matches = context => context.computerId === computerId
             && (appSession === undefined || context.appSession === appSession);
-        const available = [...frames].some(context => matches(context) && context.responsive);
         const failures = [...rings.values()].filter(matches).flatMap(ring => ring.entries)
             .sort((a, b) => b.receivedAt - a.receivedAt || b.sequence - a.sequence).slice(0, 10)
             .map(entry => ({ ...entry.failure, app: entry.app, ageMs: Math.max(0, Math.round(at - entry.receivedAt)) }));
         while (bytes(failures) > 8 * 1024) failures.pop();
+        // Retained entries outlive their window (closing Code after a failure must
+        // not hide it); with none, a live responsive collector still counts.
+        const available = failures.length > 0 || [...frames].some(context => matches(context) && context.responsive);
         return { available, failures };
     }
 

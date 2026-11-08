@@ -162,6 +162,7 @@ try {
         a2.send(failure(3)); time += 123;
         const selected = store.app_failures_for({ ...context, appSession: options.appSession });
         assert.deepEqual(selected.failures, [{ ...failure(2), app: 'code', ageMs: 123 }]);
+        // Without appSession (the global entry) the scope is every session of the frozen computer.
         assert.deepEqual(store.app_failures_for(context).failures.map(f => f.eventId), [uuid(3), uuid(2)]);
         assert.equal(store.app_failures_for({ ...context, appSession: 'unknown' }).available, false);
         selected.failures[0].code = 'mutated';
@@ -391,8 +392,10 @@ try {
             await win.on_before_exit(); await second.on_before_exit();
             assert.equal(listeners.size, before);
             post(hello[1], failure(506));
-            assert.equal(M.app_failures_for(trusted).failures[0].eventId, uuid(504));
-            assert.equal(M.app_failures_for(trusted).available, false);
+            assert.equal(M.app_failures_for(trusted).failures[0].eventId, uuid(504), 'a closed window accepts nothing new');
+            // Closing Code after a failure must not hide what it already reported.
+            assert.equal(M.app_failures_for(trusted).available, true, 'retained entries outlive the window');
+            assert.deepEqual(M.app_failures_for({ ...trusted, appSession: 'never-registered' }), { available: false, failures: [] });
         } finally {
             for (const win of windows) await win.on_before_exit?.();
             M.clear_app_failures(); codeHooks.deregister(); delete globalThis.__codeFailureTest;
