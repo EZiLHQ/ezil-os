@@ -124,6 +124,27 @@ describe.skipIf(!PG)('placement updated_at millisecond CAS on PostgreSQL', () =>
         const hosts = await db!.execute(sql`SELECT state FROM public.ezil_compute_pool_hosts WHERE id = ${poolHostId}::uuid`);
         expect(hosts).toMatchObject([{ state: 'retiring' }]);
     });
+    it('1: a past fractional row takes the transaction clock, in whole milliseconds', async () => {
+        const p = await seed('2020-01-01T00:00:00.123901Z'), before = await stamp();
+        await withAdmission(db!, async tx => {
+            const store: PlacementDb = { execute: q => tx.execute(q), transaction: fn => fn(tx) };
+            expect(await fail(p, store)).toMatchObject({ ok: true });
+            const after = await stamp(tx);
+            expect(after.micros % 1000).toBe(0);
+            expect(after.epoch).toBeGreaterThan(before.epoch + BigInt(1000));
+            expect(await tx.execute(sql`SELECT updated_at = date_trunc('milliseconds', now()) AS clock
+                FROM public.ezil_computer_placements WHERE computer_id = ${computerId}::uuid`)).toEqual([{ clock: true }]);
+        });
+    });
+    it('1: publishes the claim from a fresh fractional snapshot exactly once', async () => {
+        const p = await seed(), before = await stamp();
+        let published = 0;
+        await publishAttachedPoolClaim(db!, p, volumeId, async () => { published += 1; });
+        expect(published).toBe(1);
+        advanced(before, await stamp());
+        await publishAttachedPoolClaim(db!, p, volumeId, async () => { published += 1; });
+        expect(published).toBe(1);
+    });
     it('2: transitions a re-read snapshot after the old microsecond nonce writer', async () => {
         await seed(); await saveOld();
         const before = await stamp();
