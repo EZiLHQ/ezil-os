@@ -40,7 +40,8 @@ describe('gateway transport', () => {
         const headers = Object.fromEntries(new Headers(s.calls[0]!.init.headers));
         expect(headers).toEqual({ authorization: 'Bearer synthetic-proxy-token', 'content-type': 'application/json', accept: 'text/event-stream', 'idempotency-key': 'fixed-key' });
         expect(logs).toHaveLength(1);
-        expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'req-ok', model: gw().id, stream: true, hold: '1000', http_status: 200, latency_ms: 0,
+        expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'req-ok', model: gw().id, stream: true, hold: '1000', http_status: 200,
+            client_request_id: null, attempts: 1, partial: false, latency_ms: 0,
             usage: { input: 100, output: 8, cache_read: 3, cache_write: 4 }, stop_reason: 'end_turn', error_code: null, origin: null });
         expect(logs.join()).not.toMatch(/Hello|synthetic-proxy-token|never log/);
     });
@@ -350,7 +351,8 @@ describe('local refusals and error origin', () => {
             + 'Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
         expect(error.message).not.toMatch(/invalid|new chat/i);
         expect(logs).toHaveLength(1);
-        expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null, latency_ms: 0,
+        expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null,
+            client_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/), attempts: 0, partial: false, latency_ms: 0,
             usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
             body_bytes: bodyBytes, limit_bytes: 130_016, messages: 1, max_blocks: 1, tools: 1, tool_bytes: toolBytes });
         for (const text of [logs[0]!, error.message]) expect(text).not.toMatch(new RegExp(`${SENTINEL}|字|invalid_request`));

@@ -1,5 +1,5 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
-// never forward Copilot's provider-specific options, cache markers or previous reasoning.
+// never forward Copilot's provider-specific options, cache markers or unsigned thinking.
 import type { GatewayProtocol, ResolvedModel } from './config';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
 
@@ -48,7 +48,8 @@ type ObjectValue = Record<string, unknown>;
 export type TextBlock = { type: 'text'; text: string };
 export type ToolUse = { type: 'tool_use'; id: string; name: string; input: ObjectValue };
 export type ToolResult = { type: 'tool_result'; tool_use_id: string; content: TextBlock[]; is_error?: boolean };
-export type Block = TextBlock | ToolUse | ToolResult;
+export type ThinkingBlock = { type: 'thinking'; thinking: string; signature: string } | { type: 'redacted_thinking'; data: string };
+export type Block = TextBlock | ToolUse | ToolResult | ThinkingBlock;
 export type GatewayMessage = { role: 'user' | 'assistant'; content: Block[] };
 export type GatewayTool = { name: string; input_schema: ObjectValue; description?: string };
 export type GatewayBody = {
@@ -103,11 +104,32 @@ function partText(part: Part): string {
     return '[tool call omitted]';
 }
 
-/** One message before conversation pairing, also used for byte counting. No synthetic history here. */
-export function gatewayMessage(message: Message): { role: Message['role']; content: Block[] } {
+/**
+ * The native-route boundary for replaying signed thinking: only the Gateway's native Anthropic routes (Claude through
+ * the Anthropic API, `claude-…`, or Bedrock InvokeModel, `[geo.]anthropic.claude-…`: both forward the provider's own SSE
+ * and accept its own signed thinking back) get prior
+ * thinking blocks. Every other route drops them as before: Bedrock Converse (Kimi) rejects prior thinking blocks, and
+ * other providers never issued a signature. Decided by the explicit Claude model id, never by `family` (it defaults
+ * to `gpt`) or by the protocol (Converse models speak anthropic-messages too).
+ */
+const NATIVE_ANTHROPIC_MODEL = /^(?:(?:[a-z]{2,6}\.)?anthropic\.)?claude-[a-z0-9.:-]+$/;
+export function replaysThinking(model: string): boolean {
+    return NATIVE_ANTHROPIC_MODEL.test(model);
+}
+
+/** One message before conversation pairing, also used for byte counting (conservatively, with thinking). No synthetic history here. */
+export function gatewayMessage(message: Message, replayThinking = true): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
+    const thinking: ThinkingBlock[] = [];
     for (const part of message.parts) {
-        if (message.role === 'assistant' && part.type === 'tool_call') {
+        if (part.type === 'thinking') {
+            if (message.role !== 'assistant' || !replayThinking) continue;
+            const meta = part.metadata ?? {};
+            if (typeof meta.redactedData === 'string') thinking.push({ type: 'redacted_thinking', data: meta.redactedData });
+            else if (typeof meta._completeThinking === 'string' && typeof meta.signature === 'string' && meta.signature) {
+                thinking.push({ type: 'thinking', thinking: meta._completeThinking, signature: meta.signature });
+            }
+        } else if (message.role === 'assistant' && part.type === 'tool_call') {
             if (typeof part.callId === 'string' && typeof part.name === 'string' && TOOL_NAME.test(part.callId) && TOOL_NAME.test(part.name) && isObject(part.input) && jsonValue(part.input)) {
                 content.push({ type: 'tool_use', id: part.callId, name: part.name, input: part.input });
             } else content.push(text('[tool call omitted: invalid arguments or identifier]'));
@@ -119,12 +141,12 @@ export function gatewayMessage(message: Message): { role: Message['role']; conte
             if (value) content.push(text(value));
         }
     }
-    return { role: message.role, content: content.length ? content : [text('(empty)')] };
+    return { role: message.role, content: thinking.length || content.length ? [...thinking, ...content] : [text('(empty)')] };
 }
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[]): { system: TextBlock[]; messages: GatewayMessage[] } {
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], replayThinking = false): { system: TextBlock[]; messages: GatewayMessage[] } {
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
     const names = new Set(tools.map(tool => tool.name));
@@ -134,7 +156,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
         }
-        const converted = gatewayMessage(message);
+        const converted = gatewayMessage(message, replayThinking);
         const content = converted.content.map(block => {
             if (block.type !== 'tool_use') return block;
             if (!names.has(block.name) || seen.has(block.id)) return text('[tool call omitted: unavailable tool or duplicate identifier]');
@@ -151,6 +173,9 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
     let pending = new Set<string>();
     for (const turn of turns) {
         if (turn.role === 'assistant') {
+            // Merging adjacent assistant messages must also keep signed/redacted thinking before ordinary content.
+            const isThinking = (block: Block) => block.type === 'thinking' || block.type === 'redacted_thinking';
+            turn.content = [...turn.content.filter(isThinking), ...turn.content.filter(block => !isThinking(block))];
             pending = new Set(turn.content.filter((block): block is ToolUse => block.type === 'tool_use').map(block => block.id));
             continue;
         }
@@ -177,7 +202,7 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
 
 export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log);
-    const conversation = gatewayConversation(request.messages, tools);
+    const conversation = gatewayConversation(request.messages, tools, replaysThinking(model.model));
     const body: GatewayBody = {
         model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
         stream: model.model !== KIMI && model.stream !== false,
