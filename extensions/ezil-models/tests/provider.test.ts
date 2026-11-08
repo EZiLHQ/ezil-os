@@ -621,17 +621,19 @@ describe('EZiL gateway VS Code bridge', () => {
                 ev('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } }), ev('message_stop', {})].join('');
             const bodies: Record<string, unknown>[] = [];
             const claude = { ...gw('claude-sonnet-5-5'), default: true, capabilities: { toolCalling: true, imageInput: false } };
+            const opus = { ...gw('claude-opus-5-5'), default: false, capabilities: { toolCalling: true, imageInput: false } };
             const make = () => {
                 const host = gatewayHost((async (_input: unknown, init?: RequestInit) => {
                     bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
                     return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'thinking-fallback' } });
-                }) as unknown as typeof fetch, () => Response.json({ data: [{ id: claude.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 }] }));
-                host.models = () => [claude];
+                }) as unknown as typeof fetch, () => Response.json({ data: [claude, opus].map(m => ({ id: m.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 })) }));
+                opus.provider = claude.provider;
+                host.models = () => [claude, opus];
                 return { host, provider: new Without(host) };
             };
-            const ask = (provider: InstanceType<typeof Without>, history: unknown[]) => {
+            const ask = (provider: InstanceType<typeof Without>, history: unknown[], model = claude) => {
                 const parts: unknown[] = [];
-                return provider.provideLanguageModelChatResponse(toInformation(claude), history as never, { tools: [CREATE_FILE], modelOptions: {} } as never,
+                return provider.provideLanguageModelChatResponse(toInformation(model), history as never, { tools: [CREATE_FILE], modelOptions: {} } as never,
                     { report: p => parts.push(p) }, token() as never).then(() => parts);
             };
             const first = make();
@@ -644,11 +646,27 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(assistant.content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
             expect(assistant.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1' });
             for (const line of first.host.lines) expect(line).not.toContain('PRIVATE-THOUGHT');
+            // Never into anything but the exact continuation: each body below must carry no thinking at all.
+            const leaked = (body: Record<string, unknown>) => JSON.stringify(body).includes('PRIVATE-THOUGHT') || JSON.stringify(body).includes(signature);
+            const call = (input: Record<string, unknown>) => message(2, [new ToolCallPart('toolu_1', 'create_file', input)]);
+            const result = message(1, [new ToolResultPart('toolu_1', [new TextPart('done')])]);
+            // Another conversation that reuses the same call id, name and input after a different user turn.
+            await ask(first.provider, [message(1, [new TextPart('an unrelated chat')]), call({ filePath: 'a', content: 'b' }), result]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same history, but the tool call's input differs (another file).
+            await ask(first.provider, [message(1, [new TextPart('make a file')]), call({ filePath: 'different.ts', content: 'b' }), result]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same history and call, sent to another model.
+            await ask(first.provider, history, opus);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The exact continuation still gets it, after all of the above.
+            await ask(first.provider, history);
+            expect(leaked(bodies.at(-1)!)).toBe(true);
             // Honest limit: a new provider (a reload) has nothing to replay, and the request goes without it as before.
             const fresh = make();
             await ask(fresh.provider, history);
-            expect(JSON.stringify(bodies[2])).not.toContain('PRIVATE-THOUGHT');
-            expect(JSON.stringify(bodies[2])).not.toContain('"thinking"');
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            expect(JSON.stringify(bodies.at(-1))).not.toContain('"thinking"');
         } finally { mock.module('vscode', () => fakeVscode); }
     });
 });

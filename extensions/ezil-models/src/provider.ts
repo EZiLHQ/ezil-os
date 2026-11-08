@@ -9,7 +9,8 @@ import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
-import type { ChatRequest, Message, Part, Role, Tool, Usage } from './types';
+import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Role, type Tool, type Usage } from './types';
+import { createHash } from 'node:crypto';
 
 /** Role value of the proposed `languageModelSystem` API; guarded numerically so a missing proposal degrades to the value. */
 export const SYSTEM_ROLE = 3;
@@ -30,6 +31,35 @@ export type ProviderHost = {
 };
 
 type AnyPart = Record<string, unknown>;
+
+/** JSON with object keys sorted, so equal values hash equally whatever their key order. */
+function stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value ?? null);
+}
+function canonicalPart(part: Part): unknown {
+    switch (part.type) {
+        case 'text': return ['text', part.value];
+        case 'tool_call': return ['call', part.callId, part.name, stableJson(part.input)];
+        case 'tool_result': return ['result', part.callId, part.isError ?? null, part.content.map(canonicalPart)];
+        case 'data': return ['data', part.mimeType, createHash('sha256').update(part.data).digest('hex')];
+        default: return ['other'];
+    }
+}
+/**
+ * The identity of one turn's continuation, for the signed-thinking fallback: the resolved provider and model, the
+ * exact history the turn answered (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
+ * turn's ordered tool calls with their full inputs. A hash: nothing of it is kept or logged as text.
+ */
+function continuationKey(model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
+    const turns = history.map(message => [message.role, message.parts
+        .filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart)]);
+    return createHash('sha256').update(JSON.stringify([model.providerName, model.model, turns,
+        calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
+}
 
 // Constructor lookups are lazy because the proposed ThinkingPart may not exist at all.
 function thinkingCtor(): (new (value: string | string[], id?: string, metadata?: Record<string, unknown>) => unknown) | undefined {
@@ -158,9 +188,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     /**
      * Fallback for a workbench without the ThinkingPart API: Copilot can then not carry a turn's signed thinking into its
      * history, and a native Claude tool turn needs it back. The completed signed or redacted blocks are kept here, in
-     * memory only and never logged, keyed by the tool call they preceded, and re-attached ahead of that call in the next
-     * request (gateway-messages.ts replays them on the native route only). Bounded; lost on reload, when the request
-     * goes without them as before.
+     * memory only and never logged, under continuationKey: the resolved provider and model, the exact history the turn
+     * answered and its full ordered tool calls (id, name, input). They are re-attached only to an assistant message that
+     * continues exactly that history with exactly those calls (gateway-messages.ts replays them on the native route
+     * only), so another conversation that reuses a call id, a changed input, or another model never receives them.
+     * Bounded; lost on reload, when the request goes without them as before.
      */
     private signedThinking = new Map<string, Part[]>();
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
@@ -170,19 +202,21 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     refresh(): void { this.changed.fire(); }
     dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); }
 
-    private rememberSignedThinking(callId: string, parts: readonly Part[]): void {
-        this.signedThinking.delete(callId);
-        this.signedThinking.set(callId, [...parts]);
+    private rememberSignedThinking(key: string, parts: readonly Part[]): void {
+        this.signedThinking.delete(key);
+        this.signedThinking.set(key, [...parts]);
         while (this.signedThinking.size > 64) this.signedThinking.delete(this.signedThinking.keys().next().value!);
     }
 
-    /** Re-attach kept signed thinking ahead of an assistant message's tool calls when its history carries none. */
-    private restoreSignedThinking(request: ChatRequest): void {
-        for (const message of request.messages) {
-            if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) continue;
-            const call = message.parts.find(part => part.type === 'tool_call' && this.signedThinking.has(part.callId));
-            if (call?.type === 'tool_call') message.parts = [...this.signedThinking.get(call.callId)!, ...message.parts];
-        }
+    /** Re-attach kept signed thinking to an assistant message only when it exactly continues the turn that produced it. */
+    private restoreSignedThinking(model: ResolvedModel, request: ChatRequest): void {
+        request.messages.forEach((message, index) => {
+            if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) return;
+            const calls = message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []);
+            if (!calls.length) return;
+            const kept = this.signedThinking.get(continuationKey(model, request.messages.slice(0, index), calls));
+            if (kept) message.parts = [...kept, ...message.parts];
+        });
     }
 
     private rememberModels(models: ResolvedModel[]): ResolvedModel[] {
@@ -306,11 +340,15 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
             }
             const request = toNeutralRequest(messages, options);
-            if (!thinkingCtor()) this.restoreSignedThinking(request);
+            if (!thinkingCtor()) this.restoreSignedThinking(resolved, request);
+            // The history this turn answers, for the fallback's key (fixed before anything below can change the request).
+            const answered = request.messages.slice();
             const Thinking = thinkingCtor();
             let emittedText = false;
             // Completed signed/redacted thinking of this turn, kept only when the ThinkingPart API is missing.
             const signed: Part[] = [];
+            const calls: { callId: string; name: string; input: unknown }[] = [];
+            let completed = false;
             if (resolved.provider.type === 'ezil-gateway') {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
@@ -351,7 +389,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         progress.report(new vscode.LanguageModelTextPart(event.value));
                         break;
                     case 'tool_call':
-                        if (!Thinking && signed.length) this.rememberSignedThinking(event.callId, signed);
+                        calls.push({ callId: event.callId, name: event.name, input: event.input });
                         progress.report(new vscode.LanguageModelToolCallPart(event.callId, event.name, (typeof event.input === 'object' && event.input !== null ? event.input : {}) as object));
                         break;
                     case 'thinking':
@@ -365,6 +403,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         this.host.recordUsage(resolved, event.usage, Date.now() - started);
                         break;
                     case 'stop':
+                        completed = true;
                         if (event.reason === 'refusal') {
                             const details = event.details as { category?: string; explanation?: string } | undefined;
                             const requestId = (event.details as { requestId?: string } | undefined)?.requestId;
@@ -377,6 +416,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         }
                         break;
                 }
+            }
+            // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
+            if (!Thinking && completed && signed.length && calls.length && !token.isCancellationRequested) {
+                this.rememberSignedThinking(continuationKey(resolved, answered, calls), signed);
             }
         } catch (error) {
             const known = this.modelIdentities.get(model.id);
