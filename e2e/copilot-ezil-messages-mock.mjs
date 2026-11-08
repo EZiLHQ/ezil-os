@@ -69,7 +69,7 @@ function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
   const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
@@ -77,6 +77,13 @@ function scriptedContent(body, folder) {
     return [{ type: 'tool_use', id, name, input }];
   };
   if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
+  // A subagent (VS Code's runSubagent tool) gets the CHILD prompt; the parent names its model as `model=[Name (vendor)]`.
+  if (userText.includes('EZIL_E2E_CHILD')) return [{ type: 'text', text: 'EZiL Chat: child reply. EZIL_CHILD_OK' }];
+  if (userText.includes('EZIL_E2E_SUBAGENT') && body.tools?.length) {
+    const model = /model=\[([^\]]+)\]/.exec(userText)?.[1];
+    if (!done('ezil_subagent')) return call('ezil_subagent', 'runSubagent', { prompt: 'Reply with exactly EZIL_E2E_CHILD', description: 'Child model check', ...model ? { model } : {} });
+    return [{ type: 'text', text: 'EZiL Chat: subagent finished. EZIL_SUBAGENT_DONE' }];
+  }
   // A long answer (about 24 KB) per turn, so a few turns outgrow the input bound; its middle carries a per-turn marker
   // that a compacted request no longer needs to repeat, while the saved chat keeps it.
   if (userText.includes('EZIL_E2E_LONG')) {
