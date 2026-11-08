@@ -700,13 +700,13 @@ export const BOOT_FAILURE_COPY = {
         title: 'Your computer was just stopped',
         body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the desktop from Settings → Computer, or try again in a minute.",
     },
-    // Acceptance 1.0.34: the computer's files were last used on an older system image than new hosts run, or on one
+    // Acceptance 1.0.34: the computer's files were last used on a different system image than new hosts run, or on one
     // never recorded. Such a host refuses them, so the server refuses the open before any host starts
     // (`computer_rebase_required`). Only an operator update moves them across, so the copy names Send feedback,
     // like the hour limits, and never promises a button.
     computer_update_required: {
         title: 'Your computer needs an update before it can start',
-        body: "Your files are kept. They were last used with an older version of EZiL's computer system and have to be moved to the current one before this computer can start again. That isn't automatic yet: use Send feedback to ask for the update. Try again only checks whether it is done.",
+        body: "Your files are kept. They were last used with a different version of EZiL's computer system and have to be moved to the current one before this computer can start again. That isn't automatic yet: use Send feedback to ask for the update. Try again only checks whether it is done.",
     },
     operations_paused: {
         title: 'Your AWS computer is paused by operations',

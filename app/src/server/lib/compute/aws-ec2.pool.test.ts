@@ -866,6 +866,17 @@ describe('a volume on another lower is refused before any host is spent', () => 
         expectUntouched(s, before);
     });
 
+    it.each([
+        // In-flight answers stay ahead of the refusal: a recovery or a capacity wait is never shown as "needs an update".
+        ['a recovery in progress', { state: 'UNCONFIRMED', last_error: 'lifecycle_start_failed' }, 'computer_recovering'],
+        ['a capacity refusal', { state: 'UNCONFIRMED', last_error: 'capacity:insufficient' }, 'capacity_unavailable'],
+    ] as const)('%s on another lower keeps its own answer', async (_name, over, errorCode) => {
+        const s = setup({ rows: [stopped({ ...over, ...recorded(PREVIOUS) })], deployment: R });
+        expect(await s.ensure()).toMatchObject({ errorCode });
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts).toEqual([]);
+    });
+
     it('the current lower adopts warm exactly as before', async () => {
         const s = setup({ rows: [stopped(recorded(CURRENT))], deployment: R });
         const { result, lines } = await open(s);
