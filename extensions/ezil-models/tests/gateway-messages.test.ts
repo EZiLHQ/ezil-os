@@ -55,9 +55,11 @@ describe('gateway sanitizer', () => {
         const request = { ...ask([msg('system', txt('sys'), marker), msg('user', txt('q'), marker), msg('assistant', call('a'), marker), msg('user', result('a', [txt('out'), marker]), marker)]), tools: [{ ...tool, cache_control: { type: 'ephemeral' } }], modelOptions: { cache_control: { type: 'ephemeral' } } };
         expect(JSON.stringify(buildGatewayBody({ ...gw(), cache: { enabled: true, ttl: '1h' } }, request).body)).not.toContain('cache_control');
     });
-    test('thinking and redacted thinking are dropped', () => {
+    test('signed thinking and redacted thinking are replayed', () => {
         const body = build(ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))]));
-        expect(JSON.stringify(body)).not.toMatch(/thinking|reasoning|signature|hidden/);
+        expect(body.messages[1]!.content).toEqual([{ type: 'thinking', thinking: 'reasoning', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'hidden' }, { type: 'text', text: 'answer' }]);
+        expect(JSON.stringify(body)).not.toContain(thinking.value);
     });
     test('tool_use arguments are objects; invalid arguments and identifiers become text', () => {
         const request = { ...ask([msg('assistant', call('valid'), call('bad.id'), call('array', 'read_file', []), call('inf', 'read_file', { n: Infinity }))]), tools: [tool] };
