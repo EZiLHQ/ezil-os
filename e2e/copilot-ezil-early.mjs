@@ -51,9 +51,14 @@ try {
         await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
         await page.keyboard.type(prompt, { delay: 2 });
         // Monaco's text carries non-breaking spaces and wraps: compare without any whitespace.
-        seen = await editor.innerText();
-        typed = seen.replace(/[\s\u00a0]+/g, '').includes(prompt.replace(/\s+/g, ''));
-        if (!typed) await page.waitForTimeout(1000);
+        // Monaco paints typed text on a later frame: let the rendering settle before retyping (CI on 6df1871d retyped
+        // while its screenshot shows the whole prompt in the input).
+        for (let i = 0; i < 15 && !typed; i++) {
+          seen = await editor.innerText();
+          typed = seen.replace(/[\s\u00a0\u200b]+/g, '').includes(prompt.replace(/\s+/g, ''));
+          if (!typed) await page.waitForTimeout(200);
+        }
+        if (!typed) console.log(`[early] ${v.name}: attempt ${attempt + 1}, the input shows ${JSON.stringify(clean(seen).slice(0, 120))}`);
       }
       await page.keyboard.press('Enter');
       const sentAt = (Date.now() - t0) / 1000;
