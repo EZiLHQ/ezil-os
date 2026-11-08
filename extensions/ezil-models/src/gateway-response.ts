@@ -1,5 +1,5 @@
 import type { SseEvent } from './sse';
-import type { StreamEvent, Usage } from './types';
+import { emptyUsage, type StreamEvent, type Usage } from './types';
 import { isObject } from './gateway-messages';
 import { GatewayError } from './gateway-error';
 
@@ -51,15 +51,32 @@ export async function* gatewayBodyEvents(events: AsyncIterable<SseEvent>, reques
     catch (error) { throw responseFailure(error, requestId, 'connection_reset'); }
 }
 
-function usage(value: unknown): Usage {
+/** JSON requires all counters; SSE replaces only counters present in this event. */
+function usage(value: unknown, previous?: Usage): Usage {
     if (!isObject(value)) throw new Error('Invalid usage');
-    const count = (key: string) => {
+    const count = (key: string, fallback: number | undefined) => {
+        if (!(key in value) && fallback !== undefined) return fallback;
         const n = value[key];
         if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) throw new Error('Invalid usage');
         return n;
     };
-    return { inputTokens: count('input_tokens'), outputTokens: count('output_tokens'),
-        cacheReadTokens: count('cache_read_input_tokens'), cacheWriteTokens: count('cache_creation_input_tokens') };
+    return { inputTokens: count('input_tokens', previous?.inputTokens), outputTokens: count('output_tokens', previous?.outputTokens),
+        cacheReadTokens: count('cache_read_input_tokens', previous?.cacheReadTokens), cacheWriteTokens: count('cache_creation_input_tokens', previous?.cacheWriteTokens) };
+}
+
+type ThinkingBlock = { kind: 'thinking'; thinking: string; signature: string };
+function thinkingBlock(block: Record<string, unknown>): ThinkingBlock {
+    if (typeof block.thinking !== 'string' || ('signature' in block && typeof block.signature !== 'string')) throw new Error('Invalid thinking');
+    return { kind: 'thinking', thinking: block.thinking, signature: typeof block.signature === 'string' ? block.signature : '' };
+}
+
+function redactedEvent(block: Record<string, unknown>): StreamEvent {
+    if (typeof block.data !== 'string' || !block.data) throw new Error('Invalid redacted thinking');
+    return { type: 'thinking', value: '', metadata: { redactedData: block.data } };
+}
+
+function completeThinking(block: ThinkingBlock): StreamEvent {
+    return { type: 'thinking', value: '', metadata: { signature: block.signature, _completeThinking: block.thinking } };
 }
 
 function toolEvent(block: Record<string, unknown>): StreamEvent {
@@ -77,24 +94,31 @@ export function gatewayJson(value: unknown, requestId?: string): StreamEvent[] {
         for (const block of value.content) {
             if (!isObject(block)) throw new Error('Invalid block');
             if (block.type === 'text' && typeof block.text === 'string') events.push({ type: 'text', value: block.text });
-            else if (block.type === 'thinking' && typeof block.thinking === 'string') {
-                events.push({ type: 'thinking', value: block.thinking, metadata: { signature: block.signature } });
+            else if (block.type === 'thinking') {
+                const thinking = thinkingBlock(block);
+                if (thinking.thinking) events.push({ type: 'thinking', value: thinking.thinking });
+                if (thinking.signature) events.push(completeThinking(thinking));
             } else if (block.type === 'tool_use') events.push(toolEvent(block));
-            else if (block.type !== 'redacted_thinking') throw new Error('Invalid block');
+            else if (block.type === 'redacted_thinking') events.push(redactedEvent(block));
+            else throw new Error('Invalid block');
         }
         events.push({ type: 'usage', usage: usage(value.usage) }, { type: 'stop', reason: value.stop_reason, details: { requestId } });
         return events;
     } catch { throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response'); }
 }
 
+type PendingBlock = ThinkingBlock | { kind: 'text' | 'redacted_thinking' }
+    | { kind: 'tool_use'; block: Record<string, unknown>; json: string };
+
 /** Anthropic events, including the gateway's final-input usage (message_start counts are provisional).
  * A terminal message_stop is required. Partial text may already be visible when a stream interrupts. */
 export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?: string): AsyncGenerator<StreamEvent> {
     let started = false;
     let stopped = false;
+    let provisionalUsage = emptyUsage();
     let finalUsage: Usage | undefined;
     let stopReason: string | undefined;
-    const blocks = new Map<number, { block: Record<string, unknown>; json: string }>();
+    const blocks = new Map<number, PendingBlock>();
     const seen = new Set<number>();
     try {
         for await (const event of gatewayBodyEvents(events, requestId)) {
@@ -107,13 +131,14 @@ export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?
             if (stopped || (raw.type !== undefined && raw.type !== type)) throw new Error('Invalid order');
             if (type === 'message_start') {
                 if (started || !isObject(raw.message) || raw.message.role !== 'assistant') throw new Error('Invalid start');
+                provisionalUsage = usage(raw.message.usage === undefined ? {} : raw.message.usage, provisionalUsage);
                 started = true;
                 continue;
             }
             if (!started) throw new Error('Missing start');
             if (type === 'message_delta') {
                 if (blocks.size || finalUsage || !isObject(raw.delta) || typeof raw.delta.stop_reason !== 'string' || !STOP_REASONS.has(raw.delta.stop_reason)) throw new Error('Invalid final delta');
-                finalUsage = usage(raw.usage);
+                finalUsage = usage(raw.usage, provisionalUsage);
                 stopReason = raw.delta.stop_reason;
                 continue;
             }
@@ -127,24 +152,33 @@ export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?
             if (type === 'content_block_start') {
                 if (seen.has(index) || !isObject(raw.content_block)) throw new Error('Invalid block start');
                 const block = raw.content_block;
-                if (block.type !== 'text' && block.type !== 'tool_use') throw new Error('Invalid block type');
                 seen.add(index);
-                blocks.set(index, { block, json: '' });
                 if (block.type === 'text') {
                     if (typeof block.text !== 'string') throw new Error('Invalid text');
+                    blocks.set(index, { kind: 'text' });
                     if (block.text) yield { type: 'text', value: block.text };
-                }
+                } else if (block.type === 'thinking') blocks.set(index, thinkingBlock(block));
+                else if (block.type === 'redacted_thinking') {
+                    blocks.set(index, { kind: 'redacted_thinking' });
+                    yield redactedEvent(block);
+                } else if (block.type === 'tool_use') blocks.set(index, { kind: 'tool_use', block, json: '' });
+                else throw new Error('Invalid block type');
             } else if (type === 'content_block_delta') {
                 const current = blocks.get(index);
                 if (!current || !isObject(raw.delta)) throw new Error('Invalid delta');
                 const delta = raw.delta;
-                if (current.block.type === 'text' && delta.type === 'text_delta' && typeof delta.text === 'string') yield { type: 'text', value: delta.text };
-                else if (current.block.type === 'tool_use' && delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') current.json += delta.partial_json;
+                if (current.kind === 'text' && delta.type === 'text_delta' && typeof delta.text === 'string') yield { type: 'text', value: delta.text };
+                else if (current.kind === 'thinking' && delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+                    current.thinking += delta.thinking;
+                    if (delta.thinking) yield { type: 'thinking', value: delta.thinking };
+                } else if (current.kind === 'thinking' && delta.type === 'signature_delta' && typeof delta.signature === 'string') current.signature += delta.signature;
+                else if (current.kind === 'tool_use' && delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') current.json += delta.partial_json;
                 else throw new Error('Invalid delta');
             } else if (type === 'content_block_stop') {
                 const current = blocks.get(index);
                 if (!current) throw new Error('Invalid block stop');
-                if (current.block.type === 'tool_use') yield toolEvent({ ...current.block, input: current.json ? JSON.parse(current.json) : current.block.input });
+                if (current.kind === 'tool_use') yield toolEvent({ ...current.block, input: current.json ? JSON.parse(current.json) : current.block.input });
+                else if (current.kind === 'thinking' && current.signature) yield completeThinking(current);
                 blocks.delete(index);
             } else throw new Error('Unknown event');
         }

@@ -44,9 +44,9 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
     test('malformed event JSON is stream_malformed', async () => {
         expect(await failureOf(read([...start(), 'data: {broken\n\n']))).toMatchObject({ reason: 'stream_malformed' });
     });
-    test('unsupported thinking block is stream_malformed', async () => {
+    test('unsupported content block is stream_malformed', async () => {
         const event = protocol === 'Messages'
-            ? frame('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: SENTINEL } })
+            ? frame('content_block_start', { index: 0, content_block: { type: 'server_tool_use', input: SENTINEL } })
             : frame('response.content_part.added', { item_id: 'msg_1', output_index: 0, content_index: 0, part: { type: 'thinking', thinking: SENTINEL } });
         expect(await failureOf(read([...start(), event]))).toMatchObject({ reason: 'stream_malformed' });
     });

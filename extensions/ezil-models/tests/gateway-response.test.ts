@@ -33,9 +33,9 @@ test('malformed tool JSON, missing block stop, and bad event order fail closed',
     await expect(collect(frames().filter((_, i) => i !== 7))).rejects.toThrow('interrupted');
     await expect(collect(frames().slice(1))).rejects.toThrow('interrupted');
 });
-test('terminal event without full usage and trailing errors cannot succeed', async () => {
+test('partial final usage is normalized and trailing errors cannot succeed', async () => {
     const input = frames(); input[8] = frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } });
-    await expect(collect(input)).rejects.toThrow('interrupted');
+    expect((await collect(input)).at(-2)).toEqual({ type: 'usage', usage: { inputTokens: 0, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
     await expect(collect([...frames(), frame('error', {})])).rejects.toThrow('interrupted');
 });
 test('JSON path emits thinking, text and tools in original order after validation', () => {
