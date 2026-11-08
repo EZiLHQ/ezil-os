@@ -221,11 +221,14 @@ test('gateway defaults and configurable reserves; forced choice and images stay 
     expect(config.models[1]).toMatchObject({ maxOutputTokens: 4096, stream: false, capabilities: { imageInput: false } });
 });
 
-test('manifest and image keep Qwen utility roles independent of Kimi selection', () => {
+test('manifest and image keep Qwen utility roles independent of Kimi selection; no configured chat default', () => {
     const manifest = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8'));
     expect(manifest.license).toBe('AGPL-3.0-only');
     expect(manifest.contributes.configurationDefaults['chat.utilityModel']).toBe('ezil/qwen.qwen3-coder-next');
     expect(manifest.contributes.configurationDefaults['chat.utilitySmallModel']).toBe('ezil/qwen.qwen3-coder-next');
+    // A configured chat.defaultModel wins over the user's remembered model in every new or reloaded chat (VS Code
+    // 1.141), so a picked model would not stick; the first model is the provider's declared default instead.
+    expect('chat.defaultModel' in manifest.contributes.configurationDefaults).toBe(false);
     expect(manifest.contributes.commands.some((c: { command: string }) => c.command === 'ezil-models.showCredits')).toBe(true);
 });
 

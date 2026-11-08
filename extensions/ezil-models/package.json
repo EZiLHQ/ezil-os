@@ -120,7 +120,6 @@
       }
     ],
     "configurationDefaults": {
-      "chat.defaultModel": "qwen.qwen3-coder-next",
       "chat.planAgent.defaultModel": "qwen.qwen3-coder-next",
       "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
       "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next"
