@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Deterministic EZiL gateway double. No model service or credentials required.
 import http from 'node:http';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -123,7 +123,9 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
     const record = { n, method: req.method, path: req.url, authorized: req.headers.authorization === `Bearer ${token}`, bytes: raw.length, body };
     captured.push(record);
     writeFileSync(join(captureDir, String(n).padStart(4, '0') + '.body.json'), raw);
-    writeFileSync(join(captureDir, 'captured.json'), JSON.stringify(captured, null, 2));
+    // Readers poll this file while requests arrive: replace it whole, never let them see it half-written.
+    writeFileSync(join(captureDir, 'captured.json.tmp'), JSON.stringify(captured, null, 2));
+    renameSync(join(captureDir, 'captured.json.tmp'), join(captureDir, 'captured.json'));
     const json = (status, value) => { res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'e2e-' + n }); res.end(JSON.stringify(value)); };
     const error = (status, code, message) => json(status, { error: { code, message, request_id: 'e2e-' + n } });
     if (!record.authorized) return error(401, 'os_proxy_unauthorized', 'test bearer token required');

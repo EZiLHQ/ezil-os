@@ -96,7 +96,8 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
         maxOutputTokens: model.provider.type === 'ezil-gateway' ? gatewayOutputTokens(model) : model.maxOutputTokens,
         capabilities: { toolCalling: model.capabilities.toolCalling, imageInput: model.provider.type === 'ezil-gateway' ? false : model.capabilities.imageInput },
     };
-    // Proposed `chatProvider` fields; harmless extras where the proposal is not enabled.
+    // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
+    // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
     info.isDefault = model.default;
     info.isUserSelectable = true;
     return info;

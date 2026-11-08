@@ -4,8 +4,9 @@
 // (touch events, not mouse clicks: a mouse click in a touch context never showed that a tap did nothing) open it, it
 // stays open, and a tapped Kimi K3 is the model the Gateway receives for the turn. The pick survives a reload and a
 // new chat (no configured chat.defaultModel), and a fresh profile starts on the declared default, Qwen3 Coder Next.
-// Android and iPhone user agents take different paths in the workbench (mousedown vs pointerdown); both are covered.
-// A desktop window keeps every label and works by mouse.
+// Chromium with an Android and with an iPhone user agent: the workbench takes its iOS path (pointerdown) only for the
+// latter, so the iPhone view shows that a tap opens a picker once; real Safari is not run here. A desktop window keeps
+// every label and works by mouse.
 import { createRequire } from 'node:module';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -100,12 +101,9 @@ try {
 
       // The mode picker sits in the same header: a tap opens it and it stays open.
       const modeLabel = page.locator('.part.auxiliarybar .chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
-      if (await modeLabel.count()) {
-        await press(modeLabel);
-        await page.waitForTimeout(1200);
-        check(`${at}: the mode picker opens and stays open`, (await page.locator(rowsSel).count()) > 0);
-        for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
-      }
+      if (await modeLabel.count()) { await press(modeLabel); await page.waitForTimeout(1200); }
+      check(`${at}: the mode picker opens and stays open`, (await modeLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);
+      for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
       await press(model);
       await page.waitForTimeout(1200);

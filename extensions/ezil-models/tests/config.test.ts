@@ -226,8 +226,8 @@ test('manifest and image keep Qwen utility roles independent of Kimi selection; 
     expect(manifest.license).toBe('AGPL-3.0-only');
     expect(manifest.contributes.configurationDefaults['chat.utilityModel']).toBe('ezil/qwen.qwen3-coder-next');
     expect(manifest.contributes.configurationDefaults['chat.utilitySmallModel']).toBe('ezil/qwen.qwen3-coder-next');
-    // A configured chat.defaultModel wins over the user's remembered model in every new or reloaded chat (VS Code
-    // 1.141), so a picked model would not stick; the first model is the provider's declared default instead.
+    // A configured chat.defaultModel wins over the user's remembered model in every new or reloaded empty chat (VS
+    // Code 1.141), so a picked model would not stick; the first model is the provider's declared default instead.
     expect('chat.defaultModel' in manifest.contributes.configurationDefaults).toBe(false);
     expect(manifest.contributes.commands.some((c: { command: string }) => c.command === 'ezil-models.showCredits')).toBe(true);
 });
