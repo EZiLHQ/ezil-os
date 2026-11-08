@@ -8,25 +8,22 @@ import { JSDOM } from 'jsdom';
 const M = await import('./app-failures.js');
 const server = await import('../../../../app/src/server/feedback/types.ts');
 const fixtures = JSON.parse(readFileSync(new URL('../../../../app/src/server/feedback/app-failures.fixtures.json', import.meta.url)));
-const serverSchema = server.appFailureRecordSchema ?? server.appFailureSchema;
+const serverSchema = server.appFailureRecordSchema;
+assert.ok(serverSchema, 'server record schema export');
 let checks = 0;
 async function check (name, run) { await run(); checks++; console.log(`PASS ${name}`); }
 
-await check(`golden fixtures: ${fixtures.valid.length} valid, ${fixtures.rejected.length} rejected (${serverSchema ? 'server parity' : 'server export absent; fixtures only'})`, () => {
+await check(`golden fixtures: ${fixtures.valid.length} valid, ${fixtures.rejected.length} rejected (server parity)`, () => {
     for (const { name, failure } of fixtures.valid) {
         const clean = M.validate_failure(failure);
         assert.deepEqual(clean, failure, name);
         assert.notEqual(clean, failure, 'clean copy');
-        if (serverSchema) {
-            // Some server exports describe the report entry rather than the producer record.
-            const input = serverSchema.shape?.app ? { ...failure, app: 'code', ageMs: 0 } : failure;
-            const { app, ageMs, ...parsed } = serverSchema.parse(input);
-            assert.deepEqual(clean, parsed, name);
-        }
+        const { app, ageMs, ...parsed } = serverSchema.parse({ ...failure, app: 'code', ageMs: 0 });
+        assert.deepEqual(clean, parsed, name);
     }
     for (const { name, failure } of fixtures.rejected) {
         assert.equal(M.validate_failure(failure), null, name);
-        if (serverSchema) assert.equal(serverSchema.safeParse({ ...failure, ...(serverSchema.shape?.app ? { app: 'code', ageMs: 0 } : {}) }).success, false, name);
+        assert.equal(serverSchema.safeParse({ ...failure, app: 'code', ageMs: 0 }).success, false, name);
     }
 });
 
@@ -53,23 +50,26 @@ await check('closed enums, category codes, required keys, optional types, UUIDs 
     for (const value of ['other', null, undefined]) assert.equal(M.validate_failure({ ...base, streamReason: value }), null);
     for (const value of [true, false]) assert.ok(M.validate_failure({ ...base, retryable: value }));
     for (const value of [1, 'true', null, undefined]) assert.equal(M.validate_failure({ ...base, retryable: value }), null);
-    for (const value of ['a', 'a'.repeat(64), 'vendor/model:1.0-test_key']) assert.ok(M.validate_failure({ ...base, modelKey: value }));
-    for (const value of ['', 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null]) assert.equal(M.validate_failure({ ...base, modelKey: value }), null);
+    for (const value of ['1', 'gpt-6', 'vendor/model:1.0-test_key', 'anthropic/claude-sonnet-4-5-20250929']) {
+        assert.ok(M.validate_failure({ ...base, modelKey: value }), value);
+        assert.ok(server.isSafeModelKey(value), `server agrees: ${value}`);
+    }
+    for (const value of ['', 'a', 'a'.repeat(64), 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null,
+        'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
+        assert.equal(M.validate_failure({ ...base, modelKey: value }), null, String(value));
+        assert.equal(server.isSafeModelKey(value), false, `server agrees: ${String(value)}`);
+    }
     for (const key of ['computerId', 'app', 'appSession', 'receivedAt', 'ageMs', 'message', 'stack', '__proto__']) {
         assert.equal(M.validate_failure({ ...base, [key]: 'forged' }), null);
     }
     for (const record of [null, [], 'x', Object.create(base), { ...base, [Symbol('extra')]: true }]) assert.equal(M.validate_failure(record), null);
-    const codes = {
-        interrupted: ['stream_interrupted'], network: ['network_offline', 'network_failed'],
-        timeout: ['request_timeout', 'first_token_timeout'], auth: ['auth_expired', 'auth_invalid', 'session_expired'],
-        credits: ['credits_exhausted'], entitlement: ['membership_required', 'model_not_entitled'], rate_limit: ['rate_limited'],
-        provider: ['provider_error', 'provider_overloaded', 'provider_refused', 'model_unavailable'],
-        user_cancel: ['user_cancelled'], app_startup: ['app_start_failed', 'app_start_timeout', 'chat_unavailable'],
-    };
+    // The server's own table: a drift on either side fails here.
+    const codes = server.APP_FAILURE_CODES;
     for (const category of Object.keys(codes)) {
-        assert.ok(M.validate_failure({ ...base, category, code: 'unexpected_error' }));
+        const inCategory = category === 'cancellation' ? { ...base, category, outcome: 'cancelled', cancellationSource: 'caller' } : { ...base, category };
+        assert.ok(M.validate_failure({ ...inCategory, code: 'unexpected_error' }));
         for (const [owner, values] of Object.entries(codes)) for (const code of values) {
-            assert.equal(!!M.validate_failure({ ...base, category, code }), category === owner, `${category}/${code}`);
+            assert.equal(!!M.validate_failure({ ...inCategory, code }), category === owner, `${category}/${code}`);
         }
     }
 });
@@ -206,7 +206,7 @@ try {
     await check('maximal records export <=10 and <=8 KiB, newest first', () => {
         const store = M.create_app_failure_store(); const f = frame(store);
         for (let n = 1; n <= 20; n++) f.send({ ...failure(n), clientRequestId: uuid(100), gatewayRequestId: uuid(101),
-            vscodeRequestId: uuid(102), retryOfClientRequestId: uuid(103), attempt: 64, durationMs: 3_600_000, httpStatus: 599, modelKey: 'a'.repeat(64) });
+            vscodeRequestId: uuid(102), retryOfClientRequestId: uuid(103), attempt: 64, durationMs: 3_600_000, httpStatus: 599, modelKey: ('p/' + 'model-12.'.repeat(8)).slice(0, 64) });
         const exported = store.app_failures_for(context).failures;
         assert.ok(exported.length > 0 && exported.length <= 10);
         assert.ok(Buffer.byteLength(JSON.stringify(exported)) <= 8192);
@@ -254,7 +254,7 @@ try {
     await check('dialog freezes current computer at open, consent snapshot and cancelled presentation', () => {
         setCurrentComputer({ id: A }); open(); setCurrentComputer({ id: B });
         assert.equal(payload().diagnostics, null); assert.equal(line().hidden, true);
-        a.send(fixtures.valid.find(f => f.failure.category === 'user_cancel').failure);
+        a.send(fixtures.valid.find(f => f.failure.category === 'cancellation').failure);
         const count = calls.length; change(true);
         assert.equal(payload().computerId, A);
         assert.deepEqual(payload().diagnostics.appFailures.map(f => f.eventId), [uuid(11), uuid(101)]);

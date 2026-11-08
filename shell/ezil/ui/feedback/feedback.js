@@ -560,7 +560,7 @@ export function open_feedback_dialog (_opts) {
         appStatus.hidden = !diagnostics.checked || (!appContextUnavailable && !diagnosticSnapshot?.appFailures);
         const appEvents = diagnosticSnapshot?.appFailures || [];
         appStatus.textContent = appContextUnavailable ? 'App failure context is unavailable for this report.'
-            : `${appEvents.length} app events (${appEvents.filter(event => event.category === 'user_cancel' || event.outcome === 'cancelled').length} cancelled).`;
+            : `${appEvents.length} app events (${appEvents.filter(event => event.outcome === 'cancelled').length} cancelled).`;
         const diagnosticBytes = new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null }, null, 2)).length;
         submit.disabled = capturing || ! description.value.trim() || text.length > 4000 || diagnosticBytes > 32 * 1024
             || (bug && Object.values(values).some(value => !value.trim()));

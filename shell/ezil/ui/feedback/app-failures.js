@@ -6,8 +6,19 @@ const CODES = {
     timeout: ['request_timeout', 'first_token_timeout'], auth: ['auth_expired', 'auth_invalid', 'session_expired'],
     credits: ['credits_exhausted'], entitlement: ['membership_required', 'model_not_entitled'],
     rate_limit: ['rate_limited'], provider: ['provider_error', 'provider_overloaded', 'provider_refused', 'model_unavailable'],
-    user_cancel: ['user_cancelled'], app_startup: ['app_start_failed', 'app_start_timeout', 'chat_unavailable'],
+    cancellation: ['request_cancelled'], app_startup: ['app_start_failed', 'app_start_timeout', 'chat_unavailable'],
 };
+const PATH_ROOTS = new Set(['etc', 'usr', 'home', 'root', 'var', 'tmp', 'opt', 'bin', 'sbin', 'lib', 'proc', 'sys', 'dev', 'mnt', 'srv', 'users', 'workspace', 'workspaces', 'private']);
+/** Mirror of the server's `isSafeModelKey` (contract §2): catalog-shaped, never a credential, path or URL. */
+function safe_model_key (value) {
+    if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,63}$/.test(value) || value !== value.trim()) return false;
+    if (value.includes('://') || value.split('/').length > 2) return false;
+    if (/^(?:sk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/.test(value) || /bearer/.test(value)) return false;
+    if (/[a-z0-9]{20,}/.test(value)) return false;
+    const segments = value.split('/');
+    if (segments.length === 2 && PATH_ROOTS.has(segments[0])) return false;
+    return /[0-9-]/.test(segments.at(-1));
+}
 const oneOf = values => value => values.includes(value);
 const uuid = value => typeof value === 'string' && UUID.test(value);
 const integer = (min, max) => value => Number.isInteger(value) && value >= min && value <= max;
@@ -17,10 +28,10 @@ const FIELDS = {
     stage: oneOf(['startup', 'admission', 'request', 'headers', 'stream']),
     outcome: oneOf(['failed', 'retrying', 'recovered', 'cancelled']),
     streamReason: oneOf(['eof', 'malformed_event', 'missing_terminal']),
+    cancellationSource: oneOf(['caller', 'user_stop', 'unknown']),
     clientRequestId: uuid, gatewayRequestId: uuid, vscodeRequestId: uuid, retryOfClientRequestId: uuid,
     attempt: integer(1, 64), retryable: value => typeof value === 'boolean', durationMs: integer(0, 3_600_000),
-    // The golden URL fixture and §2's "Never URLs" further restrict the regex.
-    modelKey: value => typeof value === 'string' && /^[a-z0-9][a-z0-9._:/-]{0,63}$/.test(value) && !value.includes('://'),
+    modelKey: safe_model_key,
     httpStatus: integer(100, 599),
 };
 const REQUIRED = ['eventId', 'source', 'operation', 'category', 'code', 'stage', 'outcome'];
@@ -36,6 +47,9 @@ export function validate_failure (record) {
     }
     if (clean.code !== 'unexpected_error' && !CODES[clean.category].includes(clean.code)) return null;
     if (Object.hasOwn(clean, 'streamReason') && clean.stage !== 'stream') return null;
+    // Neutral cancellation: its source is required, and `cancelled` belongs to it alone.
+    const cancellation = clean.category === 'cancellation';
+    if (cancellation !== Object.hasOwn(clean, 'cancellationSource') || cancellation !== (clean.outcome === 'cancelled')) return null;
     return clean;
 }
 
