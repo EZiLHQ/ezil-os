@@ -62,14 +62,16 @@ jobs:
             deploy/aws/os-staging/preview/activation.json "$RUNNER_TEMP/files.txt" "$GITHUB_REPOSITORY" | tee -a "$GITHUB_OUTPUT"
 
   # One deploy lane per PR: a new head cancels that PR's older build/deploy/browser jobs.
-  # Teardown has its own never-cancelled group. Different PRs serialize on preview_host.py's
-  # host lock; a repository-wide group would silently drop all but the newest pending run.
+  # Teardown has its own never-cancelled group. A run whose plan is not this job's action gets
+  # a per-run group, so a skipped job (e.g. from a bot's label event) can never cancel or
+  # displace a real one. Different PRs serialize on preview_host.py's host lock; a
+  # repository-wide group would silently drop all but the newest pending run.
   build:
     name: Build app image
     needs: plan
     if: needs.plan.outputs.action == 'deploy'
     concurrency:
-      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}${{ needs.plan.outputs.action != 'deploy' && format('-skip-{0}', github.run_id) || '' }}
       cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -106,7 +108,7 @@ jobs:
     needs: [plan, build]
     if: ${{ !cancelled() && needs.plan.outputs.action == 'deploy' && needs.build.result == 'success' }}
     concurrency:
-      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}${{ needs.plan.outputs.action != 'deploy' && format('-skip-{0}', github.run_id) || '' }}
       cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -225,7 +227,7 @@ jobs:
     needs: [plan, deploy]
     if: ${{ !cancelled() && needs.deploy.result == 'success' }}
     concurrency:
-      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}${{ needs.plan.outputs.action != 'deploy' && format('-skip-{0}', github.run_id) || '' }}
       cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -269,7 +271,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.action == 'teardown'
     concurrency:
-      group: os-pr-preview-teardown-${{ github.event.pull_request.number }}
+      group: os-pr-preview-teardown-${{ github.event.pull_request.number }}${{ needs.plan.outputs.action != 'teardown' && format('-skip-{0}', github.run_id) || '' }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10

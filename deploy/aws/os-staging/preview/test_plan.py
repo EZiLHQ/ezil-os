@@ -119,9 +119,12 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('listArtifactsForRepo', self.text)  # no cross-run artifact reuse
         self.assertNotIn('concurrency', self.flow)
         groups = {name: job.get('concurrency') for name, job in self.jobs.items()}
-        lane = {'group': 'os-pr-preview-deploy-${{ github.event.pull_request.number }}', 'cancel-in-progress': True}
+        skip = "${{{{ needs.plan.outputs.action != '{}' && format('-skip-{{0}}', github.run_id) || '' }}}}"
+        lane = {'group': 'os-pr-preview-deploy-${{ github.event.pull_request.number }}' + skip.format('deploy'),
+                'cancel-in-progress': True}
         self.assertEqual(groups, {'plan': None, 'build': lane, 'deploy': lane, 'browser': lane,
-                                  'teardown': {'group': 'os-pr-preview-teardown-${{ github.event.pull_request.number }}',
+                                  'teardown': {'group': 'os-pr-preview-teardown-${{ github.event.pull_request.number }}'
+                                                        + skip.format('teardown'),
                                                'cancel-in-progress': False}})
 
     def test_every_identity_or_secret_job_waits_in_the_reviewed_environment(self):
