@@ -3,7 +3,7 @@
 # Chat bundled with code-server into "EZiL Chat": NO GitHub service is called
 # from the chat stack in anonymous mode, and the user-visible GitHub/Copilot
 # branding on the EZiL boot + Agent-prompt path is replaced. Strings and status
-# visibility change; command ids, setting keys, registrations and licenses stay intact.
+# visibility change; upstream command ids, setting keys and licenses stay intact.
 #
 #   patch-copilot-chat.sh [<vscode-root>]     default /usr/lib/code-server/lib/vscode
 #   patch-copilot-chat.sh --verify [<root>]   only run the post-patch gates
@@ -80,6 +80,10 @@ rows.sort((a,b)=>a[1]<b[1]?-1:a[1]>b[1]?1:0);const h=crypto.createHash("sha256")
 node -e 'const fs=require("fs");const root=process.argv[1];const j=JSON.parse(fs.readFileSync(root+"/extensions/copilot/package.json","utf8"));if(j.publisher!=="GitHub"||j.name!=="copilot-chat"||j.version!=="0.69.0"||!j.contributes?.languageModelChatProviders)throw new Error("expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders");if(!JSON.parse(fs.readFileSync(root+"/product.json","utf8")).defaultChatAgent)throw new Error("defaultChatAgent missing");' "$ROOT"
 
 # ── anchors / replacements (single source of truth for patch + gate) ────────
+# CommandsRegistry (`qe`) has just been initialized; the following `YLi` declaration makes the
+# anchor disappear after insertion. One renderer command, no registration in the extension host.
+A_APP_FAILURE='qe.registerCommand("noop",()=>{});var YLi='
+R_APP_FAILURE='qe.registerCommand("noop",()=>{});qe.registerCommand("_ezil.appFailure",(accessor,record)=>{try{window.dispatchEvent(new CustomEvent("ezil-app-failure",{detail:JSON.stringify(record)}))}catch{}});var YLi='
 # Part 1 — no GitHub calls (extension.js)
 A_TOKEN='this._logService.info("Allowing anonymous access with devDeviceId");let a=await this.authFromDevDeviceId(yGe.env.devDeviceId);'
 R_TOKEN='this._logService.info("EZiL Chat: anonymous mode, GitHub token minting (copilot_internal/v2/nltoken) disabled at build time");let a={kind:"failure",reason:"GitHubLoginFailed"};'
@@ -302,8 +306,12 @@ P_STATIC_BASE='let I=Be.join(l,this._productPath,IE),'
 P_STATIC_PAGE='WORKBENCH_WEB_BASE_URL:I,'
 P_STATIC_WEBVIEW='webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/pre"'
 
+# Re-running on this patched bundle only verifies it, including the content-derived static id.
+# A partial or altered patch still fails the gates; it is never silently repaired.
+if [ "$VERIFY_ONLY" = 0 ] && [ "$(count "$WB" "$R_APP_FAILURE")" = 1 ]; then VERIFY_ONLY=1; fi
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
+  patch app-failure "$WB" 1 "$A_APP_FAILURE" "$R_APP_FAILURE"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
@@ -372,6 +380,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
 fi
 
 # ── gates: anchors gone, replacements present, files still parse ────────────
+gate app-failure "$WB" 0 "$A_APP_FAILURE"; gate app-failure "$WB" 1 "$R_APP_FAILURE"
+gate app-failure-command "$WB" 1 'qe.registerCommand("_ezil.appFailure",'
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
