@@ -7,6 +7,9 @@ import { pathToFileURL } from 'node:url';
 
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
+// Opt-in (flash: true, env EZIL_MOCK_FLASH=1): a v1 catalog that lists Gemini 3.8 Flash for this caller and names it
+// `default_model`, as the Gateway does when the route is available; like the Gateway, it refuses sampling for Flash.
+export const FLASH = 'gemini-3.8-flash';
 export const SLOW_DONE = ' EZIL_SLOW_DONE';
 const NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -19,11 +22,12 @@ const hasCache = value => value && typeof value === 'object' &&
 const usage = { input_tokens: 1200, output_tokens: 32, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
 
 // Return an actionable reason instead of accepting payloads Bedrock would reject.
-export function validateBody(body, bytes = Buffer.byteLength(JSON.stringify(body) ?? '')) {
+export function validateBody(body, bytes = Buffer.byteLength(JSON.stringify(body) ?? ''), models = [QWEN, KIMI]) {
   if (bytes + 1056 > 131072) return { status: 413, code: 'body_too_large', message: 'body bytes + 1056 exceeds 131072' };
   const reject = message => ({ status: 400, code: 'unsupported_bedrock_converse_request', message });
   if (!only(body, ['model', 'messages', 'system', 'max_tokens', 'stream', 'temperature', 'top_p', 'stop_sequences', 'tools', 'tool_choice'])) return reject('unsupported request field');
-  if (![QWEN, KIMI].includes(body.model)) return reject('unsupported model');
+  if (!models.includes(body.model)) return reject('unsupported model');
+  if (body.model === FLASH && ('temperature' in body || 'top_p' in body)) return reject('temperature/top_p are refused for ' + FLASH);
   if (hasCache(body)) return reject('cache_control is unsupported');
   if (!Number.isInteger(body.max_tokens) || body.max_tokens < 16 || body.max_tokens > 16384) return reject('max_tokens must be 16..16384');
   if (body.stream !== undefined && typeof body.stream !== 'boolean') return reject('stream must be boolean');
@@ -108,7 +112,7 @@ function scriptedContent(body, folder) {
 }
 
 // slow: a marked answer streams `parts` numbered parts `ms` apart (the image suite leaves a chat mid-answer).
-export function createMock({ token, folder, captureDir, slow: { parts = 20, ms = 1000 } = {} }) {
+export function createMock({ token, folder, captureDir, slow: { parts = 20, ms = 1000 } = {}, flash = false }) {
   if (!nonempty(token)) throw new Error('a test token is required');
   const slowParts = () => Array.from({ length: parts }, (_, i) => ` part ${i + 1}.`);
   mkdirSync(captureDir, { recursive: true });
@@ -129,9 +133,15 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
     const json = (status, value) => { res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'e2e-' + n }); res.end(JSON.stringify(value)); };
     const error = (status, code, message) => json(status, { error: { code, message, request_id: 'e2e-' + n } });
     if (!record.authorized) return error(401, 'os_proxy_unauthorized', 'test bearer token required');
-    if (req.method === 'GET' && req.url === '/ai/v1/models') return json(200, { killswitch: false, pause: null, data: [QWEN, KIMI].map(id => ({ id, enabled: true, max_input_tokens: 131072, max_output_tokens: id === KIMI ? 4096 : 8192 })) });
+    if (req.method === 'GET' && req.url === '/ai/v1/models') {
+      if (!flash) return json(200, { killswitch: false, pause: null, data: [QWEN, KIMI].map(id => ({ id, enabled: true, max_input_tokens: 131072, max_output_tokens: id === KIMI ? 4096 : 8192 })) });
+      const row = (id, name, streaming) => ({ id, object: 'model', name, enabled: true, max_input_tokens: 131072, max_output_tokens: id === KIMI ? 4096 : 8192,
+        protocols: ['anthropic-messages'], availability: { state: 'available', reasons: [] }, capabilities: { tool_calling: true, image_input: false, streaming } });
+      return json(200, { object: 'list', contract: 'ezil.gateway.models.v1', catalog_ttl_seconds: 60, killswitch: false, pause: null, default_model: FLASH,
+        data: [row(QWEN, 'Qwen3 Coder Next', true), row(KIMI, 'Kimi K3', false), row(FLASH, 'Gemini 3.8 Flash', true)] });
+    }
     if (req.method !== 'POST' || req.url !== '/ai/v1/messages') return error(404, 'not_found', 'unsupported route');
-    const invalid = validateBody(body, raw.length);
+    const invalid = validateBody(body, raw.length, flash ? [QWEN, KIMI, FLASH] : [QWEN, KIMI]);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
     let scripted;
     try { scripted = scriptedContent(body, folder); } catch (err) { return error(500, 'e2e_missing_tool', err.message); }
@@ -165,6 +175,6 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const port = Number(process.argv[2] ?? 4142);
-  const server = createMock({ token: process.env.EZIL_E2E_TEST_TOKEN ?? 'lanec-e2e-only', folder: process.argv[3] ?? '/home/neko/project', captureDir: process.argv[4] ?? '/tmp/copilot-ezil-mock' });
+  const server = createMock({ token: process.env.EZIL_E2E_TEST_TOKEN ?? 'lanec-e2e-only', folder: process.argv[3] ?? '/home/neko/project', captureDir: process.argv[4] ?? '/tmp/copilot-ezil-mock', flash: process.env.EZIL_MOCK_FLASH === '1' });
   server.listen(port, '127.0.0.1', () => console.log('EZiL messages mock listening on loopback port ' + port));
 }

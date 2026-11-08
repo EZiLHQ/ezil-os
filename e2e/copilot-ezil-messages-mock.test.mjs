@@ -4,7 +4,7 @@ import { Readable } from 'node:stream';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMock, validateBody, QWEN, KIMI, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
+import { createMock, validateBody, QWEN, KIMI, FLASH, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
 
 const base = () => ({ model: QWEN, max_tokens: 16, stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
 const tool = name => ({ name, input_schema: { type: 'object', properties: {} } });
@@ -133,6 +133,29 @@ test('a slow answer streams its parts over time, stops for a closed client, and 
     assert.deepEqual(whole.content, [{ type: 'text', text: 'EZiL Chat: slow reply. part 1. part 2. part 3.' + SLOW_DONE }]);
     // A plain prompt is not slowed.
     assert.equal((await call(base())).filter(w => w.chunk.includes('text_delta')).length, 1);
+  } finally {
+    server.close();
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test('Flash catalog mode: v1 catalog names Flash default_model; Flash requests refuse sampling; default mode unchanged', async () => {
+  assert.equal(validateBody({ ...base(), model: FLASH })?.message, 'unsupported model', 'default mode does not accept Flash');
+  assert.equal(validateBody({ ...base(), model: FLASH }, undefined, [QWEN, KIMI, FLASH]), null);
+  for (const key of ['temperature', 'top_p']) assert.match(validateBody({ ...base(), model: FLASH, [key]: 0.5 }, undefined, [QWEN, KIMI, FLASH]).message, /refused for gemini-3.8-flash/);
+  assert.equal(validateBody({ ...base(), temperature: 0.5 }, undefined, [QWEN, KIMI, FLASH]), null, 'Qwen keeps sampling');
+  const captureDir = mkdtempSync(join(tmpdir(), 'ezil-messages-flash-'));
+  const server = createMock({ token: 'test-only', folder: '/project', captureDir, flash: true });
+  try {
+    let status, output = '';
+    const request = Readable.from([]);
+    Object.assign(request, { method: 'GET', url: '/ai/v1/models', headers: { authorization: 'Bearer test-only' } });
+    await server.listeners('request')[0](request, { writeHead(code) { status = code; }, write(c) { output += c; }, end(c = '') { output += c; } });
+    const catalog = JSON.parse(output);
+    assert.equal(status, 200);
+    assert.equal(catalog.contract, 'ezil.gateway.models.v1');
+    assert.equal(catalog.default_model, FLASH);
+    assert.deepEqual(catalog.data.map(row => [row.id, row.availability.state, row.capabilities.tool_calling]), [[QWEN, 'available', true], [KIMI, 'available', true], [FLASH, 'available', true]]);
   } finally {
     server.close();
     rmSync(captureDir, { recursive: true, force: true });
