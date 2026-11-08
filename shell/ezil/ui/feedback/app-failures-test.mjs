@@ -50,11 +50,12 @@ await check('closed enums, category codes, required keys, optional types, UUIDs 
     for (const value of ['other', null, undefined]) assert.equal(M.validate_failure({ ...base, streamReason: value }), null);
     for (const value of [true, false]) assert.ok(M.validate_failure({ ...base, retryable: value }));
     for (const value of [1, 'true', null, undefined]) assert.equal(M.validate_failure({ ...base, retryable: value }), null);
-    for (const value of ['1', 'gpt-6', 'vendor/model:1.0-test_key', 'anthropic/claude-sonnet-4-5-20250929']) {
+    assert.deepEqual([...M.MODEL_KEY_NAMESPACES], [...server.MODEL_KEY_NAMESPACES], 'namespace allowlist parity');
+    for (const value of ['anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0', 'qwen.qwen3-coder-next', 'openai/gpt-6', 'google/gemini-2.5-flash']) {
         assert.ok(M.validate_failure({ ...base, modelKey: value }), value);
         assert.ok(server.isSafeModelKey(value), `server agrees: ${value}`);
     }
-    for (const value of ['', 'a', 'a'.repeat(64), 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null,
+    for (const value of ['gpt-6', '1', 'catalog:model_1.2/variant-3', 'project/file-1', 'sb_secret_abcd-efgh-ijkl-mnop', 'openai/sb_secret_abcd-efgh', 'anthropic/claude-api-key-1', 'anthropic/sk-proj-1', 'ezil/session-1', '', 'a', 'a'.repeat(64), 'a'.repeat(65), 'A', '/a', 'a b', 'https://host', 'a\n', null,
         'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
         assert.equal(M.validate_failure({ ...base, modelKey: value }), null, String(value));
         assert.equal(server.isSafeModelKey(value), false, `server agrees: ${String(value)}`);
@@ -207,7 +208,7 @@ try {
     await check('maximal records export <=10 and <=8 KiB, newest first', () => {
         const store = M.create_app_failure_store(); const f = frame(store);
         for (let n = 1; n <= 20; n++) f.send({ ...failure(n), clientRequestId: uuid(100), gatewayRequestId: uuid(101),
-            vscodeRequestId: uuid(102), retryOfClientRequestId: uuid(103), attempt: 64, durationMs: 3_600_000, httpStatus: 599, modelKey: ('p/' + 'model-12.'.repeat(8)).slice(0, 64) });
+            vscodeRequestId: uuid(102), retryOfClientRequestId: uuid(103), attempt: 64, durationMs: 3_600_000, httpStatus: 599, modelKey: 'anthropic/' + 'model-12.'.repeat(6).slice(0, 53) });
         const exported = store.app_failures_for(context).failures;
         assert.ok(exported.length > 0 && exported.length <= 10);
         assert.ok(Buffer.byteLength(JSON.stringify(exported)) <= 8192);
@@ -285,6 +286,21 @@ try {
         assert.equal(payload().computerId, A); assert.equal(payload().diagnostics.appFailures[0].eventId, uuid(102));
         assert.doesNotMatch(body(), /session-a|session-b|nonce|origin|receivedAt/);
         assert.equal(calls.length, count); close();
+    });
+    await check('closed Code window: retained failures still reach the consented report, in both scopes', () => {
+        const closed = frame(M, { ...options, appSession: 'session-closed' });
+        closed.send(failure(301)); closed.unregister(); closed.send(failure(302));
+        // Global entry: every app session of the frozen computer, never another computer's.
+        setCurrentComputer({ id: A }); open(); change(true);
+        const global = payload().diagnostics.appFailures.map(f => f.eventId);
+        assert.ok(global.includes(uuid(301)) && global.includes(uuid(102)), 'global aggregates sessions of A');
+        assert.ok(!global.includes(uuid(302)) && !global.includes(uuid(201)), 'nothing after close, nothing from B');
+        assert.equal(line().hidden, false); assert.doesNotMatch(line().textContent, /unavailable/); close();
+        // App entry: that one session only, even though its window is gone.
+        open({ computerId: A, appSession: 'session-closed' }); change(true);
+        assert.deepEqual(payload().diagnostics.appFailures.map(f => f.eventId), [uuid(301)]); close();
+        open({ computerId: A, appSession: 'session-a' }); change(true);
+        assert.ok(!payload().diagnostics.appFailures.some(f => f.eventId === uuid(301)), 'sessions stay isolated'); close();
     });
     await check('outbox replay after computer switch keeps exact frozen app entries and ages', async () => {
         setCurrentComputer({ id: A }); open(); change(true); const frozen = body();

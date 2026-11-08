@@ -8,16 +8,25 @@ const CODES = {
     rate_limit: ['rate_limited'], provider: ['provider_error', 'provider_overloaded', 'provider_refused', 'model_unavailable'],
     cancellation: ['request_cancelled'], app_startup: ['app_start_failed', 'app_start_timeout', 'chat_unavailable'],
 };
-const PATH_ROOTS = new Set(['etc', 'usr', 'home', 'root', 'var', 'tmp', 'opt', 'bin', 'sbin', 'lib', 'proc', 'sys', 'dev', 'mnt', 'srv', 'users', 'workspace', 'workspaces', 'private']);
-/** Mirror of the server's `isSafeModelKey` (contract §2): catalog-shaped, never a credential, path or URL. */
-function safe_model_key (value) {
+/** Mirror of the server's `MODEL_KEY_NAMESPACES`; the shell test asserts equality. */
+export const MODEL_KEY_NAMESPACES = Object.freeze([
+    'anthropic', 'openai', 'google', 'gemini', 'vertex', 'bedrock', 'aws-bedrock', 'amazon', 'azure',
+    'qwen', 'moonshot', 'moonshotai', 'kimi', 'zai', 'z-ai', 'glm', 'deepseek', 'mistral', 'meta', 'llama',
+    'xai', 'cohere', 'minimax', 'groq', 'cerebras', 'openrouter', 'ezil',
+]);
+const NAMESPACES = new Set(MODEL_KEY_NAMESPACES);
+const TOKEN_WORD = /secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/;
+const TOKEN_PREFIX = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/;
+/** Mirror of the server's `isSafeModelKey` (contract §2): namespaced, never a credential, path or URL. */
+export function safe_model_key (value) {
     if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,63}$/.test(value) || value !== value.trim()) return false;
     if (value.includes('://') || value.split('/').length > 2) return false;
-    if (/^(?:sk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/.test(value) || /bearer/.test(value)) return false;
-    if (/[a-z0-9]{20,}/.test(value)) return false;
-    const segments = value.split('/');
-    if (segments.length === 2 && PATH_ROOTS.has(segments[0])) return false;
-    return /[0-9-]/.test(segments.at(-1));
+    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(value);
+    if (!match || !NAMESPACES.has(match[1])) return false;
+    const segments = match[2].split(/[/.:]/);
+    if (segments.some(segment => !segment || TOKEN_PREFIX.test(segment) || TOKEN_WORD.test(segment)
+        || /[a-z0-9]{20,}/.test(segment))) return false;
+    return /[0-9-]/.test(segments[0]);
 }
 const oneOf = values => value => values.includes(value);
 const uuid = value => typeof value === 'string' && UUID.test(value);

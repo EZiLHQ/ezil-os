@@ -66,11 +66,14 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
 | `attempt` | no | integer 1–64 |
 | `retryable` | no | boolean |
 | `durationMs` | no | integer 0–3 600 000 |
-| `modelKey` | no | catalog-shaped key `model` or `provider/model` matching `^[a-z0-9][a-z0-9._:/-]{0,63}$`; at most one `/`; the model segment contains a digit or `-`; never a URL, a credential shape (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `xox?-`, `bearer`, any 20+ character alphanumeric run, anything the description redactor masks) or a filesystem-root first segment (`etc`, `usr`, `home`, `root`, `var`, `tmp`, …). Dated keys such as `anthropic/claude-sonnet-4-5-20250929` are valid |
+| `modelKey` | no | namespaced catalog key `ns/model` or `ns.model`, `^[a-z0-9][a-z0-9._:/-]{0,63}$`, at most one `/`. `ns` is in the closed `MODEL_KEY_NAMESPACES` list (`app/src/server/feedback/types.ts`, mirrored in the shell). Each model segment (split on `/` `.` `:`) must not start with a credential prefix (`sk_`/`sk-`, `sb_`, `pk_`, `rk_`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `xox?-`), contain a credential word (`secret`, `token`, `passw`, `bearer`, `api key`, `private`, `credential`, `session`, `cookie`) or a 20+ character alphanumeric run; the model name carries a digit or `-`. Dated keys such as `anthropic/claude-sonnet-4-5-20250929` and `qwen.qwen3-coder-next` are valid |
 | `httpStatus` | no | integer 100–599 |
 
 Rules:
 - A code outside §3 is sent as `unexpected_error` with its ids, never as text.
+- The producer validates `modelKey` with the shared fixtures' rule before
+  emitting and OMITS it when unsafe; the consumer drops a whole record whose
+  `modelKey` is invalid, so an unsafe optional key must never cost the ids.
 - The three request ids are independent values. None is derived from,
   parsed from UI text, or assumed equal to another; a user-supplied
   screenshot reference stays in the user's description, not in these ids.

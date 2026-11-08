@@ -237,6 +237,19 @@
         "outcome": "failed",
         "modelKey": "anthropic.claude-sonnet-5-5-v1:0"
       }
+    },
+    {
+      "name": "bedrock-style dotted namespace",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000110",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "qwen.qwen3-coder-next"
+      }
     }
   ],
   "rejected": [
@@ -517,6 +530,58 @@
         "stage": "admission",
         "outcome": "failed",
         "modelKey": "etc/ssh-host-key"
+      }
+    },
+    {
+      "name": "un-namespaced path-like model key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000200",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "project/file-1"
+      }
+    },
+    {
+      "name": "model key shaped like a supabase secret",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000201",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "sb_secret_abcd-efgh-ijkl-mnop"
+      }
+    },
+    {
+      "name": "provider-prefixed token model key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000202",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "openai/sb_secret_abcd-efgh"
+      }
+    },
+    {
+      "name": "model key with a credential word",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000203",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic/claude-api-key-1"
       }
     }
   ]

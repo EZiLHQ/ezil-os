@@ -149,13 +149,13 @@ describe('app failure wire strictness and bounds', () => {
         }
     });
 
-    it('accepts only catalog-shaped model keys: no URL, credential, path or random run', () => {
-        for (const modelKey of ['1', 'gpt-6', 'catalog:model_1.2/variant-3', 'anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0']) {
+    it('accepts only namespaced catalog model keys: no URL, credential, path, token segment or random run', () => {
+        for (const modelKey of ['anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0', 'qwen.qwen3-coder-next', 'openai/gpt-6', 'google/gemini-2.5-flash']) {
             expect(appFailureRecordSchema.safeParse({ ...base, modelKey }).success).toBe(true);
         }
         for (const modelKey of ['', 'a'.repeat(65), 'Model', '/path', '.model', 'two words', 'model?key', 'model\n', 'model\r',
             'https://gateway.example.test/v1', 'http://host/model', 'wss://host/model', null,
-            'a', 'a'.repeat(64), 'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'xoxb-1-2', 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
+            'gpt-6', '1', 'catalog:model_1.2/variant-3', 'project/file-1', 'sb_secret_abcd-efgh-ijkl-mnop', 'openai/sb_secret_abcd-efgh', 'anthropic/claude-api-key-1', 'anthropic/sk-proj-1', 'ezil/session-1', 'a', 'a'.repeat(64), 'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'xoxb-1-2', 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
             const invalid = { ...base, modelKey };
             expect(appFailureRecordSchema.safeParse(invalid).success).toBe(false);
             expect(sanitizeDiagnostics(rawDiagnostics([invalid, base]))?.appFailures).toEqual([base]);

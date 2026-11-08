@@ -54,24 +54,37 @@ export const APP_FAILURE_REQUEST_ID_FIELDS = [
 export const APP_FAILURE_LIMITS = Object.freeze({ recordsMax: 10, ageMsMax: 1_800_000 });
 
 const MODEL_KEY = /^[a-z0-9][a-z0-9._:/-]{0,63}$/;
-/** First segments that name a filesystem location, never a model provider. */
-const PATH_ROOTS = new Set(['etc', 'usr', 'home', 'root', 'var', 'tmp', 'opt', 'bin', 'sbin', 'lib', 'proc', 'sys', 'dev', 'mnt', 'srv', 'users', 'workspace', 'workspaces', 'private']);
+/**
+ * Provider namespaces a catalog model key may start with (`ns/model` or
+ * `ns.model`). There is no static model catalog in this repo, so the
+ * namespace is the allowlist; a producer omits any other key.
+ */
+export const MODEL_KEY_NAMESPACES = Object.freeze([
+    'anthropic', 'openai', 'google', 'gemini', 'vertex', 'bedrock', 'aws-bedrock', 'amazon', 'azure',
+    'qwen', 'moonshot', 'moonshotai', 'kimi', 'zai', 'z-ai', 'glm', 'deepseek', 'mistral', 'meta', 'llama',
+    'xai', 'cohere', 'minimax', 'groq', 'cerebras', 'openrouter', 'ezil',
+]);
+const NAMESPACES = new Set<string>(MODEL_KEY_NAMESPACES);
+const TOKEN_WORD = /secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/;
+const TOKEN_PREFIX = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/;
 
 /**
- * A catalog-shaped model key (`model` or `provider/model`, dated versions
- * allowed) and nothing that could be a credential, path or URL. There is no
- * static catalog in this repo, so the shape is the allowlist. Mirrored in
- * shell/ezil/ui/feedback/app-failures.js; contract §2.
+ * A catalog-shaped model key and nothing that could be a credential, path or
+ * URL: an allowlisted provider namespace, then model segments (split on `/`,
+ * `.`, `:`) none of which looks like a token. Dated keys stay valid.
+ * Mirrored in shell/ezil/ui/feedback/app-failures.js; contract §2.
  */
 export function isSafeModelKey(value: unknown): value is string {
     // `$` also matches before a final newline, hence the explicit exact test.
     if (typeof value !== 'string' || !MODEL_KEY.test(value) || value !== value.trim()) return false;
     if (value.includes('://') || value.split('/').length > 2) return false;
-    if (/^(?:sk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/.test(value) || /bearer/.test(value)) return false;
-    if (/[a-z0-9]{20,}/.test(value)) return false;
-    const segments = value.split('/');
-    if (segments.length === 2 && PATH_ROOTS.has(segments[0]!)) return false;
-    return /[0-9-]/.test(segments.at(-1)!);
+    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(value);
+    if (!match || !NAMESPACES.has(match[1]!)) return false;
+    const segments = match[2]!.split(/[/.:]/);
+    if (segments.some(segment => !segment || TOKEN_PREFIX.test(segment) || TOKEN_WORD.test(segment)
+        || /[a-z0-9]{20,}/.test(segment))) return false;
+    // The model name itself carries a version or a family separator.
+    return /[0-9-]/.test(segments[0]!);
 }
 
 const appFailureId = z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
