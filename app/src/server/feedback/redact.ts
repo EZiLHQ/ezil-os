@@ -2,6 +2,7 @@ import { isCorrelationId, isFailureReason } from './failure-shapes';
 import { sanitizeErrorMessage } from '@/server/telemetry/sanitize';
 import { diagnosticsSchema, FEEDBACK_LIMITS, type FeedbackDiagnostics } from './types';
 
+const IDENTIFIER_LIKE = /[0-9a-f]{8,}|\d{6,}/i;
 const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 
 /** Preserve useful prose (including email addresses); only credential-shaped
@@ -79,9 +80,14 @@ export function sanitizeDiagnostics(
         if (parsed.success) out.session = parsed.data;
     }
     if (input.tracePhases) {
+        // A phase code skips `diagnosticString`, so a credential- or
+        // identifier-shaped code (an `sk-…` key, a letter-leading UUID or a hex
+        // run all fit the shape regex) is dropped, never repaired.
         out.tracePhases = input.tracePhases.slice(-24).flatMap(phase => {
             const parsed = diagnosticsSchema.shape.tracePhases.unwrap().element.safeParse(phase);
-            return parsed.success ? [parsed.data] : [];
+            if (!parsed.success) return [];
+            const { code } = parsed.data;
+            return redactDescription(code).count > 0 || IDENTIFIER_LIKE.test(code) ? [] : [parsed.data];
         });
     }
     if (input.shellVersion !== undefined) out.shellVersion = diagnosticString(input.shellVersion, 64);

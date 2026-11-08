@@ -180,4 +180,26 @@ describe('report session bundle', () => {
         ]) expect(diagnosticsSchema.safeParse(bad).success).toBe(false);
         expect(sanitizeDiagnostics(null)).toBeNull();
     });
+
+    it('drops credential- and identifier-shaped phase codes that fit the shape regex', () => {
+        const tracePhases = [
+            { code: 'mint_ok', tMs: 1 },
+            { code: 'sk-' + 'a'.repeat(30), tMs: 1 },
+            { code: 'sk-' + 'z'.repeat(30), tMs: 1 },
+            { code: 'ghp_' + 'z'.repeat(24), tMs: 1 },
+            { code: 'display_live', tMs: 1 },
+            { code: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d', tMs: 2 },
+            { code: 'step:0123456789abcdef0123456789abcdef', tMs: 3 },
+            { code: 'user:1234567', tMs: 4 },
+            { code: 'confirm_ok', tMs: 5 },
+        ];
+        expect(diagnosticsSchema.safeParse({ tracePhases }).success).toBe(true);
+        expect(sanitizeDiagnostics({ tracePhases })?.tracePhases).toEqual([
+            { code: 'mint_ok', tMs: 1 }, { code: 'display_live', tMs: 1 }, { code: 'confirm_ok', tMs: 5 }]);
+        // Strict shape still holds: an extra key fails the wire schema and is dropped by the sanitizer.
+        const extra = [{ code: 'display_live', tMs: 1, secret: 'x' }];
+        expect(diagnosticsSchema.safeParse({ tracePhases: extra }).success).toBe(false);
+        expect(sanitizeDiagnostics({ tracePhases: extra } as unknown as FeedbackDiagnostics)?.tracePhases).toEqual([]);
+        expect(sanitizeDiagnostics({ tracePhases: Array.from({ length: 30 }, () => ({ code: 'display_live', tMs: 1 })) })?.tracePhases).toHaveLength(24);
+    });
 });
