@@ -248,7 +248,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  * request cannot fail this way. See `applyDisplayEvidence`.
  *
  * @typedef {'worker_unreachable' | 'sandbox_crashed' | 'desktop_unreachable'
- *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'computer_stopped' | 'desktop_config_unapplied' | 'desktop_failed'
+ *   | 'display_not_streaming' | 'timeout' | 'operations_paused' | 'computer_stopped' | 'computer_update_required'
+ *   | 'desktop_config_unapplied' | 'desktop_failed'
  *   | 'capacity_unavailable' | 'user_hours_cap' | 'global_hours_cap'
  *   | 'payment_issue' | 'plan_required' | 'fair_use_paused' | 'files_on_aws' | 'unknown'} BootFailureReason
  */
@@ -305,7 +306,8 @@ export function estimatePhaseForElapsedMs(elapsedMs) {
  *   | 'sandbox_runtime_blocked' | 'sandbox_start_failed' | 'sandbox_starting'
  *   | 'worker_http_error' | 'desktop_unreachable' | 'timeout'
  *   | 'kill_switch' | 'aws_disabled' | 'capacity_unavailable' | 'capacity_attempt_expired' | 'region_capacity'
- *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'computer_stopped' | 'desktop_config_unapplied' | 'desktop_failed'
+ *   | 'max_running' | 'user_hours_cap' | 'global_hours_cap' | 'computer_stopped' | 'computer_rebase_required'
+ *   | 'desktop_config_unapplied' | 'desktop_failed'
  *   | BillingBootErrorCode | 'unknown'} BootErrorCode
  */
 
@@ -355,6 +357,8 @@ const AWS_REFUSAL_ERROR_CODES = [
     'global_hours_cap',
     // Hotfix r5 review: the stop hold answers the same until it lapses (60 s); re-asking at once is waste.
     'computer_stopped',
+    // The volume's recorded lower is not the deployment's: the server answers the same until an operator rebase moves it.
+    'computer_rebase_required',
     // Round 6 (seam A): the Worker answers these the same until the host's record changes.
     'desktop_config_unapplied',
     'desktop_failed',
@@ -424,6 +428,8 @@ function classifyFailure(errorCode) {
             return errorCode;
         case 'computer_stopped':
             return 'computer_stopped';
+        case 'computer_rebase_required':
+            return 'computer_update_required';
         case 'desktop_config_unapplied':
         case 'desktop_failed':
             return errorCode;
@@ -693,6 +699,14 @@ export const BOOT_FAILURE_COPY = {
     computer_stopped: {
         title: 'Your computer was just stopped',
         body: "Apps don't restart it on their own right after a stop. Your files are kept. To start it now, open the desktop from Settings → Computer, or try again in a minute.",
+    },
+    // Acceptance 1.0.34: the computer's files were last used on an older system image than new hosts run, or on one
+    // never recorded. Such a host refuses them, so the server refuses the open before any host starts
+    // (`computer_rebase_required`). Only an operator update moves them across, so the copy names Send feedback,
+    // like the hour limits, and never promises a button.
+    computer_update_required: {
+        title: 'Your computer needs an update before it can start',
+        body: "Your files are kept. They were last used with an older version of EZiL's computer system and have to be moved to the current one before this computer can start again. That isn't automatic yet: use Send feedback to ask for the update. Try again only checks whether it is done.",
     },
     operations_paused: {
         title: 'Your AWS computer is paused by operations',

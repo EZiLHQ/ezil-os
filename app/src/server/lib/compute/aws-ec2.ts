@@ -3,7 +3,7 @@ import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
 import { isStalledPoolAdoptPending } from './aws-pool-adopt-stall';
 import { settleReplacementGeneration } from './aws-rebase-generation';
 import { adoptRecoveryReplay, matchesAdoptRecovery, failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
-import { writePoolOpen } from './placement';
+import { readRecordedLowerDigest, writePoolOpen } from './placement';
 import { PoolCapacityPressure } from './aws-pool-errors';
 import { cancelComputerDemand } from './aws-pool-demand';
 import { demandDeploymentDigest, type CapacityDemand } from './capacity-demand';
@@ -225,7 +225,7 @@ const notReady = (errorCode: string, retryable = false, error = errorCode): Ensu
 /**
  * Round 6 R2-2: one line per AWS boot decision, so a cold open beside an idle spare says why. `path` is warm (a pool
  * adopt), cold (a cold provision/replace), wait (no boot on this ask: capacity demand, a pool release first, a grant
- * pending) or none (admission refused). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
+ * pending) or none (admission refused, or rebase_required: the volume's recorded lower is not the deployment's). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
  * release_failed, pool_type, volume_check, no_spare, capacity, volume_attached, grant_pending), or the refusal. No id beyond 8 chars.
  */
 function logAwsOpen(computerId: string, path: 'warm' | 'cold' | 'wait' | 'none', reason: string): void {
@@ -717,6 +717,14 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
+                    // A volume opens only on the lower it last booted on: any other host's guard refuses it
+                    // (`lower_digest_mismatch`) after a pool host or a new instance is spent, and every later open
+                    // repeats that. Only an operator rebase moves a volume to this deployment's lower, so an older or
+                    // never-recorded lower is refused here, before any lease, release, admission or start.
+                    if (deployment.lowerImageDigest && await readRecordedLowerDigest(deps.db, placement.computerId) !== deployment.lowerImageDigest) {
+                        logAwsOpen(c.computerId, 'none', 'rebase_required');
+                        return notReady('computer_rebase_required');
+                    }
                     // Round 6 R2-3: a paid plan whose new period's grant has not landed reads as Free for a moment. Never
                     // boot it as the Free hold (cold, at the hold size): wait, so the next ask opens on the paid tier.
                     // Unknown is not pending: a failed billing read keeps today's open, never an endless wait.
