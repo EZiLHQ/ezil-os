@@ -263,17 +263,17 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
 
     // The bundle's own first-load migration (chat-enabled): a new browser profile keeps the built-in chat extension
     // enabled, so an early message reaches Copilot's agent instead of timing out ("Chat took too long to get ready").
-    await t.test('a new profile keeps the built-in chat extension enabled; a completed setup still honours a disabled one (chat-enabled)', () => {
+    await t.test('a new profile keeps the built-in chat extension enabled; setup is marked completed; a completed setup still honours a disabled one (chat-enabled)', () => {
       const i = code.indexOf('ensureChatExtensionInitialDisabledState(){'), j = code.indexOf('}get hasWorkspace(){', i);
       assert(i > 0 && j > i);
       const migrate = new Function('Oc', code.slice(i + 'ensureChatExtensionInitialDisabledState(){'.length, j));
       const run = ({ completed, disabled = false, stored = false }) => {
-        const calls = { disabled: [], stored: [], settings: [] };
+        const calls = { disabled: [], stored: [], settings: [], updates: [] };
         const view = {
           _chatExtensionId: 'github.copilot-chat', environmentService: {},
           storageService: { getBoolean: () => stored, store: (k, v) => calls.stored.push([k, v]) },
           logService: { debug() {}, error() {} },
-          chatEntitlementService: { context: { value: { state: { completed } } } },
+          chatEntitlementService: { context: { value: { state: { completed }, update: u => calls.updates.push(u) } } },
           _disableExtension: e => calls.disabled.push(e.id), _isDisabledGlobally: () => disabled,
           configurationService: { getValue: () => undefined, updateValue: (k, v) => (calls.settings.push([k, v]), Promise.resolve()) },
         };
@@ -282,8 +282,10 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       };
       const fresh = run({ completed: false });
       assert.deepEqual(fresh.disabled, [], 'the extension is not disabled on a new profile');
+      assert.deepEqual(fresh.updates, [{ completed: true }], 'setup is marked completed, as a successful setup run would');
       assert.deepEqual(fresh.stored, [['builtinChatExtensionEnablementMigration', true]]);
-      assert.deepEqual(run({ completed: true, disabled: true }).settings, [['chat.disableAIFeatures', true]]);
+      const done = run({ completed: true, disabled: true });
+      assert.deepEqual(done.settings, [['chat.disableAIFeatures', true]]); assert.deepEqual(done.updates, []);
       assert.deepEqual(run({ completed: false, stored: true }).stored, [], 'runs once per profile');
       assert(!code.includes('Disabling builtin chat extension as chat set up is not completed'));
     });

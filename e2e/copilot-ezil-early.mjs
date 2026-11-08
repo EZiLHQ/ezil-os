@@ -42,20 +42,23 @@ try {
       await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
       const editor = aux.locator('.chat-input-container .monaco-editor').first();
       await editor.waitFor({ state: 'visible', timeout: 120_000 });
-      for (let attempt = 0; attempt < 3; attempt++) {
+      let typed = false;
+      for (let attempt = 0; attempt < 3 && !typed; attempt++) {
         const lines = editor.locator('.view-lines').first();
         await (v.touch ? lines.tap({ force: true }) : lines.click({ force: true }));
         await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
         await page.keyboard.type(prompt, { delay: 2 });
-        if (clean(await editor.innerText()).replace(/\s+/g, '').includes(prompt.slice(0, 20).replace(/\s+/g, ''))) break;
+        // Monaco's text carries non-breaking spaces and wraps: compare without any whitespace.
+        typed = (await editor.innerText()).replace(/[\s\u00a0]+/g, '').includes(prompt.replace(/\s+/g, ''));
       }
+      if (!typed) throw new Error('the prompt never landed in the chat input');
       await page.keyboard.press('Enter');
       const sentAt = (Date.now() - t0) / 1000;
       let answered = false, tooLong = false, reached = false;
       const tSend = Date.now();
       while (Date.now() - tSend < 75_000 && !answered && !tooLong) {
         const t = await transcript();
-        answered = /EZIL_KIMI_OK|EZiL Chat:/.test(t);
+        answered = /EZIL_KIMI_OK/.test(t);
         tooLong = /took too long to get ready/i.test(t);
         if (!answered && !tooLong) await page.waitForTimeout(500);
       }
@@ -63,6 +66,8 @@ try {
       const waited = ((Date.now() - tSend) / 1000).toFixed(1);
       await page.screenshot({ path: join(OUT, `${v.name}.png`) });
       const at = `${v.name}${v.touch ? ' (touch)' : ''}, new profile, sent ${sentAt.toFixed(1)} s after navigation`;
+      // Only an early send shows the bug: a send after ~40 s takes the setup path, which worked before the patch too.
+      check(`${at}: the message went early (within 15 s of navigation)`, sentAt < 15, `${sentAt.toFixed(1)} s`);
       check(`${at}: no "Chat took too long to get ready"`, !tooLong, `after ${waited} s`);
       check(`${at}: the first message is answered`, answered, `after ${waited} s`);
       check(`${at}: the Gateway received the first message`, reached);

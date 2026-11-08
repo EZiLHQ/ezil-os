@@ -122,10 +122,12 @@ P_HEADER_NOTIFY='this.logService=v;this.notificationService=b;'
 # EZiL models (BYOK), so a message sent in the first seconds took the no-setup path (`z3t`: setup not completed
 # but BYOK models present), waited for Copilot's agent from a disabled extension and showed "Chat took too long
 # to get ready" after 60 s (image e2e, new browser profile, send ~5 s after load; main and staging images alike).
-# The extension now stays enabled on that first load; the migration flag is still stored, and a completed setup
-# with the extension disabled (the user's own choice) still turns AI features off as upstream does.
+# The extension now stays enabled on that first load and setup is marked completed, as a successful setup run would
+# (nothing else marks it: requests now reach Copilot's agent, never the setup agent, and setup-only menu entries
+# gated on Setup.completed would stay). The migration flag is still stored, and a completed setup with the
+# extension disabled (the user's own choice) still turns AI features off as upstream does.
 A_CHAT_ENABLED='else try{this.logService.debug("Disabling builtin chat extension as chat set up is not completed"),this._disableExtension({id:this._chatExtensionId})}catch(n){this.logService.error("Failed to disable builtin chat extension during enablement migration",n)}'
-R_CHAT_ENABLED='else this.logService.debug("EZiL: builtin chat extension stays enabled although chat setup is not completed")'
+R_CHAT_ENABLED='else try{this.logService.debug("EZiL: builtin chat extension stays enabled; EZiL Chat needs no setup, so setup is marked completed"),i.value.update({completed:!0})}catch(n){this.logService.error("EZiL: chat setup state not updated",n)}'
 # workbench.js `attach-execute`: the chat view's Add Context entry (location "panel") moves from the
 # ChatInput menu (the composer's mode/model row) to ChatExecute, the toolbar Send lives in, leaving that row
 # its room on a narrow chat; that toolbar already renders this action (quick chat registers it there).
