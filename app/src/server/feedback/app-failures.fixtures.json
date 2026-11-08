@@ -211,6 +211,45 @@
         "clientRequestId": "c0000000-0000-4000-8000-00000000000f",
         "gatewayRequestId": "d0000000-0000-4000-8000-00000000000f"
       }
+    },
+    {
+      "name": "dated catalog model key",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000100",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic/claude-sonnet-4-5-20250929"
+      }
+    },
+    {
+      "name": "bedrock-style versioned key",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000101",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic.claude-sonnet-5-5-v1:0"
+      }
+    },
+    {
+      "name": "bedrock-style dotted namespace",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000110",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "qwen.qwen3-coder-next"
+      }
     }
   ],
   "rejected": [
@@ -414,6 +453,225 @@
         "stage": "stream",
         "outcome": "cancelled"
       }
+    },
+    {
+      "name": "model key shaped like an api key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000100",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "model key shaped like a path",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000101",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "etc/passwd"
+      }
+    },
+    {
+      "name": "model key with nested path",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000102",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "home/user/key"
+      }
+    },
+    {
+      "name": "model key shaped like a github token",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000103",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "ghp_zzzzzzzzzzzzzzzzzzzzzzzz"
+      }
+    },
+    {
+      "name": "model key with long random run",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000104",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "xa1b2c3d4e5a1b2c3d4e5a1b2c3d4e5"
+      }
+    },
+    {
+      "name": "model key under a filesystem root",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000105",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "etc/ssh-host-key"
+      }
+    },
+    {
+      "name": "un-namespaced path-like model key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000200",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "project/file-1"
+      }
+    },
+    {
+      "name": "model key shaped like a supabase secret",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000201",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "sb_secret_abcd-efgh-ijkl-mnop"
+      }
+    },
+    {
+      "name": "provider-prefixed token model key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000202",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "openai/sb_secret_abcd-efgh"
+      }
+    },
+    {
+      "name": "model key with a credential word",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000203",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic/claude-api-key-1"
+      }
     }
-  ]
+  ],
+  "envelopes": {
+    "note": "$NONCE is the current hello nonce and $VALID_0 is valid[0].failure; a test substitutes both.",
+    "hello": {
+      "type": "ezil.code.diag.hello",
+      "v": 1,
+      "nonce": "$NONCE"
+    },
+    "accepted": [
+      {
+        "name": "ready acknowledgement (healthy, zero errors)",
+        "stores": false,
+        "envelope": {
+          "type": "ezil.code.diag.ready",
+          "v": 1,
+          "nonce": "$NONCE"
+        }
+      },
+      {
+        "name": "failure",
+        "stores": true,
+        "envelope": {
+          "type": "ezil.code.failure",
+          "v": 1,
+          "nonce": "$NONCE",
+          "failure": "$VALID_0"
+        }
+      }
+    ],
+    "rejected": [
+      {
+        "name": "ready with an extra key",
+        "envelope": {
+          "type": "ezil.code.diag.ready",
+          "v": 1,
+          "nonce": "$NONCE",
+          "computerId": "f0000000-0000-4000-8000-000000000001"
+        }
+      },
+      {
+        "name": "wrong version",
+        "envelope": {
+          "type": "ezil.code.diag.ready",
+          "v": 2,
+          "nonce": "$NONCE"
+        }
+      },
+      {
+        "name": "unknown type",
+        "envelope": {
+          "type": "ezil.code.diag.status",
+          "v": 1,
+          "nonce": "$NONCE"
+        }
+      },
+      {
+        "name": "missing nonce",
+        "envelope": {
+          "type": "ezil.code.diag.ready",
+          "v": 1
+        }
+      },
+      {
+        "name": "stale nonce",
+        "envelope": {
+          "type": "ezil.code.diag.ready",
+          "v": 1,
+          "nonce": "stale-nonce"
+        }
+      },
+      {
+        "name": "failure with an extra envelope key",
+        "envelope": {
+          "type": "ezil.code.failure",
+          "v": 1,
+          "nonce": "$NONCE",
+          "failure": "$VALID_0",
+          "origin": "https://code.test"
+        }
+      },
+      {
+        "name": "failure envelope without a record",
+        "envelope": {
+          "type": "ezil.code.failure",
+          "v": 1,
+          "nonce": "$NONCE"
+        }
+      }
+    ]
+  }
 }

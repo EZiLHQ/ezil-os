@@ -4,7 +4,7 @@ import { env } from '@/env';
 import { db } from '@/server/db';
 import { isFeedbackAdmin } from '@/server/feedback/admin';
 import { updateFeedbackStatus, deleteFeedbackReport, feedbackAdminQueries, loadFeedbackList, loadFeedbackReport } from '@/server/feedback/admin-queries';
-import { diagnosticsSchema, FEEDBACK_STATUSES } from '@/server/feedback/types';
+import { appFailureRecordSchema, diagnosticsSchema, FEEDBACK_STATUSES } from '@/server/feedback/types';
 import { createClient } from '@/utils/supabase/server';
 
 export const dynamic = 'force-dynamic';
@@ -57,6 +57,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <p className="text-sm">Deployed commit: <span className="font-mono">{report.deploySha ?? '—'}</span></p>
                         <h3 className="font-semibold">Diagnostics</h3>
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(report.diagnostics, null, 2) ?? 'None'}</pre>
+                        <AppFailureDiagnostics diagnostics={report.diagnostics} />
                         {report.hasScreenshot ? (
                             <p><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}`} className="underline">View screenshot</a></p>
                         ) : <p className="text-sm text-offwhite/60">No screenshot available.</p>}
@@ -96,6 +97,62 @@ export default async function FeedbackAdminPage({ searchParams }: {
                 )}
             </div>
         </div>
+    );
+}
+
+const REQUEST_ID_LABELS = [
+    ['vscodeRequestId', 'Workbench request id'],
+    ['clientRequestId', 'SDK idempotency key'],
+    ['gatewayRequestId', 'Gateway request id'],
+    ['retryOfClientRequestId', 'Retry of SDK idempotency key'],
+] as const;
+
+function AppFailureDiagnostics({ diagnostics }: { diagnostics: unknown }) {
+    // Only this field is parsed, so an unrelated legacy diagnostics key never hides it.
+    const raw = (diagnostics as { appFailures?: unknown } | null)?.appFailures;
+    const failures = (Array.isArray(raw) ? raw : []).flatMap(entry => {
+        const parsed = appFailureRecordSchema.safeParse(entry);
+        return parsed.success ? [parsed.data] : [];
+    });
+    if (!failures.length) return null;
+    const fields = [
+        'app', 'eventId', 'source', 'operation', 'category', 'code', 'stage', 'outcome',
+        'streamReason', 'cancellationSource', 'attempt', 'retryable', 'httpStatus', 'durationMs', 'modelKey', 'ageMs',
+    ] as const;
+    return (
+        <section aria-labelledby="app-failure-context" className="space-y-3">
+            <h3 id="app-failure-context" className="font-semibold">App failure context</h3>
+            <p className="text-sm text-offwhite/60">Request IDs correlate logs; they are not authorization to look up another user’s data. They are independent values: the workbench id is optional and may be absent, and no equivalence between them is implied.</p>
+            <ol className="space-y-4">
+                {failures.map((failure, index) => (
+                    <li key={`${failure.eventId}-${index}`} className="overflow-x-auto">
+                        <table className="w-full text-left text-sm">
+                            <caption className="text-left font-medium">Failure {index + 1}</caption>
+                            <thead><tr className="border-b border-offwhite/20">
+                                <th scope="col" className="py-2 pr-4 font-medium">Field</th>
+                                <th scope="col" className="py-2 font-medium">Value</th>
+                            </tr></thead>
+                            <tbody>
+                                {fields.map(field => (
+                                    <tr key={field} className="border-b border-offwhite/10">
+                                        <th scope="row" className="py-1 pr-4 font-medium">{field}</th>
+                                        <td className="break-words py-1">{failure[field] === undefined ? '—' : String(failure[field])}</td>
+                                    </tr>
+                                ))}
+                                {REQUEST_ID_LABELS.map(([field, label]) => (
+                                    <tr key={field} className="border-b border-offwhite/10">
+                                        <th scope="row" className="py-1 pr-4 font-medium">{label} <span className="font-normal text-offwhite/60">({field})</span></th>
+                                        <td className="py-1">{failure[field] === undefined ? '—' : (
+                                            <code className="select-all break-all" title={`Select and copy ${field}`}>{failure[field]}</code>
+                                        )}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </li>
+                ))}
+            </ol>
+        </section>
     );
 }
 

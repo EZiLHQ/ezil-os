@@ -3,8 +3,9 @@
 Status: consumer side (shell + app feedback API) owned by the feedback lane;
 producer (EZiL chat extension + workbench transport) owned by the worker chat
 lane. Both sides test against the shared golden fixtures in
-`app/src/server/feedback/app-failures.fixtures.json`. A change to any enum or
-bound below changes those fixtures first.
+`app/src/server/feedback/app-failures.fixtures.json` (`valid` / `rejected`
+records, and `envelopes` for the exact hello, ready and failure messages). A
+change to any enum or bound below changes those fixtures first.
 
 ## Why a separate channel
 
@@ -29,6 +30,9 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
    a fresh random token per document load.
 3. The producer posts
    `{ type: 'ezil.code.failure', v: 1, nonce, failure }` to `window.parent`.
+   It may also post `{ type: 'ezil.code.diag.ready', v: 1, nonce }` once per
+   hello, with no other keys, to say the collector is present even before any
+   failure; it counts toward the rate cap and stores nothing.
 4. The shell accepts a message only when ALL hold:
    - `event.source === registeredIframe.contentWindow` (rejects nested,
      sibling and stale frames);
@@ -63,11 +67,14 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
 | `attempt` | no | integer 1–64 |
 | `retryable` | no | boolean |
 | `durationMs` | no | integer 0–3 600 000 |
-| `modelKey` | no | `^[a-z0-9][a-z0-9._:/-]{0,63}$` catalog model key |
+| `modelKey` | no | namespaced catalog key `ns/model` or `ns.model`, `^[a-z0-9][a-z0-9._:/-]{0,63}$`, at most one `/`. `ns` is in the closed `MODEL_KEY_NAMESPACES` list (`app/src/server/feedback/types.ts`, mirrored in the shell). Each model segment (split on `/` `.` `:`) must not start with a credential prefix (`sk_`/`sk-`, `sb_`, `pk_`, `rk_`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `xox?-`), contain a credential word (`secret`, `token`, `passw`, `bearer`, `api key`, `private`, `credential`, `session`, `cookie`) or a 20+ character alphanumeric run; the model name carries a digit or `-`. Dated keys such as `anthropic/claude-sonnet-4-5-20250929` and `qwen.qwen3-coder-next` are valid |
 | `httpStatus` | no | integer 100–599 |
 
 Rules:
 - A code outside §3 is sent as `unexpected_error` with its ids, never as text.
+- The producer validates `modelKey` with the shared fixtures' rule before
+  emitting and OMITS it when unsafe; the consumer drops a whole record whose
+  `modelKey` is invalid, so an unsafe optional key must never cost the ids.
 - The three request ids are independent values. None is derived from,
   parsed from UI text, or assumed equal to another; a user-supplied
   screenshot reference stays in the user's description, not in these ids.
@@ -107,20 +114,27 @@ A code is valid only in its own category (or `unexpected_error` in any).
 - A report selects ONLY its frozen context: the dialog snapshots
   `currentComputer()` when it opens (Settings / global entry) or the
   requesting frame's registration (app "Report problem" entry, which prefills
-  but never sends).
+  but never sends). Scope: with an app session (app entry), only that
+  window's ring; without one (global entry), every app session of the frozen
+  computer, never another computer's.
+- Entries outlive their window: closing or reminting a Code window stops new
+  messages from it but keeps its unexpired entries reportable.
 - Export = newest 10 for that context, each `failure` plus `app` (`code`) and
   `ageMs` (shell clock), total ≤ 8 KiB. Only with diagnostics consent; frozen
   into the previewed body like every other diagnostic.
-- If no Code frame of that context answered a hello, the preview says app
-  failure context is unavailable instead of an empty list. This is NOT a
+- If the context has no retained entries and no live Code frame of it has
+  answered a hello (`ready` or a valid failure), the preview says app failure
+  context is unavailable instead of an empty list. This is NOT a
   privileged device log.
 
 ## 5. Server
 
-- `diagnostics.appFailures`: optional strict array, ≤ 10 entries, each the §2
-  record plus `app: 'code'` and `ageMs` (integer 0–1 800 000).
-- `sanitizeDiagnostics` re-validates every entry and drops (never repairs) any
-  that fails; request ids equal to the reporter's user/computer id are dropped.
+- `diagnostics.appFailures`: optional array of ≤ 10 entries. The wire schema
+  bounds only the count, so one malformed entry never rejects the whole report
+  (description, screenshot and report id are kept); each stored entry is the
+  §2 record plus `app: 'code'` and `ageMs` (integer 0–1 800 000).
+- `sanitizeDiagnostics` validates every entry independently and drops (never
+  repairs) any that fails; request ids equal to the reporter's user/computer id are dropped.
 - The boot payload advertises `ui.feedbackAppFailures: true`. The shell sends
   `appFailures` only when that flag is present; on a 400 from an older server
   the existing downgrade (`without_event_diagnostics`) also strips it.

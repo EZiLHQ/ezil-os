@@ -3,6 +3,7 @@
 import { feedbackTraceSnapshot } from '../../trace.js';
 import { recentEvents } from '../../telemetry.js';
 import { isCorrelationId, isFailureReason } from './failure-shapes.js';
+import { app_failures_for } from './app-failures.js';
 
 /**
  * FEEDBACK-DIAG: at most this many recent events — the newest — carry the
@@ -19,6 +20,10 @@ const MAX_ANNOTATED_EVENTS = 10;
  */
 export function event_diagnostics_accepted () {
     return globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackEventDiagnostics === true;
+}
+
+export function app_failure_diagnostics_accepted () {
+    return globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackAppFailures === true;
 }
 
 const integer = value => Math.min(1_000_000_000, Math.max(0, Math.round(value)));
@@ -60,7 +65,7 @@ function os_family () {
 }
 
 /** @returns {object} Matches diagnosticsSchema; absent information is omitted. */
-export function build_diagnostics () {
+export function build_diagnostics (appContext) {
     const result = {};
     const trace = feedbackTraceSnapshot();
     const captured = Date.now();
@@ -117,5 +122,9 @@ export function build_diagnostics () {
         return out;
     });
 
+    if (app_failure_diagnostics_accepted()) {
+        const context = app_failures_for(appContext);
+        if (context.available) result.appFailures = context.failures;
+    }
     return result;
 }
