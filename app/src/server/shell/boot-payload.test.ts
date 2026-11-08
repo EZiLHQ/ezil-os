@@ -257,8 +257,21 @@ describe('buildShellBootPayload', () => {
         expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
         const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
         expect(on.endpoints.feedback).toBe('/api/shell/feedback');
-        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true });
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true });
         expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
+    });
+
+    it('advertises app-failure diagnostics only when feedback is enabled, regardless of other UI flags', () => {
+        expect(toShellDesktopState(null).ui).not.toHaveProperty('feedbackAppFailures');
+        for (const feedback of [false, true]) {
+            for (const floatingControls of [false, true]) {
+                for (const feedbackScreenshots of [false, true]) {
+                    const { ui } = toShellDesktopState(null, { feedback, floatingControls, feedbackScreenshots });
+                    if (feedback) expect(ui?.feedbackAppFailures).toBe(true);
+                    else expect(ui).not.toHaveProperty('feedbackAppFailures');
+                }
+            }
+        }
     });
 });
 

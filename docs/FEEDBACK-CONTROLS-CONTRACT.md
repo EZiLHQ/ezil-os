@@ -21,9 +21,17 @@ Shell side: features are feature-detected exactly like `endpoints.focus`.
 
 ```
 desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean,
-  feedbackEventDiagnostics?: true, feedbackReportBundle?: true }
+  feedbackEventDiagnostics?: true, feedbackReportBundle?: true, feedbackAppFailures?: true }
 desktopState.endpoints.feedback?: '/api/shell/feedback'
 ```
+
+### App failure context v1
+
+See [FEEDBACK-APP-FAILURES-CONTRACT.md](FEEDBACK-APP-FAILURES-CONTRACT.md) for the
+strict `diagnostics.appFailures` records (newest ten), category/code allowlist,
+request-id exclusions, and consent rules. `desktopState.ui.feedbackAppFailures`
+is `true` only when feedback is enabled; the shell omits these records without
+the flag, and the existing `without_event_diagnostics` downgrade strips them.
 
 ## 2. Shell module APIs (stubs exist in base; owning lane replaces the body, never the signature)
 

@@ -1,6 +1,6 @@
 import { isCorrelationId, isFailureReason } from './failure-shapes';
 import { sanitizeErrorMessage } from '@/server/telemetry/sanitize';
-import { diagnosticsSchema, FEEDBACK_LIMITS, type FeedbackDiagnostics } from './types';
+import { appFailureRecordSchema, APP_FAILURE_LIMITS, APP_FAILURE_REQUEST_ID_FIELDS, diagnosticsSchema, FEEDBACK_LIMITS, type FeedbackDiagnostics } from './types';
 
 const IDENTIFIER_LIKE = /[0-9a-f]{8,}|\d{6,}/i;
 const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
@@ -47,8 +47,8 @@ type RecentEvent = NonNullable<FeedbackDiagnostics['recentEvents']>[number];
  * FEEDBACK-DIAG: one recent event's failure annotation, ALLOWLISTED — a value
  * that does not match its shape is dropped, never repaired.
  *
- * 🔴 `correlationId` is the ONE diagnostics field exempt from the UUID mask
- * below, and narrowly: it must be a server-minted correlation id
+ * `correlationId` bypasses the UUID mask below, like validated app-failure
+ * request ids, and narrowly: it must be a server-minted correlation id
  * (`isCorrelationId`: a lowercase `randomUUID`, `cid_…` or `srv_…`), it
  * identifies one request rather than a person or a computer, and it is
  * dropped if it equals the reporter's own user or computer id. Masking it
@@ -63,7 +63,7 @@ function annotation(event: RecentEvent, excludeIds: ReadonlySet<string>): Pick<R
 }
 
 export interface SanitizeDiagnosticsOptions {
-    /** Ids a `correlationId` must never equal (the reporter's user and computer). Compared lowercase. */
+    /** Ids correlations and app-failure request ids must never equal (reporter's user/computer). Compared lowercase. */
     excludeIds?: readonly (string | null | undefined)[];
 }
 
@@ -119,6 +119,22 @@ export function sanitizeDiagnostics(
             ...(Number.isInteger(event.ageMs) && event.ageMs! >= 0 && event.ageMs! <= 1_000_000_000 ? { ageMs: event.ageMs } : {}),
             ...kept.get(i),
         }));
+    }
+    if (Array.isArray(input.appFailures)) {
+        // Like recentEvents, records arrive oldest-first. Validate before
+        // capping so invalid records cannot evict valid neighboring entries.
+        out.appFailures = input.appFailures.flatMap(failure => {
+            const parsed = appFailureRecordSchema.safeParse(failure);
+            if (!parsed.success) return [];
+            // Defence in depth over the schema's shape rule: never store a key the
+            // description redactor would mask.
+            if (parsed.data.modelKey !== undefined && redactDescription(parsed.data.modelKey).count > 0) return [];
+            if (APP_FAILURE_REQUEST_ID_FIELDS.some(field => {
+                const id = parsed.data[field];
+                return id !== undefined && excludeIds.has(id.toLowerCase());
+            })) return [];
+            return [parsed.data];
+        }).slice(-APP_FAILURE_LIMITS.recordsMax);
     }
     if (input.stream) {
         out.stream = { ...input.stream };
