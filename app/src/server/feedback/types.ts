@@ -53,6 +53,27 @@ export const APP_FAILURE_REQUEST_ID_FIELDS = [
 
 export const APP_FAILURE_LIMITS = Object.freeze({ recordsMax: 10, ageMsMax: 1_800_000 });
 
+const MODEL_KEY = /^[a-z0-9][a-z0-9._:/-]{0,63}$/;
+/** First segments that name a filesystem location, never a model provider. */
+const PATH_ROOTS = new Set(['etc', 'usr', 'home', 'root', 'var', 'tmp', 'opt', 'bin', 'sbin', 'lib', 'proc', 'sys', 'dev', 'mnt', 'srv', 'users', 'workspace', 'workspaces', 'private']);
+
+/**
+ * A catalog-shaped model key (`model` or `provider/model`, dated versions
+ * allowed) and nothing that could be a credential, path or URL. There is no
+ * static catalog in this repo, so the shape is the allowlist. Mirrored in
+ * shell/ezil/ui/feedback/app-failures.js; contract §2.
+ */
+export function isSafeModelKey(value: unknown): value is string {
+    // `$` also matches before a final newline, hence the explicit exact test.
+    if (typeof value !== 'string' || !MODEL_KEY.test(value) || value !== value.trim()) return false;
+    if (value.includes('://') || value.split('/').length > 2) return false;
+    if (/^(?:sk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/.test(value) || /bearer/.test(value)) return false;
+    if (/[a-z0-9]{20,}/.test(value)) return false;
+    const segments = value.split('/');
+    if (segments.length === 2 && PATH_ROOTS.has(segments[0]!)) return false;
+    return /[0-9-]/.test(segments.at(-1)!);
+}
+
 const appFailureId = z.string().length(36).regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 
 /** The strict server record includes the shell's app and age, never producer context. */
@@ -73,11 +94,7 @@ export const appFailureRecordSchema = z.object({
     attempt: z.number().int().min(1).max(64).optional(),
     retryable: z.boolean().optional(),
     durationMs: z.number().int().min(0).max(3_600_000).optional(),
-    modelKey: z.string().regex(/^[a-z0-9][a-z0-9._:/-]{0,63}$/)
-        // JavaScript's `$` also matches before a final newline; never trim/repair it.
-        .refine(value => value === value.trim(), 'Model keys cannot contain surrounding whitespace')
-        // The charset permits URLs, but §2 and the golden fixtures forbid them.
-        .refine(value => !/^[a-z][a-z0-9+.-]*:\/\//.test(value), 'URLs are not model keys').optional(),
+    modelKey: z.string().refine(isSafeModelKey, 'Not a catalog-shaped model key').optional(),
     httpStatus: z.number().int().min(100).max(599).optional(),
     app: z.literal('code'),
     ageMs: z.number().int().min(0).max(APP_FAILURE_LIMITS.ageMsMax),
@@ -122,7 +139,9 @@ export const diagnosticsSchema = z
             ageMs: int.optional(), reason: short(FEEDBACK_LIMITS.recentEventReasonMax).optional(),
             correlationId: short(FEEDBACK_LIMITS.recentEventCorrelationIdMax).optional(),
         }).strict()).max(50),
-        appFailures: z.array(appFailureRecordSchema).max(APP_FAILURE_LIMITS.recordsMax),
+        // Bounded but lenient on the wire: `sanitizeDiagnostics` validates each
+        // entry and drops a malformed one, so it never rejects the whole report.
+        appFailures: z.array(z.unknown()).max(APP_FAILURE_LIMITS.recordsMax),
         stream: z.object({ state: short(24).optional(), kbps: int.optional(), rttMs: int.optional() }).strict(),
     })
     .partial()

@@ -211,6 +211,32 @@
         "clientRequestId": "c0000000-0000-4000-8000-00000000000f",
         "gatewayRequestId": "d0000000-0000-4000-8000-00000000000f"
       }
+    },
+    {
+      "name": "dated catalog model key",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000100",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic/claude-sonnet-4-5-20250929"
+      }
+    },
+    {
+      "name": "bedrock-style versioned key",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000101",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "anthropic.claude-sonnet-5-5-v1:0"
+      }
     }
   ],
   "rejected": [
@@ -413,6 +439,84 @@
         "code": "user_cancelled",
         "stage": "stream",
         "outcome": "cancelled"
+      }
+    },
+    {
+      "name": "model key shaped like an api key",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000100",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "model key shaped like a path",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000101",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "etc/passwd"
+      }
+    },
+    {
+      "name": "model key with nested path",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000102",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "home/user/key"
+      }
+    },
+    {
+      "name": "model key shaped like a github token",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000103",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "ghp_zzzzzzzzzzzzzzzzzzzzzzzz"
+      }
+    },
+    {
+      "name": "model key with long random run",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000104",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "xa1b2c3d4e5a1b2c3d4e5a1b2c3d4e5"
+      }
+    },
+    {
+      "name": "model key under a filesystem root",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000105",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "etc/ssh-host-key"
       }
     }
   ]

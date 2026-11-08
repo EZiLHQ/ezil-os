@@ -126,6 +126,9 @@ export function sanitizeDiagnostics(
         out.appFailures = input.appFailures.flatMap(failure => {
             const parsed = appFailureRecordSchema.safeParse(failure);
             if (!parsed.success) return [];
+            // Defence in depth over the schema's shape rule: never store a key the
+            // description redactor would mask.
+            if (parsed.data.modelKey !== undefined && redactDescription(parsed.data.modelKey).count > 0) return [];
             if (APP_FAILURE_REQUEST_ID_FIELDS.some(field => {
                 const id = parsed.data[field];
                 return id !== undefined && excludeIds.has(id.toLowerCase());

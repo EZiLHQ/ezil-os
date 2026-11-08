@@ -32,7 +32,10 @@ describe('app failure v1 golden fixtures', () => {
     it.each(fixtures.rejected)('rejects and drops $name without affecting neighbors', ({ failure }) => {
         const record = Object.freeze(wireRecord(failure));
         expect(appFailureRecordSchema.safeParse(record).success).toBe(false);
-        expect(diagnosticsSchema.safeParse({ appFailures: [record] }).success).toBe(false);
+        // The wire stays lenient so one bad entry never rejects the whole report.
+        const report = { v: 1, clientRequestId: 'f0000000-0000-4000-8000-000000000002', category: 'bug',
+            description: 'Kept with a malformed app failure', diagnostics: { appFailures: [record] } };
+        expect(feedbackSubmitSchema.parse(report).description).toBe(report.description);
         expect(sanitizeDiagnostics(rawDiagnostics([neighbors[0], record, neighbors[1]])))
             .toEqual({ appFailures: neighbors });
     });
@@ -45,9 +48,11 @@ describe('app failure wire strictness and bounds', () => {
         expect(diagnosticsSchema.safeParse({ appFailures: Array(10).fill(base) }).success).toBe(true);
         for (const diagnostics of [
             { appFailures: Array(11).fill(base) },
-            { appFailures: [{ ...base, extra: 'private' }] },
             { appFailures: [base], unknown: true },
         ]) expect(diagnosticsSchema.safeParse(diagnostics).success).toBe(false);
+        // An extra key on one entry passes the bounded wire array and is dropped by the sanitizer.
+        expect(diagnosticsSchema.safeParse({ appFailures: [{ ...base, extra: 'private' }] }).success).toBe(true);
+        expect(sanitizeDiagnostics(rawDiagnostics([{ ...base, extra: 'private' }, base]))?.appFailures).toEqual([base]);
     });
 
     it('requires every mandatory field', () => {
@@ -144,12 +149,13 @@ describe('app failure wire strictness and bounds', () => {
         }
     });
 
-    it('bounds model keys to the catalog charset and forbids URLs even though they fit the regex', () => {
-        for (const modelKey of ['a', '1', 'catalog:model_1.2/variant-3', 'a'.repeat(64)]) {
+    it('accepts only catalog-shaped model keys: no URL, credential, path or random run', () => {
+        for (const modelKey of ['1', 'gpt-6', 'catalog:model_1.2/variant-3', 'anthropic/claude-sonnet-4-5-20250929', 'anthropic.claude-sonnet-5-5-v1:0']) {
             expect(appFailureRecordSchema.safeParse({ ...base, modelKey }).success).toBe(true);
         }
         for (const modelKey of ['', 'a'.repeat(65), 'Model', '/path', '.model', 'two words', 'model?key', 'model\n', 'model\r',
-            'https://gateway.example.test/v1', 'http://host/model', 'wss://host/model', null]) {
+            'https://gateway.example.test/v1', 'http://host/model', 'wss://host/model', null,
+            'a', 'a'.repeat(64), 'sk-proj-' + 'a'.repeat(32), 'ghp_' + 'z'.repeat(24), 'xoxb-1-2', 'etc/passwd', 'etc/ssh-host-key', 'home/id-rsa-2', 'home/user/key', 'a/b/c-1', 'bearer-1']) {
             const invalid = { ...base, modelKey };
             expect(appFailureRecordSchema.safeParse(invalid).success).toBe(false);
             expect(sanitizeDiagnostics(rawDiagnostics([invalid, base]))?.appFailures).toEqual([base]);

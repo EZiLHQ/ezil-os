@@ -63,7 +63,7 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
 | `attempt` | no | integer 1–64 |
 | `retryable` | no | boolean |
 | `durationMs` | no | integer 0–3 600 000 |
-| `modelKey` | no | `^[a-z0-9][a-z0-9._:/-]{0,63}$` catalog model key |
+| `modelKey` | no | catalog-shaped key `model` or `provider/model` matching `^[a-z0-9][a-z0-9._:/-]{0,63}$`; at most one `/`; the model segment contains a digit or `-`; never a URL, a credential shape (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghu_`, `github_pat_`, `xox?-`, `bearer`, any 20+ character alphanumeric run, anything the description redactor masks) or a filesystem-root first segment (`etc`, `usr`, `home`, `root`, `var`, `tmp`, …). Dated keys such as `anthropic/claude-sonnet-4-5-20250929` are valid |
 | `httpStatus` | no | integer 100–599 |
 
 Rules:
@@ -117,10 +117,12 @@ A code is valid only in its own category (or `unexpected_error` in any).
 
 ## 5. Server
 
-- `diagnostics.appFailures`: optional strict array, ≤ 10 entries, each the §2
-  record plus `app: 'code'` and `ageMs` (integer 0–1 800 000).
-- `sanitizeDiagnostics` re-validates every entry and drops (never repairs) any
-  that fails; request ids equal to the reporter's user/computer id are dropped.
+- `diagnostics.appFailures`: optional array of ≤ 10 entries. The wire schema
+  bounds only the count, so one malformed entry never rejects the whole report
+  (description, screenshot and report id are kept); each stored entry is the
+  §2 record plus `app: 'code'` and `ageMs` (integer 0–1 800 000).
+- `sanitizeDiagnostics` validates every entry independently and drops (never
+  repairs) any that fails; request ids equal to the reporter's user/computer id are dropped.
 - The boot payload advertises `ui.feedbackAppFailures: true`. The shell sends
   `appFailures` only when that flag is present; on a 400 from an older server
   the existing downgrade (`without_event_diagnostics`) also strips it.

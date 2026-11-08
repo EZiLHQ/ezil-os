@@ -1,6 +1,6 @@
 // feedback.js — EZiL-authored. Explicit consent, preview, then one submission.
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
-import { build_diagnostics } from './diagnostics.js';
+import { app_failure_diagnostics_accepted, build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
@@ -138,8 +138,8 @@ function listen_online () {
 function retryable (status) { return status === 0 || status === 408 || status >= 500; }
 
 /**
- * FEEDBACK-DIAG: `body` without `diagnostics.recentEvents[].reason`/`.correlationId`,
- * or null when it carries neither. Only ever removes those two keys.
+ * Roll back optional diagnostic extensions for older strict servers, or null
+ * when the body has none. The remaining frozen report stays unchanged.
  */
 function without_event_diagnostics (body) {
     try {
@@ -148,6 +148,7 @@ function without_event_diagnostics (body) {
         if (!sent?.diagnostics) return null;
         const before = JSON.stringify(sent.diagnostics);
         delete sent.diagnostics.session; delete sent.diagnostics.tracePhases; delete sent.diagnostics.traceApp;
+        delete sent.diagnostics.appFailures;
         for (const event of events || []) { delete event.reason; delete event.correlationId; delete event.ageMs; }
         if (before === JSON.stringify(sent.diagnostics)) return null;
         return JSON.stringify(sent, null, 2);
@@ -379,7 +380,11 @@ function error_copy (status) {
     return 'Could not send feedback. Check your connection and try again.';
 }
 
-/** @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string }} [_opts] */
+/**
+ * appContext is trusted shell registration context only (never producer message data).
+ * It prefills the selection; opening never sends a report.
+ * @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string, appContext?: {computerId: string, appSession: string} }} [_opts]
+ */
 export function open_feedback_dialog (_opts) {
     if ( ! feedback_enabled() ) return;
     if ( activeDialog?.isConnected ) { activeDialog.focus(); return; }
@@ -389,8 +394,12 @@ export function open_feedback_dialog (_opts) {
     const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && ! inflight.has(entry.clientRequestId)).length;
     // The canonical current computer (Settings switches never rewrite the boot
     // payload), snapshotted once: the frozen body keeps it through retries.
-    const computer = currentComputer()?.id;
+    const trusted = _opts?.appContext;
+    const hasAppContext = typeof trusted?.computerId === 'string' && UUID.test(trusted.computerId)
+        && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
+    const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
+    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
     const dialog = document.createElement('dialog');
     dialog.className = 'ezil-feedback-dialog';
@@ -436,6 +445,7 @@ export function open_feedback_dialog (_opts) {
                 </section>` : '<p class="ezil-feedback-muted">Screenshots are not available here yet. Describe the visible error in your report.</p>'}
             </fieldset>
             <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
+                <p class="ezil-feedback-muted" data-role="app-failure-context" hidden></p>
                 <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only when you choose them.</p></details>
             <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
             <div class="ezil-feedback-actions">
@@ -456,6 +466,7 @@ export function open_feedback_dialog (_opts) {
     const cancel = dialog.querySelector('[data-action="cancel"]');
     let screenshot = null;
     let diagnosticSnapshot = null;
+    let appContextUnavailable = false;
     let attemptedBody = null;
     const bug_values = () => Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact'].map(key => [key, form.elements[key].value]));
     let serialized = '';
@@ -545,6 +556,11 @@ export function open_feedback_dialog (_opts) {
             serialized = JSON.stringify(payload, null, 2);
         }
         preview.textContent = serialized;
+        const appStatus = dialog.querySelector('[data-role="app-failure-context"]');
+        appStatus.hidden = !diagnostics.checked || (!appContextUnavailable && !diagnosticSnapshot?.appFailures);
+        const appEvents = diagnosticSnapshot?.appFailures || [];
+        appStatus.textContent = appContextUnavailable ? 'App failure context is unavailable for this report.'
+            : `${appEvents.length} app events (${appEvents.filter(event => event.category === 'user_cancel' || event.outcome === 'cancelled').length} cancelled).`;
         const diagnosticBytes = new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null }, null, 2)).length;
         submit.disabled = capturing || ! description.value.trim() || text.length > 4000 || diagnosticBytes > 32 * 1024
             || (bug && Object.values(values).some(value => !value.trim()));
@@ -656,17 +672,24 @@ export function open_feedback_dialog (_opts) {
         if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
     });
     diagnostics.addEventListener('change', () => {
-        diagnosticSnapshot = diagnostics.checked ? build_diagnostics() : null;
+        snapshot_diagnostics();
         dialog.querySelector('[data-action="refresh-diagnostics"]').hidden = !diagnostics.checked;
     });
     dialog.querySelector('[data-action="refresh-diagnostics"]').addEventListener('click', () => {
-        if (diagnostics.checked) diagnosticSnapshot = build_diagnostics();
+        if (diagnostics.checked) snapshot_diagnostics();
         refresh();
     });
+    function snapshot_diagnostics () {
+        diagnosticSnapshot = diagnostics.checked ? build_diagnostics(appContext) : null;
+        appContextUnavailable = diagnostics.checked && app_failure_diagnostics_accepted()
+            && !Object.hasOwn(diagnosticSnapshot, 'appFailures');
+    }
     function on_downgrade(event) {
         if (closed || event.detail?.clientRequestId !== clientRequestId) return;
         serialized = event.detail.body; preview.textContent = serialized;
         diagnosticSnapshot = JSON.parse(serialized).diagnostics;
+        appContextUnavailable = false;
+        dialog.querySelector('[data-role="app-failure-context"]').hidden = true;
     }
     window.addEventListener('ezil:feedback-downgrade', on_downgrade);
     form.addEventListener('input', () => { refresh(); save_draft(); });
