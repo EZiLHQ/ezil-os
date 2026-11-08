@@ -304,7 +304,7 @@ export interface ShellDesktopState {
     status: 'idle';
     endpoints: Partial<typeof SHELL_API_ROUTES>;
     /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
-    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean };
+    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean; feedbackAppFailures?: boolean };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -375,7 +375,7 @@ export function toShellDesktopState(
         status: 'idle',
         endpoints,
         ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
-            ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true } : {}) },
+            ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true } : {}) },
     };
 }
 
