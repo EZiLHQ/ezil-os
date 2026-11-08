@@ -5,6 +5,7 @@ import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
 import { uploaded_image_canvas } from './image-file.js';
+import { currentComputer } from '../../session.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
@@ -386,7 +387,9 @@ export function open_feedback_dialog (_opts) {
     const draft = read_draft();
     let clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
     const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && ! inflight.has(entry.clientRequestId)).length;
-    const computer = window.__EZIL_BOOT__?.computer?.id;
+    // The canonical current computer (Settings switches never rewrite the boot
+    // payload), snapshotted once: the frozen body keeps it through retries.
+    const computer = currentComputer()?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
     const dialog = document.createElement('dialog');
