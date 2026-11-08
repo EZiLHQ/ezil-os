@@ -18,6 +18,21 @@ describe('gateway sanitizer', () => {
         expect(buildGatewayBody(model, ask()).body).toMatchObject({ temperature: 0, top_p: 1 });
         expect(buildGatewayBody(model, { ...ask(), modelOptions: { temperature: NaN, top_p: Infinity } }).body.temperature).toBeUndefined();
     });
+    test('Gemini aliases that refuse sampling never get temperature/top_p; other models keep them', () => {
+        const options = { ...ask(), modelOptions: { temperature: 0.2, top_p: 0.9 } };
+        for (const alias of ['gemini-3.8-flash', ' Gemini-3.8-Flash ', 'gemini-4-argon']) {
+            const lines: string[] = [];
+            const body = buildGatewayBody({ ...gw(), model: alias, temperature: 0.5, topP: 0.5 }, options, line => lines.push(line)).body;
+            expect(body.temperature).toBeUndefined(); expect(body.top_p).toBeUndefined();
+            expect(Object.keys(body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream']);
+            expect(lines).toEqual([`[gateway] temperature/top_p not sent: ${alias} refuses sampling options`]);
+        }
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask(), () => { throw new Error('no option, no log'); }).body.temperature).toBeUndefined();
+        for (const alias of [gw().model, KIMI, 'gemini-3.1-pro-preview', 'gemini-3.8-flash-lite']) {
+            expect(buildGatewayBody({ ...gw(), model: alias }, options).body).toMatchObject({ temperature: 0.2, top_p: 0.9 });
+            expect(buildGatewayBody({ ...gw(), model: alias, temperature: 0.4, topP: 0.6 }, ask()).body).toMatchObject({ temperature: 0.4, top_p: 0.6 });
+        }
+    });
     test('system messages become text blocks and empty system text is dropped', () => {
         const body = build(ask([msg('system', txt(''), txt('rules'), marker), msg('user', txt('q'))]));
         expect(body.system).toEqual([{ type: 'text', text: 'rules' }]);

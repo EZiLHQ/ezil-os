@@ -155,6 +155,26 @@ R_PICKER_ORDER='let t=this._getVisibleItemBounds().sort((i,n)=>(i.item.canShrink
 P_PICKER_SHRINK='canShrink:r.id===u2.ID,'
 P_PICKER_MODEL_ID='static{this.ID="workbench.action.chat.openModelPicker"}'
 P_PICKER_FIT='if(!i.some(({item:r})=>r.canShrink)&&n.width>e+o4e)return!1;for(let{item:r,bounds:a}of i){let c=n.itemWidths.get(r);if(!r.canShrink&&c!==void 0&&a.width<c-o4e)return!1}return!0}'
+# workbench.js `picker-touch` + `title-tap`: a tap on a phone never changed the model (image e2e, touch taps). On a touch
+# device VS Code's Gesture cancels touchstart/touchend once a registered target gets a gesture, so the browser sends no
+# mouse events and no click. The model picker's name and settings buttons opened only on mousedown (pointerdown on
+# iOS), so on Android a tap did nothing; `picker-touch` is upstream's own fix (microsoft/vscode#339777, after 1.141):
+# plain mousedown for the mouse and a Gesture Tap for touch and pen, so a tap opens it once on iOS too (the iOS
+# pointerdown listener is gone; _show toggles, so two opens would close it). The chat-header patch put the pickers inside the
+# chat title row, whose Tap/click handler focuses the input: the open list lost focus and closed at once (iOS, and
+# Android after picker-touch). The header's stopPropagation cannot help, because Gesture dispatches its non-bubbling
+# Tap to each registered target directly; `title-tap` makes the title row ignore Taps and clicks that start inside
+# the EZiL header. Taps elsewhere on the title still focus the input.
+A_PICKER_TOUCH='_registerButtonAction(e,t){this._register($p(e,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),'
+R_PICKER_TOUCH='_registerButtonAction(e,t){this._register(q(e,oe.MOUSE_DOWN,i=>{i.button===0&&(bt.stop(i,!0),t(!1))})),this._register(hs.addTarget(e)),this._register(q(e,jn.Tap,i=>{bt.stop(i,!0),t(!1)})),'
+A_TITLE_TAP='this._register(hs.addTarget(this.titleContainer));for(let i of[jn.Tap,oe.CLICK])this._register(q(this.titleContainer,i,()=>{this.delegate.focusChat()}))'
+R_TITLE_TAP='this._register(hs.addTarget(this.titleContainer));for(let i of[jn.Tap,oe.CLICK])this._register(q(this.titleContainer,i,n=>{(n.initialTarget??n.target)?.closest?.(".ezil-chat-header")||this.delegate.focusChat()}))'
+# Names both rely on (checked, never patched): Gesture (hs), its Tap event (jn), the listener helper (q), EventHelper
+# (bt) and dom.EventType (oe, MOUSE_DOWN), as upstream's phone chip uses them in this bundle.
+P_TOUCH_CHIP='this._renderDisposables.add(hs.addTarget(t));for(let i of[oe.CLICK,jn.Tap])this._renderDisposables.add(q(t,i,n=>{bt.stop(n,!0),this._showSheet()}))'
+P_TOUCH_GESTURE='var hs=tx;'
+P_TOUCH_TAP='var jn;(n=>(n.Tap="-monaco-gesturetap",'
+P_TOUCH_DOWN='var oe={CLICK:"click",AUXCLICK:"auxclick",DBLCLICK:"dblclick",MOUSE_UP:"mouseup",MOUSE_DOWN:"mousedown",'
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -299,6 +319,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch picker-flip    "$WB"  1  "$A_PICKER_FLIP" "$R_PICKER_FLIP"
   for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done
   patch picker-order   "$WB"  1  "$A_PICKER_ORDER" "$R_PICKER_ORDER"
+  for p in "$P_TOUCH_CHIP" "$P_TOUCH_GESTURE" "$P_TOUCH_TAP" "$P_TOUCH_DOWN"; do gate touch-names "$WB" 1 "$p"; done
+  patch picker-touch   "$WB"  1  "$A_PICKER_TOUCH" "$R_PICKER_TOUCH"
+  patch title-tap      "$WB"  1  "$A_TITLE_TAP" "$R_TITLE_TAP"
   patch status-signin  "$WB"  1  "$A_STATUS_SIGNIN" "$R_STATUS_SIGNIN"
   patch status-setup-text "$WB" 1 "$A_STATUS_SETUP_TEXT" "$R_STATUS_SETUP_TEXT"
   patch participant-fullname "$PKG" 6 "$A_FULLNAME" "$R_FULLNAME"
@@ -360,6 +383,9 @@ for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$
 gate picker-flip      "$WB"  0  "$A_PICKER_FLIP";   gate picker-flip      "$WB"  1  "$R_PICKER_FLIP"
 for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done
 gate picker-order     "$WB"  0  "$A_PICKER_ORDER";  gate picker-order     "$WB"  1  "$R_PICKER_ORDER"
+for p in "$P_TOUCH_CHIP" "$P_TOUCH_GESTURE" "$P_TOUCH_TAP" "$P_TOUCH_DOWN"; do gate touch-names "$WB" 1 "$p"; done
+gate picker-touch     "$WB"  0  "$A_PICKER_TOUCH";  gate picker-touch     "$WB"  1  "$R_PICKER_TOUCH"
+gate title-tap        "$WB"  0  "$A_TITLE_TAP";     gate title-tap        "$WB"  1  "$R_TITLE_TAP"
 gate status-signin    "$WB"  0  "$A_STATUS_SIGNIN"; gate status-signin    "$WB"  1  "$R_STATUS_SIGNIN"
 gate status-setup-text "$WB" 0 "$A_STATUS_SETUP_TEXT"; gate status-setup-text "$WB" 1 "$R_STATUS_SETUP_TEXT"
 gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$PKG" 6 "$R_FULLNAME"

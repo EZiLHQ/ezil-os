@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction phone
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone} "
+# Passes to run, in order (default all): fresh returning history sessions compaction phone subagent flash
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone subagent flash} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -157,9 +157,10 @@ if(machine["chat.allowAnonymousAccess"]!==true||machine["chat.disableAIFeatures"
   [[ "$ok" == 1 ]]
 }
 
-start_mock() {
+start_mock() { # start_mock [flash]: flash serves a v1 catalog that suggests Gemini 3.8 Flash (EZIL_MOCK_FLASH=1)
+  local flash=0; [[ "${1:-}" == flash ]] && flash=1
   docker cp "$here/copilot-ezil-messages-mock.mjs" "$NAME:/tmp/copilot-ezil-messages-mock.mjs"
-  docker exec -d "$NAME" bash -c "node /tmp/copilot-ezil-messages-mock.mjs ${MOCK_PORT} /home/neko/project ${CAPTURE_DIR} >/tmp/copilot-ezil-mock.log 2>&1"
+  docker exec -d "$NAME" bash -c "EZIL_MOCK_FLASH=$flash node /tmp/copilot-ezil-messages-mock.mjs ${MOCK_PORT} /home/neko/project ${CAPTURE_DIR} >/tmp/copilot-ezil-mock.log 2>&1"
   sleep 1
   inx "curl -fsS -H 'Authorization: Bearer ${TEST_TOKEN}' http://127.0.0.1:${MOCK_PORT}/ai/v1/models" >/dev/null
 }
@@ -290,15 +291,44 @@ fi
 
 # ── Pass 6: a phone's narrow chat keeps the model picker's name (patch-copilot-chat.sh picker-order) ──
 if [[ "$PASSES" == *" phone "* ]]; then
-echo "[e2e] pass 6 — phone: the header's model picker keeps its name at 390 and 412 px, and a desktop chat every label"
+echo "[e2e] pass 6 — phone: the header's model picker keeps its name, opens and switches by touch (Android and iPhone), the pick reaches the Gateway and survives a reload; desktop by mouse"
 ST7="$WORK/phone"; mkdir -p "$ST7/home/neko/project" "$ST7/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST7/etc/ezil/models.e2e.json"
 FORWARD_PORT=$((FORWARD_PORT + 1))
 boot "$ST7"
 start_mock || fail=1
-EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
 collect_logs phone
 network_checks phone || fail=1
+fi
+
+# ── Pass 7: an Agent turn starts a subagent on another EZiL model (VS Code's runSubagent `model`) ──
+if [[ "$PASSES" == *" subagent "* ]]; then
+echo "[e2e] pass 7 — subagent: runSubagent with a model runs the child on it, without one inherits the parent's, an unlisted one is refused"
+ST8="$WORK/subagent"; mkdir -p "$ST8/home/neko/project" "$ST8/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST8/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST8"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/subagent" node "$here/copilot-ezil-subagent.mjs" || fail=1
+collect_logs subagent
+network_checks subagent || fail=1
+fi
+
+# ── Pass 8: the Gateway's suggested Gemini 3.8 Flash is the first model; a pick stays picked ──
+if [[ "$PASSES" == *" flash "* ]]; then
+echo "[e2e] pass 8 — flash: a catalog that suggests Gemini 3.8 Flash makes it the first model, its turn has no sampling, a picked Qwen survives a reload and a new chat"
+ST9="$WORK/flash"; mkdir -p "$ST9/home/neko/project" "$ST9/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST9/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST9"
+start_mock flash || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/flash" node "$here/copilot-ezil-flash.mjs" || fail=1
+collect_logs flash
+network_checks flash || fail=1
 fi
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi

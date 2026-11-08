@@ -3,7 +3,7 @@
 
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withGatewayModelLimits, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withCatalogDefault, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -96,7 +96,8 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
         maxOutputTokens: model.provider.type === 'ezil-gateway' ? gatewayOutputTokens(model) : model.maxOutputTokens,
         capabilities: { toolCalling: model.capabilities.toolCalling, imageInput: model.provider.type === 'ezil-gateway' ? false : model.capabilities.imageInput },
     };
-    // Proposed `chatProvider` fields; harmless extras where the proposal is not enabled.
+    // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
+    // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
     info.isDefault = model.default;
     info.isUserSelectable = true;
     return info;
@@ -140,8 +141,8 @@ function aiCreditsLink(): vscode.Uri | undefined {
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps and capabilities). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify(catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
-        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])) : 'unread';
+    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
@@ -186,8 +187,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
-            return [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
-                .map(model => toInformation(withGatewayModelLimits(model, catalog.get(model.provider))));
+            // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
+            const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
+                .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
+            return withCatalogDefault(offered, catalog).map(toInformation);
         } finally { cancel.dispose(); }
     }
 

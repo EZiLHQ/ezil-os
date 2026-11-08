@@ -190,12 +190,14 @@ export const CONFIG_TEMPLATE = {
     ]
 };
 
-/** The VS Code settings that pin EZiL models into Copilot Chat's default/plan/utility slots. */
+/**
+ * The VS Code settings that pin EZiL models into Copilot Chat's plan/utility slots. Not `chat.defaultModel`: VS Code
+ * 1.141 puts a configured default over the user's remembered model in every new or reloaded empty chat, so a picked
+ * model would not stick. The first model comes from the config's `default` model (the provider's declared default).
+ */
 export function settingsSnippet(models: readonly ResolvedModel[]): Record<string, unknown> {
     const byRole = (role: ResolvedModel['roles'][number]) => models.find(model => model.roles.includes(role));
     const snippet: Record<string, unknown> = { 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent' };
-    const main = byRole('default') ?? models.find(model => model.default);
-    if (main) snippet['chat.defaultModel'] = main.id;
     const plan = byRole('plan'); if (plan) snippet['chat.planAgent.defaultModel'] = plan.id;
     const utility = byRole('utility'); if (utility) snippet['chat.utilityModel'] = `ezil/${utility.id}`;
     const small = byRole('utilitySmall'); if (small) snippet['chat.utilitySmallModel'] = `ezil/${small.id}`;
@@ -276,7 +278,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             { label: '$(refresh) Reload config', description: store.error() ? 'last load failed' : `${store.models().length} model(s)`, action: reload },
             { label: '$(credit-card) Show AI credits', action: showCredits },
             { label: '$(graph) Show token usage', action: showUsage },
-            { label: '$(clippy) Copy settings snippet', description: 'chat.defaultModel / plan / utility for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
+            { label: '$(clippy) Copy settings snippet', description: 'plan / utility models for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
         ];
         if (store.error()) items.push({ label: '$(error) Config error', detail: store.error(), action: () => output.show() });
         for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : store.notices().includes(problem) ? 'Setting ignored' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
@@ -286,7 +288,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 label: `${model.default ? '$(star-full) ' : ''}${model.name}`,
                 description: `${model.id} -> ${model.providerName}/${model.model}`,
                 detail: `${model.provider.type} · in ${model.maxInputTokens} / out ${model.maxOutputTokens}${model.thinking ? ` · thinking ${model.thinking.type}${model.thinking.effort ? `/${model.thinking.effort}` : ''}` : ''}${model.cache.enabled ? ` · cache ${model.cache.ttl}` : ''}${model.roles.length ? ` · roles ${model.roles.join(', ')}` : ''}`,
-                action: () => { void vscode.window.showInformationMessage(`EZiL Models: set "chat.defaultModel": "${model.id}" to make ${model.name} the default.`); },
+                action: () => { void vscode.window.showInformationMessage(`EZiL Models: mark ${model.name} "default": true in the config to make it the first model; a model picked in Chat stays picked.`); },
             });
         }
         const picked = await vscode.window.showQuickPick(items, { title: 'EZiL Models', placeHolder: 'Manage the EZiL model provider' });

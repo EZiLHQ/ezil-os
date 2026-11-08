@@ -86,6 +86,16 @@ describe('Responses request subset', () => {
         expect(buildGatewayResponsesBody({ ...model(), stream: false }, ask()).body.stream).toBe(false);
     });
 
+    test('Gemini aliases that refuse sampling never get temperature/top_p over Responses either', () => {
+        const options = { ...ask(), modelOptions: { temperature: 0.2, top_p: 0.9 } };
+        for (const alias of ['gemini-3.8-flash', 'GEMINI-4-ARGON']) {
+            const lines: string[] = [];
+            const body = buildGatewayResponsesBody({ ...model(), model: alias, temperature: 0.5, topP: 0.5 }, options, line => lines.push(line)).body;
+            expect([body.temperature, body.top_p, lines]).toEqual([undefined, undefined, [`[gateway] temperature/top_p not sent: ${alias} refuses sampling options`]]);
+        }
+        expect(buildGatewayResponsesBody(model(), options).body).toMatchObject({ temperature: 0.2, top_p: 0.9 });
+    });
+
     for (const mimeType of ['text/plain', 'text/markdown']) test(`inlines ${mimeType} data in messages and nested tool results, as on Messages`, () => {
         const data = { ...image, mimeType, data: new TextEncoder().encode('line one\nline two') };
         expect(build(ask([msg('user', txt('Inspect this '), data)])).body.input).toEqual([

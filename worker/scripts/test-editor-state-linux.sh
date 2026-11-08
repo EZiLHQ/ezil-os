@@ -55,7 +55,9 @@ assert.equal(machine['chat.disableAIFeatures'], false);
 assert.equal(machine['chat.byokUtilityModelDefault'], 'mainAgent');
 assert.equal(machine['chat.utilityModel'], 'ezil/qwen.qwen3-coder-next');
 assert.equal(machine['chat.utilitySmallModel'], 'ezil/qwen.qwen3-coder-next');
-assert.equal(machine['chat.defaultModel'], 'qwen.qwen3-coder-next');
+// No chat.defaultModel: VS Code 1.141 puts a configured default over the user's remembered model in every new or
+// reloaded empty chat. The first model comes from the provider's declared default (models.json "default").
+assert.equal('chat.defaultModel' in machine, false);
 assert.equal(machine['telemetry.telemetryLevel'], 'off');
 assert.equal(machine['github.copilot.chat.tools.viewImage.enabled'], false);
 assert.equal(machine['github.copilot.chat.virtualTools.threshold'], 64);

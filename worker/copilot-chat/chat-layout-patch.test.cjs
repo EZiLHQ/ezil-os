@@ -223,6 +223,45 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.deepEqual(a.order, b.order); assert.deepEqual(a.order, ['context', 'permissions']);
     });
 
+    // The bundle's own model picker button wiring and chat title handler, against doubles of the helpers they use.
+    await t.test('a tap opens the model picker once; the mouse opens it on mousedown (picker-touch, upstream #339777)', () => {
+      const i = code.indexOf('_registerButtonAction(e,t){'), j = code.indexOf('}getCacheBreakLearnMoreLink(){', i);
+      assert(i > 0 && j > i, '_registerButtonAction found');
+      const wire = new Function('bt', 'hs', 'q', 'jn', 'oe', 'Jt', 'return function(e,t){' + code.slice(i + '_registerButtonAction(e,t){'.length, j) + '}');
+      const run = () => {
+        const calls = { opened: [], down: null, listeners: {}, targets: [], stopped: 0 };
+        const fn = wire(
+          { stop: () => calls.stopped++ }, { addTarget: el => (calls.targets.push(el), {}) },
+          (el, type, h) => { calls.listeners[type] = h; return {}; }, { Tap: '-monaco-gesturetap' }, { KEY_DOWN: 'keydown', MOUSE_DOWN: 'mousedown', POINTER_DOWN: 'pointerdown' }, class { equals() { return false; } });
+        const button = {};
+        fn.call({ _register: d => d }, button, keyboard => calls.opened.push(keyboard));
+        return { calls, button };
+      };
+      const { calls, button } = run();
+      assert.deepEqual(calls.targets, [button], 'the button is a Gesture target');
+      calls.listeners['-monaco-gesturetap']({});
+      assert.deepEqual(calls.opened, [false], 'a Tap opens it (from the pointer, not the keyboard)');
+      assert.deepEqual(Object.keys(calls.listeners).sort(), ['-monaco-gesturetap', 'keydown', 'mousedown'], 'no pointerdown listener: an iOS tap cannot open it a second time');
+      calls.listeners.mousedown({ button: 0 }); calls.listeners.mousedown({ button: 2 });
+      assert.deepEqual(calls.opened, [false, false], 'a left mousedown still opens it; other buttons do not');
+      const pristine = fs.readFileSync(path.join(source, wb), 'utf8');
+      assert(!pristine.slice(pristine.indexOf('_registerButtonAction(e,t){'), pristine.indexOf('}getCacheBreakLearnMoreLink(){')).includes('jn.Tap'), 'unpatched: no Tap handler');
+    });
+
+    await t.test('the title row ignores taps and clicks that start in the EZiL header (title-tap)', () => {
+      const i = code.indexOf('this._register(q(this.titleContainer,i,'), j = code.indexOf('))', i);
+      assert(i > 0 && j > i);
+      const handlerSource = code.slice(i + 'this._register(q(this.titleContainer,i,'.length, j);
+      let focused = 0;
+      const handler = new Function('return ' + handlerSource).call({ delegate: { focusChat: () => focused++ } });
+      const inHeader = { closest: sel => (sel === '.ezil-chat-header' ? {} : null) };
+      const elsewhere = { closest: () => null };
+      handler({ initialTarget: inHeader }); handler({ target: inHeader });
+      assert.equal(focused, 0, 'a Tap or click on a header picker does not move focus to the input');
+      handler({ initialTarget: elsewhere }); handler({ target: elsewhere }); handler({ target: { nodeType: 3 } }); handler({});
+      assert.equal(focused, 4, 'taps and clicks elsewhere on the title (or without an element) still focus the input');
+    });
+
     await t.test('patch rejects a moved header anchor', () => {
       fs.copyFileSync(path.join(source, wb), path.join(root, wb));
       fs.copyFileSync(path.join(source, css), path.join(root, css));

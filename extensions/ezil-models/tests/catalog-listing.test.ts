@@ -532,3 +532,82 @@ describe('Show AI Status: each row\'s availability, in the contract\'s words', (
         expect(view.lines).toContain('Global AI pause: none reported.');
     });
 });
+
+// Founder request 2026-11-08: Gemini 3.8 Flash as the first model when the Gateway names it (`default_model`, contract §2
+// rule 8) and this caller can use it in an Agent session; a picked model still wins (VS Code persists only picks).
+describe('the Gateway\'s suggested default model', () => {
+    const FLASH = 'gemini-3.8-flash';
+    const flash = (state = 'available', extra: Row = {}) => row(FLASH, state, { name: 'Gemini 3.8 Flash', capabilities: { tool_calling: true, image_input: false, streaming: true }, ...extra });
+    const defaults = (infos: { id: string }[]) => infos.filter(info => (info as { isDefault?: boolean }).isDefault).map(info => info.id);
+
+    test('an available Flash row with tool calling becomes the declared default in place of Qwen', async () => {
+        const g = gateway(load(), () => Response.json(v1([row(QWEN, 'available'), row(KIMI, 'available'), flash()], { default_model: FLASH })));
+        const infos = await list(g.provider);
+        expect(ids(infos)).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
+    });
+
+    test('otherwise the configured default (Qwen) stays: no hint, null, legacy, unavailable, no tools, unknown protocol, missing row', async () => {
+        const cases: unknown[] = [
+            v1([row(QWEN, 'available'), flash()]),
+            v1([row(QWEN, 'available'), flash()], { default_model: null }),
+            { ...legacy([row(QWEN), flash()]), default_model: FLASH },
+            v1([row(QWEN, 'available'), flash('unavailable', { availability: { state: 'unavailable', reasons: ['not_allowed_for_caller'] } })], { default_model: FLASH }),
+            v1([row(QWEN, 'available'), flash('available', { capabilities: { tool_calling: false, image_input: false, streaming: true } })], { default_model: FLASH }),
+            v1([row(QWEN, 'available'), flash('available', { capabilities: undefined })], { default_model: FLASH }),
+            v1([row(QWEN, 'available'), flash('available', { protocols: ['openai-chat-v9'] })], { default_model: FLASH }),
+            v1([row(QWEN, 'available'), flash('available', { enabled: false })], { default_model: FLASH }),
+            v1([row(QWEN, 'available')], { default_model: FLASH }),
+            v1([row(QWEN, 'available'), flash()], { default_model: 'Gemini 3.8 Flash' }),
+        ];
+        for (const catalog of cases) {
+            forgetGatewayModels();
+            const g = gateway(load(), () => Response.json(catalog));
+            expect(defaults(await list(g.provider))).toEqual([QWEN]);
+        }
+    });
+
+    test('an unreadable catalog keeps the configured default even while the last rows stay listed', async () => {
+        let up = true;
+        const g = gateway(load(), () => up ? Response.json(v1([row(QWEN, 'available'), flash()], { default_model: FLASH })) : new Response('down', { status: 503 }));
+        expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+        up = false;
+        const later = Date.now() + 6 * 60_000;
+        const now = spyOn(Date, 'now').mockReturnValue(later);
+        try {
+            const infos = await list(g.provider);
+            expect(ids(infos)).toContain(`ezil/${FLASH}`);
+            expect(defaults(infos)).toEqual([QWEN]);
+        } finally { now.mockRestore(); }
+    });
+
+    test('a request on the Flash default names gemini-3.8-flash and carries no temperature/top_p; Qwen keeps them', async () => {
+        const g = gateway(load(), () => Response.json(v1([row(QWEN, 'available'), row(KIMI, 'available'), flash()], { default_model: FLASH })));
+        const infos = await list(g.provider);
+        const first = infos.find(info => (info as { isDefault?: boolean }).isDefault)!;
+        await send(g.provider, first, undefined, [READ_FILE], { temperature: 0.2, top_p: 0.9 });
+        await send(g.provider, infos.find(info => info.id === QWEN)!, undefined, [READ_FILE], { temperature: 0.2, top_p: 0.9 });
+        expect(g.posts.map(post => [post.body.model, post.body.temperature, post.body.top_p, (post.body.tools as unknown[] | undefined)?.length])).toEqual([
+            [FLASH, undefined, undefined, 1], [QWEN, 0.2, 0.9, 1]]);
+    });
+
+    test('a configured model for the suggested alias (any case) is the one made default, not a second entry', async () => {
+        const config = load();
+        const flashConfigured = { ...config.models[1]!, id: 'flash-configured', name: 'Flash (configured)', model: 'Gemini-3.8-Flash', default: false };
+        const g = gateway({ ...config, models: [config.models[0]!, flashConfigured] }, () => Response.json(v1([row(QWEN, 'available'), flash()], { default_model: FLASH })));
+        const infos = await list(g.provider);
+        expect(ids(infos)).toEqual([QWEN, 'flash-configured']);
+        expect(defaults(infos)).toEqual(['flash-configured']);
+    });
+
+    test('a change of the suggested default alone re-lists the models', async () => {
+        let catalog = v1([row(QWEN, 'available'), flash()]);
+        const g = gateway(load(), () => Response.json(catalog));
+        expect(defaults(await list(g.provider))).toEqual([QWEN]);
+        catalog = v1([row(QWEN, 'available'), flash()], { default_model: FLASH });
+        forgetGatewayModels();
+        await send(g.provider, { id: QWEN });
+        expect(g.changes()).toBe(1);
+        expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+    });
+});
