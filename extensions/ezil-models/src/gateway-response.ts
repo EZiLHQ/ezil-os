@@ -1,14 +1,54 @@
 import type { SseEvent } from './sse';
 import type { StreamEvent, Usage } from './types';
 import { isObject } from './gateway-messages';
+import { GatewayError } from './gateway-error';
 
 const STOP_REASONS = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'refusal']);
+export const RESPONSE_FAILURE_REASONS = ['stream_error_event', 'stream_truncated', 'stream_malformed', 'connection_reset', 'invalid_response'] as const;
+export type GatewayResponseReason = typeof RESPONSE_FAILURE_REASONS[number];
+/** The codes an SSE error event may name that triage keeps (docs/CHAT-FAILURE-CAPTURE-CONTRACT.md §2 `upstreamCode`): the Gateway's
+ * own stream error codes (EZiL AI Gateway src/app.ts streamErrorEvent) and the provider's Anthropic error types. Nothing else. */
+const UPSTREAM_CODES = ['stream_interrupted', 'upstream_timeout', 'settlement_pending', 'upstream_error', 'overloaded_error', 'api_error',
+    'rate_limit_error', 'timeout_error'] as const;
+export type UpstreamCode = typeof UPSTREAM_CODES[number];
+export function sanitizeUpstreamType(value: unknown): UpstreamCode | undefined {
+    return typeof value === 'string' && (UPSTREAM_CODES as readonly string[]).includes(value) ? value as UpstreamCode : undefined;
+}
+
 export class GatewayResponseError extends Error {
     /** A reply arrived (or started to) but was not usable; see GatewayErrorOrigin in gateway.ts. */
     public readonly origin = 'response' as const;
-    constructor(public readonly requestId?: string, public readonly code = 'stream_interrupted') {
+    public readonly upstreamType?: UpstreamCode;
+    constructor(public readonly requestId?: string, public readonly code = 'stream_interrupted',
+        public readonly reason: GatewayResponseReason = code === 'invalid_response' ? 'invalid_response' : 'stream_malformed', upstreamType?: unknown) {
         super(`EZiL AI: interrupted (request ${requestId ?? 'unknown'})`);
+        this.upstreamType = sanitizeUpstreamType(upstreamType);
     }
+}
+
+/** Keep only a closed error type; neither the parsed payload nor its message escapes. */
+export function streamErrorEvent(data: string, requestId?: string): GatewayResponseError {
+    let upstreamType: UpstreamCode | undefined;
+    try {
+        const raw: unknown = JSON.parse(data);
+        if (isObject(raw)) {
+            const error = isObject(raw.error) ? raw.error : {};
+            upstreamType = sanitizeUpstreamType(raw.code) ?? sanitizeUpstreamType(error.code) ?? sanitizeUpstreamType(error.type);
+        }
+    } catch { /* An explicit error event remains an error event even with malformed data. */ }
+    return new GatewayResponseError(requestId, 'stream_interrupted', 'stream_error_event', upstreamType);
+}
+
+/** Preserve typed deadlines and cancellation at both the body and event-validation boundaries. */
+export function responseFailure(error: unknown, requestId: string | undefined, reason: GatewayResponseReason): unknown {
+    if (error instanceof GatewayError || error instanceof GatewayResponseError || (error instanceof Error && error.name === 'AbortError')) return error;
+    return new GatewayResponseError(requestId, 'stream_interrupted', reason);
+}
+
+/** Only iterator rejections reach this catch; consumer JSON/shape validation runs outside it. */
+export async function* gatewayBodyEvents(events: AsyncIterable<SseEvent>, requestId?: string): AsyncGenerator<SseEvent> {
+    try { yield* events; }
+    catch (error) { throw responseFailure(error, requestId, 'connection_reset'); }
 }
 
 function usage(value: unknown): Usage {
@@ -44,7 +84,7 @@ export function gatewayJson(value: unknown, requestId?: string): StreamEvent[] {
         }
         events.push({ type: 'usage', usage: usage(value.usage) }, { type: 'stop', reason: value.stop_reason, details: { requestId } });
         return events;
-    } catch { throw new GatewayResponseError(requestId, 'invalid_response'); }
+    } catch { throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response'); }
 }
 
 /** Anthropic events, including the gateway's final-input usage (message_start counts are provisional).
@@ -57,12 +97,12 @@ export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?
     const blocks = new Map<number, { block: Record<string, unknown>; json: string }>();
     const seen = new Set<number>();
     try {
-        for await (const event of events) {
-            if (event.event === 'error') throw new GatewayResponseError(requestId);
+        for await (const event of gatewayBodyEvents(events, requestId)) {
+            if (event.event === 'error') throw streamErrorEvent(event.data, requestId);
             const raw: unknown = JSON.parse(event.data);
             if (!isObject(raw)) throw new Error('Invalid event');
             const type = event.event ?? raw.type;
-            if (type === 'error') throw new GatewayResponseError(requestId);
+            if (type === 'error') throw streamErrorEvent(event.data, requestId);
             if (type === 'ping') continue;
             if (stopped || (raw.type !== undefined && raw.type !== type)) throw new Error('Invalid order');
             if (type === 'message_start') {
@@ -108,11 +148,10 @@ export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?
                 blocks.delete(index);
             } else throw new Error('Unknown event');
         }
-        if (!stopped) throw new GatewayResponseError(requestId);
+        if (!stopped) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated');
         yield { type: 'usage', usage: finalUsage! };
         yield { type: 'stop', reason: stopReason, details: { requestId } };
     } catch (error) {
-        if (error instanceof GatewayResponseError) throw error;
-        throw new GatewayResponseError(requestId);
+        throw responseFailure(error, requestId, 'stream_malformed');
     }
 }

@@ -5,6 +5,8 @@
 // code host (`$EZIL_AI_BASE_URL`, `.../ai/v1`), authenticated by `$EZIL_AI_PROXY_TOKEN`.
 
 import { randomUUID } from 'node:crypto';
+import { GatewayError, type GatewayErrorOrigin } from './gateway-error';
+import { classifyChatFailure, sanitizeFailureId, type ChatFailure } from './failure';
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
@@ -42,30 +44,7 @@ const MODELS_TTL_MS = 5 * 60_000;
 const SIDE_CALL_TIMEOUT_MS = 5_000;
 const MICRO_PER_CREDIT = 1_000_000;
 
-/**
- * Where a failure arose: `local` (refused or failed on this computer; nothing was sent), `os_proxy` (the EZiL OS
- * AI proxy answered itself), `gateway` (an EZiL AI refusal relayed by the proxy), `transport` (a deadline or
- * connection failure on the way, or an HTTP error neither of them wrote) or `response` (a reply that arrived but
- * was truncated, incomplete or malformed).
- */
-export type GatewayErrorOrigin = 'local' | 'os_proxy' | 'gateway' | 'transport' | 'response';
-
-/** A gateway (or OS proxy, or local) refusal, carrying what the UI and the log need. */
-export class GatewayError extends Error {
-    constructor(
-        message: string,
-        public readonly status: number | undefined,
-        public readonly code: string | undefined,
-        public readonly requestId: string | undefined,
-        public readonly retryAfterSeconds?: number,
-        public readonly origin: GatewayErrorOrigin = 'gateway',
-        /** Local refusals only: sizes, never payload text. */
-        public readonly counts?: LocalRequestCounts,
-    ) {
-        super(message);
-        this.name = 'GatewayError';
-    }
-}
+export { GatewayError, type GatewayErrorOrigin } from './gateway-error';
 
 export type GatewayOptions = {
     signal: AbortSignal;
@@ -79,6 +58,8 @@ export type GatewayOptions = {
     onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
     /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
     onCompact?: (info: CompactionInfo) => void;
+    /** Sanitized failure/cancellation only; callback errors cannot affect the turn. */
+    onOutcome?: (record: ChatFailure) => void;
 };
 
 // ── /v1/models limits (cached) and credits ────────────────────────────────────
@@ -561,12 +542,14 @@ const transportError = (code: TransportCode, requestId?: string) => new GatewayE
  * deadline counted from `sentAt`, when this request was first sent, so a transport resend gets only what is left.
  * With nothing left it fails with `completion_timeout` (`abort` carries it) and sends nothing.
  */
-async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean, sentAt: number): Promise<Response> {
+async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean, sentAt: number,
+    onSend: () => void): Promise<Response> {
     const started = stream ? performance.now() : sentAt;
     const deadline = stream ? GATEWAY_FIRST_BYTE_TIMEOUT_MS : GATEWAY_COMPLETION_TIMEOUT_MS;
     const firstCode: TransportCode = stream ? 'first_byte_timeout' : 'completion_timeout';
     const left = deadline - (performance.now() - started);
     if (left <= 0) { const expired = transportError(firstCode); abort.abort(expired); throw expired; }
+    onSend();
     const response = await bounded(doFetch(url, { ...init, signal: abort.signal }), left, abort, transportError(firstCode));
     if (!response.body) return response;
     const reader = response.body.getReader();
@@ -605,7 +588,7 @@ async function* validateResponsesTools(events: Iterable<StreamEvent> | AsyncIter
         else pending.push(event);
     }
     signal.throwIfAborted();
-    if (pending.some(event => event.type === 'tool_call' && !offered.has(event.name))) throw new GatewayResponseError(requestId, 'invalid_response');
+    if (pending.some(event => event.type === 'tool_call' && !offered.has(event.name))) throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response');
     for (const event of pending) {
         signal.throwIfAborted();
         yield event;
@@ -620,6 +603,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const started = now();
     const log = (line: string) => options.log?.(redact(line, [provider.apiKey ?? '', ...Object.values(provider.headers)]));
     let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
+    let previousIdempotencyKey: string | undefined;
     let requestId: string | undefined;
     let hold: string | null = null;
     // The Gateway's exact response cache (opt-in set by EZiL OS, never by this extension): HIT or MISS, as evidence only.
@@ -630,7 +614,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let failureOrigin: GatewayErrorOrigin | undefined;
     let localCounts: LocalRequestCounts | undefined;
     let compaction: CompactionInfo | undefined;
-    let attempted = false;
+    let attempts = 0;
+    let partial = false;
+    let failure: GatewayError | GatewayResponseError | undefined;
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
@@ -701,8 +687,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 const sentAt = resendOf ?? performance.now();
                 let response: Response;
                 try {
-                    attempted = true;
-                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream, sentAt);
+                    response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream, sentAt,
+                        () => { attempts++; });
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
                     // A JSON reply has no headers until it is complete, so a failure this late may have cut off a request
@@ -724,11 +710,11 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     if (Number.isSafeInteger(clamped) && clamped > 0 && Number.isSafeInteger(requested) && clamped < requested) {
                         log(`Reply limited to ${clamped} tokens to fit your credit balance`);
                     }
-                    if (!response.body) throw new GatewayResponseError(requestId);
+                    if (!response.body) throw new GatewayResponseError(requestId, 'stream_interrupted', 'invalid_response');
                     const contentType = response.headers.get('content-type') ?? '';
                     if (!(stream ? contentType.includes('text/event-stream') : contentType.includes('application/json'))) {
                         await response.body.cancel();
-                        throw new GatewayResponseError(requestId, 'invalid_response');
+                        throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response');
                     }
                     const parsed = responses
                         ? stream ? gatewayResponsesStream(response.body, requestId)
@@ -739,6 +725,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         options.signal.throwIfAborted();
                         if (event.type === 'usage') used = event.usage;
                         if (event.type === 'stop') stopReason = event.reason;
+                        if (event.type === 'text' || event.type === 'tool_call') partial = true;
                         yield event;
                     }
                     if (stopReason === 'max_tokens') throw new GatewayError(`Response truncated (request ${requestId ?? 'unknown'})`, status, 'max_tokens', requestId, undefined, 'response');
@@ -792,7 +779,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     built = retry.built;
                     compaction = retry.info;
                     options.onCompact?.(compaction);
-                    idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
+                    const nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
+                    previousIdempotencyKey = idempotencyKey;
+                    idempotencyKey = nextIdempotencyKey;
                     headers['idempotency-key'] = idempotencyKey;
                     resent = false;
                     // A new request: an earlier concurrency wait does not count against it.
@@ -812,11 +801,11 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         if (error instanceof LocalRequestError) error = localRefusal(model, error);
         else if (!(error instanceof GatewayError || error instanceof GatewayResponseError)) {
             // Only a failure before any send is local; once a request may have left, it is an interrupted response.
-            error = status !== undefined || attempted ? new GatewayResponseError(requestId) : new GatewayError(
+            error = status !== undefined || attempts > 0 ? new GatewayResponseError(requestId, 'stream_interrupted', isNetworkError(error) ? 'connection_reset' : 'stream_malformed') : new GatewayError(
                 `EZiL Models: internal error while preparing the request (${errorName(error)}); nothing was sent or charged. Please report it (local_build_error)`,
                 undefined, 'local_build_error', undefined, undefined, 'local');
         }
-        const failure = error as GatewayError | GatewayResponseError;
+        failure = error as GatewayError | GatewayResponseError;
         errorCode = failure.code;
         failureOrigin = failure.origin;
         localCounts = failure instanceof GatewayError ? failure.counts : undefined;
@@ -825,9 +814,21 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         options.signal.removeEventListener('abort', cancelAttempt);
         attemptAbort.abort();
         const cancelled = options.signal.aborted;
+        const at = now();
+        const latencyMs = Math.max(0, at - started);
+        if (cancelled || failure) {
+            try {
+                options.onOutcome?.(classifyChatFailure({ error: failure, cancelled, model: model.model, clientRequestId: idempotencyKey,
+                    previousClientRequestId: previousIdempotencyKey, gatewayRequestId: requestId, attempts, partial, at, latencyMs }));
+            } catch { /* Observers cannot change the outcome or suppress the existing telemetry. */ }
+        }
         // Metadata only: local refusals add their sizes, never content.
         log(JSON.stringify({ request_id: requestId ?? null, model: model.model, stream, hold, http_status: status ?? null,
-            latency_ms: Math.max(0, now() - started), usage: { input: used.inputTokens, output: used.outputTokens, cache_read: used.cacheReadTokens, cache_write: used.cacheWriteTokens },
+            client_request_id: sanitizeFailureId(idempotencyKey),
+            ...(sanitizeFailureId(previousIdempotencyKey) ? { previous_client_request_id: sanitizeFailureId(previousIdempotencyKey) } : {}), attempts,
+            partial: (cancelled || failure !== undefined) && partial,
+            ...(!cancelled && failure instanceof GatewayResponseError ? { reason: failure.reason, upstream_type: failure.upstreamType } : {}),
+            latency_ms: latencyMs, usage: { input: used.inputTokens, output: used.outputTokens, cache_read: used.cacheReadTokens, cache_write: used.cacheWriteTokens },
             stop_reason: stopReason ?? null, error_code: cancelled ? 'cancelled' : errorCode ?? null, origin: cancelled ? null : failureOrigin ?? null,
             ...(!cancelled && localCounts ? { body_bytes: localCounts.bodyBytes, limit_bytes: localCounts.limitBytes, messages: localCounts.messages,
                 max_blocks: localCounts.maxBlocks, tools: localCounts.tools, tool_bytes: localCounts.toolBytes } : {}),
@@ -836,6 +837,12 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 limit_bytes: compaction.limitBytes, folded: compaction.folded, shortened: compaction.shortened } } : {}),
             ...(cancelled ? { notice: `cancelled; may still be charged (request ${requestId ?? 'unknown'})` } : {}) }));
     }
+}
+
+function isNetworkError(error: unknown): boolean {
+    if (error instanceof TypeError || (error instanceof Error && error.name === 'NetworkError')) return true;
+    if (typeof error !== 'object' || error === null || !('code' in error)) return false;
+    return typeof error.code === 'string' && ['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ENETUNREACH', 'EHOSTUNREACH', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET'].includes(error.code);
 }
 
 /**

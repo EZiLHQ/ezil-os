@@ -1,7 +1,7 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
 import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
-import { GatewayResponseError } from './gateway-response';
+import { gatewayBodyEvents, GatewayResponseError, responseFailure, streamErrorEvent } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
 
@@ -193,7 +193,7 @@ export function gatewayResponsesJson(value: unknown, requestId?: string): Stream
             ...item.texts.map(part => ({ type: 'text' as const, value: part.value })), ...(item.tool ? [item.tool] : []),
         ]);
         return [...output, { type: 'usage', usage: terminal.usage }, { type: 'stop', reason: terminal.reason, details: { requestId } }];
-    } catch { throw new GatewayResponseError(requestId, 'invalid_response'); }
+    } catch { throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response'); }
 }
 
 type ItemState = { id: string; index: number; type?: string; callId?: string; name?: string; arguments: string; argumentsDone: boolean;
@@ -202,12 +202,12 @@ const REASONING_EVENTS = new Set(['response.reasoning_summary_part.added', 'resp
     'response.reasoning_summary_text.delta', 'response.reasoning_summary_text.done', 'response.reasoning_text.delta', 'response.reasoning_text.done']);
 
 /** Unlike the legacy SSE reader, never dispatch an unterminated event at EOF. */
-async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
+async function* responseEvents(body: ReadableStream<Uint8Array>, requestId?: string): AsyncGenerator<SseEvent> {
     const reader = body.getReader(), decoder = new TextDecoder('utf-8', { fatal: true });
     let buffer = '', event: string | undefined, data: string[] = [], size = 0, finished = false;
     try {
         while (true) {
-            const next = await reader.read();
+            const next = await reader.read().catch(error => { throw responseFailure(error, requestId, 'connection_reset'); });
             finished = next.done;
             buffer += decoder.decode(next.value, { stream: !next.done });
             let newline: number;
@@ -231,7 +231,9 @@ async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator
             if (buffer.length + size > 4 * 1024 * 1024) throw new Error('Oversized SSE event');
             if (next.done) break;
         }
-        if (buffer || data.length || event !== undefined) throw new Error('Truncated SSE event');
+        if (buffer || data.length || event !== undefined) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated');
+    } catch (error) {
+        throw responseFailure(error, requestId, 'stream_malformed');
     } finally {
         if (!finished) await reader.cancel().catch(() => {});
         reader.releaseLock();
@@ -240,7 +242,7 @@ async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator
 
 /** Text is progressive; tools and usage are released only after a validated terminal and clean EOF. */
 export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | ReadableStream<Uint8Array>, requestId?: string): AsyncGenerator<StreamEvent> {
-    const events = 'getReader' in source ? responseEvents(source) : source;
+    const events = 'getReader' in source ? responseEvents(source, requestId) : source;
     const items = new Map<string, ItemState>(), indexes = new Map<number, string>();
     let responseId: string | undefined, terminal: Terminal | undefined, created = false;
     const itemState = (id: unknown, index: unknown): ItemState => {
@@ -283,12 +285,14 @@ export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | 
         throw new Error('Unsupported content');
     };
     try {
-        for await (const event of events) {
-            if (event.data.trim() === '[DONE]') { if (!terminal) throw new Error('Missing terminal'); continue; }
+        for await (const event of gatewayBodyEvents(events, requestId)) {
+            if (event.event === 'error') throw streamErrorEvent(event.data, requestId);
+            if (event.data.trim() === '[DONE]') { if (!terminal) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated'); continue; }
             const raw: unknown = JSON.parse(event.data);
             if (!isObject(raw)) throw new Error('Invalid event');
             const type = event.event ?? raw.type;
-            if (typeof type !== 'string' || (raw.type !== undefined && raw.type !== type) || terminal || type === 'error') throw new Error('Invalid event order');
+            if (type === 'error') throw streamErrorEvent(event.data, requestId);
+            if (typeof type !== 'string' || (raw.type !== undefined && raw.type !== type) || terminal) throw new Error('Invalid event order');
             if (['response.completed', 'response.incomplete', 'response.failed'].includes(type)) {
                 const result = terminalResponse(raw.response);
                 if (type !== `response.${(raw.response as ObjectValue).status}` || (responseId !== undefined && result.id !== responseId)) throw new Error('Mismatched terminal');
@@ -365,7 +369,7 @@ export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | 
                 yield* text(state, raw.content_index, refusal ? 'refusal' : 'output_text', delta ? raw.delta : refusal ? raw.refusal : raw.text, delta, !delta);
             } else if (!REASONING_EVENTS.has(type) && type !== 'response.output_text.annotation.added') throw new Error('Unsupported event');
         }
-        if (!terminal) throw new Error('Missing terminal response');
+        if (!terminal) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated');
         yield* finalEvents(terminal, requestId);
-    } catch { throw new GatewayResponseError(requestId); }
+    } catch (error) { throw responseFailure(error, requestId, 'stream_malformed'); }
 }
