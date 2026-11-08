@@ -155,12 +155,35 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private listedCatalogs = new Map<ResolvedProvider, string>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
     private modelIdentities = new Map<string, { type: ResolvedProvider['type']; model: string }>();
+    /**
+     * Fallback for a workbench without the ThinkingPart API: Copilot can then not carry a turn's signed thinking into its
+     * history, and a native Claude tool turn needs it back. The completed signed or redacted blocks are kept here, in
+     * memory only and never logged, keyed by the tool call they preceded, and re-attached ahead of that call in the next
+     * request (gateway-messages.ts replays them on the native route only). Bounded; lost on reload, when the request
+     * goes without them as before.
+     */
+    private signedThinking = new Map<string, Part[]>();
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
 
     refresh(): void { this.changed.fire(); }
-    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); }
+    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); }
+
+    private rememberSignedThinking(callId: string, parts: readonly Part[]): void {
+        this.signedThinking.delete(callId);
+        this.signedThinking.set(callId, [...parts]);
+        while (this.signedThinking.size > 64) this.signedThinking.delete(this.signedThinking.keys().next().value!);
+    }
+
+    /** Re-attach kept signed thinking ahead of an assistant message's tool calls when its history carries none. */
+    private restoreSignedThinking(request: ChatRequest): void {
+        for (const message of request.messages) {
+            if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) continue;
+            const call = message.parts.find(part => part.type === 'tool_call' && this.signedThinking.has(part.callId));
+            if (call?.type === 'tool_call') message.parts = [...this.signedThinking.get(call.callId)!, ...message.parts];
+        }
+    }
 
     private rememberModels(models: ResolvedModel[]): ResolvedModel[] {
         for (const model of models) this.modelIdentities.set(model.id, { type: model.provider.type, model: model.model });
@@ -283,8 +306,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
             }
             const request = toNeutralRequest(messages, options);
+            if (!thinkingCtor()) this.restoreSignedThinking(request);
             const Thinking = thinkingCtor();
             let emittedText = false;
+            // Completed signed/redacted thinking of this turn, kept only when the ThinkingPart API is missing.
+            const signed: Part[] = [];
             if (resolved.provider.type === 'ezil-gateway') {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
@@ -325,10 +351,15 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         progress.report(new vscode.LanguageModelTextPart(event.value));
                         break;
                     case 'tool_call':
+                        if (!Thinking && signed.length) this.rememberSignedThinking(event.callId, signed);
                         progress.report(new vscode.LanguageModelToolCallPart(event.callId, event.name, (typeof event.input === 'object' && event.input !== null ? event.input : {}) as object));
                         break;
                     case 'thinking':
                         if (Thinking) progress.report(new Thinking(event.value, event.id, event.metadata) as vscode.LanguageModelResponsePart);
+                        else if (typeof event.metadata?.redactedData === 'string'
+                            || (typeof event.metadata?._completeThinking === 'string' && typeof event.metadata?.signature === 'string' && event.metadata.signature)) {
+                            signed.push({ type: 'thinking', value: '', metadata: event.metadata });
+                        }
                         break;
                     case 'usage':
                         this.host.recordUsage(resolved, event.usage, Date.now() - started);

@@ -603,6 +603,54 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(parts.map(p => (p as object).constructor)).toEqual([TextPart, ToolCallPart, TextPart]);
         } finally { mock.module('vscode', () => fakeVscode); }
     });
+    test('without the ThinkingPart API, a native Claude tool turn keeps its signed thinking for the next request (memory only)', async () => {
+        mock.module('vscode', () => ({ ...fakeVscode, LanguageModelThinkingPart: undefined }));
+        try {
+            const path = '../src/provider?gateway-signed-thinking-fallback';
+            const { EZiLModelsProvider: Without } = await import(path) as typeof providerModule;
+            const thought = 'PRIVATE-THOUGHT inspect first', signature = 'synthetic-signature==';
+            const ev = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+            const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+            const turn = [ev('message_start', { message: { role: 'assistant', usage } }),
+                ev('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '' } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'thinking_delta', thinking: thought } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'signature_delta', signature } }), ev('content_block_stop', { index: 0 }),
+                ev('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'create_file', input: {} } }),
+                ev('content_block_delta', { index: 1, delta: { type: 'input_json_delta', partial_json: '{"filePath":"a","content":"b"}' } }),
+                ev('content_block_stop', { index: 1 }),
+                ev('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } }), ev('message_stop', {})].join('');
+            const bodies: Record<string, unknown>[] = [];
+            const claude = { ...gw('claude-sonnet-5-5'), default: true, capabilities: { toolCalling: true, imageInput: false } };
+            const make = () => {
+                const host = gatewayHost((async (_input: unknown, init?: RequestInit) => {
+                    bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
+                    return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'thinking-fallback' } });
+                }) as unknown as typeof fetch, () => Response.json({ data: [{ id: claude.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 }] }));
+                host.models = () => [claude];
+                return { host, provider: new Without(host) };
+            };
+            const ask = (provider: InstanceType<typeof Without>, history: unknown[]) => {
+                const parts: unknown[] = [];
+                return provider.provideLanguageModelChatResponse(toInformation(claude), history as never, { tools: [CREATE_FILE], modelOptions: {} } as never,
+                    { report: p => parts.push(p) }, token() as never).then(() => parts);
+            };
+            const first = make();
+            const parts = await ask(first.provider, [message(1, [new TextPart('make a file')])]);
+            expect(parts.map(p => (p as object).constructor)).toEqual([ToolCallPart]); // no thinking part can be reported
+            const history = [message(1, [new TextPart('make a file')]), message(2, [new ToolCallPart('toolu_1', 'create_file', { filePath: 'a', content: 'b' })]),
+                message(1, [new ToolResultPart('toolu_1', [new TextPart('done')])])];
+            await ask(first.provider, history);
+            const assistant = (bodies[1]!.messages as { role: string; content: { type: string }[] }[]).find(m => m.role === 'assistant')!;
+            expect(assistant.content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            expect(assistant.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1' });
+            for (const line of first.host.lines) expect(line).not.toContain('PRIVATE-THOUGHT');
+            // Honest limit: a new provider (a reload) has nothing to replay, and the request goes without it as before.
+            const fresh = make();
+            await ask(fresh.provider, history);
+            expect(JSON.stringify(bodies[2])).not.toContain('PRIVATE-THOUGHT');
+            expect(JSON.stringify(bodies[2])).not.toContain('"thinking"');
+        } finally { mock.module('vscode', () => fakeVscode); }
+    });
 });
 
 describe('Gateway Responses VS Code bridge', () => {

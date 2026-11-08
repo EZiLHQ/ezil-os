@@ -79,6 +79,8 @@ function counters(value: unknown): Counters {
  * message_start's preliminary one, which is never used. Input and cache counters come from the final delta (the
  * Converse route reports them only there, all three together), else from message_start (the native route); a native
  * delta that repeats one must repeat it unchanged. A counter neither event carries fails the stream: nothing is zero-filled.
+ * Explicit zeros are valid. The cache counters are REQUIRED like input_tokens, with no default: the Gateway's tap needs
+ * all four (parseAnthropicUsage) and keeps a reservation pending without them, so a reply missing one cannot settle.
  */
 function streamUsage(start: Counters, final: unknown): Usage {
     const f = counters(final);

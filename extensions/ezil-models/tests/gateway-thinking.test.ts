@@ -218,6 +218,37 @@ describe('Gateway usage normalization', () => {
         const zeros = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
         expect(await usageOf([start(zeros), finish({ ...startUsage, output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
     });
+    test('explicit zeros are valid authority (native and Converse)', async () => {
+        const zeros = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+        const none = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+        expect(await usageOf([start(zeros), finish({ output_tokens: 0 }), stop()])).toEqual({ type: 'usage', usage: none });
+        expect(await usageOf([start(zeros), finish(zeros), stop()])).toEqual({ type: 'usage', usage: none });
+    });
+    test('cache counters are required like input_tokens: a missing one is not defaulted', async () => {
+        for (const key of ['cache_read_input_tokens', 'cache_creation_input_tokens']) {
+            const { [key]: _gone, ...partial } = startUsage as Record<string, number>;
+            await malformed([start(partial), finish({ output_tokens: 22 }), stop()]);
+            // Present in the final delta instead (Converse shape, all three inputs there): valid.
+            expect(await usageOf([start(partial), finish({ ...startUsage, output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
+        }
+    });
+    test('lazy consumption: a slow consumer with delayed reads between frames sees the same events and usage', async () => {
+        const frames = sonnetFrames();
+        const eager = await parse(frames);
+        let index = 0;
+        const body = new ReadableStream<Uint8Array>({ async pull(controller) {
+            await new Promise(resolve => setTimeout(resolve, 5));
+            if (index < frames.length) controller.enqueue(new TextEncoder().encode(frames[index++]!)); else controller.close();
+        } }, { highWaterMark: 0 });
+        const lazy = []; const readAtEvent: number[] = [];
+        for await (const event of gatewayStream(sseEvents(body), requestId)) {
+            lazy.push(event); readAtEvent.push(index); await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        expect(lazy).toEqual(eager);
+        // Pulled on demand: the first event arrives long before the source is drained, and the whole body is read by the end.
+        expect(readAtEvent[0]).toBeLessThan(frames.length / 2);
+        expect(index).toBe(frames.length);
+    });
     test('missing authority is never zero-filled', async () => {
         // No input authority anywhere: message_start without counters, or without usage at all.
         await malformed([start({}), finish({ output_tokens: 22 }), stop()]);
