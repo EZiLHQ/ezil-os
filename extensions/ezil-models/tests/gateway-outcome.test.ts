@@ -1,20 +1,23 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { forgetGatewayModels, gatewayChat, type GatewayOptions } from '../src/gateway';
-import type { ChatFailure } from '../src/failure';
+import { isAppFailure, type AppFailure } from '../src/failure';
 import { ask, gw, msg, txt } from '../tests/fixtures/gateway';
 import { frames } from '../tests/fixtures/gateway-response';
 import { frame } from '../tests/fixtures/load';
 import { CLIENT_ID, collect, failureOf, GATEWAY_ID, PREVIOUS_ID, responseFinish, responseStart, responseText, SENTINEL } from './fixtures/failure';
 
-const headers = { 'content-type': 'text/event-stream', 'x-ezil-request-id': GATEWAY_ID };
+const OTHER_GATEWAY_ID = '11111111-abcd-4123-abcd-0123456789ab';
+const headers = (id = GATEWAY_ID) => ({ 'content-type': 'text/event-stream', 'x-ezil-request-id': id });
 const errorEvent = () => frame('error', { type: 'error', error: { type: 'overloaded_error', message: SENTINEL } });
+const refusal = (status: number, code: string, id: string) => Response.json({ error: { code, message: SENTINEL }, request_id: id },
+    { status, headers: { 'x-ezil-request-id': id, 'retry-after': '1' } });
 beforeEach(() => forgetGatewayModels());
 afterEach(() => forgetGatewayModels());
 
-for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol} outcome telemetry`, () => {
+for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol} app-failure records`, () => {
     const model = () => protocol === 'Messages' ? gw() : { ...gw('reviewed-azure'), gatewayProtocol: 'openai-responses' as const };
     const partialFrames = () => protocol === 'Messages' ? frames().slice(0, 2).join('') : responseStart() + responseText();
-    const success = () => new Response(protocol === 'Messages' ? frames('end_turn').join('') : responseStart() + responseText() + responseFinish(), { headers });
+    const success = (id = GATEWAY_ID) => new Response(protocol === 'Messages' ? frames('end_turn').join('') : responseStart() + responseText() + responseFinish(), { headers: headers(id) });
     function server(reply: (index: number) => Response) {
         const keys: (string | null)[] = [];
         return { keys, fetch: (async (url: string | URL | Request, init: RequestInit = {}) => {
@@ -28,93 +31,114 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         return gatewayChat(model(), request, { signal: new AbortController().signal, fetch, newIdempotencyKey: () => CLIENT_ID,
             sleep: async () => {}, now: () => 0, ...options });
     }
+    const valid = (records: AppFailure[]) => { for (const record of records) expect(isAppFailure(record)).toBe(true); };
 
-    test('failed stream logs UUID, attempts, reason, upstream type and partial; outcome is sanitized once', async () => {
-        const logs: string[] = [], outcomes: ChatFailure[] = [];
-        const s = server(() => new Response(partialFrames() + errorEvent(), { headers }));
-        const error = await failureOf(turn(s.fetch, { log: line => logs.push(line), onOutcome: record => outcomes.push(record) }));
+    test('a Gateway error event mid-stream: one failed provider record with both IDs; log keeps the reason; no text anywhere', async () => {
+        const logs: string[] = [], records: AppFailure[] = [];
+        const error = await failureOf(turn(server(() => new Response(partialFrames() + errorEvent(), { headers: headers() })).fetch,
+            { log: line => logs.push(line), onOutcome: record => records.push(record) }));
         expect(error).toMatchObject({ reason: 'stream_error_event' });
-        expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toMatchObject({ client_request_id: CLIENT_ID, attempts: 1, partial: true, request_id: GATEWAY_ID,
             reason: 'stream_error_event', upstream_type: 'overloaded_error', error_code: 'stream_interrupted', origin: 'response' });
-        expect(JSON.parse(logs[0]!)).not.toHaveProperty('previous_client_request_id');
-        expect(outcomes).toHaveLength(1);
-        expect(outcomes[0]).toMatchObject({ outcome: 'failed', kind: 'interrupted', reason: 'stream_error_event', upstreamType: 'overloaded_error',
-            attempts: 1, partial: true, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
-        expect(JSON.stringify(outcomes)).not.toContain(SENTINEL); expect(logs.join()).not.toContain(SENTINEL);
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({ source: 'ezil_chat', operation: 'chat_request', category: 'provider', code: 'provider_overloaded', stage: 'stream',
+            outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 1, retryable: true });
+        valid(records);
+        expect(JSON.stringify(records)).not.toContain('PRIVATE'); expect(logs.join()).not.toContain('PRIVATE');
     });
-    test('failure before any text or tool event logs partial false', async () => {
-        const logs: string[] = [];
-        await failureOf(turn(server(() => new Response(errorEvent(), { headers })).fetch, { log: line => logs.push(line) }));
-        expect(JSON.parse(logs[0]!)).toMatchObject({ partial: false, attempts: 1 });
+    test('a stream that ends without its terminal: interrupted / missing_terminal', async () => {
+        const records: AppFailure[] = [];
+        await failureOf(turn(server(() => new Response(partialFrames(), { headers: headers() })).fetch, { onOutcome: record => records.push(record) }));
+        expect(records).toEqual([expect.objectContaining({ category: 'interrupted', code: 'stream_interrupted', stage: 'stream', streamReason: 'missing_terminal' })]);
+        valid(records);
     });
-    test('413 compaction retry records both UUIDs and the total send count', async () => {
-        const logs: string[] = [], outcomes: ChatFailure[] = [];
-        const s = server(index => index === 0 ? Response.json({ error: { code: 'input_too_large', max_input_tokens: 65536 } }, { status: 413 })
-            : new Response(errorEvent(), { headers }));
+    test('a body connection reset: interrupted / eof', async () => {
+        const records: AppFailure[] = [];
+        const s = server(() => new Response(new ReadableStream({ pull(c) { c.error(new TypeError(SENTINEL)); } }), { headers: headers() }));
+        expect(await failureOf(turn(s.fetch, { onOutcome: record => records.push(record) }))).toMatchObject({ reason: 'connection_reset' });
+        expect(records).toEqual([expect.objectContaining({ category: 'interrupted', streamReason: 'eof', stage: 'stream' })]);
+    });
+    test('a rate-limit retry then success: retrying (attempt 1, its own Gateway ID) then recovered (attempt 2, the new ID); same client key', async () => {
+        const records: AppFailure[] = [];
+        const s = server(index => index === 0 ? refusal(429, 'rate_limited', OTHER_GATEWAY_ID) : success());
+        await collect(turn(s.fetch, { onOutcome: record => records.push(record) }));
+        expect(s.keys).toEqual([CLIENT_ID, CLIENT_ID]);
+        expect(records).toHaveLength(2);
+        expect(records[0]).toMatchObject({ outcome: 'retrying', category: 'rate_limit', code: 'rate_limited', stage: 'headers', httpStatus: 429,
+            attempt: 1, clientRequestId: CLIENT_ID, gatewayRequestId: OTHER_GATEWAY_ID, retryable: true });
+        expect(records[1]).toMatchObject({ outcome: 'recovered', code: 'rate_limited', attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+        expect(records[0]!.eventId).not.toBe(records[1]!.eventId);
+        valid(records);
+    });
+    test('per-attempt metadata never carries over: a 429 Gateway ID is gone when the next attempt fails before any response', async () => {
+        const records: AppFailure[] = [], logs: string[] = [];
+        const s = server(index => { if (index === 0) return refusal(429, 'rate_limited', OTHER_GATEWAY_ID); throw new TypeError(SENTINEL); });
+        await failureOf(turn(s.fetch, { onOutcome: record => records.push(record), log: line => logs.push(line) }));
+        expect(records.map(r => r.outcome)).toEqual(['retrying', 'failed']);
+        expect(records[1]).toMatchObject({ category: 'network', code: 'network_failed', stage: 'request', attempt: 2 });
+        expect(records[1]).not.toHaveProperty('gatewayRequestId'); expect(records[1]).not.toHaveProperty('httpStatus');
+        expect(JSON.parse(logs[0]!)).toMatchObject({ request_id: null, http_status: null, attempts: 2 });
+        valid(records);
+    });
+    test('a same-key transport resend: retrying (network, request) then the final failure, both on the same client key', async () => {
+        const records: AppFailure[] = [];
+        const s = server(index => { if (index === 0) throw new TypeError(SENTINEL); return new Response(errorEvent(), { headers: headers() }); });
+        await failureOf(turn(s.fetch, { onOutcome: record => records.push(record) }));
+        expect(s.keys).toEqual([CLIENT_ID, CLIENT_ID]);
+        expect(records.map(r => [r.outcome, r.code, r.stage, r.attempt])).toEqual([['retrying', 'network_failed', 'request', 1], ['failed', 'provider_overloaded', 'stream', 2]]);
+        valid(records);
+    });
+    test('a 413 compaction resend: the new client key and its own Gateway ID; the log keeps the earlier key', async () => {
+        const logs: string[] = [], records: AppFailure[] = [];
+        const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : new Response(errorEvent(), { headers: headers() }));
         const request = ask([...Array.from({ length: 24 }, (_, i) => [msg('user', txt(`Question ${i}`)), msg('assistant', txt(`Answer ${i} ${'a'.repeat(4000)}`))]).flat(), msg('user', txt('Last question'))]);
         let minted = 0;
         await failureOf(turn(s.fetch, { newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID,
-            log: line => logs.push(line), onOutcome: record => outcomes.push(record) }, request));
+            log: line => logs.push(line), onOutcome: record => records.push(record) }, request));
         expect(s.keys).toEqual([PREVIOUS_ID, CLIENT_ID]);
-        expect(JSON.parse(logs.at(-1)!)).toMatchObject({ client_request_id: CLIENT_ID, previous_client_request_id: PREVIOUS_ID, attempts: 2, partial: false });
-        expect(outcomes).toHaveLength(1);
-        expect(outcomes[0]).toMatchObject({ clientRequestId: CLIENT_ID, previousClientRequestId: PREVIOUS_ID, attempts: 2 });
+        expect(JSON.parse(logs.at(-1)!)).toMatchObject({ client_request_id: CLIENT_ID, previous_client_request_id: PREVIOUS_ID, attempts: 2 });
+        expect(records).toEqual([expect.objectContaining({ outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 2 })]);
+        expect(records[0]).not.toHaveProperty('retryOfClientRequestId');
+        valid(records);
     });
-    test('same-key transport resend increments attempts without a previous UUID', async () => {
-        const outcomes: ChatFailure[] = [], logs: string[] = [];
-        const s = server(index => { if (index === 0) throw new TypeError(SENTINEL); return new Response(errorEvent(), { headers }); });
-        await failureOf(turn(s.fetch, { onOutcome: record => outcomes.push(record), log: line => logs.push(line) }));
-        expect(s.keys).toEqual([CLIENT_ID, CLIENT_ID]);
-        expect(outcomes[0]).toMatchObject({ attempts: 2, clientRequestId: CLIENT_ID });
-        expect(outcomes[0]).not.toHaveProperty('previousClientRequestId');
-        expect(JSON.parse(logs[0]!)).not.toHaveProperty('previous_client_request_id');
-    });
-    test('user cancellation mid-stream does not throw and emits only a cancelled outcome', async () => {
-        const controller = new AbortController(), outcomes: ChatFailure[] = [], logs: string[] = [];
+    test('the caller cancelling mid-stream: no throw, exactly one neutral cancellation record (caller), never a failure', async () => {
+        const controller = new AbortController(), records: AppFailure[] = [], logs: string[] = [];
         let released = false;
         const s = server(() => new Response(new ReadableStream<Uint8Array>({
             start(c) { c.enqueue(new TextEncoder().encode(partialFrames())); }, cancel() { released = true; },
-        }), { headers }));
-        const iterator = turn(s.fetch, { signal: controller.signal, onOutcome: record => outcomes.push(record), log: line => logs.push(line) });
+        }), { headers: headers() }));
+        const iterator = turn(s.fetch, { signal: controller.signal, onOutcome: record => records.push(record), log: line => logs.push(line) });
         expect((await iterator.next()).value).toMatchObject({ type: 'text' });
-        // Resume into a body read before cancellation, matching an idle stream in Copilot.
         const pending = iterator.next();
         controller.abort();
         expect((await pending).done).toBe(true);
-        expect(outcomes).toHaveLength(1);
-        expect(outcomes[0]).toMatchObject({ outcome: 'cancelled', kind: 'cancelled', code: 'cancelled', origin: null, partial: true, attempts: 1 });
-        expect(outcomes.some(record => record.outcome === 'failed')).toBe(false);
-        expect(JSON.parse(logs[0]!)).toMatchObject({ error_code: 'cancelled', origin: null, partial: true,
-            notice: `cancelled; may still be charged (request ${GATEWAY_ID})` });
-        expect(JSON.parse(logs[0]!)).not.toHaveProperty('reason');
+        expect(records).toHaveLength(1);
+        expect(records[0]).toMatchObject({ category: 'cancellation', code: 'request_cancelled', outcome: 'cancelled', cancellationSource: 'caller',
+            stage: 'stream', attempt: 1, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+        expect(records[0]).not.toHaveProperty('retryable');
+        expect(JSON.parse(logs[0]!)).toMatchObject({ error_code: 'cancelled', origin: null, notice: `cancelled; may still be charged (request ${GATEWAY_ID})` });
         expect(released).toBe(true);
+        valid(records);
     });
-    test('pre-send cancellation records zero attempts and a throwing observer cannot change it', async () => {
+    test('a cancellation before any send: admission stage, no attempt; a throwing observer changes nothing', async () => {
         const controller = new AbortController(); controller.abort();
-        const s = server(success), outcomes: ChatFailure[] = [];
-        expect(await collect(turn(s.fetch, { signal: controller.signal, onOutcome: record => { outcomes.push(record); throw new Error(SENTINEL); } }))).toEqual([]);
+        const s = server(() => success()), records: AppFailure[] = [];
+        expect(await collect(turn(s.fetch, { signal: controller.signal, onOutcome: record => { records.push(record); throw new Error(SENTINEL); } }))).toEqual([]);
         expect(s.keys).toHaveLength(0);
-        expect(outcomes).toHaveLength(1); expect(outcomes[0]).toMatchObject({ outcome: 'cancelled', attempts: 0, partial: false });
+        expect(records).toEqual([expect.objectContaining({ outcome: 'cancelled', stage: 'admission' })]);
+        expect(records[0]).not.toHaveProperty('attempt');
     });
-    test('success never calls onOutcome and retains correlation metadata in the log', async () => {
-        const outcomes: ChatFailure[] = [], logs: string[] = [];
-        await collect(turn(server(success).fetch, { onOutcome: record => outcomes.push(record), log: line => logs.push(line) }));
-        expect(outcomes).toEqual([]);
-        expect(JSON.parse(logs[0]!)).toMatchObject({ client_request_id: CLIENT_ID, attempts: 1, error_code: null, origin: null, partial: false });
-        expect(JSON.parse(logs[0]!)).not.toHaveProperty('reason'); expect(JSON.parse(logs[0]!)).not.toHaveProperty('upstream_type');
+    test('a first-time success emits nothing (the attempt controller cleanup abort is never a cancellation)', async () => {
+        const records: AppFailure[] = [], logs: string[] = [];
+        await collect(turn(server(() => success()).fetch, { onOutcome: record => records.push(record), log: line => logs.push(line) }));
+        expect(records).toEqual([]);
+        expect(JSON.parse(logs[0]!)).toMatchObject({ client_request_id: CLIENT_ID, attempts: 1, error_code: null, origin: null });
     });
-    test('a throwing outcome observer cannot replace a failure or suppress its log', async () => {
+    test('a throwing observer cannot replace a failure or suppress its log', async () => {
         let calls = 0; const logs: string[] = [];
-        const error = await failureOf(turn(server(() => new Response(errorEvent(), { headers })).fetch,
+        const error = await failureOf(turn(server(() => new Response(errorEvent(), { headers: headers() })).fetch,
             { log: line => logs.push(line), onOutcome: () => { calls++; throw new Error(SENTINEL); } }));
         expect(error).toMatchObject({ reason: 'stream_error_event' }); expect(calls).toBe(1); expect(logs).toHaveLength(1);
-    });
-    test('body connection reset is network in onOutcome', async () => {
-        const outcomes: ChatFailure[] = [];
-        const s = server(() => new Response(new ReadableStream({ pull(c) { c.error(new TypeError(SENTINEL)); } }), { headers }));
-        expect(await failureOf(turn(s.fetch, { onOutcome: record => outcomes.push(record) }))).toMatchObject({ reason: 'connection_reset' });
-        expect(outcomes[0]).toMatchObject({ kind: 'network', reason: 'connection_reset' });
     });
 });
 
@@ -124,12 +148,4 @@ test('gatewayChat generic post-send fallback distinguishes TypeError/network err
         const fetch = (async () => new Response(new ReadableStream({ pull(c) { c.error(error); } }), { status: 401 })) as typeof globalThis.fetch;
         expect(await failureOf(gatewayChat(gw(), ask(), { fetch, signal: new AbortController().signal }))).toMatchObject({ reason });
     }
-});
-
-test('yielded tool calls also mark a later failure partial', async () => {
-    const logs: string[] = [];
-    const wire = [...frames().filter((_, index) => index === 0 || (index >= 4 && index <= 7)), errorEvent()].join('');
-    const fetch = (async () => new Response(wire, { headers })) as typeof globalThis.fetch;
-    await failureOf(gatewayChat(gw(), ask(), { fetch, signal: new AbortController().signal, log: line => logs.push(line) }));
-    expect(JSON.parse(logs[0]!)).toMatchObject({ partial: true });
 });

@@ -72,6 +72,8 @@ const MODEL_KEY = /^[a-z0-9][a-z0-9._:/-]{0,63}$/;
 function matches(value: unknown, pattern: RegExp): value is string {
     return typeof value === 'string' && pattern.exec(value)?.[0] === value;
 }
+/** A catalog model key: the contract pattern, and never a URL (its pattern alone admits `https://…`; the fixtures reject it). */
+const modelKey = (value: unknown): value is string => matches(value, MODEL_KEY) && !value.includes('://');
 /** A canonical lowercase UUID as given, else undefined: an ID is never case-folded or repaired into one. */
 export function failureId(value: unknown): string | undefined {
     return matches(value, UUID) ? value : undefined;
@@ -129,7 +131,7 @@ export function appFailure(input: AppFailureInput): AppFailure {
         ...(cancelled ? {} : { retryable: input.outcome !== 'failed' || RETRYABLE.has(code) && error?.code !== 'settlement_pending'
             && !(error instanceof GatewayResponseError && error.upstreamType === 'settlement_pending') }),
         ...(integer(durationMs, 0, 3_600_000) ? { durationMs } : durationMs > 3_600_000 ? { durationMs: 3_600_000 } : {}),
-        ...(matches(input.model, MODEL_KEY) ? { modelKey: input.model } : {}),
+        ...(modelKey(input.model) ? { modelKey: input.model } : {}),
         ...(status !== undefined ? { httpStatus: status } : {}),
     };
 }
@@ -159,7 +161,7 @@ export function isAppFailure(value: unknown): value is AppFailure {
     if (r.attempt !== undefined && !integer(r.attempt as number, 1, 64)) return false;
     if (r.retryable !== undefined && typeof r.retryable !== 'boolean') return false;
     if (r.durationMs !== undefined && !integer(r.durationMs as number, 0, 3_600_000)) return false;
-    if (r.modelKey !== undefined && !matches(r.modelKey, MODEL_KEY)) return false;
+    if (r.modelKey !== undefined && !modelKey(r.modelKey)) return false;
     if (r.httpStatus !== undefined && !integer(r.httpStatus as number, 100, 599)) return false;
     return true;
 }

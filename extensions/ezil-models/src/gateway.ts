@@ -695,6 +695,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             try {
                 options.signal.throwIfAborted();
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
+                // Each attempt reports only its own response: a Gateway ID, status, hold or cache verdict from an earlier
+                // attempt (a 429, a resend, the 413 before a compacted resend under a new key) never carries over.
+                requestId = undefined; status = undefined; hold = null; cache = undefined;
                 attemptAbort = new AbortController();
                 const sentAt = resendOf ?? performance.now();
                 let response: Response;

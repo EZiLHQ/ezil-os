@@ -188,9 +188,11 @@ describe('Gateway thinking validation', () => {
             [start(), thinking, blockStop(0), delta(0, { type: 'signature_delta', signature })],
             [start(), thinking, finish()], [start(), thinking, stop()], [start(), stop()],
             [start(), finish(), finish()], [start(), finish(), thinking],
-            [...sonnetFrames(), thinking], [...sonnetFrames(), stop()], [...sonnetFrames(), frame('ping', { type: 'ping' })],
+            [...sonnetFrames(), thinking], [...sonnetFrames(), stop()],
         ]) await malformed(input);
         await malformed(sonnetFrames().slice(0, -1), 'stream_truncated');
+        // A keep-alive ping stays harmless anywhere, as before thinking support.
+        expect(await parse([...sonnetFrames(), frame('ping', { type: 'ping' })])).toEqual(await parse(sonnetFrames()));
         await malformed([...sonnetFrames(), frame('error', { type: 'error' })], 'stream_error_event');
     });
 

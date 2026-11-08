@@ -105,13 +105,14 @@ function partText(part: Part): string {
 }
 
 /**
- * The native-route boundary for replaying signed thinking: only the Gateway's native Anthropic route (Claude on
- * Bedrock InvokeModel, which forwards the provider's own SSE and accepts its own signed thinking back) gets prior
+ * The native-route boundary for replaying signed thinking: only the Gateway's native Anthropic routes (Claude through
+ * the Anthropic API, `claude-…`, or Bedrock InvokeModel, `[geo.]anthropic.claude-…`: both forward the provider's own SSE
+ * and accept its own signed thinking back) get prior
  * thinking blocks. Every other route drops them as before: Bedrock Converse (Kimi) rejects prior thinking blocks, and
  * other providers never issued a signature. Decided by the explicit Claude model id, never by `family` (it defaults
  * to `gpt`) or by the protocol (Converse models speak anthropic-messages too).
  */
-const NATIVE_ANTHROPIC_MODEL = /^(?:[a-z]{2,6}\.)?anthropic\.claude-[a-z0-9.:-]+$/;
+const NATIVE_ANTHROPIC_MODEL = /^(?:(?:[a-z]{2,6}\.)?anthropic\.)?claude-[a-z0-9.:-]+$/;
 export function replaysThinking(model: string): boolean {
     return NATIVE_ANTHROPIC_MODEL.test(model);
 }

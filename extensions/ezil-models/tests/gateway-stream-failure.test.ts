@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { GatewayError } from '../src/gateway';
 import { gatewayJson, gatewayStream, GatewayResponseError } from '../src/gateway-response';
 import { gatewayResponsesJson, gatewayResponsesStream } from '../src/gateway-responses';
-import { classifyChatFailure } from '../src/failure';
+import { appFailure, isAppFailure } from '../src/failure';
 import { sseEvents, type SseEvent } from '../src/sse';
 import { frames } from '../tests/fixtures/gateway-response';
 import { frame, sseBody } from '../tests/fixtures/load';
@@ -19,8 +19,9 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         expect(error).toMatchObject({ code: 'stream_interrupted', reason: 'stream_error_event', upstreamType: 'overloaded_error',
             message: `EZiL AI: interrupted (request ${GATEWAY_ID})` });
         expect(JSON.stringify(error)).not.toContain(SENTINEL);
-        const record = classifyChatFailure({ error, cancelled: false, model: 'qwen', attempts: 1, partial: false, at: 0, latencyMs: 0 });
-        expect(record).toMatchObject({ kind: 'interrupted', upstreamType: 'overloaded_error' });
+        const record = appFailure({ outcome: 'failed', error, stage: 'stream', model: 'qwen.qwen3-coder-next', attempts: 1, durationMs: 0 });
+        expect(record).toMatchObject({ category: 'provider', code: 'provider_overloaded', stage: 'stream' });
+        expect(isAppFailure(record)).toBe(true);
         expect(JSON.stringify(record)).not.toContain(SENTINEL);
     });
     test('unknown upstream type and arbitrary error text are discarded', async () => {

@@ -14,11 +14,6 @@
       "role": "assistant",
       "content": [
         {
-          "type": "thinking",
-          "thinking": "reasoning",
-          "signature": "sig"
-        },
-        {
           "type": "text",
           "text": "Earlier answer"
         }

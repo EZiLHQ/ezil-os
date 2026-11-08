@@ -1,126 +1,94 @@
 import { describe, expect, test } from 'bun:test';
-import { CHAT_FAILURE_VERSION, classifyChatFailure, type ChatFailureKind } from '../src/failure';
-import { GatewayError, type GatewayErrorOrigin } from '../src/gateway';
+import { readFileSync } from 'node:fs';
+import { APP_FAILURE_CODES, appFailure, isAppFailure, type AppFailureInput } from '../src/failure';
+import { GatewayError } from '../src/gateway';
 import { GatewayResponseError } from '../src/gateway-response';
-import { CLIENT_ID, GATEWAY_ID, PREVIOUS_ID, SENTINEL } from './fixtures/failure';
+import { CLIENT_ID, GATEWAY_ID, SENTINEL } from './fixtures/failure';
 
-const input = { cancelled: false, model: 'org/model-v1.2:alias', clientRequestId: CLIENT_ID, previousClientRequestId: PREVIOUS_ID,
-    gatewayRequestId: GATEWAY_ID, attempts: 2, partial: true, at: 0, latencyMs: 123 };
-const gatewayError = (code?: string, status?: number, origin: GatewayErrorOrigin = 'gateway') => new GatewayError(SENTINEL, status, code, GATEWAY_ID, undefined, origin);
-const groups: Partial<Record<ChatFailureKind, string[]>> = {
-    timeout: ['first_byte_timeout', 'stream_idle_timeout', 'completion_timeout', 'os_completion_timeout'],
-    network: ['os_unreachable', 'os_ai_unavailable', 'connection_lost'],
-    auth: ['unauthorized', 'os_session_missing', 'os_session_expired', 'access_token_expired', 'os_proxy_unauthorized', 'no_ezil_role',
-        'not_a_member', 'role_mismatch', 'forbidden', 'account_suspended', 'suspended'],
-    credits: ['insufficient_credits', 'no_live_grant', 'window_budget_reached', 'daily_budget_reached'],
-    rate: ['rate_limited', 'concurrency_limit'], upstream: ['upstream_timeout', 'upstream_unavailable', 'upstream_error'],
-    refused: ['max_tokens', 'response_incomplete', 'response_failed'],
-    unavailable: ['killswitch', 'paused', 'pause', 'global_cap_reached', 'model_disabled', 'model_not_found', 'model_unavailable',
-        'no_provider_route', 'no_entitlement', 'model_not_allowed', 'catalog_unavailable'],
-    too_large: ['input_too_large', 'body_too_large', 'local_input_too_large', 'local_too_many_messages', 'local_too_many_blocks'],
-    local: ['local_build_error'],
-};
-describe('classifyChatFailure kinds', () => {
-    for (const [kind, codes] of Object.entries(groups)) for (const code of codes) test(`${code} -> ${kind}`, () => {
-        const record = classifyChatFailure({ ...input, error: gatewayError(code) });
-        expect(record).toMatchObject({ v: CHAT_FAILURE_VERSION, outcome: 'failed', kind, code });
-        expect(JSON.stringify(record)).not.toContain(SENTINEL);
-    });
-    for (const [status, kind] of [[401, 'auth'], [403, 'auth'], [402, 'credits'], [429, 'rate'], [413, 'too_large']] as const) {
-        test(`HTTP ${status} default -> ${kind}`, () => {
-            expect(classifyChatFailure({ ...input, error: gatewayError(undefined, status) })).toMatchObject({ kind, httpStatus: status });
-        });
-    }
-    test('explicit budget code takes precedence over HTTP 429', () => {
-        expect(classifyChatFailure({ ...input, error: gatewayError('window_budget_reached', 429) }).kind).toBe('credits');
-    });
-    test('cancellation overrides every error and omits response failure details', () => {
-        for (const error of [gatewayError('upstream_error', 503), new GatewayResponseError(GATEWAY_ID, 'stream_interrupted', 'stream_error_event', 'api_error'), new Error(SENTINEL)]) {
-            const record = classifyChatFailure({ ...input, cancelled: true, error });
-            expect(record).toMatchObject({ outcome: 'cancelled', kind: 'cancelled', code: 'cancelled', origin: null });
-            expect(record).not.toHaveProperty('reason'); expect(record).not.toHaveProperty('upstreamType');
-        }
-    });
-    for (const reason of ['stream_error_event', 'stream_truncated', 'stream_malformed', 'connection_reset', 'invalid_response'] as const) {
-        test(`response ${reason} -> ${reason === 'connection_reset' ? 'network' : 'interrupted'}`, () => {
-            expect(classifyChatFailure({ ...input, error: new GatewayResponseError(GATEWAY_ID, 'stream_interrupted', reason) }))
-                .toMatchObject({ kind: reason === 'connection_reset' ? 'network' : 'interrupted', reason, origin: 'response' });
-        });
-    }
-    test('other local origin -> local', () => {
-        expect(classifyChatFailure({ ...input, error: gatewayError('future_local_code', undefined, 'local') })).toMatchObject({ kind: 'local', code: 'future_local_code' });
-    });
-    test('unknown errors -> internal without copying even plausible error properties', () => {
-        for (const error of [new Error(SENTINEL), undefined, { code: 'unauthorized', message: SENTINEL, origin: 'gateway' }]) {
-            expect(classifyChatFailure({ ...input, error })).toMatchObject({ kind: 'internal', code: 'internal_error', origin: null });
-        }
-    });
+// The feedback lane's canonical golden fixtures (docs/FEEDBACK-APP-FAILURES-CONTRACT.md): the producer must agree with them.
+const fixtures = JSON.parse(readFileSync(`${import.meta.dir}/../../../app/src/server/feedback/app-failures.fixtures.json`, 'utf8')) as {
+    valid: { name: string; failure: unknown }[]; rejected: { name: string; failure: unknown }[] };
+const EVENT_ID = 'e1e1e1e1-0000-4000-8000-000000000001';
+const base: AppFailureInput = { outcome: 'failed', stage: 'headers', model: 'us.anthropic.claude-sonnet-5-5', clientRequestId: CLIENT_ID,
+    gatewayRequestId: GATEWAY_ID, attempts: 1, durationMs: 1234, newEventId: () => EVENT_ID };
+const gatewayError = (code?: string, status?: number, origin: GatewayError['origin'] = 'gateway') => new GatewayError(SENTINEL, status, code, GATEWAY_ID, undefined, origin);
+
+describe('canonical golden fixtures', () => {
+    for (const { name, failure } of fixtures.valid) test(`valid: ${name}`, () => expect(isAppFailure(failure)).toBe(true));
+    for (const { name, failure } of fixtures.rejected) test(`rejected: ${name}`, () => expect(isAppFailure(failure)).toBe(false));
 });
 
-describe('failure metadata sanitizers', () => {
-    test('UUIDs become lowercase and valid metadata has the exact version 1 shape', () => {
-        expect(classifyChatFailure({ ...input, error: gatewayError('unauthorized', 401), clientRequestId: CLIENT_ID.toUpperCase(),
-            previousClientRequestId: PREVIOUS_ID.toUpperCase(), gatewayRequestId: GATEWAY_ID.toUpperCase() })).toEqual({
-            model: input.model, clientRequestId: CLIENT_ID, previousClientRequestId: PREVIOUS_ID, gatewayRequestId: GATEWAY_ID,
-            attempts: 2, partial: true, latencyMs: 123, at: '1970-01-01T00:00:00.000Z',
-            v: 1, outcome: 'failed', kind: 'auth', code: 'unauthorized', origin: 'gateway', httpStatus: 401,
-        });
+describe('appFailure mapping', () => {
+    const table: [string, string, string][] = [
+        ['first_byte_timeout', 'timeout', 'first_token_timeout'], ['stream_idle_timeout', 'timeout', 'request_timeout'],
+        ['completion_timeout', 'timeout', 'request_timeout'], ['os_completion_timeout', 'timeout', 'request_timeout'], ['upstream_timeout', 'timeout', 'request_timeout'],
+        ['os_unreachable', 'network', 'network_failed'], ['os_ai_unavailable', 'network', 'network_failed'], ['connection_lost', 'network', 'network_failed'],
+        ['access_token_expired', 'auth', 'auth_expired'], ['os_session_expired', 'auth', 'session_expired'], ['os_session_missing', 'auth', 'auth_invalid'],
+        ['unauthorized', 'auth', 'auth_invalid'], ['os_proxy_unauthorized', 'auth', 'auth_invalid'], ['suspended', 'auth', 'auth_invalid'],
+        ['insufficient_credits', 'credits', 'credits_exhausted'], ['no_live_grant', 'credits', 'credits_exhausted'], ['window_budget_reached', 'credits', 'credits_exhausted'],
+        ['no_ezil_role', 'entitlement', 'membership_required'], ['no_entitlement', 'entitlement', 'membership_required'], ['model_not_allowed', 'entitlement', 'model_not_entitled'],
+        ['rate_limited', 'rate_limit', 'rate_limited'], ['concurrency_limit', 'rate_limit', 'rate_limited'],
+        ['upstream_error', 'provider', 'provider_error'], ['upstream_unavailable', 'provider', 'provider_error'], ['max_tokens', 'provider', 'provider_error'],
+        ['model_disabled', 'provider', 'model_unavailable'], ['killswitch', 'provider', 'model_unavailable'], ['pause', 'provider', 'model_unavailable'],
+        ['input_too_large', 'provider', 'unexpected_error'], ['local_build_error', 'provider', 'unexpected_error'], ['future_code', 'provider', 'unexpected_error'],
+    ];
+    for (const [from, category, code] of table) test(`${from} -> ${category}/${code}`, () => {
+        const record = appFailure({ ...base, error: gatewayError(from, 400) });
+        expect(record).toMatchObject({ category, code, stage: 'headers', outcome: 'failed', httpStatus: 400 });
+        expect(isAppFailure(record)).toBe(true);
     });
-    test('garbage IDs and model are null; an invalid previous ID is omitted', () => {
-        const record = classifyChatFailure({ ...input, clientRequestId: SENTINEL, previousClientRequestId: SENTINEL, gatewayRequestId: SENTINEL, model: SENTINEL });
-        expect(record).toMatchObject({ clientRequestId: null, gatewayRequestId: null, model: null });
-        expect(record).not.toHaveProperty('previousClientRequestId');
-        expect(JSON.stringify(record)).not.toContain(SENTINEL);
+    test('HTTP status decides an unknown code', () => {
+        for (const [status, code] of [[401, 'auth_invalid'], [402, 'credits_exhausted'], [403, 'membership_required'], [429, 'rate_limited'], [500, 'unexpected_error']] as const) {
+            expect(appFailure({ ...base, error: gatewayError(undefined, status) }).code).toBe(code);
+        }
+        expect(appFailure({ ...base, error: gatewayError(undefined, undefined, 'transport') })).toMatchObject({ category: 'network', code: 'unexpected_error' });
     });
-    test('paths, spaces, overlong and malformed codes use a kind-derived fallback', () => {
-        for (const code of ['private/path', 'private message', 'A_code', '_code', 'a'.repeat(49), SENTINEL]) {
-            const record = classifyChatFailure({ ...input, error: gatewayError(code, 401) });
-            expect(record).toMatchObject({ kind: 'auth', code: 'unauthorized' });
-            expect(JSON.stringify(record)).not.toContain(code);
+    test('a stream failure is interrupted in the stream stage with its fixed reason', () => {
+        for (const [reason, streamReason] of [['stream_truncated', 'missing_terminal'], ['stream_malformed', 'malformed_event'], ['connection_reset', 'eof'],
+            ['invalid_response', 'malformed_event']] as const) {
+            const record = appFailure({ ...base, stage: 'request', error: new GatewayResponseError(GATEWAY_ID, 'stream_interrupted', reason) });
+            expect(record).toMatchObject({ category: 'interrupted', code: 'stream_interrupted', stage: 'stream', streamReason, retryable: true });
+            expect(isAppFailure(record)).toBe(true);
         }
     });
-    test('safe code and model length boundaries are retained', () => {
-        expect(classifyChatFailure({ ...input, model: 'm'.repeat(128), error: gatewayError('a'.repeat(48)) })).toMatchObject({ model: 'm'.repeat(128), code: 'a'.repeat(48) });
-        expect(classifyChatFailure({ ...input, model: 'm'.repeat(129) }).model).toBeNull();
+    test('an SSE error event maps by its allowlisted code and carries no stream reason', () => {
+        const event = (type?: string) => new GatewayResponseError(GATEWAY_ID, 'stream_interrupted', 'stream_error_event', type);
+        expect(appFailure({ ...base, error: event('overloaded_error') })).toMatchObject({ category: 'provider', code: 'provider_overloaded', retryable: true });
+        expect(appFailure({ ...base, error: event('settlement_pending') })).toMatchObject({ category: 'provider', code: 'provider_error', retryable: false });
+        expect(appFailure({ ...base, error: event('upstream_timeout') })).toMatchObject({ category: 'timeout', code: 'request_timeout' });
+        expect(appFailure({ ...base, error: event('rate_limit_error') })).toMatchObject({ category: 'rate_limit', code: 'rate_limited' });
+        const gateway = appFailure({ ...base, error: event('stream_interrupted') });
+        expect(gateway).toMatchObject({ category: 'interrupted', code: 'stream_interrupted', stage: 'stream' });
+        expect(gateway).not.toHaveProperty('streamReason');
+        expect(appFailure({ ...base, error: event(SENTINEL) })).toMatchObject({ category: 'interrupted', code: 'stream_interrupted' });
     });
-    test('trailing newlines cannot pass the code, model or UUID patterns', () => {
-        const record = classifyChatFailure({ ...input, model: 'qwen\n', clientRequestId: `${CLIENT_ID}\n`,
-            previousClientRequestId: `${PREVIOUS_ID}\n`, gatewayRequestId: `${GATEWAY_ID}\n`, error: gatewayError('unauthorized\n') });
-        expect(record).toMatchObject({ model: null, clientRequestId: null, gatewayRequestId: null, code: 'internal_error' });
-        expect(record).not.toHaveProperty('previousClientRequestId');
+    test('cancellation is neutral and proves only the caller', () => {
+        const record = appFailure({ ...base, outcome: 'cancelled', cancellationSource: 'caller', stage: 'stream', error: gatewayError('upstream_error', 500) });
+        expect(record).toEqual({ eventId: EVENT_ID, source: 'ezil_chat', operation: 'chat_request', category: 'cancellation', code: 'request_cancelled',
+            stage: 'stream', outcome: 'cancelled', cancellationSource: 'caller', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 1,
+            durationMs: 1234, modelKey: 'us.anthropic.claude-sonnet-5-5' });
+        expect(isAppFailure(record)).toBe(true);
+        expect(appFailure({ ...base, outcome: 'cancelled' }).cancellationSource).toBe('unknown');
     });
-    test('invalid origin, status, reason and upstream type are dropped', () => {
-        const error = gatewayError('future_code', 999);
-        Object.assign(error, { origin: SENTINEL });
-        expect(classifyChatFailure({ ...input, error })).toMatchObject({ origin: null, httpStatus: null });
-        const response = new GatewayResponseError(GATEWAY_ID);
-        Object.assign(response, { reason: SENTINEL, upstreamType: SENTINEL });
-        const record = classifyChatFailure({ ...input, error: response });
-        expect(record).not.toHaveProperty('reason'); expect(record).not.toHaveProperty('upstreamType');
-        expect(JSON.stringify(record)).not.toContain(SENTINEL);
+    test('retrying and recovered are retryable; a failed credits refusal is not', () => {
+        expect(appFailure({ ...base, outcome: 'retrying', error: gatewayError('rate_limited', 429) }).retryable).toBe(true);
+        expect(appFailure({ ...base, outcome: 'recovered', error: gatewayError('rate_limited', 429) }).retryable).toBe(true);
+        expect(appFailure({ ...base, error: gatewayError('insufficient_credits', 402) }).retryable).toBe(false);
     });
-    test('status is an integer in 100..599', () => {
-        for (const status of [99, 600, 200.5, NaN, Infinity]) expect(classifyChatFailure({ ...input, error: gatewayError(undefined, status) }).httpStatus).toBeNull();
-        for (const status of [100, 599]) expect(classifyChatFailure({ ...input, error: gatewayError(undefined, status) }).httpStatus).toBe(status);
+    test('IDs are never repaired, bounds hold, and no message text ever appears', () => {
+        const record = appFailure({ ...base, error: gatewayError('unauthorized', 401), clientRequestId: CLIENT_ID.toUpperCase(), gatewayRequestId: `${GATEWAY_ID}\n`,
+            model: 'https://gateway.example.test/v1', attempts: 0, durationMs: 3_600_001, newEventId: () => SENTINEL });
+        expect(record).not.toHaveProperty('clientRequestId'); expect(record).not.toHaveProperty('gatewayRequestId');
+        expect(record).not.toHaveProperty('modelKey'); expect(record).not.toHaveProperty('attempt');
+        expect(record.durationMs).toBe(3_600_000);
+        expect(record.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        expect(appFailure({ ...base, attempts: 99 }).attempt).toBe(64);
+        for (const status of [99, 600, 200.5]) expect(appFailure({ ...base, error: gatewayError('upstream_error', status) })).not.toHaveProperty('httpStatus');
+        expect(JSON.stringify(record)).not.toContain('PRIVATE');
+        expect(isAppFailure(record)).toBe(true);
     });
-    test('counts clamp to 1e9 and malformed counts and dates become null', () => {
-        expect(classifyChatFailure({ ...input, attempts: Number.MAX_SAFE_INTEGER, latencyMs: 1e9 + 1 })).toMatchObject({ attempts: 1e9, latencyMs: 1e9 });
-        for (const value of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
-            expect(classifyChatFailure({ ...input, attempts: value, latencyMs: value })).toMatchObject({ attempts: null, latencyMs: null });
-        }
-        for (const at of [NaN, Infinity, 8.64e15 + 1]) expect(classifyChatFailure({ ...input, at }).at).toBeNull();
-    });
-    test('runtime malformed input types never become free text', () => {
-        const record = classifyChatFailure({ ...input, model: {}, clientRequestId: {}, gatewayRequestId: 1, previousClientRequestId: [],
-            attempts: '1', latencyMs: SENTINEL, at: SENTINEL, partial: 'true', cancelled: 'true' } as unknown as Parameters<typeof classifyChatFailure>[0]);
-        expect(record).toMatchObject({ outcome: 'failed', model: null, clientRequestId: null, gatewayRequestId: null, attempts: null, latencyMs: null, at: null, partial: false });
-        expect(JSON.stringify(record)).not.toContain(SENTINEL);
-    });
-    test('the upstream allowlist is closed at error construction', () => {
-        for (const type of ['overloaded_error', 'api_error', 'rate_limit_error', 'timeout_error', 'invalid_request_error', 'authentication_error',
-            'permission_error', 'not_found_error', 'request_too_large', 'billing_error', 'upstream_error', 'upstream_timeout', 'upstream_unavailable']) {
-            expect(new GatewayResponseError(undefined, 'stream_interrupted', 'stream_error_event', type).upstreamType).toBe(type);
-        }
-        for (const type of [SENTINEL, 'OVERLOADED_ERROR', {}, null]) expect(new GatewayResponseError(undefined, 'stream_interrupted', 'stream_error_event', type).upstreamType).toBeUndefined();
+    test('every code the producer can emit is in the contract list', () => {
+        const codes = new Set(Object.keys(APP_FAILURE_CODES));
+        for (const [, , code] of table) expect(codes.has(code) || code === 'unexpected_error').toBe(true);
     });
 });

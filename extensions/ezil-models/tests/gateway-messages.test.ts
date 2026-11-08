@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError } from '../src/gateway-messages';
+import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError, replaysThinking } from '../src/gateway-messages';
 import { ask, call, fixtureRequests, gw, image, marker, msg, result, thinking, tool, txt } from './fixtures/gateway';
 
 const build = (request = ask()) => buildGatewayBody(gw(), request).body;
@@ -55,8 +55,19 @@ describe('gateway sanitizer', () => {
         const request = { ...ask([msg('system', txt('sys'), marker), msg('user', txt('q'), marker), msg('assistant', call('a'), marker), msg('user', result('a', [txt('out'), marker]), marker)]), tools: [{ ...tool, cache_control: { type: 'ephemeral' } }], modelOptions: { cache_control: { type: 'ephemeral' } } };
         expect(JSON.stringify(buildGatewayBody({ ...gw(), cache: { enabled: true, ttl: '1h' } }, request).body)).not.toContain('cache_control');
     });
-    test('signed thinking and redacted thinking are replayed', () => {
-        const body = build(ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))]));
+    test('signed thinking and redacted thinking are dropped on every non-native route (Qwen, Kimi Converse)', () => {
+        for (const id of [gw().model, KIMI]) {
+            const body = buildGatewayBody(gw(id), ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))])).body;
+            expect(body.messages[1]!.content).toEqual([{ type: 'text', text: 'answer' }]);
+            expect(JSON.stringify(body)).not.toMatch(/thinking|hidden|"sig"/);
+        }
+    });
+    test('the native route is decided by the explicit Claude model id only', () => {
+        for (const id of ['claude-sonnet-5-5', 'anthropic.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5']) expect(replaysThinking(id)).toBe(true);
+        for (const id of [gw().model, KIMI, 'gemini-3.8-flash', 'gpt-6.1-sol', 'claude', 'x.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5\n']) expect(replaysThinking(id)).toBe(false);
+    });
+    test('signed thinking and redacted thinking are replayed on the native Anthropic route', () => {
+        const body = buildGatewayBody(gw('us.anthropic.claude-sonnet-5-5'), ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))])).body;
         expect(body.messages[1]!.content).toEqual([{ type: 'thinking', thinking: 'reasoning', signature: 'sig' },
             { type: 'redacted_thinking', data: 'hidden' }, { type: 'text', text: 'answer' }]);
         expect(JSON.stringify(body)).not.toContain(thinking.value);
