@@ -50,14 +50,15 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
 | `eventId` | yes | lowercase UUID; dedup key |
 | `source` | yes | `ezil_chat` \| `code_app` |
 | `operation` | yes | `chat_request` \| `app_start` |
-| `category` | yes | `interrupted` \| `network` \| `timeout` \| `auth` \| `credits` \| `entitlement` \| `rate_limit` \| `provider` \| `user_cancel` \| `app_startup` |
+| `category` | yes | `interrupted` \| `network` \| `timeout` \| `auth` \| `credits` \| `entitlement` \| `rate_limit` \| `provider` \| `cancellation` \| `app_startup` |
 | `code` | yes | closed allowlist, §3 |
 | `stage` | yes | `startup` \| `admission` \| `request` \| `headers` \| `stream` |
 | `outcome` | yes | `failed` \| `retrying` \| `recovered` \| `cancelled` |
 | `streamReason` | no | `eof` \| `malformed_event` \| `missing_terminal` (only with `stage: 'stream'`) |
-| `clientRequestId` | no | lowercase UUID: the SDK idempotency id, stable across automatic retries |
-| `gatewayRequestId` | no | lowercase UUID: the Gateway id of THIS attempt |
-| `vscodeRequestId` | no | lowercase UUID: the VS Code chat request id, only if it is a different value; never inferred |
+| `cancellationSource` | with `cancellation` only | `caller` \| `user_stop` \| `unknown`; required when `category` is `cancellation`, forbidden otherwise |
+| `clientRequestId` | no | lowercase UUID: the Gateway SDK idempotency key (its own `crypto.randomUUID`), stable across automatic retries |
+| `gatewayRequestId` | no | lowercase UUID: the Gateway server's request id for THIS attempt (response header or structured error) |
+| `vscodeRequestId` | no | lowercase UUID: the Copilot/workbench chat ClientRequestId, only when read from the actual Copilot request context; omitted until that hook exists |
 | `retryOfClientRequestId` | no | lowercase UUID: only for a manual retry whose original id is known |
 | `attempt` | no | integer 1–64 |
 | `retryable` | no | boolean |
@@ -67,8 +68,15 @@ Pattern: `shell/ezil/apps/code-folder.js` (exact frame, pinned origin, nonce).
 
 Rules:
 - A code outside §3 is sent as `unexpected_error` with its ids, never as text.
-- `user_cancel` only for the outer request signal the user aborted; an
-  internal attempt-controller cleanup abort is not reported.
+- The three request ids are independent values. None is derived from,
+  parsed from UI text, or assumed equal to another; a user-supplied
+  screenshot reference stays in the user's description, not in these ids.
+- Cancellation is neutral: `category: 'cancellation'`, `code:
+  'request_cancelled'`, `outcome: 'cancelled'`, with `cancellationSource`.
+  An outer CancellationToken proves only that the CALLER cancelled
+  (`caller`); `user_stop` requires a real Stop-intent marker; otherwise
+  `unknown`. An internal attempt-controller cleanup `abort()` is never
+  reported. `outcome: 'cancelled'` is used only with `cancellation`.
 - Never: prompts, replies, tool calls/results, code, usage or hold amounts,
   file paths, URLs, headers, credentials, console text, stacks, error messages.
 
@@ -84,7 +92,7 @@ Rules:
 | `entitlement` | `membership_required`, `model_not_entitled` |
 | `rate_limit` | `rate_limited` |
 | `provider` | `provider_error`, `provider_overloaded`, `provider_refused`, `model_unavailable` |
-| `user_cancel` | `user_cancelled` |
+| `cancellation` | `request_cancelled` |
 | `app_startup` | `app_start_failed`, `app_start_timeout`, `chat_unavailable` |
 | any | `unexpected_error` |
 
@@ -117,5 +125,7 @@ A code is valid only in its own category (or `unexpected_error` in any).
   `appFailures` only when that flag is present; on a 400 from an older server
   the existing downgrade (`without_event_diagnostics`) also strips it.
 - The admin report view renders every field escaped and lets a developer copy
-  the request ids. Ids correlate logs; they are not authorization to look up
-  another user's data.
+  the request ids, each labelled unambiguously (Workbench request id, SDK
+  idempotency key, Gateway request id). The workbench id is optional and not
+  guaranteed to be captured; no equivalence between the ids is claimed. Ids
+  correlate logs; they are not authorization to look up another user's data.

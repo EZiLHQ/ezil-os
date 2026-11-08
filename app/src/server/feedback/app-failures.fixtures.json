@@ -2,32 +2,418 @@
   "contract": "docs/FEEDBACK-APP-FAILURES-CONTRACT.md",
   "version": 1,
   "valid": [
-    { "name": "stream interrupted (screenshot case)", "failure": { "eventId": "a0000000-0000-4000-8000-000000000001", "source": "ezil_chat", "operation": "chat_request", "category": "interrupted", "code": "stream_interrupted", "stage": "stream", "outcome": "failed", "streamReason": "missing_terminal", "clientRequestId": "c0000000-0000-4000-8000-000000000001", "gatewayRequestId": "d0000000-0000-4000-8000-000000000001", "attempt": 1, "retryable": true, "durationMs": 41250, "modelKey": "anthropic/claude-sonnet-5-5" } },
-    { "name": "automatic retry keeps client id, new gateway id", "failure": { "eventId": "a0000000-0000-4000-8000-000000000002", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "provider_overloaded", "stage": "headers", "outcome": "retrying", "clientRequestId": "c0000000-0000-4000-8000-000000000001", "gatewayRequestId": "d0000000-0000-4000-8000-000000000002", "attempt": 2, "retryable": true, "httpStatus": 529 } },
-    { "name": "manual retry links known original", "failure": { "eventId": "a0000000-0000-4000-8000-000000000003", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "provider_error", "stage": "request", "outcome": "recovered", "clientRequestId": "c0000000-0000-4000-8000-000000000003", "retryOfClientRequestId": "c0000000-0000-4000-8000-000000000001", "vscodeRequestId": "e0000000-0000-4000-8000-000000000003", "attempt": 1 } },
-    { "name": "auth expired", "failure": { "eventId": "a0000000-0000-4000-8000-000000000004", "source": "ezil_chat", "operation": "chat_request", "category": "auth", "code": "auth_expired", "stage": "admission", "outcome": "failed", "httpStatus": 401, "retryable": false } },
-    { "name": "session expired", "failure": { "eventId": "a0000000-0000-4000-8000-000000000005", "source": "ezil_chat", "operation": "chat_request", "category": "auth", "code": "session_expired", "stage": "admission", "outcome": "failed" } },
-    { "name": "membership required", "failure": { "eventId": "a0000000-0000-4000-8000-000000000006", "source": "ezil_chat", "operation": "chat_request", "category": "entitlement", "code": "membership_required", "stage": "admission", "outcome": "failed", "httpStatus": 403 } },
-    { "name": "credits exhausted", "failure": { "eventId": "a0000000-0000-4000-8000-000000000007", "source": "ezil_chat", "operation": "chat_request", "category": "credits", "code": "credits_exhausted", "stage": "admission", "outcome": "failed", "httpStatus": 402 } },
-    { "name": "rate limited", "failure": { "eventId": "a0000000-0000-4000-8000-000000000008", "source": "ezil_chat", "operation": "chat_request", "category": "rate_limit", "code": "rate_limited", "stage": "headers", "outcome": "retrying", "httpStatus": 429, "attempt": 3 } },
-    { "name": "network failed", "failure": { "eventId": "a0000000-0000-4000-8000-000000000009", "source": "ezil_chat", "operation": "chat_request", "category": "network", "code": "network_failed", "stage": "request", "outcome": "failed" } },
-    { "name": "first token timeout", "failure": { "eventId": "a0000000-0000-4000-8000-00000000000a", "source": "ezil_chat", "operation": "chat_request", "category": "timeout", "code": "first_token_timeout", "stage": "stream", "outcome": "failed", "durationMs": 120000 } },
-    { "name": "user cancel is cancelled, not failed", "failure": { "eventId": "a0000000-0000-4000-8000-00000000000b", "source": "ezil_chat", "operation": "chat_request", "category": "user_cancel", "code": "user_cancelled", "stage": "stream", "outcome": "cancelled" } },
-    { "name": "app startup", "failure": { "eventId": "a0000000-0000-4000-8000-00000000000c", "source": "code_app", "operation": "app_start", "category": "app_startup", "code": "chat_unavailable", "stage": "startup", "outcome": "failed" } },
-    { "name": "unknown code mapped to unexpected_error", "failure": { "eventId": "a0000000-0000-4000-8000-00000000000d", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "unexpected_error", "stage": "request", "outcome": "failed", "gatewayRequestId": "d0000000-0000-4000-8000-00000000000d" } }
+    {
+      "name": "stream interrupted (screenshot case)",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000001",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "interrupted",
+        "code": "stream_interrupted",
+        "stage": "stream",
+        "outcome": "failed",
+        "streamReason": "missing_terminal",
+        "clientRequestId": "c0000000-0000-4000-8000-000000000001",
+        "gatewayRequestId": "d0000000-0000-4000-8000-000000000001",
+        "attempt": 1,
+        "retryable": true,
+        "durationMs": 41250,
+        "modelKey": "anthropic/claude-sonnet-5-5"
+      }
+    },
+    {
+      "name": "automatic retry keeps client id, new gateway id",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000002",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "provider_overloaded",
+        "stage": "headers",
+        "outcome": "retrying",
+        "clientRequestId": "c0000000-0000-4000-8000-000000000001",
+        "gatewayRequestId": "d0000000-0000-4000-8000-000000000002",
+        "attempt": 2,
+        "retryable": true,
+        "httpStatus": 529
+      }
+    },
+    {
+      "name": "manual retry links known original",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000003",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "provider_error",
+        "stage": "request",
+        "outcome": "recovered",
+        "clientRequestId": "c0000000-0000-4000-8000-000000000003",
+        "retryOfClientRequestId": "c0000000-0000-4000-8000-000000000001",
+        "attempt": 1
+      }
+    },
+    {
+      "name": "auth expired",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000004",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "auth",
+        "code": "auth_expired",
+        "stage": "admission",
+        "outcome": "failed",
+        "httpStatus": 401,
+        "retryable": false
+      }
+    },
+    {
+      "name": "session expired",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000005",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "auth",
+        "code": "session_expired",
+        "stage": "admission",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "membership required",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000006",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "entitlement",
+        "code": "membership_required",
+        "stage": "admission",
+        "outcome": "failed",
+        "httpStatus": 403
+      }
+    },
+    {
+      "name": "credits exhausted",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000007",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "credits",
+        "code": "credits_exhausted",
+        "stage": "admission",
+        "outcome": "failed",
+        "httpStatus": 402
+      }
+    },
+    {
+      "name": "rate limited",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000008",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "rate_limit",
+        "code": "rate_limited",
+        "stage": "headers",
+        "outcome": "retrying",
+        "httpStatus": 429,
+        "attempt": 3
+      }
+    },
+    {
+      "name": "network failed",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-000000000009",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "first token timeout",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000a",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "timeout",
+        "code": "first_token_timeout",
+        "stage": "stream",
+        "outcome": "failed",
+        "durationMs": 120000
+      }
+    },
+    {
+      "name": "caller cancellation is neutral, not a failure",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000b",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "cancellation",
+        "code": "request_cancelled",
+        "stage": "stream",
+        "outcome": "cancelled",
+        "cancellationSource": "caller"
+      }
+    },
+    {
+      "name": "app startup",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000c",
+        "source": "code_app",
+        "operation": "app_start",
+        "category": "app_startup",
+        "code": "chat_unavailable",
+        "stage": "startup",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "unknown code mapped to unexpected_error",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000d",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "unexpected_error",
+        "stage": "request",
+        "outcome": "failed",
+        "gatewayRequestId": "d0000000-0000-4000-8000-00000000000d"
+      }
+    },
+    {
+      "name": "explicit stop with real intent marker",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000e",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "cancellation",
+        "code": "request_cancelled",
+        "stage": "stream",
+        "outcome": "cancelled",
+        "cancellationSource": "user_stop",
+        "clientRequestId": "c0000000-0000-4000-8000-00000000000e"
+      }
+    },
+    {
+      "name": "three distinct request ids",
+      "failure": {
+        "eventId": "a0000000-0000-4000-8000-00000000000f",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "interrupted",
+        "code": "stream_interrupted",
+        "stage": "stream",
+        "outcome": "failed",
+        "streamReason": "eof",
+        "vscodeRequestId": "e0000000-0000-4000-8000-00000000000f",
+        "clientRequestId": "c0000000-0000-4000-8000-00000000000f",
+        "gatewayRequestId": "d0000000-0000-4000-8000-00000000000f"
+      }
+    }
   ],
   "rejected": [
-    { "name": "raw message field", "failure": { "eventId": "b0000000-0000-4000-8000-000000000001", "source": "ezil_chat", "operation": "chat_request", "category": "interrupted", "code": "stream_interrupted", "stage": "stream", "outcome": "failed", "message": "Response contained no choices." } },
-    { "name": "code outside its category", "failure": { "eventId": "b0000000-0000-4000-8000-000000000002", "source": "ezil_chat", "operation": "chat_request", "category": "auth", "code": "rate_limited", "stage": "admission", "outcome": "failed" } },
-    { "name": "unknown code", "failure": { "eventId": "b0000000-0000-4000-8000-000000000003", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "Error: socket hang up", "stage": "request", "outcome": "failed" } },
-    { "name": "non-uuid request id", "failure": { "eventId": "b0000000-0000-4000-8000-000000000004", "source": "ezil_chat", "operation": "chat_request", "category": "network", "code": "network_failed", "stage": "request", "outcome": "failed", "clientRequestId": "sk-abcdefabcdefabcdefabcdef" } },
-    { "name": "uppercase uuid", "failure": { "eventId": "B0000000-0000-4000-8000-000000000005", "source": "ezil_chat", "operation": "chat_request", "category": "network", "code": "network_failed", "stage": "request", "outcome": "failed" } },
-    { "name": "attempt out of range", "failure": { "eventId": "b0000000-0000-4000-8000-000000000006", "source": "ezil_chat", "operation": "chat_request", "category": "rate_limit", "code": "rate_limited", "stage": "headers", "outcome": "retrying", "attempt": 65 } },
-    { "name": "http status out of range", "failure": { "eventId": "b0000000-0000-4000-8000-000000000007", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "provider_error", "stage": "headers", "outcome": "failed", "httpStatus": 99 } },
-    { "name": "model key is a url", "failure": { "eventId": "b0000000-0000-4000-8000-000000000008", "source": "ezil_chat", "operation": "chat_request", "category": "provider", "code": "model_unavailable", "stage": "admission", "outcome": "failed", "modelKey": "https://gateway.example.test/v1" } },
-    { "name": "stream reason outside stream stage", "failure": { "eventId": "b0000000-0000-4000-8000-000000000009", "source": "ezil_chat", "operation": "chat_request", "category": "interrupted", "code": "stream_interrupted", "stage": "headers", "outcome": "failed", "streamReason": "eof" } },
-    { "name": "producer-claimed computer id", "failure": { "eventId": "b0000000-0000-4000-8000-00000000000a", "source": "ezil_chat", "operation": "chat_request", "category": "network", "code": "network_failed", "stage": "request", "outcome": "failed", "computerId": "f0000000-0000-4000-8000-00000000000a" } },
-    { "name": "unknown source", "failure": { "eventId": "b0000000-0000-4000-8000-00000000000b", "source": "copilot", "operation": "chat_request", "category": "network", "code": "network_failed", "stage": "request", "outcome": "failed" } },
-    { "name": "duration too long", "failure": { "eventId": "b0000000-0000-4000-8000-00000000000c", "source": "ezil_chat", "operation": "chat_request", "category": "timeout", "code": "request_timeout", "stage": "request", "outcome": "failed", "durationMs": 3600001 } }
+    {
+      "name": "raw message field",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000001",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "interrupted",
+        "code": "stream_interrupted",
+        "stage": "stream",
+        "outcome": "failed",
+        "message": "Response contained no choices."
+      }
+    },
+    {
+      "name": "code outside its category",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000002",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "auth",
+        "code": "rate_limited",
+        "stage": "admission",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "unknown code",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000003",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "Error: socket hang up",
+        "stage": "request",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "non-uuid request id",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000004",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed",
+        "clientRequestId": "sk-abcdefabcdefabcdefabcdef"
+      }
+    },
+    {
+      "name": "uppercase uuid",
+      "failure": {
+        "eventId": "B0000000-0000-4000-8000-000000000005",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "attempt out of range",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000006",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "rate_limit",
+        "code": "rate_limited",
+        "stage": "headers",
+        "outcome": "retrying",
+        "attempt": 65
+      }
+    },
+    {
+      "name": "http status out of range",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000007",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "provider_error",
+        "stage": "headers",
+        "outcome": "failed",
+        "httpStatus": 99
+      }
+    },
+    {
+      "name": "model key is a url",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000008",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "model_unavailable",
+        "stage": "admission",
+        "outcome": "failed",
+        "modelKey": "https://gateway.example.test/v1"
+      }
+    },
+    {
+      "name": "stream reason outside stream stage",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000009",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "interrupted",
+        "code": "stream_interrupted",
+        "stage": "headers",
+        "outcome": "failed",
+        "streamReason": "eof"
+      }
+    },
+    {
+      "name": "producer-claimed computer id",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000a",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed",
+        "computerId": "f0000000-0000-4000-8000-00000000000a"
+      }
+    },
+    {
+      "name": "unknown source",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000b",
+        "source": "copilot",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed"
+      }
+    },
+    {
+      "name": "duration too long",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000c",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "timeout",
+        "code": "request_timeout",
+        "stage": "request",
+        "outcome": "failed",
+        "durationMs": 3600001
+      }
+    },
+    {
+      "name": "cancellation without source",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000d",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "cancellation",
+        "code": "request_cancelled",
+        "stage": "stream",
+        "outcome": "cancelled"
+      }
+    },
+    {
+      "name": "cancellation source on a failure",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000e",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "network",
+        "code": "network_failed",
+        "stage": "request",
+        "outcome": "failed",
+        "cancellationSource": "caller"
+      }
+    },
+    {
+      "name": "cancelled outcome outside cancellation",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-00000000000f",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "provider",
+        "code": "provider_error",
+        "stage": "request",
+        "outcome": "cancelled"
+      }
+    },
+    {
+      "name": "legacy user_cancel category",
+      "failure": {
+        "eventId": "b0000000-0000-4000-8000-000000000010",
+        "source": "ezil_chat",
+        "operation": "chat_request",
+        "category": "user_cancel",
+        "code": "user_cancelled",
+        "stage": "stream",
+        "outcome": "cancelled"
+      }
+    }
   ]
 }
