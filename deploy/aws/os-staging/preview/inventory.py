@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Read-only URL → served commit → branch table for OS environments. No credentials, no writes.
 
+A slot's PR and image ID are in its receipt (PR comment, `preview.sh status`); /api/health gives only the commit.
+
 Usage: inventory.py [REPO_DIR]   (fetch first; it reads origin/* refs and each URL's /api/health)
 Image IDs are not public: the preview slot receipts (PR comment, host status) carry them, and
 os-staging/production image IDs come from their release owner's install receipts.
@@ -12,6 +14,7 @@ import sys
 import urllib.request
 
 URLS = {
+    'production (canonical)': 'https://os.ezil.org',
     'production': 'https://os.ezil.work',
     'os-staging': 'https://os-staging.ezil.work',
     'pr-preview-1': 'https://os-pv1.ezil.work',

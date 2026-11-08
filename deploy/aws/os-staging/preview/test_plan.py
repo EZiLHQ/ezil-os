@@ -19,9 +19,10 @@ ACTIVE = {'schema': 1, 'enabled': True, 'role_arn': 'arn:aws:iam::000000000000:r
           'label': 'preview:os', 'slots': dict(plan.SLOTS), 'ttl_hours': 48, 'computers': 'off'}
 
 
-def event(action='synchronize', labels=('preview:os',), label=None, fork=False):
+def event(action='synchronize', labels=('preview:os',), label=None, fork=False, state=None):
     body = {'action': action, 'pull_request': {
         'number': 291, 'labels': [{'name': n} for n in labels],
+        'state': state or ('closed' if action == 'closed' else 'open'),
         'head': {'sha': SHA, 'repo': {'full_name': 'someone/ezil-os' if fork else REPOSITORY}}}}
     if label:
         body['label'] = {'name': label}
@@ -49,13 +50,21 @@ class Planner(unittest.TestCase):
         self.assertNotIn('role_arn', result)
 
     def test_teardown_on_close_or_preview_label_removal(self):
-        self.assertEqual(self.decide(event('closed', labels=()))['action'], 'teardown')
+        self.assertEqual(self.decide(event('closed'))['action'], 'teardown')
+        # An unlabelled PR never had a preview (or lost it when the label went): no identity needed.
+        self.assertEqual(self.decide(event('closed', labels=()))['action'], 'skip')
         self.assertEqual(self.decide(event('unlabeled', labels=(), label='preview:os'))['action'], 'teardown')
         self.assertEqual(self.decide(event('unlabeled', label='size/S'))['action'], 'skip')
         self.assertEqual(self.decide(event('labeled', label='size/S'))['action'], 'skip')
 
     def test_unlabelled_prs_are_skipped(self):
         self.assertEqual(self.decide(event(labels=('size/S',)))['action'], 'skip')
+
+    def test_a_closed_pr_is_never_deployed(self):
+        self.assertEqual(self.decide(event('labeled', label='preview:os', state='closed'))['action'], 'skip')
+
+    def test_a_truncated_file_list_fails_closed(self):
+        self.assertEqual(self.decide(files=('app/src/a.ts', plan.TRUNCATED))['action'], 'skip')
 
     def test_schema_changes_are_refused_because_data_is_shared(self):
         for path in ('app/drizzle/0042_x.sql', 'app/drizzle/meta/_journal.json', 'app/scripts/migrate-things.mjs'):
@@ -107,11 +116,25 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('install-verified', self.text)
         self.assertNotIn('deploy.sh install', self.text)
         self.assertNotIn('deploy-staging', self.text)
-        self.assertEqual(self.flow['concurrency']['group'], 'os-pr-preview-${{ github.event.pull_request.number }}')
-        for job in self.jobs.values():
-            self.assertNotIn('concurrency', job)
+        self.assertNotIn('listArtifactsForRepo', self.text)  # no cross-run artifact reuse
+        self.assertNotIn('concurrency', self.flow)
+        groups = {name: job.get('concurrency') for name, job in self.jobs.items()}
+        lane = {'group': 'os-pr-preview-deploy-${{ github.event.pull_request.number }}', 'cancel-in-progress': True}
+        self.assertEqual(groups, {'plan': None, 'build': lane, 'deploy': lane, 'browser': lane,
+                                  'teardown': {'group': 'os-pr-preview-teardown-${{ github.event.pull_request.number }}',
+                                               'cancel-in-progress': False}})
+
+    def test_every_identity_or_secret_job_waits_in_the_reviewed_environment(self):
+        for name, job in self.jobs.items():
             env = job.get('environment')
-            self.assertIn((env or {}).get('name', env) if isinstance(env, dict) else env, (None, 'os-pr-preview'))
+            env = env.get('name') if isinstance(env, dict) else env
+            needs_env = job.get('permissions', {}).get('id-token') == 'write' or 'secrets.' in json.dumps(job)
+            self.assertEqual(env, 'os-pr-preview' if needs_env else None, name)
+
+    def test_downstream_jobs_skip_when_the_run_is_cancelled(self):
+        for name in ('deploy', 'browser'):
+            self.assertIn('!cancelled()', self.jobs[name]['if'])
+        self.assertNotIn('always()', json.dumps({k: j.get('if') for k, j in self.jobs.items()}))
 
     def test_only_deploy_and_teardown_get_a_cloud_identity(self):
         with_identity = {name for name, job in self.jobs.items() if job.get('permissions', {}).get('id-token') == 'write'}

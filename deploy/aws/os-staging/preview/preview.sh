@@ -16,25 +16,58 @@ case "$command_name" in
         host_args=(deploy --pr "$2" --sha "$3" --tag "$4" --image-id "$5" --receipt-sha256 "$6"
                    --bucket "${OS_STAGING_ARTIFACT_BUCKET:-}" --run "${7:-}"
                    --ttl-hours "${OS_PREVIEW_TTL_HOURS:-48}" --computers "${OS_PREVIEW_COMPUTERS:-off}");;
+    publish) [[ $# == 2 && $2 =~ ^pr[0-9]{1,6}-[0-9a-f]{12}$ ]] || fail 'Expected publish TAG (pr<N>-<sha12>)';;
     teardown) [[ $# == 2 ]] || fail 'Expected teardown PR'; host_args=(teardown --pr "$2");;
     status|reap|install-reaper) [[ $# == 1 ]] || fail "$command_name takes no argument"; host_args=("$command_name");;
-    *) fail 'Usage: preview.sh deploy PR SHA TAG IMAGE_ID RECEIPT_SHA256 [RUN] | teardown PR | status | reap | install-reaper';;
+    *) fail 'Usage: preview.sh publish TAG | deploy PR SHA TAG IMAGE_ID RECEIPT_SHA256 [RUN] | teardown PR | status | reap | install-reaper';;
 esac
 
 aws_call() { aws --region ap-south-1 --no-cli-pager "$@"; }
 # Same pins as deploy.sh install-verified: the staging host and its artifact bucket only.
 [[ ${OS_STAGING_INSTANCE_ID:-} == i-014810524754b9ed0 ]] || fail 'Preview slots require the pinned OS staging host.'
-if [[ $command_name == deploy ]]; then
+if [[ $command_name == deploy || $command_name == publish ]]; then
     [[ ${OS_STAGING_ARTIFACT_BUCKET:-} == ezil-main-preview-artifacts-452630323510-aps1 ]] \
         || fail 'Preview deploy requires the pinned OS staging artifact bucket.'
+fi
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+
+if [[ $command_name == publish ]]; then
+    tag=$2 artifacts="$here/../artifacts"
+    s3_etag() {
+        aws_call s3api head-object --bucket "$OS_STAGING_ARTIFACT_BUCKET" --key "os-staging/images/$1" \
+            --query ETag --output text 2>/dev/null | tr -d '"' || true
+    }
+    if [[ -n $(s3_etag "$tag.sha256") ]]; then
+        # The checksum marker is written last, so the tag is complete and immutable: the first published
+        # build of this head wins and a rebuild (never byte-identical) is discarded.
+        aws_call s3 cp "s3://$OS_STAGING_ARTIFACT_BUCKET/os-staging/images/$tag.source.json" \
+            "$temporary/published.json" --only-show-errors
+        receipt=$(sha256sum "$temporary/published.json" | cut -d' ' -f1)
+        printf 'PUBLISHED mode=reuse receipt_sha256=%s\n' "$receipt"
+        exit 0
+    fi
+    (cd "$artifacts" && sha256sum --check --quiet "$tag.sha256")
+    for suffix in tar.gz runtime.tar.gz source.json sha256; do
+        etag=$(s3_etag "$tag.$suffix")
+        if [[ -n $etag ]]; then
+            # Left by an interrupted upload: keep it only if it is these exact bytes (single-part SSE-S3 ETag = MD5).
+            [[ $etag == $(md5sum "$artifacts/$tag.$suffix" | cut -d' ' -f1) ]] \
+                || fail "Partial upload of $tag holds different bytes; the release owner removes os-staging/images/$tag.* before a retry."
+        else
+            aws_call s3api put-object --bucket "$OS_STAGING_ARTIFACT_BUCKET" --key "os-staging/images/$tag.$suffix" \
+                --body "$artifacts/$tag.$suffix" --server-side-encryption AES256 --if-none-match '*' >/dev/null
+        fi
+    done
+    receipt=$(sha256sum "$artifacts/$tag.source.json" | cut -d' ' -f1)
+    printf 'PUBLISHED mode=fresh receipt_sha256=%s\n' "$receipt"
+    exit 0
 fi
 pin=$(aws_call ec2 describe-instances --instance-ids "$OS_STAGING_INSTANCE_ID" \
     --query 'Reservations[0].Instances[0].[VpcId, Tags[?Key==`Name`].Value | [0], Tags[?Key==`ezil:env`].Value | [0]]' --output text)
 [[ $pin == $'vpc-0f6bc19fdfd4209aa\tezil-os-billing-staging-host\tbilling-staging' ]] \
     || fail 'Staging host identity/VPC mismatch.'
 
-temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT
 # The payload carries only checked-in code and nonsecret identifiers; the host renders
 # the slot env from its own staging env file.
 python3 - "$here/preview_host.py" "$here/../install_receipt.py" "$temporary/ssm.json" "${host_args[@]}" <<'PY'

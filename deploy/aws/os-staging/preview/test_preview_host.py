@@ -27,6 +27,7 @@ STAGING_ENV = ''.join(f'{k}={v}\n' for k, v in {
     'AUTH0_CLIENT_ID': 'client', 'CHECKOUT_ENABLED': '1', 'CLOUDFLARE_GUACAMOLE_HMAC_SECRET': 'h' * 40,
     'CRON_SECRET': 'c' * 40, 'EZIL_AWS_COMPUTERS_ENABLED': '1', 'EZIL_AWS_KILL_SWITCH': '0',
     'STRIPE_WEBHOOK_SECRET': 'whsec_x', 'SUPABASE_DATABASE_URL': 'postgres://u:p$w@10.0.0.1:5432/db?x=#1',
+    'EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET': 'l' * 40, 'EZIL_AWS_APP_CALLER_ROLE_ARN_AP_SOUTH_1': 'arn:x',
 }.items())
 
 
@@ -66,6 +67,11 @@ class Host(unittest.TestCase):
         self.calls.append(list(args))
         if args[:3] == ['docker', 'image', 'inspect']:
             return json.dumps({'Id': IMAGE})
+        if args[:2] == ['docker', 'compose'] and 'up' in args:
+            receipts = ph.read_receipts()
+            self.at_up = {s: (r['state'], r['expires_at']) for s, r in receipts.items()}
+            if getattr(self, 'fail_up', False):
+                raise subprocess.CalledProcessError(1, args)
         return ''
 
     def fake_download(self, bucket, t, directory):
@@ -83,6 +89,8 @@ class Host(unittest.TestCase):
         return self.archive_id
 
     def fake_verify_loaded(self, image, source, expected):
+        if getattr(self, 'fail_loaded', False):
+            raise ValueError('Loaded image ID differs from verified archive')
         self.assertEqual(image['Id'], expected)
 
     def fast_wait_healthy(self, slot, sha, deadline_seconds=120):
@@ -106,6 +114,9 @@ class Host(unittest.TestCase):
 
     def env_of(self, slot):
         return ph.parse_env((self.tmp / 'etc' / f'pv{slot}.env').read_text())
+
+    def removed_images(self):
+        return [c[3] for c in self.calls if c[:3] == ['docker', 'image', 'rm']]
 
     def compose_calls(self):
         return [c for c in self.calls if c[:2] == ['docker', 'compose']]
@@ -263,6 +274,68 @@ class Lifecycle(Host):
             ph.parse_env('not a line\n')
 
 
+class Failures(Host):
+    def test_the_slot_is_claimed_with_a_short_expiry_before_the_container_starts(self):
+        moment = ph.now()
+        receipt = self.deploy(289)
+        state, expires = self.at_up[1]
+        self.assertEqual(state, 'starting')
+        self.assertLessEqual(ph.parse_iso(expires) - moment, dt.timedelta(minutes=ph.STARTING_MINUTES, seconds=5))
+        self.assertEqual(receipt['state'], 'serving')
+        self.assertEqual(json.loads(ph.receipt_path(1).read_text())['state'], 'serving')
+
+    def test_a_failure_before_the_slot_is_touched_keeps_the_old_head_serving(self):
+        self.deploy(289)
+        self.health = {p: {'ok': True, 'sha': SHA2} for p in ph.SLOTS.values()}
+        self.fail_loaded = True
+        self.calls.clear()
+        with self.assertRaises(ValueError):
+            self.deploy(289, SHA2)
+        self.assertEqual(ph.read_receipts()[1]['sha'], SHA)
+        self.assertTrue((self.tmp / 'etc' / 'pv1.env').exists())
+        self.assertEqual(self.compose_calls(), [])
+        self.assertEqual(self.removed_images(), [f'ezil-os-staging:{tag(289, SHA2)}'])
+
+    def test_a_failure_after_the_slot_is_touched_removes_both_images(self):
+        self.deploy(289)
+        self.fail_up = True
+        self.calls.clear()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.deploy(289, SHA2)
+        self.assertEqual(ph.read_receipts(), {})
+        self.assertFalse((self.tmp / 'etc' / 'pv1.env').exists())
+        self.assertEqual(sorted(self.removed_images()),
+                         sorted([f'ezil-os-staging:{tag(289)}', f'ezil-os-staging:{tag(289, SHA2)}']))
+
+    def test_a_failed_down_keeps_the_receipt_for_the_reaper_and_the_original_error(self):
+        self.fail_up = True
+        original = self.fake_run
+
+        def down_fails(args, **kwargs):
+            if 'down' in args:
+                raise subprocess.CalledProcessError(2, args)
+            return original(args, **kwargs)
+        with mock.patch.object(ph, 'run', down_fails), self.assertRaises(subprocess.CalledProcessError) as caught:
+            self.deploy(289)
+        self.assertEqual(caught.exception.returncode, 1)
+        self.assertEqual(ph.read_receipts()[1]['state'], 'starting')
+
+    def test_image_id_is_optional_when_a_published_receipt_is_reused(self):
+        receipt = self.deploy(289, image_id='')
+        self.assertEqual(receipt['image_id'], IMAGE)
+
+    def test_computers_off_also_drops_lifecycle_and_caller_roles(self):
+        self.deploy(289)
+        env = self.env_of(1)
+        self.assertNotIn('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', env)
+        self.assertNotIn('EZIL_AWS_APP_CALLER_ROLE_ARN_AP_SOUTH_1', env)
+
+    def test_shared_computers_keep_lifecycle_and_caller_roles(self):
+        self.deploy(289, computers='shared')
+        env = self.env_of(1)
+        self.assertEqual(env['EZIL_AWS_APP_CALLER_ROLE_ARN_AP_SOUTH_1'], 'arn:x')
+
+
 class WaitHealthy(unittest.TestCase):
     def test_polls_until_the_exact_sha(self):
         answers = iter([OSError(), {'ok': True, 'sha': SHA2}, {'ok': True, 'sha': SHA}])
@@ -296,6 +369,20 @@ elif "send-command" in args:
     print("command-1")
 elif "--query" in args and args[args.index("--query") + 1] == "Status":
     print(os.environ.get("FAKE_STATUS", "Success"))
+elif "head-object" in args:
+    obj = pathlib.Path(os.environ["FAKE_S3"]) / pathlib.Path(args[args.index("--key") + 1]).name
+    if not obj.exists():
+        sys.exit(255)
+    import hashlib
+    print('"' + hashlib.md5(obj.read_bytes()).hexdigest() + '"')
+elif "put-object" in args:
+    obj = pathlib.Path(os.environ["FAKE_S3"]) / pathlib.Path(args[args.index("--key") + 1]).name
+    if obj.exists():
+        sys.exit(254)
+    shutil.copyfile(args[args.index("--body") + 1], obj)
+elif "cp" in args[:6]:
+    src = pathlib.Path(os.environ["FAKE_S3"]) / pathlib.Path(args[args.index("cp") + 1]).name
+    shutil.copyfile(src, args[args.index("cp") + 2])
 else:
     print('noise line\nPREVIEW_RESULT {"command": "deploy"}\t')
 '''
@@ -311,7 +398,8 @@ class Wrapper(unittest.TestCase):
         shim.chmod(0o755)
         self.env = {**os.environ, 'PATH': f'{self.tmp / "bin"}:{os.environ["PATH"]}', 'SHIM_STATE': str(self.tmp),
                     'OS_STAGING_INSTANCE_ID': 'i-014810524754b9ed0', 'OS_STAGING_ARTIFACT_BUCKET': BUCKET,
-                    'FAKE_PIN': PIN}
+                    'FAKE_PIN': PIN, 'FAKE_S3': str(self.tmp / 's3')}
+        (self.tmp / 's3').mkdir()
 
     def tearDown(self):
         import shutil
@@ -344,6 +432,52 @@ class Wrapper(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
                 self.assertFalse((self.tmp / 'payload.json').exists())
+
+    def artifacts(self, t):
+        directory = HERE.parent / 'artifacts'
+        directory.mkdir(exist_ok=True)
+        self.addCleanup(lambda: [f.unlink() for f in directory.glob(f'{t}.*')])
+        for suffix, body in (('tar.gz', b'image'), ('runtime.tar.gz', b'runtime'), ('source.json', b'{"r":1}')):
+            (directory / f'{t}.{suffix}').write_bytes(body)
+        subprocess.run(f'sha256sum {t}.tar.gz {t}.runtime.tar.gz > {t}.sha256', shell=True, cwd=directory, check=True)
+        return directory
+
+    def test_publish_uploads_a_new_tag_with_the_marker_last(self):
+        t = 'pr289-' + 'd' * 12
+        directory = self.artifacts(t)
+        result = self.preview('publish', t)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import hashlib
+        self.assertIn(f"PUBLISHED mode=fresh receipt_sha256={hashlib.sha256(b'{\"r\":1}').hexdigest()}", result.stdout)
+        puts = [json.loads(l) for l in (self.tmp / 'log').read_text().splitlines() if 'put-object' in l]
+        self.assertEqual([p[p.index('--key') + 1].split(t)[1] for p in puts], ['.tar.gz', '.runtime.tar.gz', '.source.json', '.sha256'])
+        self.assertTrue(all("--if-none-match" in p for p in puts))
+        self.assertEqual((self.tmp / 's3' / f'{t}.tar.gz').read_bytes(), (directory / f'{t}.tar.gz').read_bytes())
+
+    def test_publish_reuses_a_complete_tag_and_never_overwrites_it(self):
+        t = 'pr289-' + 'e' * 12
+        self.artifacts(t)
+        (self.tmp / 's3' / f'{t}.sha256').write_text('marker')
+        (self.tmp / 's3' / f'{t}.source.json').write_bytes(b'{"published":1}')
+        result = self.preview('publish', t)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import hashlib
+        self.assertIn(f"mode=reuse receipt_sha256={hashlib.sha256(b'{\"published\":1}').hexdigest()}", result.stdout)
+        self.assertNotIn('put-object', (self.tmp / 'log').read_text())
+
+    def test_publish_completes_a_matching_partial_upload_and_refuses_a_different_one(self):
+        t = 'pr289-' + 'f' * 12
+        directory = self.artifacts(t)
+        (self.tmp / 's3' / f'{t}.tar.gz').write_bytes((directory / f'{t}.tar.gz').read_bytes())
+        result = self.preview('publish', t)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('mode=fresh', result.stdout)
+        for f in (self.tmp / 's3').iterdir():
+            f.unlink()
+        (self.tmp / 's3' / f'{t}.tar.gz').write_bytes(b'another build')
+        result = self.preview('publish', t)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Partial upload', result.stderr)
 
     def test_host_failure_fails_the_wrapper(self):
         result = self.preview('teardown', '289', FAKE_STATUS='Failed')

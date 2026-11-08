@@ -44,6 +44,7 @@ REGION = 'ap-south-1'
 
 SLOTS = {1: 3101, 2: 3102}
 DEFAULT_TTL_HOURS = 48
+STARTING_MINUTES = 30
 MAX_TTL_HOURS = 72
 MEMORY = '768m'
 CPUS = '1.0'
@@ -53,8 +54,9 @@ STAGING_TAG = re.compile(r'OS_STAGING_TAG=([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})')
 # Always removed from the staging env: cron and webhook authority.
 DROP = frozenset({'CRON_SECRET', 'STRIPE_WEBHOOK_SECRET'})
 COMPUTERS_OFF = {'EZIL_AWS_COMPUTERS_ENABLED': '0', 'EZIL_AWS_KILL_SWITCH': '1'}
-# Also removed with computers off: the key that controls staging's Cloudflare computers and signs AWS enrolment.
-COMPUTER_CONTROL = 'CLOUDFLARE_GUACAMOLE_HMAC_SECRET'
+# Also removed with computers off: the key that controls staging's Cloudflare computers and signs AWS enrolment,
+# the lifecycle authority and the app-caller roles.
+COMPUTER_CONTROL = re.compile(r'CLOUDFLARE_GUACAMOLE_HMAC_SECRET|EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET|EZIL_AWS_APP_CALLER_ROLE_ARN_[A-Z0-9_]+')
 
 
 class PreviewError(Exception):
@@ -154,8 +156,8 @@ def preview_env(staging, slot, pr, computers):
     require(computers in ('off', 'shared'), 'computers must be off or shared')
     values = {k: v for k, v in staging.items() if k not in DROP}
     if computers == 'off':
+        values = {k: v for k, v in values.items() if not COMPUTER_CONTROL.fullmatch(k)}
         values.update(COMPUTERS_OFF)
-        values.pop(COMPUTER_CONTROL, None)
     values.update({
         'EZIL_DEPLOY_ENV': 'pr-preview',
         'EZIL_PR_PREVIEW_ORIGIN': origin(slot),
@@ -251,6 +253,10 @@ def download(bucket, tag, directory):
              str(directory / f'{tag}.{suffix}'), '--only-show-errors'], env=env)
 
 
+def write_receipt(slot, receipt):
+    atomic_write(receipt_path(slot), json.dumps(receipt, indent=2) + '\n', 0o644)
+
+
 def deploy(args):
     require(TAG.fullmatch(args.tag) and args.tag.startswith(f'pr{args.pr}-') and args.sha.startswith(args.tag[-12:]),
             'Tag must be pr<PR>-<first 12 of SHA>')
@@ -258,38 +264,57 @@ def deploy(args):
     receipts = read_receipts()
     slot = choose_slot(receipts, args.pr, moment)
     previous = receipts.get(slot)
-    with tempfile.TemporaryDirectory() as temporary:
-        directory = Path(temporary)
-        download(args.bucket, args.tag, directory)
-        image_id = install_receipt.verify_archive(directory, args.tag, 'staging', args.sha, args.receipt_sha256)
-        require(image_id == args.image_id, 'Verified archive image ID differs from the CI build')
-        with (directory / f'{args.tag}.tar.gz').open('rb') as archive:
-            subprocess.run(['sh', '-c', 'gzip -dc | docker load'], stdin=archive, check=True, capture_output=True)
-    loaded = json.loads(run(['docker', 'image', 'inspect', f'ezil-os-staging:{args.tag}', '--format', '{{json .}}']))
-    install_receipt.verify_loaded(loaded, args.sha, image_id)
-    if previous and previous.get('pr') != args.pr:
-        teardown_slot(slot, 'expired')
-    receipt = {
-        'schema': 1, 'slot': slot, 'origin': origin(slot), 'pr': args.pr, 'sha': args.sha, 'tag': args.tag,
-        'image_id': image_id, 'receipt_sha256': args.receipt_sha256, 'computers': args.computers,
-        'data_plane': 'shared-staging-preview-supabase', 'deployed_at': iso(moment),
-        'expires_at': iso(moment + dt.timedelta(hours=args.ttl_hours)), 'run': args.run,
-    }
-    staging = parse_env(STAGING_ENV.read_text())
-    atomic_write(ETC / f'pv{slot}.env', preview_env(staging, slot, args.pr, args.computers))
-    atomic_write(ROOT / f'pv{slot}' / 'compose.json', compose_file(slot, args.tag, receipt), 0o644)
+    old_tag = previous.get('tag') if previous and previous.get('pr') == args.pr else None
+    loaded_tag, touched = None, False
     try:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            download(args.bucket, args.tag, directory)
+            # The receipt hash pins the archive, so it alone determines the image ID; a CI build may confirm it.
+            image_id = install_receipt.verify_archive(directory, args.tag, 'staging', args.sha, args.receipt_sha256)
+            require(args.image_id in ('', image_id), 'Verified archive image ID differs from the CI build')
+            with (directory / f'{args.tag}.tar.gz').open('rb') as archive:
+                loaded_tag = args.tag
+                subprocess.run(['sh', '-c', 'gzip -dc | docker load'], stdin=archive, check=True, capture_output=True)
+        loaded = json.loads(run(['docker', 'image', 'inspect', f'ezil-os-staging:{args.tag}', '--format', '{{json .}}']))
+        install_receipt.verify_loaded(loaded, args.sha, image_id)
+        if previous and previous.get('pr') != args.pr:
+            teardown_slot(slot, 'expired')
+        receipt = {
+            'schema': 1, 'state': 'starting', 'slot': slot, 'origin': origin(slot), 'pr': args.pr, 'sha': args.sha,
+            'tag': args.tag, 'image_id': image_id, 'receipt_sha256': args.receipt_sha256, 'computers': args.computers,
+            'data_plane': 'shared-staging-preview-supabase', 'deployed_at': iso(moment),
+            'expires_at': iso(moment + dt.timedelta(minutes=STARTING_MINUTES)), 'run': args.run,
+        }
+        # The slot is claimed before its container starts: if this command dies (SSM timeout) after `up`,
+        # the short expiry hands the container to the reaper instead of leaving it serving unowned.
+        touched = True
+        write_receipt(slot, receipt)
+        staging = parse_env(STAGING_ENV.read_text())
+        atomic_write(ETC / f'pv{slot}.env', preview_env(staging, slot, args.pr, args.computers))
+        atomic_write(ROOT / f'pv{slot}' / 'compose.json', compose_file(slot, args.tag, receipt), 0o644)
         compose(slot, 'up', '--detach', '--force-recreate', '--wait', '--wait-timeout', '120')
         wait_healthy(slot, args.sha)
-    except Exception:
-        # A preview has no rollback: a failed slot is removed, never left half-serving.
-        receipt_path(slot).unlink(missing_ok=True)
-        compose(slot, 'down', '--remove-orphans', '--timeout', '20')
-        (ETC / f'pv{slot}.env').unlink(missing_ok=True)
+        receipt.update(state='serving', expires_at=iso(moment + dt.timedelta(hours=args.ttl_hours)))
+        write_receipt(slot, receipt)
+    except BaseException:
+        # A preview has no rollback. Before the slot is touched, the old head keeps serving; after, the
+        # slot is removed rather than left half-serving. Either way no failed image stays on the shared disk.
+        if touched:
+            try:
+                compose(slot, 'down', '--remove-orphans', '--timeout', '20')
+            except Exception:  # noqa: BLE001 - keep the original error; the receipt still lets reap retry
+                pass
+            else:
+                receipt_path(slot).unlink(missing_ok=True)
+            (ETC / f'pv{slot}.env').unlink(missing_ok=True)
+            if old_tag != args.tag:
+                remove_image(old_tag)
+        if loaded_tag and (touched or loaded_tag != old_tag):
+            remove_image(loaded_tag)
         raise
-    atomic_write(receipt_path(slot), json.dumps(receipt, indent=2) + '\n', 0o644)
-    if previous and previous.get('pr') == args.pr and previous.get('tag') != args.tag:
-        remove_image(previous.get('tag'))
+    if old_tag and old_tag != args.tag:
+        remove_image(old_tag)
     return receipt
 
 
@@ -343,7 +368,7 @@ def main(argv=None):
     d.add_argument('--pr', type=int, required=True)
     d.add_argument('--sha', required=True)
     d.add_argument('--tag', required=True)
-    d.add_argument('--image-id', required=True)
+    d.add_argument('--image-id', default='')
     d.add_argument('--receipt-sha256', required=True)
     d.add_argument('--bucket', required=True)
     d.add_argument('--run', default='')
@@ -357,7 +382,7 @@ def main(argv=None):
     if args.command == 'deploy':
         require(0 < args.pr < 10**6, 'Invalid PR number')
         require(re.fullmatch(r'[0-9a-f]{40}', args.sha), 'Expected a full commit SHA')
-        require(re.fullmatch(r'sha256:[0-9a-f]{64}', args.image_id), 'Expected an image ID')
+        require(args.image_id == '' or re.fullmatch(r'sha256:[0-9a-f]{64}', args.image_id), 'Expected an image ID')
         require(re.fullmatch(r'[0-9a-f]{64}', args.receipt_sha256), 'Expected a receipt SHA256')
         require(re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', args.bucket), 'Invalid bucket')
         require(re.fullmatch(r'[0-9]{0,20}(-[0-9]{1,3})?', args.run), 'Invalid run reference')

@@ -2,7 +2,8 @@
 """Decide one os-pr-preview run: deploy, teardown or skip (with the reason). No network.
 
 Usage: plan.py EVENT_JSON ACTIVATION_JSON CHANGED_FILES REPOSITORY  -> key=value lines for GITHUB_OUTPUT.
-ACTIVATION_JSON must come from the PR's base commit, so a PR cannot enable its own preview.
+ACTIVATION_JSON comes from the PR's base commit. It is an on/off switch, not a security boundary:
+the os-pr-preview environment's required reviewers are (see README.md).
 """
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ ROLE = re.compile(r'arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_-]{1,64}')
 SLOTS = {'1': 'https://os-pv1.ezil.work', '2': 'https://os-pv2.ezil.work'}
 # What the os-staging app image is built from (deploy.sh build / app/.dockerignore).
 APP_TIER = ('app/', 'native/src/contract.ts', 'native/src/surfaces.ts')
+TRUNCATED = '__TRUNCATED__'
 
 
 def schema_change(path):
@@ -42,12 +44,18 @@ def decide(event, activation, files, repository):
                   'computers': activation['computers']}
     label = activation['label']
     event_label = (event.get('label') or {}).get('name')
-    if event['action'] == 'closed' or (event['action'] == 'unlabeled' and event_label == label):
+    labelled = label in {item['name'] for item in pr.get('labels', [])}
+    # Only a PR that had a preview tears one down (removing the label already did); the TTL reaper is the backstop.
+    if (event['action'] == 'closed' and labelled) or (event['action'] == 'unlabeled' and event_label == label):
         return out('teardown', 'Pull request closed or preview label removed.', **deployment)
-    if label not in {item['name'] for item in pr.get('labels', [])}:
+    if event['action'] == 'closed' or pr.get('state') != 'open':
+        return out('skip', 'Pull request is not open.')
+    if not labelled:
         return out('skip', f'Not labelled {label}.')
     if event['action'] in ('labeled', 'unlabeled') and event_label != label:
         return out('skip', 'Another label changed; the preview is unchanged.')
+    if TRUNCATED in files:
+        return out('skip', 'Too many changed files to classify safely (API limit 300).')
     if [f for f in files if schema_change(f)]:
         return out('skip', 'Schema change: a preview shares the staging PREVIEW database, so this PR '
                            'goes through the staging release instead.')

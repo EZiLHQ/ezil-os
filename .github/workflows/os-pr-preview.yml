@@ -1,5 +1,8 @@
 # PR preview slots on the OS staging host: deploy/aws/os-staging/preview/README.md.
-# Inert until preview/activation.json is enabled ON THE BASE BRANCH by the release owner.
+# Security boundary: the `os-pr-preview` environment's required reviewers. A pull_request run
+# executes the PR's own copy of this file, and a preview runs PR code on the staging host, so
+# every identity-bearing job waits for a reviewer and the cloud role trusts only that
+# environment. activation.json (read from the base) is an on/off switch, not a boundary.
 # Never deploys os-staging, never takes the shared staging lease, never runs for forks.
 # `preview.yml` is the unrelated deploy of the `preview` branch.
 name: OS PR preview
@@ -10,13 +13,6 @@ on:
 
 permissions:
   contents: read
-
-# One lane per PR: a new head cancels its own older run; teardown waits for it instead.
-# Host mutations from different PRs are serialized by preview_host.py's lock, not here:
-# a repository-wide group would cancel every pending run but the newest.
-concurrency:
-  group: os-pr-preview-${{ github.event.pull_request.number }}
-  cancel-in-progress: ${{ github.event.action != 'closed' }}
 
 defaults:
   run:
@@ -39,7 +35,6 @@ jobs:
       role_arn: ${{ steps.plan.outputs.role_arn }}
       ttl_hours: ${{ steps.plan.outputs.ttl_hours }}
       computers: ${{ steps.plan.outputs.computers }}
-      artifact_run: ${{ steps.built.outputs.run }}
     steps:
       # The base commit's planner and activation file: the PR under test cannot change either.
       - uses: actions/checkout@v7
@@ -50,7 +45,8 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           if [[ ! -f deploy/aws/os-staging/preview/plan.py ]]; then
@@ -58,27 +54,23 @@ jobs:
             printf 'action=skip\nreason=Preview tooling is not on the base branch.\n' | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/files.txt"
+          # Exactly the event's base...head (renames list both names); the API stops at 300 files.
+          gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" \
+            --jq 'if (.files | length) >= 300 then "__TRUNCATED__" else (.files[] | .filename, (.previous_filename // empty)) end' \
+            > "$RUNNER_TEMP/files.txt"
           python3 -B deploy/aws/os-staging/preview/plan.py "$GITHUB_EVENT_PATH" \
             deploy/aws/os-staging/preview/activation.json "$RUNNER_TEMP/files.txt" "$GITHUB_REPOSITORY" | tee -a "$GITHUB_OUTPUT"
-      - name: Reuse an earlier build of this exact head
-        id: built
-        if: steps.plan.outputs.action == 'deploy'
-        uses: actions/github-script@v7
-        env:
-          TAG: ${{ steps.plan.outputs.tag }}
-        with:
-          script: |
-            // Build once per head SHA: a rerun or relabel promotes the artifact already built.
-            const {data} = await github.rest.actions.listArtifactsForRepo({...context.repo, name: `os-pr-preview-${process.env.TAG}`, per_page: 20});
-            const artifact = data.artifacts.filter(a => !a.expired && a.workflow_run?.head_sha)
-              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
-            if (artifact) core.setOutput('run', String(artifact.workflow_run.id));
 
+  # One deploy lane per PR: a new head cancels that PR's older build/deploy/browser jobs.
+  # Teardown has its own never-cancelled group. Different PRs serialize on preview_host.py's
+  # host lock; a repository-wide group would silently drop all but the newest pending run.
   build:
-    name: Build app image once
+    name: Build app image
     needs: plan
-    if: needs.plan.outputs.action == 'deploy' && needs.plan.outputs.artifact_run == ''
+    if: needs.plan.outputs.action == 'deploy'
+    concurrency:
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -105,13 +97,16 @@ jobs:
           name: os-pr-preview-${{ needs.plan.outputs.tag }}
           path: deploy/aws/os-staging/artifacts/${{ needs.plan.outputs.tag }}.*
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
           if-no-files-found: error
 
   deploy:
     name: Deploy preview slot
     needs: [plan, build]
-    if: always() && needs.plan.outputs.action == 'deploy' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    if: ${{ !cancelled() && needs.plan.outputs.action == 'deploy' && needs.build.result == 'success' }}
+    concurrency:
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     environment:
@@ -139,8 +134,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: os-pr-preview-${{ needs.plan.outputs.tag }}
-          run-id: ${{ needs.plan.outputs.artifact_run || github.run_id }}
-          github-token: ${{ github.token }}
           path: deploy/aws/os-staging/artifacts
       - name: Verify the artifact binds this head (image ID and receipt)
         id: artifact
@@ -156,25 +149,29 @@ jobs:
           role-to-assume: ${{ needs.plan.outputs.role_arn }}
           aws-region: ap-south-1
           unset-current-credentials: true
-      - name: Publish the immutable tag once
+      - name: Publish the immutable tag once (first published build of a head wins)
+        id: publish
+        env:
+          BUILT_RECEIPT: ${{ steps.artifact.outputs.receipt_sha256 }}
+          BUILT_IMAGE: ${{ steps.artifact.outputs.image_id }}
         run: |
           set -euo pipefail
-          key="os-staging/images/$TAG.source.json"
-          if aws s3api head-object --bucket "$OS_STAGING_ARTIFACT_BUCKET" --key "$key" >/dev/null 2>&1; then
-            # Already published by an earlier run: it must be this exact receipt.
-            aws s3 cp "s3://$OS_STAGING_ARTIFACT_BUCKET/$key" "$RUNNER_TEMP/published.json" --only-show-errors
-            cmp -s "$RUNNER_TEMP/published.json" "deploy/aws/os-staging/artifacts/$TAG.source.json" \
-              || { echo "::error::$TAG is already published with a different receipt; tags are immutable."; exit 1; }
-          else
-            bash deploy/aws/os-staging/deploy.sh upload "$TAG"
-          fi
+          line=$(bash deploy/aws/os-staging/preview/preview.sh publish "$TAG" | grep '^PUBLISHED ')
+          echo "$line"
+          receipt=${line##*receipt_sha256=}
+          [[ $receipt =~ ^[0-9a-f]{64}$ ]]
+          # A fresh publish is this run's build, so the host also checks its image ID. On reuse, the
+          # published receipt pins the archive and the host derives and reports the image ID.
+          image=
+          if [[ $line == *mode=fresh* ]]; then [[ $receipt == "$BUILT_RECEIPT" ]]; image=$BUILT_IMAGE; fi
+          printf 'receipt_sha256=%s\nimage_id=%s\n' "$receipt" "$image" | tee -a "$GITHUB_OUTPUT"
       - name: Deploy the slot and check it from the host
         id: host
         env:
           OS_PREVIEW_TTL_HOURS: ${{ needs.plan.outputs.ttl_hours }}
           OS_PREVIEW_COMPUTERS: ${{ needs.plan.outputs.computers }}
-          IMAGE_ID: ${{ steps.artifact.outputs.image_id }}
-          RECEIPT: ${{ steps.artifact.outputs.receipt_sha256 }}
+          IMAGE_ID: ${{ steps.publish.outputs.image_id }}
+          RECEIPT: ${{ steps.publish.outputs.receipt_sha256 }}
         run: |
           set -euo pipefail
           bash deploy/aws/os-staging/preview/preview.sh deploy "$PR" "$SHA" "$TAG" "$IMAGE_ID" "$RECEIPT" \
@@ -197,8 +194,6 @@ jobs:
         uses: actions/github-script@v7
         env:
           URL: ${{ steps.slot.outputs.url }}
-          IMAGE_ID: ${{ steps.artifact.outputs.image_id }}
-          RECEIPT: ${{ steps.artifact.outputs.receipt_sha256 }}
         with:
           script: |
             const fs = require('fs');
@@ -207,7 +202,7 @@ jobs:
             const body = [marker, '**OS PR preview** (shared staging data; not production)', '',
               '| PR head | Image tag | Image ID | Receipt SHA-256 | URL | Expires (UTC) | Computers |',
               '|---|---|---|---|---|---|---|',
-              `| \`${process.env.SHA}\` | \`${process.env.TAG}\` | \`${process.env.IMAGE_ID}\` | \`${process.env.RECEIPT}\` | ${process.env.URL} | ${host.expires_at} | ${host.computers} |`,
+              `| \`${host.sha}\` | \`${host.tag}\` | \`${host.image_id}\` | \`${host.receipt_sha256}\` | ${process.env.URL} | ${host.expires_at} | ${host.computers} |`,
               '', `Run ${context.runId}. Sessions and callbacks are isolated per slot; the database is the shared staging PREVIEW database. Editor/computer image changes are not covered by this app preview.`].join('\n');
             await core.summary.addRaw(body).write();
             const issue_number = Number(process.env.PR);
@@ -219,7 +214,10 @@ jobs:
   browser:
     name: Browser acceptance (desktop + mobile)
     needs: [plan, deploy]
-    if: needs.deploy.result == 'success'
+    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
+    concurrency:
+      group: os-pr-preview-deploy-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: os-pr-preview
@@ -261,6 +259,9 @@ jobs:
     name: Tear down preview slot
     needs: plan
     if: needs.plan.outputs.action == 'teardown'
+    concurrency:
+      group: os-pr-preview-teardown-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: os-pr-preview
