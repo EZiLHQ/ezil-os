@@ -293,10 +293,11 @@ export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
 }>;
 
-// Placement.updatedAt is a JavaScript Date and the generation CAS uses exact
-// SQL equality. Every placement updated_at writer must therefore store whole
-// milliseconds. Advance at least 1 ms on updates, even within one transaction
-// (now() is fixed there), so a same-state write always invalidates old snapshots.
+// Placement.updatedAt is a JavaScript Date; legacy rows may hold sub-millisecond
+// values, so the CAS compares at millisecond precision. Every placement updated_at
+// writer stores whole milliseconds. Advance to at least the next millisecond on
+// updates, even within one transaction (now() is fixed there), so a same-state
+// write always invalidates old snapshots.
 const PLACEMENT_INSERT_TIME = sql`date_trunc('milliseconds', now())`;
 const PLACEMENT_UPDATE_TIME = sql`GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')`;
 
@@ -1041,7 +1042,7 @@ async function casInTx(
                 ${guard.lifecycleDigest !== undefined ? sql` AND lifecycle_digest = ${guard.lifecycleDigest}` : sql``}
                 ${guard.fenceToken !== undefined ? sql` AND fence_token = ${guard.fenceToken}::uuid` : sql``}
                 ${guard.volumeId !== undefined ? sql` AND volume_id = ${guard.volumeId}` : sql``}
-                ${guard.updatedAt !== undefined ? sql` AND updated_at = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
+                ${guard.updatedAt !== undefined ? sql` AND date_trunc('milliseconds', updated_at) = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -2023,7 +2024,7 @@ export async function savePoolEnrollmentNonce(tx: PlacementExecutor, p: Placemen
     nonce: { nonceHash: string; expiresAt: Date }): Promise<boolean> {
     return rowsOf(await tx.execute(sql`UPDATE public.ezil_computer_placements
         SET enroll_nonce_hash = ${nonce.nonceHash}, enroll_expires_at = ${nonce.expiresAt.toISOString()}::timestamptz,
-            updated_at = greatest(updated_at + interval '1 millisecond', clock_timestamp())
+            updated_at = ${PLACEMENT_UPDATE_TIME}
         WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
             AND instance_id = ${p.instanceId} AND enroll_consumed_hash IS NULL AND enroll_nonce_hash IS NULL
         RETURNING computer_id`)).length === 1;

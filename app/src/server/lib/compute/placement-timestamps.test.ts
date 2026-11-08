@@ -108,12 +108,12 @@ describe('placement updated_at SQL contract', () => {
         expect(c.statement(tag).sql).toContain("updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')");
     });
 
-    it('keeps the exact timestamp and owner CAS predicates', async () => {
+    it('keeps the millisecond timestamp and owner CAS predicates', async () => {
         const c = capture(), expected = parsePlacementRow(c.row, computerId);
         await reconcileReplacementGeneration(c.db, expected, { generation: 1, fenceToken: jobId,
             instanceId: 'i-11111111111111111', instanceLost: true });
         const query = c.statement('cas');
-        expect(query.sql).toMatch(/AND updated_at = \$\d+::timestamptz/);
+        expect(query.sql).toMatch(/AND date_trunc\('milliseconds', updated_at\) = \$\d+::timestamptz/);
         expect(query.sql).toMatch(/AND owner_user_id = \$\d+::uuid/);
         expect(query.params).toContain(expected.updatedAt.toISOString());
     });
