@@ -193,7 +193,8 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
 test('gatewayChat generic post-send fallback distinguishes TypeError/network errors from malformed data', async () => {
     for (const [error, reason] of [[new TypeError(SENTINEL), 'connection_reset'], [Object.assign(new Error(SENTINEL), { code: 'ECONNRESET' }), 'connection_reset'],
         [new Error(SENTINEL), 'stream_malformed'], [new SyntaxError(SENTINEL), 'stream_malformed']] as const) {
-        const fetch = (async () => new Response(new ReadableStream({ pull(c) { c.error(error); } }), { status: 401 })) as typeof globalThis.fetch;
+        const fetch: typeof globalThis.fetch = Object.assign(async (_input: string | URL | Request, _init?: RequestInit) =>
+            new Response(new ReadableStream({ pull(c) { c.error(error); } }), { status: 401 }), { preconnect: globalThis.fetch.preconnect });
         expect(await failureOf(gatewayChat(gw(), ask(), { fetch, signal: new AbortController().signal }))).toMatchObject({ reason });
     }
 });

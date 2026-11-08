@@ -640,7 +640,7 @@ describe('EZiL gateway VS Code bridge', () => {
             const history = [message(1, [new TextPart('make a file')]), message(2, [new ToolCallPart('toolu_1', 'create_file', { filePath: 'a', content: 'b' })]),
                 message(1, [new ToolResultPart('toolu_1', [new TextPart('done')])])];
             await ask(first.provider, history);
-            const assistant = (bodies[1]!.messages as { role: string; content: { type: string }[] }[]).find(m => m.role === 'assistant')!;
+            const assistant = (bodies[1]!.messages as { role: string; content: Record<string, unknown>[] }[]).find(m => m.role === 'assistant')!;
             expect(assistant.content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
             expect(assistant.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1' });
             for (const line of first.host.lines) expect(line).not.toContain('PRIVATE-THOUGHT');

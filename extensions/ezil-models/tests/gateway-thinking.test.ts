@@ -17,8 +17,10 @@ async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[
     return output;
 }
 const parse = (input: string[], chunkSize = 1) => collect(gatewayStream(sseEvents(sseBody(input, chunkSize)), requestId));
-const signed = (thinking = thought, sig = signature): Part => ({ type: 'thinking', value: '', metadata: { _completeThinking: thinking, signature: sig } });
-const redacted: Part = { type: 'thinking', value: '', metadata: { redactedData: 'opaque-redacted-data' } };
+// A thinking part as history carries it is also the stream event that produced it: one shape, valid as both.
+type Thinking = Extract<Part, { type: 'thinking' }> & Extract<StreamEvent, { type: 'thinking' }>;
+const signed = (thinking = thought, sig = signature): Thinking => ({ type: 'thinking', value: '', metadata: { _completeThinking: thinking, signature: sig } });
+const redacted: Thinking = { type: 'thinking', value: '', metadata: { redactedData: 'opaque-redacted-data' } };
 const expected: StreamEvent[] = [
     ...thoughtPieces.map(value => ({ type: 'thinking' as const, value })),
     signed() as Extract<StreamEvent, { type: 'thinking' }>,

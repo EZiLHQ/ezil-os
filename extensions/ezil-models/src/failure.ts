@@ -158,9 +158,10 @@ export function appFailure(input: AppFailureInput): AppFailure {
         code = mapped ?? (status === 401 ? 'auth_invalid' : status === 402 ? 'credits_exhausted' : status === 403 ? 'membership_required'
             : status === 429 ? 'rate_limited' : 'unexpected_error');
     }
-    const category: AppFailureCategory = code === 'unexpected_error'
-        ? error?.origin === 'transport' ? 'network' : 'provider'
-        : APP_FAILURE_CODES[code];
+    // Every mapped code is in the contract list; one that is not is sent as unexpected_error, never as itself.
+    const listed: AppFailureCategory | undefined = code === 'unexpected_error' ? undefined : APP_FAILURE_CODES[code];
+    if (!listed) code = 'unexpected_error';
+    const category: AppFailureCategory = listed ?? (error?.origin === 'transport' ? 'network' : 'provider');
     const eventId = failureId((input.newEventId ?? randomUUID)()) ?? randomUUID();
     const clientRequestId = failureId(input.clientRequestId);
     const gatewayRequestId = failureId(input.gatewayRequestId);
