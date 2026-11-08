@@ -25,6 +25,7 @@
 #   out/vs/code/browser/workbench/workbench.js         accounts menu + session picker + AI status + chat history + chat header
 #   out/vs/code/browser/workbench/workbench.css        compact chat layout (header controls, one-row composer)
 #   extensions/copilot/package{,.nls}.json            display strings
+#   out/server-main.js                                 workbench static path carries a content id (static-id)
 set -euo pipefail
 
 VERIFY_ONLY=0
@@ -34,9 +35,10 @@ EXT="$ROOT/extensions/copilot/dist/extension.js"
 NLS_JS="$ROOT/out/nls.messages.js"
 NLS_JSON="$ROOT/out/nls.messages.json"
 WB="$ROOT/out/vs/code/browser/workbench/workbench.js"
+SERVER="$ROOT/out/server-main.js"
 NOTICE='/* Modified at build time by EZiL (worker/copilot-chat/patch-copilot-chat.sh, see PATCHES.md): GitHub service calls disabled, strings rebranded "EZiL Chat". Original work: Copyright (c) Microsoft Corporation, MIT License (LICENSE.txt). */'
 
-for f in "$EXT" "$NLS_JS" "$NLS_JSON" "$WB"; do
+for f in "$EXT" "$NLS_JS" "$NLS_JSON" "$WB" "$SERVER"; do
   [ -s "$f" ] || { echo "patch-copilot-chat: missing $f" >&2; exit 1; }
 done
 command -v node >/dev/null || { echo "patch-copilot-chat: node is required" >&2; exit 1; }
@@ -63,6 +65,15 @@ gate() {
   local have; have="$(count "$2" "$4")"
   if [ "$have" != "$3" ]; then echo "patch-copilot-chat: GATE FAILED [$1] $(basename "$2"): '$4' occurs $have times, expected $3" >&2; exit 1; fi
   echo "patch-copilot-chat: gate ok [$1] $(basename "$2") x$have"
+}
+
+# static_id <root> → "ezil-" + 20 hex of a sha256 over every file the workbench static route can serve: all of
+# <root> except extensions/ (the browser loads those through /vscode-remote-resource), product.json (compiled into
+# the bundles; the Dockerfile edits it later) and out/server-main.js (it carries the id). PATCHES.md "static-id".
+static_id() {
+  node -e 'const fs=require("fs"),path=require("path"),crypto=require("crypto");const root=process.argv[1],skip=new Set(["extensions","product.json","out/server-main.js"]),rows=[];
+(function walk(rel){for(const e of fs.readdirSync(path.join(root,rel),{withFileTypes:true})){const r=rel?rel+"/"+e.name:e.name,p=path.join(root,r);if(skip.has(r))continue;if(e.isDirectory())walk(r);else if(e.isSymbolicLink())rows.push(["L",r,fs.readlinkSync(p)]);else if(e.isFile())rows.push(["F",r,crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")]);}})("");
+rows.sort((a,b)=>a[1]<b[1]?-1:a[1]>b[1]?1:0);const h=crypto.createHash("sha256");for(const row of rows)h.update(row.join("\0")+"\n");console.log("ezil-"+h.digest("hex").slice(0,20))' "$1"
 }
 
 # Pin before changing anything, including in --verify mode.
@@ -270,6 +281,15 @@ P_HISTORY_PICKER_SERVICE='R9e=class{constructor(o,e,t,i,n,r,a){this.anchor=o;thi
 # settings and the target-picker patch keep out of EZiL Chat. EZiL runs local sessions only.
 A_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];for(let l of this.chatSessionsService.getAllChatSessionContributions()){let u=l.sessionListGroup??l.type;r.find(p=>p.id===u)||r.push({id:u,label:n(u)})}'
 R_SESSION_FILTER='r=[{id:cn.Local,label:n(cn.Local)}];'
+# Static asset identity (server-main.js). code-server serves /<quality>-<commit>/static/* with max-age=31536000
+# and our patches keep the commit, so a browser that loaded an older image kept its workbench.js/css. The route
+# constant IE also builds the page's static base (scripts, CSS, NLS fallback, webview endpoint), so a content id
+# in it gives every distinct workbench a new URL. The P_ names must still use IE, or the id moves nothing.
+A_STATIC='IE="/static",Vq="/callback"'
+P_STATIC_ROUTE='o.startsWith(IE)&&o.charCodeAt(IE.length)===47?this._handleStatic(t,e,o.substring(IE.length))'
+P_STATIC_BASE='let I=Be.join(l,this._productPath,IE),'
+P_STATIC_PAGE='WORKBENCH_WEB_BASE_URL:I,'
+P_STATIC_WEBVIEW='webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/pre"'
 
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
@@ -328,11 +348,15 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch submenu-label  "$PKG_NLS" 1 "$A_SUBMENU"     "$R_SUBMENU"
   patch walkthrough    "$PKG_NLS" 1 "$A_WALKTHROUGH" "$R_WALKTHROUGH"
   # modification notices (comments; the .json cannot carry one)
-  for f in "$EXT" "$NLS_JS" "$WB"; do
+  for f in "$EXT" "$NLS_JS" "$WB" "$SERVER"; do
     if ! head -c 400 "$f" | grep -qF 'Modified at build time by EZiL'; then
       node -e 'const fs=require("fs");const f=process.argv[1];fs.writeFileSync(f,process.argv[2]+"\n"+fs.readFileSync(f,"utf8"))' "$f" "$NOTICE"
     fi
   done
+  # Last: the id hashes the files patched above.
+  for p in "$P_STATIC_ROUTE" "$P_STATIC_BASE" "$P_STATIC_PAGE" "$P_STATIC_WEBVIEW"; do gate static-names "$SERVER" 1 "$p"; done
+  STATIC_ID="$(static_id "$ROOT")"
+  patch static-id "$SERVER" 1 "$A_STATIC" "IE=\"/static/$STATIC_ID\",Vq=\"/callback\""
 fi
 
 # ── gates: anchors gone, replacements present, files still parse ────────────
@@ -392,7 +416,12 @@ gate participant-fullname "$PKG" 0 "$A_FULLNAME";  gate participant-fullname "$P
 gate submenu-label    "$PKG_NLS" 0 "$A_SUBMENU";   gate submenu-label    "$PKG_NLS" 1 "$R_SUBMENU"
 gate walkthrough      "$PKG_NLS" 0 "$A_WALKTHROUGH"; gate walkthrough    "$PKG_NLS" 1 "$R_WALKTHROUGH"
 node -e 'for(const f of process.argv.slice(1)){const j=JSON.parse(require("fs").readFileSync(f,"utf8"));if(f.endsWith("package.json")&&(j.publisher!=="GitHub"||j.name!=="copilot-chat"))throw new Error("package.json identity changed");}console.log("patch-copilot-chat: gate ok [manifest JSON parses, publisher/name untouched]")' "$PKG" "$PKG_NLS"
-for f in "$EXT" "$NLS_JS" "$WB"; do gate notice "$f" 1 'Modified at build time by EZiL'; done
+for f in "$EXT" "$NLS_JS" "$WB" "$SERVER"; do gate notice "$f" 1 'Modified at build time by EZiL'; done
+for p in "$P_STATIC_ROUTE" "$P_STATIC_BASE" "$P_STATIC_PAGE" "$P_STATIC_WEBVIEW"; do gate static-names "$SERVER" 1 "$p"; done
+# Recomputed: a later edit to any hashed file (here or in a later Dockerfile step) leaves a stale id and fails.
+STATIC_ID="$(static_id "$ROOT")"
+gate static-id "$SERVER" 0 "$A_STATIC"; gate static-id "$SERVER" 1 'IE="/static/ezil-'
+gate static-id "$SERVER" 1 "IE=\"/static/$STATIC_ID\",Vq=\"/callback\""
 # the nls array must still be valid and keep its length; extension.js must still parse
 node -e '
 const fs=require("fs"),vm=require("vm");
@@ -404,7 +433,8 @@ if(json.length!==js.length)throw new Error(`nls.messages.js (${js.length}) and .
 for(let i=0;i<js.length;i++)if(js[i]!==json[i])throw new Error("nls.messages.js and .json differ at index "+i);
 console.log("patch-copilot-chat: gate ok [nls-parse] "+js.length+" messages, .js and .json identical");
 ' "$NLS_JSON" "$NLS_JS"
-for f in "$EXT" "$WB" "$NLS_JS"; do node --check "$f"; done
+# server-main.js is checked in place: lib/vscode/package.json makes it a module there, as when code-server loads it
+for f in "$EXT" "$WB" "$NLS_JS" "$SERVER"; do node --check "$f"; done
 echo "patch-copilot-chat: gate ok [patched JavaScript parses]"
 # license/copyright notices must be intact
 test -s "$ROOT/extensions/copilot/LICENSE.txt"
@@ -413,5 +443,6 @@ grep -qi "Copyright (c) Microsoft Corporation" "$ROOT/extensions/copilot/LICENSE
 echo "patch-copilot-chat: gate ok [copilot LICENSE.txt intact]"
 grep -q "Copyright (C) Microsoft Corporation" "$NLS_JS"
 grep -q "Copyright (C) Microsoft Corporation" "$WB"
+grep -q "Copyright (C) Microsoft Corporation" "$SERVER"
 echo "patch-copilot-chat: gate ok [Microsoft copyright headers intact]"
 echo "patch-copilot-chat: all gates passed"

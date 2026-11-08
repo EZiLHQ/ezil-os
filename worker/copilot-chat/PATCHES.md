@@ -9,7 +9,7 @@ gates alone). If a code-server bump moves a string, the Docker build fails
 with the offending anchor printed; re-derive it from the new bundle (grep the
 source tree at the matching `microsoft/vscode` tag — the anchors are the
 compiled form of the files named below) and update both the script and this
-table. Only the documented strings, network call sites, visibility filters, the chat history index (Part 3) and the chat view layout (one menu placement, DOM placement, CSS) change: no command id, setting key, contribution point,
+table. Only the documented strings, network call sites, visibility filters, the chat history index (Part 3), the chat view layout (one menu placement, DOM placement, CSS) and the workbench static path (`static-id`) change: no command id, setting key, contribution point,
 `product.json` field or LICENSE file is changed. The original work stays
 MIT, Copyright (c) Microsoft Corporation; each patched `.js` gets a one-line
 "Modified at build time by EZiL" notice (see `ATTRIBUTIONS.md`).
@@ -296,6 +296,47 @@ throwing entitlement accessors, and rejects restored quota text or anchor drift.
 Without a local pinned bundle it explicitly skips; release validation must supply
 `COPILOT_TEST_ROOT`.
 
+## static-id — a new workbench URL for every distinct set of served files
+
+code-server serves its workbench (`workbench.js`, `workbench.css`,
+`nls.messages.js`, the webview `pre/` page, workers) from
+`/<quality>-<commit>/static/…` with `Cache-Control: public, max-age=31536000`
+and no revalidation (`server-main.js` `_handleStatic`, mode 2 when built). The
+patches in this file change those files but not the commit, so a browser that
+had loaded an older EZiL image kept running its workbench after the computer
+moved to a new image: measured on a carried browser profile, the image-33
+workbench showed the pre-`chat-header` layout until the HTTP cache was removed.
+Revalidation would not help that browser (its copies are fresh for a year), and
+the commit is compiled into the client, server, extension-host and pty bundles
+(the client also builds `/vscode-remote-resource` URLs from it), so it stays.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `static-id` | `out/server-main.js`: `IE="/static",Vq="/callback"` (the static route constant) | `IE="/static/ezil-<id>",Vq="/callback"`. Anchor 0, `IE="/static/ezil-` 1, and the exact replacement with the id recomputed by `--verify` 1. |
+| `static-names` | `server-main.js`: `o.startsWith(IE)&&o.charCodeAt(IE.length)===47?this._handleStatic(t,e,o.substring(IE.length))` (router), `let I=Be.join(l,this._productPath,IE),` (the page's static base), `WORKBENCH_WEB_BASE_URL:I,`, `webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/pre"` | Checked, never patched: each occurs once, so the constant still sets the URL of everything the page loads from the static route and the router still strips it. |
+
+`<id>` is `ezil-` plus 20 hex digits of a SHA-256 over every file under
+`lib/vscode` (sorted relative path and each file's SHA-256; symlinks by target),
+computed after every other patch in this script. Excluded: `extensions/` (the
+browser loads built-in extension files through `/vscode-remote-resource`, which
+this path does not cover), `product.json` (compiled into the bundles; the
+Dockerfile edits it afterwards) and `server-main.js` (it carries the id). The
+same files give the same id; any changed served byte gives a new URL, so a new
+image's workbench cannot be answered from an older image's cache entries, while
+cookies, IndexedDB, local storage and the chat history are left alone. URLs
+without the id (`…/static/out/…`) now answer 404. `--verify` recomputes the
+id, and the Dockerfile re-runs it after its last layer, so a later edit of a
+served file fails the build instead of shipping new bytes under an old URL.
+
+Not covered: `/vscode-remote-resource` answers built-in extension files with the
+same one-year header (no patched file is loaded by the browser that way), and a
+tab left open across an image change requests the old path and has to be
+reloaded.
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/static-id-patch.test.cjs
+```
+
 ## Re-deriving the 4.141.0 anchors
 
 The three moved anchors are `token` (`yGe.env.devDeviceId`), `accounts-menu`
@@ -308,8 +349,9 @@ token branch. Do not copy minifier names from a different release.
 
 Extract the checksummed .deb with `dpkg-deb -x`, copy the extracted tree,
 and run this script followed by `--verify` against `lib/vscode` in that copy.
-Every pre-patch count must match. The verification also parses all three
-patched JS files, compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
+Every pre-patch count must match. The verification also parses the four
+patched JS files (`server-main.js` in place, where `lib/vscode/package.json`
+makes it a module), compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
 identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are
