@@ -53,7 +53,6 @@ seed_codeserver_machine_settings() {
   "chat.byokUtilityModelDefault": "mainAgent",
   "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
   "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next",
-  "chat.defaultModel": "qwen.qwen3-coder-next",
   "chat.titleBar.signIn.enabled": false,
   "chat.welcomePage.signIn.enabled": false,
   "github.copilot.enable": { "*": false },

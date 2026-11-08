@@ -290,13 +290,14 @@ fi
 
 # ── Pass 6: a phone's narrow chat keeps the model picker's name (patch-copilot-chat.sh picker-order) ──
 if [[ "$PASSES" == *" phone "* ]]; then
-echo "[e2e] pass 6 — phone: the header's model picker keeps its name at 390 and 412 px, and a desktop chat every label"
+echo "[e2e] pass 6 — phone: the header's model picker keeps its name, opens and switches by touch (Android and iPhone), the pick reaches the Gateway and survives a reload; desktop by mouse"
 ST7="$WORK/phone"; mkdir -p "$ST7/home/neko/project" "$ST7/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST7/etc/ezil/models.e2e.json"
 FORWARD_PORT=$((FORWARD_PORT + 1))
 boot "$ST7"
 start_mock || fail=1
-EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
 collect_logs phone
 network_checks phone || fail=1
 fi
