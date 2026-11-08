@@ -624,7 +624,7 @@ describe('EZiL gateway VS Code bridge', () => {
             const opus = { ...gw('claude-opus-5-5'), default: false, capabilities: { toolCalling: true, imageInput: false } };
             const make = () => {
                 const host = gatewayHost((async (_input: unknown, init?: RequestInit) => {
-                    bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
+                    bodies.push(JSON.parse(typeof init!.body === 'string' ? init!.body : new TextDecoder().decode(init!.body as Uint8Array)));
                     return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'thinking-fallback' } });
                 }) as unknown as typeof fetch, () => Response.json({ data: [claude, opus].map(m => ({ id: m.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 })) }));
                 opus.provider = claude.provider;
@@ -666,6 +666,19 @@ describe('EZiL gateway VS Code bridge', () => {
             await ask(first.provider, history, moved);
             expect(leaked(bodies.at(-1)!)).toBe(false);
             first.host.models = movedHost;
+            // A direct Anthropic provider (custom header auth possible) never uses the fallback: neither an exact
+            // continuation nor one whose x-api-key header override changed gets any thinking back.
+            const direct = { ...claude, provider: { ...claude.provider, type: 'anthropic' as const, headers: { 'x-api-key': 'account-a' } } };
+            const directOther = { ...direct, provider: { ...direct.provider, headers: { 'x-api-key': 'account-b' } } };
+            const gatewayModels = first.host.models;
+            first.host.models = () => [direct];
+            await ask(first.provider, [message(1, [new TextPart('make a file')])], direct);
+            await ask(first.provider, history, direct);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = () => [directOther];
+            await ask(first.provider, history, directOther);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = gatewayModels;
             // The exact continuation still gets it, after all of the above.
             await ask(first.provider, history);
             expect(leaked(bodies.at(-1)!)).toBe(true);

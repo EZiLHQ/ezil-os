@@ -195,7 +195,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      * answered and its full ordered tool calls (id, name, input). They are re-attached only to an assistant message that
      * continues exactly that history with exactly those calls (gateway-messages.ts replays them on the native route
      * only), so another conversation that reuses a call id, a changed input, or another model never receives them.
-     * Bounded; lost on reload, when the request goes without them as before.
+     * EZiL Gateway providers only (see respond). Bounded; lost on reload, when the request goes without them as before.
      */
     private signedThinking = new Map<string, Part[]>();
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
@@ -343,7 +343,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
             }
             const request = toNeutralRequest(messages, options);
-            if (!thinkingCtor()) this.restoreSignedThinking(resolved, request);
+            // The signed-thinking fallback is for the EZiL Gateway only: its transport sends just its own Bearer credential
+            // (custom headers are ignored), which continuationKey covers. A direct provider may authenticate through custom
+            // header overrides, so it keeps its reviewed behaviour: no fallback.
+            const fallback = !thinkingCtor() && resolved.provider.type === 'ezil-gateway';
+            if (fallback) this.restoreSignedThinking(resolved, request);
             // The history this turn answers, for the fallback's key (fixed before anything below can change the request).
             const answered = request.messages.slice();
             const Thinking = thinkingCtor();
@@ -421,7 +425,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
-            if (!Thinking && completed && signed.length && calls.length && !token.isCancellationRequested) {
+            if (fallback && completed && signed.length && calls.length && !token.isCancellationRequested) {
                 this.rememberSignedThinking(continuationKey(resolved, answered, calls), signed);
             }
         } catch (error) {
