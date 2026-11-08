@@ -88,7 +88,9 @@ R_EMB_EXT='async fetchRemoteExtensionCache(n){return{};let o=`${await this.getBa
 # toolbar stays in the composer, under the input beside Send: the founder asked for the model picker
 # at the composer, not across the panel in the header (2026-11-08). `attach-execute` puts Add
 # Context beside Send; the appended CSS (scoped to the class the header sets, so nothing changes if
-# it did not run) lays out the header and hides the tip (`chat.tips.enabled` is application-scoped
+# it did not run) lays out the header, keeps Send in view on a narrow composer (the responsive picker toolbar writes
+# its own minimum width onto the toolbar row, which pushed Add Context and Send out of a 162 px phone chat), and hides
+# the tip (`chat.tips.enabled` is application-scoped
 # and has no effect in Machine settings, measured).
 # The welcome disclaimer stays hidden upstream (rule below, gated, left as it is): it is not where
 # the notice lives.
@@ -105,6 +107,7 @@ R_CSS_LAYOUT="$(printf '%s' \
   '.chat-viewpane.ezil-compact-chat .ezil-chat-header>.ezil-chat-help{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:22px;height:22px;margin:0;padding:0;border:0;border-radius:var(--vscode-cornerRadius-small,4px);background:none;color:var(--vscode-icon-foreground);font-size:var(--vscode-codiconFontSize-compact,16px);cursor:pointer}' \
   '.chat-viewpane.ezil-compact-chat .ezil-chat-header>.ezil-chat-help:hover{background-color:var(--vscode-toolbar-hoverBackground)}' \
   '.chat-viewpane.ezil-compact-chat .ezil-chat-header>.ezil-chat-help:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}' \
+  '.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{min-width:0!important}' \
   '.chat-viewpane .chat-getting-started-tip-container{display:none!important}')"
 # workbench.js `chat-header`: ChatViewPane.createControls gains a call to a new method that moves the
 # input part's secondary toolbar node into the title row (see PATCHES.md for every name it relies on).

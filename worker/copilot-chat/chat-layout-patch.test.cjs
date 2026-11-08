@@ -77,6 +77,8 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       // The composer keeps upstream's input over its mode/model + Send row (no one-row grid): the model picker sits at the input.
       assert(!style.includes('.chat-input-container{display:grid;'));
       assert(!style.includes('.ezil-chat-header>.chat-input-toolbars'));
+      // The picker toolbar writes its own minimum width onto the composer's toolbar row; overriding it keeps Send in view.
+      assert.equal(style.split('.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{min-width:0!important}').length, 2);
     });
 
     await t.test('Add Context for the chat view moves to the Send toolbar; quick chat and editor entries unchanged', () => {
