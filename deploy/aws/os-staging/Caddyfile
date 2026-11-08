@@ -10,3 +10,23 @@ os-staging.ezil.work {
     }
     reverse_proxy 127.0.0.1:3000
 }
+
+# PR preview slots (preview/README.md): fixed hosts, so Caddy never reloads per PR.
+# preview_host.py owns ports 3101/3102; an empty slot answers 502.
+(pr_preview) {
+    encode gzip zstd
+    header Strict-Transport-Security "max-age=31536000"
+    header X-Robots-Tag "noindex, nofollow"
+    request_body {
+        max_size 2MB
+    }
+    reverse_proxy 127.0.0.1:{args[0]}
+}
+
+os-pv1.ezil.work {
+    import pr_preview 3101
+}
+
+os-pv2.ezil.work {
+    import pr_preview 3102
+}

@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "enabled": false,
+  "role_arn": null,
+  "label": "preview:os",
+  "slots": {
+    "1": "https://os-pv1.ezil.work",
+    "2": "https://os-pv2.ezil.work"
+  },
+  "ttl_hours": 48,
+  "computers": "off"
+}

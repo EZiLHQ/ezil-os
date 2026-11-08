@@ -1,0 +1,285 @@
+# PR preview slots on the OS staging host: deploy/aws/os-staging/preview/README.md.
+# Inert until preview/activation.json is enabled ON THE BASE BRANCH by the release owner.
+# Never deploys os-staging, never takes the shared staging lease, never runs for forks.
+# `preview.yml` is the unrelated deploy of the `preview` branch.
+name: OS PR preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, closed]
+
+permissions:
+  contents: read
+
+# One lane per PR: a new head cancels its own older run; teardown waits for it instead.
+# Host mutations from different PRs are serialized by preview_host.py's lock, not here:
+# a repository-wide group would cancel every pending run but the newest.
+concurrency:
+  group: os-pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event.action != 'closed' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      pr: ${{ steps.plan.outputs.pr }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tag: ${{ steps.plan.outputs.tag }}
+      role_arn: ${{ steps.plan.outputs.role_arn }}
+      ttl_hours: ${{ steps.plan.outputs.ttl_hours }}
+      computers: ${{ steps.plan.outputs.computers }}
+      artifact_run: ${{ steps.built.outputs.run }}
+    steps:
+      # The base commit's planner and activation file: the PR under test cannot change either.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Decide deploy, teardown or skip
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f deploy/aws/os-staging/preview/plan.py ]]; then
+            # The base predates preview slots (e.g. the PR that adds them).
+            printf 'action=skip\nreason=Preview tooling is not on the base branch.\n' | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/files.txt"
+          python3 -B deploy/aws/os-staging/preview/plan.py "$GITHUB_EVENT_PATH" \
+            deploy/aws/os-staging/preview/activation.json "$RUNNER_TEMP/files.txt" "$GITHUB_REPOSITORY" | tee -a "$GITHUB_OUTPUT"
+      - name: Reuse an earlier build of this exact head
+        id: built
+        if: steps.plan.outputs.action == 'deploy'
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        with:
+          script: |
+            // Build once per head SHA: a rerun or relabel promotes the artifact already built.
+            const {data} = await github.rest.actions.listArtifactsForRepo({...context.repo, name: `os-pr-preview-${process.env.TAG}`, per_page: 20});
+            const artifact = data.artifacts.filter(a => !a.expired && a.workflow_run?.head_sha)
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+            if (artifact) core.setOutput('run', String(artifact.workflow_run.id));
+
+  build:
+    name: Build app image once
+    needs: plan
+    if: needs.plan.outputs.action == 'deploy' && needs.plan.outputs.artifact_run == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the staging app image for this exact head (no AWS identity)
+        env:
+          GIT_SHA: ${{ needs.plan.outputs.sha }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.OS_STAGING_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.OS_STAGING_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ vars.OS_STAGING_STRIPE_PUBLISHABLE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ $(git rev-parse HEAD) == "$GIT_SHA" ]]
+          bash deploy/aws/os-staging/deploy.sh build "$TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-pr-preview-${{ needs.plan.outputs.tag }}
+          path: deploy/aws/os-staging/artifacts/${{ needs.plan.outputs.tag }}.*
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy preview slot
+    needs: [plan, build]
+    if: always() && needs.plan.outputs.action == 'deploy' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment:
+      name: os-pr-preview
+      url: ${{ steps.slot.outputs.url }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      pull-requests: write
+    outputs:
+      url: ${{ steps.slot.outputs.url }}
+    env:
+      OS_STAGING_INSTANCE_ID: i-014810524754b9ed0
+      OS_STAGING_ARTIFACT_BUCKET: ezil-main-preview-artifacts-452630323510-aps1
+      PR: ${{ needs.plan.outputs.pr }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      # Tooling from the base commit; only the built artifact comes from the PR.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: os-pr-preview-${{ needs.plan.outputs.tag }}
+          run-id: ${{ needs.plan.outputs.artifact_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: deploy/aws/os-staging/artifacts
+      - name: Verify the artifact binds this head (image ID and receipt)
+        id: artifact
+        run: |
+          set -euo pipefail
+          cd deploy/aws/os-staging
+          (cd artifacts && sha256sum --check "$TAG.sha256")
+          receipt=$(sha256sum "artifacts/$TAG.source.json" | cut -d' ' -f1)
+          image=$(python3 -B install_receipt.py archive artifacts "$TAG" staging "$SHA" "$receipt")
+          printf 'receipt_sha256=%s\nimage_id=%s\n' "$receipt" "$image" | tee -a "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.plan.outputs.role_arn }}
+          aws-region: ap-south-1
+          unset-current-credentials: true
+      - name: Publish the immutable tag once
+        run: |
+          set -euo pipefail
+          key="os-staging/images/$TAG.source.json"
+          if aws s3api head-object --bucket "$OS_STAGING_ARTIFACT_BUCKET" --key "$key" >/dev/null 2>&1; then
+            # Already published by an earlier run: it must be this exact receipt.
+            aws s3 cp "s3://$OS_STAGING_ARTIFACT_BUCKET/$key" "$RUNNER_TEMP/published.json" --only-show-errors
+            cmp -s "$RUNNER_TEMP/published.json" "deploy/aws/os-staging/artifacts/$TAG.source.json" \
+              || { echo "::error::$TAG is already published with a different receipt; tags are immutable."; exit 1; }
+          else
+            bash deploy/aws/os-staging/deploy.sh upload "$TAG"
+          fi
+      - name: Deploy the slot and check it from the host
+        id: host
+        env:
+          OS_PREVIEW_TTL_HOURS: ${{ needs.plan.outputs.ttl_hours }}
+          OS_PREVIEW_COMPUTERS: ${{ needs.plan.outputs.computers }}
+          IMAGE_ID: ${{ steps.artifact.outputs.image_id }}
+          RECEIPT: ${{ steps.artifact.outputs.receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          bash deploy/aws/os-staging/preview/preview.sh deploy "$PR" "$SHA" "$TAG" "$IMAGE_ID" "$RECEIPT" \
+            "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" | tee "$RUNNER_TEMP/host.txt"
+          grep '^PREVIEW_RESULT ' "$RUNNER_TEMP/host.txt" | tail -1 | cut -d' ' -f2- > "$RUNNER_TEMP/host.json"
+      - name: Check the public slot URL serves this head
+        id: slot
+        run: |
+          set -euo pipefail
+          url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["origin"])' "$RUNNER_TEMP/host.json")
+          [[ $url =~ ^https://os-pv[12]\.ezil\.work$ ]]
+          for attempt in $(seq 1 20); do
+            sha=$(curl -fsS --max-time 10 "$url/api/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha") or "")') || sha=
+            [[ $sha == "$SHA" ]] && break
+            sleep 6
+          done
+          [[ $sha == "$SHA" ]] || { echo "::error::$url does not serve $SHA"; exit 1; }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+      - name: Record the source → image → URL mapping
+        uses: actions/github-script@v7
+        env:
+          URL: ${{ steps.slot.outputs.url }}
+          IMAGE_ID: ${{ steps.artifact.outputs.image_id }}
+          RECEIPT: ${{ steps.artifact.outputs.receipt_sha256 }}
+        with:
+          script: |
+            const fs = require('fs');
+            const host = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/host.json`, 'utf8')).result;
+            const marker = '<!-- os-pr-preview -->';
+            const body = [marker, '**OS PR preview** (shared staging data; not production)', '',
+              '| PR head | Image tag | Image ID | Receipt SHA-256 | URL | Expires (UTC) | Computers |',
+              '|---|---|---|---|---|---|---|',
+              `| \`${process.env.SHA}\` | \`${process.env.TAG}\` | \`${process.env.IMAGE_ID}\` | \`${process.env.RECEIPT}\` | ${process.env.URL} | ${host.expires_at} | ${host.computers} |`,
+              '', `Run ${context.runId}. Sessions and callbacks are isolated per slot; the database is the shared staging PREVIEW database. Editor/computer image changes are not covered by this app preview.`].join('\n');
+            await core.summary.addRaw(body).write();
+            const issue_number = Number(process.env.PR);
+            const comments = await github.paginate(github.rest.issues.listComments, {...context.repo, issue_number});
+            const mine = comments.find(c => c.user?.type === 'Bot' && c.body?.startsWith(marker));
+            if (mine) await github.rest.issues.updateComment({...context.repo, comment_id: mine.id, body});
+            else await github.rest.issues.createComment({...context.repo, issue_number, body});
+
+  browser:
+    name: Browser acceptance (desktop + mobile)
+    needs: [plan, deploy]
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: os-pr-preview
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+      - name: Smoke the slot (signed-in checks need the QA identity secrets)
+        env:
+          EZIL_E2E_APP: ${{ needs.deploy.outputs.url }}
+          EZIL_PREVIEW_SHA: ${{ needs.plan.outputs.sha }}
+          EZIL_E2E_EMAIL: ${{ secrets.OS_PREVIEW_QA_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.OS_PREVIEW_QA_PASSWORD }}
+          EZIL_LIVE_OUT: ${{ runner.temp }}/os-preview-smoke
+        run: |
+          set -euo pipefail
+          status=0
+          node e2e/os-preview-smoke.mjs || status=$?
+          # 3 = PARTIAL (no QA identity): reported, never counted as a pass.
+          if [[ $status == 3 ]]; then echo '::warning::Signed-in acceptance skipped: QA identity secrets are not configured.'; exit 0; fi
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: os-pr-preview-smoke-${{ needs.plan.outputs.tag }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/os-preview-smoke
+          if-no-files-found: ignore
+          retention-days: 7
+
+  teardown:
+    name: Tear down preview slot
+    needs: plan
+    if: needs.plan.outputs.action == 'teardown'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: os-pr-preview
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      OS_STAGING_INSTANCE_ID: i-014810524754b9ed0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.plan.outputs.role_arn }}
+          aws-region: ap-south-1
+          unset-current-credentials: true
+      - name: Remove this PR's slot (other lanes untouched)
+        env:
+          PR: ${{ needs.plan.outputs.pr }}
+        run: bash deploy/aws/os-staging/preview/preview.sh teardown "$PR"
