@@ -261,6 +261,33 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.equal(focused, 4, 'taps and clicks elsewhere on the title (or without an element) still focus the input');
     });
 
+    // The bundle's own first-load migration (chat-enabled): a new browser profile keeps the built-in chat extension
+    // enabled, so an early message reaches Copilot's agent instead of timing out ("Chat took too long to get ready").
+    await t.test('a new profile keeps the built-in chat extension enabled; a completed setup still honours a disabled one (chat-enabled)', () => {
+      const i = code.indexOf('ensureChatExtensionInitialDisabledState(){'), j = code.indexOf('}get hasWorkspace(){', i);
+      assert(i > 0 && j > i);
+      const migrate = new Function('Oc', code.slice(i + 'ensureChatExtensionInitialDisabledState(){'.length, j));
+      const run = ({ completed, disabled = false, stored = false }) => {
+        const calls = { disabled: [], stored: [], settings: [] };
+        const view = {
+          _chatExtensionId: 'github.copilot-chat', environmentService: {},
+          storageService: { getBoolean: () => stored, store: (k, v) => calls.stored.push([k, v]) },
+          logService: { debug() {}, error() {} },
+          chatEntitlementService: { context: { value: { state: { completed } } } },
+          _disableExtension: e => calls.disabled.push(e.id), _isDisabledGlobally: () => disabled,
+          configurationService: { getValue: () => undefined, updateValue: (k, v) => (calls.settings.push([k, v]), Promise.resolve()) },
+        };
+        migrate.call(view, 'chat.disableAIFeatures');
+        return calls;
+      };
+      const fresh = run({ completed: false });
+      assert.deepEqual(fresh.disabled, [], 'the extension is not disabled on a new profile');
+      assert.deepEqual(fresh.stored, [['builtinChatExtensionEnablementMigration', true]]);
+      assert.deepEqual(run({ completed: true, disabled: true }).settings, [['chat.disableAIFeatures', true]]);
+      assert.deepEqual(run({ completed: false, stored: true }).stored, [], 'runs once per profile');
+      assert(!code.includes('Disabling builtin chat extension as chat set up is not completed'));
+    });
+
     await t.test('patch rejects a moved header anchor', () => {
       fs.copyFileSync(path.join(source, wb), path.join(root, wb));
       fs.copyFileSync(path.join(source, css), path.join(root, css));

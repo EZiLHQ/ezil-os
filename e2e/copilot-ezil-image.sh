@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction phone subagent flash
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone subagent flash} "
+# Passes to run, in order (default all): fresh returning history sessions compaction phone early subagent flash
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone early subagent flash} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -301,6 +301,20 @@ EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER=
   EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
 collect_logs phone
 network_checks phone || fail=1
+fi
+
+# ── Pass 6b: a new browser profile's first, early message is answered (patch-copilot-chat.sh chat-enabled) ──
+if [[ "$PASSES" == *" early "* ]]; then
+echo "[e2e] pass 6b — early: a new browser profile sends at once (desktop and Android touch); answered, no \"Chat took too long to get ready\""
+ST6B="$WORK/early"; mkdir -p "$ST6B/home/neko/project" "$ST6B/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST6B/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST6B"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/early" node "$here/copilot-ezil-early.mjs" || fail=1
+collect_logs early
+network_checks early || fail=1
 fi
 
 # ── Pass 7: an Agent turn starts a subagent on another EZiL model (VS Code's runSubagent `model`) ──

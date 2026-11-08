@@ -117,6 +117,15 @@ P_HEADER_INPUT_PART='get inputPart(){return this.inputPartDisposable.value}'
 P_HEADER_SECONDARY='this.secondaryToolbarContainer=r.secondaryToolbar;'
 P_HEADER_COMMANDS='this.chatEntitlementService=M;this.commandService=N;'
 P_HEADER_NOTIFY='this.logService=v;this.notificationService=b;'
+# workbench.js `chat-enabled`: on a browser profile's first load (`builtinChatExtensionEnablementMigration`
+# unset) 1.141 disables the built-in chat extension until chat setup completes. EZiL Chat is anonymous with
+# EZiL models (BYOK), so a message sent in the first seconds took the no-setup path (`z3t`: setup not completed
+# but BYOK models present), waited for Copilot's agent from a disabled extension and showed "Chat took too long
+# to get ready" after 60 s (image e2e, new browser profile, send ~5 s after load; main and staging images alike).
+# The extension now stays enabled on that first load; the migration flag is still stored, and a completed setup
+# with the extension disabled (the user's own choice) still turns AI features off as upstream does.
+A_CHAT_ENABLED='else try{this.logService.debug("Disabling builtin chat extension as chat set up is not completed"),this._disableExtension({id:this._chatExtensionId})}catch(n){this.logService.error("Failed to disable builtin chat extension during enablement migration",n)}'
+R_CHAT_ENABLED='else this.logService.debug("EZiL: builtin chat extension stays enabled although chat setup is not completed")'
 # workbench.js `attach-execute`: the chat view's Add Context entry (location "panel") moves from the
 # ChatInput menu (the composer's mode/model row) to ChatExecute, the toolbar Send lives in, leaving that row
 # its room on a narrow chat; that toolbar already renders this action (quick chat registers it there).
@@ -307,6 +316,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch chat-header    "$WB"  1  "$A_CHAT_HEADER" "$R_CHAT_HEADER"
   patch attach-execute "$WB"  1  "$A_ATTACH" "$R_ATTACH"
+  patch chat-enabled   "$WB"  1  "$A_CHAT_ENABLED" "$R_CHAT_ENABLED"
   for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
   patch picker-flip    "$WB"  1  "$A_PICKER_FLIP" "$R_PICKER_FLIP"
   for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done
@@ -371,6 +381,7 @@ for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEA
 done
 gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER"
 gate attach-execute   "$WB"  0  "$A_ATTACH";        gate attach-execute   "$WB"  1  "$R_ATTACH"
+gate chat-enabled     "$WB"  0  "$A_CHAT_ENABLED";  gate chat-enabled     "$WB"  1  "$R_CHAT_ENABLED"
 for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
 gate picker-flip      "$WB"  0  "$A_PICKER_FLIP";   gate picker-flip      "$WB"  1  "$R_PICKER_FLIP"
 for p in "$P_PICKER_SHRINK" "$P_PICKER_MODEL_ID" "$P_PICKER_FIT"; do gate picker-order-names "$WB" 1 "$p"; done

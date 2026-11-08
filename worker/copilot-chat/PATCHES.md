@@ -130,6 +130,23 @@ anchor). The image e2e `phone` pass covers the same by real touch taps (`copilot
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/chat-layout-patch.test.cjs
 ```
 
+### Chat stays enabled on a new browser profile — `workbench.js` (`chat-enabled`)
+
+On a browser profile's first load (`builtinChatExtensionEnablementMigration` not yet stored), 1.141's
+`ensureChatExtensionInitialDisabledState` disables the built-in chat extension when chat setup has not
+completed. EZiL Chat is anonymous with EZiL models, so the setup agent's `z3t` sends a message down the
+no-setup path (setup not completed, but BYOK models present), which waits for Copilot's default agent from
+the disabled extension: "Chat took too long to get ready. Please ensure that the extension
+`GitHub.copilot-chat` is installed and enabled." after 60 s (remote) and no answer. Measured 2026-11-08 with a
+healthy mock gateway, a new browser profile and a send about 4-6 s after load: the timeout on the staging
+image (9e3dd5f3) and the main-lineage image (2031b2c1) alike, diagnostic `agentReady:false`,
+`agentDefaultIsCore:true`, `languageModelReady:true`; Copilot Chat never activated. A send after ~40 s took
+the setup path, which re-enabled the extension, and worked; a relaunched profile worked.
+
+| id | file / anchor | replacement / gate |
+|---|---|---|
+| `chat-enabled` | workbench.js `ensureChatExtensionInitialDisabledState`: `else try{this.logService.debug("Disabling builtin chat extension as chat set up is not completed"),this._disableExtension({id:this._chatExtensionId})}catch(n){this.logService.error("Failed to disable builtin chat extension during enablement migration",n)}` | `else this.logService.debug("EZiL: builtin chat extension stays enabled although chat setup is not completed")`. The migration flag is still stored once per profile, and the other branch (setup completed, extension disabled by the user: turn AI features off) is upstream's. With the same image and only this file changed, a new profile's message sent 3.5-3.7 s after load was answered in 4.7-6.4 s. A profile that the old build already disabled recovers as before (Restart / the setup path). Anchor 0, replacement 1. Offline test runs the bundle's own function against doubles (`chat-layout-patch.test.cjs`); image e2e pass `early` sends at once from new desktop and Android profiles. |
+
 ### Accounts menu — `out/vs/code/browser/workbench/workbench.js`
 
 | id | source | anchor | replacement | count | why |
