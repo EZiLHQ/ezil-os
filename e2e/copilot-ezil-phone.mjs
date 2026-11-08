@@ -107,6 +107,13 @@ try {
       check(`${at}: the mode picker opens and stays open`, (await modeLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);
       for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
+      // The permission picker stays in the chat header (title row): a tap opens it and the title row's own Tap
+      // handler does not close it by focusing the input (`title-tap`).
+      const permLabel = page.locator('.part.auxiliarybar .chat-view-title-container .ezil-chat-header .action-label').filter({ hasText: /permissions/i }).first();
+      if (await permLabel.count()) { await press(permLabel); await page.waitForTimeout(1200); }
+      check(`${at}: the header's permission picker opens and stays open`, (await permLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);
+      for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
+
       await press(model);
       await page.waitForTimeout(1200);
       check(`${at}: the model picker opens and stays open`, (await page.locator(rowsSel).count()) > 0);

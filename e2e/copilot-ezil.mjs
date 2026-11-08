@@ -163,6 +163,8 @@ try {
     await page.waitForTimeout(750);
   }
   check('model picker does not say "Sign in to use Copilot"', toolbar !== '' && !/sign in/i.test(toolbar), `toolbar=${JSON.stringify(toolbar.slice(0, 160))}`);
+  const headerText = clean(await aux.locator('.chat-view-title-container').first().innerText().catch(() => ''));
+  check('the chat header (Local, permissions) does not say "Sign in"', !/sign in/i.test(headerText), `header=${JSON.stringify(headerText.slice(0, 160))}`);
   await page.screenshot({ path: join(OUT, 'workbench.png') });
   if (auxVisible) await aux.screenshot({ path: join(OUT, 'chat-panel.png') }).catch(() => {});
 
