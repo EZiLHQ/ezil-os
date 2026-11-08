@@ -6,6 +6,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import net from 'node:net';
 import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MODEL_NAME } from './code-app-failure-mock.mjs';
@@ -144,7 +145,11 @@ try {
   await aux.waitFor({ timeout: 120_000 });
   const modelButton = aux.locator('.action-label[aria-label^="Models, "]').first();
   await modelButton.waitFor({ timeout: 120_000 });
-  if (!(await modelButton.innerText()).includes(MODEL_NAME)) {
+  // The composer shortens the visible label on narrow panels ("Qwen3 Cod…"); the accessible label keeps the full name.
+  const selected = async () => `${await modelButton.getAttribute('aria-label')} ${await modelButton.innerText()}`.includes(MODEL_NAME);
+  // EZiL Models registers its catalog models after the chat view renders ("Auto" until then): wait for the default.
+  for (let i = 0; i < 60 && !(await selected()); i++) await page.waitForTimeout(1000);
+  if (!(await selected())) {
     await modelButton.click();
     const rows = frame.locator('.context-view .monaco-list-row, .action-widget .monaco-list-row, .monaco-menu .action-item');
     let model = rows.filter({ hasText: MODEL_NAME }).first();
@@ -154,7 +159,7 @@ try {
     }
     await model.waitFor(); await model.click();
   }
-  assert.ok((await modelButton.innerText()).includes(MODEL_NAME));
+  assert.ok(await selected());
   const input = aux.locator('.chat-input-container .monaco-editor').first();
   await input.locator('.view-lines').first().click({ force: true });
   await page.keyboard.type('Reply briefly for this synthetic transport check.', { delay: 3 });
@@ -170,16 +175,36 @@ try {
   }, null, { timeout: 120_000 });
   await page.waitForFunction(computerId => window.__codeFailureQA.app_failures_for(Object.freeze({ computerId })).failures.length > 0,
     computerId, { timeout: 60_000 });
-  await page.waitForTimeout(2000); // catches a duplicated outcome without sending another request
-  const result = await snapshot(); assert.equal(result.available, true); assert.equal(result.failures.length, 1);
-  const { app, ageMs, ...failure } = result.failures[0];
-  assert.equal(app, 'code'); assert.ok(Number.isInteger(ageMs) && ageMs >= 0 && ageMs <= 1800000);
-  assertFailureRecord(failure, variant); assert.deepEqual(validate_failure(failure), failure);
+  // Copilot sends several model requests for one message (the turn and its side requests); the mock fails each.
+  // So: exactly one record per real model request, each with its own client key, and no duplicates.
+  const requests = () => JSON.parse(execFileSync('docker', ['exec', process.env.CONTAINER, 'curl', '-fsS', 'http://127.0.0.1:4142/stats'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).messages;
+  let settled = -1;
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(1500);
+    const count = (await snapshot()).failures.length;
+    if (count === settled && count === requests()) break;
+    settled = count;
+  }
+  const result = await snapshot(); assert.equal(result.available, true);
+  const sent = requests(); assert.ok(sent >= 1); assert.equal(result.failures.length, sent);
+  const failures = result.failures.map(({ app, ageMs, ...failure }) => {
+    assert.equal(app, 'code'); assert.ok(Number.isInteger(ageMs) && ageMs >= 0 && ageMs <= 1800000);
+    assertFailureRecord(failure, variant); assert.deepEqual(validate_failure(failure), failure);
+    return failure;
+  });
+  assert.equal(new Set(failures.map(f => f.clientRequestId)).size, failures.length);
+  const failure = failures[0];
+  const ids = failures.map(f => f.eventId).sort();
+  assert.equal(new Set(failures.map(f => f.eventId)).size, failures.length);
   const wire = await page.evaluate(() => window.__failureWire.failures);
-  assert.equal(wire.length, 1);
-  assert.deepEqual(Object.keys(wire[0]).sort(), ['failure', 'nonce', 'type', 'v']);
-  assert.equal(wire[0].nonce, ready.nonce); assert.equal(wire[0].v, 1); assert.deepEqual(wire[0].failure, failure);
-  pass('failure visible; exactly one canonical record exported by real consumer with both lowercase request UUIDs');
+  assert.equal(wire.length, failures.length);
+  for (const message of wire) {
+    assert.deepEqual(Object.keys(message).sort(), ['failure', 'nonce', 'type', 'v']);
+    assert.equal(message.nonce, ready.nonce); assert.equal(message.v, 1);
+    assert.ok(failures.some(f => JSON.stringify(f) === JSON.stringify(message.failure)));
+  }
+  pass(`failure visible; one canonical record per real model request (${sent}) exported by the real consumer, each with its own client key and the mock Gateway ID`);
   await screenshot('02-failure-masked');
 
   phase = 'consumer negative controls';
@@ -195,7 +220,7 @@ try {
   await frame.evaluate(({ origin, nonce, failure }) => parent.postMessage({ type: 'ezil.code.failure', v: 1, nonce,
     failure: { ...failure, eventId: 'a0000000-0000-4000-8000-0000000000e3', extra: {} } }, origin), { origin: shellOrigin, nonce: ready.nonce, failure });
   await page.waitForTimeout(500);
-  const after = await snapshot(); assert.equal(after.failures.length, 1); assert.equal(after.failures[0].eventId, failure.eventId);
+  const after = await snapshot(); assert.deepEqual(after.failures.map(f => f.eventId).sort(), ids);
   pass('consumer rejects direct posts from unregistered frame and registered-frame extra-key forgery');
   await page.locator('#unregistered').evaluate(el => el.remove());
 
@@ -205,14 +230,16 @@ try {
   const dialog = page.locator('dialog.ezil-feedback-dialog'); await dialog.waitFor();
   await dialog.locator('input[name="diagnostics"]').check();
   await dialog.locator('.ezil-feedback-preview summary').click();
-  await page.waitForFunction(() => {
-    try { return JSON.parse(document.querySelector('.ezil-feedback-preview pre').textContent).diagnostics.appFailures.length === 1; }
+  await page.waitForFunction(count => {
+    try { return JSON.parse(document.querySelector('.ezil-feedback-preview pre').textContent).diagnostics.appFailures.length === count; }
     catch { return false; }
-  });
+  }, failures.length);
   const preview = await dialog.locator('.ezil-feedback-preview pre').evaluate(el => JSON.parse(el.textContent).diagnostics.appFailures);
-  assert.equal(preview.length, 1); assert.equal(preview[0].eventId, failure.eventId);
-  const { app: previewApp, ageMs: previewAge, ...previewFailure } = preview[0];
-  assert.equal(previewApp, 'code'); assert.ok(Number.isInteger(previewAge)); assert.deepEqual(previewFailure, failure);
+  assert.deepEqual(preview.map(p => p.eventId).sort(), ids);
+  for (const { app: previewApp, ageMs: previewAge, ...previewFailure } of preview) {
+    assert.equal(previewApp, 'code'); assert.ok(Number.isInteger(previewAge));
+    assert.deepEqual(previewFailure, failures.find(f => f.eventId === previewFailure.eventId));
+  }
   await page.waitForTimeout(100);
   const frozen = await dialog.locator('.ezil-feedback-preview pre').evaluate(el => JSON.parse(el.textContent).diagnostics.appFailures);
   assert.deepEqual(frozen, preview);

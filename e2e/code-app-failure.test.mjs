@@ -36,7 +36,7 @@ for (const variant of ['missing_terminal', 'settlement_pending']) test(`metadata
   assert.deepEqual(events.map(event => event.type), ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop',
     ...(variant === 'settlement_pending' ? ['error'] : [])]);
   assert.equal(events[0].message.role, 'assistant');
-  if (variant === 'settlement_pending') assert.equal(events.at(-1).error.code, 'settlement_pending');
+  if (variant === 'settlement_pending') assert.equal(events.at(-1).code, 'settlement_pending');
 });
 
 test('metadata does not echo unknown paths, query strings or methods', () => {

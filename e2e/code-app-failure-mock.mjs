@@ -14,14 +14,18 @@ export const modelConfig = {
 
 export function faultHandler({ variant = 'missing_terminal', log = line => process.stdout.write(`${JSON.stringify(line)}\n`) } = {}) {
   if (!['missing_terminal', 'settlement_pending'].includes(variant)) throw new Error('Unsupported fault variant');
+  // A count of model requests only (no bodies), so the harness can match one record per real request.
+  let messages = 0;
   return (req, res) => {
     // Do not log query strings or attacker-selected paths. Only closed route names enter metadata.
-    const route = ['/ai/v1/models', '/ai/v1/messages', '/healthz'].includes(req.url) ? req.url : '/unknown';
+    const route = ['/ai/v1/models', '/ai/v1/messages', '/healthz', '/stats'].includes(req.url) ? req.url : '/unknown';
     const method = ['GET', 'POST'].includes(req.method) ? req.method : 'OTHER';
-    const status = (method === 'GET' && ['/ai/v1/models', '/healthz'].includes(route))
+    const status = (method === 'GET' && ['/ai/v1/models', '/healthz', '/stats'].includes(route))
       || (method === 'POST' && route === '/ai/v1/messages') ? 200 : 404;
     log({ method, path: route, status, requestId: REQUEST_ID });
+    if (method === 'GET' && route === '/stats') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ messages })); return; }
     if (method === 'POST' && route === '/ai/v1/messages') {
+      messages++;
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store',
         'x-ezil-request-id': REQUEST_ID, connection: 'close' });
       const event = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
@@ -30,7 +34,7 @@ export function faultHandler({ variant = 'missing_terminal', log = line => proce
       event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
       event('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'Synthetic partial response.' } });
       event('content_block_stop', { index: 0 });
-      if (variant === 'settlement_pending') event('error', { error: { type: 'api_error', code: 'settlement_pending' } });
+      if (variant === 'settlement_pending') event('error', { code: 'settlement_pending', message: 'The model responded, but its credit settlement is pending review.', request_id: REQUEST_ID });
       // Deliberately no message_stop. Clean EOF (not a socket reset) makes this deterministic.
       res.end();
       return;

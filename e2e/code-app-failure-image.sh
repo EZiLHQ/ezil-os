@@ -13,6 +13,10 @@ FAULT_VARIANT="${FAULT_VARIANT:-missing_terminal}"
 EVIDENCE="${1:?evidence directory}"
 VSIX="${VSIX:-$TREE/worker/ezil-models/dist/ezil-models-0.1.0.vsix}"
 PATCH_SCRIPT="$TREE/worker/copilot-chat/patch-copilot-chat.sh"
+# A released image already carries the patches of its own commit, so this branch's script cannot apply on top of it.
+# PRISTINE_FILES names the eight files the script edits, unmodified from code-server 4.141.0 (same relative paths
+# under lib/vscode); they replace the image's copies before the branch patch runs. Empty: patch the image as is.
+PRISTINE_FILES="${PRISTINE_FILES:-}"
 NET="ezil-appfailure-net-$$"
 NAME="ezil-appfailure-code-$$"
 case "$FAULT_VARIANT" in missing_terminal|settlement_pending) ;; *) echo 'FAIL unsupported variant'; exit 2;; esac
@@ -30,6 +34,7 @@ docker run --pull=never -d --name "$NAME" --network "$NET" --cpus=2 --memory=6g 
   --mount "type=bind,src=$VSIX,dst=/fixture/ezil-models.vsix,readonly" \
   --mount "type=bind,src=$PATCH_SCRIPT,dst=/fixture/patch-copilot-chat.sh,readonly" \
   --mount "type=bind,src=$HERE/code-app-failure-mock.mjs,dst=/fixture/mock.mjs,readonly" \
+  ${PRISTINE_FILES:+--mount "type=bind,src=$PRISTINE_FILES,dst=/fixture/pristine,readonly"} \
   --env "FAULT_VARIANT=$FAULT_VARIANT" --env EZIL_MODELS_CONFIG=/tmp/app-failure-models.json \
   --env EZIL_AI_BASE_URL=http://127.0.0.1:4142/ai/v1 --env EZIL_AI_PROXY_TOKEN=synthetic-test-only \
   --env APPLICATION_INSIGHTS_NO_STATSBEAT=true --entrypoint bash "$IMAGE" -c '
@@ -40,6 +45,7 @@ docker run --pull=never -d --name "$NAME" --network "$NET" --cpus=2 --memory=6g 
     node -e '\''const p=require("/tmp/app-failure-vsix/extension/package.json");if(p.publisher!=="ezil"||p.name!=="ezil-models"||!p.contributes.languageModelChatProviders.some(p=>p.vendor==="ezil"))process.exit(1)'\''
     rm -rf /usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models
     mv /tmp/app-failure-vsix/extension /usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models
+    if [[ -d /fixture/pristine ]]; then (cd /fixture/pristine && find . -type f | while read -r f; do cp "$f" "/usr/lib/code-server/lib/vscode/$f"; done); fi
     # Both gates must complete BEFORE the server launches. Older partially patched images fail closed.
     bash /fixture/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode >/dev/null 2>&1
     bash /fixture/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode >/dev/null 2>&1
@@ -62,4 +68,4 @@ done
 [[ "$ready" == 1 ]] || { echo 'FAIL prestart install/patch/verify or code-server readiness (no container logs exported)'; exit 1; }
 docker exec "$NAME" test -f /tmp/app-failure-patch-passed
 printf 'PASS branch VSIX installed and branch patch applied/verified before code-server\n'
-NODE_NO_WARNINGS=1 FAULT_VARIANT="$FAULT_VARIANT" timeout "${SCENARIO_TIMEOUT:-600}" node "$HERE/code-app-failure.mjs" "$IP" "$EVIDENCE"
+NODE_NO_WARNINGS=1 CONTAINER="$NAME" FAULT_VARIANT="$FAULT_VARIANT" timeout "${SCENARIO_TIMEOUT:-600}" node "$HERE/code-app-failure.mjs" "$IP" "$EVIDENCE"
